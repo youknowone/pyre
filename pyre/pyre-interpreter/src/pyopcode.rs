@@ -1202,33 +1202,33 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
 
     // ── Closures / cells ──
     fn load_deref(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_deref not implemented").into())
+        Err(crate::PyError::type_error("load_deref not implemented"))
     }
     fn store_deref(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("store_deref not implemented").into())
+        Err(crate::PyError::type_error("store_deref not implemented"))
     }
     fn load_closure(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_closure not implemented").into())
+        Err(crate::PyError::type_error("load_closure not implemented"))
     }
     fn delete_deref(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_deref not implemented").into())
+        Err(crate::PyError::type_error("delete_deref not implemented"))
     }
 
     // ── Exception handling ──
     fn setup_finally(&mut self, _handler: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("setup_finally not implemented").into())
+        Err(crate::PyError::type_error("setup_finally not implemented"))
     }
     fn setup_except(&mut self, _handler: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("setup_except not implemented").into())
+        Err(crate::PyError::type_error("setup_except not implemented"))
     }
     fn pop_block(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pop_block not implemented").into())
+        Err(crate::PyError::type_error("pop_block not implemented"))
     }
     fn raise_varargs(&mut self, _argc: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("raise_varargs not implemented").into())
+        Err(crate::PyError::type_error("raise_varargs not implemented"))
     }
     fn end_finally(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("end_finally not implemented").into())
+        Err(crate::PyError::type_error("end_finally not implemented"))
     }
     fn exception_handler(&mut self) -> Result<(), PyError> {
         Ok(()) // no-op by default
@@ -1236,43 +1236,45 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
 
     // ── Import ──
     fn import_name(&mut self, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("import_name not implemented").into())
+        Err(crate::PyError::type_error("import_name not implemented"))
     }
     fn import_from(&mut self, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("import_from not implemented").into())
+        Err(crate::PyError::type_error("import_from not implemented"))
     }
     fn import_star(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("import_star not implemented").into())
+        Err(crate::PyError::type_error("import_star not implemented"))
     }
 
     // ── Stack manipulation ──
     fn rotate3(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("rotate3 not implemented").into())
+        Err(crate::PyError::type_error("rotate3 not implemented"))
     }
 
     // ── Delete operations ──
     fn delete_fast(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_fast not implemented").into())
+        Err(crate::PyError::type_error("delete_fast not implemented"))
     }
     fn delete_subscript(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_subscript not implemented").into())
+        Err(crate::PyError::type_error(
+            "delete_subscript not implemented",
+        ))
     }
     fn delete_attr(&mut self, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_attr not implemented").into())
+        Err(crate::PyError::type_error("delete_attr not implemented"))
     }
     fn delete_name(&mut self, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_name not implemented").into())
+        Err(crate::PyError::type_error("delete_name not implemented"))
     }
     fn delete_global(&mut self, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("delete_global not implemented").into())
+        Err(crate::PyError::type_error("delete_global not implemented"))
     }
 
     // Containment / identity
     fn contains_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("contains_op not implemented").into())
+        Err(crate::PyError::type_error("contains_op not implemented"))
     }
     fn is_op(&mut self, _invert: crate::bytecode::Invert) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("is_op not implemented").into())
+        Err(crate::PyError::type_error("is_op not implemented"))
     }
 
     // Exception handling
@@ -1283,10 +1285,12 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Ok(())
     }
     fn check_exc_match(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("check_exc_match not implemented").into())
+        Err(crate::PyError::type_error(
+            "check_exc_match not implemented",
+        ))
     }
     fn check_eg_match(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("check_eg_match not implemented").into())
+        Err(crate::PyError::type_error("check_eg_match not implemented"))
     }
     /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
     ///
@@ -1296,44 +1300,44 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// `RaiseWithExplicitTraceback(operr, reraise_lasti=...)`.  When
     /// `oparg == 0` no lasti is attached (default `-1`).
     fn reraise(&mut self, _oparg: u32) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("reraise not implemented").into())
+        Err(crate::PyError::type_error("reraise not implemented"))
     }
 
     // Collections
     fn build_set(&mut self, _count: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("build_set not implemented").into())
+        Err(crate::PyError::type_error("build_set not implemented"))
     }
     fn build_slice(&mut self, _argc: crate::bytecode::BuildSliceArgCount) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("build_slice not implemented").into())
+        Err(crate::PyError::type_error("build_slice not implemented"))
     }
     fn build_string(&mut self, _count: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("build_string not implemented").into())
+        Err(crate::PyError::type_error("build_string not implemented"))
     }
     fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("list_extend not implemented").into())
+        Err(crate::PyError::type_error("list_extend not implemented"))
     }
     fn set_add(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("set_add not implemented").into())
+        Err(crate::PyError::type_error("set_add not implemented"))
     }
     fn dict_merge(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("dict_merge not implemented").into())
+        Err(crate::PyError::type_error("dict_merge not implemented"))
     }
     fn dict_update(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("dict_update not implemented").into())
+        Err(crate::PyError::type_error("dict_update not implemented"))
     }
     fn set_update(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("set_update not implemented").into())
+        Err(crate::PyError::type_error("set_update not implemented"))
     }
     fn map_add(&mut self, _i: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("map_add not implemented").into())
+        Err(crate::PyError::type_error("map_add not implemented"))
     }
 
     // Slicing
     fn binary_slice(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("binary_slice not implemented").into())
+        Err(crate::PyError::type_error("binary_slice not implemented"))
     }
     fn store_slice(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("store_slice not implemented").into())
+        Err(crate::PyError::type_error("store_slice not implemented"))
     }
 
     // Common constants (CPython LOAD_COMMON_CONSTANT)
@@ -1341,20 +1345,26 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         &mut self,
         _cc: crate::bytecode::CommonConstant,
     ) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_common_constant not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_common_constant not implemented",
+        ))
     }
 
     // Boolean
     fn to_bool(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("to_bool not implemented").into())
+        Err(crate::PyError::type_error("to_bool not implemented"))
     }
 
     // None jumps
     fn pop_jump_if_none(&mut self, _target: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pop_jump_if_none not implemented").into())
+        Err(crate::PyError::type_error(
+            "pop_jump_if_none not implemented",
+        ))
     }
     fn pop_jump_if_not_none(&mut self, _target: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pop_jump_if_not_none not implemented").into())
+        Err(crate::PyError::type_error(
+            "pop_jump_if_not_none not implemented",
+        ))
     }
 
     // Closures 3.11+
@@ -1367,59 +1377,69 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Ok(())
     }
     fn return_generator(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("return_generator not implemented").into())
+        Err(crate::PyError::type_error(
+            "return_generator not implemented",
+        ))
     }
 
     // Call variants
     fn call_kw(&mut self, _argc: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("call_kw not implemented").into())
+        Err(crate::PyError::type_error("call_kw not implemented"))
     }
     fn call_function_ex(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("call_function_ex not implemented").into())
+        Err(crate::PyError::type_error(
+            "call_function_ex not implemented",
+        ))
     }
 
     // yield from / send
     fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("yield from not implemented").into())
+        Err(crate::PyError::type_error("yield from not implemented"))
     }
     fn send_value(&mut self, _target: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("send not implemented").into())
+        Err(crate::PyError::type_error("send not implemented"))
     }
     fn end_send(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("end_send not implemented").into())
+        Err(crate::PyError::type_error("end_send not implemented"))
     }
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("cleanup throw not implemented").into())
+        Err(crate::PyError::type_error("cleanup throw not implemented"))
     }
     /// GET_AWAITABLE — replace TOS with its awaitable iterator (`__await__`).
     /// Overridden by the interpreter; the trace path declines (await suspends
     /// the frame and is never JIT-traced).
     fn get_awaitable(&mut self, _context: u32) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("get_awaitable not implemented").into())
+        Err(crate::PyError::type_error("get_awaitable not implemented"))
     }
     fn get_aiter(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("get_aiter not implemented").into())
+        Err(crate::PyError::type_error("get_aiter not implemented"))
     }
     fn get_anext(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("get_anext not implemented").into())
+        Err(crate::PyError::type_error("get_anext not implemented"))
     }
     fn end_async_for(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("end_async_for not implemented").into())
+        Err(crate::PyError::type_error("end_async_for not implemented"))
     }
 
     // Class
     fn load_build_class(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_build_class not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_build_class not implemented",
+        ))
     }
     /// The value half of [`Self::load_build_class`], without the push.
     /// The JIT's `LOAD_BUILD_CLASS` residual calls this so the lookup order
     /// stays in one place, the way `load_name_checked_value` serves
     /// `load_name`.
     fn load_build_class_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("load_build_class not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_build_class not implemented",
+        ))
     }
     fn load_super_attr(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_super_attr not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_super_attr not implemented",
+        ))
     }
     fn load_super_attr_with(
         &mut self,
@@ -1427,31 +1447,37 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         _is_method: bool,
         _is_two_arg: bool,
     ) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_super_attr not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_super_attr not implemented",
+        ))
     }
     fn load_locals(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_locals not implemented").into())
+        Err(crate::PyError::type_error("load_locals not implemented"))
     }
 
     // String formatting
     fn format_simple(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("format_simple not implemented").into())
+        Err(crate::PyError::type_error("format_simple not implemented"))
     }
     fn format_with_spec(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("format_with_spec not implemented").into())
+        Err(crate::PyError::type_error(
+            "format_with_spec not implemented",
+        ))
     }
     fn convert_value(&mut self, _conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("convert_value not implemented").into())
+        Err(crate::PyError::type_error("convert_value not implemented"))
     }
 
     fn get_len(
         &mut self,
         _obj: <Self as SharedOpcodeHandler>::Value,
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("get_len not implemented").into())
+        Err(crate::PyError::type_error("get_len not implemented"))
     }
     fn load_fast_and_clear(&mut self, _idx: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_fast_and_clear not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_fast_and_clear not implemented",
+        ))
     }
     fn set_function_attribute_with_flag(
         &mut self,
@@ -1462,31 +1488,45 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Ok(())
     }
     fn load_from_dict_or_globals(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_from_dict_or_globals not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_from_dict_or_globals not implemented",
+        ))
     }
     fn load_from_dict_or_deref(&mut self, _idx: usize, _name: &str) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("load_from_dict_or_deref not implemented").into())
+        Err(crate::PyError::type_error(
+            "load_from_dict_or_deref not implemented",
+        ))
     }
     fn match_stub(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pattern matching not implemented").into())
+        Err(crate::PyError::type_error(
+            "pattern matching not implemented",
+        ))
     }
     // MATCH_MAPPING / MATCH_SEQUENCE / MATCH_KEYS / MATCH_CLASS (PEP 634).
     // The JIT tracer inherits these erroring defaults and declines a trace
     // that reaches a match statement; the interpreter overrides them.
     fn match_mapping(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pattern matching not implemented").into())
+        Err(crate::PyError::type_error(
+            "pattern matching not implemented",
+        ))
     }
     fn match_sequence(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pattern matching not implemented").into())
+        Err(crate::PyError::type_error(
+            "pattern matching not implemented",
+        ))
     }
     fn match_keys(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pattern matching not implemented").into())
+        Err(crate::PyError::type_error(
+            "pattern matching not implemented",
+        ))
     }
     fn match_class(&mut self, _count: usize) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("pattern matching not implemented").into())
+        Err(crate::PyError::type_error(
+            "pattern matching not implemented",
+        ))
     }
     fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("unpack_ex not implemented").into())
+        Err(crate::PyError::type_error("unpack_ex not implemented"))
     }
 
     /// CALL_INTRINSIC_1: single-argument intrinsic operations.
@@ -1495,7 +1535,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// import time, never inside a JIT-traced loop).
     fn import_module(&mut self, name: &str) -> Result<Self::Value, PyError> {
         let _ = name;
-        Err(crate::PyError::type_error("import_module not implemented").into())
+        Err(crate::PyError::type_error("import_module not implemented"))
     }
 
     /// Build a PEP 695 type-parameter object by routing the single intrinsic
@@ -1525,7 +1565,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         _orig: Self::Value,
         _exceptions: Self::Value,
     ) -> Result<Self::Value, PyError> {
-        Err(crate::PyError::type_error("prep_reraise_star not implemented").into())
+        Err(crate::PyError::type_error(
+            "prep_reraise_star not implemented",
+        ))
     }
 
     /// BUILD_TEMPLATE: pop the interpolations and strings tuples and build a
@@ -1533,7 +1575,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     /// path declines (t-strings run at import time, never inside a JIT-traced
     /// loop).
     fn build_template_op(&mut self) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("BUILD_TEMPLATE not implemented").into())
+        Err(crate::PyError::type_error("BUILD_TEMPLATE not implemented"))
     }
 
     /// BUILD_INTERPOLATION: build a `string.templatelib.Interpolation` from the
@@ -1544,7 +1586,9 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         _conversion: u32,
         _has_format_spec: bool,
     ) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("BUILD_INTERPOLATION not implemented").into())
+        Err(crate::PyError::type_error(
+            "BUILD_INTERPOLATION not implemented",
+        ))
     }
 
     fn call_intrinsic_1(&mut self, func: IntrinsicFunction1) -> Result<(), PyError> {
@@ -1601,8 +1645,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             _ => Err(crate::PyError::type_error(format!(
                 "intrinsic function {:?} not implemented",
                 func
-            ))
-            .into()),
+            ))),
         }
     }
 
@@ -1638,8 +1681,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             _ => Err(crate::PyError::type_error(format!(
                 "intrinsic function {:?} not implemented",
                 func
-            ))
-            .into()),
+            ))),
         }
     }
 
@@ -1648,25 +1690,25 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("unary_positive not implemented").into())
+        Err(crate::PyError::type_error("unary_positive not implemented"))
     }
     fn list_to_tuple(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("list_to_tuple not implemented").into())
+        Err(crate::PyError::type_error("list_to_tuple not implemented"))
     }
     fn async_gen_wrap(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
     ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("async_gen_wrap not implemented").into())
+        Err(crate::PyError::type_error("async_gen_wrap not implemented"))
     }
     fn print_expr(&mut self, _val: <Self as SharedOpcodeHandler>::Value) -> Result<(), PyError> {
-        Err(crate::PyError::type_error("print_expr not implemented").into())
+        Err(crate::PyError::type_error("print_expr not implemented"))
     }
     fn none_value(&mut self) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("none_value not implemented").into())
+        Err(crate::PyError::type_error("none_value not implemented"))
     }
 
     fn unsupported(
@@ -2341,7 +2383,7 @@ pub fn execute_build_interpolation<E: OpcodeStepExecutor>(
     let Instruction::BuildInterpolation { format } = instruction else {
         unreachable!()
     };
-    let oparg_val = u32::from(format.get(op_arg));
+    let oparg_val = format.get(op_arg);
     let has_format_spec = (oparg_val & 1) != 0;
     // The conversion (`!s` / `!r` / `!a`) is encoded in the upper oparg bits.
     let conversion = oparg_val >> 2;

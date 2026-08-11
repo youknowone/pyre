@@ -411,10 +411,10 @@ impl OptPure {
     /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
-        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result) {
-            if let Some((_raw, result_type)) = ctx.getconst(&result_box) {
-                return result_type == op.result_type();
-            }
+        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result)
+            && let Some((_raw, result_type)) = ctx.getconst(&result_box)
+        {
+            return result_type == op.result_type();
         }
         match ctx.opref_type(result) {
             Some(result_type) => result_type == op.result_type(),
@@ -439,7 +439,7 @@ impl OptPure {
         // pure.py:88-93 — `commutative` is forwarded into `lookup2`,
         // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
         let commutative = Self::is_commutative(key.opcode);
-        self.cache.lookup(key, &same_box, commutative)
+        self.cache.lookup(key, same_box, commutative)
     }
 
     /// Record a pure operation in the CSE cache.
@@ -816,7 +816,7 @@ impl OptPure {
             .as_ref()
             .map(|b| b.to_opref())
             .unwrap_or_else(|| op.to_opref());
-        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+        if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
@@ -850,7 +850,7 @@ impl OptPure {
         self.call_pure_results
             .iter()
             .find(|(k, _)| k.as_slice() == arg_consts.as_slice())
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| *v)
     }
 }
 
@@ -918,13 +918,11 @@ impl Optimization for OptPure {
                     ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
                         .is_some()
                 });
-                if all_args_const {
-                    if let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                        let b = ctx.materialize_operand_at(postponed.pos.get());
-                        ctx.make_constant_box(&b, Value::Int(folded));
-                        self.last_emitted_was_removed = true;
-                        return OptimizationResult::Remove; // guard also removed
-                    }
+                if all_args_const && let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
+                    let b = ctx.materialize_operand_at(postponed.pos.get());
+                    ctx.make_constant_box(&b, Value::Int(folded));
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove; // guard also removed
                 }
 
                 // pure.py:50-55: force_preamble_op replaces the OVF op
@@ -942,14 +940,14 @@ impl Optimization for OptPure {
                 // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
                 // it only when the cached opnum matches our OVF opnum.
                 let key = PureOpKey::from_op(&postponed);
-                if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
-                    if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
-                        let b_old = postponed_box.clone();
-                        let b_cached = ctx.get_box_replacement_operand(cached_ref);
-                        ctx.make_equal_to(&b_old, &b_cached);
-                        self.last_emitted_was_removed = true;
-                        return OptimizationResult::Remove; // guard also removed
-                    }
+                if let Some(cached_ref) = self.lookup_pure(&key, ctx)
+                    && Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true)
+                {
+                    let b_old = postponed_box.clone();
+                    let b_cached = ctx.get_box_replacement_operand(cached_ref);
+                    ctx.make_equal_to(&b_old, &b_cached);
+                    self.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove; // guard also removed
                 }
                 // pure.py:162-171: an OVF op cannot reuse a non-OVF result
                 // even when the args/descr are identical (the prior op

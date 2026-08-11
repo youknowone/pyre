@@ -509,10 +509,11 @@ impl LabelResumeData {
         }
         for op in ops {
             let r = op.pos.get();
-            if r != OpRef::NONE && !r.is_constant() {
-                if let Some(v) = has_producer.get_mut(r.raw() as usize) {
-                    *v = true;
-                }
+            if r != OpRef::NONE
+                && !r.is_constant()
+                && let Some(v) = has_producer.get_mut(r.raw() as usize)
+            {
+                *v = true;
             }
         }
         let mut per_label = Vec::new();
@@ -546,18 +547,20 @@ impl LabelResumeData {
             }
             for op in &ops[..label_pos] {
                 let r = op.pos.get();
-                if r != OpRef::NONE && !r.is_constant() {
-                    if let Some(v) = defined_before.get_mut(r.raw() as usize) {
-                        *v = true;
-                    }
+                if r != OpRef::NONE
+                    && !r.is_constant()
+                    && let Some(v) = defined_before.get_mut(r.raw() as usize)
+                {
+                    *v = true;
                 }
             }
             for arg in label.getarglist() {
                 let r = arg.to_opref();
-                if r != OpRef::NONE && !r.is_constant() {
-                    if let Some(v) = available.get_mut(r.raw() as usize) {
-                        *v = true;
-                    }
+                if r != OpRef::NONE
+                    && !r.is_constant()
+                    && let Some(v) = available.get_mut(r.raw() as usize)
+                {
+                    *v = true;
                 }
             }
 
@@ -585,10 +588,11 @@ impl LabelResumeData {
                     }
                 }
                 let r = op.pos.get();
-                if r != OpRef::NONE && !r.is_constant() {
-                    if let Some(v) = available.get_mut(r.raw() as usize) {
-                        *v = true;
-                    }
+                if r != OpRef::NONE
+                    && !r.is_constant()
+                    && let Some(v) = available.get_mut(r.raw() as usize)
+                {
+                    *v = true;
                 }
             }
             per_label.push(missing);
@@ -1350,17 +1354,17 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             // the (guard, failing value) pair. Without it a guard whose failing
             // value never repeats accumulates in one bucket and compiles
             // another bridge every `trace_eagerness` failures, without bound.
-            if op.opcode == OpCode::GuardValue {
-                if let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                    let arg0 = op.arg(0).to_opref();
-                    if let Some(idx) = fail_args.iter().position(|r| *r == arg0) {
-                        let type_tag = match fail_arg_types.get(idx) {
-                            Some(Type::Ref) => majit_backend::STATUS_TY_REF,
-                            Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                            _ => majit_backend::STATUS_TY_INT,
-                        };
-                        fd.make_a_counter_per_value(idx as u32, type_tag);
-                    }
+            if op.opcode == OpCode::GuardValue
+                && let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr())
+            {
+                let arg0 = op.arg(0).to_opref();
+                if let Some(idx) = fail_args.iter().position(|r| *r == arg0) {
+                    let type_tag = match fail_arg_types.get(idx) {
+                        Some(Type::Ref) => majit_backend::STATUS_TY_REF,
+                        Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                        _ => majit_backend::STATUS_TY_INT,
+                    };
+                    fd.make_a_counter_per_value(idx as u32, type_tag);
                 }
             }
             guards.push(GuardExit {
@@ -1692,7 +1696,7 @@ pub fn build_wasm_module(
         } else if ca.ca_reload_fn_ptr != 0 {
             // Every trace body can reload its own frame after a collecting
             // direct call, even though only bridges emit the CA arm.
-            Some(scanned.map_or(0, |m| m.max(0)))
+            Some(scanned.map_or(0, |m| m))
         } else {
             scanned
         }
@@ -1705,10 +1709,10 @@ pub fn build_wasm_module(
     let mut float_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
         for op in ops {
-            if let Some(sig) = residual_call_float_sig(op) {
-                if !float_residual_sigs.contains(&sig) {
-                    float_residual_sigs.push(sig);
-                }
+            if let Some(sig) = residual_call_float_sig(op)
+                && !float_residual_sigs.contains(&sig)
+            {
+                float_residual_sigs.push(sig);
             }
         }
     }
@@ -2218,8 +2222,8 @@ fn build_function(
                 op_idx,
                 op.pos.get(),
                 &liveness,
-                &label_resume,
-                &ref_homes,
+                label_resume,
+                ref_homes,
             ) {
                 Some(guard) => {
                     push_cond(&mut sink, constants, value_types, op, kind);
@@ -3717,7 +3721,7 @@ fn build_function(
                     sink.i64_extend_i32_u();
                 } else if let Some(base) = residual_type_base {
                     sink.i32_const(ca.ca_reload_fn_ptr as i32);
-                    sink.call_indirect(0, base + 0);
+                    sink.call_indirect(0, base);
                 } else {
                     let jit_call =
                         jit_call_idx.expect("CA arm needs jit_call for the frame trampolines");
@@ -4228,19 +4232,18 @@ fn build_function(
                     // Without it the nursery-zeroed `w_class` stays 0 and the
                     // promoted-`w_class` GuardValue fails every iteration on any
                     // escaping-builtin loop (e.g. `while: lst.append(i)`).
-                    if op.opcode == OpCode::NewWithVtable {
-                        if let Some((w_class_offset, w_class)) = w_class_init {
-                            if w_class != 0 {
-                                sink.local_get(1 + vi);
-                                sink.i32_wrap_i64();
-                                sink.i32_const(w_class as i32);
-                                sink.i32_store(MemArg {
-                                    offset: w_class_offset,
-                                    align: 2,
-                                    memory_index: 0,
-                                });
-                            }
-                        }
+                    if op.opcode == OpCode::NewWithVtable
+                        && let Some((w_class_offset, w_class)) = w_class_init
+                        && w_class != 0
+                    {
+                        sink.local_get(1 + vi);
+                        sink.i32_wrap_i64();
+                        sink.i32_const(w_class as i32);
+                        sink.i32_store(MemArg {
+                            offset: w_class_offset,
+                            align: 2,
+                            memory_index: 0,
+                        });
                     }
                 }
                 // The collecting allocation may have moved every other live
@@ -5063,10 +5066,10 @@ fn const_operand_value(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -
 /// Extract field offset from op's descr (FieldDescr).
 fn field_offset_from_descr(op: &Op) -> u64 {
     let __descr_arc_descr = op.getdescr();
-    if let Some(ref descr) = __descr_arc_descr.as_ref() {
-        if let Some(fd) = descr.as_field_descr() {
-            return fd.offset() as u64;
-        }
+    if let Some(descr) = __descr_arc_descr.as_ref()
+        && let Some(fd) = descr.as_field_descr()
+    {
+        return fd.offset() as u64;
     }
     missing_layout_descr("field descr (offset)", op)
 }

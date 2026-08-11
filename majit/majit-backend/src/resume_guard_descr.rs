@@ -781,17 +781,17 @@ impl Drop for ResumeGuardDescr {
         let bridge_ptr = self
             .bridge_dispatch_cell
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !bridge_ptr.is_null() {
-            if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
-                // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
-                // alongside the payload at `bridge_ptr`; the publisher's
-                // safety contract is that the function reclaims a value of
-                // the same shape the publisher published.
-                unsafe { drop_fn(bridge_ptr) };
-            }
-            // else: payload published with no cleanup registered — a
-            // backend bug.  Leaks rather than risks reading the wrong
-            // concrete type.
+        if !bridge_ptr.is_null()
+            && let Some(drop_fn) = self.bridge_dispatch_drop_fn.get()
+        {
+            // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
+            // alongside the payload at `bridge_ptr`; the publisher's
+            // safety contract is that the function reclaims a value of
+            // the same shape the publisher published.
+            unsafe { drop_fn(bridge_ptr) };
         }
+        // else: payload published with no cleanup registered — a
+        // backend bug.  Leaks rather than risks reading the wrong
+        // concrete type.
     }
 }

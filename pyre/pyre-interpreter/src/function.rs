@@ -2903,10 +2903,10 @@ pub unsafe fn descr_method_getattribute(
     // ...), while the definitions still remain absent from those type dicts.
     // Preserve that selected 3.14 delta without changing ordinary Python
     // classmethods, whose qualname continues to name the defining class.
-    if name == "__qualname__" {
-        if let Some(qualname) = unsafe { method_class_bound_qualname(obj)? } {
-            return Ok(qualname);
-        }
+    if name == "__qualname__"
+        && let Some(qualname) = unsafe { method_class_bound_qualname(obj)? }
+    {
+        return Ok(qualname);
     }
     // function.py:604-614 — method attributes win, except `__doc__`;
     // an AttributeError falls back to the wrapped function.
@@ -3183,11 +3183,10 @@ pub fn funccall_valuestack(
     if nargs == 0
         && majit_metainterp::jit::we_are_jitted()
         && std::ptr::eq(code, sys_exc_info_code())
+        && let Some(direct_fn) = sys_exc_info_direct_fn()
     {
-        if let Some(direct_fn) = sys_exc_info_direct_fn() {
-            frame.dropvalues(dropvalues);
-            return direct_fn();
-        }
+        frame.dropvalues(dropvalues);
+        return direct_fn();
     }
 
     let fast_natural_arity =

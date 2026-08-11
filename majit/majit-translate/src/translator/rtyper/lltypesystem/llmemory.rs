@@ -444,14 +444,13 @@ impl AddressOffset {
         while (i as isize) >= 0 {
             if let (AddressOffset::ItemOffset(left), AddressOffset::ItemOffset(right)) =
                 (&lst[i], &lst[i + 1])
+                && left.TYPE == right.TYPE
             {
-                if left.TYPE == right.TYPE {
-                    let merged = AddressOffset::ItemOffset(ItemOffset {
-                        TYPE: left.TYPE.clone(),
-                        repeat: left.repeat + right.repeat,
-                    });
-                    lst.splice(i..i + 2, std::iter::once(merged));
-                }
+                let merged = AddressOffset::ItemOffset(ItemOffset {
+                    TYPE: left.TYPE.clone(),
+                    repeat: left.repeat + right.repeat,
+                });
+                lst.splice(i..i + 2, std::iter::once(merged));
             }
             i = i.wrapping_sub(1);
         }
@@ -1071,7 +1070,7 @@ pub fn weakref_deref(PTRTYPE: &LowLevelType, pwref: &_ptr) -> Result<_ptr, Strin
         ._dereference()
         .map_err(|_| "weakref_deref: weakref referent is a delayed pointer".to_string())?;
     match deref {
-        None => nullptr(LowLevelType::from((**ptr_t).TO.clone())),
+        None => nullptr(LowLevelType::from(ptr_t.TO.clone())),
         Some(p) => cast_any_ptr(ptr_t, &p),
     }
 }
@@ -1736,8 +1735,8 @@ mod tests {
             &LowLevelType::Signed,
             &LowLevelType::Signed
         ));
-        assert!(array_item_type_match(&concrete_ptr, &*GCREF));
-        assert!(!array_item_type_match(&LowLevelType::Signed, &*GCREF));
+        assert!(array_item_type_match(&concrete_ptr, &GCREF));
+        assert!(!array_item_type_match(&LowLevelType::Signed, &GCREF));
     }
 
     #[test]

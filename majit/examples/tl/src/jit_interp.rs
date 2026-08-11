@@ -161,11 +161,11 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 let value = program[pc] as i8 as i64;
                 pc += 1;
                 state.stack[state.stackpos as usize] = value;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             // tl.py:98-99
             POP => {
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:101-104
             SWAP => {
@@ -186,13 +186,13 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 pc += 1;
                 let v = state.stack[(state.stackpos as usize) - i - 1];
                 state.stack[state.stackpos as usize] = v;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             // tl.py:115-117  Stack.put(i): pop and store at stackpos - i - 1
             PUT => {
                 let i = program[pc] as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let v = state.stack[state.stackpos as usize];
                 state.stack[(state.stackpos as usize) - i] = v;
             }
@@ -201,72 +201,72 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b + a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:123-125
             SUB => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b - a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:127-129
             MUL => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b * a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:131-133
             DIV => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b / a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:135-157 — inline comparisons (no helper functions)
             EQ => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b == a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             NE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b != a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             LT => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b < a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             LE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b <= a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             GT => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b > a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             GE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b >= a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             // tl.py:159-165
             BR_COND => {
                 let offset = program[pc] as i8 as i64;
                 let target = ((pc as i64) + offset + 1) as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
@@ -278,9 +278,9 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
             }
             // tl.py:167-172
             BR_COND_STK => {
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let offset = state.stack[state.stackpos as usize];
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let cond = state.stack[state.stackpos as usize];
                 if cond != 0 {
                     let target = (pc as i64 + offset) as usize;
@@ -301,20 +301,20 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 let target = (pc as i64 + offset) as usize;
                 let res = recursive_portal_call!(driver, target, program);
                 state.stack[state.stackpos as usize] = res;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             // tl.py:180-181
             RETURN => break,
             // tl.py:183-184
             PUSHARG => {
                 state.stack[state.stackpos as usize] = inputarg;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             _ => {}
         }
     }
 
-    state.stackpos = state.stackpos - 1;
+    state.stackpos -= 1;
     state.stack[state.stackpos as usize]
 }
 
@@ -322,6 +322,12 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
 pub struct JitTlInterp {
     threshold: u32,
+}
+
+impl Default for JitTlInterp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitTlInterp {

@@ -473,35 +473,29 @@ impl Option for BoolOption {
         // Upstream `:310-312`: run `self._validator(toplevel)` when
         // `value` is truthy.
         let truthy = matches!(value, OptionValue::Bool(true));
-        if truthy {
-            if let Some(validator) = &self._validator {
-                let toplevel = config._cfgimpl_get_toplevel();
-                validator(&toplevel);
-            }
+        if truthy && let Some(validator) = &self._validator {
+            let toplevel = config._cfgimpl_get_toplevel();
+            validator(&toplevel);
         }
         // Upstream `:313-321`: `_requires` propagation (truthy-only).
-        if truthy {
-            if let Some(requires) = &self._requires {
-                for edge in requires {
-                    let toplevel = config._cfgimpl_get_toplevel();
-                    let (home, name) = toplevel._cfgimpl_get_home_by_path(&edge.path)?;
-                    let who2 = if who == Owner::Default {
-                        Owner::Default
-                    } else {
-                        Owner::Required
-                    };
-                    home.setoption(&name, edge.value.clone(), who2)?;
-                }
+        if truthy && let Some(requires) = &self._requires {
+            for edge in requires {
+                let toplevel = config._cfgimpl_get_toplevel();
+                let (home, name) = toplevel._cfgimpl_get_home_by_path(&edge.path)?;
+                let who2 = if who == Owner::Default {
+                    Owner::Default
+                } else {
+                    Owner::Required
+                };
+                home.setoption(&name, edge.value.clone(), who2)?;
             }
         }
         // Upstream `:322-326`: `_suggests` propagation (truthy-only).
-        if truthy {
-            if let Some(suggests) = &self._suggests {
-                for edge in suggests {
-                    let toplevel = config._cfgimpl_get_toplevel();
-                    let (home, name) = toplevel._cfgimpl_get_home_by_path(&edge.path)?;
-                    home.suggestoption(&name, edge.value.clone());
-                }
+        if truthy && let Some(suggests) = &self._suggests {
+            for edge in suggests {
+                let toplevel = config._cfgimpl_get_toplevel();
+                let (home, name) = toplevel._cfgimpl_get_home_by_path(&edge.path)?;
+                home.suggestoption(&name, edge.value.clone());
             }
         }
         self.default_setoption(config, value, who)

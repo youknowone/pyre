@@ -2095,16 +2095,14 @@ pub(crate) fn resolve_kwargs(
     // Fill positional defaults (PyPy: _match_signature defs_w)
     // Defaults cover the LAST N of the positional params (arg_count).
     let defaults = unsafe { crate::function_get_defaults(target_func) };
-    if !defaults.is_null() {
-        if unsafe { pyre_object::is_tuple(defaults) } {
-            let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
-            let first_default = n_pos_params.saturating_sub(ndefaults);
-            for pi in first_default..n_pos_params {
-                if result[pi].is_null() {
-                    let di = pi - first_default;
-                    if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
-                        result[pi] = v;
-                    }
+    if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
+        let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
+        let first_default = n_pos_params.saturating_sub(ndefaults);
+        for pi in first_default..n_pos_params {
+            if result[pi].is_null() {
+                let di = pi - first_default;
+                if let Some(v) = unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) } {
+                    result[pi] = v;
                 }
             }
         }
@@ -2488,10 +2486,10 @@ pub fn call_with_kwargs_in_ctx(
 
     // A class call routes through `type(cls).__call__` when the metaclass
     // overrides it (enum functional API passes `module=`/`type=` kwargs).
-    if unsafe { pyre_object::is_type(callable) } {
-        if let Some(bound) = metaclass_call_override(callable) {
-            return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
-        }
+    if unsafe { pyre_object::is_type(callable) }
+        && let Some(bound) = metaclass_call_override(callable)
+    {
+        return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
     }
 
     if unsafe { crate::is_function_carrier(callable) } {
@@ -2802,18 +2800,16 @@ pub fn call_with_kwargs_in_ctx(
 
             // Fill positional defaults from __defaults__ tuple.
             let defaults = unsafe { crate::function_get_defaults(current_callable()) };
-            if !defaults.is_null() {
-                if unsafe { pyre_object::is_tuple(defaults) } {
-                    let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
-                    let first_default = n_pos_params.saturating_sub(ndefaults);
-                    for pi in first_default..n_pos_params {
-                        if result[pi].is_null() {
-                            let di = pi - first_default;
-                            if let Some(v) =
-                                unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }
-                            {
-                                result[pi] = v;
-                            }
+            if !defaults.is_null() && unsafe { pyre_object::is_tuple(defaults) } {
+                let ndefaults = unsafe { pyre_object::w_tuple_len(defaults) };
+                let first_default = n_pos_params.saturating_sub(ndefaults);
+                for pi in first_default..n_pos_params {
+                    if result[pi].is_null() {
+                        let di = pi - first_default;
+                        if let Some(v) =
+                            unsafe { pyre_object::w_tuple_getitem(defaults, di as i64) }
+                        {
+                            result[pi] = v;
                         }
                     }
                 }
@@ -3280,10 +3276,10 @@ pub fn call_function_impl_result(
             // PY_NULL; recover it here so it propagates as a real Result.
             clear_call_error();
             let result = call_user_function_with_args(callable, args);
-            if result.is_null() {
-                if let Some(err) = take_call_error() {
-                    return Err(err);
-                }
+            if result.is_null()
+                && let Some(err) = take_call_error()
+            {
+                return Err(err);
             }
             return Ok(result);
         }
@@ -3295,10 +3291,10 @@ pub fn call_function_impl_result(
             }
             clear_call_error();
             let result = type_descr_call_impl(callable, args);
-            if result.is_null() {
-                if let Some(err) = take_call_error() {
-                    return Err(err);
-                }
+            if result.is_null()
+                && let Some(err) = take_call_error()
+            {
+                return Err(err);
             }
             return Ok(result);
         }
@@ -3428,10 +3424,10 @@ pub fn type_call_instantiate(
 ) -> Result<PyObjectRef, PyError> {
     clear_call_error();
     let result = type_descr_call_impl(w_type, args);
-    if result.is_null() {
-        if let Some(err) = take_call_error() {
-            return Err(err);
-        }
+    if result.is_null()
+        && let Some(err) = take_call_error()
+    {
+        return Err(err);
     }
     Ok(result)
 }
@@ -3484,22 +3480,20 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         current_type(),
     ) && !type_call_type_x_shortcut(current_type(), args.len(), true)
-    {
-        if let Some(init_fn) =
+        && let Some(init_fn) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-        {
-            let mut init_args = Vec::with_capacity(1 + args.len());
-            init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
-            extend_current_args(&mut init_args);
-            let res = call_function_impl(init_fn, &init_args);
-            if res.is_null() {
-                // `__init__` raised — error already stashed; propagate it.
-                return PY_NULL;
-            }
-            if let Err(e) = check_init_returned_none(res) {
-                set_call_error(e);
-                return PY_NULL;
-            }
+    {
+        let mut init_args = Vec::with_capacity(1 + args.len());
+        init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
+        extend_current_args(&mut init_args);
+        let res = call_function_impl(init_fn, &init_args);
+        if res.is_null() {
+            // `__init__` raised — error already stashed; propagate it.
+            return PY_NULL;
+        }
+        if let Err(e) = check_init_returned_none(res) {
+            set_call_error(e);
+            return PY_NULL;
         }
     }
 
@@ -4621,13 +4615,13 @@ fn build_class_inner(
         // typeobject.py `_store_type_in_classcell` validates the value before
         // deleting it.  The default-metaclass shortcut bypasses
         // `type.__new__`, so it must preserve that check here too.
-        if let Some(w_classcell) = classcell {
-            if !unsafe { pyre_object::is_cell(w_classcell) } {
-                return Err(PyError::type_error(format!(
-                    "__classcell__ must be a nonlocal cell, not {}",
-                    crate::baseobjspace::object_functionstr_type_name(w_classcell),
-                )));
-            }
+        if let Some(w_classcell) = classcell
+            && !unsafe { pyre_object::is_cell(w_classcell) }
+        {
+            return Err(PyError::type_error(format!(
+                "__classcell__ must be a nonlocal cell, not {}",
+                crate::baseobjspace::object_functionstr_type_name(w_classcell),
+            )));
         }
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
@@ -4760,44 +4754,45 @@ fn build_class_inner(
     //             if not space.is_w(w_class, w_class_from_cell):
     //                 raise oefmt(space.w_TypeError,
     //                     "__class__ set to %S defining %S as %S", ...)
-    if let Some(classcell) = classcell {
-        if !classcell.is_null() && unsafe { pyre_object::is_cell(classcell) } {
-            if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
-                let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
-                if cell_value.is_null() {
-                    let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
-                    return Err(PyError::runtime_error(crate::display::wtf8_format!(
-                        format!("__class__ not set defining {name} as "),
-                        class_str,
-                        ". Was __classcell__ propagated to type.__new__?",
-                    )));
-                }
-                if !std::ptr::eq(cell_value, w_type) {
-                    let cell_str = unsafe { crate::py_str_wtf8(cell_value) }?;
-                    let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
-                    return Err(PyError::type_error(crate::display::wtf8_format!(
-                        "__class__ set to ",
-                        cell_str,
-                        format!(" defining {name} as "),
-                        class_str,
-                    )));
-                }
-            } else {
-                unsafe { pyre_object::w_cell_set(classcell, w_type) };
+    if let Some(classcell) = classcell
+        && !classcell.is_null()
+        && unsafe { pyre_object::is_cell(classcell) }
+    {
+        if w_metaclass.is_some() && unsafe { pyre_object::is_type(w_type) } {
+            let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
+            if cell_value.is_null() {
+                let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                return Err(PyError::runtime_error(crate::display::wtf8_format!(
+                    format!("__class__ not set defining {name} as "),
+                    class_str,
+                    ". Was __classcell__ propagated to type.__new__?",
+                )));
             }
+            if !std::ptr::eq(cell_value, w_type) {
+                let cell_str = unsafe { crate::py_str_wtf8(cell_value) }?;
+                let class_str = unsafe { crate::py_str_wtf8(w_type) }?;
+                return Err(PyError::type_error(crate::display::wtf8_format!(
+                    "__class__ set to ",
+                    cell_str,
+                    format!(" defining {name} as "),
+                    class_str,
+                )));
+            }
+        } else {
+            unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
     }
 
     // The default path bound this before __set_name__; the metaclass path
     // normally binds it inside type.__new__.  Retain this final validation/
     // fallback for a custom metaclass returning a type without delegating.
-    if let Some(classdictcell_root) = classdictcell_root {
-        if unsafe { pyre_object::is_type(w_type) } {
-            let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
-            let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef };
-            if !type_dict.is_null() {
-                unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
-            }
+    if let Some(classdictcell_root) = classdictcell_root
+        && unsafe { pyre_object::is_type(w_type) }
+    {
+        let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
+        let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) as PyObjectRef };
+        if !type_dict.is_null() {
+            unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
         }
     }
 
@@ -4951,24 +4946,21 @@ fn type_descr_call_with_mode(
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
     if let Some(w_insttype) = type_call_init_type(current_instance(), w_type)
         && !type_call_type_x_shortcut(w_type, args.len(), true)
-    {
-        if let Some(init_descr) =
+        && let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
-        {
-            let init_result = if unsafe { crate::is_function(init_descr) } {
-                let mut init_args = Vec::with_capacity(1 + args.len());
-                init_args.push(current_instance());
-                init_args.extend_from_slice(args);
-                call_callable_with_mode(execution_context, init_descr, &init_args, mode)?
-            } else {
-                let init_fn = unsafe {
-                    crate::baseobjspace::get(init_descr, current_instance(), w_insttype)?
-                }
-                .unwrap_or(init_descr);
-                call_callable_with_mode(execution_context, init_fn, args, mode)?
-            };
-            check_init_returned_none(init_result)?;
-        }
+    {
+        let init_result = if unsafe { crate::is_function(init_descr) } {
+            let mut init_args = Vec::with_capacity(1 + args.len());
+            init_args.push(current_instance());
+            init_args.extend_from_slice(args);
+            call_callable_with_mode(execution_context, init_descr, &init_args, mode)?
+        } else {
+            let init_fn =
+                unsafe { crate::baseobjspace::get(init_descr, current_instance(), w_insttype)? }
+                    .unwrap_or(init_descr);
+            call_callable_with_mode(execution_context, init_fn, args, mode)?
+        };
+        check_init_returned_none(init_result)?;
     }
 
     Ok(current_instance())
@@ -5078,17 +5070,17 @@ unsafe fn copy_flags_from_bases(
         }
         let len = pyre_object::w_tuple_len(w_bases);
         for i in 0..len {
-            if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64) {
-                if pyre_object::is_type(base) {
-                    if pyre_object::w_type_get_hasdict(base) {
-                        pyre_object::w_type_set_hasdict(w_type, true);
-                    }
-                    if pyre_object::w_type_get_weakrefable(base) {
-                        pyre_object::w_type_set_weakrefable(w_type, true);
-                    }
-                    if pyre_object::w_type_get_hasuserdel(base) {
-                        pyre_object::w_type_set_hasuserdel(w_type, true);
-                    }
+            if let Some(base) = pyre_object::w_tuple_getitem(w_bases, i as i64)
+                && pyre_object::is_type(base)
+            {
+                if pyre_object::w_type_get_hasdict(base) {
+                    pyre_object::w_type_set_hasdict(w_type, true);
+                }
+                if pyre_object::w_type_get_weakrefable(base) {
+                    pyre_object::w_type_set_weakrefable(w_type, true);
+                }
+                if pyre_object::w_type_get_hasuserdel(base) {
+                    pyre_object::w_type_set_hasuserdel(w_type, true);
                 }
             }
         }
@@ -5120,20 +5112,20 @@ pub unsafe fn create_all_slots(
         // `abc.Mapping` / `abc.Sequence` match `case {..}` / `case [..]`. The
         // bit lives only in the defining body's namespace, so subclasses pick
         // it up through `inherit_flag_map_or_seq` above rather than re-reading.
-        if let Some(w_flags) = crate::type_dict_lookup(w_type, "__abc_tpflags__") {
-            if pyre_object::is_int(w_flags) {
-                let flags = pyre_object::w_int_get_value(w_flags);
-                let collection_flags = flags & ((1 << 6) | (1 << 5));
-                if collection_flags == ((1 << 6) | (1 << 5)) {
-                    return Err(crate::PyError::type_error(
-                        "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
-                    ));
-                }
-                if flags & (1 << 6) != 0 {
-                    pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M');
-                } else if flags & (1 << 5) != 0 {
-                    pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'S');
-                }
+        if let Some(w_flags) = crate::type_dict_lookup(w_type, "__abc_tpflags__")
+            && pyre_object::is_int(w_flags)
+        {
+            let flags = pyre_object::w_int_get_value(w_flags);
+            let collection_flags = flags & ((1 << 6) | (1 << 5));
+            if collection_flags == ((1 << 6) | (1 << 5)) {
+                return Err(crate::PyError::type_error(
+                    "__abc_tpflags__ cannot be both Py_TPFLAGS_SEQUENCE and Py_TPFLAGS_MAPPING",
+                ));
+            }
+            if flags & (1 << 6) != 0 {
+                pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M');
+            } else if flags & (1 << 5) != 0 {
+                pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'S');
             }
         }
 

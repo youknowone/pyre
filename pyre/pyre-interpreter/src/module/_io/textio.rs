@@ -799,20 +799,16 @@ impl W_TextIOWrapper {
     /// PyPy `W_TextIOWrapper._fix_encoder_state`.
     fn reset_encoder_state(&mut self) {
         self.encoding_start_of_stream = false;
-        if let Ok(w_seekable) = super::call_method_result(self.w_buffer, "seekable", &[]) {
-            if crate::baseobjspace::is_true(w_seekable).unwrap_or(false) {
-                self.encoding_start_of_stream = true;
-                if let Ok(w_position) = super::call_method_result(self.w_buffer, "tell", &[]) {
-                    if crate::builtins::space_index_w(w_position).unwrap_or(0) != 0 {
-                        self.encoding_start_of_stream = false;
-                        if !self.w_encoder.is_null() {
-                            let _ = super::call_method_result(
-                                self.w_encoder,
-                                "setstate",
-                                &[w_int_new(0)],
-                            );
-                        }
-                    }
+        if let Ok(w_seekable) = super::call_method_result(self.w_buffer, "seekable", &[])
+            && crate::baseobjspace::is_true(w_seekable).unwrap_or(false)
+        {
+            self.encoding_start_of_stream = true;
+            if let Ok(w_position) = super::call_method_result(self.w_buffer, "tell", &[])
+                && crate::builtins::space_index_w(w_position).unwrap_or(0) != 0
+            {
+                self.encoding_start_of_stream = false;
+                if !self.w_encoder.is_null() {
+                    let _ = super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)]);
                 }
             }
         }
@@ -1159,14 +1155,9 @@ impl W_TextIOWrapper {
             .any(|cp| cp.to_u32() == b'\r' as u32);
 
         let mut to_encode = text;
-        if has_lf {
-            if let Some(writenl) = self.write_newline() {
-                to_encode = super::call_method_result(
-                    text,
-                    "replace",
-                    &[w_str_new("\n"), w_str_new(writenl)],
-                )?;
-            }
+        if has_lf && let Some(writenl) = self.write_newline() {
+            to_encode =
+                super::call_method_result(text, "replace", &[w_str_new("\n"), w_str_new(writenl)])?;
         }
 
         let need_flush = self.line_buffering && (has_lf || has_cr);
@@ -1633,10 +1624,10 @@ impl W_TextIOWrapper {
             self.set_newline(value.as_deref());
         }
         if let Some(value) = new_encoding.as_ref() {
-            self.w_encoding = w_str_new(&value);
+            self.w_encoding = w_str_new(value);
             self.w_errors = w_str_new(new_errors.as_deref().unwrap_or("strict"));
         } else if let Some(value) = new_errors.as_ref() {
-            self.w_errors = w_str_new(&value);
+            self.w_errors = w_str_new(value);
         }
         if let Some(codec) = new_codec {
             self.set_encoder_decoder(codec)?;
@@ -1796,11 +1787,11 @@ impl W_TextIOWrapper {
 
         let typename = crate::type_methods::arg_type_name(self_obj);
         let mut fields = rustpython_wtf8::Wtf8Buf::new();
-        if self.state != STATE_DETACHED {
-            if let Ok(name) = crate::baseobjspace::getattr_str(self.w_buffer, "name") {
-                fields.push_str(" name=");
-                fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(name)? });
-            }
+        if self.state != STATE_DETACHED
+            && let Ok(name) = crate::baseobjspace::getattr_str(self.w_buffer, "name")
+        {
+            fields.push_str(" name=");
+            fields.push_wtf8(&unsafe { crate::display::py_repr_wtf8(name)? });
         }
         if let Ok(mode) = crate::baseobjspace::getattr_str(self_obj, "mode") {
             fields.push_str(" mode=");

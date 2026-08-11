@@ -181,12 +181,12 @@ pub fn rtype_builtin_range(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
                 ConvertedTo::LowLevelType(&LowLevelType::Signed),
                 ConvertedTo::LowLevelType(&LowLevelType::Signed),
             ])?;
-            if let Hlvalue::Constant(c) = &args[2] {
-                if matches!(c.value, ConstValue::Int(0)) {
-                    return Err(TyperError::message(
-                        "range cannot have a const step of zero",
-                    ));
-                }
+            if let Hlvalue::Constant(c) = &args[2]
+                && matches!(c.value, ConstValue::Int(0))
+            {
+                return Err(TyperError::message(
+                    "range cannot have a const step of zero",
+                ));
             }
             (args[0].clone(), args[1].clone(), args[2].clone())
         }
@@ -3279,19 +3279,18 @@ mod tests {
         let mut raise_links = 0usize;
         for block in inner.iterblocks() {
             for op in block.borrow().operations.iter() {
-                if op.opname == "direct_call" {
-                    if let Some(Hlvalue::Constant(c)) = op.args.first() {
-                        if format!("{:?}", c.value).contains("_ll_rangelen") {
-                            rangelen_calls += 1;
-                        }
-                    }
+                if op.opname == "direct_call"
+                    && let Some(Hlvalue::Constant(c)) = op.args.first()
+                    && format!("{:?}", c.value).contains("_ll_rangelen")
+                {
+                    rangelen_calls += 1;
                 }
             }
             for link in block.borrow().exits.iter() {
-                if let Some(target) = link.borrow().target.as_ref() {
-                    if std::rc::Rc::ptr_eq(target, &inner.exceptblock) {
-                        raise_links += 1;
-                    }
+                if let Some(target) = link.borrow().target.as_ref()
+                    && std::rc::Rc::ptr_eq(target, &inner.exceptblock)
+                {
+                    raise_links += 1;
                 }
             }
         }

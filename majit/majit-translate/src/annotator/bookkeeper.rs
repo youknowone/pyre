@@ -2096,7 +2096,7 @@ impl Bookkeeper {
         // (idempotent on re-read).
         let base_enum_root: &str = {
             let mut base = enum_root;
-            for (_discr, variant_name) in &by_discr {
+            for variant_name in by_discr.values() {
                 if let Some(stripped) = base.strip_suffix(&format!("::{variant_name}")) {
                     base = stripped;
                     break;
@@ -4161,7 +4161,7 @@ mod tests {
     }
 
     fn compiled_graph_func(src: &str, defaults: Vec<Constant>) -> GraphFunc {
-        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+        let code = rp_compile(src, Mode::Exec, "<test>", Default::default())
             .expect("compile should succeed");
         let inner = code
             .constants

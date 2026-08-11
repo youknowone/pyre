@@ -91,16 +91,16 @@ pub fn get_statistics(
                     "indirect_call" => {
                         // Upstream `:33-36`: trailing arg carries the
                         // `c_graphs` list (`Constant(graphs, Void)`).
-                        if let Some(Hlvalue::Constant(c)) = op.args.last() {
-                            if let ConstValue::Graphs(keys) = &c.value {
-                                let trans_graphs = translator.graphs.borrow();
-                                for k in keys {
-                                    if let Some(g) = trans_graphs
-                                        .iter()
-                                        .find(|g| GraphKey::of(g).as_usize() == *k)
-                                    {
-                                        stack.push(g.clone());
-                                    }
+                        if let Some(Hlvalue::Constant(c)) = op.args.last()
+                            && let ConstValue::Graphs(keys) = &c.value
+                        {
+                            let trans_graphs = translator.graphs.borrow();
+                            for k in keys {
+                                if let Some(g) = trans_graphs
+                                    .iter()
+                                    .find(|g| GraphKey::of(g).as_usize() == *k)
+                                {
+                                    stack.push(g.clone());
                                 }
                             }
                         }

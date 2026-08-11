@@ -1445,7 +1445,6 @@ pub unsafe fn bh_call_v_by_classes(
 /// callee's real signature, rather than transmuting the raw funcptr to a
 /// statically-guessed `extern "C" fn`.
 ///
-
 /// `func_ptr` is the raw callee address (a table index on wasm32); `args` is
 /// the positional argument list (floats as raw bits). The return value is the
 /// callee result as a 64-bit pattern (Void callees return 0; Ref returns the

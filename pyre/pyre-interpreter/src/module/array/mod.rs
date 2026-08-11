@@ -202,7 +202,7 @@ fn array_extend_iterable(
 fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
     array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
-    if bytes.len() % isz != 0 {
+    if !bytes.len().is_multiple_of(isz) {
         return Err(PyError::value_error(
             "bytes length not a multiple of item size",
         ));
@@ -285,10 +285,8 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     }
     let obj = arr::w_array_new(typecode, itemsize);
     // Subclass: retag the fresh array with the requested class.
-    if !cls.is_null() && unsafe { pyre_object::is_type(cls) } {
-        if !std::ptr::eq(cls, canonical) {
-            crate::typedef::tag_subclass_instance(obj, cls);
-        }
+    if !cls.is_null() && unsafe { pyre_object::is_type(cls) } && !std::ptr::eq(cls, canonical) {
+        crate::typedef::tag_subclass_instance(obj, cls);
     }
     // Optional initializer.
     if pos.len() >= 3 {

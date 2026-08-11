@@ -522,7 +522,7 @@ fn acquire_pickle_buffer(obj: PyObjectRef) -> Result<(PyObjectRef, bool, PyObjec
         // descriptor.  Normalize those to the same owned memoryview carrier.
         let w_result =
             crate::builtins::w_memoryview_new(pyre_object::gc_roots::shadow_stack_get(sp))?;
-        return Ok((w_result, true, pyre_object::w_none()));
+        Ok((w_result, true, pyre_object::w_none()))
     }
 }
 
@@ -573,6 +573,19 @@ pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
         return crate::baseobjspace::is_true(w);
     }
     Ok(true)
+}
+
+/// The `memoryview` builtin type via the live execution context.
+fn memoryview_type() -> Option<PyObjectRef> {
+    let frame = crate::eval::current_frame();
+    if frame.is_null() {
+        return None;
+    }
+    let ec = unsafe { (*frame).execution_context };
+    if ec.is_null() {
+        return None;
+    }
+    unsafe { (*ec).lookup_builtin("memoryview") }
 }
 
 #[cfg(test)]
@@ -636,17 +649,4 @@ mod tests {
             assert_eq!(pyre_object::memoryview::w_memoryview_length(result), 0);
         }
     }
-}
-
-/// The `memoryview` builtin type via the live execution context.
-fn memoryview_type() -> Option<PyObjectRef> {
-    let frame = crate::eval::current_frame();
-    if frame.is_null() {
-        return None;
-    }
-    let ec = unsafe { (*frame).execution_context };
-    if ec.is_null() {
-        return None;
-    }
-    unsafe { (*ec).lookup_builtin("memoryview") }
 }

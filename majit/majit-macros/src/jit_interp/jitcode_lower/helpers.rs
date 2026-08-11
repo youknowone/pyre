@@ -4,7 +4,7 @@ use super::*;
 
 /// Check if a block contains break or continue at the top level (not nested in inner loops).
 pub(super) fn block_has_loop_control(block: &Block) -> bool {
-    block.stmts.iter().any(|stmt| stmt_has_loop_control(stmt))
+    block.stmts.iter().any(stmt_has_loop_control)
 }
 
 pub(super) fn stmt_has_loop_control(stmt: &Stmt) -> bool {
@@ -609,6 +609,17 @@ pub(super) fn opcode_for_assign_binop(op: &BinOp) -> Option<Ident> {
         BinOp::BitXorAssign(_) => "IntXor",
         BinOp::ShlAssign(_) => "IntLshift",
         BinOp::ShrAssign(_) => "IntRshift",
+        _ => return None,
+    };
+    Some(Ident::new(name, proc_macro2::Span::call_site()))
+}
+
+pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
+    let name = match op {
+        BinOp::AddAssign(_) => "FloatAdd",
+        BinOp::SubAssign(_) => "FloatSub",
+        BinOp::MulAssign(_) => "FloatMul",
+        BinOp::DivAssign(_) => "FloatTrueDiv",
         _ => return None,
     };
     Some(Ident::new(name, proc_macro2::Span::call_site()))

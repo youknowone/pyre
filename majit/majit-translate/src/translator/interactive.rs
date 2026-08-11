@@ -315,7 +315,7 @@ mod tests {
         let module = rp_compile(
             "def main():\n    return 1\n",
             Mode::Exec,
-            "<interactive-test>".into(),
+            "<interactive-test>",
             Default::default(),
         )
         .expect("compile");

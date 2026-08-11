@@ -12,7 +12,7 @@ use crate::translator::translator::TranslationContext;
 /// RPython `unsimplify.varoftype(concretetype, name=None)`
 /// (unsimplify.py:5-8).
 pub fn varoftype(concretetype: LowLevelType, name: Option<&str>) -> Variable {
-    let var = name.map(Variable::named).unwrap_or_else(Variable::new);
+    let var = name.map(Variable::named).unwrap_or_default();
     var.set_concretetype(Some(concretetype));
     var
 }
@@ -55,8 +55,8 @@ pub fn insert_empty_block(link: &LinkRef, newops: Vec<SpaceOperation>) -> BlockR
         for arg in &op.args {
             if let Hlvalue::Variable(v) = arg {
                 let id = v.id();
-                if !vars_by_id.contains_key(&id) {
-                    vars_by_id.insert(id, (v.clone(), true));
+                if let std::collections::hash_map::Entry::Vacant(e) = vars_by_id.entry(id) {
+                    e.insert((v.clone(), true));
                     order.push(id);
                 }
             }

@@ -1,3 +1,7 @@
+// Keep benchmark bytecode construction and the direct RPython interpreter
+// shape visible in this parity example.
+#![allow(clippy::empty_line_after_doc_comments, clippy::same_item_push)]
+
 /// Brainfuck interpreter benchmarks — interpreter vs JIT.
 pub mod interp;
 pub mod jit_interp;

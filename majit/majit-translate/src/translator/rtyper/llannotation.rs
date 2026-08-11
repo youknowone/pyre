@@ -816,11 +816,12 @@ fn address_address_sub(
 ) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
-    if let (SomeValue::Address(a0), SomeValue::Address(a1)) = (&s0, &s1) {
-        if a0.is_null_address() && a1.is_null_address() {
-            return bookkeeper::immutablevalue(&ConstValue::Int(0))
-                .expect("immutablevalue(0) must succeed");
-        }
+    if let (SomeValue::Address(a0), SomeValue::Address(a1)) = (&s0, &s1)
+        && a0.is_null_address()
+        && a1.is_null_address()
+    {
+        return bookkeeper::immutablevalue(&ConstValue::Int(0))
+            .expect("immutablevalue(0) must succeed");
     }
     SomeValue::Integer(SomeInteger::new(false, false))
 }

@@ -35,22 +35,22 @@ fn getfield_gc_i_pureornot(
             Some(Value::Int(n)) => Some(n),
             _ => None,
         };
-        if let Some(cached_int) = expected_int {
-            if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
-                let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    if let Some(Value::Int(loaded)) =
-                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
-                    {
-                        assert_eq!(
-                            loaded, cached_int,
-                            "_opimpl_getfield_gc_any_pureornot sanity \
+        if let Some(cached_int) = expected_int
+            && let Some(Value::Ref(struct_ref)) = ctx.box_value(obj)
+        {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != usize::MAX as i64
+                && struct_ptr != 0
+                && let Some(Value::Int(loaded)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+            {
+                assert_eq!(
+                    loaded, cached_int,
+                    "_opimpl_getfield_gc_any_pureornot sanity \
                              check (int): loaded {loaded} != cached \
                              {cached_int} (field_index={field_index}, \
                              struct_ptr={struct_ptr:#x})"
-                        );
-                    }
-                }
+                );
             }
         }
         // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
@@ -262,23 +262,23 @@ pub fn getfield_gc_f_pureornot(
             Some(Value::Float(f)) => Some(f),
             _ => None,
         };
-        if let Some(cached_float) = expected_float {
-            if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
-                let struct_ptr = struct_ref.0 as i64;
-                if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    if let Some(Value::Float(loaded)) =
-                        ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
-                    {
-                        assert_eq!(
-                            loaded.to_bits(),
-                            cached_float.to_bits(),
-                            "_opimpl_getfield_gc_any_pureornot sanity \
+        if let Some(cached_float) = expected_float
+            && let Some(Value::Ref(struct_ref)) = ctx.box_value(obj)
+        {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != usize::MAX as i64
+                && struct_ptr != 0
+                && let Some(Value::Float(loaded)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+            {
+                assert_eq!(
+                    loaded.to_bits(),
+                    cached_float.to_bits(),
+                    "_opimpl_getfield_gc_any_pureornot sanity \
                              check (float): loaded {loaded} != cached \
                              {cached_float} (field_index={field_index}, \
                              struct_ptr={struct_ptr:#x})"
-                        );
-                    }
-                }
+                );
             }
         }
         // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,

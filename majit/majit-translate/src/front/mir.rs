@@ -498,13 +498,13 @@ fn collect_ref_enum_instantiations(llbc: &Llbc) -> Vec<RefEnumInst> {
 /// is substituted — a `Box<T>` / `Vec<T>` field keeps its `??TypeVar`
 /// inner rendering, which the caller treats as unresolved and skips.
 fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
-    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) {
-        if let Some(idx) = typevar_bound_index(node) {
-            return args
-                .get(idx as usize)
-                .cloned()
-                .unwrap_or_else(|| "??typevar_oob".to_string());
-        }
+    if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
+        && let Some(idx) = typevar_bound_index(node)
+    {
+        return args
+            .get(idx as usize)
+            .cloned()
+            .unwrap_or_else(|| "??typevar_oob".to_string());
     }
     tyref_to_ast_string(ty, llbc)
 }
@@ -1942,13 +1942,13 @@ fn harden_duplicate_leaf_metadata(
     let mut variant_by_alias: std::collections::HashMap<String, Vec<&str>> =
         std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
-        if let Some((head, var)) = key.rsplit_once("::") {
-            if let Some((_, enm)) = head.rsplit_once("::") {
-                variant_by_alias
-                    .entry(format!("{enm}::{var}"))
-                    .or_default()
-                    .push(key);
-            }
+        if let Some((head, var)) = key.rsplit_once("::")
+            && let Some((_, enm)) = head.rsplit_once("::")
+        {
+            variant_by_alias
+                .entry(format!("{enm}::{var}"))
+                .or_default()
+                .push(key);
         }
     }
     let mut drop_variant_aliases: Vec<String> = Vec::new();
@@ -3078,7 +3078,7 @@ impl<'a> Lowering<'a> {
             for local_idx in 0..n_locals {
                 if !block_live_in
                     .get(mir_bb)
-                    .map_or(false, |s| s.contains(local_idx))
+                    .is_some_and(|s| s.contains(local_idx))
                 {
                     continue;
                 }
@@ -3756,23 +3756,23 @@ impl<'a> Lowering<'a> {
                 // inputarg or op result" invariant, checked at the
                 // threading site.
                 for arg in &outputargs {
-                    if let LinkArg::Value(var) = arg {
-                        if !self.graph.variable_defined_in_block(bb_id, var) {
-                            if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
-                                self.debug_dump_undefined_link_arg(
-                                    bb, bb_id, tgt, tmir, var, &ex, &tgt_state,
-                                );
-                            }
-                            return Err(LowerError::Unsupported(format!(
-                                "framestate: threaded Link.arg (var id={}) undefined in source \
+                    if let LinkArg::Value(var) = arg
+                        && !self.graph.variable_defined_in_block(bb_id, var)
+                    {
+                        if std::env::var_os("PYRE_MIR_FRAMESTATE_DEBUG").is_some() {
+                            self.debug_dump_undefined_link_arg(
+                                bb, bb_id, tgt, tmir, var, &ex, &tgt_state,
+                            );
+                        }
+                        return Err(LowerError::Unsupported(format!(
+                            "framestate: threaded Link.arg (var id={}) undefined in source \
                                  bb{bb} (BlockId {:?}) for edge -> bb{tmir} (BlockId {:?}) \
                                  in graph {:?}",
-                                var.id(),
-                                bb_id,
-                                tgt,
-                                self.graph.name,
-                            )));
-                        }
+                            var.id(),
+                            bb_id,
+                            tgt,
+                            self.graph.name,
+                        )));
                     }
                 }
                 self.graph.block_mut(bb_id).exits[idx].args = outputargs;
@@ -9901,10 +9901,10 @@ impl<'a> Lowering<'a> {
         if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
             return None;
         }
-        if let Some(leaf) = deref_impl_owner_leaf(self.llbc, fd) {
-            if matches!(leaf.as_str(), "Rc" | "Arc") {
-                return None;
-            }
+        if let Some(leaf) = deref_impl_owner_leaf(self.llbc, fd)
+            && matches!(leaf.as_str(), "Rc" | "Arc")
+        {
+            return None;
         }
         tyref_class_root(dest_ty, self.llbc)
     }
@@ -14770,14 +14770,14 @@ fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
     if let Some(s) = v.as_str() {
         return Ok(canonical_binop_label(s, None));
     }
-    if let Some(obj) = v.as_object() {
-        if let Some((k, payload)) = obj.iter().next() {
-            let suffix = match payload {
-                serde_json::Value::String(s) => Some(s.as_str()),
-                _ => None,
-            };
-            return Ok(canonical_binop_label(k, suffix));
-        }
+    if let Some(obj) = v.as_object()
+        && let Some((k, payload)) = obj.iter().next()
+    {
+        let suffix = match payload {
+            serde_json::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        };
+        return Ok(canonical_binop_label(k, suffix));
     }
     Err(LowerError::Schema(format!(
         "BinaryOp op label has unexpected shape: {v}"
@@ -14878,10 +14878,10 @@ fn scalar_is_float(v: &serde_json::Value) -> bool {
     if let Some(s) = v.as_str() {
         return matches!(s, "F32" | "F64");
     }
-    if let Some(obj) = v.as_object() {
-        if obj.contains_key("Float") {
-            return true;
-        }
+    if let Some(obj) = v.as_object()
+        && obj.contains_key("Float")
+    {
+        return true;
     }
     false
 }
@@ -17137,21 +17137,18 @@ fn charon_const_generic_to_string(cg: &serde_json::Value) -> String {
         }
         // Older serialized Charon schema retained for frozen LLBC
         // compatibility.
-        if let Some(val) = obj.get("Value") {
-            if let Some(scalar) = val
+        if let Some(val) = obj.get("Value")
+            && let Some(scalar) = val
                 .as_object()
                 .and_then(|m| m.get("Scalar"))
                 .and_then(|s| s.as_object())
-            {
-                if let Some(n) = scalar
-                    .values()
-                    .find_map(|v| v.as_object())
-                    .and_then(|m| m.get("value"))
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    return n.to_string();
-                }
-            }
+            && let Some(n) = scalar
+                .values()
+                .find_map(|v| v.as_object())
+                .and_then(|m| m.get("value"))
+                .and_then(serde_json::Value::as_u64)
+        {
+            return n.to_string();
         }
     }
     "N".to_string()
@@ -17162,15 +17159,15 @@ fn charon_const_generic_to_string(cg: &serde_json::Value) -> String {
 /// where `idx` is the field's position. We project to
 /// `<container>_<idx>` so synthetic FieldDescriptors stay readable.
 fn field_label_from_payload(payload: &serde_json::Value) -> String {
-    if let Some(arr) = payload.as_array() {
-        if arr.len() == 2 {
-            let container = arr[0]
-                .as_object()
-                .and_then(|m| m.keys().next().cloned())
-                .unwrap_or_else(|| "Field".into());
-            let idx = arr[1].as_u64().unwrap_or(u64::MAX);
-            return format!("{container}_{idx}");
-        }
+    if let Some(arr) = payload.as_array()
+        && arr.len() == 2
+    {
+        let container = arr[0]
+            .as_object()
+            .and_then(|m| m.keys().next().cloned())
+            .unwrap_or_else(|| "Field".into());
+        let idx = arr[1].as_u64().unwrap_or(u64::MAX);
+        return format!("{container}_{idx}");
     }
     "field".into()
 }
@@ -17580,16 +17577,16 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
 
 fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
     let literal = value.get("kind")?.get("Literal")?;
-    if let Some(scalar) = literal.get("Scalar").and_then(serde_json::Value::as_object) {
-        for (kind, payload) in scalar {
-            let pair = payload.as_array()?;
-            let text = pair.get(1)?.as_str()?;
-            return match kind.as_str() {
-                "Signed" | "Isize" => text.parse::<i64>().ok().map(ConstLit::Int),
-                "Unsigned" | "Usize" => text.parse::<u64>().ok().map(ConstLit::UInt),
-                _ => None,
-            };
-        }
+    if let Some(scalar) = literal.get("Scalar").and_then(serde_json::Value::as_object)
+        && let Some((kind, payload)) = scalar.into_iter().next()
+    {
+        let pair = payload.as_array()?;
+        let text = pair.get(1)?.as_str()?;
+        return match kind.as_str() {
+            "Signed" | "Isize" => text.parse::<i64>().ok().map(ConstLit::Int),
+            "Unsigned" | "Usize" => text.parse::<u64>().ok().map(ConstLit::UInt),
+            _ => None,
+        };
     }
     if let Some(value) = literal.get("Bool").and_then(serde_json::Value::as_bool) {
         return Some(ConstLit::Bool(value));
@@ -18079,10 +18076,9 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
             .as_object()
             .and_then(|m| m.get("value"))
             .and_then(Value::as_str)
+            && let Ok(v) = s.parse::<f64>()
         {
-            if let Ok(v) = s.parse::<f64>() {
-                return Ok(DecodedConst::Float(v.to_bits()));
-            }
+            return Ok(DecodedConst::Float(v.to_bits()));
         }
         return Err(LowerError::Schema(format!("Float shape: {f}")));
     }
@@ -18383,14 +18379,13 @@ fn read_array_literal_elements(
         if let OpKind::FieldWrite {
             base, field, value, ..
         } = &op.kind
+            && base.id() == array_var.id()
         {
-            if base.id() == array_var.id() {
-                let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
-                // A `setfield_gc` inline `Const` element carries no SSA
-                // Variable; the recognizer needs a register operand per slot.
-                let write_var = value.as_variable()?;
-                by_index.push((idx, write_var.clone()));
-            }
+            let idx = field.name.strip_prefix("__pos_")?.parse::<usize>().ok()?;
+            // A `setfield_gc` inline `Const` element carries no SSA
+            // Variable; the recognizer needs a register operand per slot.
+            let write_var = value.as_variable()?;
+            by_index.push((idx, write_var.clone()));
         }
     }
     by_index.sort_by_key(|(i, _)| *i);
@@ -18889,7 +18884,7 @@ fn navigate_single_arg_fmt_chain(
         // expansion below.
         return None;
     }
-    let kind = chain.args[0].kind.clone();
+    let kind = chain.args[0].kind;
     let pieces = chain.pieces.clone();
 
     // `fmt_args` reaches Bf as an inputarg threaded from Bp's
@@ -19036,10 +19031,10 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
     // 1. Re-thread the rendered values onto the forwarding links.
     for site in &sites {
         for (bid, ei, pos, repl) in &site.link_rewrites {
-            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei) {
-                if let Some(arg) = link.args.get_mut(*pos) {
-                    *arg = LinkArg::Value(repl.clone());
-                }
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei)
+                && let Some(arg) = link.args.get_mut(*pos)
+            {
+                *arg = LinkArg::Value(repl.clone());
             }
         }
     }
@@ -19054,15 +19049,15 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
         .collect();
     for block in &mut graph.blocks {
         block.operations.retain(|op| {
-            if let Some(r) = &op.result {
-                if dead_results.contains(&r.id()) {
-                    return false;
-                }
+            if let Some(r) = &op.result
+                && dead_results.contains(&r.id())
+            {
+                return false;
             }
-            if let OpKind::FieldWrite { base, .. } = &op.kind {
-                if dead_bases.contains(&base.id()) {
-                    return false;
-                }
+            if let OpKind::FieldWrite { base, .. } = &op.kind
+                && dead_bases.contains(&base.id())
+            {
+                return false;
             }
             true
         });
@@ -19607,10 +19602,10 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         //     (Tuple round-trip elimination): the threaded inputarg a `str`
         //     now reads carries the value instead of the deleted Tuple field.
         for (bid, ei, pos, value) in &site.link_rebinds {
-            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei) {
-                if let Some(arg) = link.args.get_mut(*pos) {
-                    *arg = LinkArg::Value(value.clone());
-                }
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei)
+                && let Some(arg) = link.args.get_mut(*pos)
+            {
+                *arg = LinkArg::Value(value.clone());
             }
         }
         // 2. Replace the `alloc::fmt::format` op with `same_as(fmt_args)`:
@@ -19648,10 +19643,10 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         //    `Arguments` value out of the args block.
         for link in &mut graph.block_mut(site.args_block).exits {
             for arg in &mut link.args {
-                if let LinkArg::Value(v) = arg {
-                    if v.id() == site.arguments_var {
-                        *arg = LinkArg::Value(folded.clone());
-                    }
+                if let LinkArg::Value(v) = arg
+                    && v.id() == site.arguments_var
+                {
+                    *arg = LinkArg::Value(folded.clone());
                 }
             }
         }
@@ -19668,15 +19663,15 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
         .collect();
     for block in &mut graph.blocks {
         block.operations.retain(|op| {
-            if let Some(r) = &op.result {
-                if dead_results.contains(&r.id()) {
-                    return false;
-                }
+            if let Some(r) = &op.result
+                && dead_results.contains(&r.id())
+            {
+                return false;
             }
-            if let OpKind::FieldWrite { base, .. } = &op.kind {
-                if dead_bases.contains(&base.id()) {
-                    return false;
-                }
+            if let OpKind::FieldWrite { base, .. } = &op.kind
+                && dead_bases.contains(&base.id())
+            {
+                return false;
             }
             true
         });

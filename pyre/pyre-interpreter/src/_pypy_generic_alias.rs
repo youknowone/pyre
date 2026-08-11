@@ -350,10 +350,10 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
 fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
     let n = unsafe { w_tuple_len(t) };
     for i in 0..n {
-        if let Some(x) = unsafe { w_tuple_getitem(t, i as i64) } {
-            if crate::baseobjspace::eq_w(x, item)? {
-                return Ok(Some(i));
-            }
+        if let Some(x) = unsafe { w_tuple_getitem(t, i as i64) }
+            && crate::baseobjspace::eq_w(x, item)?
+        {
+            return Ok(Some(i));
         }
     }
     Ok(None)
@@ -811,10 +811,10 @@ pub(crate) fn dir_list(ga: PyObjectRef) -> crate::PyResult {
     let mut names: Vec<String> = ATTR_EXCEPTIONS.iter().map(|s| s.to_string()).collect();
     let n = unsafe { w_list_len(dir_origin) };
     for i in 0..n {
-        if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) } {
-            if unsafe { is_str(item) } {
-                names.push(unsafe { w_str_get_value(item) }.to_string());
-            }
+        if let Some(item) = unsafe { w_list_getitem(dir_origin, i as i64) }
+            && unsafe { is_str(item) }
+        {
+            names.push(unsafe { w_str_get_value(item) }.to_string());
         }
     }
     names.sort();
@@ -960,11 +960,11 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
             };
             let mut found = false;
             for j in 0..nb {
-                if let Some(y) = w_tuple_getitem(bb, j as i64) {
-                    if crate::baseobjspace::eq_w(x, y)? {
-                        found = true;
-                        break;
-                    }
+                if let Some(y) = w_tuple_getitem(bb, j as i64)
+                    && crate::baseobjspace::eq_w(x, y)?
+                {
+                    found = true;
+                    break;
                 }
             }
             if !found {
@@ -1319,17 +1319,17 @@ pub(crate) unsafe fn repr_item(
         return unsafe { crate::display::py_repr_wtf8(current_item()) };
     }
     // `getattr(it, "__qualname__")` / `getattr(it, "__module__")`.
-    if let Ok(w_qualname) = crate::baseobjspace::getattr_str(current_item(), "__qualname__") {
-        if let Ok(qualname) = crate::baseobjspace::text_w(w_qualname) {
-            let qualname = qualname.to_string();
-            let module = crate::baseobjspace::getattr_str(current_item(), "__module__")
-                .ok()
-                .and_then(|w| crate::baseobjspace::text_w(w).ok().map(str::to_string));
-            return Ok(rustpython_wtf8::Wtf8Buf::from_string(match module {
-                Some(m) if m != "builtins" => format!("{m}.{qualname}"),
-                _ => qualname,
-            }));
-        }
+    if let Ok(w_qualname) = crate::baseobjspace::getattr_str(current_item(), "__qualname__")
+        && let Ok(qualname) = crate::baseobjspace::text_w(w_qualname)
+    {
+        let qualname = qualname.to_string();
+        let module = crate::baseobjspace::getattr_str(current_item(), "__module__")
+            .ok()
+            .and_then(|w| crate::baseobjspace::text_w(w).ok().map(str::to_string));
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string(match module {
+            Some(m) if m != "builtins" => format!("{m}.{qualname}"),
+            _ => qualname,
+        }));
     }
     unsafe { crate::display::py_repr_wtf8(current_item()) }
 }

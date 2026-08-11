@@ -83,6 +83,10 @@ impl RawBuffer {
         self.offsets.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
     pub fn offsets(&self) -> &[i64] {
         &self.offsets
     }
@@ -207,7 +211,7 @@ impl RawBuffer {
         if insert_pos < self.offsets.len() {
             let next_off = self.offsets[insert_pos];
             let end = offset.checked_add(length_i);
-            if end.map_or(true, |e| e > next_off) {
+            if end.is_none_or(|e| e > next_off) {
                 return Err(InvalidRawWrite::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
@@ -227,7 +231,7 @@ impl RawBuffer {
             let prev_len = self.lengths[insert_pos - 1];
             let prev_len_i = i64::try_from(prev_len).ok();
             let prev_end = prev_len_i.and_then(|l| prev_off.checked_add(l));
-            if prev_end.map_or(true, |e| e > offset) {
+            if prev_end.is_none_or(|e| e > offset) {
                 return Err(InvalidRawWrite::OverlappingWrite {
                     new_offset: offset,
                     new_length: length,
@@ -267,6 +271,12 @@ impl RawBuffer {
             }
         }
         Err(InvalidRawRead::UninitializedRead { offset, length }.into())
+    }
+}
+
+impl Default for RawBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

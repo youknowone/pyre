@@ -125,12 +125,11 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
             ctx.resolve_operand_operand_opt(&arg1)
                 .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b) {
-                let b = ctx.materialize_operand_at(op.pos.get());
-                ctx.make_constant_box(&b, Value::Int(result));
-                return OptimizationResult::Remove;
-            }
+        ) && let Some(result) = self.try_fold_binary_int(OpCode::IntFloorDiv, a, b)
+        {
+            let b = ctx.materialize_operand_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(result));
+            return OptimizationResult::Remove;
         }
 
         // x // 1 -> x (identity)
@@ -199,7 +198,7 @@ impl OptRewrite {
                 let known_nonneg = ctx
                     .resolve_operand_operand_opt(&arg0)
                     .and_then(|b| ctx.peek_intbound_box(&b))
-                    .map_or(false, |bound| bound.known_nonnegative());
+                    .is_some_and(|bound| bound.known_nonnegative());
                 let result = intdiv::division_operations(
                     arg0.to_opref(),
                     divisor,
@@ -235,12 +234,11 @@ impl OptRewrite {
                 .and_then(|b| ctx.get_constant_int_box(&b)),
             ctx.resolve_operand_operand_opt(&arg1)
                 .and_then(|b| ctx.get_constant_int_box(&b)),
-        ) {
-            if let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b) {
-                let b = ctx.materialize_operand_at(op.pos.get());
-                ctx.make_constant_box(&b, Value::Int(result));
-                return OptimizationResult::Remove;
-            }
+        ) && let Some(result) = self.try_fold_binary_int(OpCode::IntMod, a, b)
+        {
+            let b = ctx.materialize_operand_at(op.pos.get());
+            ctx.make_constant_box(&b, Value::Int(result));
+            return OptimizationResult::Remove;
         }
 
         // x % 1 -> 0 (any integer mod 1 is 0)
@@ -287,26 +285,26 @@ impl OptRewrite {
         if let Some(divisor) = ctx
             .resolve_operand_operand_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
+            && divisor >= 3
+            && divisor.count_ones() != 1
         {
-            if divisor >= 3 && divisor.count_ones() != 1 {
-                // rewrite.py:809 `known_nonneg = b1.known_nonnegative()`:
-                // a non-negative dividend skips the sign-correction ops.
-                let known_nonneg = ctx
-                    .resolve_operand_operand_opt(&arg0)
-                    .and_then(|b| ctx.peek_intbound_box(&b))
-                    .map_or(false, |bound| bound.known_nonnegative());
-                let result = intdiv::modulo_operations(
-                    arg0.to_opref(),
-                    divisor,
-                    known_nonneg,
-                    ctx.current_pass_idx,
-                    ctx,
-                );
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_res = ctx.get_box_replacement_operand(result);
-                ctx.make_equal_to(&b_old, &b_res);
-                return OptimizationResult::Remove;
-            }
+            // rewrite.py:809 `known_nonneg = b1.known_nonnegative()`:
+            // a non-negative dividend skips the sign-correction ops.
+            let known_nonneg = ctx
+                .resolve_operand_operand_opt(&arg0)
+                .and_then(|b| ctx.peek_intbound_box(&b))
+                .is_some_and(|bound| bound.known_nonnegative());
+            let result = intdiv::modulo_operations(
+                arg0.to_opref(),
+                divisor,
+                known_nonneg,
+                ctx.current_pass_idx,
+                ctx,
+            );
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_res = ctx.get_box_replacement_operand(result);
+            ctx.make_equal_to(&b_old, &b_res);
+            return OptimizationResult::Remove;
         }
 
         OptimizationResult::PassOn
@@ -401,37 +399,31 @@ impl OptRewrite {
         // shortcut because the buffer pointer's intbound is unrelated
         // to its boolean truthiness.
         let arg0_is_raw = ctx.is_raw_ptr(&op.arg(0).get_box_replacement(false));
-        if !arg0_is_raw {
-            if let Some(bound) = ctx
+        if !arg0_is_raw
+            && let Some(bound) = ctx
                 .resolve_operand_operand_opt(&arg0)
                 .and_then(|b| ctx.peek_intbound_box(&b))
-            {
-                if bound.is_bool() {
-                    // make_equal_to: replace INT_IS_TRUE result with arg0.
-                    let b_old = Operand::from_bound_op(op_rc);
-                    let b_arg = ctx.resolve_operand_operand(&arg0);
-                    ctx.make_equal_to(&b_old, &b_arg);
-                    return OptimizationResult::Remove;
-                }
-            }
+            && bound.is_bool()
+        {
+            // make_equal_to: replace INT_IS_TRUE result with arg0.
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_arg = ctx.resolve_operand_operand(&arg0);
+            ctx.make_equal_to(&b_old, &b_arg);
+            return OptimizationResult::Remove;
         }
 
         // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
         if let Some(inner) = ctx
             .resolve_operand_operand_opt(&arg0)
             .and_then(|pb| ctx.get_producing_op(&pb))
+            && inner.opcode == OpCode::IntAnd
+            && ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false)) == Some(i64::MIN)
         {
-            if inner.opcode == OpCode::IntAnd {
-                if ctx.get_constant_int_box(&inner.arg(1).get_box_replacement(false))
-                    == Some(i64::MIN)
-                {
-                    let zero = self.emit_constant_int(ctx, 0);
-                    let arg_zero = ctx.materialize_operand_at(zero);
-                    let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
-                    new_op.pos.set(op.pos.get());
-                    return OptimizationResult::Emit(new_op);
-                }
-            }
+            let zero = self.emit_constant_int(ctx, 0);
+            let arg_zero = ctx.materialize_operand_at(zero);
+            let mut new_op = Op::new(OpCode::IntLt, &[inner.arg(0), arg_zero.clone()]);
+            new_op.pos.set(op.pos.get());
+            return OptimizationResult::Emit(new_op);
         }
 
         self.optimize_nullness(op, arg0.to_opref(), true, ctx)
@@ -512,12 +504,12 @@ impl OptRewrite {
             let cls1 = info1
                 .as_ref()
                 .and_then(|i| i.get_known_class(ctx.cpu.as_ref()));
-            if let (Some(c0), Some(c1)) = (cls0, cls1) {
-                if c0 != c1 {
-                    let b = ctx.materialize_operand_at(op.pos.get());
-                    ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
-                    return OptimizationResult::Remove;
-                }
+            if let (Some(c0), Some(c1)) = (cls0, cls1)
+                && c0 != c1
+            {
+                let b = ctx.materialize_operand_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
+                return OptimizationResult::Remove;
             }
         } else {
             // rewrite.py:550-553: non-instance array pointer comparison.
@@ -525,12 +517,12 @@ impl OptRewrite {
             // they cannot be the same object.
             let lb0 = info0.clone().and_then(|mut i| i.getlenbound(None));
             let lb1 = info1.clone().and_then(|mut i| i.getlenbound(None));
-            if let (Some(lb0), Some(lb1)) = (lb0, lb1) {
-                if lb0.known_ne(&lb1) {
-                    let b = ctx.materialize_operand_at(op.pos.get());
-                    ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
-                    return OptimizationResult::Remove;
-                }
+            if let (Some(lb0), Some(lb1)) = (lb0, lb1)
+                && lb0.known_ne(&lb1)
+            {
+                let b = ctx.materialize_operand_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(expect_isnot as i64));
+                return OptimizationResult::Remove;
             }
         }
 
@@ -786,16 +778,14 @@ impl OptRewrite {
                     // get_known_class on the c_value side dispatches through
                     // getptrinfo → ConstPtrInfo.get_known_class (info.py:763-772)
                     // which is exactly cls_of_box for constant pointers.
-                    if let Some(prev_cls) = info.get_known_class(ctx.cpu.as_ref()) {
-                        if let Some(arg1_box) = ctx.resolve_operand_operand_opt(&arg1) {
-                            if let Some(expected_cls) = ctx.get_known_class(&arg1_box) {
-                                if prev_cls != expected_cls {
-                                    return raise_invalid_loop(
-                                        "GUARD_VALUE proven to always fail (class mismatch)",
-                                    );
-                                }
-                            }
-                        }
+                    if let Some(prev_cls) = info.get_known_class(ctx.cpu.as_ref())
+                        && let Some(arg1_box) = ctx.resolve_operand_operand_opt(&arg1)
+                        && let Some(expected_cls) = ctx.get_known_class(&arg1_box)
+                        && prev_cls != expected_cls
+                    {
+                        return raise_invalid_loop(
+                            "GUARD_VALUE proven to always fail (class mismatch)",
+                        );
                     }
                     // rewrite.py:333-334: can_replace_guards check.
                     if !ctx.can_replace_guards {
@@ -890,19 +880,18 @@ impl OptRewrite {
         let obj_info_for_class = ctx.getptrinfo(&op.arg(0).get_box_replacement(false));
         if let Some(known_class) =
             obj_info_for_class.and_then(|i| i.get_known_class(ctx.cpu.as_ref()))
+            && op.num_args() >= 2
         {
-            if op.num_args() >= 2 {
-                // RPython GuardClass / GuardNonnullClass class operands are
-                // ConstInt vtable addresses (`expectedclassbox.getint()`).
-                let expected = ctx.get_constant_int_box(&op.arg(1));
-                if let Some(expected) = expected {
-                    if known_class == expected {
-                        return OptimizationResult::Remove;
-                    }
-                    // rewrite.py:404-407: known class mismatch is a
-                    // proven-fail guard — abort the trace.
-                    return raise_invalid_loop("GUARD_CLASS proven to always fail");
+            // RPython GuardClass / GuardNonnullClass class operands are
+            // ConstInt vtable addresses (`expectedclassbox.getint()`).
+            let expected = ctx.get_constant_int_box(&op.arg(1));
+            if let Some(expected) = expected {
+                if known_class == expected {
+                    return OptimizationResult::Remove;
                 }
+                // rewrite.py:404-407: known class mismatch is a
+                // proven-fail guard — abort the trace.
+                return raise_invalid_loop("GUARD_CLASS proven to always fail");
             }
         }
         // rewrite.py:408-427: guard strengthening.
@@ -912,63 +901,62 @@ impl OptRewrite {
         // ResumeAtPositionDescr — RPython's fresh ResumeGuardDescr() at
         // line 417 must not overwrite a RAPD marker (rewrite.py:421-422
         // "old descr must not be ResumeAtPositionDescr").
-        if let Some(old_guard) = ctx.get_last_guard(&op.arg(0).get_box_replacement(false)) {
-            if old_guard.opcode == OpCode::GuardNonnull
-                && op.num_args() >= 2
-                && ctx.can_replace_guards
+        if let Some(old_guard) = ctx.get_last_guard(&op.arg(0).get_box_replacement(false))
+            && old_guard.opcode == OpCode::GuardNonnull
+            && op.num_args() >= 2
+            && ctx.can_replace_guards
+        {
+            // last_guard_pos is a _newoperations index.
+            let old_guard_idx = ctx.last_guard_pos(&op.arg(0).get_box_replacement(false));
+            if let Some(old_idx) = old_guard_idx
+                && !ctx.is_resume_at_position_guard(old_idx as i32)
             {
-                // last_guard_pos is a _newoperations index.
-                let old_guard_idx = ctx.last_guard_pos(&op.arg(0).get_box_replacement(false));
-                if let Some(old_idx) = old_guard_idx
-                    && !ctx.is_resume_at_position_guard(old_idx as i32)
+                // rewrite.py:417-426 + optimizer.py:713-718:
+                // RPython creates a fresh ResumeGuardDescr for the
+                // strengthened guard, then replace_guard_op copies the
+                // resume payload from the old guard descr into the new
+                // one. This path writes directly into new_operations, so
+                // perform the descr copy inline before replacing the op.
+                let new_descr = crate::compile::make_resume_guard_descr_typed(
+                    old_guard
+                        .get_fail_arg_types()
+                        .map(|t| t.to_vec())
+                        .unwrap_or_default(),
+                );
+                let old_descr = old_guard
+                    .getdescr()
+                    .expect("strengthened GUARD_CLASS donor must carry a descr");
+                crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
+                let combined = old_guard.copy_and_change(
+                    OpCode::GuardNonnullClass,
+                    Some(&[old_guard.arg(0), op.arg(1)]),
+                    Some(Some(new_descr)),
+                );
+                ctx.replace_new_operation(old_idx, std::rc::Rc::new(combined));
+                // rewrite.py:430-436 postprocess_GUARD_CLASS parity
+                // (invoked inline here because the replacement path
+                // rewrites `new_operations[old_idx]` directly instead
+                // of going through `emit_operation`, which would have
+                // triggered the regular postprocess dispatch).
+                //
+                // The replacement happened because the old guard is
+                // not a ResumeAtPositionDescr (guarded at
+                // `is_resume_at_position_guard(old_idx)` above), so
+                // rewrite.py:434-435 `update_last_guard = not
+                // old_guard_op or isinstance(descr, RAPD)` evaluates
+                // to False — pass `update_last_guard=false` so that
+                // make_constant_class preserves the strengthened
+                // guard's position in last_guard_pos (optimizer.py:137
+                // parity) rather than snapping it to the tail of
+                // new_operations.
+                if let Some(class_val) = ctx.get_constant_int_box(&op.arg(1))
+                    && let Some(b) = ctx.get_box_replacement_operand_opt(obj)
                 {
-                    // rewrite.py:417-426 + optimizer.py:713-718:
-                    // RPython creates a fresh ResumeGuardDescr for the
-                    // strengthened guard, then replace_guard_op copies the
-                    // resume payload from the old guard descr into the new
-                    // one. This path writes directly into new_operations, so
-                    // perform the descr copy inline before replacing the op.
-                    let new_descr = crate::compile::make_resume_guard_descr_typed(
-                        old_guard
-                            .get_fail_arg_types()
-                            .map(|t| t.to_vec())
-                            .unwrap_or_default(),
+                    crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                        ctx, &b, class_val, /* update_last_guard = */ false,
                     );
-                    let old_descr = old_guard
-                        .getdescr()
-                        .expect("strengthened GUARD_CLASS donor must carry a descr");
-                    crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                    let combined = old_guard.copy_and_change(
-                        OpCode::GuardNonnullClass,
-                        Some(&[old_guard.arg(0), op.arg(1)]),
-                        Some(Some(new_descr)),
-                    );
-                    ctx.replace_new_operation(old_idx, std::rc::Rc::new(combined));
-                    // rewrite.py:430-436 postprocess_GUARD_CLASS parity
-                    // (invoked inline here because the replacement path
-                    // rewrites `new_operations[old_idx]` directly instead
-                    // of going through `emit_operation`, which would have
-                    // triggered the regular postprocess dispatch).
-                    //
-                    // The replacement happened because the old guard is
-                    // not a ResumeAtPositionDescr (guarded at
-                    // `is_resume_at_position_guard(old_idx)` above), so
-                    // rewrite.py:434-435 `update_last_guard = not
-                    // old_guard_op or isinstance(descr, RAPD)` evaluates
-                    // to False — pass `update_last_guard=false` so that
-                    // make_constant_class preserves the strengthened
-                    // guard's position in last_guard_pos (optimizer.py:137
-                    // parity) rather than snapping it to the tail of
-                    // new_operations.
-                    if let Some(class_val) = ctx.get_constant_int_box(&op.arg(1)) {
-                        if let Some(b) = ctx.get_box_replacement_operand_opt(obj) {
-                            crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                                ctx, &b, class_val, /* update_last_guard = */ false,
-                            );
-                        }
-                    }
-                    return OptimizationResult::Remove;
                 }
+                return OptimizationResult::Remove;
             }
         }
         // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
@@ -980,11 +968,11 @@ impl OptRewrite {
         // (`optimizer.py:137-151`), so the Rust port skips the local
         // `is_virtual` guard and lets `Optimizer::make_constant_class`
         // dispatch on the live `Instance` / `Virtual` arm.
-        if op.num_args() >= 2 {
-            if let Some(class_val) = ctx.get_constant_int_box(&op.arg(1)) {
-                ctx.pending_guard_class_postprocess =
-                    Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
-            }
+        if op.num_args() >= 2
+            && let Some(class_val) = ctx.get_constant_int_box(&op.arg(1))
+        {
+            ctx.pending_guard_class_postprocess =
+                Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
         }
         OptimizationResult::PassOn
     }
@@ -1036,7 +1024,7 @@ impl OptRewrite {
         // has_ptr_info takes &Operand per info.py:880-894.
         ctx.get_box_replacement_operand_opt(opref)
             .as_ref()
-            .map_or(false, |b| ctx.has_ptr_info(b))
+            .is_some_and(|b| ctx.has_ptr_info(b))
     }
 
     /// rewrite.py:95-101: _optimize_CALL_INT_UDIV
@@ -1171,38 +1159,34 @@ impl OptRewrite {
             if let Some(shift_op) = ctx
                 .resolve_operand_operand_opt(&arg2)
                 .and_then(|pb| ctx.get_producing_op(&pb))
+                && shift_op.opcode == OpCode::IntLshift
+                && shift_op.num_args() >= 2
+                && shift_op.arg(0).get_box_replacement(false).const_int() == Some(1)
             {
-                if shift_op.opcode == OpCode::IntLshift
-                    && shift_op.num_args() >= 2
-                    && shift_op.arg(0).get_box_replacement(false).const_int() == Some(1)
-                {
-                    let shiftvar = ctx.resolve_operand_operand(&shift_op.arg(1)).to_opref();
-                    let shiftbound = {
-                        let b = ctx.get_box_replacement_operand(shiftvar);
-                        ctx.getintbound_handle(&b).borrow().clone()
-                    };
-                    if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
-                        let arg_shift = ctx.materialize_operand_at(shiftvar);
-                        let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
-                        rshift_op.pos.set(op.pos.get());
-                        ctx.emit_extra(ctx.current_pass_idx, rshift_op);
-                        ctx.last_op_removed = true;
-                        return Some(OptimizationResult::Remove);
-                    }
+                let shiftvar = ctx.resolve_operand_operand(&shift_op.arg(1)).to_opref();
+                let shiftbound = {
+                    let b = ctx.get_box_replacement_operand(shiftvar);
+                    ctx.getintbound_handle(&b).borrow().clone()
+                };
+                if shiftbound.known_nonnegative() && shiftbound.known_lt_const(63) {
+                    let arg_shift = ctx.materialize_operand_at(shiftvar);
+                    let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
+                    rshift_op.pos.set(op.pos.get());
+                    ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+                    ctx.last_op_removed = true;
+                    return Some(OptimizationResult::Remove);
                 }
             }
             return None;
         }
         let val = b2.get_constant_int();
         // rewrite.py:743-749: x // -1 → -x (if x > MININT)
-        if val == -1 {
-            if b1.known_gt_const(i64::MIN) {
-                let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
-                neg_op.pos.set(op.pos.get());
-                ctx.emit_extra(ctx.current_pass_idx, neg_op);
-                ctx.last_op_removed = true;
-                return Some(OptimizationResult::Remove);
-            }
+        if val == -1 && b1.known_gt_const(i64::MIN) {
+            let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
+            neg_op.pos.set(op.pos.get());
+            ctx.emit_extra(ctx.current_pass_idx, neg_op);
+            ctx.last_op_removed = true;
+            return Some(OptimizationResult::Remove);
         }
         // rewrite.py:750-751
         if val <= 0 {
@@ -1275,8 +1259,8 @@ impl OptRewrite {
         let source_box = source_b.as_ref().map_or(source_box, |b| b.to_opref());
         let dest_b = ctx.get_box_replacement_operand_opt(dest_box);
         let dest_box = dest_b.as_ref().map_or(dest_box, |b| b.to_opref());
-        let source_is_virtual = source_b.as_ref().map_or(false, |b| ctx.is_virtual(b));
-        let dest_is_virtual = dest_b.as_ref().map_or(false, |b| ctx.is_virtual(b));
+        let source_is_virtual = source_b.as_ref().is_some_and(|b| ctx.is_virtual(b));
+        let dest_is_virtual = dest_b.as_ref().is_some_and(|b| ctx.is_virtual(b));
 
         // rewrite.py:610-611: constant start indices required
         let source_start = match ctx
@@ -1558,12 +1542,11 @@ impl OptRewrite {
         let arg1 = op.arg(1);
 
         // rewrite.py:72-75: boolinverse(arg0, arg1)
-        if let Some(inverse_opcode) = op.opcode.bool_inverse() {
-            if let Some(result) =
+        if let Some(inverse_opcode) = op.opcode.bool_inverse()
+            && let Some(result) =
                 self.try_boolinvers(op, inverse_opcode, arg0.to_opref(), arg1.to_opref(), ctx)
-            {
-                return Some(result);
-            }
+        {
+            return Some(result);
         }
 
         // rewrite.py:77-83: boolreflex(arg1, arg0)
@@ -1577,12 +1560,11 @@ impl OptRewrite {
             }
 
             // rewrite.py:87-91: boolreflex.boolinverse(arg1, arg0)
-            if let Some(reflex_inverse) = reflex_opcode.bool_inverse() {
-                if let Some(result) =
+            if let Some(reflex_inverse) = reflex_opcode.bool_inverse()
+                && let Some(result) =
                     self.try_boolinvers(op, reflex_inverse, arg1.to_opref(), arg0.to_opref(), ctx)
-                {
-                    return Some(result);
-                }
+            {
+                return Some(result);
             }
         }
 
@@ -1605,7 +1587,7 @@ impl OptRewrite {
         // rewrite.py:109: for lhs, rhs in [(arg1, arg2), (arg2, arg1)]:
         for (lhs, rhs) in [(&arg0, &arg1), (&arg1, &arg0)] {
             if let Some(v) = ctx
-                .resolve_operand_operand_opt(&lhs)
+                .resolve_operand_operand_opt(lhs)
                 .and_then(|b| b.const_value())
                 .and_then(|v| match v {
                     Value::Float(f) => Some(f),
@@ -1614,7 +1596,7 @@ impl OptRewrite {
             {
                 if v == 1.0 {
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_v2 = ctx.resolve_operand_operand(&rhs);
+                    let b_v2 = ctx.resolve_operand_operand(rhs);
                     ctx.make_equal_to(&b_old, &b_v2);
                     return OptimizationResult::Remove;
                 }
@@ -1675,13 +1657,13 @@ impl OptRewrite {
         let v = ctx
             .resolve_operand_operand_opt(&op.arg(0))
             .or_else(|| Some(ctx.resolve_operand_operand(&op.arg(0))));
-        if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb)) {
-            if arg_op.opcode == OpCode::FloatNeg {
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_inner = ctx.resolve_operand_operand(&arg_op.arg(0));
-                ctx.make_equal_to(&b_old, &b_inner);
-                return OptimizationResult::Remove;
-            }
+        if let Some(arg_op) = v.and_then(|pb| ctx.get_producing_op(&pb))
+            && arg_op.opcode == OpCode::FloatNeg
+        {
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_inner = ctx.resolve_operand_operand(&arg_op.arg(0));
+            ctx.make_equal_to(&b_old, &b_inner);
+            return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
     }
@@ -1694,14 +1676,13 @@ impl OptRewrite {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let v = ctx.resolve_operand_operand_opt(&op.arg(0));
-        if let Some(v) = v {
-            if let Some(arg_op) = ctx.get_producing_op(&v) {
-                if arg_op.opcode == OpCode::FloatAbs {
-                    let b_old = Operand::from_bound_op(op_rc);
-                    ctx.make_equal_to(&b_old, &v);
-                    return OptimizationResult::Remove;
-                }
-            }
+        if let Some(v) = v
+            && let Some(arg_op) = ctx.get_producing_op(&v)
+            && arg_op.opcode == OpCode::FloatAbs
+        {
+            let b_old = Operand::from_bound_op(op_rc);
+            ctx.make_equal_to(&b_old, &v);
+            return OptimizationResult::Remove;
         }
         OptimizationResult::PassOn
     }
@@ -1740,10 +1721,10 @@ impl Optimization for OptRewrite {
         }
 
         // Try boolean inverse/reflex rewrites for comparisons
-        if op.opcode.bool_inverse().is_some() || op.opcode.bool_reflex().is_some() {
-            if let Some(result) = self.find_rewritable_bool(op, op_rc, ctx) {
-                return result;
-            }
+        if (op.opcode.bool_inverse().is_some() || op.opcode.bool_reflex().is_some())
+            && let Some(result) = self.find_rewritable_bool(op, op_rc, ctx)
+        {
+            return result;
         }
 
         match op.opcode {
@@ -1761,10 +1742,10 @@ impl Optimization for OptRewrite {
             // tag fold is gated on the active GC's taggedpointers config and
             // is unreachable with it off (nothing emits the matched chain).
             OpCode::IntRshift => {
-                if majit_gc::taggedpointers_enabled() {
-                    if let Some(result) = self.optimize_int_rshift_tag_unbox(op, op_rc, ctx) {
-                        return result;
-                    }
+                if majit_gc::taggedpointers_enabled()
+                    && let Some(result) = self.optimize_int_rshift_tag_unbox(op, op_rc, ctx)
+                {
+                    return result;
                 }
                 OptimizationResult::PassOn
             }
@@ -1855,10 +1836,10 @@ impl Optimization for OptRewrite {
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
                 //     return self.optimize_GUARD_CLASS(op)
-                if let Some(info) = ctx.getptrinfo(&op.arg(0).get_box_replacement(false)) {
-                    if info.is_null() {
-                        return raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
-                    }
+                if let Some(info) = ctx.getptrinfo(&op.arg(0).get_box_replacement(false))
+                    && info.is_null()
+                {
+                    return raise_invalid_loop("GUARD_NONNULL_CLASS proven to always fail");
                 }
                 self.optimize_guard_class(op, ctx)
             }
@@ -1911,19 +1892,19 @@ impl Optimization for OptRewrite {
                     ctx.last_op_removed = true;
                     return OptimizationResult::Remove;
                 }
-                if let Some(c) = ctx.get_constant_int_box(&op.arg(0).get_box_replacement(false)) {
-                    if c != 0 {
-                        let mut call_op = Op::new(
-                            OpCode::CallN,
-                            &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
-                        );
-                        call_op.pos.set(op.pos.get());
-                        if let Some(d) = op.getdescr() {
-                            call_op.setdescr(d);
-                        }
-                        ctx.last_op_removed = false;
-                        return OptimizationResult::Replace(call_op);
+                if let Some(c) = ctx.get_constant_int_box(&op.arg(0).get_box_replacement(false))
+                    && c != 0
+                {
+                    let mut call_op = Op::new(
+                        OpCode::CallN,
+                        &(1..op.num_args()).map(|i| op.arg(i)).collect::<Vec<_>>(),
+                    );
+                    call_op.pos.set(op.pos.get());
+                    if let Some(d) = op.getdescr() {
+                        call_op.setdescr(d);
                     }
+                    ctx.last_op_removed = false;
+                    return OptimizationResult::Replace(call_op);
                 }
                 ctx.last_op_removed = false;
                 OptimizationResult::PassOn
@@ -1973,7 +1954,7 @@ impl Optimization for OptRewrite {
                     let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
                     ctx.register_pure_from_args2(OpCode::InstancePtrEq, op.pos.get(), arg1, arg0);
                 }
-                return self.optimize_oois_ooisnot(op, false, instance, ctx);
+                self.optimize_oois_ooisnot(op, false, instance, ctx)
             }
             OpCode::PtrNe | OpCode::InstancePtrNe => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
@@ -1983,7 +1964,7 @@ impl Optimization for OptRewrite {
                     let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
                     ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos.get(), arg1, arg0);
                 }
-                return self.optimize_oois_ooisnot(op, true, instance, ctx);
+                self.optimize_oois_ooisnot(op, true, instance, ctx)
             }
 
             // ── Cast round-trip elimination ──
@@ -2074,32 +2055,30 @@ impl Optimization for OptRewrite {
             // only do oopspec-specific simplifications.
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        match ei.oopspecindex {
-                            // rewrite.py:688: OS_INT_UDIV
-                            majit_ir::OopSpecIndex::IntUdiv => {
-                                if self.optimize_call_int_udiv(op, op_rc, ctx) {
-                                    return OptimizationResult::Remove;
-                                }
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    match ei.oopspecindex {
+                        // rewrite.py:688: OS_INT_UDIV
+                        majit_ir::OopSpecIndex::IntUdiv => {
+                            if self.optimize_call_int_udiv(op, op_rc, ctx) {
+                                return OptimizationResult::Remove;
                             }
-                            // rewrite.py:689: OS_INT_PY_DIV
-                            majit_ir::OopSpecIndex::IntPyDiv => {
-                                if let Some(result) = self.optimize_call_int_py_div(op, op_rc, ctx)
-                                {
-                                    return result;
-                                }
-                            }
-                            // rewrite.py:692: OS_INT_PY_MOD
-                            majit_ir::OopSpecIndex::IntPyMod => {
-                                if let Some(result) = self.optimize_call_int_py_mod(op, op_rc, ctx)
-                                {
-                                    return result;
-                                }
-                            }
-                            _ => {}
                         }
+                        // rewrite.py:689: OS_INT_PY_DIV
+                        majit_ir::OopSpecIndex::IntPyDiv => {
+                            if let Some(result) = self.optimize_call_int_py_div(op, op_rc, ctx) {
+                                return result;
+                            }
+                        }
+                        // rewrite.py:692: OS_INT_PY_MOD
+                        majit_ir::OopSpecIndex::IntPyMod => {
+                            if let Some(result) = self.optimize_call_int_py_mod(op, op_rc, ctx) {
+                                return result;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 OptimizationResult::PassOn
@@ -2118,38 +2097,36 @@ impl Optimization for OptRewrite {
                         .imported_loop_invariant_results
                         .iter()
                         .find(|(k, _)| *k == func_val)
-                    {
-                        if !self
+                        && !self
                             .loop_invariant_results
                             .iter()
                             .any(|(k, _)| *k == func_val)
-                        {
-                            // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
-                            // `produce_loop_invariant` installs
-                            // `make_equal_to(source, result_opref)`, so the source
-                            // box's `_forwarded` slot now holds
-                            // `Forwarded::Op(result_op)`.
-                            // Build the synthetic SameAsI replay at
-                            // `result_opref` (= get_box_replacement(source))
-                            // so `take_preamble_forwarded_opinfo` reads the
-                            // info seeded at result_opref's slot per the
-                            // dual-slot rule (mod.rs:1817 replay_pos).
-                            let replay_pos = ctx.get_replacement_opref(source);
-                            let source_op = ctx.materialize_operand_at(source);
-                            let mut replay = Op::new(OpCode::SameAsI, &[source_op.clone()]);
-                            replay.pos.set(replay_pos);
-                            self.loop_invariant_results.insert(
-                                func_val,
-                                LoopInvariantEntry::Preamble(PreambleOp {
-                                    op: source_op,
-                                    invented_name: false,
-                                    preamble_op: std::rc::Rc::new(replay),
-                                    // Non-invented loop-invariant producer: the
-                                    // SameAs arm is never taken, so no source.
-                                    same_as_source: None,
-                                }),
-                            );
-                        }
+                    {
+                        // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
+                        // `produce_loop_invariant` installs
+                        // `make_equal_to(source, result_opref)`, so the source
+                        // box's `_forwarded` slot now holds
+                        // `Forwarded::Op(result_op)`.
+                        // Build the synthetic SameAsI replay at
+                        // `result_opref` (= get_box_replacement(source))
+                        // so `take_preamble_forwarded_opinfo` reads the
+                        // info seeded at result_opref's slot per the
+                        // dual-slot rule (mod.rs:1817 replay_pos).
+                        let replay_pos = ctx.get_replacement_opref(source);
+                        let source_op = ctx.materialize_operand_at(source);
+                        let mut replay = Op::new(OpCode::SameAsI, &[source_op.clone()]);
+                        replay.pos.set(replay_pos);
+                        self.loop_invariant_results.insert(
+                            func_val,
+                            LoopInvariantEntry::Preamble(PreambleOp {
+                                op: source_op,
+                                invented_name: false,
+                                preamble_op: std::rc::Rc::new(replay),
+                                // Non-invented loop-invariant producer: the
+                                // SameAs arm is never taken, so no source.
+                                same_as_source: None,
+                            }),
+                        );
                     }
                     // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
                     // → force_op_from_preamble → replace in dict
@@ -2256,14 +2233,15 @@ impl Optimization for OptRewrite {
             // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        match ei.oopspecindex {
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    match ei.oopspecindex {
                             // rewrite.py:580-590: OS_ARRAYCOPY / OS_ARRAYMOVE
                             majit_ir::OopSpecIndex::Arraycopy => {
-                                if op.num_args() >= 6 {
-                                    if self.optimize_call_arrayop(
+                                if op.num_args() >= 6
+                                    && self.optimize_call_arrayop(
                                         op,
                                         op.arg(1).to_opref(),
                                         op.arg(2).to_opref(), // source, dest
@@ -2274,11 +2252,10 @@ impl Optimization for OptRewrite {
                                     ) {
                                         return OptimizationResult::Remove;
                                     }
-                                }
                             }
-                            majit_ir::OopSpecIndex::Arraymove => {
+                            majit_ir::OopSpecIndex::Arraymove
                                 // rewrite.py:592-597: ARRAYMOVE: source == dest
-                                if op.num_args() >= 5 {
+                                if op.num_args() >= 5 => {
                                     let array_box = op.arg(1);
                                     if self.optimize_call_arrayop(
                                         op,
@@ -2292,10 +2269,8 @@ impl Optimization for OptRewrite {
                                         return OptimizationResult::Remove;
                                     }
                                 }
-                            }
                             _ => {}
                         }
-                    }
                 }
                 OptimizationResult::PassOn
             }
@@ -2351,10 +2326,10 @@ impl Optimization for OptRewrite {
                 ctx.make_constant_arg(&op.arg(0), majit_ir::Value::Int(0));
             }
             OpCode::GuardValue => {
-                if op.num_args() >= 2 {
-                    if let Some(val) = op.arg(1).get_box_replacement(false).const_value() {
-                        ctx.make_constant_arg(&op.arg(0), val);
-                    }
+                if op.num_args() >= 2
+                    && let Some(val) = op.arg(1).get_box_replacement(false).const_value()
+                {
+                    ctx.make_constant_arg(&op.arg(0), val);
                 }
             }
             _ => {}
@@ -3579,7 +3554,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[majit_ir::Type::Int; 2]);
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;

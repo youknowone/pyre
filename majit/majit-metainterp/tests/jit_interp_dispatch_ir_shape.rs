@@ -125,7 +125,7 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
     assert!(
         sub_jitcodes
             .iter()
-            .any(|sub| sub.code.iter().any(|&b| b == BC_STORE_STATE_FIELD)),
+            .any(|sub| sub.code.contains(&BC_STORE_STATE_FIELD)),
         "state.a += 1 arm must lower to store_state_field in the dispatch inline-call target; sub codes: {:?}",
         sub_jitcodes
             .iter()
@@ -133,9 +133,7 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
             .collect::<Vec<_>>()
     );
     assert!(
-        sub_jitcodes
-            .iter()
-            .all(|sub| !sub.code.iter().any(|&b| b == BC_ABORT)),
+        sub_jitcodes.iter().all(|sub| !sub.code.contains(&BC_ABORT)),
         "lowerable dispatch arms must not degenerate to abort sub-JitCodes"
     );
 }
@@ -254,7 +252,7 @@ mod float_state_field_shape {
             let opcode = program[pc];
             pc += 1;
             match opcode {
-                OP_TOUCH_F => state.f = state.f + 2.5,
+                OP_TOUCH_F => state.f += 2.5,
                 _ => break,
             }
         }
@@ -278,7 +276,7 @@ mod float_state_field_shape {
         assert!(
             sub_jitcodes
                 .iter()
-                .any(|sub| sub.code.iter().any(|&b| b == BC_STORE_STATE_FIELD_FLOAT)),
+                .any(|sub| sub.code.contains(&BC_STORE_STATE_FIELD_FLOAT)),
             "state.f update must lower to store_state_field_float; sub codes: {:?}",
             sub_jitcodes
                 .iter()
@@ -455,13 +453,13 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
         .expect("missing JIT_MERGE_POINT");
     let post_mp = &code[mp_idx..];
     assert!(
-        post_mp.iter().any(|&b| b == BC_GETARRAYITEM_GC_I),
+        post_mp.contains(&BC_GETARRAYITEM_GC_I),
         "dispatch JitCode body must emit BC_GETARRAYITEM_GC_I for program[pc]; \
          got bytes {:?}",
         post_mp
     );
     assert!(
-        post_mp.iter().any(|&b| b == BC_INT_ADD),
+        post_mp.contains(&BC_INT_ADD),
         "dispatch JitCode body must emit BC_INT_ADD for pc += 1; \
          got bytes {:?}",
         post_mp
@@ -498,7 +496,7 @@ fn dispatch_jitcode_emits_typed_return_for_default_arm() {
     let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     assert!(
-        code.iter().any(|&b| b == BC_INT_RETURN),
+        code.contains(&BC_INT_RETURN),
         "dispatch JitCode default arm must emit BC_INT_RETURN for `state.a` return; \
          got bytes {:?}",
         code
@@ -719,7 +717,7 @@ mod oparg_minimal {
     /// arm — `lower_dispatch_chain`'s per-arm gating suppresses
     /// `loop_header` for forward-progress arms (OP_NOP, OP_ADD_I) that have
     /// no `can_enter_jit!` marker, matching `jtransform.py:1714-1723
-    /// handle_jit_marker__loop_header` which only runs at user-placed
+    /// > handle_jit_marker__loop_header` which only runs at user-placed
     /// `can_enter_jit` source sites.
     const OP_JUMP_BACK: u8 = 2;
 
@@ -839,10 +837,10 @@ mod oparg_minimal {
     /// A.2.2: the dispatch JitCode body must lower BOTH byte fetches in
     /// `let opcode = program[pc]; let oparg = program[pc + 1]; pc += 2;`
     /// per RPython `pyopcode.py:179-181`:
-    ///   - opcode fetch → `BC_GETARRAYITEM_GC_I result, program, pc`
-    ///   - oparg  fetch → `BC_INT_ADD offset, pc, +1` then
-    ///                    `BC_GETARRAYITEM_GC_I result, program, offset`
-    ///   - pc advance   → `BC_INT_ADD pc, pc, +2`
+    ///     - opcode fetch → `BC_GETARRAYITEM_GC_I result, program, pc`
+    ///     - oparg  fetch → `BC_INT_ADD offset, pc, +1` then
+    ///       `BC_GETARRAYITEM_GC_I result, program, offset`
+    ///     - pc advance   → `BC_INT_ADD pc, pc, +2`
     ///
     /// Net post-merge-point op shape: BC_GETARRAYITEM_GC_I × 2 and at
     /// least two BC_INT_ADDs (one for `pc + 1` offset, one for `pc += 2`).
@@ -2102,8 +2100,8 @@ mod oparg_with_body_local_state_le_green {
 /// land BEFORE `BC_JIT_MERGE_POINT(_C)` and threads its result reg
 /// forward through `BC_INT_LE` and finally A.3.5's `BC_INT_GUARD_VALUE`
 /// + greens_i payload byte. Locks aheui-jit's `stackok` lowering chain
-/// so future refactors of `lower_method_call_value` (A.3.6.2) cannot
-/// silently regress it.
+///   so future refactors of `lower_method_call_value` (A.3.6.2) cannot
+///   silently regress it.
 ///
 /// RPython parity: `jtransform.py:456 handle_residual_call`
 /// (graph-identity-keyed; pyre keys on canonical path so

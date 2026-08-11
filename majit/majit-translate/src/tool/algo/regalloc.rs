@@ -203,21 +203,21 @@ impl RegAllocatorState {
             if matches!(op.kind, OpKind::Input { .. }) {
                 continue;
             }
-            if let Some(result_var) = op.result.clone() {
-                if consider(&result_var) {
-                    self.depgraph.add_node(result_var.clone());
-                    for v in &alive {
-                        // The result can already be represented in `alive`
-                        // when upstream-shaped exception/control-flow
-                        // rewrites reuse a Variable.  Keep the shared
-                        // color.py invariant by not asking it for a
-                        // self-edge.
-                        if *v != result_var {
-                            self.depgraph.add_edge(v.clone(), result_var.clone());
-                        }
+            if let Some(result_var) = op.result.clone()
+                && consider(&result_var)
+            {
+                self.depgraph.add_node(result_var.clone());
+                for v in &alive {
+                    // The result can already be represented in `alive`
+                    // when upstream-shaped exception/control-flow
+                    // rewrites reuse a Variable.  Keep the shared
+                    // color.py invariant by not asking it for a
+                    // self-edge.
+                    if *v != result_var {
+                        self.depgraph.add_edge(v.clone(), result_var.clone());
                     }
-                    alive.insert(result_var);
                 }
+                alive.insert(result_var);
             }
         }
     }
@@ -253,15 +253,15 @@ impl RegAllocatorState {
                 // `neighbours`, and `find_node_coloring` silently skips
                 // it (`color.py:25-27 getnodes()` filters
                 // `_all_nodes` by `neighbours.contains_key`).
-                if let Some(arg) = &link.last_exception {
-                    if let Some(var) = arg.as_variable() {
-                        self.depgraph.add_node(var.clone());
-                    }
+                if let Some(arg) = &link.last_exception
+                    && let Some(var) = arg.as_variable()
+                {
+                    self.depgraph.add_node(var.clone());
                 }
-                if let Some(arg) = &link.last_exc_value {
-                    if let Some(var) = arg.as_variable() {
-                        self.depgraph.add_node(var.clone());
-                    }
+                if let Some(arg) = &link.last_exc_value
+                    && let Some(var) = arg.as_variable()
+                {
+                    self.depgraph.add_node(var.clone());
                 }
                 let target_block = graph.block(link.target);
                 let target_input_vars: Vec<crate::flowspace::model::Variable> =
@@ -300,7 +300,7 @@ impl RegAllocatorState {
             .depgraph
             .neighbours
             .get(&w0)
-            .map_or(false, |ns| ns.contains(&v0))
+            .is_some_and(|ns| ns.contains(&v0))
         {
             return;
         }
@@ -472,12 +472,12 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     // unionfind rep to recover the chordal coloring entry — matches
     // upstream `regalloc.py:118 self.coloring[self.unionfind.find_rep(v)]`.
     for var in graph.iter_variables() {
-        if variable_regkind(&var) == Some(kind) {
-            if let Some(color) = allocator.getcolor(&var) {
-                coloring.insert(var.clone(), color);
-                if color + 1 > max_reg {
-                    max_reg = color + 1;
-                }
+        if variable_regkind(&var) == Some(kind)
+            && let Some(color) = allocator.getcolor(&var)
+        {
+            coloring.insert(var.clone(), color);
+            if color + 1 > max_reg {
+                max_reg = color + 1;
             }
         }
     }

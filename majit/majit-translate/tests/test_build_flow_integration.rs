@@ -43,7 +43,7 @@ fn build_flow_for_constant_return() {
     // startblock.
     let blocks = graph.iterblocks();
     assert!(
-        blocks.len() >= 1,
+        !blocks.is_empty(),
         "expected at least one block, got {}",
         blocks.len()
     );

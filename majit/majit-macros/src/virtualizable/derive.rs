@@ -287,9 +287,7 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         .collect();
 
     // stack_only_depth helper (if both vsd and nlocals fields exist)
-    let stack_only_depth = if vsd_field.is_some() && nlocals_field.is_some() {
-        let vsd = vsd_field.unwrap();
-        let nl = nlocals_field.unwrap();
+    let stack_only_depth = if let (Some(vsd), Some(nl)) = (vsd_field, nlocals_field) {
         quote! {
             /// Compute stack-only depth: valuestackdepth - nlocals.
             pub fn __vable_stack_only_depth(&self) -> usize {

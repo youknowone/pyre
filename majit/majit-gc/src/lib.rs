@@ -1,3 +1,6 @@
+// GC rewrite helpers retain the signatures of RPython's rewrite assembler.
+#![allow(clippy::too_many_arguments)]
+
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 /// GC traits and interfaces for the JIT.
 ///
@@ -1026,8 +1029,8 @@ pub trait GcAllocator: Send {
     ///    (`llop.gc_get_type_info_group`).
     ///  * `shift_by` — `2` on 32-bit, `0` on 64-bit (gc.py:596-599).
     ///  * `sizeof_ti` — `rffi.sizeof(GCData.TYPE_INFO)`.
-    /// Called by `genop_guard_guard_is_object` (x86/assembler.py:1934)
-    /// and `genop_guard_guard_subclass` (x86/assembler.py:1965).
+    ///    Called by `genop_guard_guard_is_object` (x86/assembler.py:1934)
+    ///    and `genop_guard_guard_subclass` (x86/assembler.py:1965).
     ///
     /// Default panics to match RPython: `GcLLDescr_boehm` does not
     /// define the method, and calling it when
@@ -2998,12 +3001,12 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
     let mut out = format!("BH PROBE: post-minor nursery references, through minor #{minor}\n");
     let _ = BH_PROBE_VIOLATIONS.try_with(|v| {
         for e in v.borrow().iter() {
-            let _ = write!(
+            let _ = writeln!(
                 out,
                 "  minor#{} {} holder={:#x} tid={} payload={} offset={}({}) value={:#x} \
                  forwarded={} | type: size={} item_size={} length_offset={} gc_ptr_offsets={:?} \
                  custom_trace={} is_object={} | holder: track_young={} remembered={} \
-                 barriered_ever={} traced_this_minor={} store_sites={:#b} | layout={:?}\n",
+                 barriered_ever={} traced_this_minor={} store_sites={:#b} | layout={:?}",
                 e.minor,
                 if e.origin == BH_PROBE_ORIGIN_PROMOTED {
                     "promoted"
@@ -3044,10 +3047,10 @@ static BH_PROBE_IGNORED_TIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new
 /// so a slot outside that map legitimately holds a stale scratch word that can
 /// fall inside the nursery range.
 pub fn bh_probe_ignore_tid(type_id: u32) {
-    if let Ok(mut v) = BH_PROBE_IGNORED_TIDS.lock() {
-        if !v.contains(&type_id) {
-            v.push(type_id);
-        }
+    if let Ok(mut v) = BH_PROBE_IGNORED_TIDS.lock()
+        && !v.contains(&type_id)
+    {
+        v.push(type_id);
     }
 }
 

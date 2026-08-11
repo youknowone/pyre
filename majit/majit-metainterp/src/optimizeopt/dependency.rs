@@ -73,22 +73,22 @@ fn side_effect_arguments(
     let mut result = Vec::new();
     if op.opcode.is_complex_modify() {
         // dependency.py:218-230: known complex modification patterns
-        if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode) {
-            if obj_idx < op.num_args() {
-                if cell_idx >= 0 && (cell_idx as usize) < op.num_args() {
-                    result.push((
-                        op.arg(obj_idx).to_opref(),
-                        Some(op.arg(cell_idx as usize).to_opref()),
-                        true,
-                    ));
-                    for j in (cell_idx as usize + 1)..op.num_args() {
-                        result.push((op.arg(j).to_opref(), None, false));
-                    }
-                } else {
-                    result.push((op.arg(obj_idx).to_opref(), None, true));
-                    for j in (obj_idx + 1)..op.num_args() {
-                        result.push((op.arg(j).to_opref(), None, false));
-                    }
+        if let Some((obj_idx, cell_idx)) = modify_complex_obj_args(op.opcode)
+            && obj_idx < op.num_args()
+        {
+            if cell_idx >= 0 && (cell_idx as usize) < op.num_args() {
+                result.push((
+                    op.arg(obj_idx).to_opref(),
+                    Some(op.arg(cell_idx as usize).to_opref()),
+                    true,
+                ));
+                for j in (cell_idx as usize + 1)..op.num_args() {
+                    result.push((op.arg(j).to_opref(), None, false));
+                }
+            } else {
+                result.push((op.arg(obj_idx).to_opref(), None, true));
+                for j in (obj_idx + 1)..op.num_args() {
+                    result.push((op.arg(j).to_opref(), None, false));
                 }
             }
         }
@@ -823,10 +823,10 @@ impl DependencyGraph {
             .position(|d| d.to_idx == to_idx);
         if let Some(pos) = existing {
             // dependency.py:186-194: update existing edge
-            if let Some(a) = arg {
-                if !nodes[from_idx].adjacent_list[pos].because_of(a) {
-                    nodes[from_idx].adjacent_list[pos].args.push((from_idx, a));
-                }
+            if let Some(a) = arg
+                && !nodes[from_idx].adjacent_list[pos].because_of(a)
+            {
+                nodes[from_idx].adjacent_list[pos].args.push((from_idx, a));
             }
             // dependency.py:190-191: a normal dependency overwriting a failarg
             // clears the flag. dependency.py:457-458 also propagates this to the
@@ -873,27 +873,27 @@ impl DependencyGraph {
         to_idx: usize,
         nodes: &mut Vec<Node>,
     ) {
-        if let Some(at_idx) = tracker.definition(arg) {
-            if at_idx != to_idx {
-                // Inline add_edge logic to avoid double borrow issues
-                let existing = nodes[at_idx]
-                    .adjacent_list
-                    .iter()
-                    .position(|d| d.to_idx == to_idx);
-                if let Some(pos) = existing {
-                    if !nodes[at_idx].adjacent_list[pos].because_of(arg) {
-                        nodes[at_idx].adjacent_list[pos].args.push((at_idx, arg));
-                    }
-                    Self::set_edge_failarg(nodes, at_idx, to_idx, false);
-                } else {
-                    let dep = Dependency::new(at_idx, to_idx, Some(arg), false);
-                    nodes[at_idx].adjacent_list.push(dep);
-                    let dep_back = Dependency::new(to_idx, at_idx, Some(arg), false);
-                    nodes[to_idx].adjacent_list_back.push(dep_back);
-                    if !nodes[to_idx].deps.contains(&at_idx) {
-                        nodes[to_idx].deps.push(at_idx);
-                        nodes[at_idx].users.push(to_idx);
-                    }
+        if let Some(at_idx) = tracker.definition(arg)
+            && at_idx != to_idx
+        {
+            // Inline add_edge logic to avoid double borrow issues
+            let existing = nodes[at_idx]
+                .adjacent_list
+                .iter()
+                .position(|d| d.to_idx == to_idx);
+            if let Some(pos) = existing {
+                if !nodes[at_idx].adjacent_list[pos].because_of(arg) {
+                    nodes[at_idx].adjacent_list[pos].args.push((at_idx, arg));
+                }
+                Self::set_edge_failarg(nodes, at_idx, to_idx, false);
+            } else {
+                let dep = Dependency::new(at_idx, to_idx, Some(arg), false);
+                nodes[at_idx].adjacent_list.push(dep);
+                let dep_back = Dependency::new(to_idx, at_idx, Some(arg), false);
+                nodes[to_idx].adjacent_list_back.push(dep_back);
+                if !nodes[to_idx].deps.contains(&at_idx) {
+                    nodes[to_idx].deps.push(at_idx);
+                    nodes[at_idx].users.push(to_idx);
                 }
             }
         }
@@ -914,7 +914,7 @@ impl DependencyGraph {
                 continue;
             };
             if op.opcode.to_vector().is_some() && !op.opcode.is_guard() {
-                by_opcode.entry(op.opcode).or_insert_with(Vec::new).push(i);
+                by_opcode.entry(op.opcode).or_default().push(i);
             }
         }
 
@@ -1497,10 +1497,7 @@ impl DefTracker {
         if arg.is_constant() {
             return;
         }
-        self.defs
-            .entry(arg)
-            .or_insert_with(Vec::new)
-            .push((node_idx, None));
+        self.defs.entry(arg).or_default().push((node_idx, None));
     }
 
     /// dependency.py:490-492: redefinitions — yield all nodes defining arg.
@@ -1530,10 +1527,11 @@ impl DefTracker {
 
     /// dependency.py:525-534: depends_on_arg — add edge from definition to `to_idx`.
     pub fn depends_on_arg(&self, arg: OpRef, to_idx: usize, graph: &mut Vec<Vec<usize>>) {
-        if let Some(at_idx) = self.definition(arg) {
-            if at_idx != to_idx && !graph[at_idx].contains(&to_idx) {
-                graph[at_idx].push(to_idx);
-            }
+        if let Some(at_idx) = self.definition(arg)
+            && at_idx != to_idx
+            && !graph[at_idx].contains(&to_idx)
+        {
+            graph[at_idx].push(to_idx);
         }
     }
 }

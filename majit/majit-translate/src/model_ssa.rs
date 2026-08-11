@@ -193,17 +193,17 @@ fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variable, w: &Var
     let remap = |x: &Variable| -> Variable { if x == v { w.clone() } else { x.clone() } };
     let (new_inputargs, new_ops, new_switch, new_exits) = {
         let b = graph.block(id);
-        let new_inputargs: Vec<Variable> = b.inputargs.iter().map(|x| remap(x)).collect();
+        let new_inputargs: Vec<Variable> = b.inputargs.iter().map(&remap).collect();
         let new_ops: Vec<SpaceOperation> = b
             .operations
             .iter()
             .map(|op| SpaceOperation {
-                result: op.result.as_ref().map(|r| remap(r)),
+                result: op.result.as_ref().map(&remap),
                 kind: crate::inline::remap_op_kind(&op.kind, &remap),
             })
             .collect();
         let (switch, exits) =
-            crate::model::remap_control_flow_metadata_var(&b.exitswitch, &b.exits, &remap, |blk| {
+            crate::model::remap_control_flow_metadata_var(&b.exitswitch, &b.exits, remap, |blk| {
                 blk
             });
         (new_inputargs, new_ops, switch, exits)
@@ -262,10 +262,10 @@ pub fn ssa_to_ssi(graph: &mut FunctionGraph) {
             }
             for link in &b.exits {
                 for arg in &link.args {
-                    if let LinkArg::Value(var) = arg {
-                        if seen.insert(var.clone()) {
-                            used.push(var.clone());
-                        }
+                    if let LinkArg::Value(var) = arg
+                        && seen.insert(var.clone())
+                    {
+                        used.push(var.clone());
                     }
                 }
             }

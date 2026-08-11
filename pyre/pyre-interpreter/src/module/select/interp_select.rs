@@ -21,7 +21,7 @@ pub struct Poll {
 /// `interp_select.py:15 defaultevents = POLLIN | POLLOUT | POLLPRI`.
 #[cfg(all(unix, feature = "host_env"))]
 fn default_poll_events() -> i16 {
-    (libc::POLLIN | libc::POLLOUT | libc::POLLPRI) as i16
+    libc::POLLIN | libc::POLLOUT | libc::POLLPRI
 }
 
 /// Resolve a Python fd argument (int or object with `fileno()`) to a

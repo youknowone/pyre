@@ -543,10 +543,10 @@ fn project_value_to_var(
 ) -> HashMap<Variable, ConcreteType> {
     let mut real_state: HashMap<Variable, ConcreteType> = HashMap::new();
     for (legacy_var, typed_var) in value_to_var {
-        if let Some(lltype) = typed_var.concretetype().as_ref() {
-            if let Ok(kind) = lowleveltype_to_concrete(lltype) {
-                real_state.insert(legacy_var.clone(), kind);
-            }
+        if let Some(lltype) = typed_var.concretetype().as_ref()
+            && let Ok(kind) = lowleveltype_to_concrete(lltype)
+        {
+            real_state.insert(legacy_var.clone(), kind);
         }
     }
     // `Constant.concretetype` is the ground truth for constant operands;
@@ -1722,7 +1722,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // avoided because we key on the post-strip segment sequence, not
     // on the bare leaf.
     fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
-        let mut segs: Vec<String> = path.segments.iter().cloned().collect();
+        let mut segs: Vec<String> = path.segments.to_vec();
         if segs
             .first()
             .map(|s| s == "crate" || crate::local_crates::is_local_crate_root(s))
@@ -3496,10 +3496,10 @@ fn run_phase_b_rtype_isolated(
                 .iter()
                 .filter(|(bkey, _)| !already_seen.contains_key(*bkey))
                 .filter_map(|(bkey, gopt)| {
-                    if let Some(g) = gopt {
-                        if skipped.contains(&GraphKey::of(g)) {
-                            return None;
-                        }
+                    if let Some(g) = gopt
+                        && skipped.contains(&GraphKey::of(g))
+                    {
+                        return None;
                     }
                     all_blocks.get(bkey).map(|b| (b.clone(), gopt.clone()))
                 })
@@ -3509,10 +3509,10 @@ fn run_phase_b_rtype_isolated(
             break;
         }
         for (block, gopt) in pending {
-            if let Some(g) = &gopt {
-                if skipped.contains(&GraphKey::of(g)) {
-                    continue;
-                }
+            if let Some(g) = &gopt
+                && skipped.contains(&GraphKey::of(g))
+            {
+                continue;
             }
             let session_at_entry = SubjectSessionSnapshot::capture_fixed_only(call_registry);
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3706,12 +3706,12 @@ pub(crate) fn dual_gate_outcome_from_cache(
     // deferred from `drive_subject`, which did not rtype in Phase A).
     for var in value_to_var.values() {
         let cell = var.concretetype.borrow();
-        if let Some(lltype) = cell.as_ref() {
-            if lowleveltype_to_concrete(lltype).is_err() {
-                return Ok(DualGateOutcome::Skip(
-                    "two-phase: cached lltype does not project".to_string(),
-                ));
-            }
+        if let Some(lltype) = cell.as_ref()
+            && lowleveltype_to_concrete(lltype).is_err()
+        {
+            return Ok(DualGateOutcome::Skip(
+                "two-phase: cached lltype does not project".to_string(),
+            ));
         }
     }
     for lltype in constants.values() {
@@ -3866,7 +3866,8 @@ mod tests {
 
     #[test]
     fn lowleveltype_to_concrete_float_family_collapses_to_float() {
-        for ll in [LowLevelType::Float] {
+        {
+            let ll = LowLevelType::Float;
             assert_eq!(
                 lowleveltype_to_concrete(&ll).expect("supported lltype"),
                 ConcreteType::Float,

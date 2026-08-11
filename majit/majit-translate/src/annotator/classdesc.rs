@@ -594,33 +594,33 @@ impl Attribute {
     /// full.
     pub fn validate(&mut self, homedef: &Rc<RefCell<ClassDef>>) -> Result<(), NoSuchAttrError> {
         // upstream classdesc.py:106-111 — SomePBC / MethodDesc branch.
-        if let SomeValue::PBC(pbc) = &self.s_value {
-            if let Ok(DescKind::Method) = pbc.get_kind() {
-                // upstream:
-                //     if homedef.classdesc.read_attribute(attr, None) is None:
-                //         homedef.check_missing_attribute_update(attr)
-                //
-                // classdesc.read_attribute + ClassDef.check_missing_attribute_
-                // update land with c3; skip silently here. The call site is
-                // preserved as a comment above so the follow-up patch is pure
-                // addition.
-            }
+        if let SomeValue::PBC(pbc) = &self.s_value
+            && let Ok(DescKind::Method) = pbc.get_kind()
+        {
+            // upstream:
+            //     if homedef.classdesc.read_attribute(attr, None) is None:
+            //         homedef.check_missing_attribute_update(attr)
+            //
+            // classdesc.read_attribute + ClassDef.check_missing_attribute_
+            // update land with c3; skip silently here. The call site is
+            // preserved as a comment above so the follow-up patch is pure
+            // addition.
         }
 
         // upstream classdesc.py:113-120 — __slots__ / _attrs_ enforcement.
         let homedef_ref = homedef.borrow();
         let classdesc_rc = homedef_ref.classdesc.clone();
         let classdesc_ref = classdesc_rc.borrow();
-        if let Some(enforced) = &classdesc_ref.all_enforced_attrs {
-            if !enforced.contains(&self.name) {
-                self.attr_allowed = false;
-                if !self.readonly {
-                    return Err(NoSuchAttrError::new(format!(
-                        "the attribute {:?} goes here to {:?}, but it is \
+        if let Some(enforced) = &classdesc_ref.all_enforced_attrs
+            && !enforced.contains(&self.name)
+        {
+            self.attr_allowed = false;
+            if !self.readonly {
+                return Err(NoSuchAttrError::new(format!(
+                    "the attribute {:?} goes here to {:?}, but it is \
                          forbidden here",
-                        self.name, homedef_ref.name
-                    )));
-                }
+                    self.name, homedef_ref.name
+                )));
             }
         }
         Ok(())
@@ -797,10 +797,10 @@ impl ClassDesc {
         if !self.pyobj.qualname().contains('.') {
             return true;
         }
-        if let Some(assert_err) = HOST_ENV.lookup_builtin("AssertionError") {
-            if self.pyobj.is_subclass_of(&assert_err) {
-                return true;
-            }
+        if let Some(assert_err) = HOST_ENV.lookup_builtin("AssertionError")
+            && self.pyobj.is_subclass_of(&assert_err)
+        {
+            return true;
         }
         false
     }
@@ -872,10 +872,11 @@ impl ClassDesc {
         if let Some(ref exc) = exc_cls {
             if &cls == exc {
                 baselist.clear();
-            } else if let Some(ref base_exc) = base_exc_cls {
-                if baselist.len() == 1 && &baselist[0] == base_exc {
-                    baselist = vec![exc.clone()];
-                }
+            } else if let Some(ref base_exc) = base_exc_cls
+                && baselist.len() == 1
+                && &baselist[0] == base_exc
+            {
+                baselist = vec![exc.clone()];
             }
         }
 
@@ -936,17 +937,17 @@ impl ClassDesc {
         Self::add_sources_for_class(&me, &cls)?;
 
         // classdesc.py:559-560 — resolve real base via bookkeeper.getdesc.
-        if let Some(base_host) = base.as_ref() {
-            if object_cls.as_ref() != Some(base_host) {
-                let base_entry = bookkeeper.getdesc(base_host)?;
-                let base_cd = base_entry.as_class().ok_or_else(|| {
-                    AnnotatorError::new(format!(
-                        "ClassDesc.__init__: base class {:?} not routed as ClassDesc",
-                        base_host.qualname()
-                    ))
-                })?;
-                me.borrow_mut().basedesc = Some(base_cd);
-            }
+        if let Some(base_host) = base.as_ref()
+            && object_cls.as_ref() != Some(base_host)
+        {
+            let base_entry = bookkeeper.getdesc(base_host)?;
+            let base_cd = base_entry.as_class().ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "ClassDesc.__init__: base class {:?} not routed as ClassDesc",
+                    base_host.qualname()
+                ))
+            })?;
+            me.borrow_mut().basedesc = Some(base_cd);
         }
 
         // classdesc.py:562-575 — __slots__ / _attrs_ → all_enforced_attrs.
@@ -1034,67 +1035,57 @@ impl ClassDesc {
         mixin: bool,
     ) -> Result<(), AnnotatorError> {
         // classdesc.py:591-602 — property branch.
-        if let ConstValue::HostObject(ref host) = value {
-            if host.is_property() {
-                // upstream: `if value.fget is not None:`
-                //              `newname = name + '__getter__'`
-                //              `func = func_with_new_name(value.fget, newname)`
-                //              `self.add_source_attribute(newname, func, mixin)`.
-                if let Some(fget) = host.property_fget() {
-                    let newname = format!("{name}__getter__");
-                    let renamed = fget
-                        .renamed_user_function(&newname)
-                        .unwrap_or_else(|| fget.clone());
-                    Self::add_source_attribute(
-                        this,
-                        &newname,
-                        ConstValue::HostObject(renamed),
-                        mixin,
-                    )?;
-                }
-                if let Some(fset) = host.property_fset() {
-                    let newname = format!("{name}__setter__");
-                    let renamed = fset
-                        .renamed_user_function(&newname)
-                        .unwrap_or_else(|| fset.clone());
-                    Self::add_source_attribute(
-                        this,
-                        &newname,
-                        ConstValue::HostObject(renamed),
-                        mixin,
-                    )?;
-                }
-                // upstream: `self.classdict[name] = Constant(value)` —
-                // the property object itself is retained for
-                // `_find_property_meth` to pattern-match at transform
-                // time.
-                this.borrow_mut()
-                    .classdict
-                    .insert(name.to_string(), ClassDictEntry::constant(value));
-                return Ok(());
+        if let ConstValue::HostObject(ref host) = value
+            && host.is_property()
+        {
+            // upstream: `if value.fget is not None:`
+            //              `newname = name + '__getter__'`
+            //              `func = func_with_new_name(value.fget, newname)`
+            //              `self.add_source_attribute(newname, func, mixin)`.
+            if let Some(fget) = host.property_fget() {
+                let newname = format!("{name}__getter__");
+                let renamed = fget
+                    .renamed_user_function(&newname)
+                    .unwrap_or_else(|| fget.clone());
+                Self::add_source_attribute(this, &newname, ConstValue::HostObject(renamed), mixin)?;
             }
+            if let Some(fset) = host.property_fset() {
+                let newname = format!("{name}__setter__");
+                let renamed = fset
+                    .renamed_user_function(&newname)
+                    .unwrap_or_else(|| fset.clone());
+                Self::add_source_attribute(this, &newname, ConstValue::HostObject(renamed), mixin)?;
+            }
+            // upstream: `self.classdict[name] = Constant(value)` —
+            // the property object itself is retained for
+            // `_find_property_meth` to pattern-match at transform
+            // time.
+            this.borrow_mut()
+                .classdict
+                .insert(name.to_string(), ClassDictEntry::constant(value));
+            return Ok(());
         }
 
         // classdesc.py:604-618 — FunctionType branch.
-        if let ConstValue::HostObject(ref host) = value {
-            if host.is_user_function() {
-                // upstream: if not hasattr(value, 'class_'): value.class_ =
-                // self.pyobj (debug-only attribute; Rust port skips —
-                // HostObject is immutable-keyed on the inner Arc).
-                if mixin {
-                    let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
-                        AnnotatorError::new("ClassDesc.add_source_attribute: bookkeeper dropped")
-                    })?;
-                    // upstream `newfuncdesc` returns a MemoDesc or
-                    // FunctionDesc DescEntry per the specializer.
-                    let entry = bk.newfuncdesc(host)?;
-                    this.borrow_mut()
-                        .classdict
-                        .insert(name.to_string(), ClassDictEntry::Desc(entry));
-                    return Ok(());
-                }
-                // non-mixin: falls through to Constant storage.
+        if let ConstValue::HostObject(ref host) = value
+            && host.is_user_function()
+        {
+            // upstream: if not hasattr(value, 'class_'): value.class_ =
+            // self.pyobj (debug-only attribute; Rust port skips —
+            // HostObject is immutable-keyed on the inner Arc).
+            if mixin {
+                let bk = this.borrow().bookkeeper.upgrade().ok_or_else(|| {
+                    AnnotatorError::new("ClassDesc.add_source_attribute: bookkeeper dropped")
+                })?;
+                // upstream `newfuncdesc` returns a MemoDesc or
+                // FunctionDesc DescEntry per the specializer.
+                let entry = bk.newfuncdesc(host)?;
+                this.borrow_mut()
+                    .classdict
+                    .insert(name.to_string(), ClassDictEntry::Desc(entry));
+                return Ok(());
             }
+            // non-mixin: falls through to Constant storage.
         }
 
         // classdesc.py:619-622 — staticmethod + mixin. Upstream clones
@@ -1210,11 +1201,11 @@ impl ClassDesc {
                 }
                 Self::add_source_attribute(this, &name, value, true)?;
             }
-            if base.class_has("_immutable_fields_") {
-                if let Ok(fields) = Self::extract_immutable_fields(base) {
-                    for f in fields {
-                        this.borrow_mut().immutable_fields.insert(f);
-                    }
+            if base.class_has("_immutable_fields_")
+                && let Ok(fields) = Self::extract_immutable_fields(base)
+            {
+                for f in fields {
+                    this.borrow_mut().immutable_fields.insert(f);
                 }
             }
         }
@@ -1571,8 +1562,8 @@ impl ClassDesc {
     /// caller-supplied default via `Option::or`.
     pub(crate) fn read_attribute(this: &Rc<RefCell<Self>>, name: &str) -> Option<ClassDictEntry> {
         let cdesc = Self::lookup(this, name)?;
-        let entry = cdesc.borrow().classdict.get(name).cloned();
-        entry
+
+        cdesc.borrow().classdict.get(name).cloned()
     }
 
     /// RPython `ClassDesc.s_read_attribute(self, name)` (classdesc.py:775-782).
@@ -1873,14 +1864,14 @@ impl ClassDesc {
         // upstream: `if self._detect_invalid_attrs and attr in ...: raise`.
         {
             let borrowed = this.borrow();
-            if let Some(detect) = &borrowed.detect_invalid_attrs {
-                if detect.contains(attr) {
-                    return Err(AnnotatorError::new(format!(
-                        "field {:?} was migrated to {:?} from a subclass in \
+            if let Some(detect) = &borrowed.detect_invalid_attrs
+                && detect.contains(attr)
+            {
+                return Err(AnnotatorError::new(format!(
+                    "field {:?} was migrated to {:?} from a subclass in \
                          which it was declared as _immutable_fields_",
-                        attr, borrowed.pyobj
-                    )));
-                }
+                    attr, borrowed.pyobj
+                )));
             }
         }
 
@@ -2762,10 +2753,10 @@ impl ClassDef {
                 for basedef in Self::getmro(this) {
                     let cdesc = basedef.borrow().classdesc.clone();
                     let all_enforced = cdesc.borrow().all_enforced_attrs.clone();
-                    if let Some(attrs) = all_enforced {
-                        if attrs.contains(attrname) {
-                            return Err(super::model::HarmlesslyBlocked.into());
-                        }
+                    if let Some(attrs) = all_enforced
+                        && attrs.contains(attrname)
+                    {
+                        return Err(super::model::HarmlesslyBlocked.into());
                     }
                 }
                 Ok(s_result)
@@ -3037,11 +3028,11 @@ impl ClassDef {
             let bk_opt = base_ref.bookkeeper.upgrade();
             (positions, bk_opt)
         };
-        if let Some(bk) = bk_opt {
-            if let Some(ann) = bk.annotator.borrow().upgrade() {
-                for position in positions {
-                    ann.reflowfromposition(&position);
-                }
+        if let Some(bk) = bk_opt
+            && let Some(ann) = bk.annotator.borrow().upgrade()
+        {
+            for position in positions {
+                ann.reflowfromposition(&position);
             }
         }
         let parent = base.borrow().basedef.clone();
@@ -3067,7 +3058,7 @@ mod tests {
         use rustpython_compiler::{Mode, compile as rp_compile};
         use rustpython_compiler_core::bytecode::ConstantData;
 
-        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+        let code = rp_compile(src, Mode::Exec, "<test>", Default::default())
             .expect("compile should succeed");
         let inner = code
             .constants

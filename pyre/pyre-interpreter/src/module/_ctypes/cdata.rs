@@ -380,7 +380,7 @@ pub(super) fn new_simplecdata_obj(
     tc: &str,
     value: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let size = host_ctypes::simple_type_size(tc).ok_or_else(|| invalid_type_code_error())?;
+    let size = host_ctypes::simple_type_size(tc).ok_or_else(invalid_type_code_error)?;
     let obj = new_cdata_obj_from_bytes(cls, size, &[])?;
     let ba = cdata_buffer(obj).expect("new cdata object has a backing buffer");
     // Encode after the instance exists so a `char*` keepalive can attach to it.
@@ -433,7 +433,7 @@ pub(super) fn ctype_size_of(cls: PyObjectRef) -> Option<usize> {
             // these metaclass-created raw types.
             (!std::ptr::eq(cls, super::funcptr::cfuncptr_type())
                 && unsafe { crate::baseobjspace::lookup_in_type(cls, "_flags_") }.is_some())
-            .then(|| host_ctypes::pointer_size())
+            .then(host_ctypes::pointer_size)
         })
 }
 
@@ -910,11 +910,11 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
         if d.is_null() {
             return;
         }
-        if let Some(index) = unsafe { pyre_object::w_dict_getitem_str(d, BINDEX_KEY) } {
-            if unsafe { pyre_object::is_int(index) } {
-                composite_key.push(':');
-                composite_key.push_str(&unsafe { pyre_object::w_int_get_value(index) }.to_string());
-            }
+        if let Some(index) = unsafe { pyre_object::w_dict_getitem_str(d, BINDEX_KEY) }
+            && unsafe { pyre_object::is_int(index) }
+        {
+            composite_key.push(':');
+            composite_key.push_str(&unsafe { pyre_object::w_int_get_value(index) }.to_string());
         }
         match unsafe { pyre_object::w_dict_getitem_str(d, BBASE_KEY) } {
             Some(base) if !base.is_null() && !unsafe { pyre_object::is_none(base) } => {
@@ -952,10 +952,10 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let objs = pyre_object::gc_roots::shadow_stack_get(objs_slot);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     unsafe {
-        if let Some(previous) = pyre_object::w_dict_getitem_str(objs, &composite_key) {
-            if pyre_object::is_bytes(previous) {
-                pyre_object::bytesobject::w_bytes_dec_ctypes_keepalive_refs(previous);
-            }
+        if let Some(previous) = pyre_object::w_dict_getitem_str(objs, &composite_key)
+            && pyre_object::is_bytes(previous)
+        {
+            pyre_object::bytesobject::w_bytes_dec_ctypes_keepalive_refs(previous);
         }
         if pyre_object::is_bytes(obj) {
             pyre_object::bytesobject::w_bytes_inc_ctypes_keepalive_refs(obj);

@@ -40,6 +40,9 @@ impl Highlighter for EmptyHelper {}
 impl Validator for EmptyHelper {}
 impl Helper for EmptyHelper {}
 
+// The editor is the active backend for the lifetime of an interactive session;
+// boxing it would add indirection without reducing the number of live editors.
+#[allow(clippy::large_enum_variant)]
 enum ReadlineBackend {
     Basic,
     Editor(Editor<EmptyHelper, DefaultHistory>),

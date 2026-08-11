@@ -312,10 +312,10 @@ fn clear_block_bindings(block: &BlockRef) {
             .iter()
             .chain(blk.operations.iter().map(|op| &op.result));
         for v in vars {
-            if let Hlvalue::Variable(var) = v {
-                if let Ok(mut slot) = var.annotation.try_borrow_mut() {
-                    *slot = None;
-                }
+            if let Hlvalue::Variable(var) = v
+                && let Ok(mut slot) = var.annotation.try_borrow_mut()
+            {
+                *slot = None;
             }
         }
     }
@@ -435,17 +435,17 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
                     // the dual-gate Skip arm's graph-wide
                     // `var.annotation = None` reset
                     // (codewriter.rs::dual_gate_type_state).
-                    if let Some(block) = all_blocks.shift_remove(k) {
-                        if !is_fixed {
-                            clear_block_bindings(&block);
-                        }
+                    if let Some(block) = all_blocks.shift_remove(k)
+                        && !is_fixed
+                    {
+                        clear_block_bindings(&block);
                     }
                 }
-                if !new_keys.is_empty() {
-                    if let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut() {
-                        for g in pending.iter_mut() {
-                            g.retain(|k, _| self.annotated_at_entry.contains(k));
-                        }
+                if !new_keys.is_empty()
+                    && let Ok(mut pending) = self.ann.genpendingblocks.try_borrow_mut()
+                {
+                    for g in pending.iter_mut() {
+                        g.retain(|k, _| self.annotated_at_entry.contains(k));
                     }
                 }
             }
@@ -502,7 +502,7 @@ impl RPythonAnnotator {
             .expect("register extfuncregistry");
 
         let translator_was_provided = translator.is_some();
-        let policy = policy.unwrap_or_else(AnnotatorPolicy::new);
+        let policy = policy.unwrap_or_default();
         let annotator_policy = PolicyHandle::from(policy.clone());
         let bookkeeper =
             bookkeeper.unwrap_or_else(|| Rc::new(Bookkeeper::new_with_policy(policy.clone())));
@@ -619,16 +619,16 @@ impl RPythonAnnotator {
     pub fn setbinding(&self, arg: &mut Variable, s_value: SomeValue) {
         {
             let annotation_ref = arg.annotation.borrow();
-            if let Some(s_old) = annotation_ref.as_ref() {
-                if !s_value.contains(s_old) {
-                    // upstream: `log.WARNING(...); assert False`.
-                    // Lattice widening contract — a binding cannot move
-                    // backwards.
-                    panic!(
-                        "setbinding: new value does not contain old ({:?} ⊄ {:?})",
-                        s_value, **s_old
-                    );
-                }
+            if let Some(s_old) = annotation_ref.as_ref()
+                && !s_value.contains(s_old)
+            {
+                // upstream: `log.WARNING(...); assert False`.
+                // Lattice widening contract — a binding cannot move
+                // backwards.
+                panic!(
+                    "setbinding: new value does not contain old ({:?} ⊄ {:?})",
+                    s_value, **s_old
+                );
             }
         }
         *arg.annotation.borrow_mut() = Some(Rc::new(s_value));
@@ -1083,10 +1083,10 @@ impl RPythonAnnotator {
                     ));
                 }
                 // upstream: `if op.result.annotation is None: break`.
-                if let super::super::flowspace::model::Hlvalue::Variable(v) = &op.result {
-                    if v.annotation.borrow().is_none() {
-                        break;
-                    }
+                if let super::super::flowspace::model::Hlvalue::Variable(v) = &op.result
+                    && v.annotation.borrow().is_none()
+                {
+                    break;
                 }
             }
         }
@@ -1231,38 +1231,38 @@ impl RPythonAnnotator {
             other => other,
         };
         // Rewrite SomeBool.knowntypedata under the renaming.
-        if let SV::Bool(b) = &s_out {
-            if let Some(ktd) = &b.knowntypedata {
-                let mut renamed: KnownTypeData = HashMap::new();
-                for (value, constraints) in ktd {
-                    let mut new_inner: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
-                    for (v, s) in constraints {
-                        if let Some(new_vs) = renaming.get(v) {
-                            for new_v in new_vs {
-                                new_inner.insert(Rc::clone(new_v), s.clone());
-                            }
+        if let SV::Bool(b) = &s_out
+            && let Some(ktd) = &b.knowntypedata
+        {
+            let mut renamed: KnownTypeData = HashMap::new();
+            for (value, constraints) in ktd {
+                let mut new_inner: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
+                for (v, s) in constraints {
+                    if let Some(new_vs) = renaming.get(v) {
+                        for new_v in new_vs {
+                            new_inner.insert(Rc::clone(new_v), s.clone());
                         }
                     }
-                    if !new_inner.is_empty() {
-                        renamed.insert(*value, new_inner);
-                    }
                 }
-                // upstream: `assert isinstance(s_out, SomeBool)` + rebuild.
-                let mut newcell = SomeBool::new();
-                // SomeObject.is_immutable_constant (model.py:106-107):
-                // `self.is_constant() and self.immutable`. SomeBool
-                // carries `immutable = True`, so the precondition here
-                // is just "const_box populated".
-                if b.base.const_box.is_some() {
-                    newcell.base.const_box = b.base.const_box.clone();
+                if !new_inner.is_empty() {
+                    renamed.insert(*value, new_inner);
                 }
-                newcell.set_knowntypedata(renamed);
-                // rebuild add_knowntypedata side-effect: not needed —
-                // set_knowntypedata already stores the rebuilt map.
-                let _ = add_knowntypedata; // keep the import alive.
-                let _ = SomeTypeOf::new(vec![]); // keep the import alive.
-                return SV::Bool(newcell);
             }
+            // upstream: `assert isinstance(s_out, SomeBool)` + rebuild.
+            let mut newcell = SomeBool::new();
+            // SomeObject.is_immutable_constant (model.py:106-107):
+            // `self.is_constant() and self.immutable`. SomeBool
+            // carries `immutable = True`, so the precondition here
+            // is just "const_box populated".
+            if b.base.const_box.is_some() {
+                newcell.base.const_box = b.base.const_box.clone();
+            }
+            newcell.set_knowntypedata(renamed);
+            // rebuild add_knowntypedata side-effect: not needed —
+            // set_knowntypedata already stores the rebuilt map.
+            let _ = add_knowntypedata; // keep the import alive.
+            let _ = SomeTypeOf::new(vec![]); // keep the import alive.
+            return SV::Bool(newcell);
         }
         s_out
     }
@@ -1368,14 +1368,14 @@ impl RPythonAnnotator {
             };
             if let Hlvalue::Variable(v) = excvar {
                 let annotation = v.annotation.borrow();
-                if let Some(rc) = annotation.as_ref() {
-                    if rc.can_be_none() {
-                        return Err(crate::annotator::model::AnnotatorError::new(format!(
-                            "{:?} is found by annotation to possibly raise None, but the None \
+                if let Some(rc) = annotation.as_ref()
+                    && rc.can_be_none()
+                {
+                    return Err(crate::annotator::model::AnnotatorError::new(format!(
+                        "{:?} is found by annotation to possibly raise None, but the None \
                              was not suppressed by the flow space",
-                            graph.borrow().name
-                        )));
-                    }
+                        graph.borrow().name
+                    )));
                 }
             }
         }
@@ -1393,14 +1393,14 @@ impl RPythonAnnotator {
     pub(crate) fn force_return_var_annotation(&self, graph: &GraphRef) {
         use super::model::s_impossible_value;
         let returnvar = graph.borrow().getreturnvar();
-        if let Hlvalue::Variable(v) = &returnvar {
-            if v.annotation.borrow().is_none() {
-                let sv = s_impossible_value();
-                let graph_mut = graph.borrow_mut();
-                let mut rb = graph_mut.returnblock.borrow_mut();
-                if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
-                    self.setbinding(vm, sv);
-                }
+        if let Hlvalue::Variable(v) = &returnvar
+            && v.annotation.borrow().is_none()
+        {
+            let sv = s_impossible_value();
+            let graph_mut = graph.borrow_mut();
+            let mut rb = graph_mut.returnblock.borrow_mut();
+            if let Hlvalue::Variable(vm) = &mut rb.inputargs[0] {
+                self.setbinding(vm, sv);
             }
         }
     }
@@ -1418,10 +1418,8 @@ impl RPythonAnnotator {
         let graphs: Vec<GraphRef> = {
             let annotated = self.annotated.borrow();
             let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
-            for gopt in annotated.values() {
-                if let Some(g) = gopt {
-                    seen.entry(GraphKey::of(g)).or_insert_with(|| Rc::clone(g));
-                }
+            for g in annotated.values().flatten() {
+                seen.entry(GraphKey::of(g)).or_insert_with(|| Rc::clone(g));
             }
             seen.into_values().collect()
         };
@@ -1577,10 +1575,10 @@ impl RPythonAnnotator {
             // cannot compensate: by then these keys are already gone
             // from `annotated`, so its `new_keys` sweep never sees
             // them).
-            if let Some(block) = all_blocks.shift_remove(bkey) {
-                if !is_fixed {
-                    clear_block_bindings(&block);
-                }
+            if let Some(block) = all_blocks.shift_remove(bkey)
+                && !is_fixed
+            {
+                clear_block_bindings(&block);
             }
             blocked_blocks.shift_remove(bkey);
         }
@@ -2063,14 +2061,12 @@ impl RPythonAnnotator {
                     Some(Hlvalue::Variable(v)) => {
                         // `elif v_last_exc_type.annotation.is_constant(): s_out.const = v_last_exc_type.annotation.const`.
                         let annotation = v.annotation.borrow();
-                        if let Some(ann) = annotation.as_ref() {
-                            if let SomeValue::TypeOf(t_prev) = ann.as_ref() {
-                                if let Some(c) = t_prev.base.const_box.as_ref() {
-                                    if let SomeValue::TypeOf(t) = &mut s_out {
-                                        t.base.const_box = Some(c.clone());
-                                    }
-                                }
-                            }
+                        if let Some(ann) = annotation.as_ref()
+                            && let SomeValue::TypeOf(t_prev) = ann.as_ref()
+                            && let Some(c) = t_prev.base.const_box.as_ref()
+                            && let SomeValue::TypeOf(t) = &mut s_out
+                        {
+                            t.base.const_box = Some(c.clone());
                         }
                     }
                     None => {}
@@ -3725,7 +3721,7 @@ mod tests {
         assert!(
             err.msg
                 .as_ref()
-                .map_or(false, |m| m.contains("has no get_call_parameters")),
+                .is_some_and(|m| m.contains("has no get_call_parameters")),
             "expected missing `get_call_parameters`, got {:?}",
             err.msg
         );

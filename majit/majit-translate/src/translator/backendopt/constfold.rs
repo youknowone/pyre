@@ -81,20 +81,20 @@ fn fold_op_list(
         };
         if let Some(op_desc) = ll_operations().get(spaceop.opname.as_str()) {
             if !op_desc.sideeffects && args.len() == vargs.len() {
-                if let Some(result) = eval_llop(&spaceop.opname, &args, restype.as_ref()) {
-                    if let Hlvalue::Variable(result_var) = &spaceop.result {
-                        // Upstream `constfold.py:46-47`: opnames in
-                        // `fixup_op_result` post-process the folded
-                        // result (currently only `fixup_solid` for the
-                        // four `getsubstruct` / `getarraysubstruct` /
-                        // `direct_fieldptr` / `direct_arrayitems` ops,
-                        // pinning the parent for keepalive).
-                        let result = fixup_op_result(&spaceop.opname, result);
-                        let constant = constant_for_result(result, &spaceop.result);
-                        constants.insert(result_var.clone(), constant);
-                        folded_count += 1;
-                        continue;
-                    }
+                if let Some(result) = eval_llop(&spaceop.opname, &args, restype.as_ref())
+                    && let Hlvalue::Variable(result_var) = &spaceop.result
+                {
+                    // Upstream `constfold.py:46-47`: opnames in
+                    // `fixup_op_result` post-process the folded
+                    // result (currently only `fixup_solid` for the
+                    // four `getsubstruct` / `getarraysubstruct` /
+                    // `direct_fieldptr` / `direct_arrayitems` ops,
+                    // pinning the parent for keepalive).
+                    let result = fixup_op_result(&spaceop.opname, result);
+                    let constant = constant_for_result(result, &spaceop.result);
+                    constants.insert(result_var.clone(), constant);
+                    folded_count += 1;
+                    continue;
                 }
             } else if matches!(spaceop.opname.as_str(), "ptr_eq" | "int_eq")
                 && spaceop.args.len() == 2
@@ -111,15 +111,14 @@ fn fold_op_list(
             } else if matches!(spaceop.opname.as_str(), "ptr_ne" | "int_ne")
                 && spaceop.args.len() == 2
                 && spaceop.args[0] == spaceop.args[1]
+                && let Hlvalue::Variable(result_var) = &spaceop.result
             {
-                if let Hlvalue::Variable(result_var) = &spaceop.result {
-                    constants.insert(
-                        result_var.clone(),
-                        constant_for_result(ConstValue::Bool(false), &spaceop.result),
-                    );
-                    folded_count += 1;
-                    continue;
-                }
+                constants.insert(
+                    result_var.clone(),
+                    constant_for_result(ConstValue::Bool(false), &spaceop.result),
+                );
+                folded_count += 1;
+                continue;
             }
 
             // Upstream `constfold.py:60-82`: deal with `int_add_ovf`
@@ -261,7 +260,7 @@ pub fn constant_fold_block(block: &BlockRef) {
     };
     if let Some(c) = const_switch {
         // Upstream `:121-132`: filter by `link.llexitcase == switch`.
-        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         let mut remaining_exits: Vec<LinkRef> = exits_snapshot
             .iter()
             .filter(|link| match &link.borrow().llexitcase {
@@ -307,10 +306,10 @@ pub fn constant_fold_block(block: &BlockRef) {
     for link in &block.borrow().exits {
         let mut link = link.borrow_mut();
         for arg in &mut link.args {
-            if let Some(Hlvalue::Variable(v)) = arg {
-                if let Some(c) = constants.get(v) {
-                    *arg = Some(Hlvalue::Constant(c.clone()));
-                }
+            if let Some(Hlvalue::Variable(v)) = arg
+                && let Some(c) = constants.get(v)
+            {
+                *arg = Some(Hlvalue::Constant(c.clone()));
             }
         }
     }
@@ -352,10 +351,10 @@ fn same_constant(c1: &Hlvalue, c2: &Hlvalue) -> bool {
     // — explicit value comparison for GC pointers (so two distinct
     // `Constant(<gcptr>, Ptr(GC...))` instances pointing at the same
     // gc object DO diffuse).
-    if let LowLevelType::Ptr(ptr) = ta {
-        if ptr.TO._gckind() == GcKind::Gc {
-            return a.value == b.value;
-        }
+    if let LowLevelType::Ptr(ptr) = ta
+        && ptr.TO._gckind() == GcKind::Gc
+    {
+        return a.value == b.value;
     }
     // Upstream `:314 return c1 == c2` — `Constant`'s `PartialEq`
     // implements `Hashable.__eq__` directly (value-keyed for hashable
@@ -533,11 +532,11 @@ fn prepare_constant_fold_link(
             Some(Hlvalue::Variable(v)) => Some(v.clone()),
             _ => None,
         };
-        if let Some(v) = exitswitch_var {
-            if let Some(Some(Hlvalue::Constant(c))) = constants.get(&v) {
-                let llexitvalue = c.value.clone();
-                rewire_link_for_known_exitswitch(link, &llexitvalue);
-            }
+        if let Some(v) = exitswitch_var
+            && let Some(Some(Hlvalue::Constant(c))) = constants.get(&v)
+        {
+            let llexitvalue = c.value.clone();
+            rewire_link_for_known_exitswitch(link, &llexitvalue);
         }
         return;
     }
@@ -587,69 +586,67 @@ fn prepare_constant_fold_link(
                 Some(Hlvalue::Variable(v)) => Some(v.clone()),
                 _ => None,
             };
-            if let Some(arg0_var) = nextop_arg0_var {
-                if let Some(Some(arg0_value)) = constants.get(&arg0_var).cloned() {
-                    // Build callargs: resolved function constant, then
-                    // `nextop.args[1:-1]` mapped through `constants1`
-                    // (a copy widened with `complete_constants`).
-                    let mut callargs: Vec<Hlvalue> = vec![arg0_value];
+            if let Some(arg0_var) = nextop_arg0_var
+                && let Some(Some(arg0_value)) = constants.get(&arg0_var).cloned()
+            {
+                // Build callargs: resolved function constant, then
+                // `nextop.args[1:-1]` mapped through `constants1`
+                // (a copy widened with `complete_constants`).
+                let mut callargs: Vec<Hlvalue> = vec![arg0_value];
 
-                    let mut constants1 = constants.clone();
-                    complete_constants(link, &mut constants1);
+                let mut constants1 = constants.clone();
+                complete_constants(link, &mut constants1);
 
-                    let len = nextop.args.len();
-                    let mid = if len >= 2 {
-                        &nextop.args[1..len - 1]
-                    } else {
-                        &[][..]
-                    };
-                    for v in mid {
-                        match v {
-                            Hlvalue::Variable(var) => {
-                                callargs.push(
-                                    constants1
-                                        .get(var)
-                                        .cloned()
-                                        .flatten()
-                                        .unwrap_or_else(|| Hlvalue::Variable(var.clone())),
-                                );
-                            }
-                            other => callargs.push(other.clone()),
+                let len = nextop.args.len();
+                let mid = if len >= 2 {
+                    &nextop.args[1..len - 1]
+                } else {
+                    &[][..]
+                };
+                for v in mid {
+                    match v {
+                        Hlvalue::Variable(var) => {
+                            callargs.push(
+                                constants1
+                                    .get(var)
+                                    .cloned()
+                                    .flatten()
+                                    .unwrap_or_else(|| Hlvalue::Variable(var.clone())),
+                            );
                         }
+                        other => callargs.push(other.clone()),
                     }
-
-                    let Hlvalue::Variable(orig_result) = &nextop.result else {
-                        panic!(
-                            "prepare_constant_fold_link: indirect_call result is not a Variable"
-                        );
-                    };
-                    // Upstream `v_result = Variable(nextop.result)` —
-                    // a fresh Variable named after the original, with
-                    // the same concretetype. `Variable::copy` matches
-                    // both invariants.
-                    let v_result = orig_result.copy();
-                    constants.insert(
-                        orig_result.clone(),
-                        Some(Hlvalue::Variable(v_result.clone())),
-                    );
-
-                    let callop =
-                        SpaceOperation::new("direct_call", callargs, Hlvalue::Variable(v_result));
-                    let newblock = insert_empty_block(link, vec![callop]);
-                    let exits = newblock.borrow().exits.clone();
-                    assert_eq!(
-                        exits.len(),
-                        1,
-                        "insert_empty_block should leave exactly one exit"
-                    );
-                    let new_link = exits.into_iter().next().unwrap();
-                    assert!(matches!(
-                        new_link.borrow().target.as_ref(),
-                        Some(t) if std::rc::Rc::ptr_eq(t, &block)
-                    ));
-                    effective_link = new_link;
-                    effective_folded += 1;
                 }
+
+                let Hlvalue::Variable(orig_result) = &nextop.result else {
+                    panic!("prepare_constant_fold_link: indirect_call result is not a Variable");
+                };
+                // Upstream `v_result = Variable(nextop.result)` —
+                // a fresh Variable named after the original, with
+                // the same concretetype. `Variable::copy` matches
+                // both invariants.
+                let v_result = orig_result.copy();
+                constants.insert(
+                    orig_result.clone(),
+                    Some(Hlvalue::Variable(v_result.clone())),
+                );
+
+                let callop =
+                    SpaceOperation::new("direct_call", callargs, Hlvalue::Variable(v_result));
+                let newblock = insert_empty_block(link, vec![callop]);
+                let exits = newblock.borrow().exits.clone();
+                assert_eq!(
+                    exits.len(),
+                    1,
+                    "insert_empty_block should leave exactly one exit"
+                );
+                let new_link = exits.into_iter().next().unwrap();
+                assert!(matches!(
+                    new_link.borrow().target.as_ref(),
+                    Some(t) if std::rc::Rc::ptr_eq(t, &block)
+                ));
+                effective_link = new_link;
+                effective_folded += 1;
             }
         }
     }
@@ -876,7 +873,7 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
         // is prepended to `block.operations`.
         let mut b = block.borrow_mut();
         let mut new_ops = same_as_ops;
-        new_ops.extend(b.operations.drain(..));
+        new_ops.append(&mut b.operations);
         b.operations = new_ops;
         drop(b);
         // Upstream `:302-303`: `if same_as: constant_fold_block(block)`.
@@ -939,7 +936,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
                     && tb.canraise()
                     && lastop
                         .as_ref()
-                        .map_or(false, |op| op.opname.ends_with("_ovf"));
+                        .is_some_and(|op| op.opname.ends_with("_ovf"));
                 (lastop, is_ovf)
             };
 

@@ -1359,7 +1359,7 @@ pub fn op_convert_longlong_bytes_to_float(args: &[ConstValue]) -> Option<ConstVa
 /// RPython `char_lt`/`char_le`/`char_eq`/`char_ne`/`char_gt`/`char_ge`
 /// derived via `get_primitive_op_src` (`opimpl.py:58-67`). The
 /// length-1 carrier is a 1-byte [`ConstValue::ByteStr`].
-fn char_pair<'a>(args: &'a [ConstValue]) -> Option<(u8, u8)> {
+fn char_pair(args: &[ConstValue]) -> Option<(u8, u8)> {
     match args {
         [ConstValue::ByteStr(a), ConstValue::ByteStr(b)] if a.len() == 1 && b.len() == 1 => {
             Some((a[0], b[0]))

@@ -517,7 +517,7 @@ pub fn load_statresult<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<StatRes
 /// C `printf("%.*g", precision, x)` — matches RPython `formatd(x, 'g', precision)`.
 fn c_format_g(x: f64, precision: i32) -> Vec<u8> {
     unsafe {
-        let fmt = b"%.*g\0".as_ptr() as *const libc::c_char;
+        let fmt = c"%.*g".as_ptr();
         let needed = libc::snprintf(std::ptr::null_mut(), 0, fmt, precision as libc::c_int, x);
         if needed < 0 {
             return Vec::new();

@@ -971,7 +971,7 @@ pub fn set_opt_level(config: &Rc<Config>, level: &str) -> Result<(), ConfigError
             }
             other => {
                 // Upstream `:374`: `raise ValueError(word)`.
-                return Err(ConfigError::Generic(format!("{}", other)));
+                return Err(ConfigError::Generic(other.to_string()));
             }
         }
     }

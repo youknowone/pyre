@@ -145,10 +145,10 @@ pub extern "C" fn jit_load_name_from_namespace(
         // `_load_global` builtin fallback also fires on non-module-dict
         // globals (e.g. exec/eval with a plain `dict` for globals).
         let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-        if !w_builtin_dict.is_null() {
-            if let Ok(Some(v)) = crate::baseobjspace::finditem_str(w_builtin_dict, name) {
-                return v as i64;
-            }
+        if !w_builtin_dict.is_null()
+            && let Ok(Some(v)) = crate::baseobjspace::finditem_str(w_builtin_dict, name)
+        {
+            return v as i64;
         }
     }
     std::ptr::null_mut::<()>() as i64
@@ -216,10 +216,10 @@ pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
 /// garbage on Err; resume data hands control to the except block.
 #[inline]
 pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
-    if exc_obj != PY_NULL {
-        if let Some(raiser) = JIT_EXC_RAISER.get() {
-            raiser(exc_obj as i64);
-        }
+    if exc_obj != PY_NULL
+        && let Some(raiser) = JIT_EXC_RAISER.get()
+    {
+        raiser(exc_obj as i64);
     }
 }
 
@@ -1163,10 +1163,10 @@ pub fn sequence_len(seq: PyObjectRef) -> Result<usize, PyError> {
             return Ok(w_str_len(seq));
         }
         // Try __len__ on instances
-        if is_instance(seq) {
-            if let Ok(len_val) = crate::baseobjspace::len(seq) {
-                return Ok(w_int_get_value(len_val) as usize);
-            }
+        if is_instance(seq)
+            && let Ok(len_val) = crate::baseobjspace::len(seq)
+        {
+            return Ok(w_int_get_value(len_val) as usize);
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",

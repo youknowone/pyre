@@ -424,10 +424,10 @@ fn walk_rs_files<F: FnMut(&std::path::Path, &str)>(dir: &std::path::Path, f: &mu
         let path = entry.path();
         if path.is_dir() {
             walk_rs_files(&path, f);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                f(&path, &contents);
-            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+            && let Ok(contents) = std::fs::read_to_string(&path)
+        {
+            f(&path, &contents);
         }
     }
 }

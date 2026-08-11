@@ -130,10 +130,10 @@ impl PtrInfoHandle {
     /// so two independently synthesized ConstPtrInfo handles for the
     /// same pointer are `same_info`.
     pub fn same_info(&self, other: &PtrInfoHandle) -> bool {
-        if let (PtrInfoHandle::Live(a), PtrInfoHandle::Live(b)) = (self, other) {
-            if std::rc::Rc::ptr_eq(a, b) {
-                return true;
-            }
+        if let (PtrInfoHandle::Live(a), PtrInfoHandle::Live(b)) = (self, other)
+            && std::rc::Rc::ptr_eq(a, b)
+        {
+            return true;
         }
 
         fn constptr_same_info(a: &PtrInfo, b: &PtrInfo) -> bool {
@@ -1265,12 +1265,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // `storage.rd_virtuals` keeps the shared handle so two guards that
         // reference the same virtual with the same fieldnums end up pointing
         // at the same `RdVirtualInfo` object.
-        if let Some(cache) = info.cached_vinfo() {
-            if let Some(vinfo) = cache.borrow().as_ref() {
-                if vinfo.equals(&fieldnums) {
-                    return Some(std::rc::Rc::clone(vinfo));
-                }
-            }
+        if let Some(cache) = info.cached_vinfo()
+            && let Some(vinfo) = cache.borrow().as_ref()
+            && vinfo.equals(&fieldnums)
+        {
+            return Some(std::rc::Rc::clone(vinfo));
         }
         let mut builder = RdVirtualInfoBuilder;
         let mut vinfo = info.visitor_dispatch_virtual_type(&mut builder)??;
@@ -1287,12 +1286,11 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             // handle directly onto the operand's PtrInfo so subsequent
             // operand-path readers (`virtual_info_would_be_reused`)
             // observe the cached vinfo.
-            if let Some(b) = resolved_box.as_ref() {
-                if let Some(pi) = b.ptr_info_mut() {
-                    if let Some(c) = pi.cached_vinfo() {
-                        *c.borrow_mut() = Some(std::rc::Rc::clone(&shared));
-                    }
-                }
+            if let Some(b) = resolved_box.as_ref()
+                && let Some(pi) = b.ptr_info_mut()
+                && let Some(c) = pi.cached_vinfo()
+            {
+                *c.borrow_mut() = Some(std::rc::Rc::clone(&shared));
             }
         }
         Some(shared)
@@ -1526,7 +1524,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
                             1
                         }
                     }),
-                    is_signed: ad.map_or(true, |a| a.is_item_signed()),
+                    is_signed: ad.is_none_or(|a| a.is_item_signed()),
                 }
             })
             .collect();
@@ -2043,25 +2041,25 @@ impl OptContext {
         // (mod.rs::emit invariant), so a single removal is sufficient. The
         // `ptr_eq` guard skips the self-clone — and its `RefCell` double-borrow
         // — when `op` is already the registered stand-in.
-        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos) {
-            if !std::rc::Rc::ptr_eq(&superseded, op) {
-                let carried = superseded.forwarded.borrow().clone();
-                *op.forwarded.borrow_mut() = carried;
-                // replace_op_with parity (optimizer.py:403-411): forward the
-                // superseded stand-in to `op`. A consumer dispatched before
-                // this supersession bound its operand to `superseded` (the
-                // producer registered at its dispatch-entry rebind); without
-                // this link its box-native walk freezes on the orphaned
-                // stand-in while `find_producer_op` resolves `op`, so a later
-                // operand fold lands on a different host than the OpRef path
-                // observes. `superseded` stays alive in operand `Operand::Op`
-                // strong refs, so the `Weak` upgrades and the chain reaches
-                // `op`. Mirrors `emit`'s live-synthetic catch-up so a
-                // supersession chain (stand-in → extra-producer → emitted op)
-                // stays transitively resolvable to the final producer.
-                use majit_ir::forwarding::ForwardingHost;
-                superseded.set_forwarded_op(op);
-            }
+        if let Some(superseded) = self.live_synthetics_swap_remove_pos(pos)
+            && !std::rc::Rc::ptr_eq(&superseded, op)
+        {
+            let carried = superseded.forwarded.borrow().clone();
+            *op.forwarded.borrow_mut() = carried;
+            // replace_op_with parity (optimizer.py:403-411): forward the
+            // superseded stand-in to `op`. A consumer dispatched before
+            // this supersession bound its operand to `superseded` (the
+            // producer registered at its dispatch-entry rebind); without
+            // this link its box-native walk freezes on the orphaned
+            // stand-in while `find_producer_op` resolves `op`, so a later
+            // operand fold lands on a different host than the OpRef path
+            // observes. `superseded` stays alive in operand `Operand::Op`
+            // strong refs, so the `Weak` upgrades and the chain reaches
+            // `op`. Mirrors `emit`'s live-synthetic catch-up so a
+            // supersession chain (stand-in → extra-producer → emitted op)
+            // stays transitively resolvable to the final producer.
+            use majit_ir::forwarding::ForwardingHost;
+            superseded.set_forwarded_op(op);
         }
         self.resop_refs.insert(pos, op.clone());
         self.live_synthetics_push(op.clone());
@@ -2134,10 +2132,10 @@ impl OptContext {
                 // return the position itself — `resoperation.py:57-68
                 // get_box_replacement`, where a box with no `_forwarded`
                 // resolves to itself.
-                if let Some(ia) = self.inputarg_refs.get(idx) {
-                    if ia.index as usize == idx {
-                        return Some(Operand::from_bound_inputarg(ia));
-                    }
+                if let Some(ia) = self.inputarg_refs.get(idx)
+                    && ia.index as usize == idx
+                {
+                    return Some(Operand::from_bound_inputarg(ia));
                 }
             }
             _ => {}
@@ -2492,10 +2490,10 @@ impl OptContext {
     pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> OpRef {
         let resolved_box = self.get_box_replacement_operand_opt(info_opref);
         // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
-        if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b)) {
-            if let Some(lgtop) = info.get_cached_lgtop() {
-                return lgtop;
-            }
+        if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b))
+            && let Some(lgtop) = info.get_cached_lgtop()
+        {
+            return lgtop;
         }
         // vstring.py:174/253: constant or structurally-known length
         let known_len = resolved_box
@@ -2519,10 +2517,10 @@ impl OptContext {
             .and_then(|b| self.getptrinfo(b))
             .and_then(|info| {
                 use crate::optimizeopt::info::VStringVariant;
-                if let PtrInfo::Str(sinfo) = info {
-                    if let VStringVariant::Concat(c) = sinfo.variant {
-                        return Some((c.vleft.to_opref(), c.vright.to_opref()));
-                    }
+                if let PtrInfo::Str(sinfo) = info
+                    && let VStringVariant::Concat(c) = sinfo.variant
+                {
+                    return Some((c.vleft.to_opref(), c.vright.to_opref()));
                 }
                 None
             });
@@ -2564,10 +2562,10 @@ impl OptContext {
             .get_box_replacement_operand_opt(info_opref)
             .as_ref()
             .and_then(|b| self.get_str_lenbound(b));
-        if let Some(bound) = lenbound {
-            if let Some(result_box) = self.get_box_replacement_operand_opt(result) {
-                self.setintbound(&result_box, &bound);
-            }
+        if let Some(bound) = lenbound
+            && let Some(result_box) = self.get_box_replacement_operand_opt(result)
+        {
+            self.setintbound(&result_box, &bound);
         }
         // vstring.py:117: self.lgtop = lengthop
         if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
@@ -2825,7 +2823,7 @@ impl OptContext {
             );
             let has_op_fwd = self
                 .get_box_replacement_operand_opt(op.pos.get())
-                .map_or(false, |b| self.has_op_forwarding(&b));
+                .is_some_and(|b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
                 "emit: op-forwarding redirect set on non-void result position {:?} — \
@@ -2873,15 +2871,10 @@ impl OptContext {
             // optimizer.py:705-711: is_call_pure_pure_canraise — CallPure that
             // can_raise(ignore_memoryerror=True) counts as side-effectful even
             // though has_no_side_effect is true for call_pure opcodes.
-            let dominated_by_side_effect = if (op.opcode.has_no_side_effect()
+            let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
                 || op.opcode.is_ovf()
                 || op.opcode.is_jit_debug())
-                && !Self::is_call_pure_pure_canraise(&op)
-            {
-                false
-            } else {
-                true
-            };
+                && !Self::is_call_pure_pure_canraise(&op));
             if dominated_by_side_effect {
                 self.last_guard_idx = None;
             }
@@ -3294,7 +3287,7 @@ impl OptContext {
                             arg.to_opref(),
                             self,
                             &produced_results,
-                            &mut imported_constants,
+                            imported_constants,
                         ) else {
                             return false;
                         };
@@ -3339,7 +3332,7 @@ impl OptContext {
                         object_arg.to_opref(),
                         self,
                         &produced_results,
-                        &mut imported_constants,
+                        imported_constants,
                     ) else {
                         return false;
                     };
@@ -3682,14 +3675,14 @@ impl OptContext {
                     majit_ir::forwarding::Forwarded::None
                 )
             });
-            if is_input || has_replay_marker {
-                if let Some(info) = snapshot_forwarded(self, arg) {
-                    arg_entries.push(ArgEntry {
-                        arg,
-                        info,
-                        is_input,
-                    });
-                }
+            if (is_input || has_replay_marker)
+                && let Some(info) = snapshot_forwarded(self, arg)
+            {
+                arg_entries.push(ArgEntry {
+                    arg,
+                    info,
+                    is_input,
+                });
             }
             // shortpreamble.py:391 `elif arg.get_forwarded() is None: pass`
             // is the no-info branch; falling out of `snapshot_forwarded`
@@ -3759,10 +3752,10 @@ impl OptContext {
         if source.is_constant() {
             return;
         }
-        if let Some(b) = self.get_box_replacement_operand_opt(source) {
-            if self.has_forwarding(&b) {
-                return;
-            }
+        if let Some(b) = self.get_box_replacement_operand_opt(source)
+            && self.has_forwarding(&b)
+        {
+            return;
         }
         // shortpreamble.py:425 `preamble_op.set_forwarded(info)`. The replay
         // OpRef is a short-preamble op whose producer may not be registered
@@ -3887,10 +3880,10 @@ impl OptContext {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // (covers Op redirect + Info + IntBound + Const states uniformly,
         // matching the sibling setinfo_from_preamble_item pattern below.)
-        if let Some(b) = self.get_box_replacement_operand_opt(op) {
-            if self.has_forwarding(&b) {
-                return;
-            }
+        if let Some(b) = self.get_box_replacement_operand_opt(op)
+            && self.has_forwarding(&b)
+        {
+            return;
         }
         // unroll.py:57: if op.is_constant(): return
         if self
@@ -4093,10 +4086,10 @@ impl OptContext {
         // unroll.py:53-54 `op = get_box_replacement(op)`
         let target = self.get_replacement_opref(op);
         // unroll.py:55-56 `if op.get_forwarded() is not None: return`
-        if let Some(b) = self.get_box_replacement_operand_opt(op) {
-            if self.has_forwarding(&b) {
-                return;
-            }
+        if let Some(b) = self.get_box_replacement_operand_opt(op)
+            && self.has_forwarding(&b)
+        {
+            return;
         }
         // unroll.py:57-58 `if op.is_constant(): return`
         if self
@@ -4167,10 +4160,10 @@ impl OptContext {
         {
             return;
         }
-        if let Some(b) = self.get_box_replacement_operand_opt(op) {
-            if self.has_forwarding(&b) {
-                return;
-            }
+        if let Some(b) = self.get_box_replacement_operand_opt(op)
+            && self.has_forwarding(&b)
+        {
+            return;
         }
         match preamble_info {
             OpInfo::Ptr(rc) => {
@@ -4739,18 +4732,18 @@ impl OptContext {
         if raw_hit {
             return "b-typetag";
         }
-        if self.inputargs.iter().any(|o| *o == opref) {
+        if self.inputargs.contains(&opref) {
             return "b-rekey-inputargs";
         }
-        if let Some(label_args) = self.imported_label_args.as_ref() {
-            if label_args.iter().any(|o| *o == opref) {
-                return "b-rekey-label";
-            }
+        if let Some(label_args) = self.imported_label_args.as_ref()
+            && label_args.contains(&opref)
+        {
+            return "b-rekey-label";
         }
-        if let Some((_, vargs)) = self.imported_virtual_args.as_ref() {
-            if vargs.iter().any(|o| *o == opref) {
-                return "b-rekey-vargs";
-            }
+        if let Some((_, vargs)) = self.imported_virtual_args.as_ref()
+            && vargs.contains(&opref)
+        {
+            return "b-rekey-vargs";
         }
         if self
             .imported_short_pure_ops
@@ -4815,7 +4808,8 @@ impl OptContext {
     /// resolve-then-rewrap, asserted below.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         self.heal_arg_to_canonical(arg);
-        let native = if arg.bound_op().is_some() || arg.is_constant() {
+
+        if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
             // position lives in the `OpRef` store (see `resolve_box_box`).
@@ -4826,8 +4820,7 @@ impl OptContext {
             }
         } else {
             self.get_box_replacement_operand(arg.to_opref())
-        };
-        native
+        }
     }
 
     /// `Option`-returning native sibling of [`resolve_operand_operand`], the
@@ -4838,7 +4831,8 @@ impl OptContext {
     /// total [`get_box_replacement_operand`](Self::get_box_replacement_operand).
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
         self.heal_arg_to_canonical(arg);
-        let native = if arg.bound_op().is_some() || arg.is_constant() {
+
+        if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             if resolved.same_box(arg) {
                 Some(
@@ -4850,8 +4844,7 @@ impl OptContext {
             }
         } else {
             self.get_box_replacement_operand_opt(arg.to_opref())
-        };
-        native
+        }
     }
 
     /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
@@ -4903,10 +4896,10 @@ impl OptContext {
         }
         // Skip when `canon` wraps the same bound `Op` as `arg` under a distinct
         // host — linking would be a one-node self-cycle.
-        if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op()) {
-            if std::rc::Rc::ptr_eq(&ao, &co) {
-                return;
-            }
+        if let (Some(ao), Some(co)) = (arg.bound_op(), canon.bound_op())
+            && std::rc::Rc::ptr_eq(&ao, &co)
+        {
+            return;
         }
         if let Some(value) = canon.const_value() {
             arg.set_forwarded_const(majit_ir::Const::from_value(value));
@@ -4972,10 +4965,8 @@ impl OptContext {
     /// `get_box_replacement_operand`'s body without the position-only panic
     /// fallback.
     pub fn get_box_replacement_operand_opt(&self, opref: OpRef) -> Option<Operand> {
-        let native = self
-            .resolve_to_operand(opref)
-            .map(|start| start.get_box_replacement(false));
-        native
+        self.resolve_to_operand(opref)
+            .map(|start| start.get_box_replacement(false))
     }
 
     /// `optimizer.py:1009 getptrinfo + info.is_virtual()` operand-path
@@ -4994,7 +4985,7 @@ impl OptContext {
     pub fn is_virtual(&self, op: &Operand) -> bool {
         op.get_box_replacement(false)
             .ptr_info()
-            .map_or(false, |p| p.is_virtual())
+            .is_some_and(|p| p.is_virtual())
     }
 
     /// `info.py:41-42 PtrInfo.is_nonnull` (base False) + subclass
@@ -5004,7 +4995,7 @@ impl OptContext {
     pub fn is_nonnull(&self, op: &Operand) -> bool {
         op.get_box_replacement(false)
             .ptr_info()
-            .map_or(false, |p| p.is_nonnull())
+            .is_some_and(|p| p.is_nonnull())
     }
 
     /// `optimizer.py:99-113 getintbound(op)` read variant — returns an
@@ -5030,9 +5021,7 @@ impl OptContext {
     ) -> Option<crate::optimizeopt::intutils::IntBound> {
         let resolved = op.get_box_replacement(false);
         if let Some(Value::Int(v)) = resolved.const_value() {
-            return Some(crate::optimizeopt::intutils::IntBound::from_constant(
-                v as i64,
-            ));
+            return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
         }
         resolved.int_bound().map(|ib| ib.clone())
     }
@@ -5061,7 +5050,7 @@ impl OptContext {
     ) -> Option<R> {
         let resolved = op.get_box_replacement(false);
         let mut pi = resolved.ptr_info_mut()?;
-        let result = f(&mut *pi);
+        let result = f(&mut pi);
         Some(result)
     }
 
@@ -5116,7 +5105,7 @@ impl OptContext {
         use crate::optimizeopt::info::PtrInfo;
         op.get_box_replacement(false)
             .ptr_info()
-            .map_or(false, |p| matches!(*p, PtrInfo::Virtualizable(_)))
+            .is_some_and(|p| matches!(*p, PtrInfo::Virtualizable(_)))
     }
 
     /// resoperation.py: op.get_forwarded() is not None — check if OpRef
@@ -5222,9 +5211,7 @@ impl OptContext {
             .get_box_replacement_operand_opt(replaced)
             .and_then(|cb| cb.const_value())
         {
-            return Some(crate::optimizeopt::intutils::IntBound::from_constant(
-                v as i64,
-            ));
+            return Some(crate::optimizeopt::intutils::IntBound::from_constant(v));
         }
         // optimizer.py:107 second `assert op.type == 'i'` — Box.type is
         // immutable in RPython, so the replaced op must still be int-typed.
@@ -5280,7 +5267,7 @@ impl OptContext {
         );
         if let Some(Value::Int(v)) = resolved.const_value() {
             return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::from_constant(
-                v as i64,
+                v,
             ));
         }
         match &resolved.get_forwarded() {
@@ -5397,7 +5384,7 @@ impl OptContext {
         // a no-op (already at the constant value), and the bound is
         // discarded after the closure — the Const box stays canonical.
         if let Some(Value::Int(v)) = resolved.const_value() {
-            let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(v as i64);
+            let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(v);
             return f(&mut tmp);
         }
         if resolved.is_constant() {
@@ -5421,7 +5408,7 @@ impl OptContext {
         }
         if let Some(mut bound) = resolved.int_bound_mut() {
             // optimizer.py:106-107: existing IntBound — mutate in place.
-            return f(&mut *bound);
+            return f(&mut bound);
         }
         // optimizer.py:108-109 rare case: forwarded is AbstractInfo other
         // than IntBound (RawBufferPtrInfo, FloatConst, etc.) — return a
@@ -5451,28 +5438,26 @@ impl OptContext {
         // optimizer.py:415: box = get_box_replacement(box)
         let op = op.get_box_replacement(false);
         // optimizer.py:418-429: IntBound safety check
-        if let Value::Int(intval) = value {
-            if let Some(mut bound) = op.int_bound_mut() {
-                if !bound.contains(intval as i64) {
-                    drop(bound);
-                    self.signal_invalid_loop(
-                        "constant int is outside the range allowed for that box",
-                    );
-                    return;
-                }
-                let _ = bound.make_eq_const(intval as i64);
+        if let Value::Int(intval) = value
+            && let Some(mut bound) = op.int_bound_mut()
+        {
+            if !bound.contains(intval) {
+                drop(bound);
+                self.signal_invalid_loop("constant int is outside the range allowed for that box");
+                return;
             }
+            let _ = bound.make_eq_const(intval);
         }
         // optimizer.py:430: if box.is_constant(): return
         if op.is_constant() || op.const_value().is_some() {
             return;
         }
         // optimizer.py:432-434: copy_fields_to_const for Ref
-        if let Value::Ref(gcref) = value {
-            if let Some(pos) = op.position() {
-                let opref = majit_ir::OpRef::ref_op(pos);
-                self.copy_fields_to_const(opref, gcref);
-            }
+        if let Value::Ref(gcref) = value
+            && let Some(pos) = op.position()
+        {
+            let opref = majit_ir::OpRef::ref_op(pos);
+            self.copy_fields_to_const(opref, gcref);
         }
         // optimizer.py:432: box.set_forwarded(constbox). Terminate the
         // chain in an inline value-typed Const payload (history.py:227/
@@ -5868,12 +5853,11 @@ impl OptContext {
         // is excluded for the same reason as in the Optimizer path:
         // pyjitpl.py:3236 emits it at finish() only, so no exception
         // guard can follow.
-        if opnum == OpCode::GuardNoException || opnum == OpCode::GuardException {
-            if let Some(idx) = self.last_guard_idx {
-                if self.new_operations[idx].opcode != OpCode::GuardNotForced {
-                    self.last_guard_idx = None;
-                }
-            }
+        if (opnum == OpCode::GuardNoException || opnum == OpCode::GuardException)
+            && let Some(idx) = self.last_guard_idx
+            && self.new_operations[idx].opcode != OpCode::GuardNotForced
+        {
+            self.last_guard_idx = None;
         }
 
         // optimizer.py:665-670: GUARD_ALWAYS_FAILS must never share.
@@ -5968,10 +5952,10 @@ impl OptContext {
                         // regalloc.py:1206: Const objects skip forcing.
                         // Constant OpRefs may collide with virtual positions;
                         // forcing would corrupt the virtual's PtrInfo.
-                        if !self
+                        if self
                             .get_box_replacement_operand_opt(farg)
                             .and_then(|cb| cb.const_value())
-                            .is_some()
+                            .is_none()
                         {
                             self.force_box_inline(farg);
                         }
@@ -6065,24 +6049,23 @@ impl OptContext {
         //     return ConstInt(info.get_constant_int())
         // Mirrors Optimizer::force_box — a forced operand with an already-constant
         // IntBound materializes as ConstInt; peek the bound without installing.
-        if let Some(rb) = self.get_box_replacement_operand_opt(resolved) {
-            if rb.const_value().is_none() && rb.type_() == Type::Int {
-                if let Some(bound) = self.peek_intbound_box(&rb) {
-                    if bound.is_constant() {
-                        return self.make_constant_int(bound.get_constant_int());
-                    }
-                }
-            }
+        if let Some(rb) = self.get_box_replacement_operand_opt(resolved)
+            && rb.const_value().is_none()
+            && rb.type_() == Type::Int
+            && let Some(bound) = self.peek_intbound_box(&rb)
+            && bound.is_constant()
+        {
+            return self.make_constant_int(bound.get_constant_int());
         }
         let resolved_op = self.get_box_replacement_operand_opt(opref);
-        if let Some(mut info) = resolved_op.as_ref().and_then(|b| self.peek_ptr_info(b)) {
-            if info.is_virtual() {
-                let resolved_op = resolved_op
-                    .clone()
-                    .expect("is_virtual implies resolved_op is Some");
-                let forced = info.force_box(&resolved_op, self);
-                return self.get_replacement_opref(forced);
-            }
+        if let Some(mut info) = resolved_op.as_ref().and_then(|b| self.peek_ptr_info(b))
+            && info.is_virtual()
+        {
+            let resolved_op = resolved_op
+                .clone()
+                .expect("is_virtual implies resolved_op is Some");
+            let forced = info.force_box(&resolved_op, self);
+            return self.get_replacement_opref(forced);
         }
         resolved
     }
@@ -6132,11 +6115,11 @@ impl OptContext {
         // limited to the standalone test entry.  Either way only fresh
         // descrs reach this function.
         assert!(
-            op.getdescr().map_or(true, |d| d.is_resume_guard()),
+            op.getdescr().is_none_or(|d| d.is_resume_guard()),
             "optimizer.py:723 store_final_boxes_in_guard expects \
              ResumeGuardDescr, got non-resume descr (kind={:?}, copied={})",
             op.getdescr().map(|d| d.index()),
-            op.getdescr().map_or(false, |d| d.is_resume_guard_copied())
+            op.getdescr().is_some_and(|d| d.is_resume_guard_copied())
         );
 
         // A walker-native range FOR_ITER class guard carries a pre-minted
@@ -6301,7 +6284,7 @@ impl OptContext {
                     let is_virtual = self
                         .get_box_replacement_operand_opt(boxref)
                         .as_ref()
-                        .map_or(false, |b| self.is_virtual(b));
+                        .is_some_and(|b| self.is_virtual(b));
                     let tp = majit_ir::BoxEnv::get_type(&env, boxref);
                     (boxref, resolved, is_virtual, tp)
                 })
@@ -6325,7 +6308,7 @@ impl OptContext {
                     let is_virtual = self
                         .get_box_replacement_operand_opt(boxref)
                         .as_ref()
-                        .map_or(false, |b| self.is_virtual(b));
+                        .is_some_and(|b| self.is_virtual(b));
                     let tp = majit_ir::BoxEnv::get_type(&env, boxref);
                     (boxref, resolved, is_virtual, tp)
                 })
@@ -6339,7 +6322,7 @@ impl OptContext {
                     let is_virtual = self
                         .get_box_replacement_operand_opt(boxref)
                         .as_ref()
-                        .map_or(false, |b| self.is_virtual(b));
+                        .is_some_and(|b| self.is_virtual(b));
                     let tp = majit_ir::BoxEnv::get_type(&env, boxref);
                     (boxref, resolved, is_virtual, tp)
                 })
@@ -6615,12 +6598,11 @@ impl OptContext {
             return Some(v);
         }
         // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
-        if resolved.type_() == majit_ir::Type::Int {
-            if let Some(b) = resolved.int_bound() {
-                if b.is_constant() {
-                    return Some(Value::Int(b.get_constant_int()));
-                }
-            }
+        if resolved.type_() == majit_ir::Type::Int
+            && let Some(b) = resolved.int_bound()
+            && b.is_constant()
+        {
+            return Some(Value::Int(b.get_constant_int()));
         }
         None
     }
@@ -7015,10 +6997,10 @@ impl OptContext {
         //    variant is typed by step 1); inline-Const collapsed the old
         //    pool-indexed "seeded constant without a typed variant" case
         //    into step 1, so no separate const-value fall-through remains.
-        if let Some(op) = self.op_at(resolved) {
-            if op.type_ != majit_ir::Type::Void {
-                return Some(op.type_);
-            }
+        if let Some(op) = self.op_at(resolved)
+            && op.type_ != majit_ir::Type::Void
+        {
+            return Some(op.type_);
         }
         // 3. PtrInfo-derived type (box.type parity for
         //    virtual heads across phase boundaries). Phase 1 virtualizes
@@ -7789,8 +7771,7 @@ impl OptContext {
             // walked above (`resolved` shadows here for parity).
             // optimizer.py:102-103: if isinstance(op, ConstInt): from_constant
             if let Some(Value::Int(v)) = resolved.const_value() {
-                return crate::optimizeopt::intutils::IntBound::from_constant(v as i64)
-                    .getnullness();
+                return crate::optimizeopt::intutils::IntBound::from_constant(v).getnullness();
             }
             // optimizer.py:104-109: fw = op.get_forwarded(); branch on type.
             {
@@ -8123,10 +8104,10 @@ impl OptContext {
         let value = self.materialize_operand_at(value);
         let arg0 = self.resolve_operand_operand(&op.arg(0));
         if arg0.is_constant() || arg0.const_value().is_some() {
-            if let Some(descr) = op.getdescr() {
-                if let Some(info) = self.get_const_info_array_mut_box(&arg0, descr) {
-                    info.setitem(index, value.clone());
-                }
+            if let Some(descr) = op.getdescr()
+                && let Some(info) = self.get_const_info_array_mut_box(&arg0, descr)
+            {
+                info.setitem(index, value.clone());
             }
             return;
         }
@@ -8514,7 +8495,7 @@ impl OptContext {
         self.new_operations
             .get(guard_pos as usize)
             .and_then(|op| op.getdescr())
-            .map_or(false, |descr| descr.is_resume_at_position())
+            .is_some_and(|descr| descr.is_resume_at_position())
     }
 
     /// Take ownership of PtrInfo, replacing with None.

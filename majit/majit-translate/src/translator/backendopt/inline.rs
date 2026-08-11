@@ -179,7 +179,7 @@ pub fn collect_called_graphs(
 ) -> Vec<CalledThing> {
     let mut out: Vec<CalledThing> = Vec::new();
     let push_unique = |out: &mut Vec<CalledThing>, item: CalledThing| {
-        if !out.iter().any(|existing| *existing == item) {
+        if !out.contains(&item) {
             out.push(item);
         }
     };
@@ -189,12 +189,12 @@ pub fn collect_called_graphs(
         let ops: Vec<SpaceOperation> = block.borrow().operations.clone();
         for op in &ops {
             // Upstream `:27-32 if op.opname == "direct_call":`.
-            if op.opname == "direct_call" {
-                if let Some(arg0) = op.args.first() {
-                    match get_graph(arg0, translator) {
-                        Some(callee) => push_unique(&mut out, CalledThing::Graph(callee)),
-                        None => push_unique(&mut out, CalledThing::OpaqueArg(arg0.clone())),
-                    }
+            if op.opname == "direct_call"
+                && let Some(arg0) = op.args.first()
+            {
+                match get_graph(arg0, translator) {
+                    Some(callee) => push_unique(&mut out, CalledThing::Graph(callee)),
+                    None => push_unique(&mut out, CalledThing::OpaqueArg(arg0.clone())),
                 }
             }
             // Upstream `:33-39 if op.opname == "indirect_call":`.
@@ -773,10 +773,10 @@ pub fn measure_median_execution_cost(graph: &GraphRef) -> f64 {
         for link in &exits {
             if let Some(target) = link.borrow().target.clone() {
                 let target_key = BlockKey::of(&target);
-                if let Some(target_loop_start) = loops.get(&target_key) {
-                    if same_loop_start(Some(target_loop_start), current_loop_start.as_ref()) {
-                        loop_exits.push(link.clone());
-                    }
+                if let Some(target_loop_start) = loops.get(&target_key)
+                    && same_loop_start(Some(target_loop_start), current_loop_start.as_ref())
+                {
+                    loop_exits.push(link.clone());
                 }
             }
         }
@@ -1291,8 +1291,7 @@ impl<'t> BaseInliner<'t> {
         let new_ops: Vec<SpaceOperation> = ops.iter().map(|op| self.copy_operation(op)).collect();
         new_block.borrow_mut().operations = new_ops;
         // Upstream `:261 newblock.closeblock(...)`.
-        let exits: Vec<crate::flowspace::model::LinkRef> =
-            block.borrow().exits.iter().cloned().collect();
+        let exits: Vec<crate::flowspace::model::LinkRef> = block.borrow().exits.to_vec();
         let new_exits: Vec<crate::flowspace::model::LinkRef> = exits
             .iter()
             .map(|link| self.copy_link(link, block))
@@ -1521,12 +1520,11 @@ impl<'t> BaseInliner<'t> {
                             "inline.py:179 instrument_count tag must be 'inline'"
                         );
                     }
-                    if let Some(Hlvalue::Constant(c1)) = count_op.args.get(1) {
-                        if let crate::flowspace::model::ConstValue::Int(label) = c1.value {
-                            if !pred.borrow_mut()(label) {
-                                continue;
-                            }
-                        }
+                    if let Some(Hlvalue::Constant(c1)) = count_op.args.get(1)
+                        && let crate::flowspace::model::ConstValue::Int(label) = c1.value
+                        && !pred.borrow_mut()(label)
+                    {
+                        continue;
                     }
                 }
             }
@@ -1586,10 +1584,7 @@ impl<'t> BaseInliner<'t> {
         let is_raising = {
             let b = block.borrow();
             match (b.canraise(), b.operations.last()) {
-                (true, Some(last)) => {
-                    last as *const SpaceOperation
-                        == &b.operations[index_operation] as *const SpaceOperation
-                }
+                (true, Some(last)) => std::ptr::eq(last, &b.operations[index_operation]),
                 _ => false,
             }
         };
@@ -1792,7 +1787,7 @@ impl<'t> BaseInliner<'t> {
             let mut ab = afterblock.borrow_mut();
             let mut new_inputs: Vec<Hlvalue> = Vec::with_capacity(ab.inputargs.len() + 1);
             new_inputs.push(op.result.clone());
-            new_inputs.extend(ab.inputargs.drain(..));
+            new_inputs.append(&mut ab.inputargs);
             ab.inputargs = new_inputs;
         }
         // Upstream `:421 if self.graph_to_inline.returnblock in
@@ -1942,7 +1937,7 @@ impl<'t> BaseInliner<'t> {
             // Upstream `:314-324 for copiedlink in
             // copiedblock.exits:`.
             let copied_exits: Vec<crate::flowspace::model::LinkRef> =
-                copiedblock.borrow().exits.iter().cloned().collect();
+                copiedblock.borrow().exits.to_vec();
             for copiedlink in &copied_exits {
                 let target = match copiedlink.borrow().target.clone() {
                     Some(t) => t,
@@ -2158,8 +2153,8 @@ pub fn inline_function<'t>(
 /// port — non-exception-guarded callsites inline as upstream does,
 /// and the guarded ones surface the same `CannotInline` shape until
 /// the guarded path lands.
-pub fn simple_inline_function<'t>(
-    translator: &'t TranslationContext,
+pub fn simple_inline_function(
+    translator: &TranslationContext,
     inline_func: InlineFuncTarget,
     graph: GraphRef,
 ) -> Result<usize, CannotInline> {
@@ -2276,10 +2271,10 @@ pub fn instrument_inline_candidates(
                 // Upstream `:589-592 if graph is not None: if
                 // getattr(getattr(funcobj, '_callable', None),
                 // '_dont_inline_', False): continue`.
-                if let Some(g) = callee_graph.as_ref() {
-                    if callable_dont_inline(g) {
-                        continue;
-                    }
+                if let Some(g) = callee_graph.as_ref()
+                    && callable_dont_inline(g)
+                {
+                    continue;
                 }
                 // Upstream `:593 if candidate(graph):`.
                 let key = callee_graph.as_ref().map(|g| GraphKey::of(g).as_usize());
@@ -3147,7 +3142,7 @@ mod tests {
                     Hlvalue::Constant(Constant::new(ConstValue::Int(i as i64))),
                     Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
                 ],
-                Hlvalue::Variable(Variable::named(&format!("r{i}"))),
+                Hlvalue::Variable(Variable::named(format!("r{i}"))),
             ));
         }
         start.closeblock(vec![

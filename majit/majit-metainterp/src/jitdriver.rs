@@ -176,9 +176,9 @@ pub fn drive_single_frame_blackhole(
 
     let mut builder = BackEdgeBhBuilder::lease();
     builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live as i32,
-        metainterp_sd.op_catch_exception as i32,
-        metainterp_sd.op_rvmprof_code as i32,
+        metainterp_sd.op_live,
+        metainterp_sd.op_catch_exception,
+        metainterp_sd.op_rvmprof_code,
     );
     for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
         *value = *forwarded;
@@ -324,9 +324,9 @@ pub fn drive_multi_frame_blackhole(
     }
 
     builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live as i32,
-        metainterp_sd.op_catch_exception as i32,
-        metainterp_sd.op_rvmprof_code as i32,
+        metainterp_sd.op_live,
+        metainterp_sd.op_catch_exception,
+        metainterp_sd.op_rvmprof_code,
     );
     for ((frame_index, color), forwarded) in ref_locations
         .into_iter()
@@ -382,11 +382,10 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.int_scalar_base + layout.num_scalars;
-            if (layout.int_scalar_base..scalars_end).contains(&reg_idx) {
-                if let Some(value) = bh.registers_i.get(reg_idx).copied() {
-                    state
-                        .writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
-                }
+            if (layout.int_scalar_base..scalars_end).contains(&reg_idx)
+                && let Some(value) = bh.registers_i.get(reg_idx).copied()
+            {
+                state.writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
             }
         }
         offset = it.offset;
@@ -397,13 +396,11 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.ref_scalar_base + layout.num_ref_scalars;
-            if (layout.ref_scalar_base..scalars_end).contains(&reg_idx) {
-                if let Some(value) = bh.registers_r.get(reg_idx).copied() {
-                    state.writeback_live_ref_scalar_state_field(
-                        reg_idx - layout.ref_scalar_base,
-                        value,
-                    );
-                }
+            if (layout.ref_scalar_base..scalars_end).contains(&reg_idx)
+                && let Some(value) = bh.registers_r.get(reg_idx).copied()
+            {
+                state
+                    .writeback_live_ref_scalar_state_field(reg_idx - layout.ref_scalar_base, value);
             }
         }
         offset = it.offset;
@@ -414,13 +411,13 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
-            if (layout.float_scalar_base..scalars_end).contains(&reg_idx) {
-                if let Some(value) = bh.registers_f.get(reg_idx).copied() {
-                    state.writeback_live_float_scalar_state_field(
-                        reg_idx - layout.float_scalar_base,
-                        value,
-                    );
-                }
+            if (layout.float_scalar_base..scalars_end).contains(&reg_idx)
+                && let Some(value) = bh.registers_f.get(reg_idx).copied()
+            {
+                state.writeback_live_float_scalar_state_field(
+                    reg_idx - layout.float_scalar_base,
+                    value,
+                );
             }
         }
     }
@@ -1977,10 +1974,10 @@ impl<S: JitState> JitDriver<S> {
         let Some(root) = framestack.frames.first_mut() else {
             return None;
         };
-        if let Some(slot) = layout.vable_identity_slot() {
-            if slot < root.int_values.len() {
-                root.int_values[slot] = Some(virtualizable_ptr);
-            }
+        if let Some(slot) = layout.vable_identity_slot()
+            && slot < root.int_values.len()
+        {
+            root.int_values[slot] = Some(virtualizable_ptr);
         }
         // `scalar_values` is `[int scalars.., float scalars..]` — the order
         // `collect_scalar_state_field_values` builds and
@@ -4549,7 +4546,7 @@ impl<S: JitState> JitDriver<S> {
                         .map(|ptr| ptr as i64)
                 });
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut *bh_builder,
+                    &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -4747,10 +4744,10 @@ impl<S: JitState> JitDriver<S> {
                             // the same compiled loop and re-fails the same green
                             // guard with zero forward progress.
                             state.recover_after_compiled_run();
-                            if crate::callee_rca_enabled() {
-                                if let Some(dump) = state.debug_state_fields(&compiled_meta) {
-                                    eprintln!("[callee-rca][crn-state-after]\n{dump}");
-                                }
+                            if crate::callee_rca_enabled()
+                                && let Some(dump) = state.debug_state_fields(&compiled_meta)
+                            {
+                                eprintln!("[callee-rca][crn-state-after]\n{dump}");
                             }
                             let mut resume_pc = green_pc.unwrap_or(target_pc);
                             if selected_dispatch_key != 0
@@ -4918,27 +4915,22 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        match self.meta.force_start_tracing(
+        if let BackEdgeAction::StartedTracing = self.meta.force_start_tracing(
             green_key,
             (state.code_ptr(), target_pc),
             descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
-            BackEdgeAction::StartedTracing => {
-                if spdiag_enabled() {
-                    eprintln!(
-                        "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
-                    );
-                }
-                if let Some(ctx) = self.meta.trace_ctx() {
-                    ctx.header_pc = target_pc;
-                }
-                let mut sym = S::create_sym(&meta, target_pc);
-                state.initialize_sym(&mut sym, &meta);
-                self.sym = Some(sym);
-                self.meta.begin_trace_session(meta);
+            if spdiag_enabled() {
+                eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
             }
-            _ => {}
+            if let Some(ctx) = self.meta.trace_ctx() {
+                ctx.header_pc = target_pc;
+            }
+            let mut sym = S::create_sym(&meta, target_pc);
+            state.initialize_sym(&mut sym, &meta);
+            self.sym = Some(sym);
+            self.meta.begin_trace_session(meta);
         }
     }
 
@@ -4968,28 +4960,23 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
 
-        match self.meta.bound_reached(
+        if let BackEdgeAction::StartedTracing = self.meta.bound_reached(
             green_key,
             (state.code_ptr(), target_pc),
             None,
             descriptor.map(|d| (*d).clone()),
             &live_values,
         ) {
-            BackEdgeAction::StartedTracing => {
-                if spdiag_enabled() {
-                    eprintln!(
-                        "@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}"
-                    );
-                }
-                if let Some(ctx) = self.meta.trace_ctx() {
-                    ctx.header_pc = target_pc;
-                }
-                let mut sym = S::create_sym(&meta, target_pc);
-                state.initialize_sym(&mut sym, &meta);
-                self.sym = Some(sym);
-                self.meta.begin_trace_session(meta);
+            if spdiag_enabled() {
+                eprintln!("@@@SPDIAG StartedTracing target_pc={target_pc} green_key={green_key}");
             }
-            _ => {}
+            if let Some(ctx) = self.meta.trace_ctx() {
+                ctx.header_pc = target_pc;
+            }
+            let mut sym = S::create_sym(&meta, target_pc);
+            state.initialize_sym(&mut sym, &meta);
+            self.sym = Some(sym);
+            self.meta.begin_trace_session(meta);
         }
     }
 
@@ -5191,16 +5178,16 @@ impl<S: JitState> JitDriver<S> {
         // compile.py::sync_before_jit calls `vinfo.reset_vable_token(virt)`
         // when the JitDriver has a virtualizable declared.  Pyre routes
         // this through the interpreter's `sync_named_virtualizable_before_jit`.
-        if let Some(descriptor) = descriptor {
-            if let Some(virtualizable) = descriptor.virtualizable() {
-                let ok = state.sync_named_virtualizable_before_jit(
-                    meta,
-                    &virtualizable.name,
-                    self.meta.virtualizable_info().map(|a| a.as_ref()),
-                );
-                if !ok {
-                    return false;
-                }
+        if let Some(descriptor) = descriptor
+            && let Some(virtualizable) = descriptor.virtualizable()
+        {
+            let ok = state.sync_named_virtualizable_before_jit(
+                meta,
+                &virtualizable.name,
+                self.meta.virtualizable_info().map(|a| a.as_ref()),
+            );
+            if !ok {
+                return false;
             }
         }
 
@@ -5756,7 +5743,7 @@ impl<S: JitState> JitDriver<S> {
         // stream. `resume_pc` is resolved by the caller here, so report the
         // guard's own coordinates instead.
         if guardlog_enabled() {
-            let preview: Vec<i64> = raw_values.iter().take(6).map(|v| *v as i64).collect();
+            let preview: Vec<i64> = raw_values.iter().take(6).copied().collect();
             eprintln!(
                 "@@@GUARD key={} trace={} fail={} bridge={} nvals={} vals={:?}",
                 owning_key,
@@ -6870,28 +6857,26 @@ impl<S: JitState> JitDriver<S> {
                 state.restore_values(&result_meta, &typed_values);
                 self.sync_after(state, &result_meta, descriptor.as_deref());
                 // Re-enter compiled code if state is still compatible
-                if let Some(meta) = self.meta.get_compiled_meta(key_hash) {
-                    if state.is_compatible(meta) {
-                        let meta = meta.clone();
-                        let nd = self.driver_descriptor_for(state, &meta);
-                        if self.sync_before(state, &meta, nd.as_deref()) {
-                            let nl = state.extract_live_values(&meta);
-                            if Self::live_values_match_descriptor(
-                                nd.as_deref(),
-                                &nl,
-                                state.state_field_layout().total_live_values(),
-                            ) {
-                                if let Some(v) = self.extend_compiled_live_values(
-                                    key_hash,
-                                    state,
-                                    &meta,
-                                    nd.as_deref(),
-                                    nl,
-                                ) {
-                                    live_values = v;
-                                    continue;
-                                }
-                            }
+                if let Some(meta) = self.meta.get_compiled_meta(key_hash)
+                    && state.is_compatible(meta)
+                {
+                    let meta = meta.clone();
+                    let nd = self.driver_descriptor_for(state, &meta);
+                    if self.sync_before(state, &meta, nd.as_deref()) {
+                        let nl = state.extract_live_values(&meta);
+                        if Self::live_values_match_descriptor(
+                            nd.as_deref(),
+                            &nl,
+                            state.state_field_layout().total_live_values(),
+                        ) && let Some(v) = self.extend_compiled_live_values(
+                            key_hash,
+                            state,
+                            &meta,
+                            nd.as_deref(),
+                            nl,
+                        ) {
+                            live_values = v;
+                            continue;
                         }
                     }
                 }
@@ -6936,7 +6921,7 @@ impl<S: JitState> JitDriver<S> {
                 .unwrap_or(target_pc);
 
             if guardlog_enabled() && !is_finish && fail_index != u32::MAX {
-                let preview: Vec<i64> = raw_values.iter().take(6).map(|v| *v as i64).collect();
+                let preview: Vec<i64> = raw_values.iter().take(6).copied().collect();
                 eprintln!(
                     "@@@GUARD key={} trace={} fail={} resume_pc={} bridge={} nvals={} vals={:?}",
                     key_hash,
@@ -7049,7 +7034,7 @@ impl<S: JitState> JitDriver<S> {
                         .map(|ptr| ptr as i64)
                 });
                 let bh = crate::resume::blackhole_from_resumedata(
-                    &mut *bh_builder,
+                    &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
@@ -7109,7 +7094,7 @@ impl<S: JitState> JitDriver<S> {
                         result_exc,
                     );
                     let jit_exc = crate::blackhole::run_forever_with_portal(
-                        &mut *bh_builder,
+                        &mut bh_builder,
                         bh,
                         exc,
                         self.portal_runner.as_ref().map(|r| {
@@ -7813,11 +7798,11 @@ mod tests {
             type Sym = ();
             type Env = ();
 
-            fn build_meta(&self, _: usize, _: &()) -> () {}
+            fn build_meta(&self, _: usize, _: &()) {}
             fn extract_live(&self, _: &()) -> Vec<i64> {
                 Vec::new()
             }
-            fn create_sym(_: &(), _: usize) -> () {}
+            fn create_sym(_: &(), _: usize) {}
             fn is_compatible(&self, _: &()) -> bool {
                 true
             }

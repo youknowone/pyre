@@ -220,6 +220,133 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
+    /// Recognizes `frame.array_field[index] += value` and the other numeric
+    /// compound assignments. Rust evaluates `index` once, so the lowering
+    /// shares one index register between the vable read and write.
+    pub(super) fn lower_vable_array_update(&mut self, expr: &Expr) -> Option<()> {
+        let config = self.config?;
+        let vable_var = config.vable_var.as_ref()?;
+        let binary = match expr {
+            Expr::Binary(binary) => binary,
+            _ => return None,
+        };
+        let index_expr = match &*binary.left {
+            Expr::Index(index) => index,
+            _ => return None,
+        };
+        let field = match &*index_expr.expr {
+            Expr::Field(field) => field,
+            _ => return None,
+        };
+        if !expr_matches_local_name(&field.base, vable_var) {
+            return None;
+        }
+        let member_name = named_member(&field.member)?;
+        let &(array_index, item_type) = config.vable_arrays.get(&member_name)?;
+        if matches!(item_type, ValueKind::Ref) {
+            return None;
+        }
+        let vable_reg = self.vable_base_reg()?;
+        let idx_binding = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(idx_binding.kind, BindingKind::Int) {
+            return None;
+        }
+        let idx_reg = idx_binding.reg;
+        let ai = array_index as u16;
+        let lhs_reg = self.alloc_reg();
+
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        match item_type {
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(vable_reg), Register::int(idx_reg)],
+                    vec![Register::float(lhs_reg)],
+                ),
+                quote! { __builder.vable_getarrayitem_float_with_base(#lhs_reg, #vable_reg, #ai, #idx_reg); },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(vable_reg), Register::int(idx_reg)],
+                    vec![Register::int(lhs_reg)],
+                ),
+                quote! { __builder.vable_getarrayitem_int_with_base(#lhs_reg, #vable_reg, #ai, #idx_reg); },
+            ),
+            ValueKind::Ref => unreachable!(),
+        }
+
+        let rhs = self.lower_value_expr(&binary.right)?;
+        let dst = self.alloc_reg();
+        match item_type {
+            ValueKind::Float => {
+                if !matches!(rhs.kind, BindingKind::Float) {
+                    return None;
+                }
+                let opcode = opcode_for_assign_binop_f(&binary.op)?;
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::BinopF,
+                        vec![Register::float(lhs_reg), Register::float(rhs.reg)],
+                        vec![Register::float(dst)],
+                    ),
+                    binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+                );
+            }
+            ValueKind::Int => {
+                if !matches!(rhs.kind, BindingKind::Int) {
+                    return None;
+                }
+                let opcode = opcode_for_assign_binop(&binary.op)?;
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        Register::ints(&[lhs_reg, rhs.reg]),
+                        vec![Register::int(dst)],
+                    ),
+                    binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs.reg),
+                );
+            }
+            ValueKind::Ref => unreachable!(),
+        }
+
+        self.emit_op(
+            OpMeta::live_marker(),
+            quote! { let _ = __builder.live_placeholder(); },
+        );
+        match item_type {
+            ValueKind::Float => self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![
+                        Register::ref_(vable_reg),
+                        Register::int(idx_reg),
+                        Register::float(dst),
+                    ],
+                    vec![],
+                ),
+                quote! { __builder.vable_setarrayitem_float_with_base(#vable_reg, #ai, #idx_reg, #dst); },
+            ),
+            ValueKind::Int => self.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![
+                        Register::ref_(vable_reg),
+                        Register::int(idx_reg),
+                        Register::int(dst),
+                    ],
+                    vec![],
+                ),
+                quote! { __builder.vable_setarrayitem_int_with_base(#vable_reg, #ai, #idx_reg, #dst); },
+            ),
+            ValueKind::Ref => unreachable!(),
+        }
+        Some(())
+    }
+
     /// Recognizes `state.field = expr` for scalar state fields.
     pub(super) fn lower_state_field_write(&mut self, expr: &Expr) -> Option<()> {
         let config = self.config?;
@@ -293,12 +420,37 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
-        let &field_index = config.state_scalars.get(&member_name)?;
-        let opcode = opcode_for_assign_binop(&binary.op)?;
+        if let Some(&field_index) = config.state_scalars.get(&member_name) {
+            let opcode = opcode_for_assign_binop(&binary.op)?;
+            let lhs = self.lower_state_field_read(&binary.left)?;
+            let rhs = self.lower_value_expr(&binary.right)?;
+            if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+                return None;
+            }
+            let dst = self.alloc_reg();
+            let lhs_reg = lhs.reg;
+            let rhs_reg = rhs.reg;
+            self.emit_op(
+                OpMeta::linear(
+                    OpKind::BinopI,
+                    Register::ints(&[lhs_reg, rhs_reg]),
+                    vec![Register::int(dst)],
+                ),
+                binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+            );
+            let fi = field_index as u16;
+            self.emit_op(
+                OpMeta::linear(OpKind::StateField, vec![Register::int(dst)], vec![]),
+                quote! { __builder.store_state_field(#fi, #dst); },
+            );
+            return Some(());
+        }
 
+        let &field_index = config.state_float_scalars.get(&member_name)?;
+        let opcode = opcode_for_assign_binop_f(&binary.op)?;
         let lhs = self.lower_state_field_read(&binary.left)?;
         let rhs = self.lower_value_expr(&binary.right)?;
-        if !matches!(lhs.kind, BindingKind::Int) || !matches!(rhs.kind, BindingKind::Int) {
+        if !matches!(lhs.kind, BindingKind::Float) || !matches!(rhs.kind, BindingKind::Float) {
             return None;
         }
         let dst = self.alloc_reg();
@@ -306,16 +458,16 @@ impl<'c> Lowerer<'c> {
         let rhs_reg = rhs.reg;
         self.emit_op(
             OpMeta::linear(
-                OpKind::BinopI,
-                Register::ints(&[lhs_reg, rhs_reg]),
-                vec![Register::int(dst)],
+                OpKind::BinopF,
+                vec![Register::float(lhs_reg), Register::float(rhs_reg)],
+                vec![Register::float(dst)],
             ),
-            binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
+            binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
         );
         let fi = field_index as u16;
         self.emit_op(
-            OpMeta::linear(OpKind::StateField, vec![Register::int(dst)], vec![]),
-            quote! { __builder.store_state_field(#fi, #dst); },
+            OpMeta::linear(OpKind::StateField, vec![Register::float(dst)], vec![]),
+            quote! { __builder.store_state_field_float(#fi, #dst); },
         );
         Some(())
     }

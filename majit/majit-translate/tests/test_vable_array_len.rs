@@ -152,7 +152,7 @@ fn vable_array_never_rides_a_link_out_of_its_defining_block() {
 
     for (index, block) in graph.blocks.iter().enumerate() {
         assert!(
-            !block.inputargs.iter().any(|v| *v == array_var),
+            !block.inputargs.contains(&array_var),
             "the virtualizable array is an inputarg of block {index}, so it was \
              threaded in from elsewhere rather than read in block {defining_block}",
         );

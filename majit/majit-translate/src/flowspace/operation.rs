@@ -1097,10 +1097,11 @@ impl HLOperation {
         // upstream operation.py:631-633 — NOT_REALLY_CONST guard. In
         // the Rust port the table is keyed on module qualname; the
         // guard only fires for module objects.
-        if let ConstValue::HostObject(h) = &w_obj.value {
-            if h.is_module() && not_really_const_declines(h.qualname(), &name_str) {
-                return Ok(None);
-            }
+        if let ConstValue::HostObject(h) = &w_obj.value
+            && h.is_module()
+            && not_really_const_declines(h.qualname(), &name_str)
+        {
+            return Ok(None);
         }
 
         // upstream operation.py:634 — `if w_obj.foldable() and w_name.foldable()`.
@@ -1225,10 +1226,9 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::GetAttr, 2) => {
             if let [ConstValue::HostObject(obj), name] = args
                 && let Some(name) = name.as_text()
+                && let Some(value) = obj.module_get(name)
             {
-                if let Some(value) = obj.module_get(name) {
-                    return Some(ConstValue::HostObject(value));
-                }
+                return Some(ConstValue::HostObject(value));
             }
         }
         (OpKind::GetAttr, 3) => {

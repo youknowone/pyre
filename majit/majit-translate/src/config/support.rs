@@ -100,10 +100,7 @@ pub fn sysctl_get_cpu_count(cmd: &str) -> i64 {
         Err(_) => return 1, // Upstream `:36` OSError.
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match stdout.trim().parse::<i64>() {
-        Ok(n) => n,
-        Err(_) => 1, // Upstream `:36` ValueError.
-    }
+    stdout.trim().parse::<i64>().unwrap_or(1)
 }
 
 /// Linux-only CPU count. Upstream `support.py:16-29` parses

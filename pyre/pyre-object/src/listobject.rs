@@ -1856,7 +1856,6 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         ListStrategy::Empty => {
             switch_to_correct_strategy(list, value);
             w_list_insert(obj, index, value);
-            return;
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
@@ -2309,7 +2308,7 @@ fn int_eq_float(ival: i64, fval: f64) -> bool {
         return false;
     }
     const I64_UPPER_F: f64 = (1u64 << 63) as f64;
-    if fval >= I64_UPPER_F || fval < -I64_UPPER_F {
+    if !(-I64_UPPER_F..I64_UPPER_F).contains(&fval) {
         return false;
     }
     fval as i64 == ival

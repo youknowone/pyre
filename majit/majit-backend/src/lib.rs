@@ -1,3 +1,13 @@
+// Low-level backend entry points mirror RPython's raw CPU API: callers uphold
+// their pointer contracts, and speculative-protection hooks use `Err(())` as
+// the upstream failure sentinel. The descriptor cache type likewise preserves
+// the direct upstream ownership shape.
+#![allow(
+    clippy::missing_safety_doc,
+    clippy::result_unit_err,
+    clippy::type_complexity
+)]
+
 /// Backend abstraction trait for JIT code generation.
 ///
 /// Translated from rpython/jit/backend/model.py (AbstractCPU).
@@ -2335,6 +2345,7 @@ pub trait Backend: Send {
     /// AbstractDescr.show` = pure cast against the cell).  Backends
     /// recover via `majit_ir::recover_fail_descr_cell` (`Arc::from_raw`
     /// + `Arc::increment_strong_count`); strong refs live on
+    ///
     /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`,
     /// `assembler.py:820-823 gcreftracers.append(tracer)`).  Singletons
     /// without a cell wrapper (FINISH `DoneWithThisFrame*`,
@@ -3449,8 +3460,7 @@ mod tests {
         // fails.  Use a sentinel-aware check: it's 0 OR it dereferences
         // to a non-null pointer (the singleton).  Either way, the
         // accessor must not panic when called before registration.
-        let v = memory_error_singleton_ref();
-        assert!(v == 0 || v != 0, "accessor must not panic");
+        let _ = memory_error_singleton_ref();
     }
 
     #[test]

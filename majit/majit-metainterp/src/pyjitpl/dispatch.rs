@@ -98,23 +98,22 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
         is_gc_managed,
         ..
     } = descr
+        && !all_fielddescrs.is_empty()
     {
-        if !all_fielddescrs.is_empty() {
-            let specs: Vec<_> = all_fielddescrs.iter().map(field_spec_from_bh).collect();
-            let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
-                u32::MAX,
-                *size,
-                *type_id as u32,
-                *type_id,
-                *vtable as usize,
-                *is_gc_managed,
-                headerless,
-                &specs,
-                &[],
-            );
-            let sd: majit_ir::DescrRef = group.size_descr;
-            return sd;
-        }
+        let specs: Vec<_> = all_fielddescrs.iter().map(field_spec_from_bh).collect();
+        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            *size,
+            *type_id as u32,
+            *type_id,
+            *vtable as usize,
+            *is_gc_managed,
+            headerless,
+            &specs,
+            &[],
+        );
+        let sd: majit_ir::DescrRef = group.size_descr;
+        return sd;
     }
     let size = descr.as_size();
     let vtable = descr.get_vtable();
@@ -1419,12 +1418,11 @@ where
         // args=&[] (gate is a no-op). GuardException is the extraarg-only guard
         // (RPython records it with box=None) -- its args[0] is the exception-class
         // Const, not a checked box, so the gate must NOT apply to it.
-        if opcode != OpCode::GuardException {
-            if let Some(&first) = args.first() {
-                if first.is_constant() {
-                    return first;
-                }
-            }
+        if opcode != OpCode::GuardException
+            && let Some(&first) = args.first()
+            && first.is_constant()
+        {
+            return first;
         }
         if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
             let fail_types = sym.fail_args_types();
@@ -2168,10 +2166,9 @@ where
             .first()
             .copied()
             .flatten()
+            && let Ok(pc) = usize::try_from(pc)
         {
-            if let Ok(pc) = usize::try_from(pc) {
-                ctx.walk_final_pc = Some(pc);
-            }
+            ctx.walk_final_pc = Some(pc);
         }
     }
 
@@ -3204,38 +3201,35 @@ where
             if finished_frame.portal_vable_saved {
                 ctx.restore_saved_virtualizable();
             }
-            if let Some(parent) = self.frames.frames.last_mut() {
-                if let Some((return_kind, callee_src)) =
+            if let Some(parent) = self.frames.frames.last_mut()
+                && let Some((return_kind, callee_src)) =
                     finished_frame.jitcode.trailing_return_info()
-                {
-                    match return_kind {
-                        JitArgKind::Int => {
-                            let caller_dst = finished_frame
-                                .return_i
-                                .expect("inline int return missing caller destination");
-                            parent.int_regs[caller_dst] =
-                                finished_frame.int_regs[callee_src as usize];
-                            parent.int_values[caller_dst] =
-                                finished_frame.int_values[callee_src as usize];
-                        }
-                        JitArgKind::Ref => {
-                            let caller_dst = finished_frame
-                                .return_r
-                                .expect("inline ref return missing caller destination");
-                            parent.ref_regs[caller_dst] =
-                                finished_frame.ref_regs[callee_src as usize].clone();
-                            parent.ref_values[caller_dst] =
-                                finished_frame.ref_values[callee_src as usize];
-                        }
-                        JitArgKind::Float => {
-                            let caller_dst = finished_frame
-                                .return_f
-                                .expect("inline float return missing caller destination");
-                            parent.float_regs[caller_dst] =
-                                finished_frame.float_regs[callee_src as usize];
-                            parent.float_values[caller_dst] =
-                                finished_frame.float_values[callee_src as usize];
-                        }
+            {
+                match return_kind {
+                    JitArgKind::Int => {
+                        let caller_dst = finished_frame
+                            .return_i
+                            .expect("inline int return missing caller destination");
+                        parent.int_regs[caller_dst] = finished_frame.int_regs[callee_src as usize];
+                        parent.int_values[caller_dst] =
+                            finished_frame.int_values[callee_src as usize];
+                    }
+                    JitArgKind::Ref => {
+                        let caller_dst = finished_frame
+                            .return_r
+                            .expect("inline ref return missing caller destination");
+                        parent.ref_regs[caller_dst] = finished_frame.ref_regs[callee_src as usize];
+                        parent.ref_values[caller_dst] =
+                            finished_frame.ref_values[callee_src as usize];
+                    }
+                    JitArgKind::Float => {
+                        let caller_dst = finished_frame
+                            .return_f
+                            .expect("inline float return missing caller destination");
+                        parent.float_regs[caller_dst] =
+                            finished_frame.float_regs[callee_src as usize];
+                        parent.float_values[caller_dst] =
+                            finished_frame.float_values[callee_src as usize];
                     }
                 }
             }
@@ -5073,33 +5067,30 @@ where
                                 live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
                             }
                         }
-                        if slot == 0 {
-                            if let Some(majit_ir::OpRef::ConstInt(v)) =
+                        if slot == 0
+                            && let Some(majit_ir::OpRef::ConstInt(v)) =
                                 frame.int_regs.get(reg_idx).copied().flatten()
-                            {
-                                if mp_green_pc.is_none() {
-                                    mp_green_pc = Some(v);
-                                }
-                                mp_green_ints.push(v);
+                        {
+                            if mp_green_pc.is_none() {
+                                mp_green_pc = Some(v);
                             }
+                            mp_green_ints.push(v);
                         }
                         // pyjitpl.py:3912 same_greenkey: ref (slot 1) and float
                         // (slot 2) green constants for the full-green header
                         // compare.  `equal_whatever(Float, ..)` compares f64 bits,
                         // so store the float green's `to_bits`.
-                        if slot == 1 {
-                            if let Some(majit_ir::OpRef::ConstPtr(v)) =
+                        if slot == 1
+                            && let Some(majit_ir::OpRef::ConstPtr(v)) =
                                 frame.ref_regs.get(reg_idx).copied().flatten()
-                            {
-                                mp_green_refs.push(v.0 as i64);
-                            }
+                        {
+                            mp_green_refs.push(v.0 as i64);
                         }
-                        if slot == 2 {
-                            if let Some(majit_ir::OpRef::ConstFloat(v)) =
+                        if slot == 2
+                            && let Some(majit_ir::OpRef::ConstFloat(v)) =
                                 frame.float_regs.get(reg_idx).copied().flatten()
-                            {
-                                mp_green_floats.push(v.to_bits() as i64);
-                            }
+                        {
+                            mp_green_floats.push(v.to_bits() as i64);
                         }
                         debug_assert!(
                             reg_idx < max,
@@ -5492,7 +5483,7 @@ where
                     } else {
                         ctx.header_pc
                     };
-                    let pc_matches = mp_green_pc.map_or(true, |pc| pc == close_target_pc as i64);
+                    let pc_matches = mp_green_pc.is_none_or(|pc| pc == close_target_pc as i64);
                     // pyjitpl.py:3021/3912 same_greenkey: beyond the pc, close
                     // only when EVERY green (aheui's stackok / is_queue, the
                     // `program` ref, …) equals the trace-start header's.  Compare
@@ -5623,234 +5614,231 @@ where
                     // S0 census (env-gated MAJIT_INNERMP): append-and-observe with
                     // NO close, to confirm the inner key is stable and detected on
                     // revisit before enabling the cut close.
-                    if inner_close {
-                        if let Some(pc) = mp_green_pc {
-                            let header_pc = ctx.header_pc;
-                            // pyjitpl.py:3001-3007, which runs BEFORE the
-                            // `current_merge_points` scan:
+                    if inner_close && let Some(pc) = mp_green_pc {
+                        let header_pc = ctx.header_pc;
+                        // pyjitpl.py:3001-3007, which runs BEFORE the
+                        // `current_merge_points` scan:
+                        //
+                        //     ptoken = self.get_procedure_token(greenboxes)
+                        //     if has_compiled_targets(ptoken):
+                        //         self.compile_trace(live_arg_boxes, ptoken)
+                        //
+                        // `greenboxes` is the merge point just reached, so a
+                        // loop that ALREADY has compiled code is jumped into,
+                        // never re-derived by cutting this trace at it. The
+                        // cut (compile.py:269) is for the other case: an
+                        // inner loop nobody has compiled yet, which
+                        // `compile_loop` then attaches to
+                        // `original_boxes[:num_green_args]` — the INNER
+                        // greenkey (pyjitpl.py:3183-3187).
+                        //
+                        // The JUMP is what the `already_compiled_here` arm
+                        // below performs: it publishes the token key and
+                        // returns `CloseLoop`, and the driver runs
+                        // `close_bridge` (guard origin) or
+                        // `compile_trace_from_interp` (interp origin).
+                        //
+                        // It is sound only because the key this arm derives
+                        // is the one the interpreter ENTERS by.  While the
+                        // key was `green_key_from_code_ptr(green_key_raw.0,
+                        // pc)` — `JitState::code_ptr()` defaulting to 0, not
+                        // the driver's `GreenKey::hash_u64` — a compiled loop
+                        // could sit under a key nothing enters, and jumping
+                        // into it was measured as a logo miscompile (992635
+                        // against 996310) and a SIGSEGV.  The four
+                        // procedure-token consults now share
+                        // `merge_point_green_key_hash`, so a loop is stored
+                        // under the key it is reached by and the jump lands
+                        // in code the interpreter can also enter.
+                        //
+                        // ⚠ The earlier measurement against this lever —
+                        // cel's `nested_list_loop_varying_trip_count` keeping
+                        // its results and losing its 4 aborts while `spread
+                        // 0..32` deopts went 959 → 1763 over 4000 rows and
+                        // 1275 → 2601 over 16000 — was taken BEFORE that key
+                        // unification, i.e. against jumps into loops filed
+                        // under keys nothing enters.  It does not carry over
+                        // and must be re-measured before being cited again.
+                        // Same for the note that routing the closing JUMP's
+                        // target tokens off the token it enters rather than
+                        // off the bridge origin (`unroll.py:196-197
+                        // cell_token = jump_op.getdescr()` — pyre's
+                        // `compile_bridge` hands `optimize_bridge` the ORIGIN
+                        // loop's `front_target_tokens`) recovered only 7%.
+                        //
+                        // One consequence of a DECLINED attempt is still
+                        // narrower than upstream: upstream reaches the
+                        // `current_merge_points` scan whenever `compile_trace`
+                        // does not raise, while a declined attempt here
+                        // returns to neither the scan nor the `append`
+                        // (:3058-3060), so the merge point goes unregistered
+                        // while a compiled loop sits at those greens.  Kept
+                        // deliberately — it is exactly the pre-JUMP behaviour,
+                        // so the lever has a clean A/B.
+                        //
+                        // The token lookup below is unconditional, where
+                        // upstream guards it with `if not self.partial_trace:`
+                        // (:3002).  That gate must not be spelled
+                        // `is_bridge_trace`: `partial_trace` is set only by
+                        // `retrace_needed` (pyjitpl.py:2438-2439), so it means
+                        // "this is a RETRACE", and a bridge from a guard
+                        // failure runs the consult upstream just like a
+                        // primary entry.  Its live reading is
+                        // `MetaInterp::partial_trace()`, which this loop
+                        // cannot reach while it holds the TraceCtx borrow —
+                        // harmless while the lookup only decides a log line,
+                        // and part of what the JUMP half has to carry.
+                        let mp_greens = (
+                            mp_green_ints.clone(),
+                            mp_green_refs.clone(),
+                            mp_green_floats.clone(),
+                        );
+                        let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens) else {
+                            return TraceAction::Continue;
+                        };
+                        let already_compiled_here = ctx
+                            .has_compiled_targets_fn
+                            .as_ref()
+                            .is_some_and(|f| f(inner_key));
+                        if already_compiled_here {
+                            // pyjitpl.py:3004-3007 — the merge point just reached already owns a
+                            // procedure token, so upstream JUMPs into it rather than deriving a second
+                            // copy of that loop by cutting this trace.  `compile_trace` raises on
+                            // success (`raise_if_successful`, pyjitpl.py:3119-3123), which is why the
+                            // `current_merge_points` scan below is never reached in that case.
                             //
-                            //     ptoken = self.get_procedure_token(greenboxes)
-                            //     if has_compiled_targets(ptoken):
-                            //         self.compile_trace(live_arg_boxes, ptoken)
+                            // The dispatcher holds no `&mut MetaInterp`, so the attempt is published to
+                            // the driver: `close_jump_into_key` names the token, `close_greens` /
+                            // `close_green_pc` name the greens it is keyed by (pyjitpl.py:3005
+                            // `get_procedure_token(greenboxes)` reads the greens of the merge point just
+                            // reached, not the trace-start header's).
                             //
-                            // `greenboxes` is the merge point just reached, so a
-                            // loop that ALREADY has compiled code is jumped into,
-                            // never re-derived by cutting this trace at it. The
-                            // cut (compile.py:269) is for the other case: an
-                            // inner loop nobody has compiled yet, which
-                            // `compile_loop` then attaches to
-                            // `original_boxes[:num_green_args]` — the INNER
-                            // greenkey (pyjitpl.py:3183-3187).
-                            //
-                            // The JUMP is what the `already_compiled_here` arm
-                            // below performs: it publishes the token key and
-                            // returns `CloseLoop`, and the driver runs
-                            // `close_bridge` (guard origin) or
-                            // `compile_trace_from_interp` (interp origin).
-                            //
-                            // It is sound only because the key this arm derives
-                            // is the one the interpreter ENTERS by.  While the
-                            // key was `green_key_from_code_ptr(green_key_raw.0,
-                            // pc)` — `JitState::code_ptr()` defaulting to 0, not
-                            // the driver's `GreenKey::hash_u64` — a compiled loop
-                            // could sit under a key nothing enters, and jumping
-                            // into it was measured as a logo miscompile (992635
-                            // against 996310) and a SIGSEGV.  The four
-                            // procedure-token consults now share
-                            // `merge_point_green_key_hash`, so a loop is stored
-                            // under the key it is reached by and the jump lands
-                            // in code the interpreter can also enter.
-                            //
-                            // ⚠ The earlier measurement against this lever —
-                            // cel's `nested_list_loop_varying_trip_count` keeping
-                            // its results and losing its 4 aborts while `spread
-                            // 0..32` deopts went 959 → 1763 over 4000 rows and
-                            // 1275 → 2601 over 16000 — was taken BEFORE that key
-                            // unification, i.e. against jumps into loops filed
-                            // under keys nothing enters.  It does not carry over
-                            // and must be re-measured before being cited again.
-                            // Same for the note that routing the closing JUMP's
-                            // target tokens off the token it enters rather than
-                            // off the bridge origin (`unroll.py:196-197
-                            // cell_token = jump_op.getdescr()` — pyre's
-                            // `compile_bridge` hands `optimize_bridge` the ORIGIN
-                            // loop's `front_target_tokens`) recovered only 7%.
-                            //
-                            // One consequence of a DECLINED attempt is still
-                            // narrower than upstream: upstream reaches the
-                            // `current_merge_points` scan whenever `compile_trace`
-                            // does not raise, while a declined attempt here
-                            // returns to neither the scan nor the `append`
-                            // (:3058-3060), so the merge point goes unregistered
-                            // while a compiled loop sits at those greens.  Kept
-                            // deliberately — it is exactly the pre-JUMP behaviour,
-                            // so the lever has a clean A/B.
-                            //
-                            // The token lookup below is unconditional, where
-                            // upstream guards it with `if not self.partial_trace:`
-                            // (:3002).  That gate must not be spelled
-                            // `is_bridge_trace`: `partial_trace` is set only by
-                            // `retrace_needed` (pyjitpl.py:2438-2439), so it means
-                            // "this is a RETRACE", and a bridge from a guard
-                            // failure runs the consult upstream just like a
-                            // primary entry.  Its live reading is
-                            // `MetaInterp::partial_trace()`, which this loop
-                            // cannot reach while it holds the TraceCtx borrow —
-                            // harmless while the lookup only decides a log line,
-                            // and part of what the JUMP half has to carry.
-                            let mp_greens = (
-                                mp_green_ints.clone(),
-                                mp_green_refs.clone(),
-                                mp_green_floats.clone(),
-                            );
-                            let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens)
-                            else {
-                                return TraceAction::Continue;
-                            };
-                            let already_compiled_here = ctx
-                                .has_compiled_targets_fn
-                                .as_ref()
-                                .is_some_and(|f| f(inner_key));
-                            if already_compiled_here {
-                                // pyjitpl.py:3004-3007 — the merge point just reached already owns a
-                                // procedure token, so upstream JUMPs into it rather than deriving a second
-                                // copy of that loop by cutting this trace.  `compile_trace` raises on
-                                // success (`raise_if_successful`, pyjitpl.py:3119-3123), which is why the
-                                // `current_merge_points` scan below is never reached in that case.
-                                //
-                                // The dispatcher holds no `&mut MetaInterp`, so the attempt is published to
-                                // the driver: `close_jump_into_key` names the token, `close_greens` /
-                                // `close_green_pc` name the greens it is keyed by (pyjitpl.py:3005
-                                // `get_procedure_token(greenboxes)` reads the greens of the merge point just
-                                // reached, not the trace-start header's).
-                                //
-                                // A key whose attempt already ran and did not compile keeps today's
-                                // behaviour — decline and keep tracing.  Re-attempting would re-run the
-                                // optimizer over a growing trace-so-far for a deterministic decline; the
-                                // same latch (`TraceCtx::declined_cross_loop_closes`) guards the equivalent
-                                // site in the other frontend.
-                                if ctx.cross_loop_close_declined(inner_key) {
-                                    if crate::majit_log_enabled() {
-                                        eprintln!(
-                                            "[jit] merge point pc={pc} already has compiled loop \
+                            // A key whose attempt already ran and did not compile keeps today's
+                            // behaviour — decline and keep tracing.  Re-attempting would re-run the
+                            // optimizer over a growing trace-so-far for a deterministic decline; the
+                            // same latch (`TraceCtx::declined_cross_loop_closes`) guards the equivalent
+                            // site in the other frontend.
+                            if ctx.cross_loop_close_declined(inner_key) {
+                                if crate::majit_log_enabled() {
+                                    eprintln!(
+                                        "[jit] merge point pc={pc} already has compiled loop \
                                              key={inner_key} — declining the cross-loop cut \
                                              (pyjitpl.py:3005)"
-                                        );
-                                    }
-                                } else {
-                                    ctx.close_greens = Some(mp_greens.clone());
-                                    ctx.close_green_pc = Some(pc);
-                                    ctx.close_jump_into_key = Some(inner_key);
-                                    if capture_walk_reds {
-                                        ctx.walk_final_pc = Some(pc as usize);
-                                        ctx.walk_final_reds = std::mem::take(&mut walk_reds);
-                                    }
-                                    if crate::majit_log_enabled() {
-                                        eprintln!(
-                                            "[jit] merge point pc={pc} has compiled loop key={inner_key} \
-                                             — compile_trace JUMP (pyjitpl.py:3005)"
-                                        );
-                                    }
-                                    // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
-                                    // reached_loop_header entry above (pyjitpl.py:2993).
-                                    return TraceAction::CloseLoop;
-                                }
-                            } else if ctx.has_merge_point_at(inner_key, header_pc) {
-                                if crate::jitdriver::spdiag_enabled() {
-                                    eprintln!(
-                                        "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
                                     );
                                 }
-                                if crate::closedbg_enabled() {
-                                    let mut i = 0;
-                                    while let Some(o) = sym.state_field_ref(i) {
-                                        eprintln!("@@@RED int[{i}]={o:?}");
-                                        i += 1;
-                                    }
-                                    let mut j = 0;
-                                    while let Some(o) = sym.state_ref_field_ref(j) {
-                                        eprintln!("@@@RED ref[{j}]={o:?}");
-                                        j += 1;
-                                    }
-                                }
-                                // same_greenkey revisit of a nested inner loop →
-                                // close HERE and cut the outer prefix as preamble.
-                                // Setting cut_inner_green_key routes compile_loop
-                                // through cross_loop_cut (compile.py:269-270).
-                                ctx.cut_inner_green_key = Some(inner_key);
-                                // pyjitpl.py:3005 `get_procedure_token(greenboxes)`
-                                // reads the greens of the merge point just
-                                // reached — here the INNER loop's, not the
-                                // trace-start header's.
-                                ctx.close_greens = Some((
-                                    mp_green_ints.clone(),
-                                    mp_green_refs.clone(),
-                                    mp_green_floats.clone(),
-                                ));
+                            } else {
+                                ctx.close_greens = Some(mp_greens.clone());
                                 ctx.close_green_pc = Some(pc);
+                                ctx.close_jump_into_key = Some(inner_key);
                                 if capture_walk_reds {
-                                    // Single-pass: resume at the inner loop's
-                                    // interpreter green pc (the loop variable the
-                                    // hook assigns to `pc`). The loop-carried red
-                                    // values captured above are transferred into
-                                    // native state by the merge-point hook
-                                    // (`restore_values`); storage caches are then
-                                    // re-derived by `recover`.
                                     ctx.walk_final_pc = Some(pc as usize);
                                     ctx.walk_final_reds = std::mem::take(&mut walk_reds);
                                 }
-                                // GUARD_FUTURE_CONDITION already emitted
-                                // unconditionally at the reached_loop_header entry
-                                // above (pyjitpl.py:2993).
-                                return TraceAction::CloseLoop;
-                            } else {
-                                // first visit → append and keep tracing
-                                // (pyjitpl.py:3058-3060). For the state-field dispatch
-                                // model the merge point's loop-carried values are the
-                                // RED state fields (the closing JUMP = collect_jump_args),
-                                // NOT the green operands captured in `live_arg_boxes`
-                                // (those are promoted constants folded inline in the cut
-                                // body). Register the SAME construction the close uses
-                                // — `JitState::collect_jump_args_with_boxes` reached
-                                // through `JitCodeSym::loop_carried_boxes` — so the cut
-                                // label's inputarg arity matches the JUMP's
-                                // (compile.py:334 jump.numargs()==label.numargs()), the
-                                // way RPython's single `live_arg_boxes` list does by
-                                // construction (pyjitpl.py:2981-2989). Falls back to the
-                                // operand-captured boxes for interpreters with no state
-                                // fields at all.
-                                //
-                                // Building this from the scalar state fields alone (as
-                                // this site used to) silently omits the virtualizable's
-                                // element boxes, so an interpreter whose state is purely
-                                // `[int; virt]` / `[float; virt]` arrays registered just
-                                // the greens plus one unexpanded vable ref while its
-                                // close expanded to one box per element — the arity
-                                // mismatch that made every nested loop decline.
-                                let vable_boxes =
-                                    ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                                let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
-                                    Some(mut boxes) => {
-                                        // pyjitpl.py:2978-2987 normalizes the list
-                                        // before it becomes anything — the LABEL
-                                        // this registration turns into cannot carry
-                                        // a constant or a repeated box.
-                                        ctx.remove_consts_and_duplicates(&mut boxes);
-                                        boxes
-                                            .into_iter()
-                                            .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
-                                            .collect()
-                                    }
-                                    None => live_arg_boxes,
-                                };
-                                if crate::mptrace_enabled() {
+                                if crate::majit_log_enabled() {
                                     eprintln!(
-                                        "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
-                                        ctx.num_ops(),
+                                        "[jit] merge point pc={pc} has compiled loop key={inner_key} \
+                                             — compile_trace JUMP (pyjitpl.py:3005)"
                                     );
                                 }
-                                ctx.add_merge_point(inner_key, original_boxes, header_pc);
+                                // GUARD_FUTURE_CONDITION was already emitted unconditionally at the
+                                // reached_loop_header entry above (pyjitpl.py:2993).
+                                return TraceAction::CloseLoop;
                             }
+                        } else if ctx.has_merge_point_at(inner_key, header_pc) {
+                            if crate::jitdriver::spdiag_enabled() {
+                                eprintln!(
+                                    "@@@SPDIAG INNER-CUT-CLOSE pc={pc} header_pc={header_pc} inner_key={inner_key} walk_reds={walk_reds:?}"
+                                );
+                            }
+                            if crate::closedbg_enabled() {
+                                let mut i = 0;
+                                while let Some(o) = sym.state_field_ref(i) {
+                                    eprintln!("@@@RED int[{i}]={o:?}");
+                                    i += 1;
+                                }
+                                let mut j = 0;
+                                while let Some(o) = sym.state_ref_field_ref(j) {
+                                    eprintln!("@@@RED ref[{j}]={o:?}");
+                                    j += 1;
+                                }
+                            }
+                            // same_greenkey revisit of a nested inner loop →
+                            // close HERE and cut the outer prefix as preamble.
+                            // Setting cut_inner_green_key routes compile_loop
+                            // through cross_loop_cut (compile.py:269-270).
+                            ctx.cut_inner_green_key = Some(inner_key);
+                            // pyjitpl.py:3005 `get_procedure_token(greenboxes)`
+                            // reads the greens of the merge point just
+                            // reached — here the INNER loop's, not the
+                            // trace-start header's.
+                            ctx.close_greens = Some((
+                                mp_green_ints.clone(),
+                                mp_green_refs.clone(),
+                                mp_green_floats.clone(),
+                            ));
+                            ctx.close_green_pc = Some(pc);
+                            if capture_walk_reds {
+                                // Single-pass: resume at the inner loop's
+                                // interpreter green pc (the loop variable the
+                                // hook assigns to `pc`). The loop-carried red
+                                // values captured above are transferred into
+                                // native state by the merge-point hook
+                                // (`restore_values`); storage caches are then
+                                // re-derived by `recover`.
+                                ctx.walk_final_pc = Some(pc as usize);
+                                ctx.walk_final_reds = std::mem::take(&mut walk_reds);
+                            }
+                            // GUARD_FUTURE_CONDITION already emitted
+                            // unconditionally at the reached_loop_header entry
+                            // above (pyjitpl.py:2993).
+                            return TraceAction::CloseLoop;
+                        } else {
+                            // first visit → append and keep tracing
+                            // (pyjitpl.py:3058-3060). For the state-field dispatch
+                            // model the merge point's loop-carried values are the
+                            // RED state fields (the closing JUMP = collect_jump_args),
+                            // NOT the green operands captured in `live_arg_boxes`
+                            // (those are promoted constants folded inline in the cut
+                            // body). Register the SAME construction the close uses
+                            // — `JitState::collect_jump_args_with_boxes` reached
+                            // through `JitCodeSym::loop_carried_boxes` — so the cut
+                            // label's inputarg arity matches the JUMP's
+                            // (compile.py:334 jump.numargs()==label.numargs()), the
+                            // way RPython's single `live_arg_boxes` list does by
+                            // construction (pyjitpl.py:2981-2989). Falls back to the
+                            // operand-captured boxes for interpreters with no state
+                            // fields at all.
+                            //
+                            // Building this from the scalar state fields alone (as
+                            // this site used to) silently omits the virtualizable's
+                            // element boxes, so an interpreter whose state is purely
+                            // `[int; virt]` / `[float; virt]` arrays registered just
+                            // the greens plus one unexpanded vable ref while its
+                            // close expanded to one box per element — the arity
+                            // mismatch that made every nested loop decline.
+                            let vable_boxes =
+                                ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
+                            let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                                Some(mut boxes) => {
+                                    // pyjitpl.py:2978-2987 normalizes the list
+                                    // before it becomes anything — the LABEL
+                                    // this registration turns into cannot carry
+                                    // a constant or a repeated box.
+                                    ctx.remove_consts_and_duplicates(&mut boxes);
+                                    boxes
+                                        .into_iter()
+                                        .map(|(o, ty)| crate::trace_ctx::GreenBox::new(o, ty))
+                                        .collect()
+                                }
+                                None => live_arg_boxes,
+                            };
+                            if crate::mptrace_enabled() {
+                                eprintln!(
+                                    "@@@MPTRACE add-mp pc={pc} header_pc={header_pc} inner_key={inner_key} num_ops={}",
+                                    ctx.num_ops(),
+                                );
+                            }
+                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
                         }
                     }
                 }
@@ -6659,18 +6647,17 @@ where
                     // the lookup internally on the record-side, but the
                     // concrete `bh_call_i_dispatch` below still ran first
                     // — splitting the lookup out matches upstream order.
-                    if is_loopinvariant {
-                        if let Some((cached_traced, cached_concrete)) = ctx
+                    if is_loopinvariant
+                        && let Some((cached_traced, cached_concrete)) = ctx
                             .call_loopinvariant_lookup_with_effect(
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Int,
                                 &calldescr.extra_info,
                             )
-                        {
-                            self.set_int_reg(dst, Some(cached_traced), Some(cached_concrete));
-                            return TraceAction::Continue;
-                        }
+                    {
+                        self.set_int_reg(dst, Some(cached_traced), Some(cached_concrete));
+                        return TraceAction::Continue;
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
@@ -6942,18 +6929,17 @@ where
 
                     // pyjitpl.py:2087-2090: heapcache lookup-first for
                     // loop-invariant calls (see int sibling for full cite).
-                    if is_loopinvariant {
-                        if let Some((cached_traced, cached_concrete)) = ctx
+                    if is_loopinvariant
+                        && let Some((cached_traced, cached_concrete)) = ctx
                             .call_loopinvariant_lookup_with_effect(
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Ref,
                                 &calldescr.extra_info,
                             )
-                        {
-                            self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
-                            return TraceAction::Continue;
-                        }
+                    {
+                        self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
+                        return TraceAction::Continue;
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
@@ -7173,22 +7159,17 @@ where
 
                     // pyjitpl.py:2087-2090: heapcache lookup-first for
                     // loop-invariant calls (see int sibling for full cite).
-                    if is_loopinvariant {
-                        if let Some((cached_traced, cached_concrete_bits)) = ctx
+                    if is_loopinvariant
+                        && let Some((cached_traced, cached_concrete_bits)) = ctx
                             .call_loopinvariant_lookup_with_effect(
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Float,
                                 &calldescr.extra_info,
                             )
-                        {
-                            self.set_float_reg(
-                                dst,
-                                Some(cached_traced),
-                                Some(cached_concrete_bits),
-                            );
-                            return TraceAction::Continue;
-                        }
+                    {
+                        self.set_float_reg(dst, Some(cached_traced), Some(cached_concrete_bits));
+                        return TraceAction::Continue;
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_F branch parity:
@@ -8118,10 +8099,10 @@ where
                         .expect("BC_NEWLIST_CLEAR: invalid items-block layout");
                     unsafe { std::alloc::alloc_zeroed(layout) as i64 }
                 };
-                if array_ptr != 0 {
-                    if let Some(len_ofs) = array_len_offset {
-                        unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
-                    }
+                if array_ptr != 0
+                    && let Some(len_ofs) = array_len_offset
+                {
+                    unsafe { *((array_ptr as *mut u8).add(len_ofs) as *mut i64) = length_val };
                 }
                 let abox_op = ctx.record_new_array_clear(length_opref, array_descr);
                 ctx.set_opref_concrete(abox_op, Value::Ref(majit_ir::GcRef(array_ptr as usize)));
@@ -8174,9 +8155,17 @@ where
                 }
                 regs
             };
-            let args_i = has_i_list.then(|| read_list(frame)).unwrap_or_default();
+            let args_i = if has_i_list {
+                read_list(frame)
+            } else {
+                Default::default()
+            };
             let args_r = read_list(frame);
-            let args_f = has_f_list.then(|| read_list(frame)).unwrap_or_default();
+            let args_f = if has_f_list {
+                read_list(frame)
+            } else {
+                Default::default()
+            };
             let result_dst = return_kind.map(|_| frame.next_reg() as usize);
             frame._result_argcode = match return_kind {
                 Some(JitArgKind::Int) => b'i',
@@ -8425,11 +8414,11 @@ where
         };
         let (lhs, lhs_value) = self.read_int_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_int_reg(rhs_idx);
-        if lhs == rhs {
-            if let Some(fast) = fastpath_same_boxes(opcode) {
-                self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
-                return;
-            }
+        if lhs == rhs
+            && let Some(fast) = fastpath_same_boxes(opcode)
+        {
+            self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
+            return;
         }
         let value = eval_binop_i(opcode, lhs_value, rhs_value);
         // pyjitpl.py `_record_helper_pure`: a pure op whose args are all
@@ -8540,11 +8529,11 @@ where
         };
         let (lhs, lhs_value) = self.read_ref_reg(lhs_idx);
         let (rhs, rhs_value) = self.read_ref_reg(rhs_idx);
-        if lhs == rhs {
-            if let Some(fast) = fastpath_same_boxes(opcode) {
-                self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
-                return;
-            }
+        if lhs == rhs
+            && let Some(fast) = fastpath_same_boxes(opcode)
+        {
+            self.set_int_reg(dst, Some(ctx.const_int(fast)), Some(fast));
+            return;
         }
         let value = match opcode {
             OpCode::PtrEq | OpCode::InstancePtrEq => (lhs_value == rhs_value) as i64,
@@ -10048,7 +10037,7 @@ mod tests {
             portal: portal.clone(),
         };
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
 
@@ -10721,7 +10710,7 @@ mod tests {
             token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
         };
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action =
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
         assert!(
@@ -10827,7 +10816,7 @@ mod tests {
             &[1],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11105,7 +11094,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -11141,7 +11130,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -11199,7 +11188,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -11235,7 +11224,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -11303,7 +11292,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0, &[]);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -11345,7 +11334,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         // Thread the single vable ConstPtr Box through both the
         // standard-box slot and the argument register so pyjitpl.py:1131
         // `box is standard_box` (identity) holds, matching upstream's
@@ -11415,7 +11404,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11489,7 +11478,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11782,7 +11771,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11841,7 +11830,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11900,7 +11889,7 @@ mod tests {
             &[],
         );
 
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -11956,7 +11945,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
         let recorder = ctx.into_recorder();
@@ -11981,7 +11970,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(2);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -12035,7 +12024,7 @@ mod tests {
         // target from SwitchDictDescr.dict.
         let jitcode = switch_return_jitcode();
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -12070,7 +12059,7 @@ mod tests {
         // then leave pc at the fall-through default path.
         let jitcode = switch_return_jitcode();
         let mut ctx = TraceCtx::for_test(1);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,
@@ -12130,7 +12119,7 @@ mod tests {
         let jitcode = caller.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         let finish_args = match action {
             TraceAction::Finish {
@@ -12173,7 +12162,7 @@ mod tests {
         let jitcode = caller.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         let finish_args = match action {
             TraceAction::Finish {
@@ -12212,7 +12201,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
 
         let (finish_args, finish_arg_types, exit_with_exception) = match action {
@@ -12248,7 +12237,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
-        let mut sym = DummySym::default();
+        let mut sym = DummySym;
         let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
         assert!(matches!(action, TraceAction::Continue));
 
@@ -12490,7 +12479,7 @@ mod tests {
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(2);
-        let mut sym = DummySym::default(); // fail_args() = None
+        let mut sym = DummySym; // fail_args() = None
         let action = trace_jitcode_with_args(
             &mut ctx,
             &mut sym,

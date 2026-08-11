@@ -366,7 +366,7 @@ impl<V: Eq> Eq for frozendict<V> {}
 impl<V: Hash> Hash for frozendict<V> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let mut items: Vec<(&String, &V)> = self.iter().collect();
-        items.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        items.sort_by_key(|(left_key, _)| *left_key);
         items.len().hash(state);
         for (key, value) in items {
             key.hash(state);
@@ -2870,7 +2870,7 @@ impl Hash for _func {
         self._callable.hash(state);
         self.graph.hash(state);
         let mut attrs: Vec<_> = self.attrs.iter().collect();
-        attrs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        attrs.sort_by_key(|(a, _)| *a);
         for (key, value) in attrs {
             key.hash(state);
             value.hash(state);
@@ -4733,6 +4733,12 @@ fn validate_rtti_helper_ptr(
     Ok(())
 }
 
+impl Default for ForwardReference {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ForwardReference {
     pub fn new() -> Self {
         ForwardReference {
@@ -4762,9 +4768,9 @@ impl ForwardReference {
             ));
         }
         if realcontainertype._gckind() != self._gckind {
-            return Err(format!(
-                "become() gives conflicting gckind, use the correct XxForwardReference"
-            ));
+            return Err(
+                "become() gives conflicting gckind, use the correct XxForwardReference".to_string(),
+            );
         }
         *self.target.lock().unwrap() = Some(realcontainertype);
         Ok(())

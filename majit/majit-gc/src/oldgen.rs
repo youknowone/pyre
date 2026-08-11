@@ -156,6 +156,11 @@ impl OldGen {
 
     /// Allocate uninitialized space and overwrite the complete object from
     /// `src`, as nursery promotion does.
+    ///
+    /// # Safety
+    ///
+    /// `src` must be readable for `total_size` bytes and must not overlap the
+    /// newly allocated destination.
     pub unsafe fn alloc_and_copy(&mut self, src: *const u8, total_size: usize) -> *mut u8 {
         let dst = self.alloc(total_size);
         unsafe { ptr::copy_nonoverlapping(src, dst, total_size) };

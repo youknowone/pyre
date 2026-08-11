@@ -173,10 +173,10 @@ impl<'c> Lowerer<'c> {
             Expr::Path(ExprPath { path, .. }) => {
                 // A single-segment path naming a known local binding resolves
                 // to that binding.
-                if let Some(ident) = path.get_ident() {
-                    if let Some(binding) = self.bindings.get(&ident.to_string()) {
-                        return Some(binding.clone());
-                    }
+                if let Some(ident) = path.get_ident()
+                    && let Some(binding) = self.bindings.get(&ident.to_string())
+                {
+                    return Some(binding.clone());
                 }
                 // Otherwise a path whose final segment is a SCREAMING_CASE
                 // symbolic constant (`VAL_QUEUE`, `aheui::VAL_PORT`) lowers to
@@ -570,7 +570,7 @@ impl<'c> Lowerer<'c> {
             .collect();
         let headerless = self
             .config
-            .map_or(false, |cfg| cfg.is_headerless_struct(struct_path));
+            .is_some_and(|cfg| cfg.is_headerless_struct(struct_path));
         self.emit_op(
             OpMeta::linear(OpKind::New, vec![], vec![Register::ref_(result_reg)]),
             quote! {
@@ -1967,11 +1967,7 @@ impl<'c> Lowerer<'c> {
     fn lower_native_tag_small_call(&mut self, call: &ExprCall) -> Option<Binding> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(&call.func)?;
-        if !config
-            .native_tag_small
-            .iter()
-            .any(|path| *path == func_segments)
-        {
+        if !config.native_tag_small.contains(&func_segments) {
             return None;
         }
         if call.args.len() != 1 {

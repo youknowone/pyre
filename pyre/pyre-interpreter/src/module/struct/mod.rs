@@ -334,15 +334,15 @@ unsafe fn accept_int(arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
         if is_bool(arg) {
             return Ok(BigInt::from(if w_bool_get_value(arg) { 1 } else { 0 }));
         }
-        if let Some(tp) = crate::typedef::r#type(arg) {
-            if let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__") {
-                let r = crate::call::call_function_impl_result(index_fn, &[arg])?;
-                if is_int(r) || is_long(r) {
-                    return Ok(crate::builtins::obj_to_bigint(r));
-                }
-                if is_bool(r) {
-                    return Ok(BigInt::from(if w_bool_get_value(r) { 1 } else { 0 }));
-                }
+        if let Some(tp) = crate::typedef::r#type(arg)
+            && let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__")
+        {
+            let r = crate::call::call_function_impl_result(index_fn, &[arg])?;
+            if is_int(r) || is_long(r) {
+                return Ok(crate::builtins::obj_to_bigint(r));
+            }
+            if is_bool(r) {
+                return Ok(BigInt::from(if w_bool_get_value(r) { 1 } else { 0 }));
             }
         }
         Err(struct_error("required argument is not an integer"))
@@ -372,12 +372,12 @@ unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
         if is_bool(arg) {
             return Ok(if w_bool_get_value(arg) { 1.0 } else { 0.0 });
         }
-        if let Some(tp) = crate::typedef::r#type(arg) {
-            if let Some(float_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") {
-                let r = crate::call::call_function_impl_result(float_fn, &[arg])?;
-                if is_float(r) {
-                    return Ok(w_float_get_value(r));
-                }
+        if let Some(tp) = crate::typedef::r#type(arg)
+            && let Some(float_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__")
+        {
+            let r = crate::call::call_function_impl_result(float_fn, &[arg])?;
+            if is_float(r) {
+                return Ok(w_float_get_value(r));
             }
         }
         Err(struct_error("required argument is not a float"))
@@ -704,10 +704,11 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
             if crate::builtins::memoryview_contiguity(obj).0 {
                 let off = view.offset() as usize;
                 let len = memoryview::w_memoryview_length(obj) as usize;
-                if let Some(full) = view.backing().as_bytes_mut() {
-                    if off <= full.len() && len <= full.len() - off {
-                        return Ok(&mut full[off..off + len]);
-                    }
+                if let Some(full) = view.backing().as_bytes_mut()
+                    && off <= full.len()
+                    && len <= full.len() - off
+                {
+                    return Ok(&mut full[off..off + len]);
                 }
             }
         }

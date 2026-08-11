@@ -159,7 +159,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         .map_err(|_| overflow())?
                 }
             };
-            sec.checked_mul(SECS_TO_NS).ok_or_else(|| overflow())?
+            sec.checked_mul(SECS_TO_NS).ok_or_else(overflow)?
         }
     };
     // `interp_time.py:624` — `if not (timeout >= 0)`.
@@ -800,7 +800,7 @@ fn libc_tm_to_c_tm(tm: &libc::tm) -> c_tm {
     // `tm_gmtoff` / `tm_zone` only exist on the Unix `struct tm`.
     #[cfg(unix)]
     let (tm_gmtoff, tm_zone) = (
-        tm.tm_gmtoff as i64,
+        tm.tm_gmtoff,
         if tm.tm_zone.is_null() {
             String::new()
         } else {

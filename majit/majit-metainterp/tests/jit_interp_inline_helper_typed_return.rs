@@ -195,7 +195,7 @@ fn jit_inline_ref_identity_keeps_interpreter_behavior() {
 
 #[test]
 fn jit_inline_float_identity_keeps_interpreter_behavior() {
-    assert_eq!(inline_float_identity(3.14), 3.14);
+    assert_eq!(inline_float_identity(3.125), 3.125);
     assert_eq!(
         inline_float_identity(-0.0f64).to_bits(),
         (-0.0f64).to_bits()
@@ -629,7 +629,7 @@ fn jit_inline_float_identity_works_through_jitcode_builder() {
 
     let mut builder = JitCodeBuilder::new();
     // Simulate: caller has a float value in float register 0
-    builder.load_const_f_value(0, f64::to_bits(3.14) as i64);
+    builder.load_const_f_value(0, f64::to_bits(3.125) as i64);
     let sub_idx = builder.add_sub_jitcode(sub_jitcode);
     builder.inline_call_irf_f(sub_idx, &[], &[], &[(0, 0)], Some(1));
     let jitcode = builder.finish();

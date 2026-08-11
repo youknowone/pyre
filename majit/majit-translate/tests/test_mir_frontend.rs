@@ -706,11 +706,10 @@ fn option_question_mark_lifts_to_direct_option_switch() {
                 OpKind::ConstInt(d) => last_disc = Some(*d),
                 OpKind::FieldWrite { field, .. }
                     if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some(OPTION_ROOT) =>
+                        && field.owner_root.as_deref() == Some(OPTION_ROOT)
+                        && last_disc == Some(0) =>
                 {
-                    if last_disc == Some(0) {
-                        none_ctor += 1;
-                    }
+                    none_ctor += 1;
                 }
                 _ => {}
             }

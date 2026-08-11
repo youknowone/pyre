@@ -436,22 +436,21 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // Skip non-resume FailDescrs (whose
             // `set_fail_index_per_trace` panics by default).
             let __descr_arc = op.getdescr();
-            if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
-                if op
+            if let Some(fd) = __descr_arc.as_ref().and_then(|d| d.as_fail_descr())
+                && op
                     .getdescr()
-                    .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
-                {
-                    fd.set_fail_index_per_trace(fail_index);
-                    // `ops` is the optimized frontend trace retained by
-                    // `CompiledTrace`.  The backend GC rewriter inserts
-                    // operations before code generation, so the assembler's
-                    // prepared-op index is not a valid index into this slice.
-                    // Re-stamp the canonical descr from the frontend op,
-                    // matching RPython where the ResumeGuardDescr remains
-                    // attached to the live ResOperation rather than carrying
-                    // an index into a separate rewritten array.
-                    fd.set_source_op_index(op_idx);
-                }
+                    .is_some_and(|d| d.is_resume_guard() || d.is_resume_guard_copied())
+            {
+                fd.set_fail_index_per_trace(fail_index);
+                // `ops` is the optimized frontend trace retained by
+                // `CompiledTrace`.  The backend GC rewriter inserts
+                // operations before code generation, so the assembler's
+                // prepared-op index is not a valid index into this slice.
+                // Re-stamp the canonical descr from the frontend op,
+                // matching RPython where the ResumeGuardDescr remains
+                // attached to the live ResOperation rather than carrying
+                // an index into a separate rewritten array.
+                fd.set_source_op_index(op_idx);
             }
         }
 
@@ -515,10 +514,10 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                             if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(fa) = fa_types.as_ref() {
-                                if let Some(&tp) = fa.get(i) {
-                                    return tp;
-                                }
+                            if let Some(fa) = fa_types.as_ref()
+                                && let Some(&tp) = fa.get(i)
+                            {
+                                return tp;
                             }
                             fail_arg_type(&opref.to_opref())
                         })
@@ -641,8 +640,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // so a sharing-path guard's ResumeStorage points at the same
             // byte stream the donor was built from (RPython compile.py:832
             // ResumeGuardCopiedDescr).
-            let storage_for_guard = if let Some(numb) = op.resolved_rd_numb() {
-                Some(crate::resume::ResumeStorage::with_shared_consts(
+            let storage_for_guard = op.resolved_rd_numb().map(|numb| {
+                crate::resume::ResumeStorage::with_shared_consts(
                     numb.to_vec(),
                     op.resolved_rd_consts()
                         .unwrap_or_else(|| majit_ir::SharedConstPool::new(Vec::new())),
@@ -654,10 +653,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                         .as_deref()
                         .map(<[majit_ir::GuardPendingFieldEntry]>::to_vec)
                         .unwrap_or_default(),
-                ))
-            } else {
-                None
-            };
+                )
+            });
             result.insert(fail_index, layout);
             storage_for_guard
         } else {
@@ -1302,7 +1299,7 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
             let needs_slot_types = target
                 .slot_types
                 .as_ref()
-                .map_or(true, |types| types.len() != target.slot_layouts.len());
+                .is_none_or(|types| types.len() != target.slot_layouts.len());
             if needs_slot_types
                 && source
                     .slot_types
@@ -1384,7 +1381,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
             let needs_slot_types = target
                 .slot_types
                 .as_ref()
-                .map_or(true, |types| types.len() != target.slot_layouts.len());
+                .is_none_or(|types| types.len() != target.slot_layouts.len());
             if needs_slot_types
                 && source
                     .slot_types
@@ -1684,10 +1681,10 @@ pub(crate) fn terminal_exit_layout_for_trace(
             find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
         ));
     }
-    if let Some(fail_index) = find_fail_index_for_exit_op(&trace.ops, op_index) {
-        if let Some(layout) = trace.exit_layouts.get(&fail_index) {
-            return Some(layout.public(owning_key, trace_id, fail_index));
-        }
+    if let Some(fail_index) = find_fail_index_for_exit_op(&trace.ops, op_index)
+        && let Some(layout) = trace.exit_layouts.get(&fail_index)
+    {
+        return Some(layout.public(owning_key, trace_id, fail_index));
     }
     infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
@@ -1970,7 +1967,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // for the namespace test.
     let mut next_const_idx = constants
         .keys()
-        .filter_map(|&k| OpRef::raw_is_constant(k).then(|| OpRef::raw_const_index(k)))
+        .filter(|&&k| OpRef::raw_is_constant(k))
+        .map(|&k| OpRef::raw_const_index(k))
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
@@ -4086,17 +4084,17 @@ impl Drop for ResumeGuardCopiedDescr {
         let bridge_ptr = self
             .bridge_dispatch_cell
             .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !bridge_ptr.is_null() {
-            if let Some(drop_fn) = self.bridge_dispatch_drop_fn.get() {
-                // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
-                // alongside the payload at `bridge_ptr`; the publisher
-                // contracts to hand the cleanup function a payload of the
-                // same shape it published.
-                unsafe { drop_fn(bridge_ptr) };
-            }
-            // else: payload published with no cleanup registered — a
-            // backend bug.  Leaks rather than risking the wrong type.
+        if !bridge_ptr.is_null()
+            && let Some(drop_fn) = self.bridge_dispatch_drop_fn.get()
+        {
+            // Safety: `drop_fn` was registered via `bridge_dispatch_swap`
+            // alongside the payload at `bridge_ptr`; the publisher
+            // contracts to hand the cleanup function a payload of the
+            // same shape it published.
+            unsafe { drop_fn(bridge_ptr) };
         }
+        // else: payload published with no cleanup registered — a
+        // backend bug.  Leaks rather than risking the wrong type.
     }
 }
 

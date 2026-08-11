@@ -2310,19 +2310,18 @@ impl<'a> Transformer<'a> {
                     "floordiv" | "div" => Some("floordiv"),
                     _ => None,
                 };
-                if let Some(key) = residual_key {
-                    if self.get_value_kind_var(lhs) == 'i'
-                        && self.get_value_kind_var(rhs) == 'i'
-                        && self.binop_result_is_int(op.result.as_ref(), result_ty)
-                    {
-                        return RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
-                            graph,
-                            key,
-                            lhs,
-                            rhs,
-                            op.result.clone(),
-                        ));
-                    }
+                if let Some(key) = residual_key
+                    && self.get_value_kind_var(lhs) == 'i'
+                    && self.get_value_kind_var(rhs) == 'i'
+                    && self.binop_result_is_int(op.result.as_ref(), result_ty)
+                {
+                    return RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
+                        graph,
+                        key,
+                        lhs,
+                        rhs,
+                        op.result.clone(),
+                    ));
                 }
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -2880,23 +2879,22 @@ impl<'a> Transformer<'a> {
             .iter()
             .find(|c| c.matches(field))
             .filter(|_| !fresh_virtualizable)
+            && let Some(result) = op.result.clone()
         {
-            if let Some(result) = op.result.clone() {
-                // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
-                // We store the vable base plus the arraydescr properties.
-                let base_var = match &op.kind {
-                    OpKind::FieldRead { base, .. } => base.clone(),
-                    _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
-                };
-                // Vable arrays hold word-wide `PyObjectRef` items; the
-                // default must be the target word, not the build host's.
-                let itemsize = array_field
-                    .array_itemsize
-                    .unwrap_or_else(crate::layout::target_word_size);
-                let is_signed = array_field.array_is_signed.unwrap_or(false);
-                self.vable_array_vars
-                    .insert(result, (base_var, array_field.index, itemsize, is_signed));
-            }
+            // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
+            // We store the vable base plus the arraydescr properties.
+            let base_var = match &op.kind {
+                OpKind::FieldRead { base, .. } => base.clone(),
+                _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
+            };
+            // Vable arrays hold word-wide `PyObjectRef` items; the
+            // default must be the target word, not the build host's.
+            let itemsize = array_field
+                .array_itemsize
+                .unwrap_or_else(crate::layout::target_word_size);
+            let is_signed = array_field.array_is_signed.unwrap_or(false);
+            self.vable_array_vars
+                .insert(result, (base_var, array_field.index, itemsize, is_signed));
         }
         // Virtualizable scalar field → VableFieldRead
         if let Some(vable_field) = self
@@ -3340,10 +3338,10 @@ impl<'a> Transformer<'a> {
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
-        if let Some(key) = jit_marker_key_from_target(target) {
-            if let Some(ops) = self.try_handle_jit_marker(key, args, graph) {
-                return RewriteResult::Replace(ops);
-            }
+        if let Some(key) = jit_marker_key_from_target(target)
+            && let Some(ops) = self.try_handle_jit_marker(key, args, graph)
+        {
+            return RewriteResult::Replace(ops);
         }
         // STRUCTURAL-ADAPTATION (Rust-frontend → RPython rtyper gap).
         // RPython's rtyper resolves `Result`/`Option`-style tagged-union
@@ -3773,30 +3771,28 @@ impl<'a> Transformer<'a> {
             // jtransform.py:488 — list.* / newlist oopspecs → _handle_list_call.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path (RPython raises `NotSupported`).
-            if base.starts_with("list.") || base.starts_with("newlist") {
-                if let Some(result) = self._handle_list_call(base, op, args, graph, graph_name) {
-                    return prepend_const_prefix(&mut const_prefix_ops, result);
-                }
+            if (base.starts_with("list.") || base.starts_with("newlist"))
+                && let Some(result) = self._handle_list_call(base, op, args, graph, graph_name)
+            {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // jtransform.py:491-492 — stroruni.* oopspecs → _handle_stroruni_call.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path (RPython raises `NotSupported`).
-            if base.starts_with("stroruni.") {
-                if let Some(result) =
+            if base.starts_with("stroruni.")
+                && let Some(result) =
                     self._handle_stroruni_call(base, op, target, args, result_ty, graph_name, graph)
-                {
-                    return prepend_const_prefix(&mut const_prefix_ops, result);
-                }
+            {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // jtransform.py:503-504 — rgc.* oopspecs → _handle_rgc_call.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path.
-            if base.starts_with("rgc.") {
-                if let Some(result) =
+            if base.starts_with("rgc.")
+                && let Some(result) =
                     self._handle_rgc_call(base, op, target, args, result_ty, graph_name, graph)
-                {
-                    return prepend_const_prefix(&mut const_prefix_ops, result);
-                }
+            {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
             // are handled by jitcode_lower (proc-macro level), NOT here.
@@ -3871,15 +3867,15 @@ impl<'a> Transformer<'a> {
         //
         // RPython reuses the SAME calldescr returned by getcalldescr() —
         // it carries the real NON_VOID_ARGS and RESULT types from call.py:334.
-        if oopspecindex != OopSpecIndex::None {
-            if let Some(cc) = self.callcontrol.as_mut() {
-                let func_as_int = cc.fnaddr_for_target(target) as u64;
+        if oopspecindex != OopSpecIndex::None
+            && let Some(cc) = self.callcontrol.as_mut()
+        {
+            let func_as_int = cc.fnaddr_for_target(target) as u64;
 
-                cc.callinfocollection
-                    .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
-                cc.callinfocollection
-                    .register_func_name(func_as_int, format!("{target}"));
-            }
+            cc.callinfocollection
+                .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
+            cc.callinfocollection
+                .register_func_name(func_as_int, format!("{target}"));
         }
 
         // RPython jtransform.py:2003-2007: __handle_oopspec_call always
@@ -4935,14 +4931,14 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // jtransform.py:1999-2002: callinfocollection.add
-        if oopspecindex != OopSpecIndex::None {
-            if let Some(cc) = self.callcontrol.as_mut() {
-                let func_as_int = cc.fnaddr_for_target(target) as u64;
-                cc.callinfocollection
-                    .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
-                cc.callinfocollection
-                    .register_func_name(func_as_int, format!("{target}"));
-            }
+        if oopspecindex != OopSpecIndex::None
+            && let Some(cc) = self.callcontrol.as_mut()
+        {
+            let func_as_int = cc.fnaddr_for_target(target) as u64;
+            cc.callinfocollection
+                .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
+            cc.callinfocollection
+                .register_func_name(func_as_int, format!("{target}"));
         }
         // jtransform.py:2003-2008: residual_call + optional -live-
         self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
@@ -5898,7 +5894,7 @@ fn optimize_goto_if_not(graph: &mut FunctionGraph, block_idx: usize) -> bool {
         // `for arg in op.args: if arg == v (or v in ListOfKind): return False`
         let reads =
             crate::inline::op_variable_refs(&graph.blocks[block_idx].operations[op_idx].kind);
-        if reads.iter().any(|arg| *arg == v) {
+        if reads.contains(&v) {
             return false;
         }
         // `if v is op.result:`
@@ -6824,7 +6820,7 @@ fn fold_we_are_jitted_calls(graph: &mut crate::model::FunctionGraph) {
 fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
     target
         .path_segments()
-        .and_then(|segments| crate::hints::classify_hint_segments(segments))
+        .and_then(crate::hints::classify_hint_segments)
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.

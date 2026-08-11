@@ -294,29 +294,29 @@ impl Framer {
     /// no-op when there is no file (`dumps`) or nothing is pending. The file is
     /// re-read from its pin because `write` (arbitrary Python) can relocate it.
     fn flush(&mut self) -> Result<(), PyError> {
-        if let Some(slot) = self.file_slot {
-            if !self.pending.is_empty() {
-                let w_bytes = pyre_object::w_bytes_from_bytes(&self.pending);
-                // Pin the freshly-built bytes and re-read both it and the
-                // cached callable from their roots before arbitrary Python.
-                let _roots = pyre_object::gc_roots::push_roots();
-                pyre_object::gc_roots::pin_root(w_bytes);
-                let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                if let Some(write_slot) = self.write_slot {
-                    call_fn(
-                        pyre_object::gc_roots::shadow_stack_get(write_slot),
-                        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
-                    )?;
-                } else {
-                    let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
-                    call_meth(
-                        w_file,
-                        "write",
-                        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
-                    )?;
-                }
-                self.pending.clear();
+        if let Some(slot) = self.file_slot
+            && !self.pending.is_empty()
+        {
+            let w_bytes = pyre_object::w_bytes_from_bytes(&self.pending);
+            // Pin the freshly-built bytes and re-read both it and the
+            // cached callable from their roots before arbitrary Python.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(w_bytes);
+            let bytes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            if let Some(write_slot) = self.write_slot {
+                call_fn(
+                    pyre_object::gc_roots::shadow_stack_get(write_slot),
+                    &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+                )?;
+            } else {
+                let w_file = pyre_object::gc_roots::shadow_stack_get(slot);
+                call_meth(
+                    w_file,
+                    "write",
+                    &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+                )?;
             }
+            self.pending.clear();
         }
         Ok(())
     }
@@ -1156,12 +1156,12 @@ fn fast_save_leave(ctx: &mut PickleCtx, token: Option<usize>, obj_slot: usize) {
     if !ctx.fast {
         return;
     }
-    if let Some(h) = token {
-        if let Some(slots) = ctx.fast_memo.get_mut(&h) {
-            slots.retain(|&anc| anc != obj_slot);
-            if slots.is_empty() {
-                ctx.fast_memo.remove(&h);
-            }
+    if let Some(h) = token
+        && let Some(slots) = ctx.fast_memo.get_mut(&h)
+    {
+        slots.retain(|&anc| anc != obj_slot);
+        if slots.is_empty() {
+            ctx.fast_memo.remove(&h);
         }
     }
     ctx.fast_nesting -= 1;
@@ -1237,11 +1237,9 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
             || pyre_object::is_exact_type(w_obj, &pyre_object::FLOAT_TYPE)
     };
     // Identity memo — a repeated reference becomes a GET back-reference.
-    if !is_atom {
-        if let Some(idx) = ctx.memo_get(w_obj) {
-            write_get(ctx, buf, idx);
-            return Ok(());
-        }
+    if !is_atom && let Some(idx) = ctx.memo_get(w_obj) {
+        write_get(ctx, buf, idx);
+        return Ok(());
     }
     dispatch_save(ctx, buf, w_obj)
 }
@@ -1552,25 +1550,25 @@ fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<()
         Some(v) => BigInt::from(v),
         None => unsafe { crate::builtins::obj_to_bigint(w_obj) },
     };
-    if ctx.bin {
-        if let Some(v) = small {
-            if v >= 0 {
-                if v <= 0xff {
-                    buf.push(op::BININT1);
-                    buf.push(v as u8);
-                    return Ok(());
-                }
-                if v <= 0xffff {
-                    buf.push(op::BININT2);
-                    buf.extend_from_slice(&(v as u16).to_le_bytes());
-                    return Ok(());
-                }
-            }
-            if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
-                buf.push(op::BININT);
-                buf.extend_from_slice(&(v as i32).to_le_bytes());
+    if ctx.bin
+        && let Some(v) = small
+    {
+        if v >= 0 {
+            if v <= 0xff {
+                buf.push(op::BININT1);
+                buf.push(v as u8);
                 return Ok(());
             }
+            if v <= 0xffff {
+                buf.push(op::BININT2);
+                buf.extend_from_slice(&(v as u16).to_le_bytes());
+                return Ok(());
+            }
+        }
+        if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
+            buf.push(op::BININT);
+            buf.extend_from_slice(&(v as i32).to_le_bytes());
+            return Ok(());
         }
     }
     if ctx.proto >= 2 {
@@ -1578,13 +1576,13 @@ fn save_long(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<()
         return Ok(());
     }
     // protocol 0 / 1 text: INT for a signed 4-byte value, else LONG.
-    if let Some(v) = small {
-        if (-0x8000_0000..=0x7fff_ffff).contains(&v) {
-            buf.push(op::INT);
-            buf.extend_from_slice(v.to_string().as_bytes());
-            buf.push(b'\n');
-            return Ok(());
-        }
+    if let Some(v) = small
+        && (-0x8000_0000..=0x7fff_ffff).contains(&v)
+    {
+        buf.push(op::INT);
+        buf.extend_from_slice(v.to_string().as_bytes());
+        buf.push(b'\n');
+        return Ok(());
     }
     buf.push(op::LONG);
     buf.extend_from_slice(to_big(small).to_string().as_bytes());
@@ -1923,14 +1921,14 @@ fn save_set_items(
         }
         i += 1;
     }
-    if length > 1 {
-        if let Err(err) = save(ctx, buf, pinned_get(items_slot, length - 1)) {
-            return Err(add_pickle_object_note(
-                err,
-                pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                rustpython_wtf8::Wtf8::new("element"),
-            ));
-        }
+    if length > 1
+        && let Err(err) = save(ctx, buf, pinned_get(items_slot, length - 1))
+    {
+        return Err(add_pickle_object_note(
+            err,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            rustpython_wtf8::Wtf8::new("element"),
+        ));
     }
     buf.push(op::ADDITEMS);
     Ok(())
@@ -2599,14 +2597,14 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                 }
                 for (modname, mod_slot) in candidates {
                     let w_module = pyre_object::gc_roots::shadow_stack_get(mod_slot);
-                    if let Ok((resolved, _)) = getattribute_dotted(w_module, name) {
-                        if crate::baseobjspace::is_w(
+                    if let Ok((resolved, _)) = getattribute_dotted(w_module, name)
+                        && crate::baseobjspace::is_w(
                             resolved,
                             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                        ) {
-                            found = Some(modname);
-                            break;
-                        }
+                        )
+                    {
+                        found = Some(modname);
+                        break;
                     }
                 }
             }
@@ -2723,11 +2721,11 @@ fn save_global(
 
     // protocol >= 2: a `copyreg` extension code is emitted as EXT1/EXT2/EXT4
     // (and the object is not memoized — the reference is idempotent).
-    if ctx.proto >= 2 {
-        if let Some(code) = extension_code(&module_name, &name) {
-            write_ext(buf, code)?;
-            return Ok(());
-        }
+    if ctx.proto >= 2
+        && let Some(code) = extension_code(&module_name, &name)
+    {
+        write_ext(buf, code)?;
+        return Ok(());
     }
 
     if ctx.proto >= 4 {
@@ -3276,7 +3274,7 @@ fn save_reduce(
             }
         }
         let w_newargs =
-            pyre_object::tupleobject::w_tuple_new((1..args_len).map(|i| args_get(i)).collect());
+            pyre_object::tupleobject::w_tuple_new((1..args_len).map(&args_get).collect());
         pyre_object::gc_roots::pin_root(w_newargs);
         let newargs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if let Err(err) = save(ctx, buf, args_get(0)) {

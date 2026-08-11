@@ -301,7 +301,7 @@ impl LocalScope {
                 .expect("LocalScope.uniquename: scope index out of range");
             namesbyscope
                 .get(&basename)
-                .map_or(true, |list| p == list.len())
+                .is_none_or(|list| p == list.len())
         };
         if need_new {
             let new_name = self.glob.borrow_mut().uniquename(&basename, None, 50);

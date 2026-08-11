@@ -321,10 +321,10 @@ fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                 break;
             }
             let exit_ref = target.borrow().exits[0].clone();
-            if let Some(exit_target) = exit_ref.borrow().target.clone() {
-                if BlockKey::of(&exit_target) == BlockKey::of(&target) {
-                    break;
-                }
+            if let Some(exit_target) = exit_ref.borrow().target.clone()
+                && BlockKey::of(&exit_target) == BlockKey::of(&target)
+            {
+                break;
             }
             let subst: HashMap<Variable, Hlvalue> = target
                 .borrow()
@@ -405,11 +405,11 @@ pub fn tweak_generator_body_graph(
     for block in blocks {
         for exit_ref in block.borrow().exits.clone() {
             let mut exit = exit_ref.borrow_mut();
-            if let Some(target) = &exit.target {
-                if BlockKey::of(target) == BlockKey::of(&graph.returnblock) {
-                    exit.args = Vec::new();
-                    exit.target = Some(stopblock.clone());
-                }
+            if let Some(target) = &exit.target
+                && BlockKey::of(target) == BlockKey::of(&graph.returnblock)
+            {
+                exit.args = Vec::new();
+                exit.target = Some(stopblock.clone());
             }
         }
 
@@ -559,7 +559,7 @@ pub fn make_generator_entry_graph(func: GraphFunc) -> Result<FunctionGraph, Flow
     let generator_iterator = make_generatoriterator_class(&func, &var_names);
     replace_graph_with_bootstrap(
         &generator_iterator,
-        &mut *pygraph.graph.borrow_mut(),
+        &mut pygraph.graph.borrow_mut(),
         &var_names,
     )?;
     attach_next_method(&generator_iterator, &pygraph.graph.borrow())?;

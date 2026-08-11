@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn synthetic_base_is_disjoint_from_user_addresses() {
-        assert!(SYNTHETIC_FNADDR_BASE < 0);
+        const { assert!(SYNTHETIC_FNADDR_BASE < 0) };
         assert!(!is_synthetic_fnaddr(0));
         assert!(!is_synthetic_fnaddr(i64::MAX));
         assert!(is_synthetic_fnaddr(SYNTHETIC_FNADDR_BASE));

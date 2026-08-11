@@ -513,10 +513,11 @@ pub(crate) fn try_resolve_global(
     name: &str,
     allow_qualname: bool,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    if module_name == "builtins" && !name.contains('.') {
-        if let Some(obj) = lookup_builtin(name) {
-            return Ok(Some(obj));
-        }
+    if module_name == "builtins"
+        && !name.contains('.')
+        && let Some(obj) = lookup_builtin(name)
+    {
+        return Ok(Some(obj));
     }
     let module = import_module(module_name)?;
     if allow_qualname {
@@ -554,7 +555,7 @@ pub(crate) fn encode_long(big: &BigInt) -> Vec<u8> {
         mag.pop();
     }
     // reserve a byte for the sign bit when the top magnitude bit is set
-    if mag.last().map_or(true, |&b| b & 0x80 != 0) {
+    if mag.last().is_none_or(|&b| b & 0x80 != 0) {
         mag.push(0x00);
     }
     if sign == Sign::Plus {

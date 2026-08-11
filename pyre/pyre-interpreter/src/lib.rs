@@ -1,5 +1,37 @@
 #![allow(
     ambiguous_glob_reexports,
+    // PyObjectRef and frame pointers are translated runtime handles. Public
+    // object-space wrappers keep their safe Python-facing contract while raw
+    // access remains encapsulated inside the interpreter. Function signatures,
+    // enum shapes, and indexed opcode loops mirror PyPy's interpreter sources.
+    clippy::approx_constant,
+    clippy::doc_lazy_continuation,
+    clippy::duplicate_underscore_argument,
+    clippy::empty_line_after_doc_comments,
+    clippy::enum_variant_names,
+    clippy::explicit_counter_loop,
+    clippy::iter_skip_next,
+    clippy::macro_metavars_in_unsafe,
+    clippy::manual_memcpy,
+    clippy::manual_unwrap_or_default,
+    clippy::missing_safety_doc,
+    clippy::module_inception,
+    clippy::multiple_bound_locations,
+    clippy::mut_from_ref,
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::needless_update,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::new_ret_no_self,
+    clippy::nonminimal_bool,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::result_unit_err,
+    clippy::same_item_push,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::vec_box,
+    clippy::while_let_loop,
     dead_code,
     non_snake_case,
     unconditional_recursion,
@@ -898,28 +930,6 @@ pub(crate) fn rbigint_to_compiler_bigint(value: &PyBigInt) -> malachite_bigint::
     malachite_bigint::BigInt::from_bytes_le(sign, &bytes)
 }
 
-#[cfg(test)]
-mod bigint_seam_tests {
-    use super::*;
-
-    #[test]
-    fn compiler_bigint_byte_seam_round_trips_sign_and_large_magnitude() {
-        for source in [
-            "0",
-            "1",
-            "-1",
-            "9223372036854775808",
-            "-9223372036854775809",
-            "12345678901234567890123456789012345678901234567890",
-        ] {
-            let compiler: malachite_bigint::BigInt = source.parse().unwrap();
-            let rbigint = compiler_bigint_to_rbigint(&compiler);
-            assert_eq!(rbigint.str(0).unwrap(), source);
-            assert_eq!(rbigint_to_compiler_bigint(&rbigint), compiler);
-        }
-    }
-}
-
 /// PyPy `@unwrap_spec(...)` equivalent.  See `pyre-macros/src/lib.rs`.
 pub use pyre_macros::pyre_function;
 
@@ -1200,6 +1210,28 @@ pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod bigint_seam_tests {
+    use super::*;
+
+    #[test]
+    fn compiler_bigint_byte_seam_round_trips_sign_and_large_magnitude() {
+        for source in [
+            "0",
+            "1",
+            "-1",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "12345678901234567890123456789012345678901234567890",
+        ] {
+            let compiler: malachite_bigint::BigInt = source.parse().unwrap();
+            let rbigint = compiler_bigint_to_rbigint(&compiler);
+            assert_eq!(rbigint.str(0).unwrap(), source);
+            assert_eq!(rbigint_to_compiler_bigint(&rbigint), compiler);
+        }
     }
 }
 

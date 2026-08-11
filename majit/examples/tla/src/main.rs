@@ -1,3 +1,5 @@
+#![allow(clippy::empty_line_after_doc_comments)]
+
 /// Rust port of rpython/jit/tl/tla/tla.py — TLA (Toy Language Advanced).
 ///
 /// Object-oriented stack machine with wrapped values.

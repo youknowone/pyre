@@ -346,16 +346,16 @@ impl<'a> ResOpGen<'a> {
             }
         }
         let op = &operations[opindex.saturating_sub(1)];
-        if op.opcode == OpCode::Jump {
-            if let Some(descr) = getdescr(op) {
-                let key = descr_identity(&descr);
-                if let Some((_, target)) = self.target_tokens.iter().find(|(k, _)| *k == key) {
-                    self.genedge(
-                        (graphindex, opstartindex),
-                        *target,
-                        EdgeAttrs::default().weight("0"),
-                    );
-                }
+        if op.opcode == OpCode::Jump
+            && let Some(descr) = getdescr(op)
+        {
+            let key = descr_identity(&descr);
+            if let Some((_, target)) = self.target_tokens.iter().find(|(k, _)| *k == key) {
+                self.genedge(
+                    (graphindex, opstartindex),
+                    *target,
+                    EdgeAttrs::default().weight("0"),
+                );
             }
         }
         lines.push(String::new());

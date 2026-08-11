@@ -85,7 +85,7 @@ pub fn copy_str_content(
     mode: u8,
     need_next_offset: bool,
 ) -> Option<Operand> {
-    let srcbox = ctx.resolve_operand_operand(&srcbox);
+    let srcbox = ctx.resolve_operand_operand(srcbox);
     let (set_opcode, copy_opcode) = if mode != 0 {
         (OpCode::Unicodesetitem, OpCode::Copyunicodecontent)
     } else {
@@ -144,7 +144,7 @@ pub fn copy_str_content(
                     ctx.materialize_operand_at(ch)
                 };
                 src_offset = _int_add(&src_offset, &one, ctx);
-                let arg_target = ctx.resolve_operand_operand(&targetbox);
+                let arg_target = ctx.resolve_operand_operand(targetbox);
                 let arg_dst_off = ctx.resolve_operand_operand(&dst_offset);
                 let arg_char = ctx.resolve_operand_operand(&charbox);
                 let setitem_op = Op::new(
@@ -170,10 +170,10 @@ pub fn copy_str_content(
         None
     };
     let arg_src = ctx.resolve_operand_operand(&srcbox);
-    let arg_target = ctx.resolve_operand_operand(&targetbox);
-    let arg_srcoff = ctx.resolve_operand_operand(&srcoffsetbox);
-    let arg_off = ctx.resolve_operand_operand(&offsetbox);
-    let arg_len = ctx.resolve_operand_operand(&lengthbox);
+    let arg_target = ctx.resolve_operand_operand(targetbox);
+    let arg_srcoff = ctx.resolve_operand_operand(srcoffsetbox);
+    let arg_off = ctx.resolve_operand_operand(offsetbox);
+    let arg_len = ctx.resolve_operand_operand(lengthbox);
     let copy_op = Op::new(
         copy_opcode,
         &[
@@ -223,9 +223,7 @@ pub fn string_copy_parts(
     let action = match resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
         Some(info) => match info {
             PtrInfo::Str(sinfo) if sinfo.is_virtual() => match &sinfo.variant {
-                VStringVariant::Plain(p) => {
-                    Action::Plain(p._chars.iter().map(|slot| slot.clone()).collect())
-                }
+                VStringVariant::Plain(p) => Action::Plain(p._chars.to_vec()),
                 VStringVariant::Slice(s) => Action::Slice {
                     s: s.s.clone(),
                     start: s.start.clone(),
@@ -259,7 +257,7 @@ pub fn string_copy_parts(
             for ch in &chars {
                 if let Some(ch_ref) = ch {
                     let arg_char = ctx.resolve_operand_operand(ch_ref);
-                    let arg_target = ctx.resolve_operand_operand(&targetbox);
+                    let arg_target = ctx.resolve_operand_operand(targetbox);
                     let arg_offset = ctx.resolve_operand_operand(&offset);
                     let setitem_op = Op::new(
                         set_opcode,
@@ -308,7 +306,7 @@ fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
     let resolved = resolved_box
         .as_ref()
         .map_or_else(|| opref.clone(), |b| b.clone());
-    if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+    if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
         let resolved_box = resolved_box.expect("recorder-populated");
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
         let forced = info.force_box(&resolved_box, ctx);
@@ -350,10 +348,10 @@ impl OptString {
         f: impl FnOnce(&mut VStringPlainInfo) -> R,
     ) -> Option<R> {
         ctx.with_ptr_info_mut(op, |info| {
-            if let PtrInfo::Str(sinfo) = info {
-                if let VStringVariant::Plain(plain) = &mut sinfo.variant {
-                    return Some(f(plain));
-                }
+            if let PtrInfo::Str(sinfo) = info
+                && let VStringVariant::Plain(plain) = &mut sinfo.variant
+            {
+                return Some(f(plain));
             }
             None
         })
@@ -412,7 +410,7 @@ impl OptString {
         let resolved = resolved_box
             .as_ref()
             .map_or_else(|| op.to_opref(), |b| b.to_opref());
-        if resolved_box.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+        if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
             let resolved_box = resolved_box.expect("recorder-populated");
             let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
             let forced = info.force_box(&resolved_box, ctx);
@@ -448,10 +446,10 @@ impl OptString {
     fn getstrlen_if_known(&self, op: &Operand, ctx: &mut OptContext) -> Option<OpRef> {
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
-        if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b)) {
-            if let Some(lgtop) = info.get_cached_lgtop() {
-                return Some(lgtop);
-            }
+        if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b))
+            && let Some(lgtop) = info.get_cached_lgtop()
+        {
+            return Some(lgtop);
         }
         // vstring.py:174: self.lgtop = ConstInt(len(self._chars))
         // RPython creates a pure ConstInt — no op emission.
@@ -549,21 +547,20 @@ impl OptString {
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(&index_box)
             .and_then(|b| ctx.get_constant_int_box(&b))
+            && let Some(concat) = self.get_concat_info(&strbox, ctx)
         {
-            if let Some(concat) = self.get_concat_info(&strbox, ctx) {
-                // vstring.py:506-507: len1box = leftinfo.getstrlen(...); recurse
-                // only when it is an actual ConstInt. A non-constant length —
-                // including a variable whose IntBound merely happens to be
-                // constant — is not `isinstance(len1box, ConstInt)`, so it falls
-                // through to the residual STRGETITEM on the whole concat.
-                let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
-                if let Some(len1) = ctx.isinstance_const_int(len1box) {
-                    return if idx < len1 {
-                        self.strgetitem_emit(&concat.vleft, idx, mode, ctx)
-                    } else {
-                        self.strgetitem_emit(&concat.vright, idx - len1, mode, ctx)
-                    };
-                }
+            // vstring.py:506-507: len1box = leftinfo.getstrlen(...); recurse
+            // only when it is an actual ConstInt. A non-constant length —
+            // including a variable whose IntBound merely happens to be
+            // constant — is not `isinstance(len1box, ConstInt)`, so it falls
+            // through to the residual STRGETITEM on the whole concat.
+            let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
+            if let Some(len1) = ctx.isinstance_const_int(len1box) {
+                return if idx < len1 {
+                    self.strgetitem_emit(&concat.vleft, idx, mode, ctx)
+                } else {
+                    self.strgetitem_emit(&concat.vright, idx - len1, mode, ctx)
+                };
             }
         }
         self._strgetitem(&strbox, &index_box, mode, ctx)
@@ -585,8 +582,8 @@ impl OptString {
         } else {
             OpCode::Strgetitem
         };
-        let arg_str = ctx.resolve_operand_operand(&strbox);
-        let arg_index = ctx.resolve_operand_operand(&index_box);
+        let arg_str = ctx.resolve_operand_operand(strbox);
+        let arg_index = ctx.resolve_operand_operand(index_box);
         // vstring.py:411-415 emit_extra(resbox). emit_for_force routes to
         // emit() during forcing (in_final_emission, the copy_str_content path)
         // and to emit_extra(current_pass_idx) during the pass — identical to
@@ -652,28 +649,28 @@ impl OptString {
         if let Some(len) = ctx
             .resolve_operand_operand_opt(&op.arg(0))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
+            && len >= 0
+            && (len as usize) <= MAX_CONST_LEN
         {
-            if len >= 0 && (len as usize) <= MAX_CONST_LEN {
-                // vstring.py:450: self.make_vstring_plain(op, mode, length)
-                let b = Operand::from_bound_op(op_rc);
-                {
-                    ctx.set_ptr_info(
-                        &b,
-                        PtrInfo::Str(StrPtrInfo {
-                            lenbound: None,
-                            lgtop: None,
-                            mode,
-                            length: len as i32,
-                            variant: VStringVariant::Plain(VStringPlainInfo {
-                                _chars: vec![None; len as usize],
-                            }),
-                            last_guard_pos: -1,
-                            avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            // vstring.py:450: self.make_vstring_plain(op, mode, length)
+            let b = Operand::from_bound_op(op_rc);
+            {
+                ctx.set_ptr_info(
+                    &b,
+                    PtrInfo::Str(StrPtrInfo {
+                        lenbound: None,
+                        lgtop: None,
+                        mode,
+                        length: len as i32,
+                        variant: VStringVariant::Plain(VStringPlainInfo {
+                            _chars: vec![None; len as usize],
                         }),
-                    );
-                }
-                return OptimizationResult::Remove;
+                        last_guard_pos: -1,
+                        avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+                    }),
+                );
             }
+            return OptimizationResult::Remove;
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
         // NEWSTR/NEWUNICODE produce the string object directly; use the
@@ -737,13 +734,12 @@ impl OptString {
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
+            && let Some(ch_ref) = self.strgetitem(&str_ref, idx, mode, ctx)
         {
-            if let Some(ch_ref) = self.strgetitem(&str_ref, idx, mode, ctx) {
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_new = ctx.get_box_replacement_operand(ch_ref);
-                ctx.make_equal_to(&b_old, &b_new);
-                return OptimizationResult::Remove;
-            }
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_new = ctx.get_box_replacement_operand(ch_ref);
+            ctx.make_equal_to(&b_old, &b_new);
+            return OptimizationResult::Remove;
         }
         // vstring.py:490-512: the char could not be folded. Continue the
         // strgetitem dispatch on the residual — unwrap a virtual slice to its
@@ -815,28 +811,27 @@ impl OptString {
         if let Some(idx) = ctx
             .resolve_operand_operand_opt(index)
             .and_then(|b| ctx.get_constant_int_box(&b))
+            && let Some(concat) = self.get_concat_info(&resolved_s, ctx)
         {
-            if let Some(concat) = self.get_concat_info(&resolved_s, ctx) {
-                // vstring.py:506-507: recurse only when getstrlen is an actual
-                // ConstInt, matching strgetitem_emit's concat gate; a constant
-                // IntBound on a non-ConstInt length is not enough.
-                let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
-                if let Some(len1) = ctx.isinstance_const_int(len1box) {
-                    let (child, child_idx) = if idx < len1 {
-                        (concat.vleft.clone(), idx)
-                    } else {
-                        (concat.vright.clone(), idx - len1)
-                    };
-                    let child_idx_box = {
-                        let c = ctx.make_constant_int(child_idx);
-                        ctx.materialize_operand_at(c)
-                    };
-                    let child_resolved = ctx.resolve_operand_operand(&child);
-                    return Some(
-                        self.strgetitem_rebase_residual(&child_resolved, &child_idx_box, mode, ctx)
-                            .unwrap_or((child_resolved, child_idx_box)),
-                    );
-                }
+            // vstring.py:506-507: recurse only when getstrlen is an actual
+            // ConstInt, matching strgetitem_emit's concat gate; a constant
+            // IntBound on a non-ConstInt length is not enough.
+            let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
+            if let Some(len1) = ctx.isinstance_const_int(len1box) {
+                let (child, child_idx) = if idx < len1 {
+                    (concat.vleft.clone(), idx)
+                } else {
+                    (concat.vright.clone(), idx - len1)
+                };
+                let child_idx_box = {
+                    let c = ctx.make_constant_int(child_idx);
+                    ctx.materialize_operand_at(c)
+                };
+                let child_resolved = ctx.resolve_operand_operand(&child);
+                return Some(
+                    self.strgetitem_rebase_residual(&child_resolved, &child_idx_box, mode, ctx)
+                        .unwrap_or((child_resolved, child_idx_box)),
+                );
             }
         }
         None
@@ -908,60 +903,59 @@ impl OptString {
             return OptimizationResult::Remove;
         }
 
-        if let (Some(src_start), Some(dst_start), Some(length)) = (src_start, dst_start, length) {
-            if src_is_virtual_or_constant
-                && (length < 20 || (src_is_virtual_or_constant && dst_virtual))
-            {
-                let setitem_opcode = if mode == mode_unicode {
-                    OpCode::Unicodesetitem
-                } else {
-                    OpCode::Strsetitem
-                };
-                // vstring.py:578: `for index in range(actual_length)` — a
-                // negative constant length runs zero iterations (the copy is a
-                // no-op), so clamp the capacity hint to avoid `-n as usize`.
-                let mut dst_chars = Vec::with_capacity(length.max(0) as usize);
-                for index in 0..length {
-                    // vstring.py:580-581: vresult = self.strgetitem(None, ...) —
-                    // const-folds a virtual/constant char or emits a STRGETITEM.
-                    let ch_ref = self.strgetitem_emit(&src_ref_box, src_start + index, mode, ctx);
-                    let char_ref = ctx.get_replacement_opref(ch_ref);
-                    if dst_virtual {
-                        dst_chars.push(Some(char_ref));
-                    } else {
-                        // vstring.py:585-589: self.emit_extra(new_op)
-                        let dst_index_ref = ctx.make_constant_int(dst_start + index);
-                        let pass_idx = ctx.current_pass_idx;
-                        let arg_dst = ctx.materialize_operand_at(dst_ref.to_opref());
-                        let arg_dst_index = ctx.materialize_operand_at(dst_index_ref);
-                        let arg_char = ctx.materialize_operand_at(char_ref);
-                        ctx.emit_extra(
-                            pass_idx,
-                            Op::new(
-                                setitem_opcode,
-                                &[arg_dst.clone(), arg_dst_index.clone(), arg_char.clone()],
-                            ),
-                        );
-                    }
-                }
+        if let (Some(src_start), Some(dst_start), Some(length)) = (src_start, dst_start, length)
+            && src_is_virtual_or_constant
+            && (length < 20 || (src_is_virtual_or_constant && dst_virtual))
+        {
+            let setitem_opcode = if mode == mode_unicode {
+                OpCode::Unicodesetitem
+            } else {
+                OpCode::Strsetitem
+            };
+            // vstring.py:578: `for index in range(actual_length)` — a
+            // negative constant length runs zero iterations (the copy is a
+            // no-op), so clamp the capacity hint to avoid `-n as usize`.
+            let mut dst_chars = Vec::with_capacity(length.max(0) as usize);
+            for index in 0..length {
+                // vstring.py:580-581: vresult = self.strgetitem(None, ...) —
+                // const-folds a virtual/constant char or emits a STRGETITEM.
+                let ch_ref = self.strgetitem_emit(&src_ref_box, src_start + index, mode, ctx);
+                let char_ref = ctx.get_replacement_opref(ch_ref);
                 if dst_virtual {
-                    // Materialize each char position to a bound producer before
-                    // borrowing the plain info (the closure holds `ctx`).
-                    let dst_operands: Vec<Option<Operand>> = dst_chars
-                        .into_iter()
-                        .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
-                        .collect();
-                    self.with_plain_info_mut(&dst_ref, ctx, |info| {
-                        for (index, ch_op) in dst_operands.into_iter().enumerate() {
-                            let dst_index = (dst_start as usize) + index;
-                            if dst_index < info._chars.len() {
-                                info._chars[dst_index] = ch_op;
-                            }
-                        }
-                    });
+                    dst_chars.push(Some(char_ref));
+                } else {
+                    // vstring.py:585-589: self.emit_extra(new_op)
+                    let dst_index_ref = ctx.make_constant_int(dst_start + index);
+                    let pass_idx = ctx.current_pass_idx;
+                    let arg_dst = ctx.materialize_operand_at(dst_ref.to_opref());
+                    let arg_dst_index = ctx.materialize_operand_at(dst_index_ref);
+                    let arg_char = ctx.materialize_operand_at(char_ref);
+                    ctx.emit_extra(
+                        pass_idx,
+                        Op::new(
+                            setitem_opcode,
+                            &[arg_dst.clone(), arg_dst_index.clone(), arg_char.clone()],
+                        ),
+                    );
                 }
-                return OptimizationResult::Remove;
             }
+            if dst_virtual {
+                // Materialize each char position to a bound producer before
+                // borrowing the plain info (the closure holds `ctx`).
+                let dst_operands: Vec<Option<Operand>> = dst_chars
+                    .into_iter()
+                    .map(|o| o.map(|r| ctx.materialize_operand_at(r)))
+                    .collect();
+                self.with_plain_info_mut(&dst_ref, ctx, |info| {
+                    for (index, ch_op) in dst_operands.into_iter().enumerate() {
+                        let dst_index = (dst_start as usize) + index;
+                        if dst_index < info._chars.len() {
+                            info._chars[dst_index] = ch_op;
+                        }
+                    }
+                });
+            }
+            return OptimizationResult::Remove;
         }
 
         // vstring.py:590-593: fallback — emit via copy_str_content
@@ -1015,8 +1009,8 @@ impl OptString {
                 return ctx.materialize_operand_at(__c);
             }
         }
-        let arg_a = ctx.resolve_operand_operand(&a);
-        let arg_b = ctx.resolve_operand_operand(&b);
+        let arg_a = ctx.resolve_operand_operand(a);
+        let arg_b = ctx.resolve_operand_operand(b);
         let op = Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]);
         let __r = ctx.emit_for_force(op);
         ctx.materialize_operand_at(__r)
@@ -1219,12 +1213,12 @@ impl OptString {
         if let (Some(l1), Some(l2)) = (l1box, l2box) {
             let l1c = ctx.isinstance_const_int(l1);
             let l2c = ctx.isinstance_const_int(l2);
-            if let (Some(v1), Some(v2)) = (l1c, l2c) {
-                if v1 != v2 {
-                    let b = ctx.materialize_operand_at(op.pos.get());
-                    ctx.make_constant_box(&b, Value::Int(0));
-                    return OptimizationResult::Remove;
-                }
+            if let (Some(v1), Some(v2)) = (l1c, l2c)
+                && v1 != v2
+            {
+                let b = ctx.materialize_operand_at(op.pos.get());
+                ctx.make_constant_box(&b, Value::Int(0));
+                return OptimizationResult::Remove;
             }
         }
         // vstring.py:714-718: handle_str_equal_level1 both directions
@@ -1575,12 +1569,12 @@ impl OptString {
                     .as_ref()
                     .and_then(|b| {
                         ctx.with_ptr_info_mut(b, |info| {
-                            if let PtrInfo::Str(sinfo) = info {
-                                if matches!(sinfo.variant, VStringVariant::Plain(_)) {
-                                    // vstring.py:847: i1.shrink(length)
-                                    Self::vstring_plain_shrink(sinfo, length as usize);
-                                    return true;
-                                }
+                            if let PtrInfo::Str(sinfo) = info
+                                && matches!(sinfo.variant, VStringVariant::Plain(_))
+                            {
+                                // vstring.py:847: i1.shrink(length)
+                                Self::vstring_plain_shrink(sinfo, length as usize);
+                                return true;
                             }
                             false
                         })
@@ -1660,12 +1654,12 @@ impl Optimization for OptString {
             | OpCode::CallPureF
             | OpCode::CallPureN => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        if ei.has_oopspec() {
-                            return self.optimize_oopspec_call(op, op_rc, &ei, ctx);
-                        }
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    if ei.has_oopspec() {
+                        return self.optimize_oopspec_call(op, op_rc, ei, ctx);
                     }
                 }
                 self.force_args_if_virtual(op, ctx);
@@ -2659,7 +2653,7 @@ mod tests {
         // which maps ref_op(100) → int_op(0) (result of first STRLEN).
         // Since int_op(0) is not a constant, it won't be removed by OptString alone.
         // This test just verifies no crash occurs.
-        assert!(result.len() >= 1);
+        assert!(!result.is_empty());
     }
 
     #[test]

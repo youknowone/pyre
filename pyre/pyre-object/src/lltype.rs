@@ -310,18 +310,18 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
         TypeIdCell::UNASSIGNED => 0,
         id => id,
     };
-    if let Some(raw) = crate::gc_hook::try_gc_alloc(type_id, T::SIZE) {
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut T, value);
-                // The no-collect allocator may fall back to old-gen when the
-                // nursery is full.  In that case the freshly-written payload
-                // can already contain nursery references and must enter the
-                // remembered set.  Nursery allocations ignore this barrier.
-                crate::gc_hook::try_gc_write_barrier_managed(raw);
-            }
-            return raw as *mut T;
+    if let Some(raw) = crate::gc_hook::try_gc_alloc(type_id, T::SIZE)
+        && !raw.is_null()
+    {
+        unsafe {
+            std::ptr::write(raw as *mut T, value);
+            // The no-collect allocator may fall back to old-gen when the
+            // nursery is full.  In that case the freshly-written payload
+            // can already contain nursery references and must enter the
+            // remembered set.  Nursery allocations ignore this barrier.
+            crate::gc_hook::try_gc_write_barrier_managed(raw);
         }
+        return raw as *mut T;
     }
     malloc_typed(value)
 }

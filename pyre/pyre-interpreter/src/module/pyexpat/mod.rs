@@ -1241,25 +1241,25 @@ fn declared_or_forced_encoding(parser: PyObjectRef, data: &[u8]) -> Result<Strin
     if data.starts_with(&[0, b'<', 0, b'?', 0, b'x']) {
         return Ok("utf-16be".to_string());
     }
-    if let Ok(obj) = crate::baseobjspace::getattr_str(parser, "_pyre_forced_encoding") {
-        if unsafe { is_str(obj) } {
-            return Ok(unsafe { w_str_get_value(obj) }.to_string());
-        }
+    if let Ok(obj) = crate::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
+        && unsafe { is_str(obj) }
+    {
+        return Ok(unsafe { w_str_get_value(obj) }.to_string());
     }
     let prefix: String = data.iter().take(200).map(|b| *b as char).collect();
-    if let Some(pos) = prefix.find("encoding") {
-        if let Some(eq) = prefix[pos..].find('=') {
-            let rest = prefix[pos + eq + 1..].trim_start();
-            if let Some(quote @ ('\'' | '"')) = rest.chars().next() {
-                if let Some(end) = rest[1..].find(quote) {
-                    let declared = rest[1..1 + end].to_string();
-                    let normalized = normalize_encoding(&declared);
-                    if normalized.starts_with("utf-16") && !looks_like_utf16(data) {
-                        return Ok("utf-8".to_string());
-                    }
-                    return Ok(declared);
-                }
+    if let Some(pos) = prefix.find("encoding")
+        && let Some(eq) = prefix[pos..].find('=')
+    {
+        let rest = prefix[pos + eq + 1..].trim_start();
+        if let Some(quote @ ('\'' | '"')) = rest.chars().next()
+            && let Some(end) = rest[1..].find(quote)
+        {
+            let declared = rest[1..1 + end].to_string();
+            let normalized = normalize_encoding(&declared);
+            if normalized.starts_with("utf-16") && !looks_like_utf16(data) {
+                return Ok("utf-8".to_string());
             }
+            return Ok(declared);
         }
     }
     Ok("utf-8".to_string())
@@ -1282,7 +1282,7 @@ fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, crate::PyError> 
     } else {
         (enc != "utf-16be", 0)
     };
-    if (data.len() - start) % 2 != 0 {
+    if !(data.len() - start).is_multiple_of(2) {
         return Err(crate::PyError::value_error("partial character"));
     }
     let words: Vec<u16> = data[start..]

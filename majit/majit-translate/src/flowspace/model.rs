@@ -1628,7 +1628,8 @@ impl HostEnv {
         // not yet wired through `findbltintyper`; registering only the
         // qualname without the typer body surfaces as a registry hit
         // that returns no body, which is observably wrong.
-        for name in ["object.__init__"] {
+        {
+            let name = "object.__init__";
             self.insert_builtin(name, HostObject::new_builtin_callable(name));
         }
         // Pyre-internal front-end pointer-downcast narrow (#298): the
@@ -2680,10 +2681,11 @@ fn clean_name(name: &str) -> String {
         })
         .collect();
     cleaned.push('_');
-    if let Some(first) = cleaned.chars().next() {
-        if !first.is_ascii_alphabetic() && first != '_' {
-            cleaned.insert(0, '_');
-        }
+    if let Some(first) = cleaned.chars().next()
+        && !first.is_ascii_alphabetic()
+        && first != '_'
+    {
+        cleaned.insert(0, '_');
     }
     let mut nd = NAMESDICT.lock().unwrap();
     let entry = nd
@@ -3867,10 +3869,10 @@ impl Block {
     pub fn getvariables(&self) -> Vec<Variable> {
         let mut result: Vec<Variable> = Vec::new();
         let push_var = |w: &Hlvalue, result: &mut Vec<Variable>| {
-            if let Hlvalue::Variable(v) = w {
-                if !result.iter().any(|x| x == v) {
-                    result.push(v.clone());
-                }
+            if let Hlvalue::Variable(v) = w
+                && !result.iter().any(|x| x == v)
+            {
+                result.push(v.clone());
             }
         };
         for w in &self.inputargs {
@@ -3890,10 +3892,10 @@ impl Block {
     pub fn getconstants(&self) -> Vec<Constant> {
         let mut result: Vec<Constant> = Vec::new();
         let push_const = |w: &Hlvalue, result: &mut Vec<Constant>| {
-            if let Hlvalue::Constant(c) = w {
-                if !result.iter().any(|x| x == c) {
-                    result.push(c.clone());
-                }
+            if let Hlvalue::Constant(c) = w
+                && !result.iter().any(|x| x == c)
+            {
+                result.push(c.clone());
             }
         };
         for w in &self.inputargs {
@@ -4688,18 +4690,12 @@ pub fn copygraph(
     for block in graph.iterblocks() {
         blockmap.insert(BlockKey::of(&block), copyblock(&block, &mut varmap));
     }
-    if !blockmap.contains_key(&BlockKey::of(&graph.returnblock)) {
-        blockmap.insert(
-            BlockKey::of(&graph.returnblock),
-            copyblock(&graph.returnblock, &mut varmap),
-        );
-    }
-    if !blockmap.contains_key(&BlockKey::of(&graph.exceptblock)) {
-        blockmap.insert(
-            BlockKey::of(&graph.exceptblock),
-            copyblock(&graph.exceptblock, &mut varmap),
-        );
-    }
+    blockmap
+        .entry(BlockKey::of(&graph.returnblock))
+        .or_insert_with(|| copyblock(&graph.returnblock, &mut varmap));
+    blockmap
+        .entry(BlockKey::of(&graph.exceptblock))
+        .or_insert_with(|| copyblock(&graph.exceptblock, &mut varmap));
 
     // Wire up exits.
     for block in graph.iterblocks() {
@@ -5016,13 +5012,13 @@ pub fn checkgraph(graph: &FunctionGraph) {
                             is_valid_switch_exitcase(&exitcase),
                             "switch on a non-primitive value {exitcase:?}"
                         );
-                        if let Hlvalue::Constant(c) = &exitcase {
-                            if c.value.string_eq("default") {
-                                assert!(
-                                    idx + 1 == b.exits.len(),
-                                    "'default' branch of a switch is not the last exit"
-                                );
-                            }
+                        if let Hlvalue::Constant(c) = &exitcase
+                            && c.value.string_eq("default")
+                        {
+                            assert!(
+                                idx + 1 == b.exits.len(),
+                                "'default' branch of a switch is not the last exit"
+                            );
                         }
                     }
                 }
@@ -5045,7 +5041,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
             );
             let prev = link.prevblock.as_ref().and_then(|w| w.upgrade());
             assert!(
-                prev.as_ref().map_or(false, |p| Rc::ptr_eq(p, &block)),
+                prev.as_ref().is_some_and(|p| Rc::ptr_eq(p, &block)),
                 "link.prevblock does not point back to the owning block"
             );
             if exc_link {
@@ -5066,13 +5062,11 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 if let Hlvalue::Variable(v) = arg {
                     let where_str = format!("link[{link_idx}].args[{arg_idx}]");
                     usevar(v, Some(link_id), &vars, &where_str);
-                    if exc_link {
-                        if let Some(last_op) = b.operations.last() {
-                            assert!(
-                                *arg != last_op.result,
-                                "raising operation result cannot flow into exception link"
-                            );
-                        }
+                    if exc_link && let Some(last_op) = b.operations.last() {
+                        assert!(
+                            *arg != last_op.result,
+                            "raising operation result cannot flow into exception link"
+                        );
                     }
                 }
             }
@@ -5195,7 +5189,7 @@ mod tests {
         assert_eq!(ConstValue::uni_str("name").as_pystr(), None);
         // Non-UTF-8 bytes — also reject (ASCII identifiers never
         // produce these; defensive).
-        assert_eq!(ConstValue::byte_str(&[0xff, 0xfe]).as_pystr(), None);
+        assert_eq!(ConstValue::byte_str([0xff, 0xfe]).as_pystr(), None);
         // Non-string variants reject as well.
         assert_eq!(ConstValue::Int(1).as_pystr(), None);
     }
@@ -5706,7 +5700,7 @@ mod tests {
         let g = FunctionGraph::new("f", start);
         let s = summary(&g);
         assert_eq!(s.get("int_add").copied(), Some(1));
-        assert!(s.get("same_as").is_none(), "summary excludes same_as");
+        assert!(!s.contains_key("same_as"), "summary excludes same_as");
     }
 
     #[test]

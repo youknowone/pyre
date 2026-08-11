@@ -701,7 +701,7 @@ impl IntBound {
     /// Python-style floor division bound.
     pub fn py_div_bound(&self, other: &IntBound) -> IntBound {
         // We need 0 not in other's interval; also check that other doesn't straddle 0
-        if !other.contains(0) && !(other.lower < 0 && 0 < other.upper) {
+        if !(other.contains(0) || other.lower < 0 && 0 < other.upper) {
             // py_div uses unchecked `/` and `%`, which panic on i64::MIN / -1.
             // Guard before evaluating the corners so we hit the fallback safely.
             if other.contains(-1) && (self.lower == i64::MIN || self.upper == i64::MIN) {
@@ -1269,7 +1269,7 @@ impl IntBound {
 
 /// Checked left shift for i64 that returns None on overflow.
 fn checked_shl_i64(value: i64, shift: i64) -> Option<i64> {
-    if shift < 0 || shift >= 64 {
+    if !(0..64).contains(&shift) {
         return None;
     }
     let shift = shift as u32;

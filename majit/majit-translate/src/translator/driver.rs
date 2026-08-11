@@ -950,10 +950,8 @@ impl TranslationDriver {
         let (backend, ts) = self.get_backend_and_type_system()?;
         // Upstream `:153`: `postfixes = [''] + ['_'+p for p in (backend, ts) if p]`.
         let mut postfixes: Vec<String> = vec![String::new()];
-        for p in [&backend, &ts] {
-            if let Some(p) = p {
-                postfixes.push(format!("_{}", p));
-            }
+        for p in [&backend, &ts].into_iter().flatten() {
+            postfixes.push(format!("_{}", p));
         }
         let tasks = self.engine.tasks();
         let mut out = Vec::new();
@@ -1054,8 +1052,7 @@ impl TranslationDriver {
         *self.inputtypes.borrow_mut() = Some(resolved_inputtypes);
 
         // Upstream `:185-187`: default policy = `AnnotatorPolicy()`.
-        let resolved_policy =
-            policy.unwrap_or_else(crate::annotator::policy::AnnotatorPolicy::default);
+        let resolved_policy = policy.unwrap_or_default();
         *self.policy.borrow_mut() = Some(resolved_policy);
 
         // Upstream `:189`: `self.extra = extra`.
@@ -1703,10 +1700,8 @@ impl TranslationDriver {
         };
         // Upstream `:433-434`: `if not standalone: cbuilder.modulename =
         // self.extmod_name`.
-        if !standalone {
-            if let CBuilderRef::Library(lib) = &cbuilder {
-                *lib.base.modulename.borrow_mut() = self.extmod_name.borrow().clone();
-            }
+        if !standalone && let CBuilderRef::Library(lib) = &cbuilder {
+            *lib.base.modulename.borrow_mut() = self.extmod_name.borrow().clone();
         }
         // Upstream `:435`: `database = cbuilder.build_database()`.
         let database = cbuilder.build_database()?;
@@ -1808,30 +1803,30 @@ impl TranslationDriver {
                 exename.display(),
                 newexename.display()
             ));
-            if let Some(cbuilder) = self.cbuilder.borrow().clone() {
-                if let Some(soname) = cbuilder.shared_library_name() {
-                    let newsoname =
-                        newexename.with_file_name(soname.file_name().ok_or_else(|| TaskError {
-                            message: "create_exe: shared_library_name has no basename".to_string(),
-                        })?);
-                    shutil_copy(&soname, &newsoname).map_err(|e| TaskError {
-                        message: format!(
-                            "driver.py:486 shutil_copy({}, {}): {e}",
-                            soname.display(),
-                            newsoname.display()
-                        ),
-                    })?;
-                    self.info(&format!(
-                        "copied: {} to {}",
+            if let Some(cbuilder) = self.cbuilder.borrow().clone()
+                && let Some(soname) = cbuilder.shared_library_name()
+            {
+                let newsoname =
+                    newexename.with_file_name(soname.file_name().ok_or_else(|| TaskError {
+                        message: "create_exe: shared_library_name has no basename".to_string(),
+                    })?);
+                shutil_copy(&soname, &newsoname).map_err(|e| TaskError {
+                    message: format!(
+                        "driver.py:486 shutil_copy({}, {}): {e}",
                         soname.display(),
                         newsoname.display()
+                    ),
+                })?;
+                self.info(&format!(
+                    "copied: {} to {}",
+                    soname.display(),
+                    newsoname.display()
+                ));
+                if cbuilder.executable_name_w().is_some() {
+                    return Err(self.missing_task_leaf(
+                        490,
+                        "Windows pypyw/import-library/pdb/libffi copy block",
                     ));
-                    if cbuilder.executable_name_w().is_some() {
-                        return Err(self.missing_task_leaf(
-                            490,
-                            "Windows pypyw/import-library/pdb/libffi copy block",
-                        ));
-                    }
                 }
             }
             *self.c_entryp.borrow_mut() = Some(newexename);
@@ -1919,14 +1914,13 @@ impl TranslationDriver {
         // shell still surfaces the leaf-level TaskError citing
         // `llinterp.py:84`.
         let placeholder_graph: Rc<dyn Any> = Rc::new(());
-        let get_args = self
-            .extra
+        self.extra
             .borrow()
             .get("get_llinterp_args")
             .cloned()
             .map(|_| ())
             .unwrap_or(());
-        let _ = get_args;
+        ();
         let v = interp.eval_graph(placeholder_graph, Vec::new(), false)?;
         // Upstream `:555`: `log.llinterpret("result -> %s" % v)`.
         self.info(&format!("llinterpret result -> {:?}", v.type_id()));
@@ -2058,10 +2052,10 @@ impl TranslationDriver {
         goal: &str,
         idempotent: bool,
     ) -> Result<(), TaskError> {
-        if kind == "planned" {
-            if let Some(check) = self.task_earlycheck.borrow().get(goal).cloned() {
-                check(self)?;
-            }
+        if kind == "planned"
+            && let Some(check) = self.task_earlycheck.borrow().get(goal).cloned()
+        {
+            check(self)?;
         }
         if kind == "pre" {
             // Upstream `:614`: `fork_before = self.config.translation.fork_before`.
@@ -2219,7 +2213,7 @@ impl TaskEngineHooks for DriverHooks {
                     instrument = true;
                 } else {
                     // Replicate the `finally` block before propagating.
-                    let _ = driver.timer.end_event(goal);
+                    driver.timer.end_event(goal);
                     return Err(err);
                 }
             }

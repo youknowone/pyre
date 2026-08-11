@@ -111,11 +111,10 @@ fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
     if d.is_null() {
         return 0;
     }
-    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) } {
-        if unsafe { pyre_object::is_int(v) } {
+    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) }
+        && unsafe { pyre_object::is_int(v) } {
             return unsafe { pyre_object::w_int_get_value(v) };
         }
-    }
     0
 }
 

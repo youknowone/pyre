@@ -4312,7 +4312,7 @@ pub(crate) fn build_ll_str_string_helper_graph(
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
 
     // False arm: the prebuilt `'None'` STR container (`ll_constant('None')`).
-    let none_ptr = const_str_cache_llstr(b"None").map_err(|e| TyperError::message(e))?;
+    let none_ptr = const_str_cache_llstr(b"None").map_err(TyperError::message)?;
     let none_const = constant_with_lltype(ConstValue::LLPtr(Box::new(none_ptr)), ptr_lltype);
 
     // ---- start: ptr_nonzero(s); branch on the result.
@@ -10982,7 +10982,7 @@ mod tests {
                 .map(|op| op.opname.as_str())
                 .collect();
             assert!(
-                opnames.iter().any(|&op| op == "unichar_eq"),
+                opnames.contains(&"unichar_eq"),
                 "{name}: expected 'unichar_eq', got {opnames:?}"
             );
         }
@@ -11904,7 +11904,7 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert!(body_ops.iter().any(|&op| op == "unichar_eq"));
+        assert!(body_ops.contains(&"unichar_eq"));
     }
 
     /// `ll_strhash` synthesised against `Ptr(STR)` produces a
@@ -12118,8 +12118,8 @@ mod tests {
                     .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)))
                     .expect("loop_cond branch")
                     .clone();
-                let target = link.borrow().target.as_ref().unwrap().clone();
-                target
+
+                link.borrow().target.as_ref().unwrap().clone()
             };
             let loop_body = {
                 let lc_borrow = loop_cond.borrow();
@@ -12129,8 +12129,8 @@ mod tests {
                     .find(|l| matches!(l.borrow().exitcase, Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)))
                     .expect("loop_body branch")
                     .clone();
-                let target = link.borrow().target.as_ref().unwrap().clone();
-                target
+
+                link.borrow().target.as_ref().unwrap().clone()
             };
             let lb_borrow = loop_body.borrow();
             let body_ops: Vec<&str> = lb_borrow
@@ -12139,7 +12139,7 @@ mod tests {
                 .map(|op| op.opname.as_str())
                 .collect();
             assert!(
-                body_ops.iter().any(|&op| op == "unichar_eq"),
+                body_ops.contains(&"unichar_eq"),
                 "{name}: expected 'unichar_eq', got {body_ops:?}"
             );
         }
@@ -12432,10 +12432,10 @@ mod tests {
             let b = block.borrow();
             for op in &b.operations {
                 opnames.push(op.opname.clone());
-                if op.opname == "getarrayitem" {
-                    if let Hlvalue::Constant(c) = &op.args[0] {
-                        hex_chars = Some(c.value.clone());
-                    }
+                if op.opname == "getarrayitem"
+                    && let Hlvalue::Constant(c) = &op.args[0]
+                {
+                    hex_chars = Some(c.value.clone());
                 }
             }
             for link in &b.exits {

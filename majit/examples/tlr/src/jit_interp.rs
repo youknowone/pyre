@@ -107,7 +107,7 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
             ADD_R_TO_A => {
                 let n = program[pc] as usize;
                 pc += 1;
-                state.a = state.a + state.regs[n];
+                state.a += state.regs[n];
             }
             RETURN_A => {
                 return state.a;
@@ -129,6 +129,12 @@ fn mainloop(program: &Bytecode, initial_a: i64, threshold: u32) -> i64 {
 
 pub struct JitTlrInterp {
     threshold: u32,
+}
+
+impl Default for JitTlrInterp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitTlrInterp {

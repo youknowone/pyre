@@ -68,7 +68,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // commits a real
     // `FunctionGraph::set_concretetype_of_inline` write.
     for var in graph.iter_variables() {
-        if exceptblock_inputargs.iter().any(|e| *e == var) {
+        if exceptblock_inputargs.contains(&var) {
             continue;
         }
         let ann = var.annotation.borrow();

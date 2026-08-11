@@ -588,7 +588,7 @@ mod tests {
         // source splits at byte 64, not at character 64.
         let mut s = vec![b'a'; 60];
         s.extend_from_slice("é".as_bytes()); // 2 bytes (0xC3 0xA9)
-        s.extend_from_slice(&vec![b'b'; 10]);
+        s.extend_from_slice(&[b'b'; 10]);
         let out = c_string_constant(&s);
         // First line carries 64 bytes, second line carries the rest;
         // the multi-byte code point is split across the boundary.

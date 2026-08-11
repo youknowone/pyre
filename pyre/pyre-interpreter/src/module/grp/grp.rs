@@ -102,19 +102,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::grp::getgrgid(gid) {
-                        Ok(Some(g)) => return Ok(make_struct_group(&g)),
-                        Ok(None) => {
-                            return Err(crate::PyError::key_error(format!(
-                                "getgrgid(): gid not found: {}",
-                                gid
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("getgrgid: {e}"),
-                            ));
-                        }
+                        Ok(Some(g)) => Ok(make_struct_group(&g)),
+                        Ok(None) => Err(crate::PyError::key_error(format!(
+                            "getgrgid(): gid not found: {}",
+                            gid
+                        ))),
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrgid: {e}"),
+                        )),
                     }
                 }
                 #[cfg(not(feature = "host_env"))]
@@ -155,19 +151,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::grp::getgrnam(name) {
-                        Ok(Some(g)) => return Ok(make_struct_group(&g)),
-                        Ok(None) => {
-                            return Err(crate::PyError::key_error(format!(
-                                "getgrnam(): name not found: {}",
-                                name
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("getgrnam: {e}"),
-                            ));
-                        }
+                        Ok(Some(g)) => Ok(make_struct_group(&g)),
+                        Ok(None) => Err(crate::PyError::key_error(format!(
+                            "getgrnam(): name not found: {}",
+                            name
+                        ))),
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getgrnam: {e}"),
+                        )),
                     }
                 }
                 #[cfg(not(feature = "host_env"))]
@@ -197,7 +189,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         .iter()
                         .map(make_struct_group)
                         .collect();
-                    return Ok(pyre_object::w_list_new(items));
+                    Ok(pyre_object::w_list_new(items))
                 }
                 #[cfg(not(feature = "host_env"))]
                 unsafe {

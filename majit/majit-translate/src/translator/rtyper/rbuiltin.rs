@@ -1038,13 +1038,12 @@ impl Repr for BuiltinMethodRepr {
         // rebind.
         {
             let mut args_v = hop2.args_v.borrow_mut();
-            if let Hlvalue::Constant(c) = &args_v[0] {
-                if let ConstValue::HostObject(host) = &c.value {
-                    if let Some(receiver) = host.bound_method_self() {
-                        let new_const = Constant::new(ConstValue::HostObject(receiver.clone()));
-                        args_v[0] = Hlvalue::Constant(new_const);
-                    }
-                }
+            if let Hlvalue::Constant(c) = &args_v[0]
+                && let ConstValue::HostObject(host) = &c.value
+                && let Some(receiver) = host.bound_method_self()
+            {
+                let new_const = Constant::new(ConstValue::HostObject(receiver.clone()));
+                args_v[0] = Hlvalue::Constant(new_const);
             }
         }
         *hop2.args_s.borrow_mut().get_mut(0).ok_or_else(|| {
@@ -2446,12 +2445,12 @@ pub fn rtype_raw_free(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let args_s = hop.args_s.borrow();
-    if let Some(SomeValue::Address(s_addr)) = args_s.first() {
-        if s_addr.is_null_address() {
-            return Err(TyperError::message(
-                "raw_free(x) where x is the constant NULL",
-            ));
-        }
+    if let Some(SomeValue::Address(s_addr)) = args_s.first()
+        && s_addr.is_null_address()
+    {
+        return Err(TyperError::message(
+            "raw_free(x) where x is the constant NULL",
+        ));
     }
     drop(args_s);
 
@@ -2467,10 +2466,10 @@ pub fn rtype_raw_memcopy(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
 
     let args_s = hop.args_s.borrow();
     for s_addr in args_s.iter().take(2) {
-        if let SomeValue::Address(s) = s_addr {
-            if s.is_null_address() {
-                return Err(TyperError::message("raw_memcopy() with a constant NULL"));
-            }
+        if let SomeValue::Address(s) = s_addr
+            && s.is_null_address()
+        {
+            return Err(TyperError::message("raw_memcopy() with a constant NULL"));
         }
     }
     drop(args_s);
@@ -2490,12 +2489,12 @@ pub fn rtype_raw_memclear(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     use crate::translator::rtyper::rtyper::GenopResult;
 
     let args_s = hop.args_s.borrow();
-    if let Some(SomeValue::Address(s_addr)) = args_s.first() {
-        if s_addr.is_null_address() {
-            return Err(TyperError::message(
-                "raw_memclear(x, n) where x is the constant NULL",
-            ));
-        }
+    if let Some(SomeValue::Address(s_addr)) = args_s.first()
+        && s_addr.is_null_address()
+    {
+        return Err(TyperError::message(
+            "raw_memclear(x, n) where x is the constant NULL",
+        ));
     }
     drop(args_s);
 
@@ -3477,7 +3476,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     );
     let needs_swap = hop.args_r.borrow()[0]
         .as_ref()
-        .map_or(false, |r| r.repr_class_id() != ReprClassId::PtrRepr);
+        .is_some_and(|r| r.repr_class_id() != ReprClassId::PtrRepr);
     if producer_set_someptr {
         debug_assert!(
             !needs_swap,

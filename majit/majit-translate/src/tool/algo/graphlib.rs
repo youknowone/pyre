@@ -272,10 +272,10 @@ where
                     let mut vroot = v.clone();
                     for edge in &edges[&v] {
                         let w = &edge.target;
-                        if let Some(wroot) = component_root.get(w) {
-                            if discovery_time[wroot] < discovery_time[&vroot] {
-                                vroot = wroot.clone();
-                            }
+                        if let Some(wroot) = component_root.get(w)
+                            && discovery_time[wroot] < discovery_time[&vroot]
+                        {
+                            vroot = wroot.clone();
                         }
                     }
                     if vroot == v {
@@ -726,7 +726,7 @@ where
             // a depth tie it falls through to comparing the cycles, i.e.
             // Python-2 `Edge` object-id order (non-deterministic). Stable
             // sort on depth alone keeps the `all_cycles` discovery order.
-            allcycles.sort_by(|a, b| a.0.cmp(&b.0));
+            allcycles.sort_by_key(|a| a.0);
             let mut removed: HashSet<V> = HashSet::new();
             for (_, cycle) in &allcycles {
                 // `v_depths[edge.source]` KeyErrors once a vertex on this

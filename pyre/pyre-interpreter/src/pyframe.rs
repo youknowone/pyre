@@ -946,10 +946,9 @@ fn code_yields_inside_try(code: &CodeObject) -> bool {
             let offset = (index * 2) as u32;
             if let Some((_target, depth, lasti)) =
                 crate::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
+                && (depth != 0 || !lasti)
             {
-                if depth != 0 || !lasti {
-                    return true;
-                }
+                return true;
             }
         }
         index += 1;
@@ -2224,7 +2223,7 @@ impl PyFrame {
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
         self.getdebug_data()
-            .map_or(false, |data| data.is_being_profiled)
+            .is_some_and(|data| data.is_being_profiled)
     }
 
     /// `getorcreatedebug().w_locals` — the STORE_NAME / DELETE_NAME target
@@ -2402,9 +2401,10 @@ impl PyFrame {
             ));
         }
         if closure_size != nfreevars {
-            return Err(crate::PyError::value_error(format!(
+            return Err(crate::PyError::value_error(
                 "code object received a closure with an unexpected number of free variables"
-            )));
+                    .to_string(),
+            ));
         }
 
         // CPython 3.11+ unified slot layout: only cellvars NOT in
@@ -2881,10 +2881,7 @@ impl PyFrame {
     /// PyPy-compatible `settopvalue()`.
     #[inline]
     pub fn settopvalue(&mut self, value: PyObjectRef, index_from_top: usize) {
-        let index = self
-            .valuestackdepth
-            .checked_sub(index_from_top + 1)
-            .unwrap_or(0);
+        let index = self.valuestackdepth.saturating_sub(index_from_top + 1);
         self.assert_stack_index(index);
         assert!(index < self.valuestackdepth);
         self.set_locals_w(index, value);
@@ -3412,13 +3409,13 @@ impl PyFrame {
     /// pyframe.py:153-157 get_f_trace_lines
     #[inline]
     pub fn get_f_trace_lines(&self) -> bool {
-        self.getdebug_data().map_or(true, |d| d.f_trace_lines)
+        self.getdebug_data().is_none_or(|d| d.f_trace_lines)
     }
 
     /// pyframe.py:159-163 get_f_trace_opcodes
     #[inline]
     pub fn get_f_trace_opcodes(&self) -> bool {
-        self.getdebug_data().map_or(false, |d| d.f_trace_opcodes)
+        self.getdebug_data().is_some_and(|d| d.f_trace_opcodes)
     }
 
     /// pyframe.py:796-797 fget_f_trace_lines
@@ -3553,7 +3550,7 @@ impl PyFrame {
         //     if not d.is_in_line_tracing:
         //         if ord(code[self.last_instr]) != YIELD_VALUE:
         //             raise "can only jump from a 'line' trace event"
-        if !self.getdebug().map_or(false, |d| d.is_in_line_tracing) {
+        if !self.getdebug().is_some_and(|d| d.is_in_line_tracing) {
             let at_yield = matches!(
                 crate::pyopcode::decode_instruction_at(self.code(), self.last_instr as usize),
                 Some((crate::bytecode::Instruction::YieldValue { .. }, _))

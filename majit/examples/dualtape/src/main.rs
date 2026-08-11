@@ -1,3 +1,5 @@
+#![allow(clippy::empty_line_after_doc_comments)]
+
 /// Two-tape Brainfuck-like interpreter exercising two `[int; virt]` state
 /// arrays through the state-field JIT. See `jit_interp.rs` for the language.
 pub mod interp;

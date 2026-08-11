@@ -286,7 +286,7 @@ mod tests {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         // A sentinel unlikely to collide with any other test's table.
-        const SENTINEL: GcRef = GcRef(0x0DEAD_BEEF);
+        const SENTINEL: GcRef = GcRef(0x0000_DEAD_BEEF);
         // The write side is already held, so count through the unlocked
         // walk to avoid re-entering the lock.
         let count_sentinels = || {

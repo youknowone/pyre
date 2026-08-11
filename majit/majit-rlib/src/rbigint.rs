@@ -840,7 +840,7 @@ impl RBigInt {
         if expo <= 0 {
             return Self::zero();
         }
-        let ndig = (expo as i64 - 1) / SHIFT as i64 + 1;
+        let ndig = (expo as i64 - 1) / SHIFT + 1;
         let mut value = Self::with_size(ndig, sign);
         frac *= 2_f64.powi((expo - 1) % SHIFT as i32 + 1);
         let mut i = ndig;
@@ -1254,17 +1254,9 @@ impl RBigInt {
         let ld1 = self.numdigits();
         let ld2 = other.numdigits();
         if ld1 > ld2 {
-            if othersign > 0 {
-                return false;
-            } else {
-                return true;
-            }
+            return othersign <= 0;
         } else if ld1 < ld2 {
-            if othersign > 0 {
-                return true;
-            } else {
-                return false;
-            }
+            return othersign > 0;
         }
         let mut i = ld1;
         while i > 0 {
@@ -1272,17 +1264,9 @@ impl RBigInt {
             let d1 = self.digit(i);
             let d2 = other.digit(i);
             if d1 < d2 {
-                if othersign > 0 {
-                    return true;
-                } else {
-                    return false;
-                }
+                return othersign > 0;
             } else if d1 > d2 {
-                if othersign > 0 {
-                    return false;
-                } else {
-                    return true;
-                }
+                return othersign <= 0;
             }
         }
         false
@@ -1699,7 +1683,7 @@ impl RBigInt {
             }
             return Ok(Self::zero());
         } else if digit & (digit - 1) == 0 {
-            self.int_and_((digit - 1) as i64)
+            self.int_and_(digit - 1)
         } else {
             let rem = _int_rem_core(self, digit);
             if rem == 0 {
@@ -1737,7 +1721,7 @@ impl RBigInt {
                 0
             }
         } else if digit & (digit - 1) == 0 {
-            self.int_and_((digit - 1) as i64).toint()?
+            self.int_and_(digit - 1).toint()?
         } else {
             _int_rem_core(self, digit) as i64 * selfsign
         };
@@ -1798,7 +1782,7 @@ impl RBigInt {
         if div._size != 0 {
             div._set_sign(selfsign * othersign);
         }
-        let mut rem = rem as i64;
+        let mut rem = rem;
         if selfsign < 0 {
             rem = -rem;
         }
@@ -2077,7 +2061,7 @@ impl RBigInt {
         } else if int_other == 0 || selfsign == 0 {
             return Ok(self.translated_alias());
         }
-        let mut wordshift = int_other / SHIFT as i64;
+        let mut wordshift = int_other / SHIFT;
         let remshift = int_other % SHIFT;
         if remshift == 0 {
             let newsize = self
@@ -2268,7 +2252,7 @@ impl RBigInt {
             return Ok(Self::zero());
         }
         let mut z;
-        if nbits == SHIFT as i64 {
+        if nbits == SHIFT {
             z = Self::with_size(list.len() as i64, 1);
             let mut i = 0;
             while i < list.len() as i64 {
@@ -2276,10 +2260,10 @@ impl RBigInt {
                 i += 1;
             }
         } else {
-            if !(1..SHIFT as i64).contains(&nbits) {
+            if !(1..SHIFT).contains(&nbits) {
                 return Err(RBigIntError::InvalidBitWidth);
             }
-            let length = list.len() as i64 * nbits / SHIFT as i64 + 1;
+            let length = list.len() as i64 * nbits / SHIFT + 1;
             z = Self::with_size(length, 1);
             let mut out = 0;
             let mut i = 0_i64;
@@ -2288,11 +2272,11 @@ impl RBigInt {
                 accum |= (input as u128) << i as u32;
                 let original_i = i;
                 i += nbits;
-                if i > SHIFT as i64 {
+                if i > SHIFT {
                     z.setdigit_uwidedigit(out, accum);
                     out += 1;
-                    accum = (input as u128) >> (SHIFT as i64 - original_i) as u32;
-                    i -= SHIFT as i64;
+                    accum = (input as u128) >> (SHIFT - original_i) as u32;
+                    i -= SHIFT;
                 }
             }
             debug_assert!(out < length);
@@ -2396,7 +2380,7 @@ impl RBigInt {
             i -= 1;
         }
         debug_assert!(i > 0);
-        self._size = i as i64 * self.get_sign();
+        self._size = i * self.get_sign();
         if i == 1 && self.digit(0) == NULLDIGIT {
             self._size = 0;
             self._digits = Self::zero()._digits;
@@ -2448,8 +2432,8 @@ impl RBigInt {
             s -= 1;
             let e = d;
             d = c >> s;
-            let shifted_a = a.lshift(d as i64 - e as i64 - 1)?;
-            let shifted_self = self.rshift((2 * c - e - d + 1) as i64, false)?;
+            let shifted_a = a.lshift(d - e - 1)?;
+            let shifted_self = self.rshift(2 * c - e - d + 1, false)?;
             a = shifted_a.add(&shifted_self.floordiv(&a)?);
         }
         Ok(a.int_sub(a.mul(&a).gt(self) as i64))
@@ -2538,7 +2522,7 @@ impl RBigInt {
         if self.get_sign() == 0 {
             return (RBigIntSign::NoSign, Vec::new());
         }
-        let mut words = Vec::with_capacity(((self.bits() + 31) / 32) as usize);
+        let mut words = Vec::with_capacity(self.bits().div_ceil(32) as usize);
         let mut accumulator = 0_u128;
         let mut accumulator_bits = 0_u32;
         let mut i = 0;
@@ -3596,7 +3580,7 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     let mut v = RBigInt::with_size(size_v + 1, 1);
     let mut w = RBigInt::with_size(size_w, 1);
 
-    let d = SHIFT as i64 - bits_in_digit(w1.digit(size_w - 1));
+    let d = SHIFT - bits_in_digit(w1.digit(size_w - 1));
     let carry = _v_lshift(&mut w, w1, size_w, d);
     debug_assert_eq!(carry, 0);
     let carry = _v_lshift(&mut v, v1, size_v, d);
@@ -3824,7 +3808,7 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     if m < n {
         return Ok((RBigInt::zero(), a.translated_alias()));
     }
-    let mut new_n = SHIFT as i64 * holder_limit(&HOLDER.DIV_LIMIT);
+    let mut new_n = SHIFT * holder_limit(&HOLDER.DIV_LIMIT);
     while new_n < n {
         new_n <<= 1;
     }
@@ -3839,7 +3823,7 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     } else {
         (a, b)
     };
-    let n_s = new_n / SHIFT as i64;
+    let n_s = new_n / SHIFT;
 
     let chunk_count = a
         .numdigits()
@@ -3942,11 +3926,7 @@ fn _x_int_lt(a: &RBigInt, b: i64, eq: bool) -> bool {
 
     let digits = a.numdigits();
     if digits > 1 {
-        if osign == 1 {
-            return false;
-        } else {
-            return true;
-        }
+        return osign != 1;
     }
 
     let d1 = a.get_sign() * a.digit(0);
@@ -3974,7 +3954,7 @@ fn _AsScaledDouble(value: &RBigInt) -> (f64, i64) {
     while i > 0 && nbitsneeded > 0 {
         i -= 1;
         x = x * FLOAT_MULTIPLIER + value.digit(i) as f64;
-        nbitsneeded -= SHIFT as i64;
+        nbitsneeded -= SHIFT;
     }
     debug_assert!(x > 0.0);
     (x * sign as f64, i)
@@ -4151,7 +4131,7 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     const DBL_MANT_DIG: i64 = 53;
     const DBL_MAX_EXP: i64 = 1024;
     const DBL_MIN_EXP: i64 = -1021;
-    const MANT_DIG_DIGITS: i64 = DBL_MANT_DIG / SHIFT as i64;
+    const MANT_DIG_DIGITS: i64 = DBL_MANT_DIG / SHIFT;
     const MANT_DIG_BITS: i64 = DBL_MANT_DIG % SHIFT;
 
     let negate = (a.get_sign() < 0) ^ (b.get_sign() < 0);
@@ -4183,9 +4163,8 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
         return Ok(_truediv_result(da / db, negate));
     }
 
-    let mut diff = a_size as i64 - b_size as i64;
-    diff = diff * SHIFT as i64 + bits_in_digit(a.digit(a_size - 1)) as i64
-        - bits_in_digit(b.digit(b_size - 1)) as i64;
+    let mut diff = a_size - b_size;
+    diff = diff * SHIFT + bits_in_digit(a.digit(a_size - 1)) - bits_in_digit(b.digit(b_size - 1));
     if diff > DBL_MAX_EXP {
         return _truediv_overflow();
     } else if diff < DBL_MIN_EXP - DBL_MANT_DIG - 1 {
@@ -4208,7 +4187,7 @@ fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     }
     debug_assert!(x.tobool());
     let mut x_size = x.numdigits();
-    let x_bits = (x_size - 1) as i64 * SHIFT as i64 + bits_in_digit(x.digit(x_size - 1)) as i64;
+    let x_bits = (x_size - 1) * SHIFT + bits_in_digit(x.digit(x_size - 1));
     let extra_bits = x_bits.max(DBL_MIN_EXP - shift) - DBL_MANT_DIG;
     debug_assert!(extra_bits == 2 || extra_bits == 3);
     let mask = 1_u64 << (extra_bits - 1);
@@ -4260,7 +4239,7 @@ fn _format_base2_notzero(
     // raise MemoryError.  Keep that edge instead of allowing Rust sizing
     // arithmetic to wrap or an infallible allocation to abort the process.
     let payload_bits = size_a
-        .checked_mul(SHIFT as i64)
+        .checked_mul(SHIFT)
         .and_then(|value| value.checked_add(basebits as i64 - 1))
         .ok_or(RBigIntError::Memory)?;
     let encoded_digits = payload_bits / basebits as i64;
@@ -4341,7 +4320,7 @@ impl PartsCacheBase {
             let Some(next) = curr.checked_mul(base) else {
                 break;
             };
-            if next >= MASK as i64 {
+            if next >= MASK {
                 break;
             }
             curr = next;
@@ -4687,7 +4666,7 @@ fn _format_lowest_level_divmod_int_results(x: &RBigInt, iother: i64) -> (i64, i6
     if !x.tobool() {
         return (0, 0);
     }
-    debug_assert!(iother > 0 && iother <= MASK as i64);
+    debug_assert!(iother > 0 && iother <= MASK);
     let size = x.numdigits() - 1;
     let mut rem = if size == 1 {
         let rem = x.uwidedigit(1);
@@ -5310,11 +5289,11 @@ pub fn parse_digit_string(parser: &mut NumberStringParser<'_>) -> Result<RBigInt
             if digit < 0 {
                 break;
             }
-            dig = digit as i64;
-            baseexp = base as i64;
+            dig = digit;
+            baseexp = base;
         } else {
-            dig = dig * base as i64 + digit as i64;
-            baseexp *= base as i64;
+            dig = dig * base + digit;
+            baseexp *= base;
         }
     }
     a._set_sign(a.get_sign() * parser.sign);
@@ -5429,9 +5408,9 @@ fn parse_string_from_binary_base(
     }
     let bits = n
         .checked_mul(bits_per_char)
-        .and_then(|value| value.checked_add(SHIFT as i64 - 1))
+        .and_then(|value| value.checked_add(SHIFT - 1))
         .ok_or(RBigIntError::ParseString)?;
-    let b = (bits / SHIFT as i64).max(1);
+    let b = (bits / SHIFT).max(1);
     let mut z = RBigInt::with_size(b, parser.sign);
 
     let mut accum = 0_u128;
@@ -5441,12 +5420,12 @@ fn parse_string_from_binary_base(
         let k = parser.prev_digit()? as u128;
         accum |= k << bits_in_accum as u32;
         bits_in_accum += bits_per_char;
-        if bits_in_accum >= SHIFT as i64 {
+        if bits_in_accum >= SHIFT {
             z.setdigit_uwidedigit(pdigit, accum);
             pdigit += 1;
             debug_assert!(pdigit <= b);
             accum >>= SHIFT;
-            bits_in_accum -= SHIFT as i64;
+            bits_in_accum -= SHIFT;
         }
     }
     if bits_in_accum != 0 {
@@ -6237,13 +6216,13 @@ mod tests {
             let value = RBigInt::from_u128(x);
             assert!(
                 value
-                    .rqshift(SHIFT as i64)
-                    .eq(&value.rshift(SHIFT as i64, false).unwrap())
+                    .rqshift(SHIFT)
+                    .eq(&value.rshift(SHIFT, false).unwrap())
             );
             assert!(
                 value
-                    .rqshift((SHIFT + 1) as i64)
-                    .eq(&value.rshift((SHIFT + 1) as i64, false).unwrap())
+                    .rqshift(SHIFT + 1)
+                    .eq(&value.rshift(SHIFT + 1, false).unwrap())
             );
         }
     }
@@ -6281,15 +6260,12 @@ mod tests {
         // ANDing with a negative machine integer: the negative operand is
         // sign-extended with MASK above its one explicit digit.
         let multi_digit = RBigInt::one()
-            .lshift(2 * SHIFT as i64 + 7)
+            .lshift(2 * SHIFT + 7)
             .unwrap()
             .int_add(0b1011);
         assert!(multi_digit.int_and_(-1).eq(&multi_digit));
         assert!(multi_digit.int_and_(-2).eq(&multi_digit.int_sub(1)));
-        let minint_expected = multi_digit
-            .rqshift(SHIFT as i64)
-            .lshift(SHIFT as i64)
-            .unwrap();
+        let minint_expected = multi_digit.rqshift(SHIFT).lshift(SHIFT).unwrap();
         assert!(multi_digit.int_and_(i64::MIN).eq(&minint_expected));
         assert!(
             multi_digit
@@ -6305,9 +6281,9 @@ mod tests {
             RBigInt::one(),
             RBigInt::negative_one(),
             RBigInt::new(&[0, 1], 1, 2),
-            RBigInt::new(&[MASK as i64, 1], 1, 2),
+            RBigInt::new(&[MASK, 1], 1, 2),
             RBigInt::new(&[7, 0, 3], 1, 3),
-            RBigInt::new(&[MASK as i64, MASK as i64, 5], 1, 3),
+            RBigInt::new(&[MASK, MASK, 5], 1, 3),
         ];
         let negatives: Vec<_> = bigints
             .iter()
@@ -6369,7 +6345,7 @@ mod tests {
                 assert!(RBigInt::sub_int_int_bigint_result(iself, iother).eq(&left.sub(&right)));
                 assert!(RBigInt::mul_int_int_bigint_result(iself, iother).eq(&left.mul(&right)));
             }
-            for shift in [0_i64, 1, SHIFT as i64 - 1, SHIFT as i64, 64, 127] {
+            for shift in [0_i64, 1, SHIFT - 1, SHIFT, 64, 127] {
                 assert!(
                     RBigInt::lshift_int_int_bigint_result(iself, shift)
                         .unwrap()
@@ -6387,7 +6363,7 @@ mod tests {
     fn test_from_list_n_bits() {
         let value = RBigInt::from_list_n_bits(&[0x7f, 0x01], 8).unwrap();
         assert_eq!(value.toint(), Ok(0x017f));
-        let base_digits = RBigInt::from_list_n_bits(&[MASK as i64, 1], SHIFT as i64).unwrap();
+        let base_digits = RBigInt::from_list_n_bits(&[MASK, 1], SHIFT).unwrap();
         assert_eq!(base_digits.numdigits(), 2);
         assert_eq!(base_digits.udigit(0), MASK as u64);
         assert_eq!(base_digits.digit(1), 1);
@@ -6422,8 +6398,8 @@ mod tests {
     #[test]
     fn test_multidigit_division() {
         // (B^4 - 1) / (B^2 - 1) == B^2 + 1.
-        let a = RBigInt::new(&[MASK as i64; 4], 1, 4);
-        let b = RBigInt::new(&[MASK as i64; 2], 1, 2);
+        let a = RBigInt::new(&[MASK; 4], 1, 4);
+        let b = RBigInt::new(&[MASK; 2], 1, 2);
         let (q, r) = a.divmod(&b).unwrap();
         assert_eq!(q.numdigits(), 3);
         assert_eq!(q.digit(0), 1);
@@ -6652,8 +6628,8 @@ mod tests {
 
     #[test]
     fn test_multidigit_gcd_and_isqrt() {
-        let b_minus_one = RBigInt::new(&[MASK as i64], 1, 1);
-        let b_squared_minus_one = RBigInt::new(&[MASK as i64, MASK as i64], 1, 2);
+        let b_minus_one = RBigInt::new(&[MASK], 1, 1);
+        let b_squared_minus_one = RBigInt::new(&[MASK, MASK], 1, 2);
         assert!(
             b_squared_minus_one
                 .gcd(&b_minus_one)
@@ -7039,7 +7015,7 @@ mod tests {
     #[test]
     fn test_burnikel_ziegler_divmod_cutoff() {
         let div_limit = holder_limit(&HOLDER.DIV_LIMIT);
-        let divisor_digits = vec![MASK as i64; (div_limit * 2 + 1) as usize];
+        let divisor_digits = vec![MASK; (div_limit * 2 + 1) as usize];
         let divisor = RBigInt::new(&divisor_digits, 1, divisor_digits.len() as i64);
         let mut quotient_digits = [0_i64; 20];
         quotient_digits[0] = 1;
@@ -7077,13 +7053,13 @@ mod tests {
         // zero-filled spans inside the base-2**n chunks.  PyPy deliberately
         // keeps those chunks at fixed `n_S` width instead of normalizing each
         // one before the Burnikel-Ziegler recursion.
-        let shared_shift = 100_i64 * SHIFT as i64;
+        let shared_shift = 100_i64 * SHIFT;
         let sparse_dividend = RBigInt::fromint(2)
-            .add(&RBigInt::fromint(5).lshift(SHIFT as i64).unwrap())
+            .add(&RBigInt::fromint(5).lshift(SHIFT).unwrap())
             .lshift(shared_shift)
             .unwrap();
         let sparse_divisor = RBigInt::fromint(5).lshift(shared_shift).unwrap();
-        let expected_q = RBigInt::one().lshift(SHIFT as i64).unwrap();
+        let expected_q = RBigInt::one().lshift(SHIFT).unwrap();
         let expected_r = RBigInt::fromint(2).lshift(shared_shift).unwrap();
         let (actual_q, actual_r) = divmod_big(&sparse_dividend, &sparse_divisor).unwrap();
         assert!(actual_q.eq(&expected_q));

@@ -32,7 +32,7 @@ pub fn get_frame_value_count_fn() -> Option<fn(i32, i32) -> usize> {
     if p == 0 {
         None
     } else {
-        Some(unsafe { std::mem::transmute(p) })
+        Some(unsafe { std::mem::transmute::<usize, fn(i32, i32) -> usize>(p) })
     }
 }
 
@@ -51,7 +51,7 @@ pub const TAGVIRTUAL: u8 = 3;
 /// `-live-`/`catch_exception` coordinate through the companion `jitcode_pc`
 /// field where needed.  No high-bit marker is reserved in the pc word; offsets
 /// whose natural value has bit 14 set must remain unchanged.
-
+///
 /// Sentinel for a snapshot frame's `jitcode_pc` word: no direct JitCode
 /// resume coordinate. Such a frame is unrepresentable and must decline before
 /// resume data is published.

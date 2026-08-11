@@ -16,7 +16,7 @@ pub fn make_bitstring(lst: &[u32]) -> Vec<u8> {
         return Vec::new();
     }
     let num_bits = (*lst.iter().max().unwrap() as usize) + 1;
-    let num_bytes = (num_bits + 7) / 8;
+    let num_bytes = num_bits.div_ceil(8);
     let mut entries = vec![0u8; num_bytes];
     for &x in lst {
         entries[(x >> 3) as usize] |= 1u8 << (x & 7);

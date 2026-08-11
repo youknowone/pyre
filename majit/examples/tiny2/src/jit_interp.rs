@@ -141,7 +141,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                 ]);
                 pc += 8;
                 state.stack[state.stackpos as usize] = value;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             OP_PUSH_ARG => {
                 // RPython: stack = Stack(args[n-1], stack) — copy arg to top.
@@ -149,13 +149,13 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                 pc += 1;
                 let v = state.stack[n];
                 state.stack[state.stackpos as usize] = v;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             OP_STORE_ARG => {
                 // RPython: stack, args[n-1] = stack.pop() — pop top and store at arg slot n.
                 let n = program[pc] as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let v = state.stack[state.stackpos as usize];
                 state.stack[n] = v;
             }
@@ -163,19 +163,19 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b + a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             OP_SUB => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b - a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             OP_MUL => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b * a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             OP_LOOP_START => {
                 // RPython: loops.append(pos) — loop targets are compiled into bytecode offsets.
@@ -184,7 +184,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
                 // RPython: flag = stack.pop(); if flag.as_int() != 0: pos = loops[-1]; promote(pos)
                 let target = (program[pc] as usize) | ((program[pc + 1] as usize) << 8);
                 pc += 2;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
@@ -204,7 +204,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     args_out[..n].copy_from_slice(&state.stack[..n]);
 
     // Result is the top of stack (one past stackpos-1).
-    state.stackpos = state.stackpos - 1;
+    state.stackpos -= 1;
     state.stack[state.stackpos as usize]
 }
 
@@ -212,6 +212,12 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
 
 pub struct JitTiny2Interp {
     threshold: u32,
+}
+
+impl Default for JitTiny2Interp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitTiny2Interp {

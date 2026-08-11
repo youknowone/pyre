@@ -3583,7 +3583,7 @@ mod tests {
     #[test]
     fn unichar_convert_const_rejects_non_ascii_byte_str() {
         let r = unichar_repr();
-        let err = r.convert_const(&ConstValue::byte_str(&[0xff])).unwrap_err();
+        let err = r.convert_const(&ConstValue::byte_str([0xff])).unwrap_err();
         assert!(err.to_string().contains("not a unicode character"));
     }
 

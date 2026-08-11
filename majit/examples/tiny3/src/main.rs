@@ -1,3 +1,11 @@
+// This parity example retains the source interpreter's Vec argument API and
+// branch-by-token presentation.
+#![allow(
+    clippy::empty_line_after_doc_comments,
+    clippy::if_same_then_else,
+    clippy::ptr_arg
+)]
+
 /// Rust port of rpython/jit/tl/tiny3_hotpath.py — word-based language.
 ///
 /// IntBox/FloatBox with automatic int→float casting.

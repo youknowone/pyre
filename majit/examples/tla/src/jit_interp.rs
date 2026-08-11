@@ -84,32 +84,32 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
                 let value = program[pc] as i64;
                 pc += 1;
                 state.stack[state.stackpos as usize] = value;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             POP => {
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             DUP => {
                 let v = state.stack[(state.stackpos - 1) as usize];
                 state.stack[state.stackpos as usize] = v;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             ADD => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b + a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             SUB => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b - a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             JUMP_IF => {
                 let target = program[pc] as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target <= pc {
@@ -130,7 +130,7 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
         }
     }
 
-    state.stackpos = state.stackpos - 1;
+    state.stackpos -= 1;
     state.stack[state.stackpos as usize]
 }
 
@@ -138,6 +138,12 @@ pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
 
 pub struct JitTlaInterp {
     threshold: u32,
+}
+
+impl Default for JitTlaInterp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitTlaInterp {

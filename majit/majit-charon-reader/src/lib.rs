@@ -290,19 +290,19 @@ fn collect_dedup_bodies(
         // exactly that one value (the deserializer stops at the array's
         // close, ignoring the trailing document).
         let mut de = serde_json::Deserializer::from_slice(&bytes[val_start..]);
-        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de) {
-            if seen.insert(id) {
-                if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
-                    adt.push((id, def_id));
-                }
-                bodies.push((
-                    id,
-                    DedupBody {
-                        raw,
-                        parsed: std::sync::OnceLock::new(),
-                    },
-                ));
+        if let Ok((id, raw)) = <(u64, Box<serde_json::value::RawValue>)>::deserialize(&mut de)
+            && seen.insert(id)
+        {
+            if let Some(def_id) = adt_def_id_from_ty_body(&raw) {
+                adt.push((id, def_id));
             }
+            bodies.push((
+                id,
+                DedupBody {
+                    raw,
+                    parsed: std::sync::OnceLock::new(),
+                },
+            ));
         }
     }
 }

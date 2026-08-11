@@ -379,10 +379,11 @@ impl W_Unpickler {
         // protocol < 4 treats a dotted name as one literal attribute and
         // reports the module's normal AttributeError; protocol >= 4 walks the
         // qualname component by component.
-        if module == "builtins" && !name.contains('.') {
-            if let Some(obj) = crate::module::_pickle::lookup_builtin(&name) {
-                return Ok(obj);
-            }
+        if module == "builtins"
+            && !name.contains('.')
+            && let Some(obj) = crate::module::_pickle::lookup_builtin(&name)
+        {
+            return Ok(obj);
         }
         let w_module = crate::module::_pickle::import_module(&module)?;
         if self.proto >= 4 {
@@ -620,22 +621,22 @@ mod memo_proxy {
                         i,
                     )
                 };
-                if let Some(v) = v {
-                    if !v.is_null() {
-                        // `w_dict_setitem` boxes the int key (`w_int_new`), which
-                        // may collect and move `v`; pin it across the store.
-                        let _r = pyre_object::gc_roots::push_roots();
-                        pyre_object::gc_roots::pin_root(v);
-                        let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                        let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
-                        unsafe {
-                            pyre_object::dictmultiobject::w_dict_setitem(
-                                w_dict,
-                                i,
-                                pyre_object::gc_roots::shadow_stack_get(v_slot),
-                            )
-                        };
-                    }
+                if let Some(v) = v
+                    && !v.is_null()
+                {
+                    // `w_dict_setitem` boxes the int key (`w_int_new`), which
+                    // may collect and move `v`; pin it across the store.
+                    let _r = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(v);
+                    let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+                    unsafe {
+                        pyre_object::dictmultiobject::w_dict_setitem(
+                            w_dict,
+                            i,
+                            pyre_object::gc_roots::shadow_stack_get(v_slot),
+                        )
+                    };
                 }
             }
             Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
@@ -1674,17 +1675,17 @@ fn call_find_class(
 /// Emit the `pickle.find_class` audit event. `interp_pickle.py:2601` calls
 /// `space.audit(...)` and lets a blocking audit hook's error propagate.
 fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
-    if let Ok(sys) = import_module("sys") {
-        if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
-            call_fn(
-                audit,
-                &[
-                    pyre_object::w_str_new("pickle.find_class"),
-                    pyre_object::w_str_new(module),
-                    pyre_object::w_str_new(name),
-                ],
-            )?;
-        }
+    if let Ok(sys) = import_module("sys")
+        && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
+    {
+        call_fn(
+            audit,
+            &[
+                pyre_object::w_str_new("pickle.find_class"),
+                pyre_object::w_str_new(module),
+                pyre_object::w_str_new(name),
+            ],
+        )?;
     }
     Ok(())
 }
@@ -1695,17 +1696,17 @@ fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Resul
     let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_object::gc_roots::pin_root(w_name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    if let Ok(sys) = import_module("sys") {
-        if let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit") {
-            call_fn(
-                audit,
-                &[
-                    pyre_object::w_str_new("pickle.find_class"),
-                    pyre_object::gc_roots::shadow_stack_get(module_slot),
-                    pyre_object::gc_roots::shadow_stack_get(name_slot),
-                ],
-            )?;
-        }
+    if let Ok(sys) = import_module("sys")
+        && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
+    {
+        call_fn(
+            audit,
+            &[
+                pyre_object::w_str_new("pickle.find_class"),
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            ],
+        )?;
     }
     Ok(())
 }

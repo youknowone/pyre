@@ -56,10 +56,10 @@ pub struct GcHooks;
 impl GcHooks {
     #[inline]
     pub fn fire_gc_minor(&self, duration: f64, total_memory_used: usize, pinned_objects: usize) {
-        if IS_GC_MINOR_ENABLED.get().is_some_and(|enabled| enabled()) {
-            if let Some(on_gc_minor) = ON_GC_MINOR.get() {
-                on_gc_minor(duration, total_memory_used, pinned_objects);
-            }
+        if IS_GC_MINOR_ENABLED.get().is_some_and(|enabled| enabled())
+            && let Some(on_gc_minor) = ON_GC_MINOR.get()
+        {
+            on_gc_minor(duration, total_memory_used, pinned_objects);
         }
     }
 
@@ -68,10 +68,9 @@ impl GcHooks {
         if IS_GC_COLLECT_STEP_ENABLED
             .get()
             .is_some_and(|enabled| enabled())
+            && let Some(on_gc_collect_step) = ON_GC_COLLECT_STEP.get()
         {
-            if let Some(on_gc_collect_step) = ON_GC_COLLECT_STEP.get() {
-                on_gc_collect_step(duration, oldstate, newstate);
-            }
+            on_gc_collect_step(duration, oldstate, newstate);
         }
     }
 
@@ -87,18 +86,18 @@ impl GcHooks {
         rawmalloc_bytes_after: usize,
         pinned_objects: usize,
     ) {
-        if IS_GC_COLLECT_ENABLED.get().is_some_and(|enabled| enabled()) {
-            if let Some(on_gc_collect) = ON_GC_COLLECT.get() {
-                on_gc_collect(
-                    num_major_collects,
-                    arenas_count_before,
-                    arenas_count_after,
-                    arenas_bytes,
-                    rawmalloc_bytes_before,
-                    rawmalloc_bytes_after,
-                    pinned_objects,
-                );
-            }
+        if IS_GC_COLLECT_ENABLED.get().is_some_and(|enabled| enabled())
+            && let Some(on_gc_collect) = ON_GC_COLLECT.get()
+        {
+            on_gc_collect(
+                num_major_collects,
+                arenas_count_before,
+                arenas_count_after,
+                arenas_bytes,
+                rawmalloc_bytes_before,
+                rawmalloc_bytes_after,
+                pinned_objects,
+            );
         }
     }
 }

@@ -1060,12 +1060,12 @@ impl W_Deque {
         let clamp = |i: i64| if i < 0 { (i + len).max(0) } else { i.min(len) };
         let start = clamp(
             start
-                .map(|v| crate::builtins::getindex_w(v))
+                .map(crate::builtins::getindex_w)
                 .transpose()?
                 .unwrap_or(0),
         );
         let stop = clamp(
-            stop.map(|v| crate::builtins::getindex_w(v))
+            stop.map(crate::builtins::getindex_w)
                 .transpose()?
                 .unwrap_or(len),
         );
@@ -1269,10 +1269,10 @@ impl W_Deque {
         for _ in 0..num {
             items.extend_from_slice(&base);
         }
-        if let Some(m) = maxlen_bound(self_obj) {
-            if items.len() > m {
-                items.drain(0..items.len() - m);
-            }
+        if let Some(m) = maxlen_bound(self_obj)
+            && items.len() > m
+        {
+            items.drain(0..items.len() - m);
         }
         store(self_obj, items);
         Ok(self_obj)

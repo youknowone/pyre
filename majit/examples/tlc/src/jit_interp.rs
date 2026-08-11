@@ -163,10 +163,10 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 let value = program[pc] as i8 as i64;
                 pc += 1;
                 state.stack[state.stackpos as usize] = value;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             POP => {
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             SWAP => {
                 let a = state.stack[(state.stackpos - 1) as usize];
@@ -178,55 +178,55 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b + a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             SUB => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b - a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             MUL => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = b * a;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             EQ => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b == a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             NE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b != a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             LT => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b < a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             LE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b <= a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             GT => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b > a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             GE => {
                 let a = state.stack[(state.stackpos - 1) as usize];
                 let b = state.stack[(state.stackpos - 2) as usize];
                 state.stack[(state.stackpos - 2) as usize] = if b >= a { 1 } else { 0 };
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
             }
             ROLL => {
                 let r = program[pc] as i8 as i64;
@@ -238,23 +238,23 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 pc += 1;
                 let v = state.stack[(state.stackpos as usize) - i - 1];
                 state.stack[state.stackpos as usize] = v;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             PUT => {
                 let i = program[pc] as usize;
                 pc += 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let v = state.stack[state.stackpos as usize];
                 state.stack[(state.stackpos as usize) - i] = v;
             }
             PUSHARG => {
                 state.stack[state.stackpos as usize] = inputarg;
-                state.stackpos = state.stackpos + 1;
+                state.stackpos += 1;
             }
             BR_COND => {
                 let target = ((pc as i64) + program[pc] as i8 as i64 + 1) as usize;
                 let next_pc = pc + 1;
-                state.stackpos = state.stackpos - 1;
+                state.stackpos -= 1;
                 let jump = state.stack[state.stackpos as usize] != 0;
                 if jump {
                     if target < next_pc {
@@ -282,7 +282,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     if state.stackpos == 0 {
         0
     } else {
-        state.stackpos = state.stackpos - 1;
+        state.stackpos -= 1;
         state.stack[state.stackpos as usize]
     }
 }
@@ -291,6 +291,12 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
 
 pub struct JitTlcInterp {
     threshold: u32,
+}
+
+impl Default for JitTlcInterp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitTlcInterp {

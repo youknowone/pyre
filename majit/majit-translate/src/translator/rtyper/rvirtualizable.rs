@@ -81,7 +81,7 @@ pub fn replace_force_virtualizable_with_call(
                 if op.opname == "jit_force_virtualizable"
                     && op.args.first().and_then(hlvalue_concretetype).as_ref() == Some(VTYPEPTR)
                 {
-                    if op.args.last().is_some_and(|arg| flags_access_directly(arg)) {
+                    if op.args.last().is_some_and(flags_access_directly) {
                         // `continue` before the append: an `access_directly`
                         // read reaches the virtualizable without going through
                         // the JIT, so the op is dropped rather than rewritten.

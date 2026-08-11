@@ -411,7 +411,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     let param_layout = inline_helper_param_layout(func)?;
     let mut max_reg = 0u16;
     let mut seen_ref_params = HashSet::new();
-    for (arg, (param_kind, reg)) in func.sig.inputs.iter().zip(param_layout.into_iter()) {
+    for (arg, (param_kind, reg)) in func.sig.inputs.iter().zip(param_layout) {
         let FnArg::Typed(pat_type) = arg else {
             return Err(syn::Error::new_spanned(
                 arg,

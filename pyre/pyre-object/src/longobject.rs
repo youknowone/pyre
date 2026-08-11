@@ -119,9 +119,9 @@ pub fn alloc_bigint_pair_no_collect(
     majit_rlib::rbigint::alloc_rbigint_pair_no_collect(item0, item1)
 }
 
-/// GC type id for the raw `rbigint` payload, published at JitDriver init by
-/// `set_bigint_gc_type_id`. `0` until then, in which case the alloc helpers
-/// fall back to leaked raw allocations in bare tests / pre-init bootstrap.
+// GC type id for the raw `rbigint` payload is published at JitDriver init by
+// `set_bigint_gc_type_id`. It remains 0 until then, in which case the alloc
+// helpers fall back to leaked raw allocations in bare tests/pre-init bootstrap.
 
 /// Record the GC type id registered for the `rbigint` payload (called once from
 /// `pyre-jit::eval` after `gc.register_type`).

@@ -46,7 +46,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // Each cc[i] becomes a 1-byte bytes object (CPython does the same).
         let items: Vec<_> = cc
             .iter()
-            .map(|&b| pyre_object::bytesobject::w_bytes_from_bytes(&[b as u8]))
+            .map(|&b| pyre_object::bytesobject::w_bytes_from_bytes(&[b]))
             .collect();
         pyre_object::w_list_new(items)
     }
@@ -75,8 +75,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // interp_termios.py:53 — in noncanonical mode VMIN/VTIME are
                 // single-byte counters, surfaced as ints rather than bytes.
                 if (t.c_lflag & libc::ICANON) == 0 {
-                    let vmin = libc::VMIN as usize;
-                    let vtime = libc::VTIME as usize;
+                    let vmin = libc::VMIN;
+                    let vtime = libc::VTIME;
                     unsafe {
                         pyre_object::w_list_setitem(
                             cc_list,

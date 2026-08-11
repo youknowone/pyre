@@ -1,3 +1,22 @@
+// These interfaces preserve the shared backend's explicit lowering inputs and
+// recovery-layout ownership. Interior-mutability accessors are synchronized by
+// the backend's compile lock; changing them to `&mut self` would break the
+// Backend trait's shared-reference contract.
+#![allow(
+    clippy::approx_constant,
+    clippy::empty_line_after_doc_comments,
+    clippy::inconsistent_digit_grouping,
+    clippy::manual_checked_ops,
+    clippy::mut_from_ref,
+    clippy::needless_range_loop,
+    clippy::redundant_locals,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_mut_passed,
+    clippy::useless_vec
+)]
+
 /// Cranelift-based JIT code generation backend for majit.
 ///
 /// This crate implements the `majit_backend::Backend` trait using Cranelift

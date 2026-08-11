@@ -603,12 +603,12 @@ fn argument_address(obj: PyObjectRef) -> Result<usize, crate::PyError> {
     }
     if cdata::is_cdata_instance(obj) {
         let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-        if let Some(info) = stginfo::stginfo_of(cls) {
-            if stginfo::stginfo_paramfunc(info) == "pointer" {
-                return Ok(host_ctypes::read_pointer_from_buffer(
-                    cdata::cdata_bytes(obj).unwrap_or(&[]),
-                ));
-            }
+        if let Some(info) = stginfo::stginfo_of(cls)
+            && stginfo::stginfo_paramfunc(info) == "pointer"
+        {
+            return Ok(host_ctypes::read_pointer_from_buffer(
+                cdata::cdata_bytes(obj).unwrap_or(&[]),
+            ));
         }
         if cdata::type_code_of(cls).is_some_and(|tc| cdata::is_pointer_code(&tc)) {
             return Ok(host_ctypes::read_pointer_from_buffer(

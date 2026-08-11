@@ -804,6 +804,12 @@ pub struct GcCache {
     next_type_id: u32,
 }
 
+impl Default for GcCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GcCache {
     pub fn new() -> Self {
         GcCache {
@@ -1813,10 +1819,10 @@ impl GcCache {
             }
         };
         if should_insert {
-            if let Some(old) = self._cache_size.get(&key) {
-                if !arc_in_vec(&self._size_keepalive, old) {
-                    self._size_keepalive.push(old.clone());
-                }
+            if let Some(old) = self._cache_size.get(&key)
+                && !arc_in_vec(&self._size_keepalive, old)
+            {
+                self._size_keepalive.push(old.clone());
             }
             self._cache_size.insert(key.clone(), descr.clone());
             self._cache_size_order.retain(|d| {
@@ -1857,8 +1863,8 @@ impl GcCache {
         descr: Arc<SimpleFieldDescr>,
     ) {
         let inner = self._cache_field.entry(struct_key).or_default();
-        if !inner.contains_key(&field_name) {
-            inner.insert(field_name, descr.clone());
+        if let std::collections::hash_map::Entry::Vacant(e) = inner.entry(field_name) {
+            e.insert(descr.clone());
             let as_ref: DescrRef = descr as DescrRef;
             if !arc_in_vec(&self._cache_field_order, &as_ref) {
                 self._cache_field_order.push(as_ref);
@@ -5738,7 +5744,7 @@ pub fn memcpy_fn_addr() -> i64 {
 /// the same identity invariant by returning a `OnceLock`-cached `Arc`,
 /// so every caller (`GcRewriterImpl::new` per-backend, optimizer
 /// virtualstate import, …) sees the same `DescrRef`.
-
+///
 /// llsupport/gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
 /// self, rclass.OBJECT, 'typeptr')`. FieldDescr describing the
 /// `typeptr` slot at the head of every `rclass.OBJECT` (offset 0,

@@ -25,7 +25,7 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 /// Used by `virtualize.py:28` (NEW_ARRAY size gate) and
 /// `info.py:561` (per-element initialization gate).
 pub fn reasonable_array_index(index: i64) -> bool {
-    index >= 0 && index <= 150_000
+    (0..=150_000).contains(&index)
 }
 
 /// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
@@ -1078,10 +1078,8 @@ impl PtrInfo {
                     .and_then(|d| d.as_size_descr())
                     .map(|sd| sd.all_fielddescrs().len())
                     .unwrap_or(0);
-                if v.descr.is_none() || index >= cur_len {
-                    if cur_len == 0 || new_len > cur_len {
-                        v.descr = Some(descr);
-                    }
+                if (v.descr.is_none() || index >= cur_len) && (cur_len == 0 || new_len > cur_len) {
+                    v.descr = Some(descr);
                 }
             }
             PtrInfo::Struct(v) => {
@@ -1213,7 +1211,7 @@ impl PtrInfo {
     /// RPython: `isinstance(res, PreambleOp)` check in ArrayCachedItem._getfield.
     pub fn has_preamble_item(&self, index: usize) -> bool {
         match self {
-            PtrInfo::Array(v) => v.items.get(index).map_or(false, |e| e.is_preamble()),
+            PtrInfo::Array(v) => v.items.get(index).is_some_and(|e| e.is_preamble()),
             _ => false,
         }
     }
@@ -1349,13 +1347,12 @@ impl PtrInfo {
                 }
                 v.items[index] = FieldEntry::Value(value);
             }
-            PtrInfo::VirtualArray(v) => {
+            PtrInfo::VirtualArray(v)
                 // info.py:568-569 `if self.is_virtual(): return  # bogus
                 // setarrayitem_gc into virtual, drop the operation`.
-                if index < v.items.len() {
+                if index < v.items.len() => {
                     v.items[index] = value;
                 }
-            }
             _ => {}
         }
     }
@@ -1377,10 +1374,8 @@ impl PtrInfo {
                     v.items[index] = FieldEntry::Value(Operand::None);
                 }
             }
-            PtrInfo::VirtualArray(v) => {
-                if index < v.items.len() {
-                    v.items[index] = Operand::None;
-                }
+            PtrInfo::VirtualArray(v) if index < v.items.len() => {
+                v.items[index] = Operand::None;
             }
             _ => {}
         }
@@ -1413,22 +1408,19 @@ impl PtrInfo {
         field_descr_index: u32,
         value: Operand,
     ) {
-        match self {
-            PtrInfo::VirtualArrayStruct(v) => {
-                if element_index >= v.element_fields.len() {
-                    v.element_fields.resize(element_index + 1, Vec::new());
-                }
-                let fields = &mut v.element_fields[element_index];
-                if let Some(entry) = fields
-                    .iter_mut()
-                    .find(|(fdidx, _)| *fdidx == field_descr_index)
-                {
-                    entry.1 = value;
-                } else {
-                    fields.push((field_descr_index, value));
-                }
+        if let PtrInfo::VirtualArrayStruct(v) = self {
+            if element_index >= v.element_fields.len() {
+                v.element_fields.resize(element_index + 1, Vec::new());
             }
-            _ => {}
+            let fields = &mut v.element_fields[element_index];
+            if let Some(entry) = fields
+                .iter_mut()
+                .find(|(fdidx, _)| *fdidx == field_descr_index)
+            {
+                entry.1 = value;
+            } else {
+                fields.push((field_descr_index, value));
+            }
         }
     }
 

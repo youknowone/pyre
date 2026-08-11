@@ -108,18 +108,18 @@ fn variable_to_register(
     // Void / Unknown — fall through to KINDS scan.
     let mut found: Option<Register> = None;
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        if let Some(ra) = regallocs.get(&kind) {
-            if let Some(color) = ra.color_for_variable(var) {
-                if let Some(prev) = found {
-                    panic!(
-                        "variable_to_register: Variable {var:?} colored in multiple \
+        if let Some(ra) = regallocs.get(&kind)
+            && let Some(color) = ra.color_for_variable(var)
+        {
+            if let Some(prev) = found {
+                panic!(
+                    "variable_to_register: Variable {var:?} colored in multiple \
                          regalloc classes ({:?} and {kind:?}) — RPython `getkind` must \
                          give exactly one",
-                        prev.kind,
-                    );
-                }
-                found = Some(Register::new(kind, color));
+                    prev.kind,
+                );
             }
+            found = Some(Register::new(kind, color));
         }
     }
     found

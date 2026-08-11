@@ -73,7 +73,8 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
     }
 
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
-    for bench in ["global_reassign.py"] {
+    {
+        let bench = "global_reassign.py";
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
         assert!(
@@ -570,10 +571,10 @@ fn test_call_generates_import() {
     for payload in parser.parse_all(&bytes) {
         if let Ok(wasmparser::Payload::ImportSection(imports)) = payload {
             for import in imports {
-                if let Ok(import) = import {
-                    if import.name == "jit_call_compact" {
-                        has_jit_call = true;
-                    }
+                if let Ok(import) = import
+                    && import.name == "jit_call_compact"
+                {
+                    has_jit_call = true;
                 }
             }
         }
@@ -765,23 +766,24 @@ fn test_guard_gc_type_uses_immediate_typeid() {
 /// `gc.py:619 get_translated_info_for_guard_is_object` /
 /// `x86/assembler.py:1951 cpu.subclassrange_min_offset`.
 fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
-    let mut info = codegen::GuardGcTypeInfo::default();
-    info.supports_guard_gc_type = true;
     // Pretend the TYPE_INFO table sits at a small in-memory address;
     // wasm validation only checks the bytecode shape, not the actual
     // load addresses, so any value works for codegen testing.
-    info.base_type_info = 0x1000;
     // majit `TypeEntry` stride = 32 bytes (TypeInfoLayout 16 + ClassTypeLayout 16).
     // shift_by = log2(32) = 5, sizeof_ti = rffi.sizeof(TYPE_INFO) = 16.
-    info.shift_by = 5;
-    info.sizeof_ti = 16; // size_of::<TypeInfoLayout>()
     // gc.py:603-622 _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
     // = 0x100000 (gctypelayout.py:196), packed little-endian into a
     // Signed word — byte at offset +2 carries the flag, mask = 0x10.
-    info.infobits_offset = 2;
-    info.is_object_flag = 0x10;
-    info.subclassrange_min_offset = 0; // offset within ClassTypeLayout
-    info
+    codegen::GuardGcTypeInfo {
+        supports_guard_gc_type: true,
+        base_type_info: 0x1000,
+        shift_by: 5,
+        sizeof_ti: 16, // size_of::<TypeInfoLayout>()
+        infobits_offset: 2,
+        is_object_flag: 0x10,
+        subclassrange_min_offset: 0, // offset within ClassTypeLayout
+        ..Default::default()
+    }
 }
 
 /// x86/assembler.py:1924-1943 `genop_guard_guard_is_object` lowering —

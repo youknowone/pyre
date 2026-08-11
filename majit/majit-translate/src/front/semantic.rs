@@ -440,10 +440,10 @@ impl<'a> MirGraphLookup<'a> {
                 v.insert(Ok(graph));
             }
             Entry::Occupied(mut o) => {
-                if let Ok(g0) = *o.get() {
-                    if !std::ptr::eq(g0, graph) {
-                        let _ = o.insert(Err(()));
-                    }
+                if let Ok(g0) = *o.get()
+                    && !std::ptr::eq(g0, graph)
+                {
+                    let _ = o.insert(Err(()));
                 }
                 // already Err(()): stays ambiguous.
             }
@@ -455,30 +455,21 @@ impl<'a> MirGraphLookup<'a> {
     /// resolve to a unique graph (no entry, or two modules share the
     /// bare name).
     pub fn lookup_free(&self, name: &str) -> Option<&'a FunctionGraph> {
-        match self.free_functions.get(name).copied()? {
-            Ok(g) => Some(g),
-            Err(()) => None,
-        }
+        self.free_functions.get(name).copied()?.ok()
     }
 
     /// Returns the MIR graph for an inherent or trait-impl method.
     /// Returns None when the (owner, name) tuple does not resolve to
     /// a unique graph (either no entry or ambiguous bare-leaf).
     pub fn lookup_impl_method(&self, impl_type: &str, name: &str) -> Option<&'a FunctionGraph> {
-        match self.impl_methods.get(&(impl_type, name)).copied()? {
-            Ok(g) => Some(g),
-            Err(()) => None,
-        }
+        self.impl_methods.get(&(impl_type, name)).copied()?.ok()
     }
 
     /// Returns the MIR graph for a trait-default body.  Returns None
     /// when the (trait_root, name) tuple does not resolve to a unique
     /// graph (no entry or ambiguous bare-leaf trait name).
     pub fn lookup_trait_default(&self, trait_root: &str, name: &str) -> Option<&'a FunctionGraph> {
-        match self.trait_defaults.get(&(trait_root, name)).copied()? {
-            Ok(g) => Some(g),
-            Err(()) => None,
-        }
+        self.trait_defaults.get(&(trait_root, name)).copied()?.ok()
     }
 }
 
@@ -571,7 +562,7 @@ mod tests {
         // probe the qualified `owner_path.join("::")` first, then the bare
         // tail.  The qualified probe routes correctly where the bare-only
         // probe (prior behaviour) would misroute to the struct-ctor branch.
-        let owner_path = vec!["crate".to_string(), "m1".to_string(), "E".to_string()];
+        let owner_path = ["crate".to_string(), "m1".to_string(), "E".to_string()];
         let owner_tail = owner_path.last();
         let owner_qual = owner_path.join("::");
         assert!(

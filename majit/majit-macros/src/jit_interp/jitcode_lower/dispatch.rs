@@ -657,7 +657,7 @@ fn expr_contains_can_enter_jit(expr: &Expr) -> bool {
                 || expr_if
                     .else_branch
                     .as_ref()
-                    .map_or(false, |(_, e)| expr_contains_can_enter_jit(e))
+                    .is_some_and(|(_, e)| expr_contains_can_enter_jit(e))
         }
         Expr::Block(expr_block) => block_contains_can_enter_jit(&expr_block.block),
         Expr::Match(expr_match) => expr_match
@@ -669,7 +669,7 @@ fn expr_contains_can_enter_jit(expr: &Expr) -> bool {
 }
 
 fn block_contains_can_enter_jit(block: &syn::Block) -> bool {
-    block.stmts.iter().any(|s| stmt_contains_can_enter_jit(s))
+    block.stmts.iter().any(stmt_contains_can_enter_jit)
 }
 
 /// A.2.5.a: lower a free-function call statement whose callee has a
@@ -821,12 +821,11 @@ fn lower_extended_arg_inner_while(
     // shadows rather than rebinds.
     let mut inner_alias: HashMap<String, u16> = HashMap::new();
     for stmt in &while_expr.body.stmts {
-        if let Some((lhs, rhs)) = match_simple_ident_assign(stmt) {
-            if let Some(b) = lowerer.bindings.get(&lhs) {
-                if matches!(b.kind, BindingKind::Int) {
-                    inner_alias.insert(rhs, b.reg);
-                }
-            }
+        if let Some((lhs, rhs)) = match_simple_ident_assign(stmt)
+            && let Some(b) = lowerer.bindings.get(&lhs)
+            && matches!(b.kind, BindingKind::Int)
+        {
+            inner_alias.insert(rhs, b.reg);
         }
     }
 
@@ -1337,132 +1336,130 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
     //                    init: Some(LocalInit { expr: Expr::Index {
     //                        expr: Expr::Path(program_path),
     //                        index: <pc | pc + N> } }) }
-    if let Stmt::Local(local) = stmt {
-        if let Some(init) = &local.init {
-            // Peel an outer `Expr::Cast` so `let X: i64 = program[idx] as i64`
-            // matches alongside the bare `let X = program[idx]` form. The
-            // cast is purely a Rust widening artifact (the byte fetch itself
-            // writes into an i64-banked register either way; RPython's
-            // `ord(co_code[next_instr + 1])` already returns a Python int).
-            let init_expr = match init.expr.as_ref() {
-                Expr::Cast(c) => c.expr.as_ref(),
-                other => other,
-            };
-            // Recognise the index form `program[idx]` AND the method-call
-            // PyPy `pyopcode.py:171 ord(co_code[next_instr])` is an
-            // index form on the bytecode array; that's the ONLY shape
-            // the codewriter recognises as the BC_GETARRAYITEM_GC_I
-            // opcode-fetch.  Earlier pyre revisions also whitelisted
-            // a method-call form `program.get_op(idx)` to accommodate
-            // consumers wrapping the byte access in a method, but the
-            // proc-macro cannot verify the method body actually equals
-            // `code[idx]` — a wrapper that returns `code[idx] ^ key`
-            // (or any non-trivial transformation) would silently lower
-            // as a raw byte-array load with the wrong semantic.
-            //
-            // For strict line-by-line PyPy parity, only the index form
-            // is recognised here.  Consumers using a method wrapper
-            // must register the method as a call policy
-            // (`#[jit_interp(calls = { Program::get_op =>
-            // elidable_int })]`); `lower_value_expr` then emits a
-            // `call_pure_int_canonical_via_target` op rather than a
-            // hardcoded byte-array load.
-            let opcode_fetch = match init_expr {
-                Expr::Index(idx) => {
-                    let array_name = expr_single_ident(&idx.expr);
-                    if array_name.as_deref() == Some("program") {
-                        Some(idx.index.as_ref())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            // Method-call form: `let op = program.get_op(pc)` where
-            // `get_op` is registered as an elidable call policy. Emit
-            // `call_pure_int` and bind the result so `lower_dispatch_chain`
-            // finds the opcode register.
-            if opcode_fetch.is_none() {
-                if let Expr::MethodCall(mc) = init_expr {
-                    let receiver_name = expr_single_ident(&mc.receiver);
-                    if receiver_name.as_deref() == Some("program") {
-                        if let Some(binding) =
-                            lowerer.lower_value_expr(&syn::Expr::MethodCall(mc.clone()))
-                        {
-                            if let Some(name) = pat_bound_ident_name(&local.pat) {
-                                lowerer.bindings.insert(
-                                    name.clone(),
-                                    Binding {
-                                        reg: binding.reg,
-                                        kind: binding.kind,
-                                        depends_on_stack: false,
-                                        struct_type: None,
-                                    },
-                                );
-                                lowerer.opcode_var_name = Some(name);
-                            }
-                            return true;
-                        }
-                    }
+    if let Stmt::Local(local) = stmt
+        && let Some(init) = &local.init
+    {
+        // Peel an outer `Expr::Cast` so `let X: i64 = program[idx] as i64`
+        // matches alongside the bare `let X = program[idx]` form. The
+        // cast is purely a Rust widening artifact (the byte fetch itself
+        // writes into an i64-banked register either way; RPython's
+        // `ord(co_code[next_instr + 1])` already returns a Python int).
+        let init_expr = match init.expr.as_ref() {
+            Expr::Cast(c) => c.expr.as_ref(),
+            other => other,
+        };
+        // Recognise the index form `program[idx]` AND the method-call
+        // PyPy `pyopcode.py:171 ord(co_code[next_instr])` is an
+        // index form on the bytecode array; that's the ONLY shape
+        // the codewriter recognises as the BC_GETARRAYITEM_GC_I
+        // opcode-fetch.  Earlier pyre revisions also whitelisted
+        // a method-call form `program.get_op(idx)` to accommodate
+        // consumers wrapping the byte access in a method, but the
+        // proc-macro cannot verify the method body actually equals
+        // `code[idx]` — a wrapper that returns `code[idx] ^ key`
+        // (or any non-trivial transformation) would silently lower
+        // as a raw byte-array load with the wrong semantic.
+        //
+        // For strict line-by-line PyPy parity, only the index form
+        // is recognised here.  Consumers using a method wrapper
+        // must register the method as a call policy
+        // (`#[jit_interp(calls = { Program::get_op =>
+        // elidable_int })]`); `lower_value_expr` then emits a
+        // `call_pure_int_canonical_via_target` op rather than a
+        // hardcoded byte-array load.
+        let opcode_fetch = match init_expr {
+            Expr::Index(idx) => {
+                let array_name = expr_single_ident(&idx.expr);
+                if array_name.as_deref() == Some("program") {
+                    Some(idx.index.as_ref())
+                } else {
+                    None
                 }
             }
-            if let Some(idx_expr) = opcode_fetch {
-                // Binding names: "program" → r0, "pc" → i0 (installed by
-                // lower_dispatch_body before this fn is called).
-                let program_binding = lowerer.bindings.get("program").cloned();
-                let Some(prog) = program_binding else {
-                    return false;
-                };
-                let program_reg = prog.reg;
-                let descr_tok = env_array_descr_expr(lowerer.config);
-                // Compute the index register: `pc` returns pc_reg directly,
-                // `pc + N` emits load_const + int_add into a fresh reg.
-                let Some(index_reg) = lower_array_index_expr(lowerer, idx_expr) else {
-                    return false;
-                };
-                // Allocate a fresh Int register for the fetch result.
-                let result_reg = lowerer.alloc_reg();
-                lowerer.emit_op(
-                    OpMeta::linear(
-                        OpKind::Vable,
-                        vec![Register::ref_(program_reg), Register::int(index_reg)],
-                        vec![Register::int(result_reg)],
-                    ),
-                    quote::quote! {
-                        let __descr_idx = #descr_tok;
-                        __builder.getarrayitem_gc_i(
-                            #result_reg as u16,
-                            #program_reg as u16,
-                            #index_reg as u16,
-                            __descr_idx,
-                        );
-                    },
-                );
-                // Record binding for `<name>` so downstream patterns
-                // (dispatch chain, Task 1.5) can reference it. Peel
-                // an outer `Pat::Type` so `let X: i64 = ...` (with
-                // an explicit type annotation) is recognized
-                // alongside the bare `let X = ...` form.
+            _ => None,
+        };
+        // Method-call form: `let op = program.get_op(pc)` where
+        // `get_op` is registered as an elidable call policy. Emit
+        // `call_pure_int` and bind the result so `lower_dispatch_chain`
+        // finds the opcode register.
+        if opcode_fetch.is_none()
+            && let Expr::MethodCall(mc) = init_expr
+        {
+            let receiver_name = expr_single_ident(&mc.receiver);
+            if receiver_name.as_deref() == Some("program")
+                && let Some(binding) = lowerer.lower_value_expr(&syn::Expr::MethodCall(mc.clone()))
+            {
                 if let Some(name) = pat_bound_ident_name(&local.pat) {
                     lowerer.bindings.insert(
                         name.clone(),
                         Binding {
-                            reg: result_reg,
-                            kind: BindingKind::Int,
+                            reg: binding.reg,
+                            kind: binding.kind,
                             depends_on_stack: false,
                             struct_type: None,
                         },
                     );
-                    // Slice ε.1: record the consumer's chosen
-                    // opcode-result name so `lower_dispatch_chain`
-                    // can find the binding regardless of whether the
-                    // consumer named it `opcode` (PyPy convention,
-                    // `pyopcode.py:171`) or `op` (aheui-jit
-                    // `aheui.py:255`) or anything else.
                     lowerer.opcode_var_name = Some(name);
                 }
                 return true;
             }
+        }
+        if let Some(idx_expr) = opcode_fetch {
+            // Binding names: "program" → r0, "pc" → i0 (installed by
+            // lower_dispatch_body before this fn is called).
+            let program_binding = lowerer.bindings.get("program").cloned();
+            let Some(prog) = program_binding else {
+                return false;
+            };
+            let program_reg = prog.reg;
+            let descr_tok = env_array_descr_expr(lowerer.config);
+            // Compute the index register: `pc` returns pc_reg directly,
+            // `pc + N` emits load_const + int_add into a fresh reg.
+            let Some(index_reg) = lower_array_index_expr(lowerer, idx_expr) else {
+                return false;
+            };
+            // Allocate a fresh Int register for the fetch result.
+            let result_reg = lowerer.alloc_reg();
+            lowerer.emit_op(
+                OpMeta::linear(
+                    OpKind::Vable,
+                    vec![Register::ref_(program_reg), Register::int(index_reg)],
+                    vec![Register::int(result_reg)],
+                ),
+                quote::quote! {
+                    let __descr_idx = #descr_tok;
+                    __builder.getarrayitem_gc_i(
+                        #result_reg as u16,
+                        #program_reg as u16,
+                        #index_reg as u16,
+                        __descr_idx,
+                    );
+                },
+            );
+            // Record binding for `<name>` so downstream patterns
+            // (dispatch chain, Task 1.5) can reference it. Peel
+            // an outer `Pat::Type` so `let X: i64 = ...` (with
+            // an explicit type annotation) is recognized
+            // alongside the bare `let X = ...` form.
+            if let Some(name) = pat_bound_ident_name(&local.pat) {
+                lowerer.bindings.insert(
+                    name.clone(),
+                    Binding {
+                        reg: result_reg,
+                        kind: BindingKind::Int,
+                        depends_on_stack: false,
+                        struct_type: None,
+                    },
+                );
+                // Slice ε.1: record the consumer's chosen
+                // opcode-result name so `lower_dispatch_chain`
+                // can find the binding regardless of whether the
+                // consumer named it `opcode` (PyPy convention,
+                // `pyopcode.py:171`) or `op` (aheui-jit
+                // `aheui.py:255`) or anything else.
+                lowerer.opcode_var_name = Some(name);
+            }
+            return true;
         }
     }
 
@@ -1470,40 +1467,41 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
     // syn 2 AST: Stmt::Expr(Expr::Binary { op: BinOp::AddAssign,
     //                left: pc_path, right: Expr::Lit(LitInt(N)) })
     // Also handles `pc = pc + N` (Expr::Assign with binary Add).
-    if let Some((lhs_name, increment)) = match_pc_increment_stmt(stmt) {
-        if lhs_name == "pc" && increment > 0 {
-            let pc_binding = lowerer.bindings.get("pc").cloned();
-            let Some(pc) = pc_binding else {
-                return false;
-            };
-            let pc_reg = pc.reg;
-            // Load the increment into a fresh tmp int register, then emit
-            // int_add(pc_reg, pc_reg, tmp_reg). RPython `pyopcode.py:181`
-            // `next_instr += 2` is the canonical N=2 case.
-            let tmp_reg = lowerer.alloc_reg();
-            lowerer.emit_op(
-                OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
-                quote::quote! {
-                    __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
-                },
-            );
-            lowerer.emit_op(
-                OpMeta::linear(
-                    OpKind::BinopI,
-                    vec![Register::int(pc_reg), Register::int(tmp_reg)],
-                    vec![Register::int(pc_reg)],
-                ),
-                quote::quote! {
-                    __builder.record_binop_i(
-                        #pc_reg as u16,
-                        majit_ir::OpCode::IntAdd,
-                        #pc_reg as u16,
-                        #tmp_reg as u16,
-                    );
-                },
-            );
-            return true;
-        }
+    if let Some((lhs_name, increment)) = match_pc_increment_stmt(stmt)
+        && lhs_name == "pc"
+        && increment > 0
+    {
+        let pc_binding = lowerer.bindings.get("pc").cloned();
+        let Some(pc) = pc_binding else {
+            return false;
+        };
+        let pc_reg = pc.reg;
+        // Load the increment into a fresh tmp int register, then emit
+        // int_add(pc_reg, pc_reg, tmp_reg). RPython `pyopcode.py:181`
+        // `next_instr += 2` is the canonical N=2 case.
+        let tmp_reg = lowerer.alloc_reg();
+        lowerer.emit_op(
+            OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(tmp_reg)]),
+            quote::quote! {
+                __builder.load_const_i_value(#tmp_reg as u16, #increment as i64);
+            },
+        );
+        lowerer.emit_op(
+            OpMeta::linear(
+                OpKind::BinopI,
+                vec![Register::int(pc_reg), Register::int(tmp_reg)],
+                vec![Register::int(pc_reg)],
+            ),
+            quote::quote! {
+                __builder.record_binop_i(
+                    #pc_reg as u16,
+                    majit_ir::OpCode::IntAdd,
+                    #pc_reg as u16,
+                    #tmp_reg as u16,
+                );
+            },
+        );
+        return true;
     }
 
     false
@@ -1598,23 +1596,23 @@ fn match_pc_increment_stmt(stmt: &Stmt) -> Option<(String, i64)> {
     };
     // `pc += N` — syn 2 parses compound assignments as Expr::Binary
     // with BinOp::AddAssign(syn::token::PlusEq).
-    if let Expr::Binary(bin) = expr {
-        if matches!(bin.op, syn::BinOp::AddAssign(_)) {
-            let lhs = expr_single_ident(&bin.left)?;
-            let increment = expr_int_literal_value(&bin.right)?;
-            return Some((lhs, increment));
-        }
+    if let Expr::Binary(bin) = expr
+        && matches!(bin.op, syn::BinOp::AddAssign(_))
+    {
+        let lhs = expr_single_ident(&bin.left)?;
+        let increment = expr_int_literal_value(&bin.right)?;
+        return Some((lhs, increment));
     }
     // `pc = pc + N`
     if let Expr::Assign(a) = expr {
         let lhs = expr_single_ident(&a.left)?;
-        if let Expr::Binary(bin) = a.right.as_ref() {
-            if matches!(bin.op, syn::BinOp::Add(_)) {
-                let l_name = expr_single_ident(&bin.left)?;
-                let increment = expr_int_literal_value(&bin.right)?;
-                if l_name == lhs {
-                    return Some((lhs, increment));
-                }
+        if let Expr::Binary(bin) = a.right.as_ref()
+            && matches!(bin.op, syn::BinOp::Add(_))
+        {
+            let l_name = expr_single_ident(&bin.left)?;
+            let increment = expr_int_literal_value(&bin.right)?;
+            if l_name == lhs {
+                return Some((lhs, increment));
             }
         }
     }
@@ -1911,23 +1909,19 @@ pub(super) fn env_array_descr_expr(config: Option<&LowererConfig>) -> proc_macro
 /// `match_pc_increment_stmt` but operates on an `Expr` and is pc-specific —
 /// used by `lower_pc_pinned_write` on the inline arm path.
 fn pc_self_increment(expr: &Expr) -> Option<i64> {
-    if let Expr::Binary(bin) = expr {
-        if matches!(bin.op, syn::BinOp::AddAssign(_))
-            && expr_single_ident(&bin.left).as_deref() == Some("pc")
-        {
-            return expr_int_literal_value(&bin.right);
-        }
+    if let Expr::Binary(bin) = expr
+        && matches!(bin.op, syn::BinOp::AddAssign(_))
+        && expr_single_ident(&bin.left).as_deref() == Some("pc")
+    {
+        return expr_int_literal_value(&bin.right);
     }
-    if let Expr::Assign(a) = expr {
-        if expr_single_ident(&a.left).as_deref() == Some("pc") {
-            if let Expr::Binary(bin) = a.right.as_ref() {
-                if matches!(bin.op, syn::BinOp::Add(_))
-                    && expr_single_ident(&bin.left).as_deref() == Some("pc")
-                {
-                    return expr_int_literal_value(&bin.right);
-                }
-            }
-        }
+    if let Expr::Assign(a) = expr
+        && expr_single_ident(&a.left).as_deref() == Some("pc")
+        && let Expr::Binary(bin) = a.right.as_ref()
+        && matches!(bin.op, syn::BinOp::Add(_))
+        && expr_single_ident(&bin.left).as_deref() == Some("pc")
+    {
+        return expr_int_literal_value(&bin.right);
     }
     None
 }
@@ -2003,10 +1997,10 @@ fn arm_is_pure_pc_advance(body: &Expr) -> Option<i64> {
             if pc_self_increment(e).is_some() {
                 return None;
             }
-            if let Expr::Assign(a) = e {
-                if expr_single_ident(&a.left).as_deref() == Some("pc") {
-                    return None;
-                }
+            if let Expr::Assign(a) = e
+                && expr_single_ident(&a.left).as_deref() == Some("pc")
+            {
+                return None;
             }
         }
     }
@@ -2059,50 +2053,50 @@ impl<'c> Lowerer<'c> {
             return Some(());
         }
 
-        if let Expr::Assign(assign) = expr {
-            if expr_single_ident(&assign.left).as_deref() == Some("pc") {
-                let rhs = self.lower_value_expr(&assign.right)?;
-                if !matches!(rhs.kind, BindingKind::Int) {
-                    return None;
-                }
-                if rhs.reg != pc_reg {
-                    let zero_reg = self.alloc_reg();
-                    let rhs_reg = rhs.reg;
-                    self.emit_op(
-                        OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
-                        quote::quote! {
-                            __builder.load_const_i_value(#zero_reg as u16, 0i64);
-                        },
-                    );
-                    self.emit_op(
-                        OpMeta::linear(
-                            OpKind::BinopI,
-                            vec![Register::int(rhs_reg), Register::int(zero_reg)],
-                            vec![Register::int(pc_reg)],
-                        ),
-                        quote::quote! {
-                            __builder.record_binop_i(
-                                #pc_reg as u16,
-                                majit_ir::OpCode::IntAdd,
-                                #rhs_reg as u16,
-                                #zero_reg as u16,
-                            );
-                        },
-                    );
-                }
-                // Re-pin `pc` to reg0, overriding any SSA rebind the RHS
-                // lowering may have left.
-                self.bindings.insert(
-                    "pc".to_string(),
-                    Binding {
-                        reg: pc_reg,
-                        kind: BindingKind::Int,
-                        depends_on_stack: false,
-                        struct_type: None,
+        if let Expr::Assign(assign) = expr
+            && expr_single_ident(&assign.left).as_deref() == Some("pc")
+        {
+            let rhs = self.lower_value_expr(&assign.right)?;
+            if !matches!(rhs.kind, BindingKind::Int) {
+                return None;
+            }
+            if rhs.reg != pc_reg {
+                let zero_reg = self.alloc_reg();
+                let rhs_reg = rhs.reg;
+                self.emit_op(
+                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
+                    quote::quote! {
+                        __builder.load_const_i_value(#zero_reg as u16, 0i64);
                     },
                 );
-                return Some(());
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::BinopI,
+                        vec![Register::int(rhs_reg), Register::int(zero_reg)],
+                        vec![Register::int(pc_reg)],
+                    ),
+                    quote::quote! {
+                        __builder.record_binop_i(
+                            #pc_reg as u16,
+                            majit_ir::OpCode::IntAdd,
+                            #rhs_reg as u16,
+                            #zero_reg as u16,
+                        );
+                    },
+                );
             }
+            // Re-pin `pc` to reg0, overriding any SSA rebind the RHS
+            // lowering may have left.
+            self.bindings.insert(
+                "pc".to_string(),
+                Binding {
+                    reg: pc_reg,
+                    kind: BindingKind::Int,
+                    depends_on_stack: false,
+                    struct_type: None,
+                },
+            );
+            return Some(());
         }
         None
     }
@@ -2525,26 +2519,26 @@ pub(super) fn lower_dispatch_chain(
                             } else {
                                 (0u16, 0u16)
                             };
-                            let min_i_regs = (layout
+                            let min_i_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Int))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16)
+                                .unwrap_or(0)
                                 .max(__split_int_end);
-                            let min_r_regs = (layout
+                            let min_r_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Ref))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16)
+                                .unwrap_or(0)
                                 .max(__split_ref_end);
                             let min_f_regs = layout
                                 .iter()
                                 .filter(|e| matches!(e.kind, BindingKind::Float))
                                 .map(|e| e.callee_reg + 1)
                                 .max()
-                                .unwrap_or(0) as u16;
+                                .unwrap_or(0);
                             (
                                 quote::quote! {
                                     // A runtime-resolved unsupported call policy

@@ -361,7 +361,7 @@ pub extern "C" fn jit_math_isqrt_i64(n: i64) -> i64 {
     }
     let n = n as u64;
     let mut root = (n as f64).sqrt() as u64;
-    while root + 1 <= n / (root + 1) {
+    while root < n / (root + 1) {
         root += 1;
     }
     while root > n / root {
@@ -1320,7 +1320,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
     let (pos, kwargs) = if is_kwargs {
         (&args[..args.len() - 1], Some(*args.last().unwrap()))
     } else {
-        (&args[..], None)
+        (args, None)
     };
     if pos.len() != 2 {
         return Err(crate::PyError::type_error(

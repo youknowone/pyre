@@ -5,7 +5,7 @@
 //!
 //! `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
 //! + `pyjitpl.py:3553-3579 record_result_of_call_pure` — the live wire
-//! must not break when observed from outside the metainterp crate.
+//!   must not break when observed from outside the metainterp crate.
 //!
 //! Infrastructure unit tests already exist at:
 //!  - `majit-metainterp/src/pyjitpl.rs:15126`

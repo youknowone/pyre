@@ -248,7 +248,7 @@ pub fn codepoint_index_at_byte_position(
     while index_min < index_max {
         // this addition can't overflow because storage has a length that is
         // 1/64 of the length of a string
-        let index_middle = (index_min + index_max + 1) / 2;
+        let index_middle = (index_min + index_max).div_ceil(2);
         let base_bytepos = storage[index_middle].baseindex as usize;
         if bytepos < base_bytepos {
             index_max = index_middle - 1;

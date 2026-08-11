@@ -953,9 +953,9 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let names = unsafe { read_code_names(args[9], "names")? };
     let varnames = unsafe { read_code_names(args[10], "varnames")? };
     if varnames.len() != nlocals as usize {
-        return Err(crate::PyError::value_error(format!(
-            "code: co_nlocals != len(co_varnames)"
-        )));
+        return Err(crate::PyError::value_error(
+            "code: co_nlocals != len(co_varnames)".to_string(),
+        ));
     }
     let (source_path, filename_bytes) = unsafe { read_code_filename(args[11], "filename", None)? };
     let obj_name = unsafe { read_code_str(args[12], "name")? };
@@ -2428,10 +2428,10 @@ pub fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
         }
         let vec = unsafe { &mut *code.mapdict_caches };
         for slot in vec.iter_mut() {
-            if let Some(entry) = slot.as_mut() {
-                if !entry.w_method.is_null() {
-                    forward(&mut entry.w_method);
-                }
+            if let Some(entry) = slot.as_mut()
+                && !entry.w_method.is_null()
+            {
+                forward(&mut entry.w_method);
             }
         }
     }

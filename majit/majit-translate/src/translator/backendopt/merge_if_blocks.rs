@@ -53,10 +53,10 @@ fn is_chain_block(block: &BlockRef, first: bool) -> bool {
     // those structurally — the only ConstValue carriers without a
     // stable identity-hash are mutable containers.
     let const_arg = if lhs_var { &op.args[1] } else { &op.args[0] };
-    if let Hlvalue::Constant(c) = const_arg {
-        if !is_hashable_const(&c.value) {
-            return false;
-        }
+    if let Hlvalue::Constant(c) = const_arg
+        && !is_hashable_const(&c.value)
+    {
+        return false;
     }
     true
 }

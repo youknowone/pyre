@@ -245,10 +245,11 @@ pub fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValu
         if matches!(s_obj2.const_(), Some(ConstValue::None)) && !s_obj1.can_be_none() {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
         }
-    } else if s_obj1.is_constant() {
-        if matches!(s_obj1.const_(), Some(ConstValue::None)) && !s_obj2.can_be_none() {
-            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
-        }
+    } else if s_obj1.is_constant()
+        && matches!(s_obj1.const_(), Some(ConstValue::None))
+        && !s_obj2.can_be_none()
+    {
+        r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
     }
 
     // binaryop.py:39-59.
@@ -317,22 +318,23 @@ fn bind_is(
     // `bk.valueoftype(&spec)`. When the HostObject isn't a recognised
     // type (e.g. a non-class constant), we fall back to widening by
     // `s_src` — monotone-safe and matches the prior Rust behaviour.
-    if let SomeValue::TypeOf(t) = s_tgt {
-        if s_src.is_constant() && !t.is_type_of.is_empty() {
-            let refined = s_src
-                .const_()
-                .and_then(host_to_annotation_spec)
-                .and_then(|spec| bk.valueoftype(&spec).ok())
-                .unwrap_or_else(|| s_src.clone());
-            let vars: Vec<Rc<super::super::flowspace::model::Variable>> =
-                t.is_type_of.iter().map(Rc::clone).collect();
-            super::model::add_knowntypedata(
-                knowntypedata,
-                super::model::ExitCaseKey::Bool(true),
-                &vars,
-                refined,
-            );
-        }
+    if let SomeValue::TypeOf(t) = s_tgt
+        && s_src.is_constant()
+        && !t.is_type_of.is_empty()
+    {
+        let refined = s_src
+            .const_()
+            .and_then(host_to_annotation_spec)
+            .and_then(|spec| bk.valueoftype(&spec).ok())
+            .unwrap_or_else(|| s_src.clone());
+        let vars: Vec<Rc<super::super::flowspace::model::Variable>> =
+            t.is_type_of.iter().map(Rc::clone).collect();
+        super::model::add_knowntypedata(
+            knowntypedata,
+            super::model::ExitCaseKey::Bool(true),
+            &vars,
+            refined,
+        );
     }
 
     // binaryop.py:50 — `add_knowntypedata(..., True, [tgt_obj], s_src)`.
@@ -742,11 +744,11 @@ fn read_can_only_throw_for_pair(
 ) -> Vec<BuiltinException> {
     let mut result = op.canraise().to_vec();
     crate::flowspace::operation::_REGISTRY_DOUBLE.with(|cell| {
-        if let Some(registry) = cell.borrow().get(&op) {
-            if let Some(spec) = registry.get((lhs, rhs), lhs.mro(), rhs.mro()) {
-                result = model::read_can_only_throw(&spec.can_only_throw, args_s)
-                    .unwrap_or_else(|| op.canraise().to_vec());
-            }
+        if let Some(registry) = cell.borrow().get(&op)
+            && let Some(spec) = registry.get((lhs, rhs), lhs.mro(), rhs.mro())
+        {
+            result = model::read_can_only_throw(&spec.can_only_throw, args_s)
+                .unwrap_or_else(|| op.canraise().to_vec());
         }
     });
     result
@@ -1050,10 +1052,10 @@ fn cmp_default_annotate(
         let c2 = s_2
             .const_()
             .expect("is_immutable_constant implies const set");
-        if let Some(result) = crate::flowspace::operation::pyfunc(cmp_op, &[c1, c2]) {
-            if let Ok(sv) = annotator.bookkeeper.immutablevalue(&result) {
-                return sv;
-            }
+        if let Some(result) = crate::flowspace::operation::pyfunc(cmp_op, &[c1, c2])
+            && let Ok(sv) = annotator.bookkeeper.immutablevalue(&result)
+        {
+            return sv;
         }
     }
     super::model::s_bool()
@@ -1130,48 +1132,44 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
     // binaryop.py:271-274 — `if s_int1.nonneg and isinstance(int2, Variable):
     //                        case = cmp_op.opname in ('lt', 'le', 'eq')
     //                        add_knowntypedata(..., case, [int2], SomeInteger(nonneg=True, knowntype=tointtype(s_int2)))`.
-    if let SomeValue::Integer(i1) = &s_int1 {
-        if i1.nonneg {
-            if let Hlvalue::Variable(v) = obj2 {
-                let case = matches!(cmp_op, OpKind::Lt | OpKind::Le | OpKind::Eq);
-                super::model::add_knowntypedata(
-                    &mut knowntypedata,
-                    super::model::ExitCaseKey::Bool(case),
-                    &[Rc::new(v.clone())],
-                    SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt2))),
-                );
-            }
-        }
+    if let SomeValue::Integer(i1) = &s_int1
+        && i1.nonneg
+        && let Hlvalue::Variable(v) = obj2
+    {
+        let case = matches!(cmp_op, OpKind::Lt | OpKind::Le | OpKind::Eq);
+        super::model::add_knowntypedata(
+            &mut knowntypedata,
+            super::model::ExitCaseKey::Bool(case),
+            &[Rc::new(v.clone())],
+            SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt2))),
+        );
     }
     // binaryop.py:275-278 — symmetric.
-    if let SomeValue::Integer(i2) = &s_int2 {
-        if i2.nonneg {
-            if let Hlvalue::Variable(v) = obj1 {
-                let case = matches!(cmp_op, OpKind::Gt | OpKind::Ge | OpKind::Eq);
-                super::model::add_knowntypedata(
-                    &mut knowntypedata,
-                    super::model::ExitCaseKey::Bool(case),
-                    &[Rc::new(v.clone())],
-                    SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt1))),
-                );
-            }
-        }
+    if let SomeValue::Integer(i2) = &s_int2
+        && i2.nonneg
+        && let Hlvalue::Variable(v) = obj1
+    {
+        let case = matches!(cmp_op, OpKind::Gt | OpKind::Ge | OpKind::Eq);
+        super::model::add_knowntypedata(
+            &mut knowntypedata,
+            super::model::ExitCaseKey::Bool(case),
+            &[Rc::new(v.clone())],
+            SomeValue::Integer(SomeInteger::new_with_knowntype(true, tointtype(kt1))),
+        );
     }
     r.set_knowntypedata(knowntypedata);
 
     // binaryop.py:280-290 — special case `x < 0` / `x >= 0` when `int2`
     // is a flow-graph Constant.
-    if let Hlvalue::Constant(c2) = obj2 {
-        if matches!(&c2.value, ConstValue::Int(0)) {
-            if let SomeValue::Integer(i1) = &s_int1 {
-                if i1.nonneg {
-                    if cmp_op == OpKind::Lt {
-                        r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
-                    } else if cmp_op == OpKind::Ge {
-                        r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
-                    }
-                }
-            }
+    if let Hlvalue::Constant(c2) = obj2
+        && matches!(&c2.value, ConstValue::Int(0))
+        && let SomeValue::Integer(i1) = &s_int1
+        && i1.nonneg
+    {
+        if cmp_op == OpKind::Lt {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
+        } else if cmp_op == OpKind::Ge {
+            r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
         }
     }
     SomeValue::Bool(r)
@@ -1274,11 +1272,11 @@ fn bool_xor(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         .annotation(&hl.args[1])
         .unwrap_or(SomeValue::Impossible);
     let mut s = SomeBool::new();
-    if s1.is_constant() && s2.is_constant() {
-        if let (Some(ConstValue::Bool(b1)), Some(ConstValue::Bool(b2))) = (s1.const_(), s2.const_())
-        {
-            s.base.const_box = Some(Constant::new(ConstValue::Bool(b1 ^ b2)));
-        }
+    if s1.is_constant()
+        && s2.is_constant()
+        && let (Some(ConstValue::Bool(b1)), Some(ConstValue::Bool(b2))) = (s1.const_(), s2.const_())
+    {
+        s.base.const_box = Some(Constant::new(ConstValue::Bool(b1 ^ b2)));
     }
     SomeValue::Bool(s)
 }
@@ -1409,14 +1407,14 @@ fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let mut result = SomeString::new(false, s1.inner.no_nul && s2.inner.no_nul);
     // upstream: `if str1.is_immutable_constant() and str2.is_immutable_constant():
     //              result.const = str1.const + str2.const`
-    if s1.is_immutable_constant() && s2.is_immutable_constant() {
-        if let (Some(c1), Some(c2)) = (&s1.inner.base.const_box, &s2.inner.base.const_box) {
-            if let (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) = (&c1.value, &c2.value) {
-                let mut combined = a.clone();
-                combined.extend_from_slice(b);
-                result.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(combined)));
-            }
-        }
+    if s1.is_immutable_constant()
+        && s2.is_immutable_constant()
+        && let (Some(c1), Some(c2)) = (&s1.inner.base.const_box, &s2.inner.base.const_box)
+        && let (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) = (&c1.value, &c2.value)
+    {
+        let mut combined = a.clone();
+        combined.extend_from_slice(b);
+        result.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(combined)));
     }
     SomeValue::String(result)
 }
@@ -1962,24 +1960,23 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
         Some(SomeValue::Integer(i)) => i,
         _ => panic!("tuple_int_getitem: arg 1 not SomeInteger"),
     };
-    if int2.is_immutable_constant() {
-        if let Some(c) = &int2.base.const_box {
-            if let ConstValue::Int(idx) = c.value {
-                let idx_usize = if idx < 0 {
-                    let adj = tup1.items.len() as i64 + idx;
-                    if adj < 0 {
-                        return s_impossible_value();
-                    }
-                    adj as usize
-                } else {
-                    idx as usize
-                };
-                if idx_usize < tup1.items.len() {
-                    return tup1.items[idx_usize].clone();
-                }
+    if int2.is_immutable_constant()
+        && let Some(c) = &int2.base.const_box
+        && let ConstValue::Int(idx) = c.value
+    {
+        let idx_usize = if idx < 0 {
+            let adj = tup1.items.len() as i64 + idx;
+            if adj < 0 {
                 return s_impossible_value();
             }
+            adj as usize
+        } else {
+            idx as usize
+        };
+        if idx_usize < tup1.items.len() {
+            return tup1.items[idx_usize].clone();
         }
+        return s_impossible_value();
     }
     unionof(tup1.items.iter()).expect("tuple_int_getitem: unionof failed")
 }

@@ -213,34 +213,35 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         }
     }
     // _py_abc.py:135-139 — subclass of a registered class (recursive).
-    if let Ok(registry) = crate::baseobjspace::getattr_str(roots.get(cls_slot), "_abc_registry") {
-        if !registry.is_null() && unsafe { is_list(registry) } {
-            let registry_roots = pyre_object::gc_roots::push_roots();
-            let registry_slot = registry_roots.base();
-            registry_roots.pin_root(registry);
-            let n = unsafe { w_list_len(registry_roots.get(registry_slot)) };
-            for i in 0..n {
-                if let Some(rcls) =
-                    unsafe { w_list_getitem(registry_roots.get(registry_slot), i as i64) }
-                {
-                    // A registered entry that is not a class cannot be a base
-                    // class, so it can never make `subclass` a subclass — skip
-                    // it rather than letting `issubclass` raise.  `range` is
-                    // registered to `Sequence` but is a builtin function in
-                    // pyre, so without this guard a single bad entry aborts the
-                    // whole recursive check.
-                    if !unsafe { is_type(rcls) } {
-                        continue;
-                    }
-                    let item_roots = pyre_object::gc_roots::push_roots();
-                    let rcls_slot = item_roots.base();
-                    item_roots.pin_root(rcls);
-                    if crate::baseobjspace::issubclass(
-                        roots.get(subclass_slot),
-                        item_roots.get(rcls_slot),
-                    )? {
-                        return Ok(true);
-                    }
+    if let Ok(registry) = crate::baseobjspace::getattr_str(roots.get(cls_slot), "_abc_registry")
+        && !registry.is_null()
+        && unsafe { is_list(registry) }
+    {
+        let registry_roots = pyre_object::gc_roots::push_roots();
+        let registry_slot = registry_roots.base();
+        registry_roots.pin_root(registry);
+        let n = unsafe { w_list_len(registry_roots.get(registry_slot)) };
+        for i in 0..n {
+            if let Some(rcls) =
+                unsafe { w_list_getitem(registry_roots.get(registry_slot), i as i64) }
+            {
+                // A registered entry that is not a class cannot be a base
+                // class, so it can never make `subclass` a subclass — skip
+                // it rather than letting `issubclass` raise.  `range` is
+                // registered to `Sequence` but is a builtin function in
+                // pyre, so without this guard a single bad entry aborts the
+                // whole recursive check.
+                if !unsafe { is_type(rcls) } {
+                    continue;
+                }
+                let item_roots = pyre_object::gc_roots::push_roots();
+                let rcls_slot = item_roots.base();
+                item_roots.pin_root(rcls);
+                if crate::baseobjspace::issubclass(
+                    roots.get(subclass_slot),
+                    item_roots.get(rcls_slot),
+                )? {
+                    return Ok(true);
                 }
             }
         }

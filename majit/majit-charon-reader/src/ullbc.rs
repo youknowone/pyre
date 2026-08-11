@@ -585,10 +585,10 @@ impl ProjectionElem {
         match self {
             ProjectionElem::Atom(s) => s.clone(),
             ProjectionElem::Tagged(v) => {
-                if let Some(obj) = v.as_object() {
-                    if let Some(k) = obj.keys().next() {
-                        return k.clone();
-                    }
+                if let Some(obj) = v.as_object()
+                    && let Some(k) = obj.keys().next()
+                {
+                    return k.clone();
                 }
                 "?".into()
             }

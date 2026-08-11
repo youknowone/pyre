@@ -342,10 +342,10 @@ impl AnnotatorPolicy {
                 let new_arg =
                     Hlvalue::Constant(Constant::new(ConstValue::HostObject(trampoline_host)));
                 let mut blk_mut = block_ref.borrow_mut();
-                if let Some(op_mut) = blk_mut.operations.get_mut(i) {
-                    if !op_mut.args.is_empty() {
-                        op_mut.args[0] = new_arg;
-                    }
+                if let Some(op_mut) = blk_mut.operations.get_mut(i)
+                    && !op_mut.args.is_empty()
+                {
+                    op_mut.args[0] = new_arg;
                 }
 
                 // Suppress unused-warning when the SomePBC import above

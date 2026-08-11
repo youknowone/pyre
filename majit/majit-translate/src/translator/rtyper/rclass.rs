@@ -468,7 +468,7 @@ pub(super) fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, Ty
             "classdesc.get_param('_alloc_flavor_') must return a string",
         ));
     };
-    Flavor::from_alloc_flavor(&alloc_flavor)
+    Flavor::from_alloc_flavor(alloc_flavor)
 }
 
 fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
@@ -1794,13 +1794,11 @@ impl Repr for ClassRepr {
             clsfields.insert(attr_name.clone(), (mangled_name.clone(), r.clone()));
             llfields.push((mangled_name, r.lowleveltype().clone()));
         }
-        for (access_set, attr_name, counter) in
-            self.classdef.borrow().extra_access_sets.values().cloned()
-        {
+        for (access_set, attr_name, counter) in self.classdef.borrow().extra_access_sets.values() {
             let r = rtyper.getrepr(&access_set.borrow().s_value)?;
-            let mangled_name = mangle(&format!("pbc{counter}"), &attr_name);
+            let mangled_name = mangle(&format!("pbc{counter}"), attr_name);
             pbcfields.insert(
-                (class_attr_family_key(&access_set), attr_name.clone()),
+                (class_attr_family_key(access_set), attr_name.clone()),
                 (mangled_name.clone(), r.clone()),
             );
             llfields.push((mangled_name, r.lowleveltype().clone()));
@@ -3313,19 +3311,19 @@ impl Repr for InstanceRepr {
         // upstream rclass.py:839-840: `if hop.s_result.is_constant():
         //     return hop.inputconst(hop.r_result, hop.s_result.const)`.
         let s_result_clone = hop.s_result.borrow().clone();
-        if let Some(s_result) = &s_result_clone {
-            if s_result.is_constant() {
-                let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
-                    TyperError::message("InstanceRepr.rtype_getattr: r_result missing")
-                })?;
-                let const_val = s_result
-                    .const_()
-                    .cloned()
-                    .expect("s_result.is_constant() implies const_() is Some");
-                return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), &const_val)
-                    .map(Hlvalue::Constant)
-                    .map(Some);
-            }
+        if let Some(s_result) = &s_result_clone
+            && s_result.is_constant()
+        {
+            let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_getattr: r_result missing")
+            })?;
+            let const_val = s_result
+                .const_()
+                .cloned()
+                .expect("s_result.is_constant() implies const_() is Some");
+            return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), &const_val)
+                .map(Hlvalue::Constant)
+                .map(Some);
         }
 
         // upstream: `attr = hop.args_s[1].const` (rclass.py:841).
@@ -3427,7 +3425,7 @@ impl Repr for InstanceRepr {
         if has_field {
             let flags = {
                 let args_s = hop.args_s.borrow();
-                let s_inst = args_s.get(0).ok_or_else(|| {
+                let s_inst = args_s.first().ok_or_else(|| {
                     TyperError::message("InstanceRepr.rtype_getattr: hop.args_s[0] missing")
                 })?;
                 match s_inst {
@@ -3819,7 +3817,7 @@ impl Repr for InstanceRepr {
             // variant skips the runtime branch.
             let can_be_none = {
                 let args_s = hop.args_s.borrow();
-                match args_s.get(0) {
+                match args_s.first() {
                     Some(SomeValue::Instance(inst)) => inst.can_be_none,
                     Some(SomeValue::PBC(pbc)) => pbc.can_be_none,
                     _ => true,
@@ -4269,25 +4267,24 @@ pub(crate) fn externalvsinternal(
     item_repr: Arc<dyn Repr>,
     gcref: bool,
 ) -> Result<(Arc<dyn Repr>, Arc<dyn Repr>), TyperError> {
-    if gcref {
-        if let LowLevelType::Ptr(ptr) = item_repr.lowleveltype() {
-            if ptr._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc {
-                let internal = crate::translator::rtyper::lltypesystem::rgcref::GCRefRepr::make(
-                    item_repr.clone(),
-                    &rtyper.gcrefreprcache,
-                );
-                let external = item_repr;
-                return Ok((external, internal as Arc<dyn Repr>));
-            }
-        }
+    if gcref
+        && let LowLevelType::Ptr(ptr) = item_repr.lowleveltype()
+        && ptr._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+    {
+        let internal = crate::translator::rtyper::lltypesystem::rgcref::GCRefRepr::make(
+            item_repr.clone(),
+            &rtyper.gcrefreprcache,
+        );
+        let external = item_repr;
+        return Ok((external, internal as Arc<dyn Repr>));
     }
     let any_r: &dyn std::any::Any = item_repr.as_ref();
-    if let Some(inst) = any_r.downcast_ref::<InstanceRepr>() {
-        if inst.gcflavor() == Flavor::Gc {
-            let internal = getinstancerepr(rtyper, None, Flavor::Gc)?;
-            let external = item_repr.clone();
-            return Ok((external, internal as Arc<dyn Repr>));
-        }
+    if let Some(inst) = any_r.downcast_ref::<InstanceRepr>()
+        && inst.gcflavor() == Flavor::Gc
+    {
+        let internal = getinstancerepr(rtyper, None, Flavor::Gc)?;
+        let external = item_repr.clone();
+        return Ok((external, internal as Arc<dyn Repr>));
     }
     let external = item_repr.clone();
     Ok((external, item_repr))

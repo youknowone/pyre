@@ -1314,7 +1314,7 @@ impl WarmEnterState {
     pub fn can_inline_callable(&self, callee_key: u64) -> bool {
         self.cells
             .get(&callee_key)
-            .map_or(true, |cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
+            .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
     }
 
     /// Mark a callee as a location that should no longer be inlined into
@@ -1463,10 +1463,7 @@ impl WarmEnterState {
     ///
     /// `qmut_key` should be a hash of (object_id, field_index) or similar.
     pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, green_key_hash: u64) {
-        let deps = self
-            .quasiimmut_deps
-            .entry(qmut_key)
-            .or_insert_with(Vec::new);
+        let deps = self.quasiimmut_deps.entry(qmut_key).or_default();
         if !deps.contains(&green_key_hash) {
             deps.push(green_key_hash);
         }
@@ -1488,12 +1485,12 @@ impl WarmEnterState {
 
         let mut invalidated = 0;
         for green_key_hash in &deps {
-            if let Some(cell) = self.cells.get_mut(green_key_hash) {
-                if let Some(token) = &cell.loop_token {
-                    token.invalidate();
-                    cell.state = BaseJitCellState::Invalidated;
-                    invalidated += 1;
-                }
+            if let Some(cell) = self.cells.get_mut(green_key_hash)
+                && let Some(token) = &cell.loop_token
+            {
+                token.invalidate();
+                cell.state = BaseJitCellState::Invalidated;
+                invalidated += 1;
             }
         }
         invalidated

@@ -273,9 +273,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Ok(pyre_object::w_none());
                     }
                     FAULTHANDLER_FD.store(previous_fd, std::sync::atomic::Ordering::Relaxed);
-                    return Err(crate::PyError::runtime_error(
+                    Err(crate::PyError::runtime_error(
                         "faulthandler.enable: sigaction failed",
-                    ));
+                    ))
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
@@ -317,9 +317,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
-                    return Ok(pyre_object::w_bool_from(
+                    Ok(pyre_object::w_bool_from(
                         FAULTHANDLER_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-                    ));
+                    ))
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 Ok(pyre_object::w_bool_from(false))
@@ -437,7 +437,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             pyre_object::gc_roots::shadow_stack_get,
                         ),
                     );
-                    return Ok(pyre_object::w_none());
+                    Ok(pyre_object::w_none())
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
@@ -474,7 +474,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `handler.py:131-132` `self.user_w_files.pop(signum, None)`,
                     // run whether or not the signal was registered.
                     clear_user_signal_file(signum);
-                    return Ok(pyre_object::w_bool_from(changed));
+                    Ok(pyre_object::w_bool_from(changed))
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {

@@ -26,7 +26,7 @@ fn test_just_finish() {
     // Simplest possible trace: just FINISH with no args
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
 
     let inputargs = vec![];
 
@@ -38,7 +38,7 @@ fn test_just_finish() {
     let ops = vec![finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[]);
@@ -50,7 +50,7 @@ fn test_just_finish() {
 fn test_simple_int_add() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
 
     // Simple trace: i1 = int_add(i0, CONST_1)
     // finish(i1)  [fail_arg_types: [Int], fail_args: [i1]]
@@ -72,7 +72,7 @@ fn test_simple_int_add() {
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
     // Compile
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     // Execute with input i0 = 42
@@ -91,7 +91,7 @@ fn test_simple_int_add() {
 fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(11);
+    let token = JitCellToken::new(11);
 
     let const_1 = OpRef::const_int(1);
 
@@ -109,7 +109,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[Value::Int(42)]);
@@ -123,7 +123,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
 fn test_float_add() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
 
     let i0 = OpRef::input_arg_float(0); // input: f64
     // history.py:268 ConstFloat.value inline.
@@ -142,7 +142,7 @@ fn test_float_add() {
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     // Execute with input = 1.5
@@ -164,7 +164,7 @@ fn test_float_add() {
 fn test_setarrayitem_raw_float_roundtrip() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(23);
+    let token = JitCellToken::new(23);
 
     let const_index = OpRef::const_int(3);
 
@@ -195,7 +195,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let mut items = vec![0.0f64; 8];
@@ -212,7 +212,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
 fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(24);
+    let token = JitCellToken::new(24);
 
     let array_descr = make_array_descr(0, 8, Type::Float);
 
@@ -240,7 +240,7 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let mut items = vec![0.0f64; 8];
@@ -267,7 +267,7 @@ fn test_guard_and_loop() {
     // jump(i1)
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let loop_descr = make_loop_target_descr(token.number, false);
@@ -300,7 +300,7 @@ fn test_guard_and_loop() {
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     // Start with 0: should loop 0→1→2→3→4→5, guard fails at 5
@@ -319,7 +319,7 @@ fn test_guard_and_loop() {
 fn test_float_loop_carried_across_jump() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(1);
+    let token = JitCellToken::new(1);
 
     let inputargs = vec![
         InputArg::from_type(Type::Float, 0),
@@ -378,7 +378,7 @@ fn test_float_loop_carried_across_jump() {
     ];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
 
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let args = vec![Value::Float(0.0), Value::Int(0)];
@@ -411,7 +411,7 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
     backend.set_gc_allocator(Box::new(gc));
-    let mut token = JitCellToken::new(41);
+    let token = JitCellToken::new(41);
 
     let const_child_tid = OpRef::const_int(child_tid as i64);
     let const_root_vtable = OpRef::const_int(root_vtable as i64);
@@ -441,7 +441,7 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
 
     let ops = vec![guard_gc_type, guard_is_object, guard_subclass, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[Value::Ref(child_obj)]);
@@ -462,7 +462,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
-        let mut token = JitCellToken::new(45);
+        let token = JitCellToken::new(45);
 
         let const_child_tid = OpRef::const_int(child_tid as i64);
 
@@ -481,7 +481,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(Rc::new)
             .collect();
-        let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+        let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_obj)]);
         assert!(
@@ -499,7 +499,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
-        let mut token = JitCellToken::new(46);
+        let token = JitCellToken::new(46);
 
         let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
@@ -516,7 +516,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(Rc::new)
             .collect();
-        let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+        let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(raw_obj)]);
         assert!(
@@ -539,7 +539,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
-        let mut token = JitCellToken::new(47);
+        let token = JitCellToken::new(47);
 
         let const_root_a_vtable = OpRef::const_int(root_a_vtable as i64);
 
@@ -558,7 +558,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(Rc::new)
             .collect();
-        let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+        let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_b_obj)]);
         assert!(
@@ -576,7 +576,7 @@ fn test_exception_guards_use_dynasm_emit() {
 
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(42);
+    let token = JitCellToken::new(42);
 
     let expected_class = 0x5151_0000_i64;
     let const_expected_class = OpRef::const_int(expected_class);
@@ -595,7 +595,7 @@ fn test_exception_guards_use_dynasm_emit() {
 
     let ops = vec![guard_exception, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let mut exc_obj = vec![expected_class as usize, 0usize];
@@ -618,7 +618,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(43);
+    let token = JitCellToken::new(43);
 
     let inputargs = vec![];
     let guard_no_exception = Op::new(OpCode::GuardNoException, &[]);
@@ -633,7 +633,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let ops = vec![guard_no_exception, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[]);
@@ -653,7 +653,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let mut always_backend = DynasmBackend::new();
     always_backend.attach_default_test_descrs();
-    let mut always_token = JitCellToken::new(44);
+    let always_token = JitCellToken::new(44);
     let guard_always_fails = Op::new(OpCode::GuardAlwaysFails, &[]);
     guard_always_fails.pos.set(OpRef::void_op(0));
     guard_always_fails.set_fail_arg_types(vec![]);
@@ -664,7 +664,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     finish_op.setfailargs(vec![].into());
     let ops = vec![guard_always_fails, finish_op];
     let ops_rc: Vec<Rc<Op>> = ops.into_iter().map(Rc::new).collect();
-    let result = always_backend.compile_loop(&[], &ops_rc, &mut always_token);
+    let result = always_backend.compile_loop(&[], &ops_rc, &always_token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let frame = always_backend.execute_token(&always_token, &[]);
     assert!(
@@ -682,7 +682,7 @@ fn test_int_binop_wide_immediate_is_not_truncated() {
     let mask = 0xFFFF_FFFF_FFFFi64;
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(45);
+    let token = JitCellToken::new(45);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
@@ -696,7 +696,7 @@ fn test_int_binop_wide_immediate_is_not_truncated() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops_rc: Vec<Rc<Op>> = vec![Rc::new(and_op), Rc::new(finish_op)];
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[Value::Int(-1)]);
@@ -715,7 +715,7 @@ fn test_int_add_wide_immediate_is_not_truncated() {
     let addend = 1i64 << 32;
     let mut backend = DynasmBackend::new();
     backend.attach_default_test_descrs();
-    let mut token = JitCellToken::new(46);
+    let token = JitCellToken::new(46);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
@@ -729,7 +729,7 @@ fn test_int_add_wide_immediate_is_not_truncated() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops_rc: Vec<Rc<Op>> = vec![Rc::new(add_op), Rc::new(finish_op)];
-    let result = backend.compile_loop(&inputargs, &ops_rc, &mut token);
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
     let frame = backend.execute_token(&token, &[Value::Int(7)]);

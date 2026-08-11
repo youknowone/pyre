@@ -182,9 +182,7 @@ impl<'c> Lowerer<'c> {
     /// runs in the interpreter instead of compiling to a trace that
     /// aborts mid-record.
     fn lower_stmt_fallback(&mut self, stmt: &Stmt, what: &str) -> Option<()> {
-        if self.config.is_none() {
-            return None;
-        }
+        self.config?;
         // Drop only genuinely inert statements: no jit-state write, no
         // storage/user-local reference, AND no call.  A residual call
         // (e.g. `record_event();` or an unrolled `for _ in 0..4 {
@@ -967,6 +965,9 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_state_array_write(expr) {
             return Some(());
         }
+        if let Some(()) = self.lower_vable_array_update(expr) {
+            return Some(());
+        }
         // RPython jtransform.py:923 — virtualizable field write rewrite.
         if let Some(()) = self.lower_vable_field_write(expr) {
             return Some(());
@@ -1022,10 +1023,10 @@ impl<'c> Lowerer<'c> {
         }
 
         // Config-aware patterns
-        if self.config.is_some() {
-            if let Some(()) = self.lower_io_call_stmt(expr) {
-                return Some(());
-            }
+        if self.config.is_some()
+            && let Some(()) = self.lower_io_call_stmt(expr)
+        {
+            return Some(());
         }
 
         None

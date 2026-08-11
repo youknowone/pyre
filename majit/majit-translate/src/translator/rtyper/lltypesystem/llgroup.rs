@@ -151,7 +151,7 @@ impl group {
     }
 }
 
-fn group_by_ptr_mut<'a>(ptr: GroupPtr, current: &'a mut group) -> Option<&'a mut group> {
+fn group_by_ptr_mut(ptr: GroupPtr, current: &mut group) -> Option<&mut group> {
     if current._as_ptr() == ptr {
         Some(current)
     } else {

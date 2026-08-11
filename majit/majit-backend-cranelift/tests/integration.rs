@@ -1,3 +1,11 @@
+#![allow(
+    clippy::approx_constant,
+    clippy::empty_line_after_doc_comments,
+    clippy::let_and_return,
+    clippy::let_unit_value,
+    clippy::unnecessary_mut_passed
+)]
+
 //! Integration tests: trace recording -> optimization -> Cranelift compilation -> execution.
 //!
 //! These tests exercise the full majit pipeline from end to end.

@@ -1976,11 +1976,10 @@ fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
     if d.is_null() {
         return -1;
     }
-    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) } {
-        if unsafe { pyre_object::is_int(v) } {
+    if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(d, key) }
+        && unsafe { pyre_object::is_int(v) } {
             return unsafe { pyre_object::w_int_get_value(v) };
         }
-    }
     -1
 }
 
@@ -2336,16 +2335,14 @@ fn pack_inet_addr(
             )));
         }
         sin6.sin6_addr.s6_addr = buf;
-        if len >= 3 {
-            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 2) } {
+        if len >= 3
+            && let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 2) } {
                 sin6.sin6_flowinfo = unsafe { pyre_object::w_int_get_value(v) } as u32;
             }
-        }
-        if len >= 4 {
-            if let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 3) } {
+        if len >= 4
+            && let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 3) } {
                 sin6.sin6_scope_id = unsafe { pyre_object::w_int_get_value(v) } as u32;
             }
-        }
         Ok((
             storage,
             core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
@@ -3921,7 +3918,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
                 Ok(pyre_object::w_int_new(v as i64))
             } else {
-                if buflen < 0 || buflen > 1024 {
+                if !(0..=1024).contains(&buflen) {
                     return Err(crate::PyError::os_error("getsockopt buflen out of range"));
                 }
                 let buflen = buflen as usize;

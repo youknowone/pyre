@@ -1023,18 +1023,15 @@ fn init_somefloat_overrides(
         Specialization {
             apply: pure(|ann, hl| {
                 let s = ann.annotation(&hl.args[0]).expect("float.bool: unbound");
-                if let SomeValue::Float(f) = &s {
-                    if f.is_immutable_constant() {
-                        if let Some(c) = &f.base.const_box {
-                            if let ConstValue::Float(bits) = c.value {
-                                let mut r = SomeBool::new();
-                                r.base.const_box = Some(Constant::new(ConstValue::Bool(
-                                    f64::from_bits(bits) != 0.0,
-                                )));
-                                return SomeValue::Bool(r);
-                            }
-                        }
-                    }
+                if let SomeValue::Float(f) = &s
+                    && f.is_immutable_constant()
+                    && let Some(c) = &f.base.const_box
+                    && let ConstValue::Float(bits) = c.value
+                {
+                    let mut r = SomeBool::new();
+                    r.base.const_box =
+                        Some(Constant::new(ConstValue::Bool(f64::from_bits(bits) != 0.0)));
+                    return SomeValue::Bool(r);
                 }
                 SomeValue::Bool(SomeBool::new())
             }),
@@ -1511,23 +1508,23 @@ fn init_somelist_overrides(
 /// RPython `check_negative_slice(s_start, s_stop, error="slicing")`
 /// (unaryop.py:437-443). Helper shared by list and string slice paths.
 pub fn check_negative_slice(s_start: &SomeValue, s_stop: &SomeValue, error: &str) {
-    if let SomeValue::Integer(i) = s_start {
-        if !i.nonneg {
-            panic!("AnnotatorError: {error}: not proven to have non-negative start");
-        }
+    if let SomeValue::Integer(i) = s_start
+        && !i.nonneg
+    {
+        panic!("AnnotatorError: {error}: not proven to have non-negative start");
     }
-    if let SomeValue::Integer(i) = s_stop {
-        if !i.nonneg {
-            // upstream: allow const == -1 as sentinel for "slice to end".
-            let is_minus_one = i
-                .base
-                .const_box
-                .as_ref()
-                .map(|c| matches!(c.value, ConstValue::Int(-1)))
-                .unwrap_or(false);
-            if !is_minus_one {
-                panic!("AnnotatorError: {error}: not proven to have non-negative stop");
-            }
+    if let SomeValue::Integer(i) = s_stop
+        && !i.nonneg
+    {
+        // upstream: allow const == -1 as sentinel for "slice to end".
+        let is_minus_one = i
+            .base
+            .const_box
+            .as_ref()
+            .map(|c| matches!(c.value, ConstValue::Int(-1)))
+            .unwrap_or(false);
+        if !is_minus_one {
+            panic!("AnnotatorError: {error}: not proven to have non-negative stop");
         }
     }
 }
@@ -2143,14 +2140,13 @@ fn init_somestring_overrides(
                     Some(SomeValue::String(s)) => s,
                     _ => panic!("string.len: arg 0 not SomeString"),
                 };
-                if s.is_constant() {
-                    if let Some(c) = &s.inner.base.const_box {
-                        if let ConstValue::ByteStr(v) = &c.value {
-                            let mut i = SomeInteger::new(true, false);
-                            i.base.const_box = Some(Constant::new(ConstValue::Int(v.len() as i64)));
-                            return SomeValue::Integer(i);
-                        }
-                    }
+                if s.is_constant()
+                    && let Some(c) = &s.inner.base.const_box
+                    && let ConstValue::ByteStr(v) = &c.value
+                {
+                    let mut i = SomeInteger::new(true, false);
+                    i.base.const_box = Some(Constant::new(ConstValue::Int(v.len() as i64)));
+                    return SomeValue::Integer(i);
                 }
                 SomeValue::Integer(SomeInteger::new(true, false))
             }),
@@ -2523,7 +2519,7 @@ fn str_method_split(
     let max_value = s_max.and_then(const_int_of).unwrap_or(-1);
     let no_nul = if max_value == -1
         && const_str_of(s_patt)
-            .map(|p| p.chars().count() == 1 && p.chars().next() == Some('\0'))
+            .map(|p| p.chars().count() == 1 && p.starts_with('\0'))
             .unwrap_or(false)
     {
         true
@@ -3628,10 +3624,10 @@ fn init_someiterator_overrides(
                 //       can_throw.append(RuntimeError)
                 //   return can_throw
                 let mut throws = vec![BuiltinException::StopIteration];
-                if let Some(SomeValue::Iterator(i)) = args_s.first() {
-                    if matches!(&*i.s_container, SomeValue::Dict(_)) {
-                        throws.push(BuiltinException::RuntimeError);
-                    }
+                if let Some(SomeValue::Iterator(i)) = args_s.first()
+                    && matches!(&*i.s_container, SomeValue::Dict(_))
+                {
+                    throws.push(BuiltinException::RuntimeError);
                 }
                 Some(throws)
             })),

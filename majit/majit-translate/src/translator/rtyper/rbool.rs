@@ -298,9 +298,7 @@ pub fn pair_bool_integer_convert_from_to(
                     TyperError::message("cast_bool_to_int unexpectedly returned Void")
                 })?;
             let signed = super::rint::signed_repr();
-            llops
-                .convertvar(v_int, signed.as_ref(), r_to)
-                .map(|converted| Some(converted))
+            llops.convertvar(v_int, signed.as_ref(), r_to).map(Some)
         }
     }
 }

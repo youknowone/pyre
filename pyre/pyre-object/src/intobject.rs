@@ -129,7 +129,7 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::fits_tagged(value) {
         return crate::tagged_int::tag_int(value);
     }
-    if WITHPREBUILTINT && value >= PREBUILTINTFROM && value < PREBUILTINTTO {
+    if WITHPREBUILTINT && (PREBUILTINTFROM..PREBUILTINTTO).contains(&value) {
         let idx = (value - PREBUILTINTFROM) as usize;
         return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }

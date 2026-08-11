@@ -303,49 +303,49 @@ fn rewrite_variables_in_block(block: &BlockRef, rename: &HashMap<u64, (String, i
     }
     let mut b = block.borrow_mut();
     for arg in b.inputargs.iter_mut() {
-        if let Hlvalue::Variable(v) = arg {
-            if let Some((name, nr)) = rename.get(&v.id()) {
-                v.set_name(name.clone(), *nr);
-            }
+        if let Hlvalue::Variable(v) = arg
+            && let Some((name, nr)) = rename.get(&v.id())
+        {
+            v.set_name(name.clone(), *nr);
         }
     }
     for op in b.operations.iter_mut() {
         for arg in op.args.iter_mut() {
-            if let Hlvalue::Variable(v) = arg {
-                if let Some((name, nr)) = rename.get(&v.id()) {
-                    v.set_name(name.clone(), *nr);
-                }
-            }
-        }
-        if let Hlvalue::Variable(v) = &mut op.result {
-            if let Some((name, nr)) = rename.get(&v.id()) {
+            if let Hlvalue::Variable(v) = arg
+                && let Some((name, nr)) = rename.get(&v.id())
+            {
                 v.set_name(name.clone(), *nr);
             }
         }
-    }
-    if let Some(Hlvalue::Variable(v)) = b.exitswitch.as_mut() {
-        if let Some((name, nr)) = rename.get(&v.id()) {
+        if let Hlvalue::Variable(v) = &mut op.result
+            && let Some((name, nr)) = rename.get(&v.id())
+        {
             v.set_name(name.clone(), *nr);
         }
+    }
+    if let Some(Hlvalue::Variable(v)) = b.exitswitch.as_mut()
+        && let Some((name, nr)) = rename.get(&v.id())
+    {
+        v.set_name(name.clone(), *nr);
     }
     for link in &b.exits {
         let mut l = link.borrow_mut();
         for arg in l.args.iter_mut() {
-            if let Some(Hlvalue::Variable(v)) = arg {
-                if let Some((name, nr)) = rename.get(&v.id()) {
-                    v.set_name(name.clone(), *nr);
-                }
-            }
-        }
-        if let Some(Hlvalue::Variable(v)) = l.last_exception.as_mut() {
-            if let Some((name, nr)) = rename.get(&v.id()) {
+            if let Some(Hlvalue::Variable(v)) = arg
+                && let Some((name, nr)) = rename.get(&v.id())
+            {
                 v.set_name(name.clone(), *nr);
             }
         }
-        if let Some(Hlvalue::Variable(v)) = l.last_exc_value.as_mut() {
-            if let Some((name, nr)) = rename.get(&v.id()) {
-                v.set_name(name.clone(), *nr);
-            }
+        if let Some(Hlvalue::Variable(v)) = l.last_exception.as_mut()
+            && let Some((name, nr)) = rename.get(&v.id())
+        {
+            v.set_name(name.clone(), *nr);
+        }
+        if let Some(Hlvalue::Variable(v)) = l.last_exc_value.as_mut()
+            && let Some((name, nr)) = rename.get(&v.id())
+        {
+            v.set_name(name.clone(), *nr);
         }
     }
 }
@@ -405,16 +405,16 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
             continue;
         };
         let rep = variable_families.find_rep(Hlvalue::Variable(v_var.clone()));
-        if let Hlvalue::Variable(rep_var) = rep {
-            if rep_var != v_var {
-                // Materialise rep_var's lazy nr before reading it so
-                // set_name_from's observable state matches upstream.
-                let _ = rep_var.name();
-                rename_targets.insert(
-                    v_var.id(),
-                    (rep_var.name_prefix().to_string(), rep_var.nr()),
-                );
-            }
+        if let Hlvalue::Variable(rep_var) = rep
+            && rep_var != v_var
+        {
+            // Materialise rep_var's lazy nr before reading it so
+            // set_name_from's observable state matches upstream.
+            let _ = rep_var.name();
+            rename_targets.insert(
+                v_var.id(),
+                (rep_var.name_prefix().to_string(), rep_var.nr()),
+            );
         }
     }
     for block in graph.iterblocks() {
@@ -547,11 +547,11 @@ pub fn ssa_to_ssi(
         let mut variables_used: Vec<Hlvalue> = Vec::new();
         let record_used_var =
             |v: Option<&Hlvalue>, seen: &mut HashSet<Hlvalue>, used: &mut Vec<Hlvalue>| {
-                if let Some(vv) = v {
-                    if !seen.contains(vv) {
-                        used.push(vv.clone());
-                        seen.insert(vv.clone());
-                    }
+                if let Some(vv) = v
+                    && !seen.contains(vv)
+                {
+                    used.push(vv.clone());
+                    seen.insert(vv.clone());
                 }
             };
 

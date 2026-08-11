@@ -1176,7 +1176,7 @@ mod tests {
     fn test_conditional_call_elidable_ptr() {
         let x: i64 = 42;
         let non_null: *const i64 = &x;
-        let result = conditional_call_elidable(non_null, || std::ptr::null::<i64>());
+        let result = conditional_call_elidable(non_null, std::ptr::null::<i64>);
         assert_eq!(result, non_null);
 
         let null: *const i64 = std::ptr::null();

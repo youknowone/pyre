@@ -1430,52 +1430,49 @@ impl PyError {
                 w_object,
             ],
         );
-        if let Some(sys_mod) = crate::importing::get_sys_module("sys") {
-            if let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook") {
-                if !w_hook.is_null() && !unsafe { pyre_object::is_none(w_hook) } {
-                    match crate::call::call_function_impl_result(w_hook, &[hook_args]) {
-                        Ok(_) => return,
-                        Err(mut hook_err) => {
-                            first_line = Wtf8Buf::from_string(
-                                "Exception ignored in sys.unraisablehook".to_string(),
-                            );
-                            w_object = w_hook;
-                            let hook_value = hook_err
-                                .normalize_exception(space)
-                                .unwrap_or_else(|_| hook_err.to_exc_object());
-                            w_type = crate::baseobjspace::exception_getclass(hook_value);
-                            if w_type.is_null() {
-                                w_type = pyre_object::w_none();
-                            }
-                            // `error.py:312` — same `get_w_traceback` read
-                            // for the exception the hook itself raised.
-                            w_tb = if !hook_value.is_null()
-                                && unsafe { pyre_object::is_exception(hook_value) }
-                            {
-                                unsafe {
-                                    pyre_object::interp_exceptions::w_exception_get_traceback(
-                                        hook_value,
-                                    )
-                                }
-                            } else {
-                                pyre_object::PY_NULL
-                            };
-                            unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
-                            if w_tb.is_null() {
-                                w_tb = pyre_object::w_none();
-                            }
-                            Self::write_unraisable_default(
-                                space,
-                                w_type,
-                                hook_value,
-                                w_tb,
-                                &first_line,
-                                w_object,
-                                "",
-                            );
-                            return;
-                        }
+        if let Some(sys_mod) = crate::importing::get_sys_module("sys")
+            && let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook")
+            && !w_hook.is_null()
+            && !unsafe { pyre_object::is_none(w_hook) }
+        {
+            match crate::call::call_function_impl_result(w_hook, &[hook_args]) {
+                Ok(_) => return,
+                Err(mut hook_err) => {
+                    first_line =
+                        Wtf8Buf::from_string("Exception ignored in sys.unraisablehook".to_string());
+                    w_object = w_hook;
+                    let hook_value = hook_err
+                        .normalize_exception(space)
+                        .unwrap_or_else(|_| hook_err.to_exc_object());
+                    w_type = crate::baseobjspace::exception_getclass(hook_value);
+                    if w_type.is_null() {
+                        w_type = pyre_object::w_none();
                     }
+                    // `error.py:312` — same `get_w_traceback` read
+                    // for the exception the hook itself raised.
+                    w_tb = if !hook_value.is_null()
+                        && unsafe { pyre_object::is_exception(hook_value) }
+                    {
+                        unsafe {
+                            pyre_object::interp_exceptions::w_exception_get_traceback(hook_value)
+                        }
+                    } else {
+                        pyre_object::PY_NULL
+                    };
+                    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+                    if w_tb.is_null() {
+                        w_tb = pyre_object::w_none();
+                    }
+                    Self::write_unraisable_default(
+                        space,
+                        w_type,
+                        hook_value,
+                        w_tb,
+                        &first_line,
+                        w_object,
+                        "",
+                    );
+                    return;
                 }
             }
         }
@@ -2185,9 +2182,9 @@ fn write_exception_group<W: Write>(
         } else {
             (index + 1).to_string()
         };
-        write!(
+        writeln!(
             writer,
-            "{}{}+---------------- {title} ----------------\n",
+            "{}{}+---------------- {title} ----------------",
             " ".repeat(2 * context.exception_group_depth),
             if index == 0 { "+-" } else { "  " },
         )?;
@@ -3263,27 +3260,6 @@ pub fn get_operrcls2(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
     (std::ptr::null_mut(), strings)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{PyError, PyErrorKind, write_exception};
-
-    #[test]
-    fn render_exception_omits_empty_message_separator() {
-        let err = PyError::new(PyErrorKind::StopIteration, "");
-        assert_eq!(err.render_exception(), "StopIteration");
-    }
-
-    #[test]
-    fn write_exception_includes_traceback_header() {
-        let err = PyError::type_error("bad operand");
-        let mut out = Vec::new();
-        write_exception(&mut out, &err, true).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("Traceback (most recent call last):"));
-        assert!(text.contains("TypeError: bad operand"));
-    }
-}
-
 pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
     get_operrcls2(valuefmt)
 }
@@ -3343,4 +3319,25 @@ pub fn wrap_oserror(
 ) -> OperationError {
     let _ = _filename;
     wrap_oserror2(space, error, None, w_exception_class)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PyError, PyErrorKind, write_exception};
+
+    #[test]
+    fn render_exception_omits_empty_message_separator() {
+        let err = PyError::new(PyErrorKind::StopIteration, "");
+        assert_eq!(err.render_exception(), "StopIteration");
+    }
+
+    #[test]
+    fn write_exception_includes_traceback_header() {
+        let err = PyError::type_error("bad operand");
+        let mut out = Vec::new();
+        write_exception(&mut out, &err, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Traceback (most recent call last):"));
+        assert!(text.contains("TypeError: bad operand"));
+    }
 }

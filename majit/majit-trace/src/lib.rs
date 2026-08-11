@@ -1,3 +1,7 @@
+// Heap-cache helpers retain the argument-for-field shape of
+// rpython/jit/metainterp/heapcache.py.
+#![allow(clippy::too_many_arguments)]
+
 /// Tracing engine for the JIT.
 ///
 /// Provides:

@@ -163,7 +163,7 @@ fn errno_location() -> *mut libc::c_int {
 /// then write one byte to the wakeup fd via the raw `write` syscall.
 #[cfg(unix)]
 extern "C" fn signal_setflag_handler(signum: libc::c_int) {
-    signal_pushback(signum as i32);
+    signal_pushback(signum);
     let fd = WAKEUP_FD.load(Ordering::SeqCst);
     if fd != -1 {
         // `signals.c:153-170` — save errno, write the signal-number byte

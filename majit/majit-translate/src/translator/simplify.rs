@@ -159,15 +159,14 @@ fn rename_op(op: &SpaceOperation, mapping: &HashMap<Variable, Hlvalue>) -> Space
     };
     // upstream: indirect_call with a Constant callee is rewritten back
     // to direct_call (simplify.py:293-297).
-    if new_op.opname == "indirect_call" {
-        if matches!(new_op.args.first(), Some(Hlvalue::Constant(_))) {
-            assert!(
-                matches!(new_op.args.last(), Some(Hlvalue::Constant(_))),
-                "indirect_call's trailing argument must be a Constant"
-            );
-            new_op.args.pop();
-            new_op.opname = "direct_call".to_string();
-        }
+    if new_op.opname == "indirect_call" && matches!(new_op.args.first(), Some(Hlvalue::Constant(_)))
+    {
+        assert!(
+            matches!(new_op.args.last(), Some(Hlvalue::Constant(_))),
+            "indirect_call's trailing argument must be a Constant"
+        );
+        new_op.args.pop();
+        new_op.opname = "direct_call".to_string();
     }
     new_op
 }
@@ -224,7 +223,7 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
         )
     };
 
-    let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+    let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
     let mut newexits: Vec<LinkRef> = exits_snapshot
         .iter()
         .filter(|l| cases_eq(l))
@@ -815,28 +814,28 @@ pub fn transform_dead_op_vars_in_blocks(
             if canremove_op(&op, block, i) {
                 block.borrow_mut().operations.remove(i);
             } else if opname == "simple_call" {
-                if let Some(h) = first_arg_builtin {
-                    if can_remove_builtins_list.iter().any(|b| b == &h) {
-                        block.borrow_mut().operations.remove(i);
-                    }
+                if let Some(h) = first_arg_builtin
+                    && can_remove_builtins_list.iter().any(|b| b == &h)
+                {
+                    block.borrow_mut().operations.remove(i);
                 }
-            } else if opname == "direct_call" {
-                if let Some(trans) = translator {
-                    let Some(callee_arg) = op.args.first() else {
-                        continue;
+            } else if opname == "direct_call"
+                && let Some(trans) = translator
+            {
+                let Some(callee_arg) = op.args.first() else {
+                    continue;
+                };
+                if let Some(graph) = get_graph(callee_arg, trans) {
+                    // upstream: `op is not block.raising_op` —
+                    // positional identity matches upstream object
+                    // identity because `raising_op` is
+                    // `operations[-1]` (model.rs:2426-2433).
+                    let is_raising = {
+                        let b = block.borrow();
+                        b.canraise() && i + 1 == b.operations.len()
                     };
-                    if let Some(graph) = get_graph(callee_arg, trans) {
-                        // upstream: `op is not block.raising_op` —
-                        // positional identity matches upstream object
-                        // identity because `raising_op` is
-                        // `operations[-1]` (model.rs:2426-2433).
-                        let is_raising = {
-                            let b = block.borrow();
-                            b.canraise() && i + 1 == b.operations.len()
-                        };
-                        if has_no_side_effects(trans, &graph, None) && !is_raising {
-                            block.borrow_mut().operations.remove(i);
-                        }
+                    if has_no_side_effects(trans, &graph, None) && !is_raising {
+                        block.borrow_mut().operations.remove(i);
                     }
                 }
             }
@@ -845,7 +844,7 @@ pub fn transform_dead_op_vars_in_blocks(
         // upstream: output vars never used — drop their positions from
         // link.args. Must happen before block.inputargs is shrunk so
         // the same-index cross-block invariant holds.
-        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits_snapshot {
             let target = link.borrow().target.clone();
             let Some(target) = target else { continue };
@@ -946,7 +945,7 @@ fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
         b.exitswitch = new_exitswitch;
     }
     // link.args are Vec<Option<Hlvalue>>; rename in place.
-    let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+    let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
     for link in exits_snapshot {
         let mut l = link.borrow_mut();
         l.args = l
@@ -1064,7 +1063,7 @@ pub fn remove_identical_vars_SSA(graph: &FunctionGraph) {
             .collect();
         block.borrow_mut().inputargs = new_inputs;
         assert_eq!(links.len(), per_link_args.len());
-        for (link, args) in links.iter().zip(per_link_args.into_iter()) {
+        for (link, args) in links.iter().zip(per_link_args) {
             link.borrow_mut().args = args;
         }
     }
@@ -1088,12 +1087,13 @@ fn simplify_phis_inner(
         let new_args: Vec<Hlvalue> = phi_args.iter().map(|a| uf.find_rep(a.clone())).collect();
         // upstream: `if all_equal(new_args) and not isspecialvar(new_args[0]):`
         let first = new_args.first().cloned();
-        if let Some(first) = first {
-            if all_equal(&new_args) && !isspecialvar(&first) {
-                uf.union(first, Hlvalue::Variable(input.clone()));
-                to_remove.push(i);
-                continue;
-            }
+        if let Some(first) = first
+            && all_equal(&new_args)
+            && !isspecialvar(&first)
+        {
+            uf.union(first, Hlvalue::Variable(input.clone()));
+            to_remove.push(i);
+            continue;
         }
         // upstream: else branch — group by identical phi-tuple.
         let key = new_args;
@@ -1291,7 +1291,7 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
                     _ => false,
                 })
                 .unwrap_or(false);
-            let exits_snapshot: Vec<LinkRef> = b.exits.iter().cloned().collect();
+            let exits_snapshot: Vec<LinkRef> = b.exits.to_vec();
             (canraise, last_is_exception, exits_snapshot)
         };
         if !(canraise && last_is_exception) {
@@ -1306,10 +1306,8 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
             .map(|l| l.borrow().exitcase.clone())
             .collect();
         // upstream: `preserve = list(block.exits[:-1])`.
-        let preserve: Vec<LinkRef> = exits_snapshot[..exits_snapshot.len().saturating_sub(1)]
-            .iter()
-            .cloned()
-            .collect();
+        let preserve: Vec<LinkRef> =
+            exits_snapshot[..exits_snapshot.len().saturating_sub(1)].to_vec();
         let mut seen: Vec<Hlvalue> = Vec::new();
         let mut switches: Vec<(Hlvalue, LinkRef)> = Vec::new();
 
@@ -1384,7 +1382,7 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
                 break;
             };
             // upstream: `if case not in seen: ... switches.append((case, lyes))`.
-            if !seen.iter().any(|s| *s == case_hl) {
+            if !seen.contains(&case_hl) {
                 let is_covered = covered.iter().any(|cov_opt| match cov_opt {
                     Some(cov) => is_exitcase_subclass(&case_hl, cov),
                     None => false,
@@ -1402,7 +1400,7 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
         let exception_hlvalue = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
             exception_class.clone(),
         )));
-        if !seen.iter().any(|s| *s == exception_hlvalue) {
+        if !seen.contains(&exception_hlvalue) {
             switches.push((exception_hlvalue.clone(), exc));
         }
 
@@ -1473,7 +1471,7 @@ pub fn coalesce_bool(graph: &FunctionGraph) {
     }
 
     while let Some((cand, tgts)) = candidates.pop() {
-        let cand_exits_snapshot: Vec<LinkRef> = cand.borrow().exits.iter().cloned().collect();
+        let cand_exits_snapshot: Vec<LinkRef> = cand.borrow().exits.to_vec();
         let mut new_exits: Vec<LinkRef> = cand_exits_snapshot.clone();
 
         for (case_bool, tgt) in tgts {
@@ -1694,7 +1692,7 @@ pub fn remove_dead_exceptions(graph: &FunctionGraph) {
         if !block.borrow().canraise() {
             continue;
         }
-        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         let mut new_exits: Vec<LinkRef> = Vec::new();
         let mut seen: Vec<Option<Hlvalue>> = Vec::new();
 
@@ -1870,7 +1868,7 @@ pub fn remove_assertion_errors(graph: &FunctionGraph) {
             }
             // upstream: `lst = list(block.exits); del lst[i];
             // block.recloseblock(*lst)`.
-            let mut lst: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+            let mut lst: Vec<LinkRef> = block.borrow().exits.to_vec();
             lst.remove(i);
             block.recloseblock(lst);
         }
@@ -2619,7 +2617,7 @@ pub fn cleanup_graph(graph: &FunctionGraph) {
 pub fn constfold_exitswitch(graph: &FunctionGraph) {
     let mut seen: HashSet<BlockKey> = HashSet::new();
     seen.insert(BlockKey::of(&graph.startblock));
-    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.iter().cloned().collect();
+    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.to_vec();
 
     while let Some(link) = stack.pop() {
         let (prev_rc, target_rc) = {
@@ -2654,7 +2652,7 @@ pub fn constfold_exitswitch(graph: &FunctionGraph) {
             stack.extend(new_exits);
         } else {
             seen.insert(BlockKey::of(&target_rc));
-            let more: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            let more: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
             stack.extend(more);
         }
     }
@@ -2695,7 +2693,7 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
     let entrymap = mkentrymap(graph);
     let mut seen: HashSet<BlockKey> = HashSet::new();
     seen.insert(BlockKey::of(&graph.startblock));
-    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.iter().cloned().collect();
+    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.to_vec();
 
     while let Some(link) = stack.pop() {
         let (prev_rc, target_rc, link_args_empty) = {
@@ -2741,13 +2739,13 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
             let new_switch = target_rc.borrow().exitswitch.clone();
             prev_rc.borrow_mut().exitswitch = new_switch;
             // upstream: `source.recloseblock(*target.exits)`.
-            let target_exits: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            let target_exits: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
             prev_rc.recloseblock(target_exits);
-            let source_exits: Vec<LinkRef> = prev_rc.borrow().exits.iter().cloned().collect();
+            let source_exits: Vec<LinkRef> = prev_rc.borrow().exits.to_vec();
             stack.extend(source_exits);
         } else {
             seen.insert(BlockKey::of(&target_rc));
-            let more: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            let more: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
             stack.extend(more);
         }
     }
@@ -2812,7 +2810,7 @@ pub fn join_blocks(graph: &FunctionGraph) {
     seen.insert(BlockKey::of(&graph.startblock));
 
     // upstream: `stack = list(block.exits)`.
-    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.iter().cloned().collect();
+    let mut stack: Vec<LinkRef> = graph.startblock.borrow().exits.to_vec();
 
     while let Some(link) = stack.pop() {
         // Snapshot the fields we need before re-borrowing the Link
@@ -2875,7 +2873,7 @@ pub fn join_blocks(graph: &FunctionGraph) {
             }
 
             // upstream: `exits = [exit.replace(renaming) for exit in target.exits]`.
-            let target_exits: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+            let target_exits: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
             let mut new_exits: Vec<LinkRef> = target_exits
                 .iter()
                 .map(|e| rename_link_args(e, &renaming))
@@ -2892,10 +2890,10 @@ pub fn join_blocks(graph: &FunctionGraph) {
 
             // upstream: constant-fold the new switch when prevblock is
             // not a can-raise block (simplify.py:311-314).
-            if let Some(Hlvalue::Constant(const_)) = &new_exitswitch {
-                if !prev_rc.borrow().canraise() {
-                    new_exits = replace_exitswitch_by_constant(&prev_rc, const_);
-                }
+            if let Some(Hlvalue::Constant(const_)) = &new_exitswitch
+                && !prev_rc.borrow().canraise()
+            {
+                new_exits = replace_exitswitch_by_constant(&prev_rc, const_);
             }
 
             stack.extend(new_exits);
@@ -2904,7 +2902,7 @@ pub fn join_blocks(graph: &FunctionGraph) {
             let target_key = BlockKey::of(&target_rc);
             if !seen.contains(&target_key) {
                 seen.insert(target_key);
-                let more: Vec<LinkRef> = target_rc.borrow().exits.iter().cloned().collect();
+                let more: Vec<LinkRef> = target_rc.borrow().exits.to_vec();
                 stack.extend(more);
             }
         }
@@ -3809,7 +3807,7 @@ mod tests {
         rtyper.mark_already_seen(&callee_start);
         rtyper.mark_already_seen(&caller_start);
 
-        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+        transform_dead_op_vars(&caller.borrow(), Some(translator));
 
         let ops = &caller_start.borrow().operations;
         assert_eq!(ops.len(), 1);
@@ -3893,7 +3891,7 @@ mod tests {
         rtyper.mark_already_seen(&rec_start);
         rtyper.mark_already_seen(&caller_start);
 
-        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+        transform_dead_op_vars(&caller.borrow(), Some(translator));
 
         let ops = &caller_start.borrow().operations;
         assert_eq!(ops.len(), 1);
@@ -4027,7 +4025,7 @@ mod tests {
         rtyper.mark_already_seen(&wrapper_start);
         rtyper.mark_already_seen(&caller_start);
 
-        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+        transform_dead_op_vars(&caller.borrow(), Some(translator));
 
         let ops = &caller_start.borrow().operations;
         assert_eq!(ops.len(), 1);
@@ -4124,7 +4122,7 @@ mod tests {
         rtyper.mark_already_seen(&wrapper_start);
         rtyper.mark_already_seen(&caller_start);
 
-        transform_dead_op_vars(&caller.borrow(), Some(&translator));
+        transform_dead_op_vars(&caller.borrow(), Some(translator));
 
         let ops = &caller_start.borrow().operations;
         assert_eq!(ops.len(), 2);
@@ -4166,7 +4164,7 @@ mod tests {
         transform_dead_op_vars_in_blocks(
             &[block_a, block_b],
             2,
-            Some(&translator),
+            Some(translator),
             Some(graph_a.borrow().startblock.clone()),
         );
     }

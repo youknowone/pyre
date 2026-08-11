@@ -2218,12 +2218,11 @@ impl Repr for PtrRepr {
             )));
         }
         let opname = if let Some(Hlvalue::Constant(c_func)) = vlist.first() {
-            if let ConstValue::LLPtr(ptr) = &c_func.value {
-                if let Ok(lltype::_ptr_obj::Func(func)) = ptr._obj() {
-                    if let Some(graph_id) = func.graph {
-                        hop.llops.borrow().record_extra_call_by_graph_id(graph_id)?;
-                    }
-                }
+            if let ConstValue::LLPtr(ptr) = &c_func.value
+                && let Ok(lltype::_ptr_obj::Func(func)) = ptr._obj()
+                && let Some(graph_id) = func.graph
+            {
+                hop.llops.borrow().record_extra_call_by_graph_id(graph_id)?;
             }
             "direct_call"
         } else {

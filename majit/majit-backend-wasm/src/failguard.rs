@@ -564,7 +564,7 @@ impl CompiledWasmLoop {
         }
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
-            return Ok(0);
+            Ok(0)
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
@@ -602,14 +602,12 @@ impl Drop for CompiledWasmLoop {
         let mut reg = LABEL_TARGETS.lock().unwrap();
         if let Some(map) = reg.as_mut() {
             for &id in &self.label_descrs {
-                if id != 0 {
-                    if let Some(t) = map.get(&id) {
-                        if t.func_handle == self.func_handle.get() {
-                            map.remove(&id);
-                            crate::BRIDGE_DIAG[22]
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+                if id != 0
+                    && let Some(t) = map.get(&id)
+                    && t.func_handle == self.func_handle.get()
+                {
+                    map.remove(&id);
+                    crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

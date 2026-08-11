@@ -117,6 +117,12 @@ pub struct JitTinyFrameInterp {
     threshold: u32,
 }
 
+impl Default for JitTinyFrameInterp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitTinyFrameInterp {
     pub fn new() -> Self {
         JitTinyFrameInterp {

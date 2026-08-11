@@ -1613,7 +1613,7 @@ fn jit_state_restore_guard_failure_restores_from_reconstructed_resume_frame() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444, -1);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
     resume.map_slot(1, 0);
     resume.set_slot_constant(2, majit_ir::Const::Int(99));
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
@@ -1877,10 +1877,10 @@ fn jit_state_restore_guard_failure_can_restore_multi_frame_resume_state() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100, -1);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 200, -1);
-    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr)));
     resume.map_slot(1, 0);
     let reconstructed_state = resume.build().reconstruct_state(&[2]);
 

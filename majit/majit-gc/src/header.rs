@@ -1,8 +1,8 @@
-/// Object header layout for GC-managed objects.
-///
-/// Each GC object starts with a single machine word that stores both
-/// the type ID (lower 32 bits) and GC flags (upper 32 bits), matching
-/// incminimark's HDR.tid layout where `first_gcflag = 1 << (LONG_BIT//2)`.
+//! Object header layout for GC-managed objects.
+//!
+//! Each GC object starts with a single machine word that stores both
+//! the type ID (lower 32 bits) and GC flags (upper 32 bits), matching
+//! incminimark's HDR.tid layout where `first_gcflag = 1 << (LONG_BIT//2)`.
 
 /// Number of bits reserved for the type ID in the lower half.
 pub const TYPE_ID_BITS: u32 = 32;

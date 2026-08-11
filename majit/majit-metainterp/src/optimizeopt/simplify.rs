@@ -139,7 +139,7 @@ mod tests {
     /// to once emitted — the bound-graph counterpart of the old fixtures'
     /// `int_op(0..n)` free positions (`to_opref` of an `InputArg` box).
     fn input_oprefs(n: u32) -> Vec<OpRef> {
-        (0..n).map(|i| OpRef::input_arg_int(i)).collect()
+        (0..n).map(OpRef::input_arg_int).collect()
     }
 
     #[test]

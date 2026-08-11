@@ -122,10 +122,8 @@ pub fn remove_duplicate_casts(graph: &FunctionGraph, translator: &TranslationCon
             {
                 let b = block.borrow();
                 for link in &b.exits {
-                    for arg in &link.borrow().args {
-                        if let Some(arg) = arg {
-                            used.insert(arg.clone(), true);
-                        }
+                    for arg in link.borrow().args.iter().flatten() {
+                        used.insert(arg.clone(), true);
                     }
                 }
             }

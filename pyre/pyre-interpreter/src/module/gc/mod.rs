@@ -722,20 +722,20 @@ fn enable_finalizers(action: &mut crate::executioncontext::UserDelAction) {
         return;
     }
     action.finalizers_lock_count -= 1;
-    if action.finalizers_lock_count == 0 {
-        if let Some(pending) = action.pending_with_disabled_del.take() {
-            // The list just left its GC-visible UserDelAction slot; keep every
-            // entry rooted while the finalizers run (upstream clears the
-            // GC-visible list as it progresses, interp_gc.py:80-84).
-            let _roots = pyre_object::gc_roots::push_roots();
-            for &obj in pending.iter() {
-                pyre_object::gc_roots::pin_root(obj);
-            }
-            let root_end = pyre_object::gc_roots::shadow_stack_len();
-            let root_base = root_end - pending.len();
-            for index in 0..pending.len() {
-                action._call_finalizer(pyre_object::gc_roots::shadow_stack_get(root_base + index));
-            }
+    if action.finalizers_lock_count == 0
+        && let Some(pending) = action.pending_with_disabled_del.take()
+    {
+        // The list just left its GC-visible UserDelAction slot; keep every
+        // entry rooted while the finalizers run (upstream clears the
+        // GC-visible list as it progresses, interp_gc.py:80-84).
+        let _roots = pyre_object::gc_roots::push_roots();
+        for &obj in pending.iter() {
+            pyre_object::gc_roots::pin_root(obj);
+        }
+        let root_end = pyre_object::gc_roots::shadow_stack_len();
+        let root_base = root_end - pending.len();
+        for index in 0..pending.len() {
+            action._call_finalizer(pyre_object::gc_roots::shadow_stack_get(root_base + index));
         }
     }
 }
@@ -1269,23 +1269,21 @@ crate::py_module! {
         "disable"       / 0 = |_| {
             pyre_object::gc_hook::try_gc_set_enabled(false);
             GC_ENABLED.store(false, Ordering::Relaxed);
-            if let Some(action) = user_del_action() {
-                if action.enabled_at_app_level {
+            if let Some(action) = user_del_action()
+                && action.enabled_at_app_level {
                     action.enabled_at_app_level = false;
                     disable_finalizers(action);
                 }
-            }
             Ok(w_none())
         },
         "enable"        / 0 = |_| {
             pyre_object::gc_hook::try_gc_set_enabled(true);
             GC_ENABLED.store(true, Ordering::Relaxed);
-            if let Some(action) = user_del_action() {
-                if !action.enabled_at_app_level {
+            if let Some(action) = user_del_action()
+                && !action.enabled_at_app_level {
                     action.enabled_at_app_level = true;
                     enable_finalizers(action);
                 }
-            }
             Ok(w_none())
         },
         "isenabled"     / 0 = |_| {

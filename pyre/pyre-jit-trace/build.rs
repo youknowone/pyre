@@ -983,7 +983,7 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
             .unwrap_or(std::time::UNIX_EPOCH);
         by_last_use.push((last_use, path));
     }
-    by_last_use.sort_by(|a, b| b.0.cmp(&a.0));
+    by_last_use.sort_by_key(|item| std::cmp::Reverse(item.0));
     // `keep` is excluded above and occupies one of the retained slots.
     let retained = CODEGEN_CACHE_MAX_ENTRIES.saturating_sub(1);
     for (_, path) in by_last_use.into_iter().skip(retained) {

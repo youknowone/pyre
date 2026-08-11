@@ -187,10 +187,10 @@ pub fn find_calls_from(
     // callers thread their own GraphKey into the memo when they
     // already have one in hand.
     let key = graph as *const _ as usize;
-    if let Some(memo) = memo.as_deref() {
-        if let Some(cached) = memo.get(&key) {
-            return cached.clone();
-        }
+    if let Some(memo) = memo.as_deref()
+        && let Some(cached) = memo.get(&key)
+    {
+        return cached.clone();
     }
     let res = _find_calls_from(translator, graph);
     if let Some(memo) = memo {
@@ -211,12 +211,11 @@ fn _find_calls_from(
             // Upstream `:42-45 if op.opname == "direct_call":
             // called_graph = get_graph(op.args[0], translator); if
             // called_graph is not None: yield block, called_graph`.
-            if op.opname == "direct_call" {
-                if let Some(arg0) = op.args.first() {
-                    if let Some(called) = get_graph(arg0, translator) {
-                        out.push((block.clone(), called));
-                    }
-                }
+            if op.opname == "direct_call"
+                && let Some(arg0) = op.args.first()
+                && let Some(called) = get_graph(arg0, translator)
+            {
+                out.push((block.clone(), called));
             }
             // Upstream `:46-50 if op.opname == "indirect_call":
             // graphs = op.args[-1].value; if graphs is not None: for
@@ -226,19 +225,18 @@ fn _find_calls_from(
             // either as `Hlvalue::Constant(LLPtr-list)` or the
             // sentinel `None` constant; only the resolvable form
             // produces edges.
-            if op.opname == "indirect_call" {
-                if let Some(last) = op.args.last() {
-                    if let Hlvalue::Constant(c) = last {
-                        if let ConstValue::Graphs(graph_keys) = &c.value {
-                            let trans_graphs = translator.graphs.borrow();
-                            for key in graph_keys {
-                                if let Some(g) = trans_graphs.iter().find(|g| {
-                                    crate::flowspace::model::GraphKey::of(g).as_usize() == *key
-                                }) {
-                                    out.push((block.clone(), g.clone()));
-                                }
-                            }
-                        }
+            if op.opname == "indirect_call"
+                && let Some(last) = op.args.last()
+                && let Hlvalue::Constant(c) = last
+                && let ConstValue::Graphs(graph_keys) = &c.value
+            {
+                let trans_graphs = translator.graphs.borrow();
+                for key in graph_keys {
+                    if let Some(g) = trans_graphs
+                        .iter()
+                        .find(|g| crate::flowspace::model::GraphKey::of(g).as_usize() == *key)
+                    {
+                        out.push((block.clone(), g.clone()));
                     }
                 }
             }
@@ -420,7 +418,7 @@ fn find_backedges_dfs(
 ) {
     let block_key = BlockKey::of(block);
     seeing.insert(block_key.clone());
-    let exits: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+    let exits: Vec<LinkRef> = block.borrow().exits.to_vec();
     for link in &exits {
         let target = match link.borrow().target.clone() {
             Some(t) => t,
@@ -457,7 +455,7 @@ pub fn compute_reachability(graph: &FunctionGraph) -> HashMap<BlockKey, HashSet<
         let mut reach: HashSet<BlockKey> = HashSet::new();
         let mut scheduled: Vec<BlockRef> = vec![block.clone()];
         while let Some(current) = scheduled.pop() {
-            let exits: Vec<LinkRef> = current.borrow().exits.iter().cloned().collect();
+            let exits: Vec<LinkRef> = current.borrow().exits.to_vec();
             for link in &exits {
                 let Some(target) = link.borrow().target.clone() else {
                     continue;
@@ -544,12 +542,12 @@ pub fn find_loop_blocks(graph: &FunctionGraph) -> HashMap<BlockKey, BlockRef> {
             //     for link in current.exits:
             //         if link.target not in seen:
             //             scheduled.append(link.target)
-            let exits: Vec<LinkRef> = current.borrow().exits.iter().cloned().collect();
+            let exits: Vec<LinkRef> = current.borrow().exits.to_vec();
             for link in &exits {
-                if let Some(target) = link.borrow().target.clone() {
-                    if !seen.contains(&BlockKey::of(&target)) {
-                        scheduled.push(target);
-                    }
+                if let Some(target) = link.borrow().target.clone()
+                    && !seen.contains(&BlockKey::of(&target))
+                {
+                    scheduled.push(target);
                 }
             }
         }

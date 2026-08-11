@@ -1322,7 +1322,7 @@ impl MiniMarkGC {
     /// box-probe experiment — so the tid witness stands.
     #[inline]
     fn registered_pyobject_header(&self, addr: usize) -> Option<*mut GcHeader> {
-        if addr < GcHeader::SIZE || addr % GcHeader::ALIGN != 0 {
+        if addr < GcHeader::SIZE || !addr.is_multiple_of(GcHeader::ALIGN) {
             return None;
         }
         let vtable = unsafe { *(addr as *const usize) };
@@ -2149,7 +2149,7 @@ impl MiniMarkGC {
         // We use raw pointers to avoid borrow checker issues since
         // copy_nursery_object mutates oldgen/nursery.
         // Pinned objects are left in place (not copied to old gen).
-        let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
+        let roots: Vec<*mut GcRef> = self.roots.roots.to_vec();
         for root_ptr in roots {
             let gcref = unsafe { &mut *root_ptr };
             self.drag_out_root(gcref);
@@ -2280,7 +2280,7 @@ impl MiniMarkGC {
         // those black objects so the major collector rescans their new
         // outgoing references before sweep.
         if self.gc_state == GcState::Marking {
-            let remembered_now: Vec<usize> = self.remembered_set.iter().copied().collect();
+            let remembered_now: Vec<usize> = self.remembered_set.to_vec();
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
                 if unsafe { (*hdr).has_flag(flags::VISITED) } {
@@ -3565,11 +3565,11 @@ impl MiniMarkGC {
         };
         if !object.is_null() && self.is_managed_heap_object(object.0) {
             let type_id = unsafe { (*header_of(object.0)).type_id() };
-            if (type_id as usize) < self.types.len() {
-                if let Some(offset) = self.types.get(type_id).memory_pressure_offset {
-                    unsafe {
-                        *((object.0 + offset) as *mut isize) = size;
-                    }
+            if (type_id as usize) < self.types.len()
+                && let Some(offset) = self.types.get(type_id).memory_pressure_offset
+            {
+                unsafe {
+                    *((object.0 + offset) as *mut isize) = size;
                 }
             }
         }
@@ -3607,10 +3607,10 @@ impl MiniMarkGC {
         let mut count = 0isize;
         while let Some(obj) = pending.pop() {
             let type_id = unsafe { (*header_of(obj.0)).type_id() };
-            if (type_id as usize) < self.types.len() {
-                if let Some(offset) = self.types.get(type_id).memory_pressure_offset {
-                    count = count.wrapping_add(unsafe { *((obj.0 + offset) as *const isize) });
-                }
+            if (type_id as usize) < self.types.len()
+                && let Some(offset) = self.types.get(type_id).memory_pressure_offset
+            {
+                count = count.wrapping_add(unsafe { *((obj.0 + offset) as *const isize) });
             }
             let mut referents = Vec::new();
             self.visit_referents(obj.0, &mut |child| referents.push(child));
@@ -4241,7 +4241,7 @@ impl MiniMarkGC {
     /// sets VISITED at push time, so a black object is simply re-pushed; white
     /// entries are left for the normal frontier / retain to drop.)
     fn rescan_remembered_black_and_drain(&mut self) {
-        let snapshot: Vec<usize> = self.remembered_set.iter().copied().collect();
+        let snapshot: Vec<usize> = self.remembered_set.to_vec();
         for addr in snapshot {
             if unsafe { (*header_of(addr)).has_flag(flags::VISITED) } {
                 self.incr_state.gray_stack.push(addr);
@@ -5175,9 +5175,7 @@ impl MiniMarkGC {
     /// Process `old_objects_with_cards_set` — for each object, scan
     /// dirty card ranges and copy nursery objects out.
     fn collect_cardrefs_to_nursery(&mut self) {
-        while !self.old_objects_with_cards_set.is_empty() {
-            let obj = self.old_objects_with_cards_set.pop().unwrap();
-
+        while let Some(obj) = self.old_objects_with_cards_set.pop() {
             // incminimark.py:2016-2020
             let hdr = unsafe { header_of(obj) };
             debug_assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
@@ -8643,7 +8641,7 @@ mod tests {
 
         gc.set_mark_budget(1);
         gc.start_incremental_cycle();
-        assert!(gc.incr_state.gray_stack.len() >= 1);
+        assert!(!gc.incr_state.gray_stack.is_empty());
 
         // Simulate a minor collection that promoted more than one step's worth
         // of objects so incminimark-style accounting demands extra progress.
@@ -8837,7 +8835,7 @@ mod tests {
         // survivor. The promotion allocates on ArenaCollection's fresh active
         // page lists created by mass_free_prepare, not the frozen old_* lists.
         let young = gc.alloc_with_type(tid, 16);
-        unsafe { *(young.0 as *mut u64) = 0x51_7E_A5E };
+        unsafe { *(young.0 as *mut u64) = 0x0517_EA5E };
         let mut root = young;
         unsafe { gc.roots.add(&mut root) };
         gc.disable();
@@ -8849,7 +8847,7 @@ mod tests {
         assert_eq!(gc.gc_state, GcState::Scanning);
         assert_eq!(gc.major_collections, 1);
         assert_eq!(gc.oldgen.object_count(), 1);
-        assert_eq!(unsafe { *(root.0 as *const u64) }, 0x51_7E_A5E);
+        assert_eq!(unsafe { *(root.0 as *const u64) }, 0x0517_EA5E);
         gc.roots.clear();
     }
 
@@ -8943,7 +8941,7 @@ mod tests {
         // Register the scanned slots as roots with the GC.
         for root_ptr in &roots_from_frame {
             unsafe {
-                gc.roots.add(*root_ptr as *mut GcRef);
+                gc.roots.add(*root_ptr);
             }
         }
 

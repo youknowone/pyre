@@ -511,10 +511,10 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         if crate::builtins::is_native_exception_dunder(method) {
             return Ok(None);
         }
-        if let Some(base) = crate::builtins::lookup_exc_class("BaseException") {
-            if std::ptr::eq(src, base) {
-                return Ok(None);
-            }
+        if let Some(base) = crate::builtins::lookup_exc_class("BaseException")
+            && std::ptr::eq(src, base)
+        {
+            return Ok(None);
         }
         let r = crate::builtins::call_and_check(method, &[obj])?;
         if pyre_object::is_str(r) {
@@ -640,16 +640,16 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 // generic `<object at ...>`.
                 if let Some((src, method)) =
                     crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
+                    && !std::ptr::eq(src, crate::typedef::w_object())
+                    && !method.is_null()
                 {
-                    if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
-                        // A raising override propagates; a non-string return is
-                        // a TypeError like every other `__repr__` override.
-                        let r = crate::builtins::call_and_check(method, &[obj])?;
-                        if pyre_object::is_str(r) {
-                            return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
-                        }
-                        return Err(dunder_returned_non_string("__repr__", r));
+                    // A raising override propagates; a non-string return is
+                    // a TypeError like every other `__repr__` override.
+                    let r = crate::builtins::call_and_check(method, &[obj])?;
+                    if pyre_object::is_str(r) {
+                        return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                     }
+                    return Err(dunder_returned_non_string("__repr__", r));
                 }
             }
             return tuple_repr(obj);
@@ -991,18 +991,17 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `<name object at 0x...>` fallback.  Mirrors the tuple-subclass
             // path above.
             let w_class = (*obj).w_class;
-            if !w_class.is_null() {
-                if let Some((src, method)) =
+            if !w_class.is_null()
+                && let Some((src, method)) =
                     crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
-                {
-                    if !std::ptr::eq(src, crate::typedef::w_object()) && !method.is_null() {
-                        let r = crate::builtins::call_and_check(method, &[obj])?;
-                        if pyre_object::is_str(r) {
-                            return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
-                        }
-                        return Err(dunder_returned_non_string("__repr__", r));
-                    }
+                && !std::ptr::eq(src, crate::typedef::w_object())
+                && !method.is_null()
+            {
+                let r = crate::builtins::call_and_check(method, &[obj])?;
+                if pyre_object::is_str(r) {
+                    return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                 }
+                return Err(dunder_returned_non_string("__repr__", r));
             }
             let name = crate::baseobjspace::getfulltypename(obj);
             format!("<{name} object at {}>", repr_addr(obj as usize))
@@ -1138,10 +1137,10 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         }
         // A `types.ModuleType` subclass `__str__` override wins; without one,
         // `str` falls back to `__repr__` through `py_repr`.
-        if pyre_object::is_module(obj) {
-            if let Some(r) = module_user_dunder_obj(obj, "__str__")? {
-                return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
-            }
+        if pyre_object::is_module(obj)
+            && let Some(r) = module_user_dunder_obj(obj, "__str__")?
+        {
+            return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }
         py_repr_wtf8(obj)
     }

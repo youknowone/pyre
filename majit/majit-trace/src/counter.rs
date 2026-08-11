@@ -7,7 +7,7 @@ use majit_ir::IndexMapExt;
 /// tick(hash, increment) adds increment; fires when >= 1.0.
 /// 5-way associative cache indexed by _get_index(hash), matched by
 /// _get_subhash(hash). MRU promotion via _swap.
-
+///
 /// counter.py:82 DEFAULT_SIZE = 2048
 pub const DEFAULT_SIZE: usize = 2048;
 
@@ -226,6 +226,107 @@ impl JitCounter {
     }
 }
 
+/// counter.py:309 DeterministicJitCounter — test-only, NOT_RPYTHON.
+///
+/// RPython: subclasses JitCounter, overrides _get_index to return the
+/// raw hash (identity — no collision), uses a defaultdict timetable.
+/// Rust: uses a IndexMap<u64, Entry> to mirror the defaultdict approach.
+pub struct DeterministicJitCounter {
+    entries: indexmap::IndexMap<u64, Entry>,
+}
+
+impl Default for DeterministicJitCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeterministicJitCounter {
+    /// counter.py:310-315 DeterministicJitCounter.__init__
+    pub fn new() -> Self {
+        DeterministicJitCounter {
+            entries: indexmap::IndexMap::new(),
+        }
+    }
+
+    /// counter.py:318-319 _get_index — identity (no hash collision).
+    #[inline(always)]
+    fn _get_index(hash: u64) -> u64 {
+        hash
+    }
+
+    /// counter.py:138-140 _get_subhash
+    #[inline(always)]
+    fn _get_subhash(hash: u64) -> u16 {
+        (hash & 0xFFFF) as u16
+    }
+
+    /// counter.py:122-126 compute_threshold
+    pub fn compute_threshold(&self, threshold: u32) -> f64 {
+        if threshold == 0 {
+            return 0.0;
+        }
+        1.0_f64 / (threshold as f64 - 0.001)
+    }
+
+    /// counter.py:185-202 tick — same logic but using identity _get_index.
+    pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
+        let key = Self::_get_index(hash);
+        let subhash = Self::_get_subhash(hash);
+        let entry = self.entries.entry_or_insert_with(key, Entry::default);
+
+        let n = if entry.subhashes[0] == subhash {
+            0
+        } else if entry.subhashes[1] == subhash {
+            JitCounter::_swap(entry, 0)
+        } else if entry.subhashes[2] == subhash {
+            JitCounter::_swap(entry, 1)
+        } else if entry.subhashes[3] == subhash {
+            JitCounter::_swap(entry, 2)
+        } else if entry.subhashes[4] == subhash {
+            JitCounter::_swap(entry, 3)
+        } else {
+            let mut n = 4;
+            while n > 0 && entry.times[n - 1] == 0.0 {
+                n -= 1;
+            }
+            entry.subhashes[n] = subhash;
+            entry.times[n] = 0.0;
+            n
+        };
+
+        let counter: f64 = entry.times[n] as f64 + increment;
+        if counter < 1.0 {
+            entry.times[n] = counter as f32;
+            false
+        } else {
+            self.reset(hash);
+            true
+        }
+    }
+
+    /// counter.py:232-237 reset
+    pub fn reset(&mut self, hash: u64) {
+        let key = Self::_get_index(hash);
+        let subhash = Self::_get_subhash(hash);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            for i in 0..ASSOCIATIVITY {
+                if entry.subhashes[i] == subhash {
+                    entry.times[i] = 0.0;
+                }
+            }
+        }
+    }
+
+    /// counter.py:322 decay_all_counters — no-op for deterministic counter.
+    pub fn decay_all_counters(&mut self) {}
+
+    /// counter.py:326-327 _clear_all
+    pub fn _clear_all(&mut self) {
+        self.entries.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,100 +432,5 @@ mod tests {
         assert_eq!(counter.size, 1024);
         // 0xFFFFFFFF >> shift = 1023 → shift = 22
         assert_eq!(counter.shift, 22);
-    }
-}
-
-/// counter.py:309 DeterministicJitCounter — test-only, NOT_RPYTHON.
-///
-/// RPython: subclasses JitCounter, overrides _get_index to return the
-/// raw hash (identity — no collision), uses a defaultdict timetable.
-/// Rust: uses a IndexMap<u64, Entry> to mirror the defaultdict approach.
-pub struct DeterministicJitCounter {
-    entries: indexmap::IndexMap<u64, Entry>,
-}
-
-impl DeterministicJitCounter {
-    /// counter.py:310-315 DeterministicJitCounter.__init__
-    pub fn new() -> Self {
-        DeterministicJitCounter {
-            entries: indexmap::IndexMap::new(),
-        }
-    }
-
-    /// counter.py:318-319 _get_index — identity (no hash collision).
-    #[inline(always)]
-    fn _get_index(hash: u64) -> u64 {
-        hash
-    }
-
-    /// counter.py:138-140 _get_subhash
-    #[inline(always)]
-    fn _get_subhash(hash: u64) -> u16 {
-        (hash & 0xFFFF) as u16
-    }
-
-    /// counter.py:122-126 compute_threshold
-    pub fn compute_threshold(&self, threshold: u32) -> f64 {
-        if threshold == 0 {
-            return 0.0;
-        }
-        1.0_f64 / (threshold as f64 - 0.001)
-    }
-
-    /// counter.py:185-202 tick — same logic but using identity _get_index.
-    pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
-        let key = Self::_get_index(hash);
-        let subhash = Self::_get_subhash(hash);
-        let entry = self.entries.entry_or_insert_with(key, Entry::default);
-
-        let n = if entry.subhashes[0] == subhash {
-            0
-        } else if entry.subhashes[1] == subhash {
-            JitCounter::_swap(entry, 0)
-        } else if entry.subhashes[2] == subhash {
-            JitCounter::_swap(entry, 1)
-        } else if entry.subhashes[3] == subhash {
-            JitCounter::_swap(entry, 2)
-        } else if entry.subhashes[4] == subhash {
-            JitCounter::_swap(entry, 3)
-        } else {
-            let mut n = 4;
-            while n > 0 && entry.times[n - 1] == 0.0 {
-                n -= 1;
-            }
-            entry.subhashes[n] = subhash;
-            entry.times[n] = 0.0;
-            n
-        };
-
-        let counter: f64 = entry.times[n] as f64 + increment;
-        if counter < 1.0 {
-            entry.times[n] = counter as f32;
-            false
-        } else {
-            self.reset(hash);
-            true
-        }
-    }
-
-    /// counter.py:232-237 reset
-    pub fn reset(&mut self, hash: u64) {
-        let key = Self::_get_index(hash);
-        let subhash = Self::_get_subhash(hash);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            for i in 0..ASSOCIATIVITY {
-                if entry.subhashes[i] == subhash {
-                    entry.times[i] = 0.0;
-                }
-            }
-        }
-    }
-
-    /// counter.py:322 decay_all_counters — no-op for deterministic counter.
-    pub fn decay_all_counters(&mut self) {}
-
-    /// counter.py:326-327 _clear_all
-    pub fn _clear_all(&mut self) {
-        self.entries.clear();
     }
 }

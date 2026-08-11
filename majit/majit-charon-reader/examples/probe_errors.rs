@@ -44,10 +44,10 @@ fn outer_key(v: &serde_json::Value) -> String {
     if let Some(s) = v.as_str() {
         return format!("\"{s}\"");
     }
-    if let Some(obj) = v.as_object() {
-        if let Some(k) = obj.keys().next() {
-            return k.clone();
-        }
+    if let Some(obj) = v.as_object()
+        && let Some(k) = obj.keys().next()
+    {
+        return k.clone();
     }
     "?".into()
 }

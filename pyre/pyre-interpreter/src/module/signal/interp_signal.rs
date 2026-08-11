@@ -363,11 +363,10 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
     let w_n = pyre_object::w_int_new(n as i64);
     let w_frame = pyre_object::w_none();
     let res = crate::baseobjspace::call_function(w_handler, &[w_n, w_frame]);
-    if res.is_null() {
-        if let Some(err) = crate::call::take_call_error() {
+    if res.is_null()
+        && let Some(err) = crate::call::take_call_error() {
             return Err(err);
         }
-    }
     Ok(())
 }
 
@@ -593,13 +592,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             // have been delivered to this thread; run the
                             // pending handler now (may raise).
                             checksignals_now()?;
-                            return Ok(pyre_object::w_none());
+                            Ok(pyre_object::w_none())
                         }
                         Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
+                            Err(crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
                                 format!("raise_signal: {e}"),
-                            ));
+                            ))
                         }
                     }
                 }
@@ -636,9 +635,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `'Unknown signal: 32'` on pypy.
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
-                    return Ok(rustpython_host_env::signal::strsignal(signum)
+                    Ok(rustpython_host_env::signal::strsignal(signum)
                         .map(|s| pyre_object::w_str_new(&s))
-                        .unwrap_or(pyre_object::w_none()));
+                        .unwrap_or(pyre_object::w_none()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 {
@@ -667,7 +666,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         .into_iter()
                         .map(|n| pyre_object::w_int_new(n as i64))
                         .collect();
-                    return Ok(pyre_object::w_set_from_items(&items));
+                    Ok(pyre_object::w_set_from_items(&items))
                 }
                 #[cfg(not(feature = "host_env"))]
                 Err(crate::PyError::not_implemented(
@@ -712,9 +711,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         } else {
                             return Err(crate::PyError::type_error("alarm() missing argument"));
                         };
-                        return Ok(pyre_object::w_int_new(
+                        Ok(pyre_object::w_int_new(
                             rustpython_host_env::signal::alarm(secs) as i64,
-                        ));
+                        ))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
@@ -792,10 +791,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             errno_exception("signal.ItimerError", e.raw_os_error().unwrap_or(0))
                         })?;
                     let (delay, interval) = rustpython_host_env::signal::itimerval_to_tuple(&old);
-                    return Ok(pyre_object::w_tuple_new(vec![
+                    Ok(pyre_object::w_tuple_new(vec![
                         pyre_object::w_float_new(delay),
                         pyre_object::w_float_new(interval),
-                    ]));
+                    ]))
                 }
                 #[cfg(not(feature = "host_env"))]
                 {
@@ -834,10 +833,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         })?;
                         let (delay, interval) =
                             rustpython_host_env::signal::itimerval_to_tuple(&it);
-                        return Ok(pyre_object::w_tuple_new(vec![
+                        Ok(pyre_object::w_tuple_new(vec![
                             pyre_object::w_float_new(delay),
                             pyre_object::w_float_new(interval),
-                        ]));
+                        ]))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
@@ -877,7 +876,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 format!("siginterrupt: {e}"),
                             )
                         })?;
-                        return Ok(pyre_object::w_none());
+                        Ok(pyre_object::w_none())
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
@@ -952,7 +951,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }
-                        return Ok(pyre_object::w_int_new(signum as i64));
+                        Ok(pyre_object::w_int_new(signum as i64))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
@@ -983,11 +982,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // interp_signal.py:502-513 _sigset_to_signals
                         let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
                             .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(mask, *s as i32)
+                                rustpython_host_env::signal::sigset_contains(mask, *s)
                             })
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();
-                        return Ok(pyre_object::w_set_from_items(&items));
+                        Ok(pyre_object::w_set_from_items(&items))
                     }
                     #[cfg(not(feature = "host_env"))]
                     Err(crate::PyError::not_implemented(
@@ -1028,7 +1027,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // interp_signal.py:473-474 — the signal may have been
                         // sent to the current thread.
                         checksignals_now()?;
-                        return Ok(pyre_object::w_none());
+                        Ok(pyre_object::w_none())
                     }
                     #[cfg(not(feature = "host_env"))]
                     {
@@ -1118,11 +1117,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         checksignals_now()?;
                         let out: Vec<pyre_object::PyObjectRef> = (1..=64)
                             .filter(|s| {
-                                rustpython_host_env::signal::sigset_contains(prev, *s as i32)
+                                rustpython_host_env::signal::sigset_contains(prev, *s)
                             })
                             .map(|s| pyre_object::w_int_new(s as i64))
                             .collect();
-                        return Ok(pyre_object::w_set_from_items(&out));
+                        Ok(pyre_object::w_set_from_items(&out))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {

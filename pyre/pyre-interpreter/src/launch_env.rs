@@ -15,7 +15,7 @@ use std::sync::{LazyLock, Mutex};
 /// The launcher options, as parsed from a command line and then folded with
 /// the environment by [`finalize`]. `app_main.py` keeps the same set in its
 /// `options` dict before `sys` initialization reads them back.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct LaunchFlags {
     pub inspect: bool,
     pub quiet: bool,
@@ -44,29 +44,6 @@ pub struct LaunchFlags {
     /// Every raw `-X` value stays in a list until sys module initialization
     /// turns it into `sys._xoptions`.
     pub xoptions: Vec<std::ffi::OsString>,
-}
-
-impl Default for LaunchFlags {
-    fn default() -> Self {
-        Self {
-            inspect: false,
-            quiet: false,
-            no_site: false,
-            no_user_site: false,
-            ignore_environment: false,
-            isolated: false,
-            dev_mode: false,
-            utf8_mode: None,
-            safe_path: false,
-            optimize: 0,
-            bytes_warning: 0,
-            dont_write_bytecode: false,
-            unbuffered: false,
-            warnoptions: Vec::new(),
-            stdio_encoding: None,
-            xoptions: Vec::new(),
-        }
-    }
 }
 
 /// Environment the launcher options resolve against, when the process
@@ -190,16 +167,16 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
     if !flags.ignore_environment {
         // Compared as bytes: a value that does not decode is *invalid*, which is
         // fatal, not absent, which would silently fall through to the locale.
-        if let Some(value) = read_raw("PYTHONUTF8") {
-            if !value.is_empty() {
-                return match value.as_slice() {
-                    b"0" => Ok(0),
-                    b"1" => Ok(1),
-                    _ => Err(PreConfigError(
-                        "invalid PYTHONUTF8 environment variable value",
-                    )),
-                };
-            }
+        if let Some(value) = read_raw("PYTHONUTF8")
+            && !value.is_empty()
+        {
+            return match value.as_slice() {
+                b"0" => Ok(0),
+                b"1" => Ok(1),
+                _ => Err(PreConfigError(
+                    "invalid PYTHONUTF8 environment variable value",
+                )),
+            };
         }
     }
     Ok(if locale_implies_utf8_mode() { 1 } else { 0 })
@@ -232,10 +209,10 @@ fn env_int_flag(name: &str) -> Option<u32> {
 /// the compiler clamps it into a byte at read time.
 fn resolve_optimize(flags: &LaunchFlags) -> i64 {
     let mut level = flags.optimize;
-    if !flags.ignore_environment {
-        if let Some(v) = env_int_flag("PYTHONOPTIMIZE") {
-            level = level.max(i64::from(v));
-        }
+    if !flags.ignore_environment
+        && let Some(v) = env_int_flag("PYTHONOPTIMIZE")
+    {
+        level = level.max(i64::from(v));
     }
     level
 }
@@ -285,10 +262,10 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         // Read as bytes: a filter is free text, so `read`'s `env::var`
         // contract would drop the whole variable for one undecodable byte
         // rather than carry the entry `-W` would have carried.
-        if let Some(value) = read_raw("PYTHONWARNINGS") {
-            if !value.is_empty() {
-                warnoptions.extend(value.split(|&b| b == b',').map(os_string_from_bytes));
-            }
+        if let Some(value) = read_raw("PYTHONWARNINGS")
+            && !value.is_empty()
+        {
+            warnoptions.extend(value.split(|&b| b == b',').map(os_string_from_bytes));
         }
     }
     warnoptions.append(&mut flags.warnoptions);

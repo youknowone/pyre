@@ -71,20 +71,20 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
 
         match ch {
             b'>' => {
-                state.pointer = state.pointer + 1;
-                pc = pc + 1;
+                state.pointer += 1;
+                pc += 1;
             }
             b'<' => {
-                state.pointer = state.pointer - 1;
-                pc = pc + 1;
+                state.pointer -= 1;
+                pc += 1;
             }
             b'+' => {
-                state.tape[state.pointer as usize] = state.tape[state.pointer as usize] + 1;
-                pc = pc + 1;
+                state.tape[state.pointer as usize] += 1;
+                pc += 1;
             }
             b'-' => {
-                state.tape[state.pointer as usize] = state.tape[state.pointer as usize] - 1;
-                pc = pc + 1;
+                state.tape[state.pointer as usize] -= 1;
+                pc += 1;
             }
             b'.' => break,
             b',' => break,
@@ -94,31 +94,27 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
                     let mut p = pc + 1;
                     while need > 0 {
                         if program[p] == b']' {
-                            need = need - 1;
+                            need -= 1;
                         } else if program[p] == b'[' {
-                            need = need + 1;
+                            need += 1;
                         }
-                        p = p + 1;
+                        p += 1;
                     }
                     pc = p;
                 } else {
-                    pc = pc + 1;
+                    pc += 1;
                 }
             }
-            b']' => {
-                if state.tape[state.pointer as usize] != 0 {
-                    let target = find_matching_open(program, pc);
-                    if target < pc {
-                        can_enter_jit!(driver, target, &mut state, program, || {});
-                    }
-                    pc = target;
-                    continue;
-                } else {
-                    pc = pc + 1;
+            b']' if state.tape[state.pointer as usize] != 0 => {
+                let target = find_matching_open(program, pc);
+                if target < pc {
+                    can_enter_jit!(driver, target, &mut state, program, || {});
                 }
+                pc = target;
+                continue;
             }
             _ => {
-                pc = pc + 1;
+                pc += 1;
             }
         }
     }
@@ -225,6 +221,12 @@ fn find_matching_open(code: &[u8], close_pos: usize) -> usize {
 
 pub struct JitBrainInterp {
     threshold: u32,
+}
+
+impl Default for JitBrainInterp {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JitBrainInterp {

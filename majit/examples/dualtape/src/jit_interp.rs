@@ -59,36 +59,36 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
 
         match ch {
             b'>' => {
-                state.pa = state.pa + 1;
-                pc = pc + 1;
+                state.pa += 1;
+                pc += 1;
             }
             b'<' => {
-                state.pa = state.pa - 1;
-                pc = pc + 1;
+                state.pa -= 1;
+                pc += 1;
             }
             b'+' => {
-                state.a[state.pa as usize] = state.a[state.pa as usize] + 1;
-                pc = pc + 1;
+                state.a[state.pa as usize] += 1;
+                pc += 1;
             }
             b'-' => {
-                state.a[state.pa as usize] = state.a[state.pa as usize] - 1;
-                pc = pc + 1;
+                state.a[state.pa as usize] -= 1;
+                pc += 1;
             }
             b'}' => {
-                state.pb = state.pb + 1;
-                pc = pc + 1;
+                state.pb += 1;
+                pc += 1;
             }
             b'{' => {
-                state.pb = state.pb - 1;
-                pc = pc + 1;
+                state.pb -= 1;
+                pc += 1;
             }
             b'*' => {
-                state.b[state.pb as usize] = state.b[state.pb as usize] + 1;
-                pc = pc + 1;
+                state.b[state.pb as usize] += 1;
+                pc += 1;
             }
             b'/' => {
-                state.b[state.pb as usize] = state.b[state.pb as usize] - 1;
-                pc = pc + 1;
+                state.b[state.pb as usize] -= 1;
+                pc += 1;
             }
             b'[' => {
                 if state.a[state.pa as usize] == 0 {
@@ -96,31 +96,27 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
                     let mut p = pc + 1;
                     while need > 0 {
                         if program[p] == b']' {
-                            need = need - 1;
+                            need -= 1;
                         } else if program[p] == b'[' {
-                            need = need + 1;
+                            need += 1;
                         }
-                        p = p + 1;
+                        p += 1;
                     }
                     pc = p;
                 } else {
-                    pc = pc + 1;
+                    pc += 1;
                 }
             }
-            b']' => {
-                if state.a[state.pa as usize] != 0 {
-                    let target = find_matching_open(program, pc);
-                    if target < pc {
-                        can_enter_jit!(driver, target, &mut state, program, || {});
-                    }
-                    pc = target;
-                    continue;
-                } else {
-                    pc = pc + 1;
+            b']' if state.a[state.pa as usize] != 0 => {
+                let target = find_matching_open(program, pc);
+                if target < pc {
+                    can_enter_jit!(driver, target, &mut state, program, || {});
                 }
+                pc = target;
+                continue;
             }
             _ => {
-                pc = pc + 1;
+                pc += 1;
             }
         }
     }

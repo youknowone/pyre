@@ -431,10 +431,11 @@ impl PackSet {
 
         if independent {
             // vector.py:700-704: forward + accumulating origin -> abort
-            if let Some(op) = origin_pack {
-                if forward && op.is_accumulating {
-                    return Err(NotAVectorizeableLoop);
-                }
+            if let Some(op) = origin_pack
+                && forward
+                && op.is_accumulating
+            {
+                return Err(NotAVectorizeableLoop);
             }
             // vector.py:706-707
             if self.contains_pair(lnode, rnode) {
@@ -589,9 +590,7 @@ impl PackSet {
 
         // vector.py:779: scalar, index = self.getaccumulator_variable(left, right, origin_pack)
         let (scalar, index) = Self::getaccumulator_variable(left, right);
-        if scalar.is_none() {
-            return None;
-        }
+        scalar?;
         let index = index as usize;
 
         // vector.py:782-787: dependency only because of the scalar?
@@ -950,7 +949,7 @@ pub fn optimize_vector(
     info.snapshot(&loop_.operations_as_ops(), &label_args);
     let version = loop_.clone_loop();
 
-    let result = (|| {
+    let result = {
         // vector.py:142-143. `run_optimization` owns the scheduler state, so
         // it calls vector.py:135 `loop.setup_vectorization()` (and the
         // vector.py:172 `teardown_vectorization()`) against that state
@@ -958,7 +957,7 @@ pub fn optimize_vector(
         // `_forwarded` equivalent that `forwarded_vecinfo` reads.
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
         opt.run_optimization(loop_, info, user_code)
-    })();
+    };
 
     if result.is_err() {
         // vector.py:155 / :160: `return loop_info, version.loop.finaloplist()`.
@@ -1524,20 +1523,18 @@ impl VectorizingOptimizer {
     /// smallest array element byte size to determine SIMD width.
     pub fn linear_find_smallest_type(&mut self, loop_: &VectorLoop) {
         for op in &loop_.operations {
-            if op.opcode.is_getarrayitem()
+            if (op.opcode.is_getarrayitem()
                 || op.opcode.is_setarrayitem()
                 || matches!(
                     op.opcode,
                     OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
-                )
+                ))
+                && let Some(descr) = op.getdescr()
+                && let Some(ad) = descr.as_array_descr()
             {
-                if let Some(descr) = op.getdescr() {
-                    if let Some(ad) = descr.as_array_descr() {
-                        let item_size = ad.item_size();
-                        if self.smallest_type_bytes == 0 || item_size < self.smallest_type_bytes {
-                            self.smallest_type_bytes = item_size;
-                        }
-                    }
+                let item_size = ad.item_size();
+                if self.smallest_type_bytes == 0 || item_size < self.smallest_type_bytes {
+                    self.smallest_type_bytes = item_size;
                 }
             }
         }
@@ -1606,9 +1603,10 @@ impl VectorizingOptimizer {
                 // vector.py:399: memref_a.is_adjacent_after(memref_b)
                 if memref_a.is_adjacent_after(memref_b) {
                     // vector.py:400-401: packset.can_be_packed(node_a, node_b, None, False)
-                    match packset.can_be_packed(state, node_a, node_b, None, false, graph) {
-                        Ok(Some(pair)) => packset.add_pack(pair),
-                        _ => {}
+                    if let Ok(Some(pair)) =
+                        packset.can_be_packed(state, node_a, node_b, None, false, graph)
+                    {
+                        packset.add_pack(pair)
                     }
                 }
             }
@@ -2271,10 +2269,11 @@ impl VectorLoop {
             if let Some(rc) = produced.get(&renamed) {
                 return Operand::from_bound_op(rc);
             }
-            if !renamed.is_constant() && !renamed.is_none() {
-                if let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed) {
-                    return Operand::from_bound_op(rc);
-                }
+            if !renamed.is_constant()
+                && !renamed.is_none()
+                && let Some(rc) = original_body.iter().find(|op| op.pos.get() == renamed)
+            {
+                return Operand::from_bound_op(rc);
             }
             renamer.bound_box(renamed)
         }
@@ -2405,17 +2404,17 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                     .getvector_of_box(arg.to_opref())
                     .map(|(_, vec_ref)| vec_ref)
                     .unwrap_or(arg.to_opref());
-                if let Some(descr) = op.getdescr() {
-                    if let Some(fail_descr) = descr.as_fail_descr() {
-                        fail_descr.attach_vector_info(majit_ir::AccumInfo {
-                            prev: None,
-                            failargs_pos: fi,
-                            variable: arg.to_opref(),
-                            location,
-                            accum_operation: entry.operator,
-                            scalar: OpRef::NONE,
-                        });
-                    }
+                if let Some(descr) = op.getdescr()
+                    && let Some(fail_descr) = descr.as_fail_descr()
+                {
+                    fail_descr.attach_vector_info(majit_ir::AccumInfo {
+                        prev: None,
+                        failargs_pos: fi,
+                        variable: arg.to_opref(),
+                        location,
+                        accum_operation: entry.operator,
+                        scalar: OpRef::NONE,
+                    });
                 }
                 // schedule.py:656-657: failargs[i] = renamer.rename_map.get(seed,
                 // seed) — a rename hit installs the bound renamed producer, a miss
@@ -2472,24 +2471,24 @@ pub(crate) fn ensure_args_unpacked(
         }
     }
     // schedule.py:708-716: unpack guard failargs
-    if op.opcode.is_guard() {
-        if let Some(mut fail_args) = op.getfailargs() {
-            for arg in fail_args.iter_mut() {
-                if arg.is_constant() || seen.contains(&arg.to_opref()) {
+    if op.opcode.is_guard()
+        && let Some(mut fail_args) = op.getfailargs()
+    {
+        for arg in fail_args.iter_mut() {
+            if arg.is_constant() || seen.contains(&arg.to_opref()) {
+                continue;
+            }
+            if let Some((pos, vec_ref)) = state.getvector_of_box(arg.to_opref()) {
+                if state.accumulation.contains_key(&arg.to_opref()) {
                     continue;
                 }
-                if let Some((pos, vec_ref)) = state.getvector_of_box(arg.to_opref()) {
-                    if state.accumulation.contains_key(&arg.to_opref()) {
-                        continue;
-                    }
-                    let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
-                    state.renamer.start_renaming(arg.to_opref(), unpacked);
-                    seen.insert(unpacked);
-                    *arg = state.bound_arg_boxref(unpacked);
-                }
+                let unpacked = unpack_from_vector(state, vec_ref, pos, 1);
+                state.renamer.start_renaming(arg.to_opref(), unpacked);
+                seen.insert(unpacked);
+                *arg = state.bound_arg_boxref(unpacked);
             }
-            op.setfailargs(fail_args);
         }
+        op.setfailargs(fail_args);
     }
 }
 

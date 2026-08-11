@@ -13,6 +13,51 @@
 //! (flowspace/operation.py ↔ annotator, annotator/annrpython.py ↔
 //! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
+// These shapes mirror RPython's graph objects, translation APIs, and control
+// flow. In particular, identity-bearing graph values are intentional map keys;
+// enum variants, constructor names, arithmetic helpers, indexed loops, and
+// sentinel expressions retain their upstream form; and the port preserves
+// upstream function boundaries instead of bundling arguments. Changing those
+// solely for Rust style lints would break the line-by-line parity required of
+// this crate.
+#![allow(
+    clippy::approx_constant,
+    clippy::arc_with_non_send_sync,
+    clippy::assertions_on_constants,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::empty_line_after_doc_comments,
+    clippy::eq_op,
+    clippy::field_reassign_with_default,
+    clippy::if_same_then_else,
+    clippy::large_enum_variant,
+    clippy::len_without_is_empty,
+    clippy::manual_find,
+    clippy::manual_memcpy,
+    clippy::match_like_matches_macro,
+    clippy::match_single_binding,
+    clippy::module_inception,
+    clippy::mutable_key_type,
+    clippy::needless_range_loop,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::new_ret_no_self,
+    clippy::no_effect,
+    clippy::obfuscated_if_else,
+    clippy::only_used_in_recursion,
+    clippy::ptr_arg,
+    clippy::question_mark,
+    clippy::result_large_err,
+    clippy::result_unit_err,
+    clippy::should_implement_trait,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_sort_by,
+    clippy::unnecessary_unwrap,
+    clippy::vec_init_then_push,
+    clippy::while_let_loop
+)]
+
 pub mod annotator;
 pub mod codewriter;
 pub mod config;
@@ -1219,7 +1264,7 @@ fn analyze_pipeline_from_module_paths(
     // disables `_jit_look_inside_` etc. for module-qualified callers,
     // which `CallControl::find_all_graphs` looks up by callee path.
     for func in &program.functions {
-        if !func.self_ty_root.is_none() || func.hints.is_empty() {
+        if func.self_ty_root.is_some() || func.hints.is_empty() {
             continue;
         }
         let graph = match &func.return_type {
@@ -1682,7 +1727,7 @@ fn analyze_pipeline_from_module_paths(
         // registered above carries a graph.
         let graph: model::FunctionGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
-            .map(|g| g.clone())
+            .cloned()
             .unwrap_or_else(|| method_info.graph.clone());
         // Pair the graph with the method's hints so the BFS-driven
         // `look_inside_graph` synthesises a `SemanticFunction` whose
@@ -1799,10 +1844,8 @@ fn analyze_pipeline_from_module_paths(
                     }
                     // RPython: random_effects_on_gcobjs is on external funcobj only.
                     // Only register for paths WITHOUT a graph (external functions).
-                    "gc_effects" => {
-                        if !call_control.function_graphs().contains_key(p) {
-                            call_control.mark_external_gc_effects(p.clone());
-                        }
+                    "gc_effects" if !call_control.function_graphs().contains_key(p) => {
+                        call_control.mark_external_gc_effects(p.clone());
                     }
                     _ => {}
                 }

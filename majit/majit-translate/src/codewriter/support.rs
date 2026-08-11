@@ -402,10 +402,10 @@ fn parse_literal_slot(
         return NormalizeSlot::ConstInt(n);
     }
     // Float literal — `1.5`, `2.0e3`, `.5`, `inf`, etc.
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        if let Ok(f) = s.parse::<f64>() {
-            return NormalizeSlot::ConstFloat(f.to_bits());
-        }
+    if (s.contains('.') || s.contains('e') || s.contains('E'))
+        && let Ok(f) = s.parse::<f64>()
+    {
+        return NormalizeSlot::ConstFloat(f.to_bits());
     }
     panic!(
         "parse_oopspec: slot {s:?} in spec {spec:?} is neither a known argname \
@@ -724,10 +724,10 @@ pub fn builtin_func_for_spec(
 
     // `support.py:771-774`: try: return rtyper._builtin_func_for_spec_cache[key]
     //                       except (KeyError, AttributeError): pass
-    if let Some(cc) = call_control {
-        if let Some(cached) = cc.lookup_builtin_func_for_spec_cache(&key) {
-            return cached;
-        }
+    if let Some(cc) = call_control
+        && let Some(cached) = cc.lookup_builtin_func_for_spec_cache(&key)
+    {
+        return cached;
     }
 
     // `support.py:775`: args_s = [lltype_to_annotation(v) for v in ll_args]

@@ -147,7 +147,7 @@ fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) ->
 /// versus the JIT), only without any JIT machinery.
 fn clean_interp(program: &Code, base_a: i64, base_b: i64, n: i64) -> f64 {
     let mut i = 0i64;
-    let mut regs = vec![0.0f64; NUM_REGS];
+    let mut regs = [0.0f64; NUM_REGS];
     let mut pc = 0usize;
     loop {
         match program[pc] {
@@ -490,8 +490,8 @@ mod twobank {
     }
 
     fn clean_twobank(program: &Code) -> i64 {
-        let mut regs = vec![0i64; NUM_INT];
-        let mut fregs = vec![0.0f64; NUM_FLOAT];
+        let mut regs = [0i64; NUM_INT];
+        let mut fregs = [0.0f64; NUM_FLOAT];
         let mut pc = 0usize;
         loop {
             match program[pc] {

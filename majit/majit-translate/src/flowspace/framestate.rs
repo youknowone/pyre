@@ -173,11 +173,7 @@ impl FrameState {
         data.extend(self.locals_w.iter().cloned());
         // RPython `recursively_flatten(self.stack)` — signals on the
         // stack unwrap into their `args`.
-        data.extend(
-            recursively_flatten(&self.stack)
-                .into_iter()
-                .map(|h| Some(h)),
-        );
+        data.extend(recursively_flatten(&self.stack).into_iter().map(Some));
         // `[exc_type, exc_value]` tail per upstream — `Constant(None)`
         // sentinels when there is no pending exception.
         match &self.last_exception {

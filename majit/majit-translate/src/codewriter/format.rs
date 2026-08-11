@@ -314,7 +314,7 @@ pub fn assert_format(ssarepr: &SSARepr, expected: &str) {
     for (asm_line, exp_line) in asm_lines.iter().zip(exp_lines.iter()) {
         if asm_line != exp_line {
             let mut msg = String::new();
-            msg.push_str("\n");
+            msg.push('\n');
             let _ = writeln!(msg, "Got:      {asm_line}");
             let _ = writeln!(msg, "Expected: {exp_line}");
             let mut common = 0usize;

@@ -46,7 +46,7 @@ pub fn fits_tagged(value: i64) -> bool {
     // range; on wasm32 it narrows to a 31-bit signed payload.
     const LO: i64 = (isize::MIN >> 1) as i64;
     const HI: i64 = (isize::MAX >> 1) as i64;
-    value >= LO && value <= HI
+    (LO..=HI).contains(&value)
 }
 
 /// `ll_int_to_unboxed` — reinterpret `(value << 1) | 1` as a pointer.

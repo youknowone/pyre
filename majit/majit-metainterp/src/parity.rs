@@ -90,7 +90,7 @@ pub fn normalize_trace(trace: &TreeLoop, constants: &IndexMap<u32, i64>) -> Vec<
         // are concrete InputArgInt/InputArgFloat/InputArgRef instances;
         // pre-number the matching typed OpRef so later render_arg hits
         // reuse these IDs.
-        vars.id_for(OpRef::input_arg_typed(inputarg.index as u32, inputarg.tp));
+        vars.id_for(OpRef::input_arg_typed(inputarg.index, inputarg.tp));
     }
     trace
         .ops

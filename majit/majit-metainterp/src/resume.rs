@@ -372,6 +372,12 @@ pub struct SimpleBoxEnv {
     box_cache: std::cell::RefCell<indexmap::IndexMap<majit_ir::OpRef, majit_ir::operand::Operand>>,
 }
 
+impl Default for SimpleBoxEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SimpleBoxEnv {
     pub fn new() -> Self {
         SimpleBoxEnv {
@@ -1563,7 +1569,7 @@ pub fn rd_virtual_to_virtual_info(
                 .map(|&tagged| rd_virtual_field_source(tagged))
                 .unwrap_or(ResumeValueSource::Unavailable);
             VirtualInfo::VRawSlice {
-                offset: *offset as i64,
+                offset: *offset,
                 parent,
             }
         }
@@ -2012,7 +2018,7 @@ impl EncodedResumeData {
         }
         // resume.py:243-247: vref_array (pairs).
         assert!(
-            vref_array.len() % 2 == 0,
+            vref_array.len().is_multiple_of(2),
             "vref_array must have even length (pairs)"
         );
         rd_numb.push(encode_len(vref_array.len() / 2));
@@ -3637,15 +3643,15 @@ impl ResumeDataLoopMemo {
                                 return t;
                             }
                             if let Some(t) = new_liveboxes.get(&b) {
-                                if tagged_eq(t, UNASSIGNED) {
-                                    if let Some(&num) = self.cached_boxes.get(&b) {
-                                        return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
-                                    }
+                                if tagged_eq(t, UNASSIGNED)
+                                    && let Some(&num) = self.cached_boxes.get(&b)
+                                {
+                                    return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
                                 }
-                                if tagged_eq(t, UNASSIGNEDVIRTUAL) {
-                                    if let Some(&num) = self.cached_virtuals.get(&b) {
-                                        return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
-                                    }
+                                if tagged_eq(t, UNASSIGNEDVIRTUAL)
+                                    && let Some(&num) = self.cached_virtuals.get(&b)
+                                {
+                                    return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
                                 }
                                 return t;
                             }
@@ -3780,15 +3786,15 @@ impl ResumeDataLoopMemo {
         }
         if let Some(tagged) = new_liveboxes.get(&b) {
             // Resolve UNASSIGNED to real cached number
-            if tagged_eq(tagged, UNASSIGNED) {
-                if let Some(&num) = self.cached_boxes.get(&b) {
-                    return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
-                }
+            if tagged_eq(tagged, UNASSIGNED)
+                && let Some(&num) = self.cached_boxes.get(&b)
+            {
+                return tag(num, TAGBOX).unwrap_or(UNASSIGNED);
             }
-            if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                if let Some(&num) = self.cached_virtuals.get(&b) {
-                    return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
-                }
+            if tagged_eq(tagged, UNASSIGNEDVIRTUAL)
+                && let Some(&num) = self.cached_virtuals.get(&b)
+            {
+                return tag(num, TAGVIRTUAL).unwrap_or(UNASSIGNEDVIRTUAL);
             }
             return tagged;
         }
@@ -4311,7 +4317,7 @@ impl ResumeDataLoopMemo {
         }
         // resume.py:243-247: vref_array (pairs).
         assert!(
-            rd.vref_array.len() % 2 == 0,
+            rd.vref_array.len().is_multiple_of(2),
             "vref_array must have even length (pairs)"
         );
         rd_numb.push(encode_len(rd.vref_array.len() / 2));
@@ -4351,7 +4357,7 @@ impl ResumeDataLoopMemo {
         // resume.py:420-430: walk pending fields — register + encode.
         // Collect first, then encode — can't hold iter borrow and call
         // `&mut self` method in the same expression.
-        let pending_fields_snapshot: Vec<_> = rd.pending_fields.iter().cloned().collect();
+        let pending_fields_snapshot: Vec<_> = rd.pending_fields.to_vec();
         let rd_pendingfields: Vec<_> = pending_fields_snapshot
             .into_iter()
             .map(|pending| EncodedPendingFieldWrite {
@@ -6062,11 +6068,11 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 let is_pointers = arraydescr
                     .as_ref()
                     .and_then(|d| d.as_array_descr())
-                    .map_or(false, |ad| ad.is_array_of_pointers());
+                    .is_some_and(|ad| ad.is_array_of_pointers());
                 let is_floats = arraydescr
                     .as_ref()
                     .and_then(|d| d.as_array_descr())
-                    .map_or(false, |ad| ad.is_array_of_floats());
+                    .is_some_and(|ad| ad.is_array_of_floats());
                 if let Some(ad) = arraydescr.as_ref() {
                     for (i, source) in items.iter().enumerate() {
                         // decode_field_source may materialize a nested virtual
@@ -6122,7 +6128,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                         fields.len(),
                         fielddescrs.len()
                     );
-                    for (j, &(_, ref source)) in fields.iter().enumerate() {
+                    for (j, (_, source)) in fields.iter().enumerate() {
                         if virtual_source_is_uninitialized(source) {
                             continue;
                         }
@@ -6860,7 +6866,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it.by_ref() {
                 let value = self.next_int();
                 if bh_debug {
                     eprintln!("[bh-seed] i{reg_idx} = {value}");
@@ -6873,7 +6879,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it.by_ref() {
                 let value = self.next_ref_for_resume_slot();
                 if bh_debug {
                     eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
@@ -6889,7 +6895,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it {
                 let value = self.next_float();
                 // resume.py:1596-1597 `write_a_float`.
                 bh.setarg_f(reg_idx as usize, value);
@@ -6931,7 +6937,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it.by_ref() {
                 let value = self.next_int();
                 cb(majit_ir::Type::Int, reg_idx, value);
             }
@@ -6940,7 +6946,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it.by_ref() {
                 let value = self.next_ref_for_resume_slot();
                 cb(majit_ir::Type::Ref, reg_idx, value);
             }
@@ -6949,7 +6955,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while let Some(reg_idx) = it.next() {
+            for reg_idx in it {
                 let value = self.next_float();
                 cb(majit_ir::Type::Float, reg_idx, value);
             }
@@ -7309,10 +7315,10 @@ impl<'a> ResumeDataDirectReader<'a> {
     ) {
         let is_pointer = descr
             .as_interior_field_descr()
-            .map_or(false, |ifd| ifd.field_descr().is_pointer_field());
+            .is_some_and(|ifd| ifd.field_descr().is_pointer_field());
         let is_float = descr
             .as_interior_field_descr()
-            .map_or(false, |ifd| ifd.field_descr().is_float_field());
+            .is_some_and(|ifd| ifd.field_descr().is_float_field());
         // decode_field_source* may materialize a nested virtual and relocate
         // the array; re-read the forwarded pointer from the rooted cache slot
         // before the write (same hazard as abstract_virtual_struct_info_setfields).
@@ -7440,7 +7446,7 @@ pub fn read_frame_liveness_reg_indices(
         }
         let mut it = LivenessIterator::new(*offset, length, all_liveness);
         let mut out = Vec::with_capacity(length as usize);
-        while let Some(reg_idx) = it.next() {
+        for reg_idx in it.by_ref() {
             out.push(reg_idx);
         }
         *offset = it.offset;

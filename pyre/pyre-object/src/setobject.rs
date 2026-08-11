@@ -48,7 +48,7 @@ pub unsafe fn is_set_iterator(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &SET_ITERATOR_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &SET_ITERATOR_TYPE)
 }
 
 #[inline]
@@ -875,7 +875,7 @@ unsafe fn w_set_insert_key_into(
         return Ok(());
     }
     let entries = &mut *items;
-    let hash = entries.hasher().hash_one(&key);
+    let hash = entries.hasher().hash_one(key);
     match entries.raw_entry_mut_v1().from_hash(hash, |_| false) {
         RawEntryMut::Vacant(entry) => {
             entry.insert_hashed_nocheck(hash, key, ());

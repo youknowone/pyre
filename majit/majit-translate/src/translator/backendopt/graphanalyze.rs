@@ -482,7 +482,7 @@ where
             // self.analyze_link(exit, seen)`. Snapshot the exits so
             // the inner `borrow()` is dropped before analyzers reach
             // back into the block.
-            let exits: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+            let exits: Vec<LinkRef> = block.borrow().exits.to_vec();
             for exit in &exits {
                 result = R::add_to_result(result, analyzer.analyze_link(exit, Some(seen)));
                 if R::is_top_result(&result) {
@@ -743,7 +743,7 @@ mod tests {
         let graph = empty_graph("entry");
         translator.graphs.borrow_mut().push(graph.clone());
         let mut analyzer = TrivialAnalyzer::new(&translator);
-        assert_eq!(analyzer.analyze_direct_call(&graph, None), false);
+        assert!(!analyzer.analyze_direct_call(&graph, None));
     }
 
     #[test]
@@ -759,6 +759,6 @@ mod tests {
             Hlvalue::Variable(Variable::named("result")),
         );
 
-        assert_eq!(analyzer.analyze(&op, None, &()), true);
+        assert!(analyzer.analyze(&op, None, &()));
     }
 }

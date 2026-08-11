@@ -151,9 +151,8 @@ impl ShortPreamble {
             exported_state.walk_const_ptr_refs_mut(visitor);
         }
         for (_, konst) in self.constants.iter_mut() {
-            match konst {
-                majit_ir::Const::Ref(gcref) => visitor(gcref),
-                _ => {}
+            if let majit_ir::Const::Ref(gcref) = konst {
+                visitor(gcref)
             }
         }
         for info in self.inputarg_infos.iter_mut().flatten() {
@@ -626,7 +625,7 @@ impl ShortBoxes {
 
     /// RPython parity: check if opref is reachable in the short preamble.
     pub fn is_reachable(&self, opref: OpRef) -> bool {
-        self.label_args.iter().any(|&a| a == opref)
+        self.label_args.contains(&opref)
             || opref.is_constant()
             || self.potential_op_oprefs.contains(&opref)
     }
@@ -1879,19 +1878,19 @@ impl ProducedShortOp {
         } else {
             let pop_for_array = pop.clone();
             ctx.with_ensured_ptr_info_arg0(&getarrayitem_op, |mut array_info| {
-                if let Some(mut info) = array_info.as_mut() {
-                    if let crate::optimizeopt::info::PtrInfo::Array(array_info) = &mut *info {
-                        let _ = array_info.lenbound.make_gt_const(index);
-                        let idx = index as usize;
-                        if idx >= array_info.items.len() {
-                            array_info.items.resize(
-                                idx + 1,
-                                crate::optimizeopt::info::FieldEntry::Value(Operand::None),
-                            );
-                        }
-                        array_info.items[idx] =
-                            crate::optimizeopt::info::FieldEntry::Preamble(pop_for_array);
+                if let Some(mut info) = array_info.as_mut()
+                    && let crate::optimizeopt::info::PtrInfo::Array(array_info) = &mut *info
+                {
+                    let _ = array_info.lenbound.make_gt_const(index);
+                    let idx = index as usize;
+                    if idx >= array_info.items.len() {
+                        array_info.items.resize(
+                            idx + 1,
+                            crate::optimizeopt::info::FieldEntry::Value(Operand::None),
+                        );
                     }
+                    array_info.items[idx] =
+                        crate::optimizeopt::info::FieldEntry::Preamble(pop_for_array);
                 }
             });
         }
@@ -2109,7 +2108,7 @@ impl AbstractShortPreambleBuilderState {
             let arg_opref = arg.to_opref();
             if self.short_results.contains(&arg_opref)
                 || already_in_short.contains(&arg_opref)
-                || self.short_inputargs.iter().any(|a| *a == arg_opref)
+                || self.short_inputargs.contains(&arg_opref)
                 || self.known_constants.contains(&arg_opref)
             {
                 continue;
@@ -2664,11 +2663,11 @@ impl ExtendedShortPreambleBuilder {
             for &(arg_pos, label_idx) in &entry.arg_mapping {
                 if let Some(phase1_ref) = entry.op.getarglist().get(arg_pos) {
                     let phase1_ref = phase1_ref.to_opref();
-                    if let Some(&current_inputarg) = label_args.get(label_idx) {
-                        if phase1_ref != current_inputarg {
-                            self.phase1_to_inputarg
-                                .insert(phase1_ref, ctx.materialize_operand_at(current_inputarg));
-                        }
+                    if let Some(&current_inputarg) = label_args.get(label_idx)
+                        && phase1_ref != current_inputarg
+                    {
+                        self.phase1_to_inputarg
+                            .insert(phase1_ref, ctx.materialize_operand_at(current_inputarg));
                     }
                 }
             }
@@ -3137,7 +3136,7 @@ impl ExtendedShortPreambleBuilder {
             for arg in preamble_op.getarglist().iter() {
                 let arg = arg.to_opref();
                 if self.short_results.contains(&arg)
-                    || self.short_inputargs.iter().any(|a| *a == arg)
+                    || self.short_inputargs.contains(&arg)
                     || self.known_constants.contains(&arg)
                 {
                     continue;

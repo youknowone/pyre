@@ -8880,7 +8880,7 @@ mod tests {
         let result = iter_repr
             .rtype_next(&hop)
             .unwrap_or_else(|err| panic!("dict next: {err:?}"));
-        assert!(matches!(result, Some(_)));
+        assert!(result.is_some());
         let ops = llops.borrow();
         let opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
         assert_eq!(

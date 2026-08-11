@@ -98,10 +98,10 @@ fn pick_next_numbered_path(root: &Path, prefix: &str) -> std::io::Result<PathBuf
             Ok(n) => n,
             Err(_) => continue,
         };
-        if let Some(suffix) = name.strip_prefix(prefix) {
-            if let Ok(n) = suffix.parse::<u32>() {
-                highest = Some(highest.map_or(n, |cur| cur.max(n)));
-            }
+        if let Some(suffix) = name.strip_prefix(prefix)
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            highest = Some(highest.map_or(n, |cur| cur.max(n)));
         }
     }
     let next = highest.map_or(0, |n| n + 1);
@@ -127,10 +127,10 @@ fn cleanup_older_numbered_dirs(
             Ok(n) => n,
             Err(_) => continue,
         };
-        if let Some(suffix) = name.strip_prefix(prefix) {
-            if let Ok(n) = suffix.parse::<u32>() {
-                entries.push((n, path));
-            }
+        if let Some(suffix) = name.strip_prefix(prefix)
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            entries.push((n, path));
         }
     }
     entries.sort_by_key(|(n, _)| *n);
@@ -259,10 +259,10 @@ mod tests {
         for entry in fs::read_dir(root.path()).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().into_string().unwrap();
-            if let Some(s) = name.strip_prefix("usession-x-") {
-                if let Ok(n) = s.parse::<u32>() {
-                    numbered.push(n);
-                }
+            if let Some(s) = name.strip_prefix("usession-x-")
+                && let Ok(n) = s.parse::<u32>()
+            {
+                numbered.push(n);
             }
         }
         numbered.sort();

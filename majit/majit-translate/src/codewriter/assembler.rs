@@ -2384,10 +2384,10 @@ impl Assembler {
         // RPython assembler.py:217-219: record result type position.
         // If argcodes contains '>', the last char is the result kind,
         // and we record the current code length as the result position.
-        if argcodes.contains('>') {
-            if let Some(reskind) = argcodes.chars().last() {
-                state.resulttypes.insert(state.code.len(), reskind);
-            }
+        if argcodes.contains('>')
+            && let Some(reskind) = argcodes.chars().last()
+        {
+            state.resulttypes.insert(state.code.len(), reskind);
         }
     }
 
@@ -2640,18 +2640,18 @@ impl Assembler {
         // a KINDS-ordered scan with a single-class assertion.
         let mut found: Option<(u8, RegKind)> = None;
         for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-            if let Some(ra) = regallocs.get(&kind) {
-                if let Some(&color) = ra.coloring.get(var) {
-                    if let Some((_, prev)) = found {
-                        panic!(
-                            "lookup_coloring: value {var:?} colored in multiple regalloc \
+            if let Some(ra) = regallocs.get(&kind)
+                && let Some(&color) = ra.coloring.get(var)
+            {
+                if let Some((_, prev)) = found {
+                    panic!(
+                        "lookup_coloring: value {var:?} colored in multiple regalloc \
                              classes ({prev:?} and {kind:?}) — RPython `getkind` must \
                              give exactly one (graph={:?}, op={:?})",
-                            self.current_graph_name, self.current_flatop_debug,
-                        );
-                    }
-                    found = Some((color as u8, kind));
+                        self.current_graph_name, self.current_flatop_debug,
+                    );
                 }
+                found = Some((color as u8, kind));
             }
         }
         if let Some(result) = found {
@@ -3010,12 +3010,11 @@ impl Assembler {
         // the string's bytes + precomputed hash for runtime materialization
         // and pool a non-canonical sentinel that the jitcode-load pass
         // overwrites with the live immortal STR GcStruct address.
-        if let ConstValue::LLPtr(p) = value {
-            if let Some((bytes, hash)) =
+        if let ConstValue::LLPtr(p) = value
+            && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
-            {
-                return self.emit_str_const_r(bytes, hash, state);
-            }
+        {
+            return self.emit_str_const_r(bytes, hash, state);
         }
         let bits = match value {
             ConstValue::HostObject(obj) => obj.identity_id() as i64,
@@ -4264,10 +4263,10 @@ fn vable_arraydescrof(
 
 fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     let s = type_str.trim();
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        if start < end {
-            return Some(s[start + 1..end].trim().to_string());
-        }
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>'))
+        && start < end
+    {
+        return Some(s[start + 1..end].trim().to_string());
     }
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];

@@ -8,8 +8,8 @@ use rustpython_compiler_core::bytecode::CodeObject;
 /// object (the first function body). Panics if compilation fails or the
 /// source contains no function body.
 pub fn compile_first_code(src: &str) -> CodeObject {
-    let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
-        .expect("compile should succeed");
+    let module =
+        rp_compile(src, Mode::Exec, "<pyre>", Default::default()).expect("compile should succeed");
     module
         .constants
         .iter()

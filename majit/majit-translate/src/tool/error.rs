@@ -361,10 +361,10 @@ pub fn source_lines1(
 ) -> Vec<String> {
     let g = graph.borrow();
     // upstream: `if block is graph.returnblock: return ['<return block>']`.
-    if let Some(b) = block {
-        if Rc::ptr_eq(b, &g.returnblock) {
-            return vec!["<return block>".into()];
-        }
+    if let Some(b) = block
+        && Rc::ptr_eq(b, &g.returnblock)
+    {
+        return vec!["<return block>".into()];
     }
     // upstream: `source = graph.source`; attribute absent → ['no source!'].
     let source = match g.source() {
@@ -498,11 +498,11 @@ pub fn format_annotations(
     let mut args_and_result = oper.args.clone();
     args_and_result.push(oper.result.clone());
     for arg in &args_and_result {
-        if let Hlvalue::Variable(v) = arg {
-            if annotator.annotation(arg).is_some() {
-                let s = annotator.binding(arg);
-                msg.push(format!(" {} = {}", v, render_somevalue(&s)));
-            }
+        if let Hlvalue::Variable(v) = arg
+            && annotator.annotation(arg).is_some()
+        {
+            let s = annotator.binding(arg);
+            msg.push(format!(" {} = {}", v, render_somevalue(&s)));
         }
     }
     msg
@@ -567,11 +567,11 @@ pub fn gather_error(
         SHOW_DEFAULT_LINES_OF_CODE,
     ));
     // upstream: annotation dump.
-    if let Some(op) = &oper {
-        if SHOW_ANNOTATIONS {
-            msg.extend(format_annotations(annotator, op));
-            msg.push(String::new());
-        }
+    if let Some(op) = &oper
+        && SHOW_ANNOTATIONS
+    {
+        msg.extend(format_annotations(annotator, op));
+        msg.push(String::new());
     }
     msg.join("\n")
 }

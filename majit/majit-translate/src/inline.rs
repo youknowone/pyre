@@ -352,17 +352,17 @@ fn remap_callee_values(
                         .or_insert_with(|| graph.alloc_value_var());
                 }
             }
-            if let Some(arg) = &link.last_exception {
-                if let Some(var) = arg.as_variable() {
-                    map.entry(var.clone())
-                        .or_insert_with(|| graph.alloc_value_var());
-                }
+            if let Some(arg) = &link.last_exception
+                && let Some(var) = arg.as_variable()
+            {
+                map.entry(var.clone())
+                    .or_insert_with(|| graph.alloc_value_var());
             }
-            if let Some(arg) = &link.last_exc_value {
-                if let Some(var) = arg.as_variable() {
-                    map.entry(var.clone())
-                        .or_insert_with(|| graph.alloc_value_var());
-                }
+            if let Some(arg) = &link.last_exc_value
+                && let Some(var) = arg.as_variable()
+            {
+                map.entry(var.clone())
+                    .or_insert_with(|| graph.alloc_value_var());
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
@@ -399,7 +399,7 @@ fn remap_op(
     let remap_var = |var: &crate::flowspace::model::Variable| {
         value_map.get(var).cloned().unwrap_or_else(|| var.clone())
     };
-    let result = op.result.as_ref().map(|v| remap_var(v));
+    let result = op.result.as_ref().map(&remap_var);
     let kind = remap_op_kind(&op.kind, &remap_var);
     SpaceOperation { result, kind }
 }

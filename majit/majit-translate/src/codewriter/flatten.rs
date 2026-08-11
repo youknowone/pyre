@@ -912,10 +912,10 @@ impl<'a> GraphFlattener<'a> {
             };
             // `flatten.py:314 if v == w: continue` — color-level
             // identity skip (post-regalloc Register equality).
-            if let RegOrConst::Reg(src_r) = &src {
-                if *src_r == dst {
-                    continue;
-                }
+            if let RegOrConst::Reg(src_r) = &src
+                && *src_r == dst
+            {
+                continue;
             }
             lst.push((src, dst));
         }
@@ -1128,11 +1128,9 @@ impl<'a> GraphFlattener<'a> {
             // the real raising op.  When the trailing op is NOT `-live-`
             // (RPython's `index == -1`) the call did not declare
             // `can_raise` — emit only the normal link.
-            if !last_op_is_live {
-                if !self._include_all_exc_links {
-                    self.make_link(&exits[0], false);
-                    return;
-                }
+            if !last_op_is_live && !self._include_all_exc_links {
+                self.make_link(&exits[0], false);
+                return;
             }
             // `flatten.py:220-238`: emit `catch_exception` then the
             // normal-link body, then iterate the typed exception links.
@@ -1297,7 +1295,7 @@ impl<'a> GraphFlattener<'a> {
             //       self.emitline(Label(switch))
             //       self.emitline('-live-')
             //       self.make_link(switch, handling_ovf)
-            for ((_, link), (_, landing)) in switches.into_iter().zip(targets.into_iter()) {
+            for ((_, link), (_, landing)) in switches.into_iter().zip(targets) {
                 self.emitline(FlatOp::Label(landing));
                 self.emitline(FlatOp::Live {
                     live_values: Vec::new(),
@@ -1356,17 +1354,17 @@ fn lookup_kind_color(
 ) -> Option<(RegKind, usize)> {
     let mut found: Option<(RegKind, usize)> = None;
     for kind in KINDS {
-        if let Some(ra) = regallocs.get(&kind) {
-            if let Some(color) = ra.color_for_variable(var) {
-                if let Some((prev_kind, _)) = found {
-                    panic!(
-                        "lookup_kind_color: Variable {var:?} colored in multiple regalloc \
+        if let Some(ra) = regallocs.get(&kind)
+            && let Some(color) = ra.color_for_variable(var)
+        {
+            if let Some((prev_kind, _)) = found {
+                panic!(
+                    "lookup_kind_color: Variable {var:?} colored in multiple regalloc \
                          classes ({prev_kind:?} and {kind:?}) — RPython `getkind` must \
                          give exactly one",
-                    );
-                }
-                found = Some((kind, color));
+                );
             }
+            found = Some((kind, color));
         }
     }
     found
@@ -1385,17 +1383,17 @@ fn lookup_kind_color(
 fn value_kind(var: &Variable, regallocs: &HashMap<RegKind, RegAllocator>) -> char {
     let mut found: Option<RegKind> = None;
     for kind in KINDS {
-        if let Some(ra) = regallocs.get(&kind) {
-            if ra.contains_variable(var) {
-                if let Some(prev) = found {
-                    panic!(
-                        "value_kind: Variable {var:?} colored in multiple regalloc \
+        if let Some(ra) = regallocs.get(&kind)
+            && ra.contains_variable(var)
+        {
+            if let Some(prev) = found {
+                panic!(
+                    "value_kind: Variable {var:?} colored in multiple regalloc \
                          classes ({prev:?} and {kind:?}) — RPython `getkind` must \
                          give exactly one",
-                    );
-                }
-                found = Some(kind);
+                );
             }
+            found = Some(kind);
         }
     }
     match found {

@@ -1438,6 +1438,12 @@ impl VectorizationInfo {
     }
 }
 
+impl Default for VectorizationInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn type_to_vector_datatype(tp: Type) -> char {
     match tp {
         Type::Int => 'i',
@@ -2185,37 +2191,37 @@ impl OpCode {
     #[allow(clippy::absurd_extreme_comparisons)]
     pub fn is_final(self) -> bool {
         let n = self.as_u16();
-        FINAL_FIRST <= n && n <= FINAL_LAST
+        (FINAL_FIRST..=FINAL_LAST).contains(&n)
     }
 
     pub fn is_guard(self) -> bool {
         let n = self.as_u16();
-        GUARD_FIRST <= n && n <= GUARD_LAST
+        (GUARD_FIRST..=GUARD_LAST).contains(&n)
     }
 
     pub fn is_foldable_guard(self) -> bool {
         let n = self.as_u16();
-        GUARD_FOLDABLE_FIRST <= n && n <= GUARD_FOLDABLE_LAST
+        (GUARD_FOLDABLE_FIRST..=GUARD_FOLDABLE_LAST).contains(&n)
     }
 
     pub fn is_always_pure(self) -> bool {
         let n = self.as_u16();
-        ALWAYS_PURE_FIRST <= n && n <= ALWAYS_PURE_LAST
+        (ALWAYS_PURE_FIRST..=ALWAYS_PURE_LAST).contains(&n)
     }
 
     pub fn has_no_side_effect(self) -> bool {
         let n = self.as_u16();
-        NOSIDEEFFECT_FIRST <= n && n <= NOSIDEEFFECT_LAST
+        (NOSIDEEFFECT_FIRST..=NOSIDEEFFECT_LAST).contains(&n)
     }
 
     pub fn is_malloc(self) -> bool {
         let n = self.as_u16();
-        MALLOC_FIRST <= n && n <= MALLOC_LAST
+        (MALLOC_FIRST..=MALLOC_LAST).contains(&n)
     }
 
     pub fn is_call(self) -> bool {
         let n = self.as_u16();
-        CALL_FIRST <= n && n <= CALL_LAST
+        (CALL_FIRST..=CALL_LAST).contains(&n)
     }
 
     /// resoperation.py:1434 `OpHelpers.is_real_call`.
@@ -2228,7 +2234,7 @@ impl OpCode {
 
     pub fn can_raise(self) -> bool {
         let n = self.as_u16();
-        CANRAISE_FIRST <= n && n <= CANRAISE_LAST
+        (CANRAISE_FIRST..=CANRAISE_LAST).contains(&n)
     }
 
     pub fn can_malloc(self) -> bool {
@@ -2237,7 +2243,7 @@ impl OpCode {
 
     pub fn is_ovf(self) -> bool {
         let n = self.as_u16();
-        OVF_FIRST <= n && n <= OVF_LAST
+        (OVF_FIRST..=OVF_LAST).contains(&n)
     }
 
     pub fn is_raw_load(self) -> bool {
@@ -2340,7 +2346,7 @@ impl OpCode {
 
     pub fn is_jit_debug(self) -> bool {
         let n = self.as_u16();
-        JIT_DEBUG_FIRST <= n && n <= JIT_DEBUG_LAST
+        (JIT_DEBUG_FIRST..=JIT_DEBUG_LAST).contains(&n)
     }
 
     pub fn is_comparison(self) -> bool {

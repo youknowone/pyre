@@ -35,7 +35,7 @@ fn set_param(
     // interp_jit.py:151-156 — positional string → set_user_param(None, text).
     if let Some(&text_obj) = pos.first() {
         let text = crate::baseobjspace::text_w(text_obj)?;
-        if crate::call::set_jit_param_string(&text).is_err() {
+        if crate::call::set_jit_param_string(text).is_err() {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
                 "error in JIT parameters string".to_string(),
@@ -89,6 +89,6 @@ fn set_param(
 crate::py_module! {
     "pypyjit",
     functions: {
-        "set_param" / * = |args| set_param(args),
+        "set_param" / * = set_param,
     }
 }

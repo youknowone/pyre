@@ -264,7 +264,7 @@ fn fatal(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
+fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     let mut config = Config::new();
     // Allow the interpreter's deep recursion before wasmtime raises a stack
     // overflow trap; the interpreter's own recursion limit normally fires
@@ -444,12 +444,11 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
             set_launch_env.call(&mut store, (p, blen))?;
             dealloc.call(&mut store, (p, blen))?;
         }
-    } else if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty()) {
-        if let Ok(set_safe_path) =
+    } else if std::env::var_os("PYTHONSAFEPATH").is_some_and(|value| !value.is_empty())
+        && let Ok(set_safe_path) =
             instance.get_typed_func::<u32, ()>(&mut store, "pyre_set_safe_path")
-        {
-            set_safe_path.call(&mut store, 1)?;
-        }
+    {
+        set_safe_path.call(&mut store, 1)?;
     }
 
     // The environment the collector sizes itself from, forwarded the same way
@@ -518,12 +517,11 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     // here for the usual reason, so the switch travels as a call. Absent on a
     // module predating the export, in which case the readout below finds
     // nothing and says so.
-    if std::env::var_os("PYRE_WASM_GUARD_CENSUS").is_some() {
-        if let Ok(arm) =
+    if std::env::var_os("PYRE_WASM_GUARD_CENSUS").is_some()
+        && let Ok(arm) =
             instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_guard_census_enable")
-        {
-            arm.call(&mut store, ())?;
-        }
+    {
+        arm.call(&mut store, ())?;
     }
 
     let src = source.as_bytes();
@@ -548,18 +546,18 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     if fuel_limit.is_some() {
         let _ = store.set_fuel(u64::MAX);
     }
-    if let Some(path) = &guest_profile_out {
-        if let Some(p) = store.data_mut().guest_profiler.take() {
-            match std::fs::File::create(path).context("create guest profile output") {
-                Ok(f) => match p
-                    .finish(std::io::BufWriter::new(f))
-                    .context("write guest profile")
-                {
-                    Ok(()) => eprintln!("[guest-profile] wrote {path}"),
-                    Err(err) => eprintln!("[guest-profile] failed to write {path}: {err:#}"),
-                },
-                Err(err) => eprintln!("[guest-profile] failed to create {path}: {err:#}"),
-            }
+    if let Some(path) = &guest_profile_out
+        && let Some(p) = store.data_mut().guest_profiler.take()
+    {
+        match std::fs::File::create(path).context("create guest profile output") {
+            Ok(f) => match p
+                .finish(std::io::BufWriter::new(f))
+                .context("write guest profile")
+            {
+                Ok(()) => eprintln!("[guest-profile] wrote {path}"),
+                Err(err) => eprintln!("[guest-profile] failed to write {path}: {err:#}"),
+            },
+            Err(err) => eprintln!("[guest-profile] failed to create {path}: {err:#}"),
         }
     }
     if std::env::var_os("PYRE_WASM_JIT_STATS").is_some() {
@@ -1018,24 +1016,24 @@ fn run(module_path: &PathBuf, source: &str, script: &Path) -> Result<i32> {
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a
     // module predating the export, in which case there is nothing to print.
-    if std::env::var_os("PYRE_WASM_FBW_CENSUS").is_some() {
-        if let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_census") {
-            let census_result: Result<()> = (|| {
-                let packed = census.call(&mut store, ())?;
-                let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
-                if clen != 0 {
-                    let mut bytes = vec![0u8; clen as usize];
-                    memory.read(&store, ptr as usize, &mut bytes)?;
-                    dealloc.call(&mut store, (ptr, clen))?;
-                    eprint!("{}", String::from_utf8_lossy(&bytes));
-                } else {
-                    eprintln!("[fbw-census] (no declines recorded)");
-                }
-                Ok(())
-            })();
-            if let Err(err) = census_result {
-                eprintln!("pyre-wasm-runner: fbw census failed: {err}");
+    if std::env::var_os("PYRE_WASM_FBW_CENSUS").is_some()
+        && let Ok(census) = instance.get_typed_func::<(), u64>(&mut store, "pyre_fbw_census")
+    {
+        let census_result: Result<()> = (|| {
+            let packed = census.call(&mut store, ())?;
+            let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+            if clen != 0 {
+                let mut bytes = vec![0u8; clen as usize];
+                memory.read(&store, ptr as usize, &mut bytes)?;
+                dealloc.call(&mut store, (ptr, clen))?;
+                eprint!("{}", String::from_utf8_lossy(&bytes));
+            } else {
+                eprintln!("[fbw-census] (no declines recorded)");
             }
+            Ok(())
+        })();
+        if let Err(err) = census_result {
+            eprintln!("pyre-wasm-runner: fbw census failed: {err}");
         }
     }
     // The per-guard deopt census armed before the run, printed in the shape
@@ -1127,14 +1125,12 @@ fn load_main_module(engine: &Engine, module_path: &Path) -> Result<Module> {
 
     let module = Module::new(engine, &wasm_bytes[..])
         .with_context(|| format!("load wasm module {}", module_path.display()))?;
-    if !cache_disabled {
-        if let Ok(bytes) = module.serialize() {
-            // Best-effort: a failed cache write only forgoes the speedup. Write
-            // the artifact before the key so an interrupted write never leaves a
-            // key pointing at a half-written `.cwasm`.
-            if std::fs::write(&cache_path, bytes).is_ok() {
-                let _ = std::fs::write(&key_path, &hash);
-            }
+    if !cache_disabled && let Ok(bytes) = module.serialize() {
+        // Best-effort: a failed cache write only forgoes the speedup. Write
+        // the artifact before the key so an interrupted write never leaves a
+        // key pointing at a half-written `.cwasm`.
+        if std::fs::write(&cache_path, bytes).is_ok() {
+            let _ = std::fs::write(&key_path, &hash);
         }
     }
     Ok(module)
@@ -1343,7 +1339,6 @@ fn host_read(
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
 /// module's linear memory and wiring the `jit_call` trampoline.
-
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
@@ -1463,15 +1458,15 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
         _ => 0,
     };
     // Diagnostic: record which (trace, guard-exit fail_index) round-tripped.
-    if std::env::var_os("PYRE_WASM_EXEC_TRACE").is_some() {
-        if let Some(mem) = caller.data().memory {
-            let fail_index = read_u32(&mem, &*caller, frame_ptr as usize);
-            *caller
-                .data_mut()
-                .exec_hist
-                .entry((func_id, fail_index))
-                .or_insert(0) += 1;
-        }
+    if std::env::var_os("PYRE_WASM_EXEC_TRACE").is_some()
+        && let Some(mem) = caller.data().memory
+    {
+        let fail_index = read_u32(&mem, &*caller, frame_ptr as usize);
+        *caller
+            .data_mut()
+            .exec_hist
+            .entry((func_id, fail_index))
+            .or_insert(0) += 1;
     }
     Ok(ret)
 }

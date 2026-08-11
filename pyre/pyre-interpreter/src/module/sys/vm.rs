@@ -3126,12 +3126,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // pyopcode load_method dispatch), so the first arg may be the string
     // directly. Pick whichever element is a real str.
     fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
-        for &a in args {
-            if !a.is_null() && unsafe { is_str(a) } {
-                return Some(a);
-            }
-        }
-        None
+        args.iter().find(|&&a| !a.is_null() && unsafe { is_str(a) }).copied()
     }
     // Encode through `encode_object` with the stream's error handler so a lone
     // surrogate is routed there (stdout `strict` → UnicodeEncodeError; stderr

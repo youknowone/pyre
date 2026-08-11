@@ -444,7 +444,7 @@ fn rewrite_alias_args(sig: &mut syn::Signature) {
             continue;
         };
         if let Some(binding_ty) = typed_alias_binding_ty(&seg.ident.to_string()) {
-            pt.ty = Box::new(syn::parse2(binding_ty).expect("alias binding ty parses"));
+            *pt.ty = syn::parse2(binding_ty).expect("alias binding ty parses");
         }
     }
 }
@@ -679,12 +679,11 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
     // `Vec<u8>` binding.  Inner fn signatures get rewritten elsewhere so
     // the body's parameter type matches the binding type the alias
     // resolves to.
-    if let Type::Path(p) = ty {
-        if let Some(seg) = p.path.segments.last() {
-            if let Some((_, expr)) = typed_alias(&seg.ident.to_string(), idx) {
-                return Ok(expr);
-            }
-        }
+    if let Type::Path(p) = ty
+        && let Some(seg) = p.path.segments.last()
+        && let Some((_, expr)) = typed_alias(&seg.ident.to_string(), idx)
+    {
+        return Ok(expr);
     }
     // `&[PyObjectRef]` — pass the whole slice (varargs).
     // `&[u8]`        — bytes-like (bytes + bytearray) → `bytes_like_data`,
@@ -696,32 +695,32 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
             if type_is_py_object_ref(elem) {
                 return Ok(quote! { args });
             }
-            if let Type::Path(p) = elem {
-                if path_is_ident(&p.path, "u8") {
-                    return Ok(quote! {
-                        {
-                            if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
-                                return ::std::result::Result::Err(
-                                    crate::PyError::type_error(
-                                        format!("argument {} must be bytes-like", #idx)
-                                    )
-                                );
-                            }
-                            unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) }
+            if let Type::Path(p) = elem
+                && path_is_ident(&p.path, "u8")
+            {
+                return Ok(quote! {
+                    {
+                        if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
+                            return ::std::result::Result::Err(
+                                crate::PyError::type_error(
+                                    format!("argument {} must be bytes-like", #idx)
+                                )
+                            );
                         }
-                    });
-                }
+                        unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) }
+                    }
+                });
             }
         }
         // `&str` — borrow the utf-8 view.  A lone surrogate has no such view,
         // so it is reported as the `UnicodeEncodeError` the strict utf-8
         // encoder raises rather than demanding one.
-        if let Type::Path(p) = &*r.elem {
-            if path_is_ident(&p.path, "str") {
-                return Ok(quote! {
-                    crate::baseobjspace::str_utf8_w(args[#idx])?
-                });
-            }
+        if let Type::Path(p) = &*r.elem
+            && path_is_ident(&p.path, "str")
+        {
+            return Ok(quote! {
+                crate::baseobjspace::str_utf8_w(args[#idx])?
+            });
         }
     }
 
@@ -768,10 +767,9 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
 
     Err(syn::Error::new(
         ty.span(),
-        format!(
-            "#[pyre_function]: unsupported argument type — \
+        "#[pyre_function]: unsupported argument type — \
              add a mapping in pyre-macros/src/lib.rs::unwrap_expr"
-        ),
+            .to_string(),
     ))
 }
 
@@ -866,10 +864,10 @@ fn arity_message(
 /// slice).
 fn is_varargs_param(ty: &Type) -> bool {
     let ty = unwrap_type_group(ty);
-    if let Type::Reference(r) = ty {
-        if let Type::Slice(s) = &*r.elem {
-            return type_is_py_object_ref(unwrap_type_group(&s.elem));
-        }
+    if let Type::Reference(r) = ty
+        && let Type::Slice(s) = &*r.elem
+    {
+        return type_is_py_object_ref(unwrap_type_group(&s.elem));
     }
     false
 }
@@ -925,79 +923,78 @@ fn wrap_value_expr(
     if type_is_py_object_ref(ty) {
         return Ok(value);
     }
-    if let Type::Path(p) = ty {
-        if let Some(seg) = p.path.segments.last() {
-            let name = seg.ident.to_string();
-            match name.as_str() {
-                "i64" => return Ok(quote! { ::pyre_object::w_int_new(#value) }),
-                "i32" | "u32" | "usize" | "isize" | "u16" | "i16" | "u8" | "i8" => {
-                    return Ok(quote! { ::pyre_object::w_int_new((#value) as i64) });
-                }
-                "f64" => return Ok(quote! { ::pyre_object::w_float_new(#value) }),
-                "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
-                "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
-                // A method whose text may hold a lone surrogate — a `__repr__`
-                // naming a filename, say — returns the WTF-8 buffer itself
-                // rather than a `String` it cannot spell.
-                "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8(#value) }),
-                _ => {}
+    if let Type::Path(p) = ty
+        && let Some(seg) = p.path.segments.last()
+    {
+        let name = seg.ident.to_string();
+        match name.as_str() {
+            "i64" => return Ok(quote! { ::pyre_object::w_int_new(#value) }),
+            "i32" | "u32" | "usize" | "isize" | "u16" | "i16" | "u8" | "i8" => {
+                return Ok(quote! { ::pyre_object::w_int_new((#value) as i64) });
             }
-            // `Vec<T>` — bytes / list-of-X.
-            //   * `Vec<u8>`                        → bytes via w_bytes_from_bytes
-            //   * `Vec<PyObjectRef>`               → list passthrough
-            //   * `Vec<i64> / <i32> / <f64> / <String> / <bool>` →
-            //     wrap each element via `PywrapKind` then `w_list_new`.
-            // Mirrors PyPy `space.newlist([space.newint(x) for x in vec])`
-            // where the interp2app auto-wraps a Rust `[W_Root]` return
-            // through `space.newlist`.
-            if seg.ident == "Vec" {
-                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                        let inner = unwrap_type_group(inner);
-                        if let Type::Path(ip) = inner {
-                            if path_is_ident(&ip.path, "u8") {
-                                return Ok(quote! {
-                                    ::pyre_object::bytesobject::w_bytes_from_bytes(&#value)
-                                });
-                            }
-                            if type_is_py_object_ref(inner) {
-                                return Ok(quote! { ::pyre_object::w_list_new(#value) });
-                            }
-                            if let Some(last) = ip.path.segments.last() {
-                                let nm = last.ident.to_string();
-                                if matches!(
-                                    nm.as_str(),
-                                    "i64"
-                                        | "i32"
-                                        | "u32"
-                                        | "usize"
-                                        | "isize"
-                                        | "u16"
-                                        | "i16"
-                                        | "i8"
-                                        | "f64"
-                                        | "bool"
-                                        | "String"
-                                ) {
-                                    return Ok(quote! {
-                                        ::pyre_object::w_list_new(
-                                            (#value).into_iter()
-                                                .map(<_ as crate::PywrapKind>::into_py)
-                                                .collect()
-                                        )
-                                    });
-                                }
-                            }
-                        }
+            "f64" => return Ok(quote! { ::pyre_object::w_float_new(#value) }),
+            "bool" => return Ok(quote! { ::pyre_object::w_bool_from(#value) }),
+            "String" => return Ok(quote! { ::pyre_object::w_str_new(&#value) }),
+            // A method whose text may hold a lone surrogate — a `__repr__`
+            // naming a filename, say — returns the WTF-8 buffer itself
+            // rather than a `String` it cannot spell.
+            "Wtf8Buf" => return Ok(quote! { ::pyre_object::w_str_from_wtf8(#value) }),
+            _ => {}
+        }
+        // `Vec<T>` — bytes / list-of-X.
+        //   * `Vec<u8>`                        → bytes via w_bytes_from_bytes
+        //   * `Vec<PyObjectRef>`               → list passthrough
+        //   * `Vec<i64> / <i32> / <f64> / <String> / <bool>` →
+        //     wrap each element via `PywrapKind` then `w_list_new`.
+        // Mirrors PyPy `space.newlist([space.newint(x) for x in vec])`
+        // where the interp2app auto-wraps a Rust `[W_Root]` return
+        // through `space.newlist`.
+        if seg.ident == "Vec"
+            && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+            && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+        {
+            let inner = unwrap_type_group(inner);
+            if let Type::Path(ip) = inner {
+                if path_is_ident(&ip.path, "u8") {
+                    return Ok(quote! {
+                        ::pyre_object::bytesobject::w_bytes_from_bytes(&#value)
+                    });
+                }
+                if type_is_py_object_ref(inner) {
+                    return Ok(quote! { ::pyre_object::w_list_new(#value) });
+                }
+                if let Some(last) = ip.path.segments.last() {
+                    let nm = last.ident.to_string();
+                    if matches!(
+                        nm.as_str(),
+                        "i64"
+                            | "i32"
+                            | "u32"
+                            | "usize"
+                            | "isize"
+                            | "u16"
+                            | "i16"
+                            | "i8"
+                            | "f64"
+                            | "bool"
+                            | "String"
+                    ) {
+                        return Ok(quote! {
+                            ::pyre_object::w_list_new(
+                                (#value).into_iter()
+                                    .map(<_ as crate::PywrapKind>::into_py)
+                                    .collect()
+                            )
+                        });
                     }
                 }
             }
         }
     }
-    if let Type::Tuple(t) = ty {
-        if t.elems.is_empty() {
-            return Ok(quote! { { #value; ::pyre_object::w_none() } });
-        }
+    if let Type::Tuple(t) = ty
+        && t.elems.is_empty()
+    {
+        return Ok(quote! { { #value; ::pyre_object::w_none() } });
     }
     use quote::ToTokens;
     Err(syn::Error::new(

@@ -14,6 +14,10 @@
 //!
 //! and asserts structural properties (checkgraph, copygraph, iter*,
 //! mkentrymap, block attributes, variable renaming).
+
+// Variable identity is the behavior under test, so the mapping deliberately
+// uses the same interior-mutable graph keys as the translated implementation.
+#![allow(clippy::mutable_key_type)]
 //!
 //! Deviation from upstream, per CLAUDE.md parity rule #1:
 //!
@@ -273,7 +277,7 @@ fn test_graphattributes() {
     assert!(
         header_exit0_target
             .as_ref()
-            .map_or(false, |t| Rc::ptr_eq(t, &graph.returnblock)),
+            .is_some_and(|t| Rc::ptr_eq(t, &graph.returnblock)),
         "returnblock should be the first exit of the header block"
     );
 
@@ -466,8 +470,8 @@ fn test_variable() {
     // assert name1.split('_', 1)[1].isdigit()
     assert!(
         name1
-            .splitn(2, '_')
-            .nth(1)
+            .split_once('_')
+            .map(|x| x.1)
             .map(|s| s.chars().all(|c| c.is_ascii_digit()))
             .unwrap_or(false)
     );
@@ -486,8 +490,8 @@ fn test_variable() {
     assert!(n2.starts_with("foobar_"));
     assert_ne!(n2, v.name());
     assert!(
-        n2.splitn(2, '_')
-            .nth(1)
+        n2.split_once('_')
+            .map(|x| x.1)
             .map(|s| s.chars().all(|c| c.is_ascii_digit()))
             .unwrap_or(false)
     );

@@ -240,16 +240,16 @@ impl Parser {
                 continue;
             }
 
-            if line.ends_with(':') {
+            if let Some(name) = line.strip_suffix(':') {
                 // Function/section label
                 self.finish_current_code();
-                self.name = Some(line[..line.len() - 1].to_string());
+                self.name = Some(name.to_string());
                 continue;
             }
 
-            if line.starts_with('@') {
+            if let Some(label) = line.strip_prefix('@') {
                 // Label
-                self.labels.insert(line[1..].to_string(), self.code.len());
+                self.labels.insert(label.to_string(), self.code.len());
                 continue;
             }
 
@@ -318,7 +318,7 @@ impl Parser {
 
     fn compile_add(&mut self, args: &str) {
         let (args, result) = args.split_once("=>").unwrap();
-        let parts: Vec<&str> = args.trim().split_whitespace().collect();
+        let parts: Vec<&str> = args.split_whitespace().collect();
         let r0 = self.rint(parts[0]);
         let r1 = self.rint(parts[1]);
         let r2 = self.rint(result.trim());
@@ -370,7 +370,7 @@ impl Parser {
 
     fn compile_call(&mut self, args: &str) {
         let (args, result) = args.split_once("=>").unwrap();
-        let parts: Vec<&str> = args.trim().split_whitespace().collect();
+        let parts: Vec<&str> = args.split_whitespace().collect();
         let r0 = self.rint(parts[0]);
         let r1 = self.rint(parts[1]);
         let r2 = self.rint(result.trim());

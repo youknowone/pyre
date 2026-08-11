@@ -632,7 +632,7 @@ impl CodeWriter {
         // iff getkind matches" semantic.
         for (var, kind) in &post_result_types {
             if !matches!(kind, crate::model::ConcreteType::Unknown) {
-                crate::model::FunctionGraph::set_concretetype_of_inline(var, kind.clone());
+                crate::model::FunctionGraph::set_concretetype_of_inline(var, *kind);
             }
         }
 

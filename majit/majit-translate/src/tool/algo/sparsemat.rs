@@ -102,7 +102,7 @@ impl SparseMatrix {
         // Upstream `:33 vector = list(vector)`.
         let mut vector: Vec<f64> = vector.to_vec();
         // Upstream `:34 lines = [line.copy() for line in self.lines]`.
-        let mut lines: Vec<HashMap<usize, f64>> = self.lines.iter().cloned().collect();
+        let mut lines: Vec<HashMap<usize, f64>> = self.lines.to_vec();
         // Upstream `:35 columns = [{} for i in range(len(vector))]`.
         let mut columns: Vec<HashMap<usize, f64>> =
             (0..vector.len()).map(|_| HashMap::new()).collect();

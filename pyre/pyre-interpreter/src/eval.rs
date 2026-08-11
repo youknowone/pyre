@@ -957,13 +957,11 @@ pub unsafe fn walk_pyframe_roots_area(
             // (executioncontext.py:652); pyre's Vec lives in the boxed
             // UserDelAction, so its element slots are visited here.
             let action = unsafe { (*ec).user_del_action };
-            if !action.is_null() {
-                if let Some(list) = unsafe { (*action).pending_with_disabled_del.as_mut() } {
-                    for slot in list.iter_mut() {
-                        visitor(unsafe {
-                            &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef)
-                        });
-                    }
+            if !action.is_null()
+                && let Some(list) = unsafe { (*action).pending_with_disabled_del.as_mut() }
+            {
+                for slot in list.iter_mut() {
+                    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
                 }
             }
         };
@@ -1561,15 +1559,16 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     // the generator. `get_sys_exception` is residual, so this does not expose
     // the virtualizable frame to the tracer.
     crate::error::chain_context(exc, get_sys_exception());
-    if let Some(cause_obj) = cause {
-        if !cause_obj.is_null() && unsafe { pyre_object::is_exception(exc) } {
-            // `interp_exceptions.py:166-174 descr_setcause` — writes
-            // `w_cause` and flips `suppress_context` to True.
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
-                pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
-            };
-        }
+    if let Some(cause_obj) = cause
+        && !cause_obj.is_null()
+        && unsafe { pyre_object::is_exception(exc) }
+    {
+        // `interp_exceptions.py:166-174 descr_setcause` — writes
+        // `w_cause` and flips `suppress_context` to True.
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
+            pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
+        };
     }
     Ok(())
 }
@@ -1608,10 +1607,10 @@ pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyErr
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
-                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
-                    if !crate::baseobjspace::exception_is_valid_class_w(w_type) {
-                        return Err(PyError::type_error(CANNOT_CATCH_MSG));
-                    }
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i)
+                    && !crate::baseobjspace::exception_is_valid_class_w(w_type)
+                {
+                    return Err(PyError::type_error(CANNOT_CATCH_MSG));
                 }
             }
         } else if !crate::baseobjspace::exception_is_valid_class_w(exc_type) {
@@ -1628,12 +1627,12 @@ fn validate_check_eg_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
         if pyre_object::is_tuple(exc_type) {
             let n = pyre_object::w_tuple_len(exc_type) as i64;
             for i in 0..n {
-                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i) {
-                    if crate::baseobjspace::issubclass(w_type, base_group)? {
-                        return Err(PyError::type_error(
-                            "catching ExceptionGroup with except* is not allowed. Use except instead.",
-                        ));
-                    }
+                if let Some(w_type) = pyre_object::w_tuple_getitem(exc_type, i)
+                    && crate::baseobjspace::issubclass(w_type, base_group)?
+                {
+                    return Err(PyError::type_error(
+                        "catching ExceptionGroup with except* is not allowed. Use except instead.",
+                    ));
                 }
             }
         } else if crate::baseobjspace::issubclass(exc_type, base_group)? {
@@ -1991,10 +1990,10 @@ fn prepare_frame_resume(
             Err(err) => pending_operr = Some(err),
         }
     }
-    if pending_operr.is_none() {
-        if let Some(w_arg_or_err) = w_inputvalue {
-            let _ = frame.resume_execute_frame(w_arg_or_err)?;
-        }
+    if pending_operr.is_none()
+        && let Some(w_arg_or_err) = w_inputvalue
+    {
+        let _ = frame.resume_execute_frame(w_arg_or_err)?;
     }
     Ok(FrameResume::Dispatch(pending_operr))
 }
@@ -2494,10 +2493,10 @@ impl NamespaceOpcodeHandler for PyFrame {
         // the general mapping object, so a raising key `__eq__` propagates
         // instead of being swallowed as a miss.
         let w_globals = self.get_w_globals();
-        if !w_globals.is_null() {
-            if let Some(value) = crate::baseobjspace::finditem_str(w_globals, name)? {
-                return Ok(value);
-            }
+        if !w_globals.is_null()
+            && let Some(value) = crate::baseobjspace::finditem_str(w_globals, name)?
+        {
+            return Ok(value);
         }
         // `pyopcode.py:918-927 _load_global` — fall back to
         // `self.get_builtin().getdictvalue(space, varname)`.  Pyre's
@@ -2558,10 +2557,10 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
         } else if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-            if !w_dict.is_null() {
-                if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
-                    return Ok(value);
-                }
+            if !w_dict.is_null()
+                && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
+            {
+                return Ok(value);
             }
         }
         // `pyopcode.py:970 _load_global_failed`: NameError.
@@ -2656,51 +2655,51 @@ unsafe fn load_global_via_cache(
         // `celldict.py:292-313`: per-name slot fast path.  Read the slot,
         // upgrade the weakref; if the cache is alive, follow cell → builtincache
         // → builtins w_dict before falling through to the strategy lookup.
-        if !pycode.is_null() {
-            if let Some(cache) = crate::pycode::w_code_globals_caches_get(pycode, nameindex) {
-                // `celldict.py:295-313`: fast-path layout —
-                //
-                //     w_value = cache.getvalue(self.space)
-                //     if w_value is not None:
-                //         return w_value
-                //     if cache.valid:
-                //         builtincache = cache.builtincache
-                //         if builtincache is not None:
-                //             w_value = builtincache.getvalue(self.space)
-                //             if w_value is not None:
-                //                 return w_value
-                //             # builtin getdictvalue + _load_global_failed
-                //
-                // The builtins fallback is GATED on `builtincache is not None`.
-                // Under pyre's honor__builtins__=True equivalence the
-                // `builtincache` attach is dead, so the slot path just
-                // returns early on a cell hit and otherwise falls through to
-                // the slow path (`# either no cache or an invalid cache`),
-                // which calls `_load_global` whose own fallback chain reads
-                // the frame's picked builtin via `space.finditem_str`.
-                let (cell_opt, valid, bc_opt) = {
-                    let c = cache.lock().unwrap();
-                    (c.cell, c.valid, c.builtincache.clone())
-                };
-                if let Some(v) = cell_opt {
+        if !pycode.is_null()
+            && let Some(cache) = crate::pycode::w_code_globals_caches_get(pycode, nameindex)
+        {
+            // `celldict.py:295-313`: fast-path layout —
+            //
+            //     w_value = cache.getvalue(self.space)
+            //     if w_value is not None:
+            //         return w_value
+            //     if cache.valid:
+            //         builtincache = cache.builtincache
+            //         if builtincache is not None:
+            //             w_value = builtincache.getvalue(self.space)
+            //             if w_value is not None:
+            //                 return w_value
+            //             # builtin getdictvalue + _load_global_failed
+            //
+            // The builtins fallback is GATED on `builtincache is not None`.
+            // Under pyre's honor__builtins__=True equivalence the
+            // `builtincache` attach is dead, so the slot path just
+            // returns early on a cell hit and otherwise falls through to
+            // the slow path (`# either no cache or an invalid cache`),
+            // which calls `_load_global` whose own fallback chain reads
+            // the frame's picked builtin via `space.finditem_str`.
+            let (cell_opt, valid, bc_opt) = {
+                let c = cache.lock().unwrap();
+                (c.cell, c.valid, c.builtincache.clone())
+            };
+            if let Some(v) = cell_opt {
+                return Ok(Some(unwrap_cell(v)));
+            }
+            if valid && let Some(bc) = bc_opt {
+                let bcell = bc.lock().unwrap().cell;
+                if let Some(v) = bcell {
                     return Ok(Some(unwrap_cell(v)));
                 }
-                if valid && let Some(bc) = bc_opt {
-                    let bcell = bc.lock().unwrap().cell;
-                    if let Some(v) = bcell {
-                        return Ok(Some(unwrap_cell(v)));
-                    }
-                    // `celldict.py:307-313`: the `_load_global_failed`
-                    // branch is inside `if builtincache is not None` — only
-                    // reachable when a real builtincache is installed.
-                    // Under honor=True this scope is dead; included for
-                    // strict line-by-line shape parity should
-                    // honor__builtins__ ever flip False.
-                    if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
-                        let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
-                        if !w_builtin_dict.is_null() {
-                            return crate::baseobjspace::finditem_str(w_builtin_dict, name);
-                        }
+                // `celldict.py:307-313`: the `_load_global_failed`
+                // branch is inside `if builtincache is not None` — only
+                // reachable when a real builtincache is installed.
+                // Under honor=True this scope is dead; included for
+                // strict line-by-line shape parity should
+                // honor__builtins__ ever flip False.
+                if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                    let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+                    if !w_builtin_dict.is_null() {
+                        return crate::baseobjspace::finditem_str(w_builtin_dict, name);
                     }
                 }
             }
@@ -2946,14 +2945,13 @@ impl IterOpcodeHandler for PyFrame {
                         None
                     }
                 };
-                if let Some(metaclass) = mc {
-                    if let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
-                    {
-                        let result = crate::call_function(method, &[iter]);
-                        let tos = self.valuestackdepth - 1;
-                        self.set_locals_w(tos, result);
-                        return Ok(());
-                    }
+                if let Some(metaclass) = mc
+                    && let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
+                {
+                    let result = crate::call_function(method, &[iter]);
+                    let tos = self.valuestackdepth - 1;
+                    self.set_locals_w(tos, result);
+                    return Ok(());
                 }
             }
         }
@@ -3410,8 +3408,7 @@ impl OpcodeStepExecutor for PyFrame {
         let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
-                .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed"))
-                .into());
+                .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed")));
         }
         self.push(res);
         Ok(())
@@ -4077,24 +4074,24 @@ impl OpcodeStepExecutor for PyFrame {
                     // uncached LOAD_NAME fallback directly rather than
                     // corrupting an unrelated per-code LOAD_GLOBAL cache slot.
                     let w_globals = self.get_w_globals();
-                    if !w_globals.is_null() {
-                        if let Some(value) = unsafe {
+                    if !w_globals.is_null()
+                        && let Some(value) = unsafe {
                             pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name)
-                        } {
-                            self.push(value);
-                            return Ok(());
                         }
+                    {
+                        self.push(value);
+                        return Ok(());
                     }
                     // `self.get_builtin()`, not the `builtin` field — see
                     // `load_global_value`.
                     let w_builtin = self.get_builtin();
                     if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
                         let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-                        if !w_dict.is_null() {
-                            if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
-                                self.push(value);
-                                return Ok(());
-                            }
+                        if !w_dict.is_null()
+                            && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
+                        {
+                            self.push(value);
+                            return Ok(());
                         }
                     }
                     return Err(PyError::name_error_with_name(
@@ -4759,8 +4756,7 @@ impl OpcodeStepExecutor for PyFrame {
                 );
                 if result.is_null() {
                     return Err(crate::call::take_call_error()
-                        .unwrap_or_else(|| crate::PyError::type_error("call failed"))
-                        .into());
+                        .unwrap_or_else(|| crate::PyError::type_error("call failed")));
                 }
                 // baseobjspace.py:1256 self.pushvalue(w_result). The callee may
                 // have relocated this frame via a minor collection, so push

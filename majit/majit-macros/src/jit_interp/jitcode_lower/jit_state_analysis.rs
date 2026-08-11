@@ -58,7 +58,7 @@ impl<'c> Lowerer<'c> {
                     // Type / module / constant idents start uppercase or
                     // underscore-uppercase (e.g. `OP_MOV`, `VAL_PORT`).
                     let first = s.chars().next();
-                    if first.map_or(false, |c| c.is_uppercase() || c == '_') {
+                    if first.is_some_and(|c| c.is_uppercase() || c == '_') {
                         return false;
                     }
                     // Bare lowercase identifier — assume it is a user

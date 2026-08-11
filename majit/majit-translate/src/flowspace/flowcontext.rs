@@ -248,12 +248,10 @@ fn exception_message(w_exc_value: &Hlvalue) -> String {
         value: ConstValue::HostObject(obj),
         ..
     }) = w_exc_value
+        && let Some(args) = obj.instance_args()
+        && let Some(m) = args.first().and_then(ConstValue::as_text)
     {
-        if let Some(args) = obj.instance_args() {
-            if let Some(m) = args.first().and_then(ConstValue::as_text) {
-                return m.to_string();
-            }
-        }
+        return m.to_string();
     }
     if let Hlvalue::Constant(Constant { value, .. }) = w_exc_value
         && let Some(message) = value.as_text()
@@ -343,13 +341,13 @@ fn exception_from_hlvalue(value: &Hlvalue) -> Option<FSException> {
             Hlvalue::Constant(Constant::new(ConstValue::HostObject(obj.clone()))),
             Hlvalue::Constant(Constant::new(ConstValue::HostObject(inst))),
         ))
-    } else if let Some(class) = obj.instance_class() {
-        Some(FSException::new(
-            Hlvalue::Constant(Constant::new(ConstValue::HostObject(class.clone()))),
-            Hlvalue::Constant(Constant::new(ConstValue::HostObject(obj.clone()))),
-        ))
     } else {
-        None
+        obj.instance_class().map(|class| {
+            FSException::new(
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(class.clone()))),
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(obj.clone()))),
+            )
+        })
     }
 }
 
@@ -1019,11 +1017,11 @@ impl FlowContext {
     }
 
     pub fn maybe_merge(&mut self) -> Result<(), FlowContextError> {
-        if let Some(recorder) = &self.recorder {
-            if let Some(final_state) = recorder.final_state() {
-                self.mergeblock(recorder.current_block(), final_state);
-                return Err(FlowContextError::StopFlowing);
-            }
+        if let Some(recorder) = &self.recorder
+            && let Some(final_state) = recorder.final_state()
+        {
+            self.mergeblock(recorder.current_block(), final_state);
+            return Err(FlowContextError::StopFlowing);
         }
         Ok(())
     }
@@ -1386,10 +1384,10 @@ impl FlowContext {
                 ..
             }),
         ) = (w_valuetype, w_class)
+            && actual.is_class()
+            && expected.is_class()
         {
-            if actual.is_class() && expected.is_class() {
-                return Ok(Some(actual.is_subclass_of(expected)));
-            }
+            return Ok(Some(actual.is_subclass_of(expected)));
         }
         Ok(None)
     }
@@ -1464,22 +1462,22 @@ impl FlowContext {
         w_iterable: Hlvalue,
         expected_length: usize,
     ) -> Result<Vec<Hlvalue>, FlowContextError> {
-        if let Hlvalue::Constant(Constant { value, .. }) = &w_iterable {
-            if let Some(items) = value.sequence_items() {
-                if items.len() != expected_length {
-                    return Err(FlowContextError::Signal(FlowSignal::Raise {
-                        w_exc: FSException::new(
-                            exception_class_value("ValueError"),
-                            exception_instance_value("ValueError", None),
-                        ),
-                    }));
-                }
-                return Ok(items
-                    .iter()
-                    .cloned()
-                    .map(|item| Hlvalue::Constant(Constant::new(item)))
-                    .collect());
+        if let Hlvalue::Constant(Constant { value, .. }) = &w_iterable
+            && let Some(items) = value.sequence_items()
+        {
+            if items.len() != expected_length {
+                return Err(FlowContextError::Signal(FlowSignal::Raise {
+                    w_exc: FSException::new(
+                        exception_class_value("ValueError"),
+                        exception_instance_value("ValueError", None),
+                    ),
+                }));
             }
+            return Ok(items
+                .iter()
+                .cloned()
+                .map(|item| Hlvalue::Constant(Constant::new(item)))
+                .collect());
         }
         let w_len = self.record_maybe_raise_op(
             "len",
@@ -2115,25 +2113,24 @@ impl FlowContext {
             }
         };
         // `if not isinstance(check_class, tuple):` → simple class case.
-        if let ConstValue::HostObject(check_class) = check_value {
-            if check_class.is_class() {
-                // `issubclass(check_class, (NotImplementedError, AssertionError))`.
-                let not_impl = HOST_ENV.lookup_builtin("NotImplementedError").unwrap();
-                let assert_err = HOST_ENV.lookup_builtin("AssertionError").unwrap();
-                if check_class.is_subclass_of(&not_impl) || check_class.is_subclass_of(&assert_err)
-                {
-                    return Err(FlowContextError::Flowing(FlowingError::new(format!(
-                        "Catching NotImplementedError, AssertionError, or a subclass is not valid in RPython ({check_class:?})"
-                    ))));
-                }
-                // `return self.guessbool(op.issubtype(w_exc_type, w_check_class).eval(self))`.
-                if let Some(actual) = exception_class_from_hlvalue(w_exc_type) {
-                    return Ok(actual.is_subclass_of(check_class));
-                }
-                let w_match = self
-                    .record_pure_op("issubtype", vec![w_exc_type.clone(), w_check_class.clone()])?;
-                return self.guessbool(w_match);
+        if let ConstValue::HostObject(check_class) = check_value
+            && check_class.is_class()
+        {
+            // `issubclass(check_class, (NotImplementedError, AssertionError))`.
+            let not_impl = HOST_ENV.lookup_builtin("NotImplementedError").unwrap();
+            let assert_err = HOST_ENV.lookup_builtin("AssertionError").unwrap();
+            if check_class.is_subclass_of(&not_impl) || check_class.is_subclass_of(&assert_err) {
+                return Err(FlowContextError::Flowing(FlowingError::new(format!(
+                    "Catching NotImplementedError, AssertionError, or a subclass is not valid in RPython ({check_class:?})"
+                ))));
             }
+            // `return self.guessbool(op.issubtype(w_exc_type, w_check_class).eval(self))`.
+            if let Some(actual) = exception_class_from_hlvalue(w_exc_type) {
+                return Ok(actual.is_subclass_of(check_class));
+            }
+            let w_match =
+                self.record_pure_op("issubtype", vec![w_exc_type.clone(), w_check_class.clone()])?;
+            return self.guessbool(w_match);
         }
         // `if not isinstance(check_class, tuple):` 가 위에서 True 이면
         // 이미 리턴; 여기 도달했다는 건 check_class 가 tuple.
@@ -2167,10 +2164,9 @@ impl FlowContext {
         if matches!(
             signal,
             FlowSignal::Raise { .. } | FlowSignal::RaiseImplicit { .. }
-        ) {
-            if let Some(entry) = self.current_exception_table_handler() {
-                return self.dispatch_exception_to_handler(signal, entry);
-            }
+        ) && let Some(entry) = self.current_exception_table_handler()
+        {
+            return self.dispatch_exception_to_handler(signal, entry);
         }
         signal.nomoreblocks(self)
     }
@@ -2867,7 +2863,7 @@ impl FlowContext {
                     let mut positional = total_values[..split].to_vec();
                     let keyword_values = total_values[split..].to_vec();
                     let mut keywords = HashMap::new();
-                    for (name, value) in keyword_names.into_iter().zip(keyword_values.into_iter()) {
+                    for (name, value) in keyword_names.into_iter().zip(keyword_values) {
                         keywords.insert(name, value);
                     }
                     let w_function = self.pop_hlvalue()?;
@@ -3512,7 +3508,7 @@ mod test {
     }
 
     fn compile_function_body(src: &str) -> CodeObject {
-        let module = rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
+        let module = rp_compile(src, Mode::Exec, "<pyre>", Default::default())
             .expect("compile should succeed");
         module
             .constants

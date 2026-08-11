@@ -195,8 +195,9 @@ pub enum UnsupportedExprKind {
 /// * `"field?"`      → `QuasiImmutable`
 /// * `"field[*]"`    → `ImmutableArray`
 /// * `"field?[*]"`   → `QuasiImmutableArray`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ImmutableRank {
+    #[default]
     Immutable,
     QuasiImmutable,
     ImmutableArray,
@@ -236,12 +237,6 @@ impl ImmutableRank {
     /// `rclass.py:670 rank in (IR_QUASIIMMUTABLE_ARRAY, IR_IMMUTABLE_ARRAY)`.
     pub fn is_array(self) -> bool {
         matches!(self, Self::ImmutableArray | Self::QuasiImmutableArray)
-    }
-}
-
-impl Default for ImmutableRank {
-    fn default() -> Self {
-        Self::Immutable
     }
 }
 
@@ -2399,10 +2394,8 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                 // upstream: `subst = dict(zip(block1.inputargs,
                 // link.args))`.
                 let link_args = graph.block(block_id).exits[exit_idx].args.clone();
-                let subst: HashMap<crate::flowspace::model::Variable, LinkArg> = target_inputargs
-                    .into_iter()
-                    .zip(link_args.into_iter())
-                    .collect();
+                let subst: HashMap<crate::flowspace::model::Variable, LinkArg> =
+                    target_inputargs.into_iter().zip(link_args).collect();
                 // upstream: `link.args = [v.replace(subst) for v in
                 // exit.args]`.
                 let new_args: Vec<LinkArg> = target_exit
@@ -2621,7 +2614,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         // (`front::mir` terminator lowering).
         let (bool_case, int_case) = match kind {
             Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
-            Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then(|| *n != 0), Some(*n)),
+            Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n)),
             _ => continue,
         };
         let block = &graph.blocks[block_idx];
@@ -3954,17 +3947,17 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         let mut seen: HashSet<BlockId> = HashSet::new();
         let mut stack: Vec<BlockId> = Vec::new();
         for &sb in &start_blocks {
-            if seen.insert(sb) {
-                if let Some(&i) = block_index.get(&sb) {
-                    stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
-                }
+            if seen.insert(sb)
+                && let Some(&i) = block_index.get(&sb)
+            {
+                stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
             }
         }
         while let Some(target) = stack.pop() {
-            if seen.insert(target) {
-                if let Some(&i) = block_index.get(&target) {
-                    stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
-                }
+            if seen.insert(target)
+                && let Some(&i) = block_index.get(&target)
+            {
+                stack.extend(graph.blocks[i].exits.iter().rev().map(|e| e.target));
             }
         }
         seen
@@ -4359,12 +4352,11 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         let LinkArg::Value(src) = key.clone() else {
             continue;
         };
-        if let Some(info) = uf.get(&key) {
-            if let LinkArg::Value(dst) = &info.rep {
-                if src != *dst {
-                    renaming.insert(src, dst.clone());
-                }
-            }
+        if let Some(info) = uf.get(&key)
+            && let LinkArg::Value(dst) = &info.rep
+            && src != *dst
+        {
+            renaming.insert(src, dst.clone());
         }
     }
 
@@ -4425,7 +4417,7 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         let (exitswitch, exits) = remap_control_flow_metadata_var(
             &block.exitswitch,
             &block.exits,
-            &remap_var,
+            remap_var,
             |block_id| block_id,
         );
         block.exitswitch = exitswitch;
@@ -5980,10 +5972,10 @@ impl FunctionGraph {
         let var_id = var.id();
         for block in &self.blocks {
             for op in &block.operations {
-                if let OpKind::Input { name, .. } = &op.kind {
-                    if op.result.as_ref().map(|r| r.id()) == Some(var_id) {
-                        return Some(name.clone());
-                    }
+                if let OpKind::Input { name, .. } = &op.kind
+                    && op.result.as_ref().map(|r| r.id()) == Some(var_id)
+                {
+                    return Some(name.clone());
                 }
             }
         }

@@ -144,9 +144,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     } else {
                         return Err(crate::PyError::type_error("setlogmask() missing argument"));
                     };
-                    return Ok(pyre_object::w_int_new(
+                    Ok(pyre_object::w_int_new(
                         rustpython_host_env::syslog::setlogmask(mask) as i64,
-                    ));
+                    ))
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {

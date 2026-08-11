@@ -4951,10 +4951,10 @@ impl JitCodeBuilder {
     ) -> u16 {
         let target = JitCallTarget::with_save_err(trace_ptr, concrete_ptr, slot, save_err);
         for (idx, entry) in self.descrs.iter().enumerate() {
-            if let RuntimeBhDescr::Call(existing) = entry {
-                if *existing == target {
-                    return idx as u16;
-                }
+            if let RuntimeBhDescr::Call(existing) = entry
+                && *existing == target
+            {
+                return idx as u16;
             }
         }
         self.push_descr_entry(RuntimeBhDescr::Call(target))
@@ -4967,10 +4967,10 @@ impl JitCodeBuilder {
     ) -> u16 {
         let target = JitCallAssemblerTarget::new(token_number, concrete_ptr);
         for (idx, entry) in self.descrs.iter().enumerate() {
-            if let RuntimeBhDescr::AssemblerToken(existing) = entry {
-                if *existing == target {
-                    return idx as u16;
-                }
+            if let RuntimeBhDescr::AssemblerToken(existing) = entry
+                && *existing == target
+            {
+                return idx as u16;
             }
         }
         self.push_descr_entry(RuntimeBhDescr::AssemblerToken(target))
@@ -5068,10 +5068,10 @@ impl JitCodeBuilder {
 
     fn add_bh_descr(&mut self, descr: CanonicalBhDescr) -> u16 {
         for (idx, entry) in self.descrs.iter().enumerate() {
-            if let RuntimeBhDescr::Descr(existing) = entry {
-                if canonical_bh_descr_eq(existing, &descr) {
-                    return idx as u16;
-                }
+            if let RuntimeBhDescr::Descr(existing) = entry
+                && canonical_bh_descr_eq(existing, &descr)
+            {
+                return idx as u16;
             }
         }
         self.push_descr_entry(RuntimeBhDescr::Descr(descr))
@@ -5112,10 +5112,10 @@ impl JitCodeBuilder {
         self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_field_descr_parents();
-        if cfg!(debug_assertions) {
-            if let Some(disagreement) = self.field_descr_position_disagreement() {
-                panic!("{disagreement}");
-            }
+        if cfg!(debug_assertions)
+            && let Some(disagreement) = self.field_descr_position_disagreement()
+        {
+            panic!("{disagreement}");
         }
         self.patch_const_u8_refs();
         // RPython `jitcode.py:47 self._resulttypes = resulttypes`.

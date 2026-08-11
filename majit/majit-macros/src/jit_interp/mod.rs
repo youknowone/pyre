@@ -246,6 +246,7 @@ pub struct VableArrayDecl {
 }
 
 /// Layout description for a virtualizable array field.
+#[allow(clippy::large_enum_variant)]
 pub enum VableArrayLayoutDecl {
     /// Direct pointer field: the virtualizable stores a pointer to the
     /// array object. `length_offset` and `items_offset` describe where,
@@ -863,7 +864,7 @@ fn split_struct_field_path(full_path: Path) -> syn::Result<(Path, Ident)> {
     let mut segments: Vec<_> = full_path.segments.into_iter().collect();
     if segments.len() < 2 {
         return Err(syn::Error::new_spanned(
-            &full_path.leading_colon,
+            full_path.leading_colon,
             "entry must be `Struct::field`",
         ));
     }
@@ -1582,33 +1583,33 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         fn visit_expr_mut(&mut self, expr: &mut Expr) {
             // Write-through: `state.<ref>.<member> = <rhs>` ->
             // `unsafe { (*(state.<ref> as *mut T)).<member> = <rhs> }`.
-            if let Expr::Assign(assign) = expr {
-                if let Expr::Field(lhs) = &*assign.left {
-                    // Unify state-ref and local-ref write-through.
-                    let base_struct = self
-                        .ref_struct_of_base(&lhs.base)
-                        .or_else(|| self.local_ref_struct_of_base(&lhs.base));
-                    if let Some(struct_path) = base_struct {
-                        let base = (*lhs.base).clone();
-                        let member = lhs.member.clone();
-                        let member_name = match &lhs.member {
-                            syn::Member::Named(id) => id.to_string(),
-                            _ => String::new(),
+            if let Expr::Assign(assign) = expr
+                && let Expr::Field(lhs) = &*assign.left
+            {
+                // Unify state-ref and local-ref write-through.
+                let base_struct = self
+                    .ref_struct_of_base(&lhs.base)
+                    .or_else(|| self.local_ref_struct_of_base(&lhs.base));
+                if let Some(struct_path) = base_struct {
+                    let base = (*lhs.base).clone();
+                    let member = lhs.member.clone();
+                    let member_name = match &lhs.member {
+                        syn::Member::Named(id) => id.to_string(),
+                        _ => String::new(),
+                    };
+                    let mut rhs = (*assign.right).clone();
+                    self.visit_expr_mut(&mut rhs);
+                    if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
+                        // Ref-kind field → cast RHS from usize to *mut Pointee.
+                        *expr = syn::parse_quote! {
+                            unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
                         };
-                        let mut rhs = (*assign.right).clone();
-                        self.visit_expr_mut(&mut rhs);
-                        if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
-                            // Ref-kind field → cast RHS from usize to *mut Pointee.
-                            *expr = syn::parse_quote! {
-                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
-                            };
-                        } else {
-                            *expr = syn::parse_quote! {
-                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
-                            };
-                        }
-                        return;
+                    } else {
+                        *expr = syn::parse_quote! {
+                            unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
+                        };
                     }
+                    return;
                 }
             }
             // Read: `state.<ref>.<member>` reads a mutable heap field live from
@@ -1708,43 +1709,37 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             // if this is a `let <ident> = <base>.<field>` where <base> is
             // a state ref scalar or a local ref binding, and the field is
             // declared ref-kind.
-            if let syn::Stmt::Local(local) = stmt {
-                if let Some(init) = &local.init {
-                    if let Expr::Field(field) = &*init.expr {
-                        let member_name = match &field.member {
-                            syn::Member::Named(id) => Some(id.to_string()),
-                            _ => None,
-                        };
-                        if let Some(member_name) = member_name {
-                            // Check if base is state.<ref_scalar>
-                            let struct_path = self
-                                .ref_struct_of_base(&field.base)
-                                .or_else(|| self.local_ref_struct_of_base(&field.base));
-                            if let Some(struct_path) = struct_path {
-                                if let Some(pointee) =
-                                    self.field_pointee(&struct_path, &member_name)
-                                {
-                                    // This field is ref-kind → the local is a
-                                    // ref binding pointing to pointee type.
-                                    if let syn::Pat::Ident(pat_ident) = &local.pat {
-                                        self.record_local_ref(
-                                            &pat_ident.ident.to_string(),
-                                            pointee,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // `let x = func(...)` where func is in `call_returns` →
-                    // record x as a local ref binding with the declared type.
-                    if let Expr::Call(call) = &*init.expr {
-                        if let Some(struct_type) = self.call_return_type(&call.func) {
+            if let syn::Stmt::Local(local) = stmt
+                && let Some(init) = &local.init
+            {
+                if let Expr::Field(field) = &*init.expr {
+                    let member_name = match &field.member {
+                        syn::Member::Named(id) => Some(id.to_string()),
+                        _ => None,
+                    };
+                    if let Some(member_name) = member_name {
+                        // Check if base is state.<ref_scalar>
+                        let struct_path = self
+                            .ref_struct_of_base(&field.base)
+                            .or_else(|| self.local_ref_struct_of_base(&field.base));
+                        if let Some(struct_path) = struct_path
+                            && let Some(pointee) = self.field_pointee(&struct_path, &member_name)
+                        {
+                            // This field is ref-kind → the local is a
+                            // ref binding pointing to pointee type.
                             if let syn::Pat::Ident(pat_ident) = &local.pat {
-                                self.record_local_ref(&pat_ident.ident.to_string(), struct_type);
+                                self.record_local_ref(&pat_ident.ident.to_string(), pointee);
                             }
                         }
                     }
+                }
+                // `let x = func(...)` where func is in `call_returns` →
+                // record x as a local ref binding with the declared type.
+                if let Expr::Call(call) = &*init.expr
+                    && let Some(struct_type) = self.call_return_type(&call.func)
+                    && let syn::Pat::Ident(pat_ident) = &local.pat
+                {
+                    self.record_local_ref(&pat_ident.ident.to_string(), struct_type);
                 }
             }
             // Rewrite struct literal inits on the concrete path:
@@ -1753,23 +1748,21 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             // The JIT path handles struct literals via `lower_struct_value`
             // (New + SetfieldGc); this rewrite makes the concrete path
             // produce the same allocation through the runtime allocator.
-            if let syn::Stmt::Local(local) = stmt {
-                if let Some(init) = &mut local.init {
-                    if let Expr::Struct(s) = &*init.expr {
-                        let segs: Vec<String> = s
-                            .path
-                            .segments
-                            .iter()
-                            .map(|seg| seg.ident.to_string())
-                            .collect();
-                        if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
-                            let field_args: Vec<Expr> =
-                                s.fields.iter().map(|f| f.expr.clone()).collect();
-                            init.expr = Box::new(syn::parse_quote! {
-                                #alloc_func(#(#field_args),*)
-                            });
-                        }
-                    }
+            if let syn::Stmt::Local(local) = stmt
+                && let Some(init) = &mut local.init
+                && let Expr::Struct(s) = &*init.expr
+            {
+                let segs: Vec<String> = s
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
+                if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
+                    let field_args: Vec<Expr> = s.fields.iter().map(|f| f.expr.clone()).collect();
+                    *init.expr = syn::parse_quote! {
+                        #alloc_func(#(#field_args),*)
+                    };
                 }
             }
             // Now run the default visitor which will rewrite the init expr.
@@ -2323,7 +2316,6 @@ fn rewrite_body(
                     let new_tokens = quote! { #entry(#(#greens),*) };
                     *expr = syn::parse2(new_tokens)
                         .expect("failed to parse recursive_portal_call concrete fallback");
-                    return;
                 }
             }
         }

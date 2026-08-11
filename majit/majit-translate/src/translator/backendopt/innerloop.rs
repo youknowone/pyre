@@ -64,8 +64,10 @@ pub fn find_inner_loops(
     while !pending.is_empty() {
         let mut newblocks: Vec<BlockRef> = Vec::new();
         for block in &pending {
-            if !startdistance.contains_key(&BlockVertex(block.clone())) {
-                startdistance.insert(BlockVertex(block.clone()), dist);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                startdistance.entry(BlockVertex(block.clone()))
+            {
+                e.insert(dist);
                 for link in &block.borrow().exits {
                     let target = link
                         .borrow()
@@ -205,7 +207,7 @@ pub fn find_inner_loops(
     // discovery order on ties, the deterministic part of the pipeline.
     // Distinct (non-overlapping) loops are unaffected; only the kept loop
     // among overlapping equal-key loops can differ from a given host run.
-    loops.sort_by(|a, b| a.0.cmp(&b.0));
+    loops.sort_by_key(|a| a.0);
 
     // return 'loops' without overlapping blocks (`:108-120`).
     let mut result: Vec<Loop> = Vec::new();

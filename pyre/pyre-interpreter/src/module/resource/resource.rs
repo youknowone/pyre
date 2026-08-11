@@ -57,20 +57,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             vec![
                 pyre_object::floatobject::w_float_new(tv_to_f(r.ru_utime)),
                 pyre_object::floatobject::w_float_new(tv_to_f(r.ru_stime)),
-                pyre_object::w_int_new(r.ru_maxrss as i64),
-                pyre_object::w_int_new(r.ru_ixrss as i64),
-                pyre_object::w_int_new(r.ru_idrss as i64),
-                pyre_object::w_int_new(r.ru_isrss as i64),
-                pyre_object::w_int_new(r.ru_minflt as i64),
-                pyre_object::w_int_new(r.ru_majflt as i64),
-                pyre_object::w_int_new(r.ru_nswap as i64),
-                pyre_object::w_int_new(r.ru_inblock as i64),
-                pyre_object::w_int_new(r.ru_oublock as i64),
-                pyre_object::w_int_new(r.ru_msgsnd as i64),
-                pyre_object::w_int_new(r.ru_msgrcv as i64),
-                pyre_object::w_int_new(r.ru_nsignals as i64),
-                pyre_object::w_int_new(r.ru_nvcsw as i64),
-                pyre_object::w_int_new(r.ru_nivcsw as i64),
+                pyre_object::w_int_new(r.ru_maxrss),
+                pyre_object::w_int_new(r.ru_ixrss),
+                pyre_object::w_int_new(r.ru_idrss),
+                pyre_object::w_int_new(r.ru_isrss),
+                pyre_object::w_int_new(r.ru_minflt),
+                pyre_object::w_int_new(r.ru_majflt),
+                pyre_object::w_int_new(r.ru_nswap),
+                pyre_object::w_int_new(r.ru_inblock),
+                pyre_object::w_int_new(r.ru_oublock),
+                pyre_object::w_int_new(r.ru_msgsnd),
+                pyre_object::w_int_new(r.ru_msgrcv),
+                pyre_object::w_int_new(r.ru_nsignals),
+                pyre_object::w_int_new(r.ru_nvcsw),
+                pyre_object::w_int_new(r.ru_nivcsw),
             ],
         )
     }
@@ -94,7 +94,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("getrusage() missing argument"));
                     };
                     match rustpython_host_env::resource::getrusage(who) {
-                        Ok(r) => return Ok(make_struct_rusage(&r)),
+                        Ok(r) => Ok(make_struct_rusage(&r)),
                         Err(e) => {
                             let errno = e.raw_os_error().unwrap_or(0);
                             // `lib_pypy/resource.py:106` raises ValueError for
@@ -103,10 +103,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             if errno == libc::EINVAL {
                                 return Err(crate::PyError::value_error("invalid who parameter"));
                             }
-                            return Err(crate::PyError::os_error_with_errno(
+                            Err(crate::PyError::os_error_with_errno(
                                 errno,
                                 format!("getrusage: {e}"),
-                            ));
+                            ))
                         }
                     }
                 }
@@ -142,16 +142,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     };
                     match rustpython_host_env::resource::getrlimit(res) {
                         Ok(rl) => {
-                            return Ok(pyre_object::w_tuple_new(vec![
+                            Ok(pyre_object::w_tuple_new(vec![
                                 pyre_object::w_int_new(rl.rlim_cur as i64),
                                 pyre_object::w_int_new(rl.rlim_max as i64),
-                            ]));
+                            ]))
                         }
                         Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
+                            Err(crate::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
                                 format!("getrlimit: {e}"),
-                            ));
+                            ))
                         }
                     }
                 }
@@ -220,7 +220,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         rlim_max: hard,
                     };
                     match rustpython_host_env::resource::setrlimit(res, rl) {
-                        Ok(()) => return Ok(pyre_object::w_none()),
+                        Ok(()) => Ok(pyre_object::w_none()),
                         Err(e) => {
                             // `lib_pypy/resource.py:89-95` — EINVAL and
                             // EPERM both surface as ValueError with
@@ -237,10 +237,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                     "not allowed to raise maximum limit",
                                 ));
                             }
-                            return Err(crate::PyError::os_error_with_errno(
+                            Err(crate::PyError::os_error_with_errno(
                                 errno,
                                 format!("setrlimit: {e}"),
-                            ));
+                            ))
                         }
                     }
                 }

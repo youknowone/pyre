@@ -950,8 +950,7 @@ pub fn normalize_calltable_row_annotation(
     let mut generalizedargs = Vec::with_capacity(nbargs);
     for i in 0..nbargs {
         let column: Vec<&_> = graph_bindings.iter().map(|b| &b[i]).collect();
-        let s_value =
-            unionof(column.into_iter()).map_err(|e| AnnotatorError::new(e.to_string()))?;
+        let s_value = unionof(column).map_err(|e| AnnotatorError::new(e.to_string()))?;
         generalizedargs.push(s_value);
     }
 
@@ -1010,11 +1009,11 @@ pub fn normalize_calltable_row_annotation(
             annotator.all_blocks.borrow_mut().insert(new_key, newblock);
         }
         let fg = graph.graph.borrow_mut();
-        if let Hlvalue::Variable(v) = &mut fg.returnblock.borrow_mut().inputargs[0] {
-            if annotator.binding(&Hlvalue::Variable(v.clone())) != generalizedresult {
-                conversion = true;
-                annotator.setbinding(v, generalizedresult.clone());
-            }
+        if let Hlvalue::Variable(v) = &mut fg.returnblock.borrow_mut().inputargs[0]
+            && annotator.binding(&Hlvalue::Variable(v.clone())) != generalizedresult
+        {
+            conversion = true;
+            annotator.setbinding(v, generalizedresult.clone());
         }
     }
 

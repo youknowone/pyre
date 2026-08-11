@@ -430,10 +430,10 @@ impl Guard {
         ops[self.index] = None;
         if self.index > 0 {
             // guard.py:154: if operations[self.index-1] is self.cmp_op
-            if let Some(ref prev) = ops[self.index - 1] {
-                if prev.pos.get() == self.cmp_op.pos.get() {
-                    ops[self.index - 1] = None;
-                }
+            if let Some(ref prev) = ops[self.index - 1]
+                && prev.pos.get() == self.cmp_op.pos.get()
+            {
+                ops[self.index - 1] = None;
             }
         }
     }
@@ -491,13 +491,13 @@ impl GuardStrengthenOpt {
             // guard.py:183: Guard.of(op.getarg(0), operations, i, self.index_vars)
             let bool_arg = op.arg(0).to_opref();
             let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
-            if let Some(cmp) = cmp_op {
-                if let Some(guard) = Guard::of(i, op, cmp, &self.index_vars) {
-                    let lk = guard.getleftkey();
-                    let rk = guard.getrightkey();
-                    self.record_guard(lk, guard.clone());
-                    self.record_guard(rk, guard);
-                }
+            if let Some(cmp) = cmp_op
+                && let Some(guard) = Guard::of(i, op, cmp, &self.index_vars)
+            {
+                let lk = guard.getleftkey();
+                let rk = guard.getrightkey();
+                self.record_guard(lk, guard.clone());
+                self.record_guard(rk, guard);
             }
         }
     }
@@ -513,7 +513,7 @@ impl GuardStrengthenOpt {
         // simultaneously, matching PyPy's two-map update order.
         let strongest_guards = &mut self.strongest_guards;
         let guards = &mut self.guards;
-        let others = strongest_guards.entry(key).or_insert_with(Vec::new);
+        let others = strongest_guards.entry(key).or_default();
         if !others.is_empty() {
             let mut replaced = false;
             for i in 0..others.len() {
@@ -587,21 +587,20 @@ impl GuardStrengthenOpt {
                 }
             }
             // guard.py:239-245: non-void index_var → emit_operations + rename
-            if op.opcode.result_type() != majit_ir::Type::Void {
-                if let Some(index_var) = index_vars.get(&op.pos.get()) {
-                    if !index_var.is_identity() {
-                        let ncp = &mut self.next_const_pos;
-                        let cv = &mut self.const_values;
-                        let result = index_var.emit_operations(&mut self._newoperations, |value| {
-                            let cref = OpRef::const_int(value);
-                            *ncp += 1;
-                            cv.insert(cref, value);
-                            cref
-                        });
-                        self.renamer.insert(op.pos.get(), result);
-                        continue;
-                    }
-                }
+            if op.opcode.result_type() != majit_ir::Type::Void
+                && let Some(index_var) = index_vars.get(&op.pos.get())
+                && !index_var.is_identity()
+            {
+                let ncp = &mut self.next_const_pos;
+                let cv = &mut self.const_values;
+                let result = index_var.emit_operations(&mut self._newoperations, |value| {
+                    let cref = OpRef::const_int(value);
+                    *ncp += 1;
+                    cv.insert(cref, value);
+                    cref
+                });
+                self.renamer.insert(op.pos.get(), result);
+                continue;
             }
             // guard.py:246: self.emit_operation(op)
             let mut renamed = op.clone();
@@ -643,17 +642,16 @@ impl GuardStrengthenOpt {
                 continue;
             }
             let __descr_arc_descr = op.getdescr();
-            if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                if let Some(fd) = descr.as_fail_descr() {
-                    if fd.loop_version() {
-                        // `version.py:32-36 leads_to[descr]` keys by descr
-                        // identity.  Use `Descr::index()` (the globally
-                        // unique `alloc_fail_index()` value) rather than
-                        // `FailDescr::fail_index()` (per-trace, 0 until
-                        // backend codegen).
-                        info.track(descr.index(), version.clone());
-                    }
-                }
+            if let Some(descr) = __descr_arc_descr.as_ref()
+                && let Some(fd) = descr.as_fail_descr()
+                && fd.loop_version()
+            {
+                // `version.py:32-36 leads_to[descr]` keys by descr
+                // identity.  Use `Descr::index()` (the globally
+                // unique `alloc_fail_index()` value) rather than
+                // `FailDescr::fail_index()` (per-trace, 0 until
+                // backend codegen).
+                info.track(descr.index(), version.clone());
             }
         }
 
@@ -905,7 +903,7 @@ mod tests {
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
         opt.add_pass(Box::new(crate::optimizeopt::intbounds::OptIntBounds::new()));
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
-        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 2]);
+        opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[majit_ir::Type::Int; 2]);
 
         use crate::history::test_support::rooted_inputarg_operand;
         use majit_ir::{OpRc, Type, Value};

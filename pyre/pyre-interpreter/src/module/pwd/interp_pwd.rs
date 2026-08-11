@@ -144,19 +144,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::pwd::getpwuid(uid) {
-                        Ok(Some(pw)) => return Ok(make_struct_passwd(&pw)),
-                        Ok(None) => {
-                            return Err(crate::PyError::key_error(format!(
-                                "getpwuid(): uid not found: {}",
-                                uid as i64
-                            )));
-                        }
-                        Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("getpwuid: {e}"),
-                            ));
-                        }
+                        Ok(Some(pw)) => Ok(make_struct_passwd(&pw)),
+                        Ok(None) => Err(crate::PyError::key_error(format!(
+                            "getpwuid(): uid not found: {}",
+                            uid as i64
+                        ))),
+                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                            e.raw_os_error().unwrap_or(0),
+                            format!("getpwuid: {e}"),
+                        )),
                     }
                 }
                 // `interp_pwd.py:90-108` — libc fallback path; host_env
@@ -200,13 +196,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(feature = "host_env")]
                 {
                     match rustpython_host_env::pwd::getpwnam(name) {
-                        Some(pw) => return Ok(make_struct_passwd(&pw)),
-                        None => {
-                            return Err(crate::PyError::key_error(format!(
-                                "getpwnam(): name not found: {}",
-                                name
-                            )));
-                        }
+                        Some(pw) => Ok(make_struct_passwd(&pw)),
+                        None => Err(crate::PyError::key_error(format!(
+                            "getpwnam(): name not found: {}",
+                            name
+                        ))),
                     }
                 }
                 #[cfg(not(feature = "host_env"))]
@@ -236,7 +230,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         .iter()
                         .map(make_struct_passwd)
                         .collect();
-                    return Ok(pyre_object::w_list_new(items));
+                    Ok(pyre_object::w_list_new(items))
                 }
                 // `interp_pwd.py:123-134` — setpwent / loop getpwent /
                 // endpwent.

@@ -80,6 +80,12 @@ pub struct State {
     pub bookkeeper: Option<Rc<Bookkeeper>>,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl State {
     pub const fn new() -> Self {
         State {
@@ -230,10 +236,12 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// reach (they share `W_Root`), so it cannot perturb them.
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
-        if !name.contains("::") && !name.contains('<') && name.contains('.') {
-            if let Some((_crate, rest)) = name.split_once('.') {
-                return rest.replace('.', "::");
-            }
+        if !name.contains("::")
+            && !name.contains('<')
+            && name.contains('.')
+            && let Some((_crate, rest)) = name.split_once('.')
+        {
+            return rest.replace('.', "::");
         }
         majit_ir::descr::canonical_struct_name(name)
     }
@@ -1162,10 +1170,7 @@ impl SomeTuple {
                 let value = if let Some(value) = item.const_() {
                     value.clone()
                 } else if let SomeValue::Tuple(t) = item {
-                    match t.base.const_box.as_ref().map(|c| c.value.clone()) {
-                        Some(value) => value,
-                        None => return None,
-                    }
+                    t.base.const_box.as_ref().map(|c| c.value.clone())?
                 } else {
                     return None;
                 };
@@ -1577,40 +1582,39 @@ impl SomePBC {
             }
         }
         // upstream model.py:538-553 — multi-desc kind enforcement.
-        if pbc.descriptions.len() > 1 {
-            if let Ok(kind) = pbc.get_kind() {
-                match kind {
-                    DescKind::Class => {
-                        // upstream: `for desc in descriptions: desc.getuniqueclassdef()`.
-                        //   "a PBC of several classes: enforce them all
-                        //   to be built, without support for specialization."
-                        for entry in pbc.descriptions.values() {
-                            if let Some(cd) = entry.as_class() {
-                                let _ = super::classdesc::ClassDesc::getuniqueclassdef(&cd);
-                            }
+        if pbc.descriptions.len() > 1
+            && let Ok(kind) = pbc.get_kind()
+        {
+            match kind {
+                DescKind::Class => {
+                    // upstream: `for desc in descriptions: desc.getuniqueclassdef()`.
+                    //   "a PBC of several classes: enforce them all
+                    //   to be built, without support for specialization."
+                    for entry in pbc.descriptions.values() {
+                        if let Some(cd) = entry.as_class() {
+                            let _ = super::classdesc::ClassDesc::getuniqueclassdef(&cd);
                         }
                     }
-                    DescKind::MethodOfFrozen => {
-                        // upstream: `funcdescs = set(desc.funcdesc for
-                        //   desc in descriptions)`; mixing funcdescs
-                        //   raises AnnotatorError.
-                        let mut funcdesc_keys: std::collections::BTreeSet<
-                            super::description::DescKey,
-                        > = std::collections::BTreeSet::new();
-                        for entry in pbc.descriptions.values() {
-                            if let Some(mof) = entry.as_method_of_frozen() {
-                                funcdesc_keys.insert(mof.borrow().funcdesc.desc_key());
-                            }
-                        }
-                        if funcdesc_keys.len() > 1 {
-                            panic!(
-                                "AnnotatorError: You can't mix a set of methods on a frozen PBC in \
-                                 RPython that are different underlying functions"
-                            );
-                        }
-                    }
-                    _ => {}
                 }
+                DescKind::MethodOfFrozen => {
+                    // upstream: `funcdescs = set(desc.funcdesc for
+                    //   desc in descriptions)`; mixing funcdescs
+                    //   raises AnnotatorError.
+                    let mut funcdesc_keys: std::collections::BTreeSet<super::description::DescKey> =
+                        std::collections::BTreeSet::new();
+                    for entry in pbc.descriptions.values() {
+                        if let Some(mof) = entry.as_method_of_frozen() {
+                            funcdesc_keys.insert(mof.borrow().funcdesc.desc_key());
+                        }
+                    }
+                    if funcdesc_keys.len() > 1 {
+                        panic!(
+                            "AnnotatorError: You can't mix a set of methods on a frozen PBC in \
+                                 RPython that are different underlying functions"
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         pbc
@@ -3143,10 +3147,10 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // must reproduce `new` when `new` generalises `old`.
         (SomeValue::Bool(b1), SomeValue::Bool(b2)) => {
             let mut s = SomeBool::new();
-            if let (Some(c1), Some(c2)) = (&b1.base.const_box, &b2.base.const_box) {
-                if c1.value == c2.value {
-                    s.base.const_box = Some(Constant::new(c1.value.clone()));
-                }
+            if let (Some(c1), Some(c2)) = (&b1.base.const_box, &b2.base.const_box)
+                && c1.value == c2.value
+            {
+                s.base.const_box = Some(Constant::new(c1.value.clone()));
             }
             if let (Some(k1), Some(k2)) = (&b1.knowntypedata, &b2.knowntypedata) {
                 s.set_knowntypedata(merge_knowntypedata(k1, k2));

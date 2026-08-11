@@ -53,22 +53,20 @@ fn interp_char(
             }
             return p;
         }
-    } else if ch == b']' {
-        if tape[*pointer] != 0 {
-            let mut need: i32 = 1;
-            let mut p = pc - 1;
-            while need > 0 {
-                if code[p] == b']' {
-                    need += 1;
-                } else if code[p] == b'[' {
-                    need -= 1;
-                }
-                if need > 0 {
-                    p -= 1;
-                }
+    } else if ch == b']' && tape[*pointer] != 0 {
+        let mut need: i32 = 1;
+        let mut p = pc - 1;
+        while need > 0 {
+            if code[p] == b']' {
+                need += 1;
+            } else if code[p] == b'[' {
+                need -= 1;
             }
-            return p + 1;
+            if need > 0 {
+                p -= 1;
+            }
         }
+        return p + 1;
     }
     pc + 1
 }

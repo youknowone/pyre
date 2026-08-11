@@ -242,7 +242,7 @@ pub fn transform_dead_code(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
         // identity — Python lets you mutate a list during iteration
         // provided you don't resize, but `block.exits = tuple(lst)`
         // rebinds the attribute which changes subsequent comparisons).
-        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits_snapshot {
             let followed = ann.links_followed.borrow().contains(&LinkKey::of(&link));
             if followed {
@@ -383,7 +383,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
 
     // upstream: `block.recloseblock(errlink, *block.exits)`.
     let mut new_exits: Vec<LinkRef> = vec![errlink.clone()];
-    let existing_exits: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+    let existing_exits: Vec<LinkRef> = block.borrow().exits.to_vec();
     new_exits.extend(existing_exits);
     block.recloseblock(new_exits);
 
@@ -472,7 +472,7 @@ pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef])
     simplify::transform_dead_op_vars_in_blocks(
         block_subset,
         graphs_len,
-        Some(&translator),
+        Some(translator),
         single_graph_startblock,
     );
 }
@@ -571,10 +571,10 @@ pub fn transform_extend_with_str_slice(ann: &RPythonAnnotator, block_subset: &[B
                 // upstream: `self.gettype(op.args[0]) is str` — true
                 // for both SomeString and SomeChar (both set
                 // knowntype = str).
-                if ann.gettype(&op.args[0]) == KnownType::Str {
-                    if let Hlvalue::Variable(result_v) = &op.result {
-                        slice_sources.insert(result_v.clone(), op.args.clone());
-                    }
+                if ann.gettype(&op.args[0]) == KnownType::Str
+                    && let Hlvalue::Variable(result_v) = &op.result
+                {
+                    slice_sources.insert(result_v.clone(), op.args.clone());
                 }
             } else if op.opname == "inplace_add" && op.args.len() == 2 {
                 // upstream: `op.args[1] in slice_sources`.
@@ -639,7 +639,7 @@ pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[
     // qualify as integer counts.
     fn is_integer_subclass(s: &Option<SomeValue>) -> bool {
         s.as_ref()
-            .is_some_and(|sv| sv.tag().mro().iter().any(|t| *t == SomeValueTag::Integer))
+            .is_some_and(|sv| sv.tag().mro().contains(&SomeValueTag::Integer))
     }
 
     for block in block_subset {

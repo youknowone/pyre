@@ -111,10 +111,10 @@ fn get_codepoint(
     }
     let s = unsafe { pyre_object::w_str_get_value(w_src) };
     let mut chars = s.chars();
-    if let Some(c) = chars.next() {
-        if chars.next().is_none() {
-            return Ok(Some(c as u32));
-        }
+    if let Some(c) = chars.next()
+        && chars.next().is_none()
+    {
+        return Ok(Some(c as u32));
     }
     Err(PyError::type_error(format!(
         "\"{name}\" must be {}, not a string of length {}",
@@ -193,10 +193,10 @@ fn validate_dialect(cfg: &DialectConfig) -> Result<(), PyError> {
         ("escapechar", "quotechar", cfg.escapechar, cfg.quotechar),
     ];
     for (n1, n2, a, b) in pairs {
-        if let (Some(x), Some(y)) = (a, b) {
-            if x == y {
-                return Err(PyError::value_error(format!("bad {n1} or {n2} value")));
-            }
+        if let (Some(x), Some(y)) = (a, b)
+            && x == y
+        {
+            return Err(PyError::value_error(format!("bad {n1} or {n2} value")));
         }
     }
     for c in cfg.lineterminator.chars() {
@@ -386,10 +386,10 @@ fn read_char_field(d: PyObjectRef, name: &str) -> Result<Option<u32>, PyError> {
     }
     if unsafe { pyre_object::is_str(v) } {
         let mut chars = unsafe { pyre_object::w_str_get_value(v) }.chars();
-        if let Some(c) = chars.next() {
-            if chars.next().is_none() {
-                return Ok(Some(c as u32));
-            }
+        if let Some(c) = chars.next()
+            && chars.next().is_none()
+        {
+            return Ok(Some(c as u32));
         }
     }
     Ok(None)
@@ -785,12 +785,10 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
                         "line {line_num}: '{dc}' expected after '{qc}'"
                     )));
                 }
-            } else if state == EAT_CRNL {
-                if !is_nl {
-                    return Err(csv_error(format!(
-                        "line {line_num}: new-line character seen in unquoted field - do you need to open the file with newline=''?"
-                    )));
-                }
+            } else if state == EAT_CRNL && !is_nl {
+                return Err(csv_error(format!(
+                    "line {line_num}: new-line character seen in unquoted field - do you need to open the file with newline=''?"
+                )));
             }
         }
 

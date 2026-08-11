@@ -610,21 +610,21 @@ pub fn builtin_range(
         if step == 0 {
             return Err(AnnotatorError::new("range() with step zero"));
         }
-        if is_immutable_constant(&s_start) && is_immutable_constant(&s_stop) {
-            if let (Some(ConstValue::Int(start)), Some(ConstValue::Int(stop))) =
+        if is_immutable_constant(&s_start)
+            && is_immutable_constant(&s_stop)
+            && let (Some(ConstValue::Int(start)), Some(ConstValue::Int(stop))) =
                 (s_start.const_(), s_stop.const_())
-            {
-                // upstream `if len(xrange(start, stop, step)) == 0:`.
-                let range_len: i64 = if step > 0 {
-                    if *stop > *start { 1 } else { 0 }
-                } else if *stop < *start {
-                    1
-                } else {
-                    0
-                };
-                if range_len == 0 {
-                    empty = true;
-                }
+        {
+            // upstream `if len(xrange(start, stop, step)) == 0:`.
+            let range_len: i64 = if step > 0 {
+                if *stop > *start { 1 } else { 0 }
+            } else if *stop < *start {
+                1
+            } else {
+                0
+            };
+            if range_len == 0 {
+                empty = true;
             }
         }
     }
@@ -2987,11 +2987,11 @@ mod tests {
             _ => None,
         })
         .unwrap();
-        if let SomeValue::Integer(i) = out {
-            if let Some(ConstValue::Int(n)) = i.base.const_box.as_ref().map(|c| &c.value) {
-                assert_eq!(*n, 15);
-                return;
-            }
+        if let SomeValue::Integer(i) = out
+            && let Some(ConstValue::Int(n)) = i.base.const_box.as_ref().map(|c| &c.value)
+        {
+            assert_eq!(*n, 15);
+            return;
         }
         panic!("expected constant SomeInteger(15)");
     }

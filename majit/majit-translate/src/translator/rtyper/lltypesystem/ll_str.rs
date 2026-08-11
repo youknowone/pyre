@@ -142,10 +142,10 @@ mod tests {
             let b = block.borrow();
             for op in &b.operations {
                 opnames.push(op.opname.clone());
-                if op.opname == "getarrayitem" {
-                    if let Hlvalue::Constant(c) = &op.args[0] {
-                        hex_chars = Some(c.value.clone());
-                    }
+                if op.opname == "getarrayitem"
+                    && let Hlvalue::Constant(c) = &op.args[0]
+                {
+                    hex_chars = Some(c.value.clone());
                 }
             }
             for link in &b.exits {

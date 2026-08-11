@@ -325,7 +325,7 @@ impl<'c> Lowerer<'c> {
         let count: Option<i64> = match range.limits {
             // `end > start >= 0` and both `<= i64::MAX`, so the difference
             // never overflows.
-            syn::RangeLimits::HalfOpen(_) => Some((start < end).then(|| end - start).unwrap_or(0)),
+            syn::RangeLimits::HalfOpen(_) => Some(if start < end { end - start } else { 0 }),
             // Closed range spans `end - start + 1` values; the `+ 1` can
             // overflow when `end == i64::MAX`, so guard it.
             syn::RangeLimits::Closed(_) => {
@@ -336,9 +336,7 @@ impl<'c> Lowerer<'c> {
                 }
             }
         };
-        let Some(count) = count else {
-            return None;
-        };
+        let count = count?;
         if count > 64 || block_has_loop_control(&expr_for.body) {
             return None;
         }
@@ -466,11 +464,11 @@ impl<'c> Lowerer<'c> {
     ) -> Option<()> {
         match stmt {
             Stmt::Expr(Expr::Break(_), _) => {
-                self.emit_jump(&break_label);
+                self.emit_jump(break_label);
                 Some(())
             }
             Stmt::Expr(Expr::Continue(_), _) => {
-                self.emit_jump(&continue_label);
+                self.emit_jump(continue_label);
                 Some(())
             }
             Stmt::Expr(Expr::If(expr_if), _) => {
@@ -903,7 +901,7 @@ mod unroll_binding_tests {
         // `y` did not exist before the loop, so its body-local binding must not
         // escape.
         assert!(
-            lowerer.bindings.get("y").is_none(),
+            !lowerer.bindings.contains_key("y"),
             "a body-local let must not escape the loop"
         );
     }

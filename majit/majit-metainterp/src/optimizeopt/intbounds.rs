@@ -116,7 +116,7 @@ impl OptIntBounds {
     /// the bound; this takes that resolve box-native via `resolve_box_box`,
     /// without collapsing the operand to an `OpRef` first.
     fn getintbound_arg(&self, arg: &Operand, ctx: &mut OptContext) -> IntBound {
-        let b = ctx.resolve_operand_operand(&arg);
+        let b = ctx.resolve_operand_operand(arg);
         ctx.getintbound_handle(&b).borrow().clone()
     }
 
@@ -401,15 +401,15 @@ impl OptIntBounds {
         );
         // intbounds.py: constant inversion for INT_SUB — `isinstance(arg1,
         // ConstInt)` raw Const check (no IntBound synthesis).
-        if let Some(Value::Int(c1)) = arg1.const_value() {
-            if c1 != i64::MIN {
-                let arg0 = arg0.to_opref();
-                let neg_ref = self.get_or_make_const(-c1, ctx);
-                ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), arg0, neg_ref);
-                ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), neg_ref, arg0);
-                ctx.register_pure_from_args2(OpCode::IntSub, arg0, op.pos.get(), neg_ref);
-                ctx.register_pure_from_args2(OpCode::IntSub, neg_ref, op.pos.get(), arg0);
-            }
+        if let Some(Value::Int(c1)) = arg1.const_value()
+            && c1 != i64::MIN
+        {
+            let arg0 = arg0.to_opref();
+            let neg_ref = self.get_or_make_const(-c1, ctx);
+            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), arg0, neg_ref);
+            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos.get(), neg_ref, arg0);
+            ctx.register_pure_from_args2(OpCode::IntSub, arg0, op.pos.get(), neg_ref);
+            ctx.register_pure_from_args2(OpCode::IntSub, neg_ref, op.pos.get(), arg0);
         }
     }
 
@@ -814,10 +814,10 @@ impl OptIntBounds {
         let cond = self.resolve_box(&op.arg(0), ctx);
 
         // Constant check: if condition is known constant nonzero, remove guard.
-        if let Some(val) = ctx.get_constant_int_box(&cond) {
-            if val != 0 {
-                return OptimizationResult::Remove;
-            }
+        if let Some(val) = ctx.get_constant_int_box(&cond)
+            && val != 0
+        {
+            return OptimizationResult::Remove;
         }
 
         if !matches!(ctx.opref_type(cond.to_opref()), Some(majit_ir::Type::Int)) {
@@ -836,10 +836,10 @@ impl OptIntBounds {
     fn optimize_guard_false(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let cond = self.resolve_box(&op.arg(0), ctx);
 
-        if let Some(val) = ctx.get_constant_int_box(&cond) {
-            if val == 0 {
-                return OptimizationResult::Remove;
-            }
+        if let Some(val) = ctx.get_constant_int_box(&cond)
+            && val == 0
+        {
+            return OptimizationResult::Remove;
         }
 
         if !matches!(ctx.opref_type(cond.to_opref()), Some(majit_ir::Type::Int)) {
@@ -1673,7 +1673,7 @@ impl Optimization for OptIntBounds {
                 let is_int = arg0
                     .ty()
                     .or_else(|| ctx.opref_type(arg0))
-                    .map_or(true, |t| t == majit_ir::Type::Int);
+                    .is_none_or(|t| t == majit_ir::Type::Int);
                 if !is_int {
                     return;
                 }
@@ -1725,7 +1725,7 @@ impl Optimization for OptIntBounds {
             // for an integer bound on a `Ref` box.
             OpCode::GetfieldRawI | OpCode::GetfieldGcI | OpCode::GetinteriorfieldGcI => {
                 let __descr_arc_d = op.getdescr();
-                if let Some(ref d) = __descr_arc_d.as_ref() {
+                if let Some(d) = __descr_arc_d.as_ref() {
                     let (field_size, signed) = d.field_size_and_sign();
                     if field_size > 0 && field_size < 8 {
                         let (lo, hi) = if signed {
@@ -1742,19 +1742,19 @@ impl Optimization for OptIntBounds {
             // ── Array item accesses ──
             OpCode::GetarrayitemRawI | OpCode::GetarrayitemGcI => {
                 let __descr_arc_d = op.getdescr();
-                if let Some(ref d) = __descr_arc_d.as_ref() {
-                    if let Some(ad) = d.as_array_descr() {
-                        let item_size = ad.item_size();
-                        if item_size > 0 && item_size < 8 {
-                            let signed = ad.is_item_signed();
-                            let (lo, hi) = if signed {
-                                let half = 1i64 << (item_size * 8 - 1);
-                                (-half, half - 1)
-                            } else {
-                                (0, (1i64 << (item_size * 8)) - 1)
-                            };
-                            self.intersect_bound(op.pos.get(), &IntBound::bounded(lo, hi), ctx);
-                        }
+                if let Some(d) = __descr_arc_d.as_ref()
+                    && let Some(ad) = d.as_array_descr()
+                {
+                    let item_size = ad.item_size();
+                    if item_size > 0 && item_size < 8 {
+                        let signed = ad.is_item_signed();
+                        let (lo, hi) = if signed {
+                            let half = 1i64 << (item_size * 8 - 1);
+                            (-half, half - 1)
+                        } else {
+                            (0, (1i64 << (item_size * 8)) - 1)
+                        };
+                        self.intersect_bound(op.pos.get(), &IntBound::bounded(lo, hi), ctx);
                     }
                 }
             }
@@ -1762,30 +1762,28 @@ impl Optimization for OptIntBounds {
             // ── Call postprocess ──
             OpCode::CallPureI | OpCode::CallI => {
                 let __descr_arc_d = op.getdescr();
-                if let Some(ref d) = __descr_arc_d.as_ref() {
-                    if let Some(cd) = d.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        match ei.oopspecindex {
-                            majit_ir::OopSpecIndex::IntPyDiv => {
-                                if op.num_args() >= 3 {
-                                    // intbounds.py:165-169 post_call_INT_PY_DIV.
-                                    let b1 = self.getintbound_arg(&op.arg(1), ctx);
-                                    let b2 = self.getintbound_arg(&op.arg(2), ctx);
-                                    let result_bound = b1.py_div_bound(&b2);
-                                    self.intersect_bound(op.pos.get(), &result_bound, ctx);
-                                }
+                if let Some(d) = __descr_arc_d.as_ref()
+                    && let Some(cd) = d.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    match ei.oopspecindex {
+                        majit_ir::OopSpecIndex::IntPyDiv => {
+                            if op.num_args() >= 3 {
+                                // intbounds.py:165-169 post_call_INT_PY_DIV.
+                                let b1 = self.getintbound_arg(&op.arg(1), ctx);
+                                let b2 = self.getintbound_arg(&op.arg(2), ctx);
+                                let result_bound = b1.py_div_bound(&b2);
+                                self.intersect_bound(op.pos.get(), &result_bound, ctx);
                             }
-                            majit_ir::OopSpecIndex::IntPyMod => {
-                                if op.num_args() >= 3 {
-                                    // intbounds.py:171-175 post_call_INT_PY_MOD.
-                                    let b1 = self.getintbound_arg(&op.arg(1), ctx);
-                                    let b2 = self.getintbound_arg(&op.arg(2), ctx);
-                                    let result_bound = b1.mod_bound(&b2);
-                                    self.intersect_bound(op.pos.get(), &result_bound, ctx);
-                                }
-                            }
-                            _ => {}
                         }
+                        majit_ir::OopSpecIndex::IntPyMod if op.num_args() >= 3 => {
+                            // intbounds.py:171-175 post_call_INT_PY_MOD.
+                            let b1 = self.getintbound_arg(&op.arg(1), ctx);
+                            let b2 = self.getintbound_arg(&op.arg(2), ctx);
+                            let result_bound = b1.mod_bound(&b2);
+                            self.intersect_bound(op.pos.get(), &result_bound, ctx);
+                        }
+                        _ => {}
                     }
                 }
             }

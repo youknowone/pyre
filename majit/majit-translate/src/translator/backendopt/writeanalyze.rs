@@ -234,12 +234,11 @@ impl FreshMallocs {
                 }
                 // `elif op.opname in ('cast_pointer', 'same_as'):
                 //      if self.is_fresh_malloc(op.args[0]): continue`.
-                if op.opname == "cast_pointer" || op.opname == "same_as" {
-                    if let Some(arg0) = op.args.first() {
-                        if fm.is_fresh_malloc(arg0) {
-                            continue;
-                        }
-                    }
+                if (op.opname == "cast_pointer" || op.opname == "same_as")
+                    && let Some(arg0) = op.args.first()
+                    && fm.is_fresh_malloc(arg0)
+                {
+                    continue;
                 }
                 // `self.nonfresh.add(op.result)`.
                 if let Some(r) = as_variable(op.result.clone()) {
@@ -248,7 +247,7 @@ impl FreshMallocs {
             }
             // `for link in block.exits:` — snapshot so the block borrow
             // is dropped before `link.target.inputargs` is read.
-            let exits: Vec<_> = block.borrow().exits.iter().cloned().collect();
+            let exits: Vec<_> = block.borrow().exits.to_vec();
             for link in exits {
                 let link = link.borrow();
                 // `self.nonfresh.update(link.getextravars())` /
@@ -268,10 +267,8 @@ impl FreshMallocs {
                     // `v1` is `Option<Hlvalue>` (transient undefined-local
                     // sentinel); a `None` slot is conservatively not-fresh.
                     let v1_fresh = v1.as_ref().is_some_and(|hv| fm.is_fresh_malloc(hv));
-                    if !v1_fresh {
-                        if let Some(v2v) = as_variable(v2.clone()) {
-                            fm.nonfresh.insert(v2v);
-                        }
+                    if !v1_fresh && let Some(v2v) = as_variable(v2.clone()) {
+                        fm.nonfresh.insert(v2v);
                     }
                 }
                 // `if len(self.nonfresh) > prevlen: pendingblocks.append(link.target)`.

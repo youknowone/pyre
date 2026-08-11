@@ -115,22 +115,22 @@ fn polymorphic_mainloop(program: &Bytecode, threshold: u32) -> i64 {
         match opcode {
             OP_GUARD_A => {
                 if state.a != 0 {
-                    state.a = state.a + 1;
+                    state.a += 1;
                 }
             }
             OP_SUM_AB => {
                 if state.a + state.b != 0 {
-                    state.a = state.a + 1;
+                    state.a += 1;
                 }
             }
             OP_SUM_ABC => {
                 if state.a + state.b + state.c != 0 {
-                    state.a = state.a + 1;
+                    state.a += 1;
                 }
             }
             OP_SUM_ABCD => {
                 if state.a + state.b + state.c + state.d != 0 {
-                    state.a = state.a + 1;
+                    state.a += 1;
                 }
             }
             _ => break,

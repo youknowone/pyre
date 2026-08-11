@@ -237,8 +237,8 @@ mod tests {
             signof_question("char"),
             "printf(\"sign char=%d\\n\", ((char) -1) <= (char)0);"
         );
-        assert_eq!(parse_signof_c_type("char", "sign char=1\n").unwrap(), true);
-        assert_eq!(parse_signof_c_type("char", "sign char=0\n").unwrap(), false);
+        assert!(parse_signof_c_type("char", "sign char=1\n").unwrap());
+        assert!(!parse_signof_c_type("char", "sign char=0\n").unwrap());
     }
 
     #[test]

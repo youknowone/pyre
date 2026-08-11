@@ -306,6 +306,12 @@ impl UnwrapSpecRecipe {
 #[derive(Debug, Clone)]
 pub struct UnwrapSpecEmit;
 
+impl Default for UnwrapSpecEmit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UnwrapSpecEmit {
     pub fn new() -> Self {
         Self
@@ -1481,71 +1487,6 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Guard against drift between the constant colocated with
-    /// `BuiltinCode` and the id that `pyre-jit/src/eval.rs` asserts at
-    /// JitDriver init. Mirror of the W_INT/W_FLOAT trip-wire tests.
-    #[test]
-    fn builtin_code_gc_type_id_matches_descr() {
-        assert_eq!(BUILTIN_CODE_GC_TYPE_ID, 13);
-        assert_eq!(
-            <BuiltinCode as pyre_object::lltype::GcType>::type_id(),
-            BUILTIN_CODE_GC_TYPE_ID
-        );
-        assert_eq!(
-            <BuiltinCode as pyre_object::lltype::GcType>::SIZE,
-            std::mem::size_of::<BuiltinCode>()
-        );
-    }
-
-    /// pypy/interpreter/signature.py:33-46 accessor parity:
-    /// `def f(a, b, /, c, d, *args, e, f, **kwargs): ...`
-    /// → argnames=[a,b,c,d,e,f], varargname=args, kwargname=kwargs,
-    /// posonlyargcount=2, kwonlyargcount=2.
-    #[test]
-    fn signature_accessor_parity() {
-        let sig = Signature::new(
-            vec!["a", "b", "c", "d", "e", "f"],
-            Some("args"),
-            Some("kwargs"),
-            2,
-            2,
-        );
-        // num_argnames = len(argnames) - kwonlyargcount = 6 - 2 = 4
-        assert_eq!(sig.num_argnames(), 4);
-        assert_eq!(sig.num_posonlyargnames(), 2);
-        assert_eq!(sig.num_kwonlyargnames(), 2);
-        assert!(sig.has_vararg());
-        assert!(sig.has_kwarg());
-        // scope_length = len(argnames) + has_vararg + has_kwarg = 6 + 1 + 1 = 8
-        assert_eq!(sig.scope_length(), 8);
-        // find_argname returns -1 for unknown
-        assert_eq!(sig.find_argname("a"), 0);
-        assert_eq!(sig.find_argname("e"), 4);
-        assert_eq!(sig.find_argname("missing"), -1);
-        // getallvarnames appends varargname + kwargname
-        assert_eq!(
-            sig.getallvarnames(),
-            vec!["a", "b", "c", "d", "e", "f", "args", "kwargs"],
-        );
-    }
-
-    /// `def f(a, b): ...` — no *args / **kwargs / kwonly.
-    #[test]
-    fn signature_minimal_no_extras() {
-        let sig = Signature::new(vec!["a", "b"], None, None, 0, 0);
-        assert_eq!(sig.num_argnames(), 2);
-        assert_eq!(sig.num_kwonlyargnames(), 0);
-        assert!(!sig.has_vararg());
-        assert!(!sig.has_kwarg());
-        assert_eq!(sig.scope_length(), 2);
-        assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
-    }
-}
-
 // ── fsencode_bytes_w ─────────────────────────────────────────────────
 /// `baseobjspace.py:1970 fsencode_w` accepts str, bytes, or an object
 /// implementing `__fspath__`, and answers with the filesystem-encoded bytes.
@@ -1962,5 +1903,70 @@ pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, c
         Ok(std::path::PathBuf::from(crate::baseobjspace::str_utf8_w(
             obj,
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard against drift between the constant colocated with
+    /// `BuiltinCode` and the id that `pyre-jit/src/eval.rs` asserts at
+    /// JitDriver init. Mirror of the W_INT/W_FLOAT trip-wire tests.
+    #[test]
+    fn builtin_code_gc_type_id_matches_descr() {
+        assert_eq!(BUILTIN_CODE_GC_TYPE_ID, 13);
+        assert_eq!(
+            <BuiltinCode as pyre_object::lltype::GcType>::type_id(),
+            BUILTIN_CODE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <BuiltinCode as pyre_object::lltype::GcType>::SIZE,
+            std::mem::size_of::<BuiltinCode>()
+        );
+    }
+
+    /// pypy/interpreter/signature.py:33-46 accessor parity:
+    /// `def f(a, b, /, c, d, *args, e, f, **kwargs): ...`
+    /// → argnames=[a,b,c,d,e,f], varargname=args, kwargname=kwargs,
+    /// posonlyargcount=2, kwonlyargcount=2.
+    #[test]
+    fn signature_accessor_parity() {
+        let sig = Signature::new(
+            vec!["a", "b", "c", "d", "e", "f"],
+            Some("args"),
+            Some("kwargs"),
+            2,
+            2,
+        );
+        // num_argnames = len(argnames) - kwonlyargcount = 6 - 2 = 4
+        assert_eq!(sig.num_argnames(), 4);
+        assert_eq!(sig.num_posonlyargnames(), 2);
+        assert_eq!(sig.num_kwonlyargnames(), 2);
+        assert!(sig.has_vararg());
+        assert!(sig.has_kwarg());
+        // scope_length = len(argnames) + has_vararg + has_kwarg = 6 + 1 + 1 = 8
+        assert_eq!(sig.scope_length(), 8);
+        // find_argname returns -1 for unknown
+        assert_eq!(sig.find_argname("a"), 0);
+        assert_eq!(sig.find_argname("e"), 4);
+        assert_eq!(sig.find_argname("missing"), -1);
+        // getallvarnames appends varargname + kwargname
+        assert_eq!(
+            sig.getallvarnames(),
+            vec!["a", "b", "c", "d", "e", "f", "args", "kwargs"],
+        );
+    }
+
+    /// `def f(a, b): ...` — no *args / **kwargs / kwonly.
+    #[test]
+    fn signature_minimal_no_extras() {
+        let sig = Signature::new(vec!["a", "b"], None, None, 0, 0);
+        assert_eq!(sig.num_argnames(), 2);
+        assert_eq!(sig.num_kwonlyargnames(), 0);
+        assert!(!sig.has_vararg());
+        assert!(!sig.has_kwarg());
+        assert_eq!(sig.scope_length(), 2);
+        assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
     }
 }

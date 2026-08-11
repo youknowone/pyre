@@ -986,7 +986,7 @@ pub unsafe fn w_range_index_of(obj: PyObjectRef, item: &BigInt) -> PyObjectRef {
 /// `descr_eq` — two ranges are equal iff they generate the same sequence:
 /// equal lengths, and for a non-empty range equal start and (for length
 /// > 1) equal step.  The caller has already established both operands are
-/// ranges.
+/// >    ranges.
 ///
 /// # Safety
 /// `a` and `b` must point to valid `W_Range` objects.

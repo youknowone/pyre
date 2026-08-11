@@ -202,11 +202,11 @@ impl<'t> GraphAnalyzer<bool, ()> for RaiseAnalyzer<'t> {
             let links = graph.borrow().iterlinks();
             for link in links {
                 let last_exc_value = link.borrow().last_exc_value.clone();
-                if let Some(v) = last_exc_value {
-                    if dff.variable_families.find_rep(v) == v_exc_instance {
-                        // re-raise of caught exception — does not count
-                        return false;
-                    }
+                if let Some(v) = last_exc_value
+                    && dff.variable_families.find_rep(v) == v_exc_instance
+                {
+                    // re-raise of caught exception — does not count
+                    return false;
                 }
             }
         }

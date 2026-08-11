@@ -7,7 +7,7 @@ use indexmap::{IndexMap, IndexSet};
 /// Converts:
 /// - NEW / NEW_WITH_VTABLE -> CALL_MALLOC_NURSERY + tid initialization
 ///   (consecutive fixed-size allocations are batched into a single
-///    CALL_MALLOC_NURSERY with NURSERY_PTR_INCREMENT for subsequent objects)
+///   CALL_MALLOC_NURSERY with NURSERY_PTR_INCREMENT for subsequent objects)
 /// - NEW_ARRAY / NEW_ARRAY_CLEAR -> CALL_MALLOC_NURSERY_VARSIZE
 /// - SETFIELD_GC with a Ref-typed value -> COND_CALL_GC_WB + SETFIELD_GC
 ///
@@ -373,15 +373,16 @@ impl JitFrameDescrs {
 ///
 /// Encodes the three semantic outcomes that upstream signals via the
 /// `(index_box, emit)` tuple:
-///   - `Const`        — index folded into offset; caller must emit the
-///                      non-indexed GC_LOAD / GC_STORE form (upstream's
-///                      `index_box is None` check at rewrite.py:148, :199).
-///   - `Passthrough`  — original index re-used unchanged; the CPU's
-///                      addressing mode supports the requested factor.
-///   - `PreScale(op)` — the helper constructed an unemitted INT_LSHIFT /
-///                      INT_MUL; `_emit_mul_if_factor_offset_not_supported`
-///                      (or vector_ext callers) emits it before reading the
-///                      OpRef back as the final indexed-op `index` arg.
+/// - `Const`        — index folded into offset; caller must emit the
+///   non-indexed GC_LOAD / GC_STORE form (upstream's
+///   `index_box is None` check at rewrite.py:148, :199).
+/// - `Passthrough`  — original index re-used unchanged; the CPU's
+///   addressing mode supports the requested factor.
+/// - `PreScale(op)` — the helper constructed an unemitted INT_LSHIFT /
+///   INT_MUL; `_emit_mul_if_factor_offset_not_supported`
+///   (or vector_ext callers) emits it before reading the
+///   OpRef back as the final indexed-op `index` arg.
+#[allow(clippy::large_enum_variant)]
 enum ScaledIndex {
     Const,
     Passthrough(Operand),
@@ -665,11 +666,11 @@ impl RewriteState {
             return;
         }
         for i in 0..op.num_args() {
-            if let Some(Value::Ref(gcref)) = op.arg(i).const_value() {
-                if !gcref.is_null() {
-                    let load = self.remove_constptr(gcref);
-                    op.setarg(i, load);
-                }
+            if let Some(Value::Ref(gcref)) = op.arg(i).const_value()
+                && !gcref.is_null()
+            {
+                let load = self.remove_constptr(gcref);
+                op.setarg(i, load);
             }
         }
     }
@@ -1212,12 +1213,11 @@ impl GcRewriterImpl {
         // clear_gc_fields handles both, and the optimizer's force path may
         // materialize either Virtual or VirtualStruct without a duplicate
         // SETFIELD_GC for this header slot.
-        if let Some(w_class) = descr.w_class_obj() {
-            if w_class != 0 {
-                if let Some(w_class_fd) = descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class()) {
-                    self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
-                }
-            }
+        if let Some(w_class) = descr.w_class_obj()
+            && w_class != 0
+            && let Some(w_class_fd) = descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
+        {
+            self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
         }
 
         // rewrite.py:544 `self.clear_gc_fields(descr, op)` — record every
@@ -1290,12 +1290,11 @@ impl GcRewriterImpl {
         // matching upstream's `OverflowError: pass`.
         let mut total_size: i64 = -1;
         if let Some(num_elem) = length_const {
-            if num_elem >= 0 {
-                if let Some(var_size) = (item_size as i64).checked_mul(num_elem) {
-                    if let Some(t) = (descr.base_size() as i64).checked_add(var_size) {
-                        total_size = t;
-                    }
-                }
+            if num_elem >= 0
+                && let Some(var_size) = (item_size as i64).checked_mul(num_elem)
+                && let Some(t) = (descr.base_size() as i64).checked_add(var_size)
+            {
+                total_size = t;
             }
         } else if item_size == 0 {
             // rewrite.py:557-558 — non-const length but zero itemsize
@@ -1583,7 +1582,10 @@ impl GcRewriterImpl {
         let call_op = mk_op(OpCode::CallR, args);
         call_op.setdescr(calldescr);
         let result = st.emit_result(call_op, result_pos);
-        st.emit(mk_op(OpCode::CheckMemoryError, &[result.clone()]));
+        st.emit(mk_op(
+            OpCode::CheckMemoryError,
+            std::slice::from_ref(&result),
+        ));
         result
     }
 
@@ -1939,7 +1941,7 @@ impl GcRewriterImpl {
 
     /// rewrite.py:948-953 `gen_write_barrier`.
     fn gen_write_barrier(&self, v_base: Operand, st: &mut RewriteState) {
-        let wb_op = mk_op(OpCode::CondCallGcWb, &[v_base.clone()]);
+        let wb_op = mk_op(OpCode::CondCallGcWb, std::slice::from_ref(&v_base));
         st.emit(wb_op);
         st.remember_wb(&v_base);
     }
@@ -2651,7 +2653,7 @@ impl GcRewriterImpl {
             }
         }
         // Fall-back: produce a regular write_barrier.
-        let wb_op = mk_op(OpCode::CondCallGcWb, &[v_base.clone()]);
+        let wb_op = mk_op(OpCode::CondCallGcWb, std::slice::from_ref(&v_base));
         st.emit(wb_op);
         st.remember_wb(&v_base);
     }
@@ -3016,7 +3018,7 @@ impl GcRewriterImpl {
         let mut start = 0;
         if ops
             .first()
-            .map_or(false, |op| op.opcode == OpCode::IncrementDebugCounter)
+            .is_some_and(|op| op.opcode == OpCode::IncrementDebugCounter)
         {
             start = 1;
         }
@@ -4355,7 +4357,7 @@ mod tests {
             .find(|o| o.opcode == OpCode::CallMallocNursery)
             .unwrap();
         // rewrite.py:893-895: combined size = round_up(24+8) + round_up(32+8) = 32 + 40 = 72
-        let header = crate::header::GcHeader::SIZE as usize;
+        let header = crate::header::GcHeader::SIZE;
         let expected_size = round_up(24 + header) as i64 + round_up(32 + header) as i64;
         assert_eq!(
             malloc

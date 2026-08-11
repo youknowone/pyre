@@ -980,7 +980,7 @@ impl TypeRegistry {
         // Witness for typeid T = [T_root, ..., T_grandparent, T_parent, T]
         // where T_root is the topmost rclass.OBJECT-layout ancestor.
         let mut witness: Vec<Option<Vec<WitnessElement>>> = vec![None; n];
-        for id in 0..n {
+        for (id, witness_slot) in witness.iter_mut().enumerate().take(n) {
             if !self.entries[id].has_subclass_range {
                 continue;
             }
@@ -991,7 +991,7 @@ impl TypeRegistry {
                 cur = self.entries[c as usize].parent;
             }
             mro.reverse();
-            witness[id] = Some(mro);
+            *witness_slot = Some(mro);
         }
 
         // Build the peer list: each registered classdef contributes a
@@ -1006,8 +1006,8 @@ impl TypeRegistry {
             is_max: bool,
         }
         let mut peers: Vec<Peer> = Vec::new();
-        for id in 0..n {
-            let Some(w) = witness[id].as_ref() else {
+        for (id, witness_slot) in witness.iter().enumerate().take(n) {
+            let Some(w) = witness_slot.as_ref() else {
                 continue;
             };
             peers.push(Peer {

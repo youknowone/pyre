@@ -208,7 +208,7 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
             return;
         }
         let current = ba.alloc;
-        let fits = size + ba.logical_offset + 1 <= current;
+        let fits = size + ba.logical_offset < current;
         if fits && size >= current / 2 {
             return;
         }

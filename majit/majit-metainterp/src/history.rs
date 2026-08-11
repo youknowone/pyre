@@ -60,6 +60,12 @@ pub struct TargetToken {
     jump_target_descr: Arc<LoopTargetDescr>,
 }
 
+impl Default for TargetToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TargetToken {
     pub fn new() -> Self {
         TargetToken {
@@ -666,12 +672,11 @@ impl TreeLoop {
                 }
             }
             // history.py:594-595: if op produces a value, add to seen
-            if op.opcode.result_type() != Type::Void {
-                if !op.pos.get().is_none() {
-                    if !seen.insert(op.pos.get()) {
-                        return false;
-                    }
-                }
+            if op.opcode.result_type() != Type::Void
+                && !op.pos.get().is_none()
+                && !seen.insert(op.pos.get())
+            {
+                return false;
             }
             // history.py:596-602: LABEL resets seen
             if op.opcode == OpCode::Label {
@@ -692,12 +697,11 @@ impl TreeLoop {
             return false;
         }
         // history.py:605-608: if a JUMP has a target, it must be TargetToken.
-        if last.opcode == OpCode::Jump {
-            if let Some(descr) = last.getdescr() {
-                if descr.as_loop_target_descr().is_none() {
-                    return false;
-                }
-            }
+        if last.opcode == OpCode::Jump
+            && let Some(descr) = last.getdescr()
+            && descr.as_loop_target_descr().is_none()
+        {
+            return false;
         }
 
         true
@@ -882,9 +886,7 @@ impl TreeLoop {
             let mut stack: Vec<(OpRef, bool)> = vec![(*root, true)];
             while let Some((r, is_root)) = stack.pop() {
                 if r.raw() < num_original_inputargs {
-                    if inputarg_consts.get(r.raw() as usize).is_none() {
-                        return None;
-                    }
+                    inputarg_consts.get(r.raw() as usize)?;
                     continue;
                 }
                 if !seen.insert(r) {
@@ -1196,7 +1198,7 @@ impl TreeLoop {
                                     crate::recorder::SnapshotTagged::Box(new_ref, *tp)
                                 } else if !Self::is_runtime_opref(*old_ref) {
                                     // Constants and NONE pass through unchanged.
-                                    t.clone()
+                                    *t
                                 } else {
                                     // opencoder.py:287-288: _get(i) asserts
                                     // _cache[i] is not None. An unmapped pre-cut
@@ -1206,7 +1208,7 @@ impl TreeLoop {
                                     crate::recorder::SnapshotTagged::Box(OpRef::NONE, *tp)
                                 }
                             }
-                            other => other.clone(),
+                            other => *other,
                         }
                     };
                 crate::recorder::Snapshot {

@@ -644,7 +644,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     let new_term = unsafe { type_terminator_or_create(w_cls) };
     let mut inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
-    let new_obj = unsafe { node_set_terminator(map, &mut inst, new_term) };
+    let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
     let new_map = new_obj.map;
     inst._set_mapdict_storage_and_map(new_obj.storage, new_map);
 }
@@ -889,7 +889,7 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    let w_res = unsafe { node_read(map, &mut inst, Wtf8::new("slot"), attrkind) };
+    let w_res = unsafe { node_read(map, &inst, Wtf8::new("slot"), attrkind) };
     // read → _direct_read (mapdict.py:592-598) lazily migrates an unboxed
     // attribute to boxed storage, as in `instance_node_getdictvalue`.
     unsafe { maybe_migrate_to_boxed(map, &mut inst, Wtf8::new("slot"), attrkind) };
@@ -2404,48 +2404,49 @@ unsafe fn store_attr_slowpath(
         let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
         // mapdict.py:1596-1611 — fast path for stores that add a new attribute
         // that this slot has already cached the transition for.
-        if let Some(e) = entry {
-            if e.valid_for_store && version_tag == e.version_tag {
-                let entry_map = e.cached_map;
-                let attr_to_add = e.cached_attr;
-                // mapdict.py:1599-1602 `entry_map is not None and
-                // isinstance(entry_map, PlainAttribute) and attr_to_add is entry_map
-                // and entry_map.back is map`.
-                if !entry_map.is_null()
-                    && unsafe { (*entry_map).is_plain() }
-                    && std::ptr::eq(attr_to_add, entry_map)
-                    && std::ptr::eq(unsafe { (*entry_map).as_plain() }.back, map)
-                {
-                    // mapdict.py:1603-1606 — for an unboxed attr the new value must
-                    // match the unbox type, else fall through to the general path.
-                    let p = unsafe { (*attr_to_add).as_plain() };
-                    let typsafe = match &p.unboxed {
-                        Some(u) => unsafe { value_has_unbox_type(u.typ, w_value) },
-                        None => true,
-                    };
-                    if typsafe {
-                        let switched = {
-                            let _instance_guard = instance_lock(w_obj);
-                            let current_map = unsafe { mapdict_map_or_null(w_obj) };
-                            if std::ptr::eq(current_map, map) {
-                                // mapdict.py:1610
-                                // `_switch_map_and_write_increase_storage1`.
-                                let mut inst = unsafe { mapdict_carrier(w_obj) };
-                                unsafe {
-                                    switch_map_and_write_increase_storage1(
-                                        attr_to_add,
-                                        &mut inst,
-                                        w_value,
-                                    )
-                                };
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if switched {
-                            return Ok(());
+        if let Some(e) = entry
+            && e.valid_for_store
+            && version_tag == e.version_tag
+        {
+            let entry_map = e.cached_map;
+            let attr_to_add = e.cached_attr;
+            // mapdict.py:1599-1602 `entry_map is not None and
+            // isinstance(entry_map, PlainAttribute) and attr_to_add is entry_map
+            // and entry_map.back is map`.
+            if !entry_map.is_null()
+                && unsafe { (*entry_map).is_plain() }
+                && std::ptr::eq(attr_to_add, entry_map)
+                && std::ptr::eq(unsafe { (*entry_map).as_plain() }.back, map)
+            {
+                // mapdict.py:1603-1606 — for an unboxed attr the new value must
+                // match the unbox type, else fall through to the general path.
+                let p = unsafe { (*attr_to_add).as_plain() };
+                let typsafe = match &p.unboxed {
+                    Some(u) => unsafe { value_has_unbox_type(u.typ, w_value) },
+                    None => true,
+                };
+                if typsafe {
+                    let switched = {
+                        let _instance_guard = instance_lock(w_obj);
+                        let current_map = unsafe { mapdict_map_or_null(w_obj) };
+                        if std::ptr::eq(current_map, map) {
+                            // mapdict.py:1610
+                            // `_switch_map_and_write_increase_storage1`.
+                            let mut inst = unsafe { mapdict_carrier(w_obj) };
+                            unsafe {
+                                switch_map_and_write_increase_storage1(
+                                    attr_to_add,
+                                    &mut inst,
+                                    w_value,
+                                )
+                            };
+                            true
+                        } else {
+                            false
                         }
+                    };
+                    if switched {
+                        return Ok(());
                     }
                 }
             }
@@ -5929,7 +5930,7 @@ mod tests {
                 Some(sentinel(0x2))
             );
             // deleting again reports the attribute is gone
-            assert_eq!(instance_node_deldictvalue(obj_ref, wn("x")), false);
+            assert!(!instance_node_deldictvalue(obj_ref, wn("x")));
         }
     }
 
@@ -6267,7 +6268,7 @@ mod tests {
             // Never entered INSTANCE_DICT (no getdict call), proving storage
             // forwarding is decoupled from wrapper materialisation.
             let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
-            assert_eq!(in_instance_dict, false);
+            assert!(!in_instance_dict);
 
             let mut seen: Vec<PyObjectRef> = Vec::new();
             instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
@@ -6316,7 +6317,7 @@ mod tests {
             assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
             let addr = obj_ref as usize;
             let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
-            assert_eq!(in_instance_dict, false);
+            assert!(!in_instance_dict);
             // identity stable across repeated access.
             let w2 = _obj_getdict(obj_ref);
             assert_eq!(w1, w2);

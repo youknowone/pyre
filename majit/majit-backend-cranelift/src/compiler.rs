@@ -1201,10 +1201,10 @@ fn is_demoted_failarg(demoted_failarg_slots: &IndexMap<u32, i32>, var_idx: u32) 
 
 fn var(idx: u32) -> Variable {
     OPREF_VAR_MAP.with(|cell| {
-        if let Some(map) = cell.borrow().as_ref() {
-            if let Some(&v) = map.get(&idx) {
-                return v;
-            }
+        if let Some(map) = cell.borrow().as_ref()
+            && let Some(&v) = map.get(&idx)
+        {
+            return v;
         }
         // Pre-declaration fallback: callers that materialise a Variable
         // before do_compile populates the map (e.g. test fixtures, helper
@@ -2413,10 +2413,11 @@ thread_local! {
 /// clears CA_FAST_PTR before removing from CA_TARGET_CACHE).
 unsafe fn fast_lookup_ca_target(token_number: u64) -> *const RegisteredLoopTarget {
     // Hot path: single Cell read, no borrow, no atomic ops
-    if let Ok((t, p)) = CA_FAST_PTR.try_with(|c| c.get()) {
-        if t == token_number && p != 0 {
-            return p as *const RegisteredLoopTarget;
-        }
+    if let Ok((t, p)) = CA_FAST_PTR.try_with(|c| c.get())
+        && t == token_number
+        && p != 0
+    {
+        return p as *const RegisteredLoopTarget;
     }
     // Warm path: IndexMap lookup, extract pointer without Arc clone
     if let Ok(Some(ptr)) = CA_TARGET_CACHE.try_with(|c| {
@@ -2857,12 +2858,12 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
     let Some(new_target) = lookup_call_assembler_target(new_number) else {
         return Ok(());
     };
-    if let Some(old_target) = lookup_call_assembler_target(old_number) {
-        if old_target.inputarg_types != new_target.inputarg_types {
-            return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect from token {old_number} to {new_number} changed input types"
-            )));
-        }
+    if let Some(old_target) = lookup_call_assembler_target(old_number)
+        && old_target.inputarg_types != new_target.inputarg_types
+    {
+        return Err(BackendError::Unsupported(format!(
+            "call-assembler redirect from token {old_number} to {new_number} changed input types"
+        )));
     }
     validate_registered_target_against_call_assembler_expectations(old_number, &new_target)?;
     // Update dispatch slot so existing compiled code sees the new target.
@@ -3187,7 +3188,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     // only fires during `MetaInterpStaticData.finish_setup`, long
     // before compiled code runs.
     let attachments_guard = target.cpu_attachments.read().unwrap();
-    let attachments: &CpuDescrAttachments = &*attachments_guard;
+    let attachments: &CpuDescrAttachments = &attachments_guard;
     loop {
         let exec = run_compiled_code(
             cur_code_ptr,
@@ -3195,7 +3196,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             cur_num_ref_roots,
             cur_max_output_slots,
             &current_inputs,
-            &attachments,
+            attachments,
             cur_dispatch_key,
         );
         let fail_index = exec.fail_index;
@@ -3228,7 +3229,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     &bridge,
                     &raw_outputs,
                     fail_descr_fd.fail_arg_types(),
-                    &attachments,
+                    attachments,
                 );
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
@@ -3282,7 +3283,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 &bridge,
                 &mat_outputs,
                 fail_arg_types,
-                &attachments,
+                attachments,
             );
         }
 
@@ -3498,7 +3499,7 @@ fn call_assembler_guard_failure_inner(
         &default_attachments
     } else {
         attachments_guard = unsafe { (*cpu_handle).read().unwrap() };
-        &*attachments_guard
+        &attachments_guard
     };
     // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
     if fail_descr_ptr == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
@@ -4343,10 +4344,11 @@ fn use_declared_var_or_panic(builder: &mut FunctionBuilder, opref: OpRef, what: 
 /// `majit_gc::can_move`; the `we_are_translated()` clause is subsumed
 /// because `can_move` is false when no moving GC is active.
 fn guard_constptr_immediate(opref: OpRef) {
-    if let Some(g) = opref.as_const_ptr() {
-        if !g.is_null() && majit_gc::can_move(g) {
-            panic!("convert_to_imm: ConstPtr needs special care");
-        }
+    if let Some(g) = opref.as_const_ptr()
+        && !g.is_null()
+        && majit_gc::can_move(g)
+    {
+        panic!("convert_to_imm: ConstPtr needs special care");
     }
 }
 
@@ -4548,7 +4550,7 @@ fn is_rewriter_immediate_arg(opcode: majit_ir::OpCode, arg_idx: usize) -> bool {
     use majit_ir::OpCode;
     match opcode {
         // ZeroArray(base, start_imm, size_imm, scale_start_imm, scale_size_imm)
-        OpCode::ZeroArray => arg_idx >= 1 && arg_idx <= 4,
+        OpCode::ZeroArray => (1..=4).contains(&arg_idx),
         _ => false,
     }
 }
@@ -4929,10 +4931,10 @@ fn build_type_overrides(
                 continue;
             }
             let var_idx = op.pos.get().raw();
-            if let Some(ia_type) = type_index.inputarg_type(op.pos.get()) {
-                if ia_type != result_type {
-                    op_def_positions.insert(var_idx, op_idx);
-                }
+            if let Some(ia_type) = type_index.inputarg_type(op.pos.get())
+                && ia_type != result_type
+            {
+                op_def_positions.insert(var_idx, op_idx);
             }
         }
     }
@@ -4947,12 +4949,12 @@ fn build_type_overrides(
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
             let __descr_arc_d = op.getdescr();
-            if let Some(ref d) = __descr_arc_d.as_ref() {
+            if let Some(d) = __descr_arc_d.as_ref() {
                 label_by_descr.insert(d.index(), op_idx);
             }
         } else if op.opcode == OpCode::Jump {
             let __descr_arc_d = op.getdescr();
-            if let Some(ref d) = __descr_arc_d.as_ref() {
+            if let Some(d) = __descr_arc_d.as_ref() {
                 jumps_by_descr.push((d.index(), op_idx));
             }
         }
@@ -5403,14 +5405,14 @@ fn log_internal_jump_type_mismatches(
         {
             let got = lookup_type_at(type_index, overrides, arg.to_opref(), jump_idx);
             let want = lookup_type_at(type_index, overrides, want_arg.to_opref(), label_idx);
-            if let (Some(got), Some(want)) = (got, want) {
-                if got != want {
-                    eprintln!(
-                        "[ref-root] JUMP/LABEL type mismatch at arg {i}: \
+            if let (Some(got), Some(want)) = (got, want)
+                && got != want
+            {
+                eprintln!(
+                    "[ref-root] JUMP/LABEL type mismatch at arg {i}: \
                          label wants {want:?}, jump passes {got:?} \
                          (jump_idx={jump_idx} label_idx={label_idx})"
-                    );
-                }
+                );
             }
         }
     }
@@ -5639,10 +5641,10 @@ fn type_for_opref(
 ) -> Result<Type, BackendError> {
     // history.py:220/261/307 — Const OpRef variant tag carries the type;
     // `opref.ty()` returns it without touching `.raw()`.
-    if let Some(tp) = opref.ty() {
-        if opref.is_constant() {
-            return Ok(tp);
-        }
+    if let Some(tp) = opref.ty()
+        && opref.is_constant()
+    {
+        return Ok(tp);
     }
     if let Some(tp) = lookup_type_at(type_index, overrides, opref, op_index) {
         return Ok(tp);
@@ -5989,10 +5991,10 @@ fn get_gcmap(
         }
         // regalloc.py:1096/1102: box.type == REF and self.rm.is_still_alive(box)
         // is_still_alive: longevity[v].last_usage >= position
-        if let Some(&last_usage) = longevity.get(&var_idx) {
-            if last_usage >= position {
-                live_bit_positions.push(max_output_slots + slot);
-            }
+        if let Some(&last_usage) = longevity.get(&var_idx)
+            && last_usage >= position
+        {
+            live_bit_positions.push(max_output_slots + slot);
         }
     }
     if live_bit_positions.is_empty() {
@@ -6007,7 +6009,7 @@ fn get_gcmap(
         let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
         return gcmap_arr.as_ptr() as i64;
     }
-    let num_words = (max_bit + 63) / 64;
+    let num_words = max_bit.div_ceil(64);
     let mut gcmap: Vec<isize> = vec![0; 1 + num_words];
     gcmap[0] = num_words as isize;
     for bit_pos in &live_bit_positions {
@@ -7338,19 +7340,18 @@ fn find_fail_descr_in_fail_descrs(
     // (singleton FINISH descrs introduced by 7-Tβ3).  Use position
     // directly so this function does not depend on the descr-internal
     // accessor.
-    if let Some(descr) = fail_descrs.get(fail_index as usize) {
-        if as_fd(descr).trace_id() == trace_id {
-            return Some(descr.clone());
-        }
+    if let Some(descr) = fail_descrs.get(fail_index as usize)
+        && as_fd(descr).trace_id() == trace_id
+    {
+        return Some(descr.clone());
     }
     for descr in fail_descrs {
         let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref() {
-            if let Some(found) =
+        if let Some(bridge) = bridge_guard.as_ref()
+            && let Some(found) =
                 find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
-            {
-                return Some(found);
-            }
+        {
+            return Some(found);
         }
     }
     None
@@ -7406,10 +7407,10 @@ fn find_fail_descr_by_ptr(
             return Some(global.clone());
         }
     }
-    if let Some(propagate) = propagate_exception_descr {
-        if Arc::as_ptr(propagate) as *const () as usize == descr_ptr {
-            return Some(propagate.clone());
-        }
+    if let Some(propagate) = propagate_exception_descr
+        && Arc::as_ptr(propagate) as *const () as usize == descr_ptr
+    {
+        return Some(propagate.clone());
     }
     let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_ptr) };
     Some(cell.descr.clone())
@@ -7915,16 +7916,16 @@ fn patch_terminal_exit_recovery_layout(
 
     for descr in fail_descrs {
         let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref() {
-            if patch_terminal_exit_recovery_layout(
+        if let Some(bridge) = bridge_guard.as_ref()
+            && patch_terminal_exit_recovery_layout(
                 &bridge.terminal_exit_layouts,
                 &bridge.fail_descrs,
                 trace_id,
                 op_index,
                 recovery_layout,
-            ) {
-                return true;
-            }
+            )
+        {
+            return true;
         }
     }
     false
@@ -8001,11 +8002,11 @@ fn resolve_fail_arg_types(
             if opref.is_none() {
                 return Type::Ref;
             }
-            if let Some(&def_pos) = op_def_positions.get(&opref.raw()) {
-                if guard_op_index < def_pos {
-                    // Guard before redefinition: use inputarg type.
-                    return type_index.inputarg_type(opref).unwrap_or(tp);
-                }
+            if let Some(&def_pos) = op_def_positions.get(&opref.raw())
+                && guard_op_index < def_pos
+            {
+                // Guard before redefinition: use inputarg type.
+                return type_index.inputarg_type(opref).unwrap_or(tp);
             }
             tp
         })
@@ -8070,6 +8071,12 @@ pub struct CraneliftBackend {
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
     descr_attachments: CpuDescrHandle,
+}
+
+impl Default for CraneliftBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CraneliftBackend {
@@ -8186,40 +8193,39 @@ impl CraneliftBackend {
                         let prev_fd = as_fd(prev_d);
                         let fi = prev_fd.fail_index();
                         let tid = prev_fd.trace_id();
-                        if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi) {
-                            if !fail_descr_has_bridge(as_fd(&new_d)) {
-                                if let Some(b) = fail_descr_bridge_ref(as_fd(prev_d)) {
-                                    if std::env::var_os("MAJIT_LOG").is_some() {
-                                        eprintln!(
-                                            "[jit] propagate bridge tid={} fi={} to new token",
-                                            tid, fi,
-                                        );
-                                    }
-                                    fail_descr_attach_bridge(
-                                        as_fd(&new_d),
-                                        BridgeData {
-                                            trace_id: b.trace_id,
-                                            input_types: b.input_types.clone(),
-                                            header_pc: b.header_pc,
-                                            source_guard: b.source_guard,
-                                            caller_prefix_layout: b.caller_prefix_layout.clone(),
-                                            code_ptr: b.code_ptr,
-                                            body_ptr: b.body_ptr,
-                                            fail_descrs: b.fail_descrs.clone(),
-                                            fail_descr_cells: b.fail_descr_cells.clone(),
-                                            num_inputs: b.num_inputs,
-                                            num_ref_roots: b.num_ref_roots,
-                                            max_output_slots: b.max_output_slots,
-                                            terminal_exit_layouts: UnsafeCell::new(
-                                                unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                                            ),
-                                            loop_reentry: b.loop_reentry,
-                                            invalidated_arc: b.invalidated_arc.clone(),
-                                            gc_table: b.gc_table.clone(),
-                                        },
-                                    );
-                                }
+                        if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi)
+                            && !fail_descr_has_bridge(as_fd(&new_d))
+                            && let Some(b) = fail_descr_bridge_ref(as_fd(prev_d))
+                        {
+                            if std::env::var_os("MAJIT_LOG").is_some() {
+                                eprintln!(
+                                    "[jit] propagate bridge tid={} fi={} to new token",
+                                    tid, fi,
+                                );
                             }
+                            fail_descr_attach_bridge(
+                                as_fd(&new_d),
+                                BridgeData {
+                                    trace_id: b.trace_id,
+                                    input_types: b.input_types.clone(),
+                                    header_pc: b.header_pc,
+                                    source_guard: b.source_guard,
+                                    caller_prefix_layout: b.caller_prefix_layout.clone(),
+                                    code_ptr: b.code_ptr,
+                                    body_ptr: b.body_ptr,
+                                    fail_descrs: b.fail_descrs.clone(),
+                                    fail_descr_cells: b.fail_descr_cells.clone(),
+                                    num_inputs: b.num_inputs,
+                                    num_ref_roots: b.num_ref_roots,
+                                    max_output_slots: b.max_output_slots,
+                                    terminal_exit_layouts: UnsafeCell::new(
+                                        unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                                    ),
+                                    loop_reentry: b.loop_reentry,
+                                    invalidated_arc: b.invalidated_arc.clone(),
+                                    gc_table: b.gc_table.clone(),
+                                },
+                            );
                         }
                     }
                 }
@@ -8619,7 +8625,7 @@ impl CraneliftBackend {
         // fires during `MetaInterpStaticData.finish_setup`, long before
         // compiled code runs.
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
-        let attachments: &CpuDescrAttachments = &*attachments_guard;
+        let attachments: &CpuDescrAttachments = &attachments_guard;
 
         loop {
             let exec = run_compiled_code(
@@ -9643,10 +9649,8 @@ impl CraneliftBackend {
         // the function prologue and preamble code is deferred to the end.
         // Tracks whether the current op-emission phase is in preamble.
         let mut preamble_phase = label_blocks.len() >= 2;
-        if preamble_phase {
-            if let Some(&(_, first_label_block)) = label_blocks.first() {
-                builder.set_cold_block(first_label_block);
-            }
+        if preamble_phase && let Some(&(_, first_label_block)) = label_blocks.first() {
+            builder.set_cold_block(first_label_block);
         }
 
         let first_label_entered_at_entry = false;
@@ -9740,7 +9744,7 @@ impl CraneliftBackend {
                     }
                 }
                 let vals: Vec<CValue> = (0..arity)
-                    .filter(|&i| !loop_phi_keep.is_some_and(|keep| !keep[i]))
+                    .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
                     .map(|i| {
                         let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                         builder
@@ -9871,7 +9875,7 @@ impl CraneliftBackend {
                             .getarglist()
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| !loop_phi_keep.is_some_and(|keep| !keep[*i]))
+                            .filter(|(i, _)| loop_phi_keep.is_none_or(|keep| keep[*i]))
                             .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
                             .collect();
                         let args = block_args_to(&mut builder, *label_block, &vals);
@@ -11246,19 +11250,20 @@ impl CraneliftBackend {
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
-                    if let Some(result) = call_result {
-                        if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
-                            sync_ref_root_var(
-                                &mut builder,
-                                ptr_type,
-                                &mut None,
-                                &ref_root_slots,
-                                vi,
-                                result,
-                                ref_root_base_ofs,
-                                &mut synced_ref_vars,
-                            );
-                        }
+                    if let Some(result) = call_result
+                        && op.result_type() == Type::Ref
+                        && !force_tokens.contains(&vi)
+                    {
+                        sync_ref_root_var(
+                            &mut builder,
+                            ptr_type,
+                            &mut None,
+                            &ref_root_slots,
+                            vi,
+                            result,
+                            ref_root_base_ofs,
+                            &mut synced_ref_vars,
+                        );
                     }
                 }
 
@@ -11299,28 +11304,26 @@ impl CraneliftBackend {
                     // If next op is GUARD_NOT_FORCED, store its fail descr
                     // to jf_force_descr BEFORE the call. GC rewriter elides
                     // CallN(drop_frame), so GUARD_NOT_FORCED is ops[idx+1].
-                    if let Some(next) = ops.get(op_idx + 1) {
-                        if next.opcode == OpCode::GuardNotForced
-                            || next.opcode == OpCode::GuardNotForced2
-                        {
-                            let info = &guard_infos[guard_idx];
-                            let descr_val =
-                                builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
-                            let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                            builder.ins().store(
-                                MemFlags::trusted(),
-                                descr_val,
-                                cur_jf,
-                                JF_FORCE_DESCR_OFS,
-                            );
-                            // Reset jf_descr to 0: a previous guard exit
-                            // (e.g., base-case bridge) may have left jf_descr
-                            // non-zero. RPython's _call_header resets it.
-                            let zero = builder.ins().iconst(cl_types::I64, 0);
-                            builder
-                                .ins()
-                                .store(MemFlags::trusted(), zero, cur_jf, JF_DESCR_OFS);
-                        }
+                    if let Some(next) = ops.get(op_idx + 1)
+                        && (next.opcode == OpCode::GuardNotForced
+                            || next.opcode == OpCode::GuardNotForced2)
+                    {
+                        let info = &guard_infos[guard_idx];
+                        let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            descr_val,
+                            cur_jf,
+                            JF_FORCE_DESCR_OFS,
+                        );
+                        // Reset jf_descr to 0: a previous guard exit
+                        // (e.g., base-case bridge) may have left jf_descr
+                        // non-zero. RPython's _call_header resets it.
+                        let zero = builder.ins().iconst(cl_types::I64, 0);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), zero, cur_jf, JF_DESCR_OFS);
                     }
 
                     // rewrite.py:613-653 gen_malloc_frame parity:
@@ -11989,32 +11992,31 @@ impl CraneliftBackend {
                     builder.switch_to_block(call_block);
                     builder.seal_block(call_block);
 
-                    if let Some(descr) = op.getdescr() {
-                        if let Some(call_descr) = descr.as_call_descr() {
-                            let call_jf = builder.ins().get_pinned_reg(ptr_type);
-                            let _ = emit_indirect_call_from_parts(
-                                &mut builder,
-                                &constants,
-                                op.arg(1).to_opref(),
-                                &op.getarglist()[2..]
-                                    .iter()
-                                    .map(|a| a.to_opref())
-                                    .collect::<Vec<_>>(),
-                                call_descr,
-                                call_conv,
-                                ptr_type,
-                                call_jf,
-                                &ref_root_slots,
-                                &defined_ref_vars,
-                                &stale_ref_vars,
-                                &demoted_failarg_slots,
-                                ref_root_base_ofs,
-                                per_call_gcmap,
-                            );
-                            jf_ptr =
-                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                            builder.ins().set_pinned_reg(jf_ptr);
-                        }
+                    if let Some(descr) = op.getdescr()
+                        && let Some(call_descr) = descr.as_call_descr()
+                    {
+                        let call_jf = builder.ins().get_pinned_reg(ptr_type);
+                        let _ = emit_indirect_call_from_parts(
+                            &mut builder,
+                            &constants,
+                            op.arg(1).to_opref(),
+                            &op.getarglist()[2..]
+                                .iter()
+                                .map(|a| a.to_opref())
+                                .collect::<Vec<_>>(),
+                            call_descr,
+                            call_conv,
+                            ptr_type,
+                            call_jf,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
+                        );
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        builder.ins().set_pinned_reg(jf_ptr);
                     }
 
                     builder.ins().jump(cont_block, &[]);
@@ -12049,34 +12051,33 @@ impl CraneliftBackend {
                     builder.seal_block(call_block);
 
                     let mut call_result = cond; // fallback
-                    if let Some(descr) = op.getdescr() {
-                        if let Some(call_descr) = descr.as_call_descr() {
-                            let call_jf = builder.ins().get_pinned_reg(ptr_type);
-                            if let Some(result) = emit_indirect_call_from_parts(
-                                &mut builder,
-                                &constants,
-                                op.arg(1).to_opref(),
-                                &op.getarglist()[2..]
-                                    .iter()
-                                    .map(|a| a.to_opref())
-                                    .collect::<Vec<_>>(),
-                                call_descr,
-                                call_conv,
-                                ptr_type,
-                                call_jf,
-                                &ref_root_slots,
-                                &defined_ref_vars,
-                                &stale_ref_vars,
-                                &demoted_failarg_slots,
-                                ref_root_base_ofs,
-                                per_call_gcmap,
-                            ) {
-                                call_result = result;
-                            }
-                            jf_ptr =
-                                emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                            builder.ins().set_pinned_reg(jf_ptr);
+                    if let Some(descr) = op.getdescr()
+                        && let Some(call_descr) = descr.as_call_descr()
+                    {
+                        let call_jf = builder.ins().get_pinned_reg(ptr_type);
+                        if let Some(result) = emit_indirect_call_from_parts(
+                            &mut builder,
+                            &constants,
+                            op.arg(1).to_opref(),
+                            &op.getarglist()[2..]
+                                .iter()
+                                .map(|a| a.to_opref())
+                                .collect::<Vec<_>>(),
+                            call_descr,
+                            call_conv,
+                            ptr_type,
+                            call_jf,
+                            &ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            per_call_gcmap,
+                        ) {
+                            call_result = result;
                         }
+                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        builder.ins().set_pinned_reg(jf_ptr);
                     }
 
                     builder
@@ -12626,7 +12627,7 @@ impl CraneliftBackend {
                     // Load flag byte from object header.
                     let rw = self.gc_rewriter();
                     let wb = rw.wb_descr.as_ref();
-                    let wb_byteofs = wb.map(|d| d.jit_wb_if_flag_byteofs as i32).unwrap_or(0);
+                    let wb_byteofs = wb.map(|d| d.jit_wb_if_flag_byteofs).unwrap_or(0);
                     let wb_mask_raw = wb.map(|d| d.jit_wb_if_flag_singlebyte).unwrap_or(0);
                     let wb_cards_set = wb.map(|d| d.jit_wb_cards_set).unwrap_or(0);
                     let wb_card_shift = wb.map(|d| d.jit_wb_card_page_shift).unwrap_or(0);
@@ -13519,7 +13520,7 @@ impl CraneliftBackend {
                             .getarglist()
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| !target_keep.is_some_and(|keep| !keep[*i]))
+                            .filter(|(i, _)| target_keep.is_none_or(|keep| keep[*i]))
                             .map(|(_, r)| {
                                 resolve_local_jump_arg(
                                     &mut builder,
@@ -14939,7 +14940,7 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = op.opcode == OpCode::Jump
-            && op.getdescr().as_ref().map_or(false, |d| {
+            && op.getdescr().as_ref().is_some_and(|d| {
                 let id = majit_ir::descr_identity(d);
                 match label_arity_by_descr
                     .iter()
@@ -15008,7 +15009,7 @@ fn collect_guards(
         let is_external_jump = op.opcode == OpCode::Jump
             && op
                 .getdescr()
-                .map_or(false, |d| match label_arity_by_descr.get(&d.index()) {
+                .is_some_and(|d| match label_arity_by_descr.get(&d.index()) {
                     None => true,
                     Some(&arity) => arity != op.num_args(),
                 });
@@ -15547,7 +15548,7 @@ fn collect_guards(
             let is_exit_exc = descr_arc
                 .as_ref()
                 .and_then(|d| d.as_fail_descr())
-                .map(|fd| FailDescr::is_exit_frame_with_exception(fd))
+                .map(FailDescr::is_exit_frame_with_exception)
                 .unwrap_or(false);
             if is_exit_exc {
                 EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone()
@@ -15608,13 +15609,13 @@ fn collect_guards(
             // setters at the ResumeDescr family; non-Resume meta
             // descrs skip the trait calls so the trait-default panic
             // path stays unreached.
-            if descr.is_resume_guard() || descr.is_resume_guard_copied() {
-                if let Some(fd) = descr.as_fail_descr() {
-                    fd.set_fail_index_per_trace(fail_index);
-                    fd.set_trace_id(trace_id);
-                    if fd.fail_arg_types().is_empty() {
-                        fd.set_fail_arg_types(fail_arg_types.to_vec());
-                    }
+            if (descr.is_resume_guard() || descr.is_resume_guard_copied())
+                && let Some(fd) = descr.as_fail_descr()
+            {
+                fd.set_fail_index_per_trace(fail_index);
+                fd.set_trace_id(trace_id);
+                if fd.fail_arg_types().is_empty() {
+                    fd.set_fail_arg_types(fail_arg_types.to_vec());
                 }
             }
             // Per-emission setters publish into ResumeGuardDescr slots
@@ -15653,17 +15654,17 @@ fn collect_guards(
         // regalloc.py:496-501 consider_guard_value / compile.py:813-824
         // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
         // index + type tag in status (overrides store_hash).
-        if op.opcode == majit_ir::OpCode::GuardValue {
-            if let Some(fa) = op.getfailargs() {
-                let arg0 = op.arg(0).to_opref();
-                if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
-                    let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
-                        Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
-                        Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                        _ => majit_backend::STATUS_TY_INT,
-                    };
-                    as_fd(&descr).make_a_counter_per_value(idx as u32, type_tag);
-                }
+        if op.opcode == majit_ir::OpCode::GuardValue
+            && let Some(fa) = op.getfailargs()
+        {
+            let arg0 = op.arg(0).to_opref();
+            if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
+                let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
+                    Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
+                    Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                    _ => majit_backend::STATUS_TY_INT,
+                };
+                as_fd(&descr).make_a_counter_per_value(idx as u32, type_tag);
             }
         }
         // assembler.py:2126 get_gcref_from_faildescr parity: store the
@@ -16162,10 +16163,10 @@ impl majit_backend::Backend for CraneliftBackend {
             }
         }
         {
-            if let Some(ref sd) = source_descr {
-                if let Some(bridge) = fail_descr_bridge_ref(as_fd(sd)) {
-                    unregister_bridge_call_assembler_expectations(&bridge);
-                }
+            if let Some(ref sd) = source_descr
+                && let Some(bridge) = fail_descr_bridge_ref(as_fd(sd))
+            {
+                unregister_bridge_call_assembler_expectations(&bridge);
             }
         }
         if let Some(ref sd) = source_descr {
@@ -16213,42 +16214,40 @@ impl majit_backend::Backend for CraneliftBackend {
                     .compiled
                     .get()
                     .and_then(|c| c.downcast_ref::<CompiledLoop>())
-                {
-                    if let Some(prev_descr) = find_fail_descr_in_fail_descrs(
+                    && let Some(prev_descr) = find_fail_descr_in_fail_descrs(
                         &prev_compiled.fail_descrs,
                         source_trace_id,
                         fail_descr.fail_index_per_trace(),
-                    ) {
-                        if !fail_descr_has_bridge(as_fd(&prev_descr)) {
-                            // Reconstruct a minimal BridgeData from the
-                            // bridge already attached to `sd`.
-                            if let Some(b) = fail_descr_bridge_ref(as_fd(sd)) {
-                                fail_descr_attach_bridge(
-                                    as_fd(&prev_descr),
-                                    BridgeData {
-                                        trace_id: b.trace_id,
-                                        input_types: b.input_types.clone(),
-                                        header_pc: b.header_pc,
-                                        source_guard: b.source_guard,
-                                        caller_prefix_layout: b.caller_prefix_layout.clone(),
-                                        code_ptr: b.code_ptr,
-                                        body_ptr: b.body_ptr,
-                                        fail_descrs: b.fail_descrs.clone(),
-                                        fail_descr_cells: b.fail_descr_cells.clone(),
-                                        num_inputs: b.num_inputs,
-                                        num_ref_roots: b.num_ref_roots,
-                                        max_output_slots: b.max_output_slots,
+                    )
+                    && !fail_descr_has_bridge(as_fd(&prev_descr))
+                {
+                    // Reconstruct a minimal BridgeData from the
+                    // bridge already attached to `sd`.
+                    if let Some(b) = fail_descr_bridge_ref(as_fd(sd)) {
+                        fail_descr_attach_bridge(
+                            as_fd(&prev_descr),
+                            BridgeData {
+                                trace_id: b.trace_id,
+                                input_types: b.input_types.clone(),
+                                header_pc: b.header_pc,
+                                source_guard: b.source_guard,
+                                caller_prefix_layout: b.caller_prefix_layout.clone(),
+                                code_ptr: b.code_ptr,
+                                body_ptr: b.body_ptr,
+                                fail_descrs: b.fail_descrs.clone(),
+                                fail_descr_cells: b.fail_descr_cells.clone(),
+                                num_inputs: b.num_inputs,
+                                num_ref_roots: b.num_ref_roots,
+                                max_output_slots: b.max_output_slots,
 
-                                        terminal_exit_layouts: UnsafeCell::new(
-                                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                                        ),
-                                        loop_reentry: b.loop_reentry,
-                                        invalidated_arc: b.invalidated_arc.clone(),
-                                        gc_table: b.gc_table.clone(),
-                                    },
-                                );
-                            }
-                        }
+                                terminal_exit_layouts: UnsafeCell::new(
+                                    unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                                ),
+                                loop_reentry: b.loop_reentry,
+                                invalidated_arc: b.invalidated_arc.clone(),
+                                gc_table: b.gc_table.clone(),
+                            },
+                        );
                     }
                 }
             }
@@ -16316,18 +16315,18 @@ impl majit_backend::Backend for CraneliftBackend {
                 source_trace_id,
                 source_fail_index,
             );
-            if let Some(descr) = source_descr {
-                if let Some(bridge) = fail_descr_bridge_ref(as_fd(&descr)) {
-                    for (i, &hash) in hashes.iter().enumerate() {
-                        if let Some(bd) = bridge.fail_descrs.get(i) {
-                            // Same `ResumeDescr`-family gate as in
-                            // `store_guard_hashes` above (compile.py:826-829).
-                            let fd = as_fd(bd);
-                            if (fd.is_resume_guard() || fd.is_resume_guard_copied())
-                                && fd.get_status() == 0
-                            {
-                                fd.store_hash(hash);
-                            }
+            if let Some(descr) = source_descr
+                && let Some(bridge) = fail_descr_bridge_ref(as_fd(&descr))
+            {
+                for (i, &hash) in hashes.iter().enumerate() {
+                    if let Some(bd) = bridge.fail_descrs.get(i) {
+                        // Same `ResumeDescr`-family gate as in
+                        // `store_guard_hashes` above (compile.py:826-829).
+                        let fd = as_fd(bd);
+                        if (fd.is_resume_guard() || fd.is_resume_guard_copied())
+                            && fd.get_status() == 0
+                        {
+                            fd.store_hash(hash);
                         }
                     }
                 }
@@ -16358,35 +16357,35 @@ impl majit_backend::Backend for CraneliftBackend {
                 as_fd(old_fd).trace_id(),
                 as_fd(old_fd).fail_index_per_trace(),
             );
-            if let Some(new_fd) = target {
-                if !fail_descr_has_bridge(as_fd(&new_fd)) {
-                    // Clone the bridge (don't take_bridge — old code may
-                    // still reference old_fd and needs bridge dispatch).
-                    fail_descr_attach_bridge(
-                        as_fd(&new_fd),
-                        BridgeData {
-                            trace_id: b.trace_id,
-                            input_types: b.input_types.clone(),
-                            header_pc: b.header_pc,
-                            source_guard: b.source_guard,
-                            caller_prefix_layout: b.caller_prefix_layout.clone(),
-                            code_ptr: b.code_ptr,
-                            body_ptr: b.body_ptr,
-                            fail_descrs: b.fail_descrs.clone(),
-                            fail_descr_cells: b.fail_descr_cells.clone(),
-                            num_inputs: b.num_inputs,
-                            num_ref_roots: b.num_ref_roots,
-                            max_output_slots: b.max_output_slots,
+            if let Some(new_fd) = target
+                && !fail_descr_has_bridge(as_fd(&new_fd))
+            {
+                // Clone the bridge (don't take_bridge — old code may
+                // still reference old_fd and needs bridge dispatch).
+                fail_descr_attach_bridge(
+                    as_fd(&new_fd),
+                    BridgeData {
+                        trace_id: b.trace_id,
+                        input_types: b.input_types.clone(),
+                        header_pc: b.header_pc,
+                        source_guard: b.source_guard,
+                        caller_prefix_layout: b.caller_prefix_layout.clone(),
+                        code_ptr: b.code_ptr,
+                        body_ptr: b.body_ptr,
+                        fail_descrs: b.fail_descrs.clone(),
+                        fail_descr_cells: b.fail_descr_cells.clone(),
+                        num_inputs: b.num_inputs,
+                        num_ref_roots: b.num_ref_roots,
+                        max_output_slots: b.max_output_slots,
 
-                            terminal_exit_layouts: UnsafeCell::new(
-                                unsafe { &*b.terminal_exit_layouts.get() }.clone(),
-                            ),
-                            loop_reentry: b.loop_reentry,
-                            invalidated_arc: b.invalidated_arc.clone(),
-                            gc_table: b.gc_table.clone(),
-                        },
-                    );
-                }
+                        terminal_exit_layouts: UnsafeCell::new(
+                            unsafe { &*b.terminal_exit_layouts.get() }.clone(),
+                        ),
+                        loop_reentry: b.loop_reentry,
+                        invalidated_arc: b.invalidated_arc.clone(),
+                        gc_table: b.gc_table.clone(),
+                    },
+                );
             }
         }
     }
@@ -16491,7 +16490,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // including the first LABEL, selects its loader (label_block_id + 1).
         let mut cur_dispatch_key: u32 = 0;
         let attachments_guard = compiled.cpu_attachments.read().unwrap();
-        let attachments: &CpuDescrAttachments = &*attachments_guard;
+        let attachments: &CpuDescrAttachments = &attachments_guard;
 
         loop {
             let exec = run_compiled_code(
@@ -17039,11 +17038,12 @@ impl majit_backend::Backend for CraneliftBackend {
         };
         // llmodel.py:780-782: if self.vtable_offset is not None:
         //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
-        if let Some(vt_off) = self.vtable_offset {
-            if vtable != 0 && !ptr.is_null() {
-                unsafe {
-                    *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
-                }
+        if let Some(vt_off) = self.vtable_offset
+            && vtable != 0
+            && !ptr.is_null()
+        {
+            unsafe {
+                *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
             }
         }
         ptr as i64

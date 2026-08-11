@@ -840,13 +840,12 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let eff = if pack > 0 { pack.min(align) } else { align };
         max_align = max_align.max(eff);
 
-        if let Some(fi) = stginfo::stginfo_of(ftype) {
-            if stginfo::stginfo_flags(fi)
+        if let Some(fi) = stginfo::stginfo_of(ftype)
+            && stginfo::stginfo_flags(fi)
                 & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
                 != 0
-            {
-                has_pointer = true;
-            }
+        {
+            has_pointer = true;
         }
 
         if let Some(bits) = entry.bits {
@@ -1010,10 +1009,10 @@ fn meta_from_param(args: &[PyObjectRef]) -> PyResult {
 
 fn pointer_type_get(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
-    if let Some(info) = stginfo::stginfo_of(cls) {
-        if let Some(pt) = stginfo::stginfo_pointer_type(info) {
-            return Ok(pt);
-        }
+    if let Some(info) = stginfo::stginfo_of(cls)
+        && let Some(pt) = stginfo::stginfo_pointer_type(info)
+    {
+        return Ok(pt);
     }
     Err(crate::PyError::attribute_error(
         "type has no attribute '__pointer_type__'",
@@ -1526,10 +1525,10 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
 fn field_names_base_first(cls: PyObjectRef) -> Vec<String> {
     let mut names = Vec::new();
     for &t in mro_items(cls).iter().rev() {
-        if let Some(f) = crate::type_dict_lookup(t, "_fields_") {
-            if let Ok(entries) = field_entries(f) {
-                names.extend(entries.into_iter().map(|entry| entry.name));
-            }
+        if let Some(f) = crate::type_dict_lookup(t, "_fields_")
+            && let Ok(entries) = field_entries(f)
+        {
+            names.extend(entries.into_iter().map(|entry| entry.name));
         }
     }
     names
@@ -1561,12 +1560,12 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
                 continue;
             }
             // Duplicate positional + keyword assignment for the same field.
-            if let Some(pos_idx) = names.iter().position(|n| *n == key) {
-                if pos_idx < pos.len() {
-                    return Err(crate::PyError::type_error(format!(
-                        "duplicate values for field '{key}'"
-                    )));
-                }
+            if let Some(pos_idx) = names.iter().position(|n| *n == key)
+                && pos_idx < pos.len()
+            {
+                return Err(crate::PyError::type_error(format!(
+                    "duplicate values for field '{key}'"
+                )));
             }
             crate::baseobjspace::setattr_str(obj, &key, val)?;
         }
@@ -1681,12 +1680,11 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
     data.length = length;
     data.element_size = elem_size;
     data.proto = Some(elem);
-    if let Some(ei) = stginfo::stginfo_of(elem) {
-        if stginfo::stginfo_flags(ei) & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
+    if let Some(ei) = stginfo::stginfo_of(elem)
+        && stginfo::stginfo_flags(ei) & (stginfo::TYPEFLAG_ISPOINTER | stginfo::TYPEFLAG_HASPOINTER)
             != 0
-        {
-            data.flags |= stginfo::TYPEFLAG_HASPOINTER;
-        }
+    {
+        data.flags |= stginfo::TYPEFLAG_HASPOINTER;
     }
     stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
 
@@ -2111,10 +2109,10 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
     let proto = unsafe { crate::baseobjspace::lookup_in_type(cls, "_type_") }
         .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
-    if let Some(p) = proto {
-        if stginfo::field_size_of(p).is_none() {
-            return Err(crate::PyError::type_error("_type_ must have storage info"));
-        }
+    if let Some(p) = proto
+        && stginfo::field_size_of(p).is_none()
+    {
+        return Err(crate::PyError::type_error("_type_ must have storage info"));
     }
     let psize = host_ctypes::pointer_size();
     let mut data = StgInfoData::new(psize, psize, "pointer");
@@ -2203,10 +2201,10 @@ fn pointer_init(args: &[PyObjectRef]) -> PyResult {
     }
     let obj = args[0];
     let (pos, _kw) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    if let Some(&val) = pos.first() {
-        if !unsafe { pyre_object::is_none(val) } {
-            pointer_set_contents(obj, val)?;
-        }
+    if let Some(&val) = pos.first()
+        && !unsafe { pyre_object::is_none(val) }
+    {
+        pointer_set_contents(obj, val)?;
     }
     Ok(pyre_object::w_none())
 }

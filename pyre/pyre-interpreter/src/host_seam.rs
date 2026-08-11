@@ -606,23 +606,23 @@ impl StatBuf {
     #[cfg(not(feature = "sandbox"))]
     fn from_libc(st: &libc::stat) -> Self {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-        let st_flags = st.st_flags as u32;
+        let st_flags = st.st_flags;
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
         let st_flags = 0u32;
         StatBuf {
             mode: st.st_mode as u32,
-            ino: st.st_ino as u64,
+            ino: st.st_ino,
             dev: st.st_dev as u64,
             nlink: st.st_nlink as u64,
-            uid: st.st_uid as u32,
-            gid: st.st_gid as u32,
+            uid: st.st_uid,
+            gid: st.st_gid,
             size: st.st_size as u64,
-            atime: st.st_atime as i64,
-            mtime: st.st_mtime as i64,
-            ctime: st.st_ctime as i64,
-            atime_nsec: st.st_atime_nsec as i64,
-            mtime_nsec: st.st_mtime_nsec as i64,
-            ctime_nsec: st.st_ctime_nsec as i64,
+            atime: st.st_atime,
+            mtime: st.st_mtime,
+            ctime: st.st_ctime,
+            atime_nsec: st.st_atime_nsec,
+            mtime_nsec: st.st_mtime_nsec,
+            ctime_nsec: st.st_ctime_nsec,
             blksize: st.st_blksize as u64,
             blocks: st.st_blocks as u64,
             rdev: st.st_rdev as u64,

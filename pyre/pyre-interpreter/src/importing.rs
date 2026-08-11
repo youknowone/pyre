@@ -1320,14 +1320,14 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
         // its search path from the controller, so it does not read the host
         // environment here.
         #[cfg(not(feature = "sandbox"))]
-        if !ignore_environment_flag() {
-            if let Ok(pythonpath) = host_os::var("PYTHONPATH") {
-                let sep = if cfg!(windows) { ';' } else { ':' };
-                // Empty components are preserved — an empty `sys.path` entry
-                // denotes the current directory (app_main.setup_and_fix_paths
-                // extends with the raw split).
-                path.extend(pythonpath.split(sep).map(PathBuf::from));
-            }
+        if !ignore_environment_flag()
+            && let Ok(pythonpath) = host_os::var("PYTHONPATH")
+        {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            // Empty components are preserved — an empty `sys.path` entry
+            // denotes the current directory (app_main.setup_and_fix_paths
+            // extends with the raw split).
+            path.extend(pythonpath.split(sep).map(PathBuf::from));
         }
         // The stdlib entry is appended when the `sys` module is created —
         // `create_sys_path_list` forces `ensure_stdlib_path` before flushing
@@ -2114,20 +2114,19 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     // Copy the entries up front so no Python borrow is held across the
     // filesystem probes in `find_in_dirs` (which never invoke user code).
     let mut dirs = Vec::new();
-    if let Some(w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") } {
-        if unsafe { pyre_object::is_list(w_path) } {
-            let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
-            dirs.reserve(n);
-            for i in 0..n {
-                if let Some(item) =
-                    unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) }
-                {
-                    // Non-str entries are skipped: pyre's only path hook is the
-                    // native filesystem probe, and CPython also skips an entry no
-                    // hook accepts.
-                    if unsafe { pyre_object::is_str(item) } {
-                        dirs.push(crate::gateway::fspath_buf(item)?);
-                    }
+    if let Some(w_path) = unsafe { pyre_object::w_dict_getitem_str(w_dict, "path") }
+        && unsafe { pyre_object::is_list(w_path) }
+    {
+        let n = unsafe { pyre_object::listobject::w_list_len(w_path) };
+        dirs.reserve(n);
+        for i in 0..n {
+            if let Some(item) = unsafe { pyre_object::listobject::w_list_getitem(w_path, i as i64) }
+            {
+                // Non-str entries are skipped: pyre's only path hook is the
+                // native filesystem probe, and CPython also skips an entry no
+                // hook accepts.
+                if unsafe { pyre_object::is_str(item) } {
+                    dirs.push(crate::gateway::fspath_buf(item)?);
                 }
             }
         }
@@ -2580,10 +2579,10 @@ fn load_source_module(
     // `decimal` → `_pydecimal` pattern, or PyPy's `_cffi_backend` style
     // late rewiring). Honour that — PyPy: interp_import.importhook
     // reads sys.modules again after exec_code_module via importcache.
-    if let Some(replaced) = check_sys_modules(modulename) {
-        if !std::ptr::eq(replaced, module) {
-            return Ok(replaced);
-        }
+    if let Some(replaced) = check_sys_modules(modulename)
+        && !std::ptr::eq(replaced, module)
+    {
+        return Ok(replaced);
     }
 
     // `_bootstrap` has no `sys` or `_imp` of its own until it is handed them,
@@ -2591,23 +2590,23 @@ fn load_source_module(
     // the module back out of sys.modules rather than reusing the local: the
     // body just executed arbitrary code, and a collection in there relocates
     // a young module while only the dict entry is updated.
-    if modulename == "importlib._bootstrap" && importlib_bootstrap_needs_install() {
-        if let Some(loaded) = check_sys_modules(modulename) {
-            if let Err(e) = install_importlib_bootstrap(loaded, execution_context) {
-                // Unwind the partial install: `dunder_import` routes through
-                // `_bootstrap.__import__` whenever `importlib._bootstrap` is
-                // in `sys.modules`, and a half-installed bootstrap (module
-                // registered, PathFinder missing — e.g. `_bootstrap_external`
-                // needs the `nt` builtin on Windows) would then answer every
-                // import with no file finder installed. Dropping the entries
-                // keeps the native importer authoritative, the minimal-
-                // importer role the boot sequence already documents.
-                remove_sys_module(modulename);
-                remove_sys_module("_frozen_importlib");
-                remove_sys_module("_frozen_importlib_external");
-                return Err(e);
-            }
-        }
+    if modulename == "importlib._bootstrap"
+        && importlib_bootstrap_needs_install()
+        && let Some(loaded) = check_sys_modules(modulename)
+        && let Err(e) = install_importlib_bootstrap(loaded, execution_context)
+    {
+        // Unwind the partial install: `dunder_import` routes through
+        // `_bootstrap.__import__` whenever `importlib._bootstrap` is
+        // in `sys.modules`, and a half-installed bootstrap (module
+        // registered, PathFinder missing — e.g. `_bootstrap_external`
+        // needs the `nt` builtin on Windows) would then answer every
+        // import with no file finder installed. Dropping the entries
+        // keeps the native importer authoritative, the minimal-
+        // importer role the boot sequence already documents.
+        remove_sys_module(modulename);
+        remove_sys_module("_frozen_importlib");
+        remove_sys_module("_frozen_importlib_external");
+        return Err(e);
     }
 
     Ok(module)
@@ -3028,19 +3027,17 @@ fn absolute_import(
         // submodule as an attribute of its parent package so `import a.b`
         // makes `a.b` reachable. Only an AttributeError is swallowed (with an
         // ImportWarning); any other exception propagates.
-        if let Some(parent_mod) = parent {
-            if let Err(err) = crate::setattr_str(parent_mod, part, module) {
-                if err.kind != crate::PyErrorKind::AttributeError {
-                    return Err(err);
-                }
-                let parent_name = parts[..level].join(".");
-                crate::warn::warn(
-                    &format!(
-                        "Cannot set an attribute on '{parent_name}' for child module '{part}'"
-                    ),
-                    "ImportWarning",
-                );
+        if let Some(parent_mod) = parent
+            && let Err(err) = crate::setattr_str(parent_mod, part, module)
+        {
+            if err.kind != crate::PyErrorKind::AttributeError {
+                return Err(err);
             }
+            let parent_name = parts[..level].join(".");
+            crate::warn::warn(
+                &format!("Cannot set an attribute on '{parent_name}' for child module '{part}'"),
+                "ImportWarning",
+            );
         }
         if level == 0 {
             first = Some(module);
@@ -3145,35 +3142,34 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     pin_root(w_spec);
     if let Some(w_initializing) =
         crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
+        && crate::baseobjspace::is_true(w_initializing)?
     {
-        if crate::baseobjspace::is_true(w_initializing)? {
-            let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
-                return Ok(None);
-            };
-            let bootstrap_slot = shadow_stack_len();
-            pin_root(w_bootstrap);
-            let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
-                shadow_stack_get(bootstrap_slot),
-                "_lock_unlock_module",
-            )?
-            else {
-                return Ok(None);
-            };
-            let lock_unlock_slot = shadow_stack_len();
-            pin_root(w_lock_unlock);
-            let name_slot = shadow_stack_len();
-            pin_root(pyre_object::w_str_new(name));
-            crate::call::call_function_impl_result(
-                shadow_stack_get(lock_unlock_slot),
-                &[shadow_stack_get(name_slot)],
-            )?;
+        let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
+            return Ok(None);
+        };
+        let bootstrap_slot = shadow_stack_len();
+        pin_root(w_bootstrap);
+        let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
+            shadow_stack_get(bootstrap_slot),
+            "_lock_unlock_module",
+        )?
+        else {
+            return Ok(None);
+        };
+        let lock_unlock_slot = shadow_stack_len();
+        pin_root(w_lock_unlock);
+        let name_slot = shadow_stack_len();
+        pin_root(pyre_object::w_str_new(name));
+        crate::call::call_function_impl_result(
+            shadow_stack_get(lock_unlock_slot),
+            &[shadow_stack_get(name_slot)],
+        )?;
 
-            let Some(w_current) = check_sys_modules(name) else {
-                return Ok(None);
-            };
-            if w_current != shadow_stack_get(mod_slot) {
-                return Ok(None);
-            }
+        let Some(w_current) = check_sys_modules(name) else {
+            return Ok(None);
+        };
+        if w_current != shadow_stack_get(mod_slot) {
+            return Ok(None);
         }
     }
     Ok(Some(shadow_stack_get(mod_slot)))
@@ -3708,30 +3704,30 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     // non-None __package__ wins; otherwise __spec__.parent is authoritative.
     let package = crate::baseobjspace::finditem_str(w_globals, "__package__")?;
     let spec = crate::baseobjspace::finditem_str(w_globals, "__spec__")?;
-    if let Some(pkg) = package {
-        if !unsafe { pyre_object::is_none(pkg) } {
-            if !unsafe { pyre_object::is_str(pkg) } {
-                return Err(crate::PyError::type_error(
-                    "__package__ not set to a string",
-                ));
-            }
-            return Ok(Some(
-                unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
+    if let Some(pkg) = package
+        && !unsafe { pyre_object::is_none(pkg) }
+    {
+        if !unsafe { pyre_object::is_str(pkg) } {
+            return Err(crate::PyError::type_error(
+                "__package__ not set to a string",
             ));
         }
+        return Ok(Some(
+            unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
+        ));
     }
-    if let Some(spec) = spec {
-        if !unsafe { pyre_object::is_none(spec) } {
-            let parent = crate::baseobjspace::getattr_str(spec, "parent")?;
-            if !unsafe { pyre_object::is_str(parent) } {
-                return Err(crate::PyError::type_error(
-                    "__spec__.parent is not a string",
-                ));
-            }
-            return Ok(Some(
-                unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
+    if let Some(spec) = spec
+        && !unsafe { pyre_object::is_none(spec) }
+    {
+        let parent = crate::baseobjspace::getattr_str(spec, "parent")?;
+        if !unsafe { pyre_object::is_str(parent) } {
+            return Err(crate::PyError::type_error(
+                "__spec__.parent is not a string",
             ));
         }
+        return Ok(Some(
+            unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
+        ));
     }
 
     // _calc___package__ emits ImportWarning before the legacy __name__ /
@@ -3744,19 +3740,20 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     )?;
 
     // Fallback: __name__ (for modules inside packages)
-    if let Some(name_obj) = crate::baseobjspace::finditem_str(w_globals, "__name__")? {
-        if !name_obj.is_null() && unsafe { pyre_object::is_str(name_obj) } {
-            let name = unsafe { pyre_object::w_str_get_value(name_obj) };
-            // If the module has a __path__, it's a package — use __name__ as-is
-            if crate::baseobjspace::finditem_str(w_globals, "__path__")?.is_some() {
-                return Ok(Some(name.to_string()));
-            }
-            // Otherwise `rpartition('.')[0]` is also the empty string for a
-            // top-level module such as __main__.
-            return Ok(Some(
-                name.rfind('.').map_or("", |dot| &name[..dot]).to_string(),
-            ));
+    if let Some(name_obj) = crate::baseobjspace::finditem_str(w_globals, "__name__")?
+        && !name_obj.is_null()
+        && unsafe { pyre_object::is_str(name_obj) }
+    {
+        let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+        // If the module has a __path__, it's a package — use __name__ as-is
+        if crate::baseobjspace::finditem_str(w_globals, "__path__")?.is_some() {
+            return Ok(Some(name.to_string()));
         }
+        // Otherwise `rpartition('.')[0]` is also the empty string for a
+        // top-level module such as __main__.
+        return Ok(Some(
+            name.rfind('.').map_or("", |dot| &name[..dot]).to_string(),
+        ));
     }
 
     Ok(None)
@@ -3938,49 +3935,47 @@ pub fn import_from(
     // Modules' submodule fallback honours overridden `__getitem__`.
     if unsafe { is_module(module) } {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-        if !w_dict.is_null() && unsafe { pyre_object::is_dict(w_dict) } {
-            if let Some(modname_obj) =
+        if !w_dict.is_null()
+            && unsafe { pyre_object::is_dict(w_dict) }
+            && let Some(modname_obj) =
                 unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") }
-            {
-                if !modname_obj.is_null() && unsafe { pyre_object::is_str(modname_obj) } {
-                    let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
-                    let fullname = format!("{modname}.{name}");
-                    match importhook(
-                        &fullname,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        0,
-                        execution_context,
-                    ) {
-                        Ok(_) => {
-                            // importhook returns the top-level module when
-                            // fromlist is empty. Retrieve the actual leaf
-                            // module from sys.modules.
-                            if let Some(submod) = check_sys_modules(&fullname) {
-                                unsafe {
-                                    pyre_object::dictmultiobject::w_dict_setitem_str(
-                                        w_dict, name, submod,
-                                    );
-                                }
-                                return Ok(submod);
-                            }
+            && !modname_obj.is_null()
+            && unsafe { pyre_object::is_str(modname_obj) }
+        {
+            let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
+            let fullname = format!("{modname}.{name}");
+            match importhook(
+                &fullname,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                execution_context,
+            ) {
+                Ok(_) => {
+                    // importhook returns the top-level module when
+                    // fromlist is empty. Retrieve the actual leaf
+                    // module from sys.modules.
+                    if let Some(submod) = check_sys_modules(&fullname) {
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, name, submod);
                         }
-                        Err(e) => {
-                            // A ModuleNotFoundError naming `fullname` itself
-                            // means `name` is simply not a submodule, so fall
-                            // through to the attribute-style "cannot import
-                            // name".  Any other failure is a transitive import
-                            // error inside the submodule and must propagate
-                            // rather than be masked (`_handle_fromlist`).
-                            let absent_submodule = e.kind
-                                == crate::PyErrorKind::ModuleNotFoundError
-                                && e.message.contains(&rustpython_wtf8::Wtf8Buf::from_string(
-                                    format!("'{fullname}'"),
-                                ));
-                            if !absent_submodule {
-                                return Err(e);
-                            }
-                        }
+                        return Ok(submod);
+                    }
+                }
+                Err(e) => {
+                    // A ModuleNotFoundError naming `fullname` itself
+                    // means `name` is simply not a submodule, so fall
+                    // through to the attribute-style "cannot import
+                    // name".  Any other failure is a transitive import
+                    // error inside the submodule and must propagate
+                    // rather than be masked (`_handle_fromlist`).
+                    let absent_submodule = e.kind == crate::PyErrorKind::ModuleNotFoundError
+                        && e.message
+                            .contains(&rustpython_wtf8::Wtf8Buf::from_string(format!(
+                                "'{fullname}'"
+                            )));
+                    if !absent_submodule {
+                        return Err(e);
                     }
                 }
             }
@@ -3992,13 +3987,13 @@ pub fn import_from(
     // attribute (e.g. a non-module stand-in with restrictive slots that
     // `_handle_fromlist` could not setattr onto). Read `__name__` off the object
     // rather than requiring it to be a module.
-    if let Ok(w_name) = crate::baseobjspace::getattr_str(module, "__name__") {
-        if unsafe { pyre_object::is_str(w_name) } {
-            let modname = unsafe { pyre_object::w_str_get_value(w_name) };
-            let fullname = format!("{modname}.{name}");
-            if let Some(submod) = check_sys_modules(&fullname) {
-                return Ok(submod);
-            }
+    if let Ok(w_name) = crate::baseobjspace::getattr_str(module, "__name__")
+        && unsafe { pyre_object::is_str(w_name) }
+    {
+        let modname = unsafe { pyre_object::w_str_get_value(w_name) };
+        let fullname = format!("{modname}.{name}");
+        if let Some(submod) = check_sys_modules(&fullname) {
+            return Ok(submod);
         }
     }
 

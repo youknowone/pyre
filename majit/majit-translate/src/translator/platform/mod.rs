@@ -129,19 +129,19 @@ pub fn execute(
     }
 
     // Upstream `:94-101`: inject loader search path for compiled artifacts.
-    if cfg!(unix) {
-        if let Some(info) = compilation_info {
-            let joined = info
-                .library_dirs
-                .iter()
-                .map(|path| path.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(":");
-            if cfg!(target_os = "macos") {
-                command.env("DYLD_LIBRARY_PATH", joined);
-            } else {
-                command.env("LD_LIBRARY_PATH", joined);
-            }
+    if cfg!(unix)
+        && let Some(info) = compilation_info
+    {
+        let joined = info
+            .library_dirs
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(":");
+        if cfg!(target_os = "macos") {
+            command.env("DYLD_LIBRARY_PATH", joined);
+        } else {
+            command.env("LD_LIBRARY_PATH", joined);
         }
     }
 

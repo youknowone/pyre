@@ -38,7 +38,7 @@ fn u16_to_opcode(v: u16) -> OpCode {
 /// opencoder.py:59-73 encode_varint_signed.
 pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
     debug_assert!(
-        MIN_VALUE <= value && value <= MAX_VALUE,
+        (MIN_VALUE..=MAX_VALUE).contains(&value),
         "encode_varint_signed out of range: {value}"
     );
     let mut v = value;
@@ -786,7 +786,7 @@ impl<'a> ByteTraceIter<'a> {
                 if v & 1 != 0 {
                     // history.py:268 ConstFloat.value inline.
                     let bits = self.trace._floats[pool_idx];
-                    Operand::from_opref(OpRef::const_float(f64::from_bits(bits as u64)))
+                    Operand::from_opref(OpRef::const_float(f64::from_bits(bits)))
                 } else {
                     // history.py:227 ConstInt.value inline.
                     let val = self.trace._bigints[pool_idx];
@@ -1489,9 +1489,7 @@ impl Trace {
     /// guard on the check).
     pub fn set_inputargs(&mut self, inputargs: Vec<InputArg>) {
         debug_assert!(
-            inputargs
-                .iter()
-                .all(|ia| (ia.index as u32) < self.max_num_inputargs),
+            inputargs.iter().all(|ia| ia.index < self.max_num_inputargs),
             "inputarg position exceeds max_num_inputargs"
         );
         self.inputargs = inputargs;
@@ -1560,7 +1558,7 @@ impl Trace {
             self.max_num_inputargs,
         );
         let mut ops = Vec::new();
-        while let Some(op) = iter.next() {
+        for op in iter {
             ops.push((*op).clone());
         }
         ops
@@ -1575,7 +1573,7 @@ impl Trace {
             self._pos,
             self.max_num_inputargs,
         );
-        while let Some(op) = iter.next() {
+        for op in iter {
             if op.pos.get() == pos {
                 return Some((*op).clone());
             }
@@ -1593,7 +1591,7 @@ impl Trace {
             self.max_num_inputargs,
         );
         let mut last = None;
-        while let Some(op) = iter.next() {
+        for op in iter {
             last = Some((*op).clone());
         }
         last
@@ -2731,10 +2729,10 @@ impl Trace {
     /// (opencoder.py:873-875, 883).
     pub(crate) fn get_dead_ranges(&mut self) -> Vec<usize> {
         // opencoder.py:873-875 cache hit path.
-        if let Some((cached_count, cached)) = &self._deadranges {
-            if *cached_count == self._count {
-                return cached.clone();
-            }
+        if let Some((cached_count, cached)) = &self._deadranges
+            && *cached_count == self._count
+        {
+            return cached.clone();
         }
         // opencoder.py:876 `liveranges = self.get_live_ranges()`.
         let liveranges = self.get_live_ranges();
@@ -4498,7 +4496,7 @@ mod tests {
         let fresh_add1 = it.inputargs[0].opref();
         let fresh_i1 = it.inputargs[1].opref();
         let mut ops = Vec::new();
-        while let Some(op) = it.next() {
+        for op in it {
             ops.push(op);
         }
         // assert len(l) == 3

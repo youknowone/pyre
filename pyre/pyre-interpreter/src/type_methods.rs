@@ -788,7 +788,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     );
 
     let reverse = crate::builtins::kwarg_get(kwargs, "reverse")
-        .map(|value| crate::baseobjspace::is_true(value))
+        .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
 
@@ -2297,11 +2297,11 @@ fn pad_to_width(
         '=' => {
             let mut chars = body.chars().peekable();
             let mut prefix = String::new();
-            if let Some(&c) = chars.peek() {
-                if c == '-' || c == '+' || c == ' ' {
-                    prefix.push(c);
-                    chars.next();
-                }
+            if let Some(&c) = chars.peek()
+                && (c == '-' || c == '+' || c == ' ')
+            {
+                prefix.push(c);
+                chars.next();
             }
             let rest_so_far: String = chars.clone().collect();
             if rest_so_far.len() >= 2 && rest_so_far.as_bytes()[0] == b'0' {
@@ -2810,13 +2810,12 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     // builtin default takes the fast path below, which formats the
     // underlying value directly.  `__format__` is resolved on the type (not
     // the instance) so an instance-dict attribute does not shadow it.
-    if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") } {
-        if unsafe { is_instance(val) }
-            || !unsafe { py_type_check(meth, &crate::function::BUILTIN_FUNCTION_TYPE) }
-        {
-            let spec_obj = pyre_object::w_str_from_wtf8(spec.to_wtf8_buf());
-            return call_format_dispatch(val, meth, spec_obj);
-        }
+    if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
+        && (unsafe { is_instance(val) }
+            || !unsafe { py_type_check(meth, &crate::function::BUILTIN_FUNCTION_TYPE) })
+    {
+        let spec_obj = pyre_object::w_str_from_wtf8(spec.to_wtf8_buf());
+        return call_format_dispatch(val, meth, spec_obj);
     }
     if spec.is_empty() {
         // Empty spec collapses to `str(value)`, preserved in WTF-8 so a
@@ -6187,12 +6186,11 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             // Read that reserved layout slot directly: going through
             // `getattr_str` would incorrectly expose internal dict operations
             // to a subclass's Python-level `__getattribute__` hook.
-            if let Some(slot) = dict_data_slot(obj) {
-                if let Some(backing) = crate::objspace::std::mapdict::getslotvalue(obj, slot) {
-                    if is_dict(backing) {
-                        return backing;
-                    }
-                }
+            if let Some(slot) = dict_data_slot(obj)
+                && let Some(backing) = crate::objspace::std::mapdict::getslotvalue(obj, slot)
+                && is_dict(backing)
+            {
+                return backing;
             }
         }
     }

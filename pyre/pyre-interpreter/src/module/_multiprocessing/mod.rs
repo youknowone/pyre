@@ -28,10 +28,10 @@ fn semlock_get_handle(obj: PyObjectRef) -> *mut libc::sem_t {
     if d.is_null() {
         return core::ptr::null_mut();
     }
-    if let Some(v) = unsafe { w_dict_getitem_str(d, "_handle") } {
-        if unsafe { is_int(v) } {
-            return unsafe { w_int_get_value(v) } as usize as *mut libc::sem_t;
-        }
+    if let Some(v) = unsafe { w_dict_getitem_str(d, "_handle") }
+        && unsafe { is_int(v) }
+    {
+        return unsafe { w_int_get_value(v) } as usize as *mut libc::sem_t;
     }
     core::ptr::null_mut()
 }

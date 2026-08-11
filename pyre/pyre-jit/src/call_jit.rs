@@ -7116,7 +7116,7 @@ pub fn cranelift_resumedata_deopt(
     // or out-of-range value means the control opcodes were not set up,
     // which would break the per-section walk — short-circuit to the
     // recovery_layout fallback instead.
-    if op_live_i32 < 0 || op_live_i32 > 255 {
+    if !(0..=255).contains(&op_live_i32) {
         return false;
     }
     let op_live = op_live_i32 as u8;

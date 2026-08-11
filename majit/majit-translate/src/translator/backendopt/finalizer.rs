@@ -240,10 +240,10 @@ impl<'t> GraphAnalyzer<bool, ()> for FinalizerAnalyzer<'t> {
         if opname_is_arith_or_cast(&op.opname) {
             return false;
         }
-        if op.opname == "setfield" || op.opname == "bare_setfield" {
-            if op_writes_primitive_field(op) {
-                return false;
-            }
+        if (op.opname == "setfield" || op.opname == "bare_setfield")
+            && op_writes_primitive_field(op)
+        {
+            return false;
         }
         if op.opname == "getfield" && op_reads_primitive_field(op) {
             return false;

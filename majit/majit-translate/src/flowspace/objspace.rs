@@ -63,15 +63,15 @@ fn _assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
     //         func.__doc__.lstrip().startswith('NOT_RPYTHON'): raise`.
     // CPython stores the docstring at `co_consts[0]` when it is a bare
     // string literal.
-    if let Some(ConstantData::Str { value, .. }) = code.consts.first() {
-        if value.trim_start().starts_with("NOT_RPYTHON") {
-            return Err(FlowContextError::Flowing(
-                super::flowcontext::FlowingError::new(format!(
-                    "{} is tagged as NOT_RPYTHON",
-                    func.name
-                )),
-            ));
-        }
+    if let Some(ConstantData::Str { value, .. }) = code.consts.first()
+        && value.trim_start().starts_with("NOT_RPYTHON")
+    {
+        return Err(FlowContextError::Flowing(
+            super::flowcontext::FlowingError::new(format!(
+                "{} is tagged as NOT_RPYTHON",
+                func.name
+            )),
+        ));
     }
 
     // upstream line 25-32: `if func.__code__.co_cellvars: raise

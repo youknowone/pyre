@@ -322,26 +322,26 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
         // `_`; `0b12` -> `0b1`, `2`).  CPython's tokenizer treats an
         // identifier or another number immediately following a number as a
         // lexical error, while whitespace-separated `1 2` remains tokenizable.
-        if is_number_kind(kind) {
-            if let Some(next) = this.tokens.get(this.index) {
-                let next_range = next.as_tuple().1;
-                let next_start = u32::from(next_range.start()) as usize;
-                let next_end = u32::from(next_range.end()) as usize;
-                let next_text = if next_end <= this.source.len() {
-                    &this.source[next_start..next_end]
-                } else {
-                    ""
-                };
-                if next_start == end
-                    && (is_number_kind(next.kind())
-                        || (next.kind() == TokenKind::Name
-                            && (!this.extra_tokens
-                                || next_text.starts_with('_')
-                                || next_text.eq_ignore_ascii_case("e"))))
-                {
-                    let (line, column) = this.lines.line_col(&this.source, next_end);
-                    return Err(raise_syntax_error("invalid decimal literal", line, column));
-                }
+        if is_number_kind(kind)
+            && let Some(next) = this.tokens.get(this.index)
+        {
+            let next_range = next.as_tuple().1;
+            let next_start = u32::from(next_range.start()) as usize;
+            let next_end = u32::from(next_range.end()) as usize;
+            let next_text = if next_end <= this.source.len() {
+                &this.source[next_start..next_end]
+            } else {
+                ""
+            };
+            if next_start == end
+                && (is_number_kind(next.kind())
+                    || (next.kind() == TokenKind::Name
+                        && (!this.extra_tokens
+                            || next_text.starts_with('_')
+                            || next_text.eq_ignore_ascii_case("e"))))
+            {
+                let (line, column) = this.lines.line_col(&this.source, next_end);
+                return Err(raise_syntax_error("invalid decimal literal", line, column));
             }
         }
 
@@ -735,7 +735,7 @@ fn positioned_syntax_error(
     };
     let _roots = gc_roots::push_roots();
     gc_roots::pin_root(class);
-    gc_roots::pin_root(w_str_new(&message));
+    gc_roots::pin_root(w_str_new(message));
     let base = gc_roots::shadow_stack_len() - 2;
     let exc = match crate::builtins::call_and_check(
         gc_roots::shadow_stack_get(base),

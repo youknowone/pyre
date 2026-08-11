@@ -176,7 +176,7 @@ fn rewire_one_slice_index_rangeto_site(
         .ok_or_else(|| format!("{}: no RangeTo index consumer", graph.name))?;
     let bounds = if minus_one_end_matches(graph, &site.end, &slice) {
         SliceIndexBounds::MinusOne { end: &site.end }
-    } else if rangeto_static_length_bound_matches(graph, &site.end, &slice, &range) {
+    } else if rangeto_static_length_bound_matches(graph, &site.end, &slice, range) {
         SliceIndexBounds::StaticLength { end: &site.end }
     } else {
         return Err(format!(
@@ -455,7 +455,7 @@ fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
         .iter()
         .flat_map(|b| &b.operations)
         .find_map(|op| {
-            (op.result.as_ref() == Some(&var)).then(|| match op.kind {
+            (op.result.as_ref() == Some(&var)).then_some(match op.kind {
                 OpKind::ConstInt(value) => Some(value),
                 _ => None,
             })?
@@ -714,9 +714,11 @@ fn array_len_base_is_stable(
         let start = (block.id == earlier.0 && !later_is_in_cycle)
             .then_some(earlier.1 + 1)
             .unwrap_or(0);
-        let end = (block.id == later.0 && !later_is_in_cycle)
-            .then_some(later.1)
-            .unwrap_or(block.operations.len());
+        let end = if block.id == later.0 && !later_is_in_cycle {
+            later.1
+        } else {
+            block.operations.len()
+        };
         let operations = &block.operations[start..end];
         operations.iter().all(|op| match &op.kind {
             OpKind::ConstInt(_)

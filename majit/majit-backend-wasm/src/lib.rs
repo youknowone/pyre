@@ -1,3 +1,15 @@
+// Wasm trace assembly follows the backend's stage boundaries directly. The
+// wide builder interface, returned layout tuple, and incremental parameter
+// population make those boundaries explicit; the AtomicU64 const is used only
+// to initialize independent array elements.
+#![allow(
+    clippy::declare_interior_mutable_const,
+    clippy::field_reassign_with_default,
+    clippy::manual_checked_ops,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 /// WebAssembly backend for majit.
 ///
 /// Generates wasm bytecodes via wasm-encoder. On wasm32 targets,
@@ -1266,6 +1278,12 @@ fn missing_legacy_const(arg: majit_ir::OpRef) -> ! {
     );
 }
 
+impl Default for WasmBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WasmBackend {
     pub fn new() -> Self {
         WasmBackend {
@@ -1348,12 +1366,10 @@ impl WasmBackend {
                 op.opcode,
                 majit_ir::OpCode::GuardClass | majit_ir::OpCode::GuardNonnullClass
             ) && op.num_args() >= 2
+                && let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref())
+                && let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize)
             {
-                if let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref()) {
-                    if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
-                        table.insert(classptr, tid);
-                    }
-                }
+                table.insert(classptr, tid);
             }
         }
         table
@@ -1392,12 +1408,12 @@ impl WasmBackend {
             // assembler.py:1971-1974: (subclassrange_min, subclassrange_max)
             // for every constant GuardSubclass arg1.
             for op in ops {
-                if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
-                    if let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref()) {
-                        if let Some(range) = gc.subclass_range(classptr as usize) {
-                            info.subclass_ranges.insert(classptr, range);
-                        }
-                    }
+                if op.opcode == majit_ir::OpCode::GuardSubclass
+                    && op.num_args() >= 2
+                    && let Some(classptr) = self.const_class_vtable(op.arg(1).to_opref())
+                    && let Some(range) = gc.subclass_range(classptr as usize)
+                {
+                    info.subclass_ranges.insert(classptr, range);
                 }
             }
             info
@@ -1965,11 +1981,12 @@ impl majit_backend::Backend for WasmBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
         let ptr = wasm_bh_alloc_struct(sizedescr);
-        if ptr != 0 && vtable != 0 {
-            if let Some(vt_off) = self.vtable_offset {
-                unsafe {
-                    *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
-                }
+        if ptr != 0
+            && vtable != 0
+            && let Some(vt_off) = self.vtable_offset
+        {
+            unsafe {
+                *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
             }
         }
         ptr
@@ -2298,10 +2315,10 @@ impl majit_backend::Backend for WasmBackend {
                     .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
                     .unwrap_or(0),
             );
-            if let Some(descr) = op.getdescr() {
-                if let Some(target) = descr.as_loop_target_descr() {
-                    target.set_label_block_id(label_block_id);
-                }
+            if let Some(descr) = op.getdescr()
+                && let Some(target) = descr.as_loop_target_descr()
+            {
+                target.set_label_block_id(label_block_id);
             }
             label_block_id += 1;
         }
@@ -2563,21 +2580,20 @@ impl majit_backend::Backend for WasmBackend {
                         .unwrap_or_default(),
                 ))
             } else {
-                match source_loop
+                source_loop
                     .chained_trace_meta
                     .borrow()
                     .get(&source_trace_id)
-                {
-                    Some(m) => Some((
-                        m.cells_base,
-                        m.num_cells,
-                        m.guard_fail_arg_advanced
-                            .get(source_fail_index as usize)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )),
-                    None => None,
-                }
+                    .map(|m| {
+                        (
+                            m.cells_base,
+                            m.num_cells,
+                            m.guard_fail_arg_advanced
+                                .get(source_fail_index as usize)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
             };
             (
                 guard,

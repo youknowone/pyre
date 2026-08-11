@@ -519,7 +519,7 @@ impl MIFrame {
     /// `ref_values` is cleared in lockstep — it is the pyre-only
     /// concrete-value mirror that lives next to each box.
     pub fn cleanup_registers(&mut self) {
-        let num_regs_r = self.jitcode.num_regs_r() as usize;
+        let num_regs_r = self.jitcode.num_regs_r();
         for i in 0..num_regs_r {
             self.ref_regs[i] = None;
             self.ref_values[i] = None;
@@ -743,7 +743,7 @@ impl MIFrame {
         // `copy_constants` + `registers_i[index]` lookup would return.
         if length_i > 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_int_idx {
                     // pyjitpl.py:184-185 history.CONST_FALSE clearing.
@@ -771,7 +771,7 @@ impl MIFrame {
         // we cast through `u64` for `Box::ConstPtr`.
         if length_r > 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_ref_idx {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
@@ -796,7 +796,7 @@ impl MIFrame {
         // pyjitpl.py:228-233 — push live float registers.
         if length_f > 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it.by_ref() {
                 let idx = index as usize;
                 let b = if Some(idx) == clear_float_idx {
                     // pyjitpl.py:188-189 history.CONST_FZERO clearing.
@@ -900,7 +900,7 @@ impl MIFrame {
 
         if length_i > 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it.by_ref() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_int_idx {
                     SnapshotTagged::Const(0, Type::Int)
@@ -937,7 +937,7 @@ impl MIFrame {
 
         if length_r > 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it.by_ref() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
@@ -968,7 +968,7 @@ impl MIFrame {
 
         if length_f > 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            while let Some(index) = it.next() {
+            for index in it {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_float_idx {
                     SnapshotTagged::Const(0, Type::Float)
@@ -1587,7 +1587,7 @@ mod tests {
         let mut builder = JitCodeBuilder::new();
         // Emit a canonical Pure residual_call that records 'i' at
         // end-of-instr per `assembler.py`.
-        let fn_idx = builder.add_fn_ptr(0x1usize as *const ());
+        let fn_idx = builder.add_fn_ptr(std::ptr::dangling::<()>());
         builder.call_pure_int_canonical_via_target(fn_idx, &[JitCallArg::int(0)], 0);
         let jitcode = Arc::new(builder.finish());
         let post_call_pc = jitcode.body().code.len();
@@ -1618,7 +1618,7 @@ mod tests {
         // RPython `pyjitpl.py:264` assertion port.
         use crate::JitCallArg;
         let mut builder = JitCodeBuilder::new();
-        let fn_idx = builder.add_fn_ptr(0x1usize as *const ());
+        let fn_idx = builder.add_fn_ptr(std::ptr::dangling::<()>());
         builder.call_pure_int_canonical_via_target(fn_idx, &[JitCallArg::int(0)], 0);
         let jitcode = Arc::new(builder.finish());
         let post_call_pc = jitcode.body().code.len();

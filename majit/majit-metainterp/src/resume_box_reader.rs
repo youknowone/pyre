@@ -612,7 +612,7 @@ pub fn materialize_bridge_virtual(
                     tp,
                     di.is_signed,
                 );
-                let offset_ref = ctx.const_int(off as i64);
+                let offset_ref = ctx.const_int(off);
                 ctx.profiler()
                     .count_ops(OpCode::RawStore, crate::counters::OPS);
                 ctx.profiler()
@@ -644,7 +644,7 @@ pub fn materialize_bridge_virtual(
             // resume.py:725: base_buffer = decoder.decode_int(self.fieldnums[0])
             let base_buffer = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
             // resume.py:726: buffer = decoder.int_add_const(base_buffer, self.offset)
-            let offset_ref = ctx.const_int(*offset as i64);
+            let offset_ref = ctx.const_int(*offset);
             ctx.profiler()
                 .count_ops(OpCode::IntAdd, crate::counters::OPS);
             ctx.profiler()

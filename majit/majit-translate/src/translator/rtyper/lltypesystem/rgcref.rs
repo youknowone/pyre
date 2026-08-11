@@ -298,17 +298,17 @@ pub(crate) fn pair_gcref_repr_convert_from_to(
     v: &Hlvalue,
     llops: &mut LowLevelOpList,
 ) -> Result<Option<Hlvalue>, TyperError> {
-    if let LowLevelType::Ptr(ptr) = r_to.lowleveltype() {
-        if ptr._gckind() == GcKind::Gc {
-            let converted = llops
-                .genop(
-                    "cast_opaque_ptr",
-                    vec![v.clone()],
-                    GenopResult::LLType(r_to.lowleveltype().clone()),
-                )
-                .map(Hlvalue::Variable);
-            return Ok(converted);
-        }
+    if let LowLevelType::Ptr(ptr) = r_to.lowleveltype()
+        && ptr._gckind() == GcKind::Gc
+    {
+        let converted = llops
+            .genop(
+                "cast_opaque_ptr",
+                vec![v.clone()],
+                GenopResult::LLType(r_to.lowleveltype().clone()),
+            )
+            .map(Hlvalue::Variable);
+        return Ok(converted);
     }
     Ok(None)
 }

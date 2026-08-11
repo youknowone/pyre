@@ -38,6 +38,12 @@ pub struct Renamer {
     producer_roots: Vec<Rc<dyn std::any::Any>>,
 }
 
+impl Default for Renamer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Renamer {
     pub fn new() -> Self {
         Renamer {

@@ -324,10 +324,10 @@ impl SimpleTaskEngine {
             let mut cands: Vec<String> = Vec::new();
             let mut cand_seen: HashSet<String> = HashSet::new();
             for constr in &constraints {
-                if let Some(head) = constr.first() {
-                    if cand_seen.insert(head.clone()) {
-                        cands.push(head.clone());
-                    }
+                if let Some(head) = constr.first()
+                    && cand_seen.insert(head.clone())
+                {
+                    cands.push(head.clone());
                 }
             }
             if cands.is_empty() {

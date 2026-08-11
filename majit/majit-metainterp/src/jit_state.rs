@@ -1457,11 +1457,11 @@ mod tests {
         type Sym = ();
         type Env = ();
 
-        fn build_meta(&self, _: usize, _: &()) -> () {}
+        fn build_meta(&self, _: usize, _: &()) {}
         fn extract_live(&self, _: &()) -> Vec<i64> {
             Vec::new()
         }
-        fn create_sym(_: &(), _: usize) -> () {}
+        fn create_sym(_: &(), _: usize) {}
         fn is_compatible(&self, _: &()) -> bool {
             true
         }

@@ -727,25 +727,25 @@ impl PtrInfoExt for PtrInfo {
             PtrInfo::Str(sinfo) => {
                 // vstring.py:116-126: StrPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, &[op_b.clone()]));
-                if let Some(ref bound) = sinfo.lenbound {
-                    if bound.lower >= 1 {
-                        let lenop_code = if sinfo.mode == 0 {
-                            OpCode::Strlen
-                        } else {
-                            OpCode::Unicodelen
-                        };
-                        let mut lenop = Op::new(lenop_code, &[op_b.clone()]);
-                        // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
-                        // is consumed by `bound.make_guards(lenop, ...)`.
-                        // Materialize the producer result before the chain.
-                        lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
-                        let lenop_pos = lenop.pos.get();
-                        short.push(lenop);
-                        // intutils.py:1264-1289 IntBound.make_guards: emits the
-                        // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
-                        // pairs against `lenop_pos`.
-                        bound.make_guards(lenop_pos, short, ctx);
-                    }
+                if let Some(ref bound) = sinfo.lenbound
+                    && bound.lower >= 1
+                {
+                    let lenop_code = if sinfo.mode == 0 {
+                        OpCode::Strlen
+                    } else {
+                        OpCode::Unicodelen
+                    };
+                    let mut lenop = Op::new(lenop_code, &[op_b.clone()]);
+                    // vstring.py:124 `lenop = ResOperation(STRLEN, [op])`
+                    // is consumed by `bound.make_guards(lenop, ...)`.
+                    // Materialize the producer result before the chain.
+                    lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
+                    let lenop_pos = lenop.pos.get();
+                    short.push(lenop);
+                    // intutils.py:1264-1289 IntBound.make_guards: emits the
+                    // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
+                    // pairs against `lenop_pos`.
+                    bound.make_guards(lenop_pos, short, ctx);
                 }
             }
             // Virtuals/Virtualizable: no guards needed in short preamble
@@ -932,10 +932,11 @@ impl PtrInfoExt for PtrInfo {
                 // immutable virtual ever reaches here: thread a
                 // `memo: &mut Vec<Operand>` keyed on the receiver box (operand
                 // Rc-identity) mirroring info.py:282-284.
-                if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-                    if info.is_virtual() && info.is_immutable_and_filled_with_constants(ctx) {
-                        continue;
-                    }
+                if let Some(info) = resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+                    && info.is_virtual()
+                    && info.is_immutable_and_filled_with_constants(ctx)
+                {
+                    continue;
                 }
                 return false;
             }
@@ -973,15 +974,14 @@ fn force_box_impl(
         // install that `getintbound_handle` performs (optimizer.py:111), so a
         // plain int box with no info is returned as-is below rather than given a
         // fresh unbounded slot.
-        if let Some(b) = &value_box {
-            if b.const_value().is_none() && b.type_() == majit_ir::Type::Int {
-                if let Some(bound) = ctx.peek_intbound_box(b) {
-                    if bound.is_constant() {
-                        let c = ctx.make_constant_int(bound.get_constant_int());
-                        return ctx.materialize_operand_at(c);
-                    }
-                }
-            }
+        if let Some(b) = &value_box
+            && b.const_value().is_none()
+            && b.type_() == majit_ir::Type::Int
+            && let Some(bound) = ctx.peek_intbound_box(b)
+            && bound.is_constant()
+        {
+            let c = ctx.make_constant_int(bound.get_constant_int());
+            return ctx.materialize_operand_at(c);
         }
         let value_is_virtual = match &value_box {
             Some(b) => ctx.is_virtual(b),
@@ -1076,22 +1076,20 @@ fn force_box_impl(
                         if let Some(value) = ctx
                             .resolve_operand_operand_opt(val_ref)
                             .and_then(|cb| cb.const_value())
+                            && let Some(fd) = lookup_field_descr(field_descrs, field_idx)
+                            && let Some(field_d) = fd.as_field_descr()
                         {
-                            if let Some(fd) = lookup_field_descr(field_descrs, field_idx) {
-                                if let Some(field_d) = fd.as_field_descr() {
-                                    let offset = field_d.offset();
-                                    match value {
-                                        Value::Int(v) => unsafe {
-                                            let dest = (ptr.0 as *mut u8).add(offset) as *mut i64;
-                                            *dest = v;
-                                        },
-                                        Value::Ref(r) => unsafe {
-                                            let dest = (ptr.0 as *mut u8).add(offset) as *mut usize;
-                                            *dest = r.0;
-                                        },
-                                        _ => {}
-                                    }
-                                }
+                            let offset = field_d.offset();
+                            match value {
+                                Value::Int(v) => unsafe {
+                                    let dest = (ptr.0 as *mut u8).add(offset) as *mut i64;
+                                    *dest = v;
+                                },
+                                Value::Ref(r) => unsafe {
+                                    let dest = (ptr.0 as *mut u8).add(offset) as *mut usize;
+                                    *dest = r.0;
+                                },
+                                _ => {}
                             }
                         }
                     }
@@ -1268,7 +1266,7 @@ fn force_box_impl(
                         .resolve_operand_operand_opt(&item_ref)
                         .as_ref()
                         .and_then(|b| ctx.getconst(b))
-                        .map_or(false, |(raw, _)| raw == 0);
+                        .is_some_and(|(raw, _)| raw == 0);
                     if is_default {
                         continue;
                     }
@@ -1446,7 +1444,7 @@ fn force_box_impl(
             // raw-slice identity and mis-route any later
             // `get_virtual_fields` / raw-guard path.
             let parent_forced = force_child(&slice.parent, ctx);
-            let offset_ref = ctx.emit_constant_int(slice.offset as i64);
+            let offset_ref = ctx.emit_constant_int(slice.offset);
             let arg_parent = ctx.resolve_operand_operand(&parent_forced);
             let arg_offset = ctx.materialize_operand_at(offset_ref);
             let mut add_op = Op::new(OpCode::IntAdd, &[arg_parent.clone(), arg_offset.clone()]);
@@ -2164,7 +2162,7 @@ mod tests {
 
         assert!(info.has_preamble_item(1));
         // After set_preamble_item, getitem returns Preamble (not the old Value)
-        assert!(info.getitem(1).map_or(false, |e| e.is_preamble()));
+        assert!(info.getitem(1).is_some_and(|e| e.is_preamble()));
         let recovered = info
             .take_preamble_item(1)
             .expect("preamble item should be recoverable");

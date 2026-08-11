@@ -158,7 +158,7 @@ impl KwargsDictStrategy {
         let values_w = std::mem::take(&mut old.1);
         dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
         dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
-        for (k, v) in keys_w.into_iter().zip(values_w.into_iter()) {
+        for (k, v) in keys_w.into_iter().zip(values_w) {
             crate::dictmultiobject::w_dict_store(w_dict, k, v);
         }
     }

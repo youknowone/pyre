@@ -764,7 +764,7 @@ impl Optimizer {
             VirtualStateInfo::Constant(value) => {
                 // `box_` is a caller-provided bound box (reserve_virtual_box /
                 // get_box_replacement_box), so the Operand lowering is panic-free.
-                ctx.make_constant_box(box_, value.clone());
+                ctx.make_constant_box(box_, *value);
             }
             VirtualStateInfo::Virtual {
                 descr,
@@ -1028,7 +1028,7 @@ impl Optimizer {
                     let field_is_virtual = ctx
                         .get_box_replacement_operand_opt(field_ref)
                         .as_ref()
-                        .map_or(false, |b| ctx.is_virtual(b));
+                        .is_some_and(|b| ctx.is_virtual(b));
                     let field_is_const = ctx
                         .get_box_replacement_operand_opt(field_ref)
                         .and_then(|cb| cb.const_value())
@@ -1072,10 +1072,10 @@ impl Optimizer {
         // as a virtual head (allocated during import_state).
         for entry in &entries {
             if !entry.head.is_none()
-                && !ctx
+                && ctx
                     .get_box_replacement_operand_opt(entry.head)
                     .and_then(|cb| cb.const_value())
-                    .is_some()
+                    .is_none()
             {
                 ctx.next_pos = ctx.next_pos.max(entry.head.raw() + 1);
             }
@@ -1586,10 +1586,10 @@ impl Optimizer {
         required_opnum: Option<majit_ir::OpCode>,
         ctx: &OptContext,
     ) -> Option<OpRef> {
-        if let Some(required) = required_opnum {
-            if ctx.op_at(opref).map(|op| op.opcode) != Some(required) {
-                return None;
-            }
+        if let Some(required) = required_opnum
+            && ctx.op_at(opref).map(|op| op.opcode) != Some(required)
+        {
+            return None;
         }
         // optimizer.py:374 `if op in self._emittedoperations` keys by the op's
         // own (raw) identity, not its forwarded replacement. `resolve_to_operand`
@@ -1854,17 +1854,16 @@ impl Optimizer {
         // A forced operand whose IntBound is already constant materializes as a
         // ConstInt before the virtual-force branch. Read the bound without
         // installing one (peek), so a plain int box keeps flowing unchanged.
-        if let Some(rb) = ctx.get_box_replacement_operand_opt(resolved) {
-            if rb.const_value().is_none() && rb.type_() == majit_ir::Type::Int {
-                if let Some(bound) = ctx.peek_intbound_box(&rb) {
-                    if bound.is_constant() {
-                        return ctx.make_constant_int(bound.get_constant_int());
-                    }
-                }
-            }
+        if let Some(rb) = ctx.get_box_replacement_operand_opt(resolved)
+            && rb.const_value().is_none()
+            && rb.type_() == majit_ir::Type::Int
+            && let Some(bound) = ctx.peek_intbound_box(&rb)
+            && bound.is_constant()
+        {
+            return ctx.make_constant_int(bound.get_constant_int());
         }
         let resolved_op = ctx.get_box_replacement_operand_opt(opref);
-        if resolved_op.as_ref().map_or(false, |b| ctx.is_virtual(b)) {
+        if resolved_op.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
             // Virtualizable represents an existing heap object with tracked
             // fields — not a deferred allocation. force_box must not take
             // its PtrInfo. RPython parity: Virtualizable is never a "true"
@@ -1873,7 +1872,7 @@ impl Optimizer {
             // the tracked state via take_ptr_info.
             if resolved_op
                 .as_ref()
-                .map_or(false, |b| ctx.is_virtualizable(b))
+                .is_some_and(|b| ctx.is_virtualizable(b))
             {
                 return resolved;
             }
@@ -1921,7 +1920,7 @@ impl Optimizer {
                 let resolved_is_virtual = ctx
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(b));
+                    .is_some_and(|b| ctx.is_virtual(b));
                 if resolved_is_virtual {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
@@ -1938,7 +1937,7 @@ impl Optimizer {
                 let resolved_has_info = ctx
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(b));
+                    .is_some_and(|b| ctx.has_ptr_info(b));
                 if resolved_has_info {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
@@ -2317,7 +2316,7 @@ impl Optimizer {
             .map(|op| op.raw())
             .max()
             .unwrap_or(0);
-        let start_next_pos = ((max_pos as u32) + 1).max(num_inputs as u32);
+        let start_next_pos = (max_pos + 1).max(num_inputs as u32);
         self.optimize_with_constants_and_inputs_at(
             ops,
             constants,
@@ -2555,7 +2554,7 @@ impl Optimizer {
             // seed_constant takes the canonical `_forwarded` host; resolve
             // the body OpRef to its producing `Op` / `InputArg` box first.
             let op_ = ctx.materialize_operand_at(opref);
-            ctx.seed_constant(&op_, value.clone());
+            ctx.seed_constant(&op_, *value);
         }
 
         // Setup all passes
@@ -2874,20 +2873,20 @@ impl Optimizer {
                 let resolved_has_ptr_info = ctx
                     .resolve_operand_operand_opt(&arg)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(b));
+                    .is_some_and(|b| ctx.has_ptr_info(b));
                 let resolved_is_ref =
                     ctx.opref_type(resolved) == Some(majit_ir::Type::Ref) || resolved_has_ptr_info;
                 if expected_ref
                     && !resolved_is_ref
-                    && !ctx
+                    && ctx
                         .get_box_replacement_operand_opt(resolved)
                         .and_then(|cb| cb.const_value())
-                        .is_some()
+                        .is_none()
                 {
                     let arg_is_virtual = ctx
                         .resolve_operand_operand_opt(&arg)
                         .as_ref()
-                        .map_or(false, |b| ctx.is_virtual(b));
+                        .is_some_and(|b| ctx.is_virtual(b));
                     if arg_is_virtual {
                         force_needed.push(i);
                     } else {
@@ -3094,7 +3093,7 @@ impl Optimizer {
                         let target_slot = arg.raw() as usize;
                         let target_slot_self_forwards = original_args
                             .get(target_slot)
-                            .map_or(true, |other| *other == *arg);
+                            .is_none_or(|other| *other == *arg);
                         let is_cross_inputarg = target_slot < num_inputs
                             && target_slot != slot_idx
                             && !emitted_positions.contains(arg)
@@ -3533,7 +3532,7 @@ impl Optimizer {
                 let resolved_is_virtual = ctx
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
-                    .map_or(false, |b| ctx.is_virtual(b));
+                    .is_some_and(|b| ctx.is_virtual(b));
                 if resolved_is_virtual {
                     self.force_box_for_end_of_preamble(opref, &mut ctx);
                 }
@@ -4024,7 +4023,7 @@ impl Optimizer {
         let has_body_guard = ops
             .iter()
             .any(|op| op.opcode.is_guard() && op.rd_resume_position.get() >= 0);
-        let retarget_close_jump = ops.last().map_or(false, |op| op.opcode == OpCode::Jump)
+        let retarget_close_jump = ops.last().is_some_and(|op| op.opcode == OpCode::Jump)
             && inline_short_preamble
             && front_target_tokens.len() > 1
             && has_body_guard;
@@ -4058,21 +4057,21 @@ impl Optimizer {
         // last body guard (highest resume position, closest to the close).
         // `retarget_close_jump` already gated on `has_body_guard`, so the
         // filter is guaranteed non-empty here.
-        if retarget_close_jump && self.patchguardop.is_none() {
-            if let Some(g) = ops
+        if retarget_close_jump
+            && self.patchguardop.is_none()
+            && let Some(g) = ops
                 .iter()
                 .filter(|o| o.opcode.is_guard() && o.rd_resume_position.get() >= 0)
                 .max_by_key(|o| o.rd_resume_position.get())
-            {
-                self.patchguardop = Some((**g).clone());
-            }
+        {
+            self.patchguardop = Some((**g).clone());
         }
 
         // RPython flush=False: JUMP is in terminal_op, not in optimized_ops.
         let terminal_jump = self.terminal_op.take();
         let has_jump = terminal_jump
             .as_ref()
-            .map_or(false, |op| op.opcode == OpCode::Jump);
+            .is_some_and(|op| op.opcode == OpCode::Jump);
 
         if optimized_ops.len() < 120 && crate::smallir_enabled() {
             eprintln!(
@@ -4137,7 +4136,7 @@ impl Optimizer {
                 let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
                 self.send_extra_operation(&jump_op, &mut ctx)?;
                 let mut result = optimized_ops;
-                result.extend(ctx.new_operations.drain(..));
+                result.append(&mut ctx.new_operations);
                 return Ok((result, false));
             }
             return Ok((optimized_ops, false));
@@ -4237,7 +4236,7 @@ impl Optimizer {
                     let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
                     self.send_extra_operation(&jump_op, &mut ctx)?;
                     let mut result = optimized_ops;
-                    result.extend(ctx.new_operations.drain(..));
+                    result.append(&mut ctx.new_operations);
                     return Ok((result, false));
                 }
                 return Ok((optimized_ops, false));
@@ -4247,7 +4246,7 @@ impl Optimizer {
         // unroll.py:212-213: vs is None → matched, JUMP redirected
         if vs.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.append(&mut ctx.new_operations);
             return Ok((result, false));
         }
 
@@ -4300,7 +4299,7 @@ impl Optimizer {
         // unroll.py:226-227: vs is None → matched with forced boxes
         if vs2.is_none() {
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.append(&mut ctx.new_operations);
             return Ok((result, false));
         }
 
@@ -4324,7 +4323,7 @@ impl Optimizer {
             let jump_op = terminal_jump.copy_and_change(OpCode::Jump, None, None);
             self.send_extra_operation(&jump_op, &mut ctx)?;
             let mut result = optimized_ops;
-            result.extend(ctx.new_operations.drain(..));
+            result.append(&mut ctx.new_operations);
             Ok((result, false))
         } else {
             Ok((optimized_ops, false))
@@ -4745,52 +4744,51 @@ impl Optimizer {
             // optimizer.py:660 `orig_op in self.replaces_guard` keys by the raw
             // `orig_op` identity (before get_box_replacement), so resolve to the
             // producer box without following `_forwarded`.
-            if self.can_replace_guards {
-                if let Some(replacement) = ctx
+            if self.can_replace_guards
+                && let Some(replacement) = ctx
                     .resolve_to_operand(op.pos.get())
                     .and_then(|op_key| self.replaces_guard.swap_remove(&op_key))
-                {
-                    let target_pos = replacement.pos.get().raw() as usize;
-                    if target_pos < ctx.new_operations.len() {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
-                                op.opcode,
-                                op.pos.get(),
-                                target_pos,
-                                ctx.new_operations.len()
-                            );
-                        }
-                        // optimizer.py:713-720 replace_guard_op:
-                        //   old_descr = old_op.getdescr()
-                        //   new_descr = new_op.getdescr()
-                        //   new_descr.copy_all_attributes_from(old_descr)
-                        // Inherit the slot's resume payload onto the new op's
-                        // descr so the new guard carries old's rd_* — without
-                        // this, `_newoperations[target_pos]` would land with
-                        // the new descr's empty rd_* defaults.  In-place
-                        // mutation preserves new_descr's identity (fail_index
-                        // / status / subtype tag).
-                        //
-                        // RPython performs both getdescr() calls and the
-                        // copy_all_attributes_from unconditionally; an old/new
-                        // descr missing here means the optimizer gave us a
-                        // replacement guard without resume payload, which
-                        // would silently overwrite the slot.  Match RPython
-                        // by panicking instead of skipping.
-                        let old_descr = ctx.new_operations[target_pos].getdescr().expect(
-                            "optimizer.py:716 old_descr = old_op.getdescr(): \
-                                 replaced guard slot has no descr",
+            {
+                let target_pos = replacement.pos.get().raw() as usize;
+                if target_pos < ctx.new_operations.len() {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
+                            op.opcode,
+                            op.pos.get(),
+                            target_pos,
+                            ctx.new_operations.len()
                         );
-                        let new_descr = op.getdescr().expect(
-                            "optimizer.py:717 new_descr = new_op.getdescr(): \
-                             replacement guard has no descr",
-                        );
-                        crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
-                        ctx.replace_new_operation(target_pos, std::rc::Rc::new(op.clone()));
-                        ctx.in_final_emission = saved_in_final_emission;
-                        return Ok(());
                     }
+                    // optimizer.py:713-720 replace_guard_op:
+                    //   old_descr = old_op.getdescr()
+                    //   new_descr = new_op.getdescr()
+                    //   new_descr.copy_all_attributes_from(old_descr)
+                    // Inherit the slot's resume payload onto the new op's
+                    // descr so the new guard carries old's rd_* — without
+                    // this, `_newoperations[target_pos]` would land with
+                    // the new descr's empty rd_* defaults.  In-place
+                    // mutation preserves new_descr's identity (fail_index
+                    // / status / subtype tag).
+                    //
+                    // RPython performs both getdescr() calls and the
+                    // copy_all_attributes_from unconditionally; an old/new
+                    // descr missing here means the optimizer gave us a
+                    // replacement guard without resume payload, which
+                    // would silently overwrite the slot.  Match RPython
+                    // by panicking instead of skipping.
+                    let old_descr = ctx.new_operations[target_pos].getdescr().expect(
+                        "optimizer.py:716 old_descr = old_op.getdescr(): \
+                                 replaced guard slot has no descr",
+                    );
+                    let new_descr = op.getdescr().expect(
+                        "optimizer.py:717 new_descr = new_op.getdescr(): \
+                             replacement guard has no descr",
+                    );
+                    crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
+                    ctx.replace_new_operation(target_pos, std::rc::Rc::new(op.clone()));
+                    ctx.in_final_emission = saved_in_final_emission;
+                    return Ok(());
                 }
             }
 
@@ -4868,12 +4866,12 @@ impl Optimizer {
                 .get_box_replacement_operand_opt(emitted)
                 .as_ref()
                 .and_then(|b| ctx.peek_intbound_box(b));
-            if let Some(bound) = bound {
-                if bound.is_constant() {
-                    let const_val = bound.get_constant_int();
-                    let b = ctx.materialize_operand_at(replaced);
-                    ctx.make_constant_box(&b, majit_ir::Value::Int(const_val));
-                }
+            if let Some(bound) = bound
+                && bound.is_constant()
+            {
+                let const_val = bound.get_constant_int();
+                let b = ctx.materialize_operand_at(replaced);
+                ctx.make_constant_box(&b, majit_ir::Value::Int(const_val));
             }
         }
         if crate::majit_log_enabled()
@@ -4897,10 +4895,10 @@ impl Optimizer {
         // optimizer.py:47-54: run deferred postprocess after emit.
         // RPython calls OptimizationResult.callback() → propagate_postprocess.
         // rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard
-        if let Some(opref) = ctx.pending_mark_last_guard.take() {
-            if let Some(b) = ctx.get_box_replacement_operand_opt(opref) {
-                ctx.mark_last_guard(&b);
-            }
+        if let Some(opref) = ctx.pending_mark_last_guard.take()
+            && let Some(b) = ctx.get_box_replacement_operand_opt(opref)
+        {
+            ctx.mark_last_guard(&b);
         }
         if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
             // rewrite.py:430-436 postprocess_GUARD_CLASS:
@@ -5233,12 +5231,11 @@ impl Optimizer {
         // backend regalloc.
         if let Some(fail_args) = op.fail_args_mut() {
             for fa_idx in 0..fail_args.len() {
-                if !fail_args[fa_idx].is_none() {
-                    if let Some(resolved) =
+                if !fail_args[fa_idx].is_none()
+                    && let Some(resolved) =
                         ctx.get_box_replacement_not_const_operand(&fail_args[fa_idx])
-                    {
-                        fail_args[fa_idx] = resolved;
-                    }
+                {
+                    fail_args[fa_idx] = resolved;
                 }
             }
         }
@@ -5654,7 +5651,7 @@ mod tests {
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
                 let b = ctx.materialize_operand_at(op.pos.get());
-                ctx.make_constant_box(&b, self.value.clone());
+                ctx.make_constant_box(&b, self.value);
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -5679,7 +5676,7 @@ mod tests {
         ) -> OptimizationResult {
             if op.pos.get() == self.target {
                 let b = ctx.materialize_operand_at(op.pos.get());
-                ctx.make_constant_box(&b, self.value.clone());
+                ctx.make_constant_box(&b, self.value);
             }
             OptimizationResult::PassOn
         }
@@ -5913,7 +5910,7 @@ mod tests {
     fn test_restart_from_extra_operation_rediscovers_first_pass() {
         let hits = Rc::new(Cell::new(0));
         let mut opt = Optimizer::new();
-        opt.trace_inputargs = OpRef::inputarg_refs(&vec![majit_ir::Type::Int; 8]);
+        opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int; 8]);
         opt.add_pass(Box::new(QueueRestartCandidate { queued: false }));
         opt.add_pass(Box::new(RestartIntAddAsSub));
         opt.add_pass(Box::new(CountRestartedIntSub { hits: hits.clone() }));

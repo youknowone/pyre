@@ -25,6 +25,12 @@ pub struct DependencyGraph<N: Eq + std::hash::Hash + Clone> {
     pub neighbours: HashMap<N, HashSet<N>>,
 }
 
+impl<N: Eq + std::hash::Hash + Clone> Default for DependencyGraph<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     pub fn new() -> Self {
         Self {
@@ -78,7 +84,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// RPython: `regalloc.py:105` `v0 not in dg.neighbours[w0]`.
     /// Returns true iff there is an interference edge between `v1` and `v2`.
     pub fn has_edge(&self, v1: &N, v2: &N) -> bool {
-        self.neighbours.get(v1).map_or(false, |ns| ns.contains(v2))
+        self.neighbours.get(v1).is_some_and(|ns| ns.contains(v2))
     }
 
     pub fn getnodes(&self) -> Vec<N> {

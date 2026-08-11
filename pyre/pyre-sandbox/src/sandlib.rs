@@ -248,10 +248,10 @@ impl SandboxPolicy {
         let vpath = arg_path(args, 0)?;
         // sandlib.py:555: sockets are checked before the read-only flag gate,
         // since a connected stream is inherently read-write.
-        if self.allow_net {
-            if let Some(target) = vpath.strip_prefix("tcp://") {
-                return self.do_open_socket(target);
-            }
+        if self.allow_net
+            && let Some(target) = vpath.strip_prefix("tcp://")
+        {
+            return self.do_open_socket(target);
         }
         let flags = arg_int(args, 1)? as i32;
         let node = self.get_node(&vpath)?;
@@ -754,11 +754,11 @@ fn posix_normpath(path: &str) -> String {
         match comp {
             "" | "." => {}
             ".." => {
-                if let Some(&last) = out.last() {
-                    if last != ".." {
-                        out.pop();
-                        continue;
-                    }
+                if let Some(&last) = out.last()
+                    && last != ".."
+                {
+                    out.pop();
+                    continue;
                 }
                 if !absolute {
                     out.push("..");

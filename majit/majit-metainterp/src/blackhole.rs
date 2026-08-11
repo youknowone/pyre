@@ -119,11 +119,12 @@ fn unwired_handler_placeholder(
 /// Return type of a blackhole frame.
 ///
 /// RPython: `BlackholeInterpreter._return_type`
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BhReturnType {
     Int,
     Ref,
     Float,
+    #[default]
     Void,
 }
 
@@ -155,14 +156,6 @@ pub struct BhJitDriverSd {
     /// `jitdriver_sd.mainjitcode.calldescr` — CallDescr of the portal
     /// function returned by `get_portal_runner` for `bh_call_*`.
     pub mainjitcode_calldescr: BhCallDescr,
-}
-
-impl Default for BhReturnType {
-    fn default() -> Self {
-        // Entry-creation defaults to Void so empty drivers stay inert
-        // until populated.
-        BhReturnType::Void
-    }
 }
 
 /// Signal raised by handlers and propagated up through `dispatch_step` to `run`.
@@ -458,19 +451,19 @@ impl BlackholeInterpreter {
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
             jitcode.num_regs_and_consts_i(),
-            jitcode.num_regs_i() as usize,
+            jitcode.num_regs_i(),
             jitcode.constants_i.iter().copied(),
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_r,
             jitcode.num_regs_and_consts_r(),
-            jitcode.num_regs_r() as usize,
+            jitcode.num_regs_r(),
             jitcode.constants_r.iter().copied(),
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
             jitcode.num_regs_and_consts_f(),
-            jitcode.num_regs_f() as usize,
+            jitcode.num_regs_f(),
             jitcode.constants_f.iter().copied(),
         );
     }
@@ -695,17 +688,17 @@ impl BlackholeInterpreter {
     /// RPython: `BlackholeInterpreter._copy_data_from_miframe(miframe)`
     pub fn copy_data_from_miframe(&mut self, miframe: &MIFrame) {
         self.setposition(miframe.jitcode.clone(), miframe.pc);
-        for i in 0..self.jitcode.num_regs_i() as usize {
+        for i in 0..self.jitcode.num_regs_i() {
             if let Some(val) = miframe.int_values.get(i).copied().flatten() {
                 self.setarg_i(i, val);
             }
         }
-        for i in 0..self.jitcode.num_regs_r() as usize {
+        for i in 0..self.jitcode.num_regs_r() {
             if let Some(val) = miframe.ref_values.get(i).copied().flatten() {
                 self.setarg_r(i, val);
             }
         }
-        for i in 0..self.jitcode.num_regs_f() as usize {
+        for i in 0..self.jitcode.num_regs_f() {
             if let Some(val) = miframe.float_values.get(i).copied().flatten() {
                 self.setarg_f(i, val);
             }
@@ -717,7 +710,7 @@ impl BlackholeInterpreter {
     /// Clear reference registers to avoid keeping objects alive.
     /// Does not clear constants (they are prebuilt).
     pub fn cleanup_registers(&mut self) {
-        for i in 0..self.jitcode.num_regs_r() as usize {
+        for i in 0..self.jitcode.num_regs_r() {
             if i < self.registers_r.len() {
                 self.registers_r[i] = 0;
             }
@@ -778,16 +771,11 @@ impl BlackholeInterpreter {
         let pos = self.position;
         if pos > VSD_SYNC_LEN
             && code[pos - VSD_SYNC_LEN] == majit_translate::insns::BC_SETFIELD_VABLE_I
+            && let Some(descr_idx) = self.peek_u16_at(pos - 2)
+            && let Some(BhDescr::VableField { index }) = self.runtime_bh_descr(descr_idx as usize)
+            && *index == VSD_FIELD_IDX
         {
-            if let Some(descr_idx) = self.peek_u16_at(pos - 2) {
-                if let Some(BhDescr::VableField { index }) =
-                    self.runtime_bh_descr(descr_idx as usize)
-                {
-                    if *index == VSD_FIELD_IDX {
-                        return code[pos - VSD_SYNC_LEN - 1] as usize;
-                    }
-                }
-            }
+            return code[pos - VSD_SYNC_LEN - 1] as usize;
         }
         if code[pos - 1] == crate::jitcode::NO_RETURN_REG && pos >= 3 {
             let slot_back = match kind {
@@ -869,16 +857,14 @@ impl BlackholeInterpreter {
         // blackhole.py:1614-1618
         // If there is a current exception, raise it now
         // (it may be caught by a catch_operation in this frame)
-        if current_exc != 0 {
-            if !self.handle_exception_in_frame(current_exc) {
-                // No handler: propagate.  The exception leaves this frame here,
-                // so record its node — see [`Self::record_frame_traceback`].
-                self.record_frame_traceback(current_exc);
-                if self.nextblackholeinterp.is_none() {
-                    return Err(self.exit_frame_with_exception(current_exc));
-                }
-                return Ok(current_exc);
+        if current_exc != 0 && !self.handle_exception_in_frame(current_exc) {
+            // No handler: propagate.  The exception leaves this frame here,
+            // so record its node — see [`Self::record_frame_traceback`].
+            self.record_frame_traceback(current_exc);
+            if self.nextblackholeinterp.is_none() {
+                return Err(self.exit_frame_with_exception(current_exc));
             }
+            return Ok(current_exc);
         }
 
         // blackhole.py:1621 — run the bytecode.
@@ -1516,7 +1502,7 @@ impl BlackholeInterpreter {
                     eprintln!(
                         "[bh-trace] finished at pos={} reg0={}",
                         self.position,
-                        self.registers_i.get(0).copied().unwrap_or(-1)
+                        self.registers_i.first().copied().unwrap_or(-1)
                     );
                 }
                 return None;
@@ -1529,7 +1515,7 @@ impl BlackholeInterpreter {
                     "[bh-trace] pos={} op={} reg0={} reg1={}",
                     pos_before,
                     opcode,
-                    self.registers_i.get(0).copied().unwrap_or(-1),
+                    self.registers_i.first().copied().unwrap_or(-1),
                     self.registers_i.get(1).copied().unwrap_or(-1),
                 );
             }
@@ -7550,7 +7536,7 @@ fn bh_null_arg_report(bh: &BlackholeInterpreter, ar: &[i64], position: usize) {
     if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_NULL_ARG").is_some()) {
         return;
     }
-    if ar.iter().any(|&a| a == 0) {
+    if ar.contains(&0) {
         eprintln!(
             "[bh-null-arg] jitcode={} position={} last_opcode_position={} \
              entry_position={} args_r={:?}",

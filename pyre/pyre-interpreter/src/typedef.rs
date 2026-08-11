@@ -1777,7 +1777,7 @@ fn patch_typeobject_descriptor_names() {
     let Some(reg) = TYPEOBJECT_CACHE.get() else {
         return;
     };
-    for (_pytype_addr, &w_typeobject_addr) in reg {
+    for &w_typeobject_addr in reg.values() {
         let tp = w_typeobject_addr as PyObjectRef;
         if tp.is_null() {
             continue;
@@ -2578,7 +2578,7 @@ fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = crate::builtins::builtin_int(&args[1..])?;
     // If cls is int itself, return a plain int.
     let int_typeobj = gettypefor(&pyre_object::INT_TYPE);
-    if int_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
+    if int_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     // cls is a subclass of int. Create a unique instance (bypassing the
@@ -2748,10 +2748,10 @@ macro_rules! make_maketrans_descr {
 /// with the actual class.
 fn module_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_module = pyre_object::w_module_new_managed("");
-    if let Some(cls) = args.first().copied() {
-        if !cls.is_null() {
-            tag_subclass_instance(w_module, cls);
-        }
+    if let Some(cls) = args.first().copied()
+        && !cls.is_null()
+    {
+        tag_subclass_instance(w_module, cls);
     }
     // module.py:Module.descr_module__new__ allocates through
     // `space.allocate_instance(Module, w_subtype)`.
@@ -2869,40 +2869,39 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
     }
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
-    if let Some(spec) = crate::baseobjspace::finditem_str(w_dict, "__spec__")? {
-        if !spec.is_null()
-            && !unsafe { pyre_object::is_none(spec) }
-            && crate::baseobjspace::is_true(spec)?
-        {
-            let mut name = crate::baseobjspace::getattr_str(spec, "name")?;
-            if unsafe { pyre_object::is_none(name) } {
-                name = pyre_object::w_str_new("?");
-            }
-            let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
-            if unsafe { pyre_object::is_none(origin) } {
-                let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
-                let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-                if unsafe { pyre_object::is_none(spec_loader) } {
-                    return Ok(wtf8_format!("<module ", name_repr, ">"));
-                }
-                let loader_repr = unsafe { crate::display::py_repr_wtf8(spec_loader)? };
-                return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
-            }
-            let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-            let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
-            if crate::baseobjspace::is_true(has_location)? {
-                let origin_repr = unsafe { crate::display::py_repr_wtf8(origin)? };
-                return Ok(wtf8_format!(
-                    "<module ",
-                    name_repr,
-                    " from ",
-                    origin_repr,
-                    ">"
-                ));
-            }
-            let origin_str = unsafe { crate::display::py_str_wtf8(origin)? };
-            return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
+    if let Some(spec) = crate::baseobjspace::finditem_str(w_dict, "__spec__")?
+        && !spec.is_null()
+        && !unsafe { pyre_object::is_none(spec) }
+        && crate::baseobjspace::is_true(spec)?
+    {
+        let mut name = crate::baseobjspace::getattr_str(spec, "name")?;
+        if unsafe { pyre_object::is_none(name) } {
+            name = pyre_object::w_str_new("?");
         }
+        let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
+        if unsafe { pyre_object::is_none(origin) } {
+            let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
+            let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
+            if unsafe { pyre_object::is_none(spec_loader) } {
+                return Ok(wtf8_format!("<module ", name_repr, ">"));
+            }
+            let loader_repr = unsafe { crate::display::py_repr_wtf8(spec_loader)? };
+            return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
+        }
+        let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
+        let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
+        if crate::baseobjspace::is_true(has_location)? {
+            let origin_repr = unsafe { crate::display::py_repr_wtf8(origin)? };
+            return Ok(wtf8_format!(
+                "<module ",
+                name_repr,
+                " from ",
+                origin_repr,
+                ">"
+            ));
+        }
+        let origin_str = unsafe { crate::display::py_str_wtf8(origin)? };
+        return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
     }
     let name = crate::baseobjspace::finditem_str(w_dict, "__name__")?
         .unwrap_or_else(|| pyre_object::w_str_new("?"));
@@ -2913,11 +2912,12 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
             "<module ", name_repr, " from ", file_repr, ">"
         ));
     }
-    if let Some(loader) = loader {
-        if !loader.is_null() && !unsafe { pyre_object::is_none(loader) } {
-            let loader_repr = unsafe { crate::display::py_repr_wtf8(loader)? };
-            return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
-        }
+    if let Some(loader) = loader
+        && !loader.is_null()
+        && !unsafe { pyre_object::is_none(loader) }
+    {
+        let loader_repr = unsafe { crate::display::py_repr_wtf8(loader)? };
+        return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
     }
     Ok(wtf8_format!("<module ", name_repr, ">"))
 }
@@ -3489,7 +3489,7 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(value);
     }
     let str_typeobj = gettypefor(&pyre_object::STR_TYPE);
-    if str_typeobj.map_or(false, |t| std::ptr::eq(cls, t.as_ptr())) {
+    if str_typeobj.is_some_and(|t| std::ptr::eq(cls, t.as_ptr())) {
         return Ok(value);
     }
     if !unsafe { pyre_object::is_type(cls) } {
@@ -3497,13 +3497,13 @@ fn str_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "str.__new__(X): X is not a subtype of str",
         ));
     }
-    if let Some(w_str) = str_typeobj {
-        if !unsafe { crate::baseobjspace::issubtype_w(cls, w_str.as_ptr()) } {
-            let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
-            return Err(crate::PyError::type_error(format!(
-                "str.__new__({cls_name}): {cls_name} is not a subtype of str"
-            )));
-        }
+    if let Some(w_str) = str_typeobj
+        && !unsafe { crate::baseobjspace::issubtype_w(cls, w_str.as_ptr()) }
+    {
+        let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
+        return Err(crate::PyError::type_error(format!(
+            "str.__new__({cls_name}): {cls_name} is not a subtype of str"
+        )));
     }
     let contents = unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf();
     Ok(pyre_object::w_str_subclass_from_wtf8(contents, cls))
@@ -9818,13 +9818,13 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                 // pyre's typecheck wrapper equivalent: descr_self_interp_w runs
                 // before the inner function so DescrMismatch is raised the same
                 // way PyPy's `_make_descr_typecheck_wrapper` does.
-                if !reqcls.is_null() {
-                    if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
-                        if e.kind == crate::PyErrorKind::DescrMismatch {
-                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                        }
-                        return Err(e);
+                if !reqcls.is_null()
+                    && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+                {
+                    if e.kind == crate::PyErrorKind::DescrMismatch {
+                        return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                     }
+                    return Err(e);
                 }
                 let fget = read_fget(w_self);
                 if fget.is_null() {
@@ -9871,13 +9871,13 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                         return Err(readonly_attribute(w_self));
                     }
                     let reqcls = read_reqcls(w_self);
-                    if !reqcls.is_null() {
-                        if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
-                            if e.kind == crate::PyErrorKind::DescrMismatch {
-                                return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                            }
-                            return Err(e);
+                    if !reqcls.is_null()
+                        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+                    {
+                        if e.kind == crate::PyErrorKind::DescrMismatch {
+                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                         }
+                        return Err(e);
                     }
                     match crate::call::call_function_impl_result(fset, &[w_self, w_obj, w_value]) {
                         Ok(_) => Ok(pyre_object::w_none()),
@@ -9947,13 +9947,13 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                         )));
                     }
                     let reqcls = read_reqcls(w_self);
-                    if !reqcls.is_null() {
-                        if let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj) {
-                            if e.kind == crate::PyErrorKind::DescrMismatch {
-                                return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
-                            }
-                            return Err(e);
+                    if !reqcls.is_null()
+                        && let Err(e) = crate::baseobjspace::descr_self_interp_w(reqcls, w_obj)
+                    {
+                        if e.kind == crate::PyErrorKind::DescrMismatch {
+                            return Err(getset_descr_mismatch(w_self, w_obj, reqcls));
                         }
+                        return Err(e);
                     }
                     match crate::call::call_function_impl_result(fdel, &[w_self, w_obj]) {
                         Ok(_) => Ok(pyre_object::w_none()),
@@ -10807,10 +10807,9 @@ fn init_type_type(ns: PyObjectRef) {
             if !w_type.is_null()
                 && unsafe { pyre_object::is_type(w_type) }
                 && !std::ptr::eq(w_type, crate::typedef::w_type())
+                && let Some(value) = crate::type_dict_lookup(w_type, "__abstractmethods__")
             {
-                if let Some(value) = crate::type_dict_lookup(w_type, "__abstractmethods__") {
-                    return Ok(value);
-                }
+                return Ok(value);
             }
             Err(crate::PyError::attribute_error("__abstractmethods__"))
         },
@@ -11062,12 +11061,12 @@ fn init_type_type(ns: PyObjectRef) {
             let prefix = format!("{name}(");
             if raw_doc.starts_with(prefix.as_str()) {
                 const MARKER: &str = ")\n--\n\n";
-                if let Some(end) = raw_doc.find(MARKER.as_ref()) {
-                    if end > 0 {
-                        return Ok(pyre_object::w_str_from_wtf8(
-                            raw_doc[name.len()..end + 1].to_wtf8_buf(),
-                        ));
-                    }
+                if let Some(end) = raw_doc.find(MARKER.as_ref())
+                    && end > 0
+                {
+                    return Ok(pyre_object::w_str_from_wtf8(
+                        raw_doc[name.len()..end + 1].to_wtf8_buf(),
+                    ));
                 }
             }
             Ok(pyre_object::w_none())
@@ -11225,12 +11224,11 @@ fn init_type_type(ns: PyObjectRef) {
             // type derives it from the qualified name.  `lookup_in_type`
             // filters out null entries but preserves `w_none()`, matching
             // PyPy's "value present even if it's None" semantic.
-            if unsafe { pyre_object::w_type_is_heaptype(cls) } {
-                if let Some(v) = crate::type_dict_lookup(cls, "__module__") {
-                    if !v.is_null() {
-                        return Ok(v);
-                    }
-                }
+            if unsafe { pyre_object::w_type_is_heaptype(cls) }
+                && let Some(v) = crate::type_dict_lookup(cls, "__module__")
+                && !v.is_null()
+            {
+                return Ok(v);
             }
             // Builtin-name dot split fallback (`typeobject.py:619-624`).
             let name = unsafe { pyre_object::w_type_get_name(cls) };
@@ -11660,11 +11658,11 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if !saved_bases.is_null() {
             let old_n = pyre_object::w_tuple_len(saved_bases);
             for i in 0..old_n as i64 {
-                if let Some(w_oldbase) = pyre_object::w_tuple_getitem(saved_bases, i) {
-                    if pyre_object::is_type(w_oldbase) {
-                        let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
-                        pyre_object::typeobject::w_type_remove_subclass(w_oldbase, w_type);
-                    }
+                if let Some(w_oldbase) = pyre_object::w_tuple_getitem(saved_bases, i)
+                    && pyre_object::is_type(w_oldbase)
+                {
+                    let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
+                    pyre_object::typeobject::w_type_remove_subclass(w_oldbase, w_type);
                 }
             }
         }
@@ -13655,16 +13653,16 @@ fn patch_builtin_function_descriptors() {
         "__self__",
         "__text_signature__",
     ] {
-        if let Some(descr) = crate::type_dict_lookup(bf_type, name) {
-            if unsafe { pyre_object::typedef::is_getset_property(descr) } {
-                unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
-            }
+        if let Some(descr) = crate::type_dict_lookup(bf_type, name)
+            && unsafe { pyre_object::typedef::is_getset_property(descr) }
+        {
+            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, bf_type) };
         }
     }
-    if let Some(descr) = crate::type_dict_lookup(bf_type, "__module__") {
-        if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
-            unsafe { pyre_object::w_member_set_cls(descr, bf_type) };
-        }
+    if let Some(descr) = crate::type_dict_lookup(bf_type, "__module__")
+        && unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) }
+    {
+        unsafe { pyre_object::w_member_set_cls(descr, bf_type) };
     }
 }
 
@@ -13684,10 +13682,10 @@ fn patch_function_member_descriptors() {
         "__module__",
         "__builtins__",
     ] {
-        if let Some(descr) = crate::type_dict_lookup(function_type, name) {
-            if unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) } {
-                unsafe { pyre_object::w_member_set_cls(descr, function_type) };
-            }
+        if let Some(descr) = crate::type_dict_lookup(function_type, name)
+            && unsafe { pyre_object::is_member(descr) && pyre_object::w_member_is_direct(descr) }
+        {
+            unsafe { pyre_object::w_member_set_cls(descr, function_type) };
         }
     }
 }
@@ -13702,10 +13700,10 @@ fn patch_module_descriptors() {
         return;
     }
     for name in ["__annotations__", "__annotate__"] {
-        if let Some(descr) = crate::type_dict_lookup(module_type, name) {
-            if unsafe { pyre_object::typedef::is_getset_property(descr) } {
-                unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, module_type) };
-            }
+        if let Some(descr) = crate::type_dict_lookup(module_type, name)
+            && unsafe { pyre_object::typedef::is_getset_property(descr) }
+        {
+            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, module_type) };
         }
     }
 }
@@ -13720,10 +13718,10 @@ fn patch_cell_descriptor() {
     if cell_type.is_null() || !crate::type_dict_has_storage(cell_type) {
         return;
     }
-    if let Some(descr) = crate::type_dict_lookup(cell_type, "cell_contents") {
-        if unsafe { pyre_object::typedef::is_getset_property(descr) } {
-            unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, cell_type) };
-        }
+    if let Some(descr) = crate::type_dict_lookup(cell_type, "cell_contents")
+        && unsafe { pyre_object::typedef::is_getset_property(descr) }
+    {
+        unsafe { pyre_object::typedef::w_getset_set_reqcls(descr, cell_type) };
     }
 }
 
@@ -18843,10 +18841,10 @@ fn abstract_instantiation_error(cls: PyObjectRef) -> crate::PyError {
     };
     let mut methods: Vec<String> = Vec::new();
     for item in items {
-        if unsafe { pyre_object::is_str(item) } {
-            if let Ok(s) = unsafe { pyre_object::w_str_get_wtf8(item) }.as_str() {
-                methods.push(s.to_string());
-            }
+        if unsafe { pyre_object::is_str(item) }
+            && let Ok(s) = unsafe { pyre_object::w_str_get_wtf8(item) }.as_str()
+        {
+            methods.push(s.to_string());
         }
     }
     methods.sort();
@@ -19591,19 +19589,19 @@ fn bytes_codec_arg_w(
     argument: &str,
     value: Option<PyObjectRef>,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
-    if let Some(w_value) = value {
-        if !unsafe { pyre_object::is_str(w_value) } {
-            // `_PyArg_BadArgument` renders the None singleton as `None`,
-            // rather than its class name `NoneType`.
-            let type_name = if unsafe { pyre_object::is_none(w_value) } {
-                "None"
-            } else {
-                unsafe { pyre_object::type_name_of(w_value) }
-            };
-            return Err(crate::PyError::type_error(format!(
-                "{constructor}() argument '{argument}' must be str, not {type_name}"
-            )));
-        }
+    if let Some(w_value) = value
+        && !unsafe { pyre_object::is_str(w_value) }
+    {
+        // `_PyArg_BadArgument` renders the None singleton as `None`,
+        // rather than its class name `NoneType`.
+        let type_name = if unsafe { pyre_object::is_none(w_value) } {
+            "None"
+        } else {
+            unsafe { pyre_object::type_name_of(w_value) }
+        };
+        return Err(crate::PyError::type_error(format!(
+            "{constructor}() argument '{argument}' must be str, not {type_name}"
+        )));
     }
     Ok(value)
 }
@@ -20176,14 +20174,14 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mul__",
-            make_builtin_function_with_arity("__mul__", |args| bytes_descr_repeat(args), 2),
+            make_builtin_function_with_arity("__mul__", bytes_descr_repeat, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", |args| bytes_descr_repeat(args), 2),
+            make_builtin_function_with_arity("__rmul__", bytes_descr_repeat, 2),
         )
     };
     unsafe {
@@ -22654,21 +22652,21 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     // `get_encoding_and_errors` (unicodeobject.py) defaults only on the
     // *omitted* argument; a supplied value — `None` included — goes through
     // `space.text_w` and is refused unless it is a str.
-    if let Some(enc) = w_encoding {
-        if !unsafe { pyre_object::is_str(enc) } {
-            let tn = crate::type_methods::clinic_arg_type_name(enc);
-            return Err(crate::PyError::type_error(format!(
-                "decode() argument 'encoding' must be str, not {tn}",
-            )));
-        }
+    if let Some(enc) = w_encoding
+        && !unsafe { pyre_object::is_str(enc) }
+    {
+        let tn = crate::type_methods::clinic_arg_type_name(enc);
+        return Err(crate::PyError::type_error(format!(
+            "decode() argument 'encoding' must be str, not {tn}",
+        )));
     }
-    if let Some(err) = w_errors {
-        if !unsafe { pyre_object::is_str(err) } {
-            let tn = crate::type_methods::clinic_arg_type_name(err);
-            return Err(crate::PyError::type_error(format!(
-                "decode() argument 'errors' must be str, not {tn}",
-            )));
-        }
+    if let Some(err) = w_errors
+        && !unsafe { pyre_object::is_str(err) }
+    {
+        let tn = crate::type_methods::clinic_arg_type_name(err);
+        return Err(crate::PyError::type_error(format!(
+            "decode() argument 'errors' must be str, not {tn}",
+        )));
     }
     let encoding = match w_encoding {
         Some(e) if unsafe { pyre_object::is_str(e) } => {
@@ -23993,14 +23991,14 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mul__",
-            make_builtin_function_with_arity("__mul__", |args| bytes_descr_repeat(args), 2),
+            make_builtin_function_with_arity("__mul__", bytes_descr_repeat, 2),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmul__",
-            make_builtin_function_with_arity("__rmul__", |args| bytes_descr_repeat(args), 2),
+            make_builtin_function_with_arity("__rmul__", bytes_descr_repeat, 2),
         )
     };
     unsafe {
@@ -24119,10 +24117,10 @@ pub(crate) fn set_descr_contains(
     match crate::type_methods::set_contains_checked(w_set, w_other) {
         Ok(found) => Ok(found),
         Err(e) => {
-            if e.kind == crate::PyErrorKind::TypeError {
-                if let Some(w_f) = convert_set_to_frozenset(w_other) {
-                    return crate::type_methods::set_contains_checked(w_set, w_f);
-                }
+            if e.kind == crate::PyErrorKind::TypeError
+                && let Some(w_f) = convert_set_to_frozenset(w_other)
+            {
+                return crate::type_methods::set_contains_checked(w_set, w_f);
             }
             Err(e)
         }

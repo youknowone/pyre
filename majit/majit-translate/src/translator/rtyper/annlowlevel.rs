@@ -93,7 +93,7 @@ use crate::flowspace::pygraph::PyGraph;
 use super::error::TyperError;
 use super::llannotation::{annotation_to_lltype, lltype_to_annotation};
 use super::lltypesystem::lltype::{
-    self, _ptr, DelayedPointer, ForwardReference, FuncType, LowLevelType, Ptr, PtrTarget,
+    self, _ptr, DelayedPointer, FuncType, LowLevelType, Ptr, PtrTarget,
 };
 use super::rmodel::Repr;
 use super::rmodel::{RTypeResult, inputconst_from_lltype};
@@ -1071,7 +1071,7 @@ impl LLHelperEntry {
         }
         let f = {
             let args_s = hop.args_s.borrow();
-            let s_f = args_s.get(0).ok_or_else(|| {
+            let s_f = args_s.first().ok_or_else(|| {
                 TyperError::message("LLHelperEntry.specialize_call: missing F argument")
             })?;
             lowlevel_ptr_type_from_const(
@@ -1296,10 +1296,10 @@ impl MixLevelHelperAnnotator {
             .into_iter()
             .zip(args_s.iter())
         {
-            if let crate::flowspace::model::Hlvalue::Variable(mut v_arg) = v_arg {
-                if let Some(s_arg) = s_arg.clone() {
-                    ann.setbinding(&mut v_arg, s_arg);
-                }
+            if let crate::flowspace::model::Hlvalue::Variable(mut v_arg) = v_arg
+                && let Some(s_arg) = s_arg.clone()
+            {
+                ann.setbinding(&mut v_arg, s_arg);
             }
         }
         if let crate::flowspace::model::Hlvalue::Variable(mut retvar) =
@@ -1396,8 +1396,7 @@ impl MixLevelHelperAnnotator {
         graph: &Rc<PyGraph>,
         functype: Option<LowLevelType>,
     ) -> Result<_ptr, TyperError> {
-        let functype = functype
-            .unwrap_or_else(|| LowLevelType::ForwardReference(Box::new(ForwardReference::new())));
+        let functype = functype.unwrap_or_else(|| LowLevelType::ForwardReference(Box::default()));
         let _name = format!("delayed!{}", graph.graph.borrow().name);
         let delayedptr = _ptr::new_with_solid(
             Ptr::from_container_type(functype).map_err(TyperError::message)?,
@@ -2081,7 +2080,7 @@ mod tests {
     }
 
     fn compiled_host_function(src: &str) -> HostObject {
-        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+        let code = rp_compile(src, Mode::Exec, "<test>", Default::default())
             .expect("compile should succeed");
         let inner = code
             .constants

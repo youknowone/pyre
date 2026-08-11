@@ -192,7 +192,8 @@ impl CallFamily {
         self.modified = true;
         self.normalized = self.normalized || other.normalized;
         for (k, v) in &other.descs {
-            self.descs.insert(*k, *v);
+            let _: () = *v;
+            self.descs.insert(*k, ());
         }
         for (shape, table) in &other.calltables {
             for row in table {
@@ -291,10 +292,12 @@ impl FrozenAttrFamily {
     /// RPython `FrozenAttrFamily.update(other)` (description.py:83-86).
     pub fn update(&mut self, other: &FrozenAttrFamily) {
         for (k, v) in &other.descs {
-            self.descs.insert(*k, *v);
+            let _: () = *v;
+            self.descs.insert(*k, ());
         }
         for (k, v) in &other.read_locations {
-            self.read_locations.insert(k.clone(), *v);
+            let _: () = *v;
+            self.read_locations.insert(k.clone(), ());
         }
         for (k, v) in &other.attrs {
             self.attrs.insert(k.clone(), v.clone());
@@ -373,10 +376,12 @@ impl ClassAttrFamily {
     /// can fail (`UnionError` bubbles out of any pair-union branch).
     pub fn update(&mut self, other: &ClassAttrFamily) -> Result<(), super::model::UnionError> {
         for (k, v) in &other.descs {
-            self.descs.insert(*k, *v);
+            let _: () = *v;
+            self.descs.insert(*k, ());
         }
         for (k, v) in &other.read_locations {
-            self.read_locations.insert(k.clone(), *v);
+            let _: () = *v;
+            self.read_locations.insert(k.clone(), ());
         }
         self.s_value = union(&self.s_value, &other.s_value)?;
         Ok(())
@@ -1434,7 +1439,7 @@ impl FunctionDesc {
             )
             .map_err(|e| -> AnnotatorError { e.into() })?;
         }
-        for (slot, s) in inputs_s.iter_mut().zip(concrete.into_iter()) {
+        for (slot, s) in inputs_s.iter_mut().zip(concrete) {
             *slot = Some(s);
         }
         Ok(())
@@ -1893,7 +1898,7 @@ impl FunctionDesc {
         let argscopy: Vec<Variable> = old_args
             .iter()
             .map(|hl| match hl {
-                Hlvalue::Variable(v) => Variable::named(&v.name()),
+                Hlvalue::Variable(v) => Variable::named(v.name()),
                 _ => Variable::new(),
             })
             .collect();
@@ -3414,7 +3419,7 @@ mod tests {
         src: &str,
         defaults: Vec<Constant>,
     ) -> crate::flowspace::model::GraphFunc {
-        let code = rp_compile(src, Mode::Exec, "<test>".into(), Default::default())
+        let code = rp_compile(src, Mode::Exec, "<test>", Default::default())
             .expect("compile should succeed");
         let inner = code
             .constants

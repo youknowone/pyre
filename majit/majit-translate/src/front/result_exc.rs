@@ -1284,7 +1284,7 @@ fn catch_and_rewrap(
         ));
     }
     let is_r = |arg: &LinkArg| matches!(arg, LinkArg::Value(v) if v == r);
-    let has_r = orig.args.iter().any(|a| is_r(a));
+    let has_r = orig.args.iter().any(&is_r);
 
     // --- Normal arm N: receive every Value arg, rebuild `Ok(r)`.
     let value_args: Vec<LinkArg> = orig
@@ -1297,7 +1297,7 @@ fn catch_and_rewrap(
     let n_shell: Option<Variable> = if has_r {
         let r_value_idx = value_args
             .iter()
-            .position(|a| is_r(a))
+            .position(&is_r)
             .expect("has_r implies a Value position");
         let payload = n_inputs[r_value_idx].clone();
         Some(build_shell(
@@ -2161,7 +2161,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
 
     // Break edge args in H scope (all forwarded Variables; the dead threads
     // were pruned, so no const rides the surviving edge).
-    let break_vars: Vec<Variable> = break_vars_src.iter().map(|av| h_of(av)).collect();
+    let break_vars: Vec<Variable> = break_vars_src.iter().map(h_of).collect();
 
     // Drop every dead slot in the transitive chain from its block's inputargs
     // and from every predecessor link feeding that block (descending indices so

@@ -214,11 +214,11 @@ pub fn polluted_qgen(t: &TranslationContext) -> Vec<String> {
             for var in block.getvariables() {
                 let v_hl = Hlvalue::Variable(var);
                 let s = ann.annotation(&v_hl);
-                if let Some(SomeValue::Object(base)) = s {
-                    if base.knowntype != KnownType::Type {
-                        polluted = true;
-                        break 'outer;
-                    }
+                if let Some(SomeValue::Object(base)) = s
+                    && base.knowntype != KnownType::Type
+                {
+                    polluted = true;
+                    break 'outer;
                 }
             }
         }
@@ -298,11 +298,11 @@ pub fn check_exceptblocks_qgen(t: &TranslationContext) -> Vec<String> {
                     // The Rust port's `SomeTypeOf.is_type_of` is
                     // always populated, so the `hasattr` check
                     // collapses to the equality check.
-                    if let Hlvalue::Variable(ev_var) = ev {
-                        if typeof_.is_type_of.len() == 1 && typeof_.is_type_of[0].as_ref() == ev_var
-                        {
-                            continue;
-                        }
+                    if let Hlvalue::Variable(ev_var) = ev
+                        && typeof_.is_type_of.len() == 1
+                        && typeof_.is_type_of[0].as_ref() == ev_var
+                    {
+                        continue;
                     }
                 } else if matches!(&s_et, SomeValue::PBC(_)) {
                     // Upstream `:54-56`: `else: if s_et.__class__ ==
@@ -493,18 +493,17 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
                 };
                 // Upstream `:96-98`: `if isinstance(c, FunctionDesc):
                 // if c not in funcs: yield "lost method: ..."`.
-                if let Some(funcdesc_key) = resolved {
-                    if !funcs.contains(&funcdesc_key) {
-                        let attr_keys: Vec<String> =
-                            subcls.borrow().attrs.keys().cloned().collect();
-                        out.push(format!(
-                            "lost method: {} {} {} {:?}",
-                            name,
-                            subcls.borrow().name,
-                            clsdef.borrow().name,
-                            attr_keys
-                        ));
-                    }
+                if let Some(funcdesc_key) = resolved
+                    && !funcs.contains(&funcdesc_key)
+                {
+                    let attr_keys: Vec<String> = subcls.borrow().attrs.keys().cloned().collect();
+                    out.push(format!(
+                        "lost method: {} {} {} {:?}",
+                        name,
+                        subcls.borrow().name,
+                        clsdef.borrow().name,
+                        attr_keys
+                    ));
                 }
             }
         }
@@ -648,7 +647,7 @@ mod tests {
         use crate::annotator::policy::AnnotatorPolicy;
         use crate::flowspace::model::Variable;
         let ctx = Rc::new(TranslationContext::new());
-        let _ann = ctx.buildannotator(Some(AnnotatorPolicy::default()));
+        let _ann = ctx.buildannotator(Some(AnnotatorPolicy));
         let ann = ctx.annotator().expect("annotator installed");
         let v = Hlvalue::Variable(Variable::new());
         assert_eq!(short_binding(&ann, &v), "?");

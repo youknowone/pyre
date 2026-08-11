@@ -10,6 +10,19 @@
 //! in a crate above the module that allocates it. The module path spells the
 //! upstream package it came from.
 
+// This crate is a line-by-line port of RPython's runtime helpers. Its raw
+// allocation functions inherit upstream pointer contracts, while indexed
+// bigint loops and recursive formatter signatures intentionally retain the
+// source structure and argument lists.
+#![allow(
+    clippy::absurd_extreme_comparisons,
+    clippy::missing_safety_doc,
+    clippy::needless_range_loop,
+    clippy::new_ret_no_self,
+    clippy::too_many_arguments,
+    clippy::while_let_loop
+)]
+
 pub mod lltypesystem;
 pub mod rbigint;
 

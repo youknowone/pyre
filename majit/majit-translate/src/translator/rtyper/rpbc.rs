@@ -111,11 +111,11 @@ impl LLCallTable {
             }
             let mut mismatched = false;
             for (funcdesc, llfn) in &row.row {
-                if let Some(existing_llfn) = existingrow.row.get(funcdesc) {
-                    if llfn != existing_llfn {
-                        mismatched = true;
-                        break;
-                    }
+                if let Some(existing_llfn) = existingrow.row.get(funcdesc)
+                    && llfn != existing_llfn
+                {
+                    mismatched = true;
+                    break;
                 }
             }
             if mismatched {
@@ -1014,10 +1014,7 @@ impl FunctionReprBase {
         // today so those routes stay unpopulated until their concrete
         // reprs land.
         let callfamily = match s_pbc.any_description().and_then(|e| e.as_function()) {
-            Some(rc) => match rc.borrow().base.getcallfamily() {
-                Ok(family) => Some(family),
-                Err(_) => None,
-            },
+            Some(rc) => rc.borrow().base.getcallfamily().ok(),
             None => None,
         };
         Ok(FunctionReprBase {
@@ -2391,8 +2388,8 @@ impl SmallFunctionSetPBCRepr {
         // `value.name` is the graph's qualified name. Take the last
         // dotted segment (`name.rsplit(".", 1)[-1]`).
         let mut names: Vec<String> = row
-            .iter()
-            .map(|(_key, graph)| {
+            .values()
+            .map(|graph| {
                 let full = graph.func.name.clone();
                 full.rsplit_once('.')
                     .map(|(_, last)| last.to_string())
@@ -4551,15 +4548,14 @@ pub fn pair_function_repr_base_rtype_is_(
 
     // upstream: `if hop.s_result.is_constant(): return
     //              inputconst(Bool, hop.s_result.const)`.
-    if let Some(s_result) = hop.s_result.borrow().clone() {
-        if s_result.is_constant() {
-            if let Some(cv) = s_result.const_().cloned() {
-                return Ok(Hlvalue::Constant(HighLevelOp::inputconst(
-                    ConvertedTo::LowLevelType(&LowLevelType::Bool),
-                    &cv,
-                )?));
-            }
-        }
+    if let Some(s_result) = hop.s_result.borrow().clone()
+        && s_result.is_constant()
+        && let Some(cv) = s_result.const_().cloned()
+    {
+        return Ok(Hlvalue::Constant(HighLevelOp::inputconst(
+            ConvertedTo::LowLevelType(&LowLevelType::Bool),
+            &cv,
+        )?));
     }
 
     // upstream: `s_pbc = annmodel.unionof(robj1.s_pbc, robj2.s_pbc);
@@ -5115,7 +5111,7 @@ impl Repr for MultipleFrozenPBCRepr {
         // upstream `v_res = self.getfield(vpbc, attr, hop.llops)`.
         let v_res = {
             let mut llops = hop.llops.borrow_mut();
-            self.getfield(vpbc, &attr, &mut *llops)?
+            self.getfield(vpbc, &attr, &mut llops)?
         };
 
         // upstream `mangled_name, r_res = self.fieldmap[attr]; return
@@ -5414,15 +5410,16 @@ impl MethodOfFrozenPBCRepr {
         // would AttributeError on `.im_self`.
         let new_first_const: Option<FlowConstant> = {
             let args_v = hop2.args_v.borrow();
-            match args_v.get(0) {
+            match args_v.first() {
                 Some(Hlvalue::Constant(c)) => match &c.value {
                     ConstValue::HostObject(host_obj) => {
                         let self_obj = host_obj.bound_method_self().ok_or_else(|| {
-                            TyperError::message(format!(
+                            TyperError::message(
                                 "MethodOfFrozenPBCRepr.redispatch_call: \
                                      Constant arg[0] HostObject is not a bound \
                                      method (no im_self)"
-                            ))
+                                    .to_string(),
+                            )
                         })?;
                         Some(FlowConstant::new(ConstValue::HostObject(self_obj.clone())))
                     }
@@ -6177,7 +6174,7 @@ impl Repr for ClassesPBCRepr {
         let access_set_id = Rc::as_ptr(&access_set) as usize;
         let v_res = {
             let mut llops = hop.llops.borrow_mut();
-            class_repr_inst.getpbcfield(vcls, access_set_id, &attr, &mut *llops)?
+            class_repr_inst.getpbcfield(vcls, access_set_id, &attr, &mut llops)?
         };
 
         // upstream `s_res = access_set.s_value; r_res = self.rtyper.getrepr(s_res)`.
@@ -6721,7 +6718,7 @@ impl MethodsPBCRepr {
 
         // upstream: `funcdescs = [desc.funcdesc for desc in
         //                          hop.args_s[0].descriptions]`.
-        let s_pbc_call = match hop.args_s.borrow().get(0).cloned() {
+        let s_pbc_call = match hop.args_s.borrow().first().cloned() {
             Some(SomeValue::PBC(pbc)) => pbc,
             other => {
                 return Err(TyperError::message(format!(
@@ -6807,7 +6804,7 @@ impl MethodsPBCRepr {
             //   Re-derive `s_func` SomePBC from the inserted-arg's
             //   SomeValue so the new FunctionsPBCRepr matches the
             //   narrowed funcdescs.
-            let s_func_pbc = match hop2.args_s.borrow().get(0).cloned() {
+            let s_func_pbc = match hop2.args_s.borrow().first().cloned() {
                 Some(SomeValue::PBC(p)) => p,
                 other => {
                     return Err(TyperError::message(format!(

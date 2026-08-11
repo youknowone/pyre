@@ -158,10 +158,10 @@ impl CacheEntry {
         if !(ref_box.is_constant() && ref_box.ty() == Some(Type::Ref)) {
             return ref_box;
         }
-        if let Some(last) = self.last_const_box {
-            if oracle.same_constant(last, ref_box) {
-                return last;
-            }
+        if let Some(last) = self.last_const_box
+            && oracle.same_constant(last, ref_box)
+        {
+            return last;
         }
         self.last_const_box = Some(ref_box);
         ref_box
@@ -579,10 +579,8 @@ impl HeapCache {
                     self.known_nullity[i] = 0;
                 }
             }
-            HF_KNOWN_CLASS => {
-                if i < self.known_class.len() {
-                    self.known_class[i] = None;
-                }
+            HF_KNOWN_CLASS if i < self.known_class.len() => {
+                self.known_class[i] = None;
             }
             _ => {}
         }
@@ -659,15 +657,15 @@ impl HeapCache {
         self._remove_flag(opref, HF_IS_UNESCAPED);
         let i = opref.raw() as usize;
         let deps = self.heapc_deps.get_mut(i).and_then(Option::take);
-        if let Some(deps) = deps {
-            if self.test_head_version(opref) {
-                let kept_len = deps.first().cloned().flatten();
-                if let Some(length) = kept_len {
-                    self.heapc_deps[i] = Some(vec![Some(length)]);
-                }
-                for dep in deps.into_iter().skip(1).flatten() {
-                    self._escape_box(dep);
-                }
+        if let Some(deps) = deps
+            && self.test_head_version(opref)
+        {
+            let kept_len = deps.first().cloned().flatten();
+            if let Some(length) = kept_len {
+                self.heapc_deps[i] = Some(vec![Some(length)]);
+            }
+            for dep in deps.into_iter().skip(1).flatten() {
+                self._escape_box(dep);
             }
         }
     }
@@ -677,12 +675,10 @@ impl HeapCache {
         if opnum == OpCode::SetfieldGc {
             if argboxes.len() == 2 {
                 self._escape_from_write(argboxes[0], argboxes[1]);
-                return;
             }
         } else if opnum == OpCode::SetarrayitemGc {
             if argboxes.len() == 3 {
                 self._escape_from_write(argboxes[0], argboxes[2]);
-                return;
             }
         } else if !matches!(
             opnum,
@@ -719,29 +715,29 @@ impl HeapCache {
         const_value: F,
     ) {
         if opnum == OpCode::CallN {
-            if let Some(ei) = effectinfo {
-                if ei.single_write_descr_array.is_some() {
-                    // heapcache.py:272-281: CALL_N + OS_ARRAYCOPY with all
-                    // three index/length operands ConstInt → don't escape
-                    // argboxes.
-                    if ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy
-                        && argboxes.len() >= 6
-                        && const_value(argboxes[3]).is_some()
-                        && const_value(argboxes[4]).is_some()
-                        && const_value(argboxes[5]).is_some()
-                    {
-                        return;
-                    }
-                    // heapcache.py:282-290: CALL_N + OS_ARRAYMOVE with all
-                    // three operands ConstInt → don't escape argboxes.
-                    if ei.oopspecindex == majit_ir::OopSpecIndex::Arraymove
-                        && argboxes.len() >= 5
-                        && const_value(argboxes[2]).is_some()
-                        && const_value(argboxes[3]).is_some()
-                        && const_value(argboxes[4]).is_some()
-                    {
-                        return;
-                    }
+            if let Some(ei) = effectinfo
+                && ei.single_write_descr_array.is_some()
+            {
+                // heapcache.py:272-281: CALL_N + OS_ARRAYCOPY with all
+                // three index/length operands ConstInt → don't escape
+                // argboxes.
+                if ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy
+                    && argboxes.len() >= 6
+                    && const_value(argboxes[3]).is_some()
+                    && const_value(argboxes[4]).is_some()
+                    && const_value(argboxes[5]).is_some()
+                {
+                    return;
+                }
+                // heapcache.py:282-290: CALL_N + OS_ARRAYMOVE with all
+                // three operands ConstInt → don't escape argboxes.
+                if ei.oopspecindex == majit_ir::OopSpecIndex::Arraymove
+                    && argboxes.len() >= 5
+                    && const_value(argboxes[2]).is_some()
+                    && const_value(argboxes[3]).is_some()
+                    && const_value(argboxes[4]).is_some()
+                {
+                    return;
                 }
             }
             // heapcache.py:291-293 fallback: escape all argboxes.
@@ -1537,7 +1533,7 @@ impl HeapCache {
                         .entry(descr)
                         .or_default()
                         .entry(dst_index)
-                        .or_insert_with(CacheEntry::new);
+                        .or_default();
                     // heapcache.py:90-94 `do_write_with_aliasing` —
                     // canonicalise dest, then `_clear_cache_on_write(seen_alloc)`
                     // BEFORE the insert so aliasing entries from prior
@@ -1708,7 +1704,7 @@ impl HeapCache {
             .entry(descr)
             .or_default()
             .entry(index_value)
-            .or_insert_with(CacheEntry::new);
+            .or_default();
         // CacheEntry.do_write_with_aliasing internally canonicalises
         // ConstPtr operands via `_unique_const_heuristic`, replicating
         // heapcache.py:577 `indexcache.do_write_with_aliasing(box, ...)`.
@@ -1736,7 +1732,7 @@ impl HeapCache {
             .entry(descr)
             .or_default()
             .entry(index_value)
-            .or_insert_with(CacheEntry::new);
+            .or_default();
         let array = entry._unique_const_heuristic(array, oracle);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }

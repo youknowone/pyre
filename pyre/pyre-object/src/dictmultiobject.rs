@@ -2992,9 +2992,7 @@ pub unsafe fn w_dict_setdefault_checked(
             if let Ok(Some(existing)) = result {
                 return Ok(existing);
             }
-            if let Err(err) = result {
-                return Err(err);
-            }
+            result?;
             // `Ok(None)` only arises on a broken probe (which surfaces as the
             // outer `None`); fall through to the scan defensively.
         }
@@ -3222,10 +3220,10 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     lock_dict_refs!(_module_guard, obj, key, value);
     // Prebuilt-family store (see `w_module_dict_setitem_str_internal`).
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    if !w_module_dict_is_object_strategy(obj) {
-        if let Some(ks) = key_as_utf8(key) {
-            return w_module_dict_setitem_str(obj, ks, value);
-        }
+    if !w_module_dict_is_object_strategy(obj)
+        && let Some(ks) = key_as_utf8(key)
+    {
+        return w_module_dict_setitem_str(obj, ks, value);
     }
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
@@ -3248,11 +3246,11 @@ pub unsafe fn w_module_dict_store_inner_checked(
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
     lock_dict_refs!(_module_guard, obj, key, value);
-    if !w_module_dict_is_object_strategy(obj) {
-        if let Some(ks) = key_as_utf8(key) {
-            w_module_dict_setitem_str(obj, ks, value);
-            return Ok(());
-        }
+    if !w_module_dict_is_object_strategy(obj)
+        && let Some(ks) = key_as_utf8(key)
+    {
+        w_module_dict_setitem_str(obj, ks, value);
+        return Ok(());
     }
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
@@ -5444,7 +5442,7 @@ pub trait DictStrategy {
         // dictmultiobject.py:624-634
         let w_item = self.getitem(w_dict, w_key);
         if let Some(val) = w_item {
-            if self.delitem(w_dict, w_key) == false {
+            if !self.delitem(w_dict, w_key) {
                 return Err(());
             }
             Ok(val)
@@ -5786,11 +5784,11 @@ impl EmptyDictStrategy {
         // at startup; pyre-object snapshot/lib tests return `None`
         // and fall through to the Object strategy).
         let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null() {
-            if let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type) {
-                self.switch_to_identity_strategy(w_dict);
-                return;
-            }
+        if !w_key_type.is_null()
+            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
+        {
+            self.switch_to_identity_strategy(w_dict);
+            return;
         }
         self.switch_to_object_strategy(w_dict);
     }
@@ -5914,11 +5912,11 @@ impl EmptyKwargsDictStrategy {
             return;
         }
         let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null() {
-            if let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type) {
-                EMPTY_DICT_STRATEGY.switch_to_identity_strategy(w_dict);
-                return;
-            }
+        if !w_key_type.is_null()
+            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
+        {
+            EMPTY_DICT_STRATEGY.switch_to_identity_strategy(w_dict);
+            return;
         }
         // `kwargsdict.py:13-22` inherits the parent's
         // `switch_to_object_strategy` (`dictmultiobject.py:732-736`),

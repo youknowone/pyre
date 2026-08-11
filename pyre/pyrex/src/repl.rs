@@ -16,6 +16,10 @@ use crate::repl_readline::{Readline, ReadlineResult};
 const DEFAULT_PRIMARY_PROMPT: &str = ">>> ";
 const DEFAULT_SECONDARY_PROMPT: &str = "... ";
 
+// This value is short-lived at the REPL compile boundary. Boxing CodeObject
+// would add an allocation to every successfully compiled input solely to make
+// the uncommon control variants smaller.
+#[allow(clippy::large_enum_variant)]
 enum ShellCompileAction {
     Execute(pyre_interpreter::CodeObject),
     Ignore,
@@ -345,7 +349,7 @@ fn compile_repl_input(
     #[cfg(windows)]
     let source = normalized.as_str();
 
-    match pyre_interpreter::rp_compile(source, Mode::Single, "<stdin>".into(), Default::default()) {
+    match pyre_interpreter::rp_compile(source, Mode::Single, "<stdin>", Default::default()) {
         Ok(code) => {
             if empty_line_given || !continuing_block {
                 ShellCompileAction::Execute(code)

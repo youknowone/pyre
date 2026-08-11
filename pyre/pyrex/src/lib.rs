@@ -732,6 +732,9 @@ fn real_main(binary_name: &str) {
 /// `pypy/sandbox/pypy_interact.py`'s `main`. Unix-only: the controller relies
 /// on a fork/fd-based child, so non-unix hosts reject `interact` at dispatch.
 #[cfg(unix)]
+// Keep the command-line options explicit at the sandbox-controller boundary;
+// grouping them would only duplicate the CLI parser's argument structure.
+#[allow(clippy::too_many_arguments)]
 fn run_interact(
     binary_name: &str,
     exe: String,

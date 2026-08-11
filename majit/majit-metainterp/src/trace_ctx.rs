@@ -1857,10 +1857,10 @@ impl TraceCtx {
         if let Some(v) = opref.inline_const_to_value() {
             return Some(v);
         }
-        if Some(opref) == self.standard_virtualizable_box() {
-            if let Some(v) = self.standard_virtualizable_concrete() {
-                return Some(v);
-            }
+        if Some(opref) == self.standard_virtualizable_box()
+            && let Some(v) = self.standard_virtualizable_concrete()
+        {
+            return Some(v);
         }
         self.lookup_opref_concrete(opref)
     }
@@ -2844,11 +2844,11 @@ impl TraceCtx {
     /// also change concrete (vable set{field,arrayitem}), use
     /// `set_virtualizable_entry_at`.
     pub fn set_virtualizable_box_at(&mut self, index: usize, value: OpRef) -> bool {
-        if let Some(boxes) = &mut self.virtualizable_boxes {
-            if let Some(slot) = boxes.get_mut(index) {
-                *slot = value;
-                return true;
-            }
+        if let Some(boxes) = &mut self.virtualizable_boxes
+            && let Some(slot) = boxes.get_mut(index)
+        {
+            *slot = value;
+            return true;
         }
         false
     }
@@ -3109,10 +3109,10 @@ impl TraceCtx {
                 return Some(value);
             }
         }
-        if Some(opref) == self.standard_virtualizable_box() {
-            if let Some(v) = self.standard_virtualizable_concrete() {
-                return Some(v);
-            }
+        if Some(opref) == self.standard_virtualizable_box()
+            && let Some(v) = self.standard_virtualizable_concrete()
+        {
+            return Some(v);
         }
         self.lookup_opref_concrete(opref)
     }
@@ -3935,20 +3935,18 @@ impl TraceCtx {
                     Some(Value::Int(n)) => Some(n),
                     _ => None,
                 };
-                if let Some(cached_int) = expected_int {
-                    if vable_struct_ptr != 0 {
-                        if let Some(Value::Int(loaded)) =
-                            self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
-                        {
-                            assert_eq!(
-                                loaded, cached_int,
-                                "_opimpl_getfield_gc_any_pureornot sanity \
+                if let Some(cached_int) = expected_int
+                    && vable_struct_ptr != 0
+                    && let Some(Value::Int(loaded)) =
+                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
+                {
+                    assert_eq!(
+                        loaded, cached_int,
+                        "_opimpl_getfield_gc_any_pureornot sanity \
                                  check: loaded {loaded} != cached {cached_int} \
                                  (field_index={field_index}, vable_struct_ptr=\
                                  {vable_struct_ptr:#x})"
-                            );
-                        }
-                    }
+                    );
                 }
                 // pyjitpl.py:946 profiler.count_ops(rop.GETFIELD_GC_I,
                 // Counters.HEAPCACHED_OPS) on cache hit.
@@ -3992,10 +3990,10 @@ impl TraceCtx {
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let Some(idx) = index {
-            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(idx) = index
+            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         // Fallback for tests/missing layout
         self.profiler()
@@ -4172,16 +4170,16 @@ impl TraceCtx {
             // through unchanged.
             let record_descr = self.vable_static_record_descr(&fielddescr);
             let field_index = fielddescr.index();
-            if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
-                if cached == value {
-                    // pyjitpl.py:977 profiler.count_ops(rop.SETFIELD_GC,
-                    // Counters.HEAPCACHED_OPS) when the cache already
-                    // holds `valuebox` — `upd.currfieldbox is valuebox`
-                    // (Box identity, not value equality).
-                    self.profiler()
-                        .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                    return None;
-                }
+            if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index)
+                && cached == value
+            {
+                // pyjitpl.py:977 profiler.count_ops(rop.SETFIELD_GC,
+                // Counters.HEAPCACHED_OPS) when the cache already
+                // holds `valuebox` — `upd.currfieldbox is valuebox`
+                // (Box identity, not value equality).
+                self.profiler()
+                    .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
+                return None;
             }
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
             // the standard heap operation.
@@ -4269,21 +4267,19 @@ impl TraceCtx {
                     Some(Value::Ref(r)) => Some(r),
                     _ => None,
                 };
-                if let Some(cached_ref) = expected_ref {
-                    if vable_struct_ptr != 0 {
-                        if let Some(Value::Ref(loaded)) =
-                            self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
-                        {
-                            assert_eq!(
-                                loaded, cached_ref,
-                                "_opimpl_getfield_gc_any_pureornot sanity \
+                if let Some(cached_ref) = expected_ref
+                    && vable_struct_ptr != 0
+                    && let Some(Value::Ref(loaded)) =
+                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
+                {
+                    assert_eq!(
+                        loaded, cached_ref,
+                        "_opimpl_getfield_gc_any_pureornot sanity \
                                  check (ref): loaded {:#x} != cached {:#x} \
                                  (field_index={field_index}, vable_struct_ptr=\
                                  {vable_struct_ptr:#x})",
-                                loaded.0, cached_ref.0,
-                            );
-                        }
-                    }
+                        loaded.0, cached_ref.0,
+                    );
                 }
                 self.profiler().count_ops(
                     OpCode::GetfieldGcI,
@@ -4319,10 +4315,10 @@ impl TraceCtx {
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let Some(idx) = index {
-            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(idx) = index
+            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
@@ -4379,21 +4375,19 @@ impl TraceCtx {
                     Some(Value::Float(f)) => Some(f),
                     _ => None,
                 };
-                if let Some(cached_float) = expected_float {
-                    if vable_struct_ptr != 0 {
-                        if let Some(Value::Float(loaded)) =
-                            self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
-                        {
-                            assert_eq!(
-                                loaded.to_bits(),
-                                cached_float.to_bits(),
-                                "_opimpl_getfield_gc_any_pureornot sanity \
+                if let Some(cached_float) = expected_float
+                    && vable_struct_ptr != 0
+                    && let Some(Value::Float(loaded)) =
+                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
+                {
+                    assert_eq!(
+                        loaded.to_bits(),
+                        cached_float.to_bits(),
+                        "_opimpl_getfield_gc_any_pureornot sanity \
                                  check (float): loaded {loaded} != cached \
                                  {cached_float} (field_index={field_index}, \
                                  vable_struct_ptr={vable_struct_ptr:#x})"
-                            );
-                        }
-                    }
+                    );
                 }
                 self.profiler().count_ops(
                     OpCode::GetfieldGcI,
@@ -4428,10 +4422,10 @@ impl TraceCtx {
             .virtualizable_info
             .as_ref()
             .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let Some(idx) = index {
-            if let Some((op, value)) = self.virtualizable_entry_at(idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(idx) = index
+            && let Some((op, value)) = self.virtualizable_entry_at(idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         self.profiler()
             .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
@@ -4451,10 +4445,10 @@ impl TraceCtx {
         item_index: usize,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         let index = self.const_int(item_index as i64);
         // pyjitpl.py:1218-1230 vable fallback uses standard array access.
@@ -4545,10 +4539,9 @@ impl TraceCtx {
         // return self.metainterp.virtualizable_boxes[index]
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
         {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+            return (op, concrete_shadow_value(value));
         }
         // Fallback: vable layout missing — go through getfield + arrayitem.
         self.profiler()
@@ -4617,10 +4610,10 @@ impl TraceCtx {
         item_index: usize,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         let index = self.const_int(item_index as i64);
         self.profiler()
@@ -4665,10 +4658,9 @@ impl TraceCtx {
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
         {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+            return (op, concrete_shadow_value(value));
         }
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
@@ -4695,10 +4687,10 @@ impl TraceCtx {
         item_index: usize,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index) {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
+        {
+            return (op, concrete_shadow_value(value));
         }
         let index = self.const_int(item_index as i64);
         self.profiler()
@@ -4735,10 +4727,9 @@ impl TraceCtx {
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
+            && let Some((op, value)) = self.virtualizable_entry_at(flat_idx)
         {
-            if let Some((op, value)) = self.virtualizable_entry_at(flat_idx) {
-                return (op, concrete_shadow_value(value));
-            }
+            return (op, concrete_shadow_value(value));
         }
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
@@ -4811,10 +4802,11 @@ impl TraceCtx {
         };
         let overwritten = VableEntryWrite::of(self, flat_idx);
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
-        if live_null_push && matches!(concrete, Value::Ref(r) if r.is_null()) {
-            if let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut() {
-                live_null_slots[flat_idx] = true;
-            }
+        if live_null_push
+            && matches!(concrete, Value::Ref(r) if r.is_null())
+            && let Some(live_null_slots) = self.virtualizable_live_null_slots.as_mut()
+        {
+            live_null_slots[flat_idx] = true;
         }
         self.synchronize_virtualizable();
         VableArrayStore::Stored(overwritten)
@@ -4904,21 +4896,19 @@ impl TraceCtx {
                     Some(Value::Ref(r)) => Some(r),
                     _ => None,
                 };
-                if let Some(cached_ref) = expected_ref {
-                    if vable_struct_ptr != 0 {
-                        if let Some(Value::Ref(loaded)) =
-                            self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
-                        {
-                            assert_eq!(
-                                loaded, cached_ref,
-                                "_opimpl_getfield_gc_any_pureornot sanity \
+                if let Some(cached_ref) = expected_ref
+                    && vable_struct_ptr != 0
+                    && let Some(Value::Ref(loaded)) =
+                        self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
+                {
+                    assert_eq!(
+                        loaded, cached_ref,
+                        "_opimpl_getfield_gc_any_pureornot sanity \
                                      check (ref): loaded {:#x} != cached {:#x} \
                                      (field_index={f_index}, vable_struct_ptr=\
                                      {vable_struct_ptr:#x})",
-                                loaded.0, cached_ref.0,
-                            );
-                        }
-                    }
+                        loaded.0, cached_ref.0,
+                    );
                 }
                 self.profiler().count_ops(
                     OpCode::GetfieldGcR,
@@ -4956,12 +4946,10 @@ impl TraceCtx {
         // return ConstInt(result)
         if let (Some(info), Some(lengths)) =
             (&self.virtualizable_info, &self.virtualizable_array_lengths)
+            && let Some(array_idx) = info.array_field_by_descr(&fdescr)
+            && let Some(&length) = lengths.get(array_idx)
         {
-            if let Some(array_idx) = info.array_field_by_descr(&fdescr) {
-                if let Some(&length) = lengths.get(array_idx) {
-                    return self.const_int(length as i64);
-                }
-            }
+            return self.const_int(length as i64);
         }
         // Fallback when the layout is unavailable.
         self.profiler()

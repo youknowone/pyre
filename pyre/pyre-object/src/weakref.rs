@@ -79,12 +79,11 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
             &mut rooted_target as *mut PyObjectRef as *mut *mut u8,
             &mut needs_write_barrier,
         )
-    } {
-        if !payload.is_null() {
-            let wref = payload as *mut Weakref;
-            unsafe { (*wref).weakptr = rooted_target };
-            return wref;
-        }
+    } && !payload.is_null()
+    {
+        let wref = payload as *mut Weakref;
+        unsafe { (*wref).weakptr = rooted_target };
+        return wref;
     }
 
     // Bootstrap/test environments may install only the ordinary allocation

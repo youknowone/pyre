@@ -747,7 +747,7 @@ pub enum PyreHelperKind {
     /// raw Int.  The full-body walker recognises this tag to specialise a
     /// provably-int operand to a pure `guard_class INT` + `getfield intval`
     /// + `int_is_true`, eliding the `CALL_MAY_FORCE` (and its
-    /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
+    ///   `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
     Truth,
     /// `bh_unary_positive_fn(value)` — the CALL_INTRINSIC_1 UNARY_POSITIVE
     /// helper (`opcode_ops::unary_positive_value` → `space.pos`).  `int.__pos__`
@@ -782,7 +782,7 @@ pub enum PyreHelperKind {
     /// reader.  The full-body walker recognises this tag to read `value0` /
     /// `value1` from a specialised int tuple directly (`getfield_gc_pure_i`
     /// + `wrapint`), so the unpacked items stay unboxed ints through the
-    /// downstream BINARY_OP int fold.
+    ///   downstream BINARY_OP int fold.
     UnpackItem,
     /// `bh_newtuple_from_array(array)` — the BUILD_TUPLE array consumer that
     /// `lower_tuple_build_hlop_to_insn` emits after `new_array_clear` +
@@ -1642,15 +1642,15 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
             for (ei_i, ei) in all_eis.iter().enumerate() {
                 let canon = canonical_id_for_position[ei_i];
                 let (r, w) = pick_category(ei, category);
-                if let Some(rs) = r {
-                    if rs.binary_search_by_key(&pid, descr_ptr_id).is_ok() {
-                        eisetr.push(canon);
-                    }
+                if let Some(rs) = r
+                    && rs.binary_search_by_key(&pid, descr_ptr_id).is_ok()
+                {
+                    eisetr.push(canon);
                 }
-                if let Some(ws) = w {
-                    if ws.binary_search_by_key(&pid, descr_ptr_id).is_ok() {
-                        eisetw.push(canon);
-                    }
+                if let Some(ws) = w
+                    && ws.binary_search_by_key(&pid, descr_ptr_id).is_ok()
+                {
+                    eisetw.push(canon);
                 }
             }
             // `frozenset(eisetr)` semantic: dedup canonical IDs (sort
@@ -1687,7 +1687,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
         // The Arc is guaranteed to be the actual descr from the raw
         // set, so two distinct Arcs that share `descr.index()` each
         // get their own `set_ei_index` call.
-        for (_pid, (descr, ei_index)) in &descr_to_eiindex_by_ptr {
+        for (descr, ei_index) in descr_to_eiindex_by_ptr.values() {
             descr.set_ei_index(*ei_index);
         }
 

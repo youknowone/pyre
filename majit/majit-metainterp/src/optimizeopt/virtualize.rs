@@ -132,13 +132,13 @@ impl VirtualizableTracker {
             let first_check = ctx
                 .get_box_replacement_operand_opt(OpRef::input_arg_ref(base))
                 .as_ref()
-                .map_or(false, |b| ctx.has_ptr_info(b));
+                .is_some_and(|b| ctx.has_ptr_info(b));
             if !first_check {
                 self.init(ctx);
                 let second_check = ctx
                     .get_box_replacement_operand_opt(OpRef::input_arg_ref(base))
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(b));
+                    .is_some_and(|b| ctx.has_ptr_info(b));
                 if !second_check {
                     {
                         let b = ctx.materialize_operand_at(OpRef::input_arg_ref(base));
@@ -321,7 +321,7 @@ impl VirtualizableTracker {
         let frame_box = ctx.resolve_operand_operand(&producer.arg(0));
         let is_standard = ctx
             .resolve_operand_operand_opt(&producer.arg(0))
-            .map_or(false, |b| self.is_standard_ref(&b, ctx));
+            .is_some_and(|b| self.is_standard_ref(&b, ctx));
         if !is_standard {
             return None;
         }
@@ -450,7 +450,7 @@ impl OptVirtualize {
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
         ctx.get_box_replacement_operand_opt(opref)
             .as_ref()
-            .map_or(false, |b| ctx.is_virtual(b))
+            .is_some_and(|b| ctx.is_virtual(b))
     }
 
     fn is_standard_virtualizable_ref(&self, b: &Operand, ctx: &OptContext) -> bool {
@@ -603,7 +603,7 @@ impl OptVirtualize {
                 // virtualize.py:30-32: arraydescr.is_array_of_structs()
                 let is_struct = descr
                     .as_array_descr()
-                    .map_or(false, |ad| ad.is_array_of_structs());
+                    .is_some_and(|ad| ad.is_array_of_structs());
                 if is_struct {
                     // virtualize.py:31: assert clear
                     debug_assert!(matches!(op.opcode, OpCode::NewArrayClear));
@@ -725,7 +725,7 @@ impl OptVirtualize {
         if is_raw_op
             && struct_box
                 .as_ref()
-                .map_or(false, |b| self.is_standard_virtualizable_ref(b, ctx))
+                .is_some_and(|b| self.is_standard_virtualizable_ref(b, ctx))
         {
             return OptimizationResult::PassOn;
         }
@@ -760,11 +760,10 @@ impl OptVirtualize {
                         // branch should not observe a typeptr op. Defensively
                         // capture known_class if a typeptr setfield still arrives.
                         if is_typeptr {
-                            if vinfo.known_class.is_none() {
-                                if let Some(class_val) = value_as_constant {
+                            if vinfo.known_class.is_none()
+                                && let Some(class_val) = value_as_constant {
                                     vinfo.known_class = Some(class_val as i64);
                                 }
-                            }
                             return Some(OptimizationResult::Remove);
                         }
                         set_field(&mut vinfo.fields, field_idx, value_op.clone());
@@ -803,10 +802,10 @@ impl OptVirtualize {
         // It's forced by _emit_operation (optimizer.py:623-625) at final emit.
         // In majit, this is handled by emit_operation or force_all_lazy_sets.
         // virtualize.py:204: self.make_nonnull(op.getarg(0))
-        if !struct_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = struct_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !struct_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = struct_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -832,7 +831,7 @@ impl OptVirtualize {
         );
         let is_standard_vable_ref = struct_box
             .as_ref()
-            .map_or(false, |b| self.is_standard_virtualizable_ref(b, ctx));
+            .is_some_and(|b| self.is_standard_virtualizable_ref(b, ctx));
 
         // The standard virtualizable's array-pointer field has no virtual-field
         // value to fold to (its contents are tracked as array elements, not a
@@ -841,9 +840,10 @@ impl OptVirtualize {
         // emits. The frame is a real object (the trace's first inputarg), so
         // reading its array-pointer field does not force it.
         let reads_vable_array_field = is_standard_vable_ref
-            && self.vable.as_ref().map_or(false, |vt| {
-                vt.array_idx_for_offset(field_descr.offset()).is_some()
-            });
+            && self
+                .vable
+                .as_ref()
+                .is_some_and(|vt| vt.array_idx_for_offset(field_descr.offset()).is_some());
         if (is_raw_op && is_standard_vable_ref) || reads_vable_array_field {
             return OptimizationResult::PassOn;
         }
@@ -864,30 +864,30 @@ impl OptVirtualize {
         // `OptHeap`'s to move (`optimizer.py:484`). The header reads are
         // excluded for the reason the arms below give -- they do not resolve
         // through the field list at all.
-        if !is_raw_op && !is_typeptr && !field_descr.is_w_class() {
-            if let (Some(b), Some(parent_descr)) =
+        if !is_raw_op
+            && !is_typeptr
+            && !field_descr.is_w_class()
+            && let (Some(b), Some(parent_descr)) =
                 (struct_box.as_ref(), field_descr.get_parent_descr())
-            {
-                ctx.with_ptr_info_mut(b, |info| {
-                    if info.is_virtual() {
-                        info.init_fields(parent_descr, field_idx as usize);
-                    }
-                });
-            }
+        {
+            ctx.with_ptr_info_mut(b, |info| {
+                if info.is_virtual() {
+                    info.init_fields(parent_descr, field_idx as usize);
+                }
+            });
         }
 
         if let Some(info) = struct_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
             // info.py:212-214 getfield: return _fields[fielddescr.get_index()].
             // For Virtual, ob_type (typeptr) is not in fields — fold from
             // known_class (info.py:324-325 get_known_class).
-            if let PtrInfo::Virtual(ref vinfo) = info {
-                if is_typeptr {
-                    if let Some(class_val) = vinfo.known_class {
-                        let b = ctx.materialize_operand_at(op.pos.get());
-                        ctx.make_constant_box(&b, majit_ir::Value::Int(class_val));
-                        return OptimizationResult::Remove;
-                    }
-                }
+            if let PtrInfo::Virtual(ref vinfo) = info
+                && is_typeptr
+                && let Some(class_val) = vinfo.known_class
+            {
+                let b = ctx.materialize_operand_at(op.pos.get());
+                ctx.make_constant_box(&b, majit_ir::Value::Int(class_val));
+                return OptimizationResult::Remove;
             }
             // Pyre object-model: `w_class` (PyObject offset 8) is a header
             // field carrying Python-level class identity, not a value field.
@@ -899,64 +899,64 @@ impl OptVirtualize {
             // explicitly), otherwise the canonical class object for the size
             // descr's type (builtins built by `new_with_vtable` inherit the
             // type's `get_instantiate`).
-            if field_descr.is_w_class() {
-                if let PtrInfo::Virtual(ref vinfo) = info {
-                    let stored = vinfo
-                        .descr
-                        .as_size_descr()
-                        .and_then(|sd| {
-                            sd.all_fielddescrs()
-                                .iter()
-                                .find(|fd| fd.is_w_class())
-                                .map(|fd| fd.index_in_parent() as u32)
-                        })
-                        .and_then(|widx| get_field(&vinfo.fields, widx));
-                    if let Some(val_ref) = stored {
-                        let b_old = Operand::from_bound_op(op_rc);
-                        let b_val = ctx.get_box_replacement_operand(val_ref);
-                        ctx.make_equal_to(&b_old, &b_val);
-                        return OptimizationResult::Remove;
-                    }
-                    if let Some(w_class) = vinfo
-                        .descr
-                        .as_size_descr()
-                        .and_then(|sd| sd.w_class_obj())
-                        .filter(|&w| w != 0)
-                    {
-                        let b = ctx.materialize_operand_at(op.pos.get());
-                        ctx.make_constant_box(
-                            &b,
-                            majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
-                        );
-                        return OptimizationResult::Remove;
-                    }
-                    // Class identity unresolved: leave the read in place so
-                    // the virtual is forced and the real `w_class` is read,
-                    // rather than mis-indexing a value field.
-                    return OptimizationResult::PassOn;
+            if field_descr.is_w_class()
+                && let PtrInfo::Virtual(ref vinfo) = info
+            {
+                let stored = vinfo
+                    .descr
+                    .as_size_descr()
+                    .and_then(|sd| {
+                        sd.all_fielddescrs()
+                            .iter()
+                            .find(|fd| fd.is_w_class())
+                            .map(|fd| fd.index_in_parent() as u32)
+                    })
+                    .and_then(|widx| get_field(&vinfo.fields, widx));
+                if let Some(val_ref) = stored {
+                    let b_old = Operand::from_bound_op(op_rc);
+                    let b_val = ctx.get_box_replacement_operand(val_ref);
+                    ctx.make_equal_to(&b_old, &b_val);
+                    return OptimizationResult::Remove;
                 }
-                // Once the allocation is forced the read is NOT resolved — not
-                // here and not in `optimize_getfield`. `virtualize.py:184-195
-                // optimize_GETFIELD_GC_*` folds only under
-                // `opinfo.is_virtual()` and otherwise emits; upstream has no
-                // counterpart to resolve afterwards because
-                // `jtransform.py:1004-1009 handle_getfield_typeptr` deletes the
-                // read at codewriter time, so no typeptr getfield ever reaches
-                // the optimizer.
-                //
-                // Answering from the layout's canonical class here is unsound:
-                // `force_box` empties the forced instance's field list
-                // (info.rs:1113-1118, so heap's `do_setfield` cannot
-                // MUST_ALIAS-elide the materializing SETFIELD_GC) and routes
-                // the header write into `OptHeap`, where it sits in
-                // `CachedField::lazy_set`. A retag to a user subclass would be
-                // discarded and the base class answered instead. Resolving it
-                // in `OptHeap` does not close the hole either: reads and writes
-                // of this header carry different descr spellings, and the
-                // caches are keyed by `Arc::as_ptr` while `structinfo_setfield`
-                // slots by `field_slot_index`, so the two do not meet. Removing
-                // that split is the prerequisite for folding this read at all.
+                if let Some(w_class) = vinfo
+                    .descr
+                    .as_size_descr()
+                    .and_then(|sd| sd.w_class_obj())
+                    .filter(|&w| w != 0)
+                {
+                    let b = ctx.materialize_operand_at(op.pos.get());
+                    ctx.make_constant_box(
+                        &b,
+                        majit_ir::Value::Ref(majit_ir::GcRef(w_class as usize)),
+                    );
+                    return OptimizationResult::Remove;
+                }
+                // Class identity unresolved: leave the read in place so
+                // the virtual is forced and the real `w_class` is read,
+                // rather than mis-indexing a value field.
+                return OptimizationResult::PassOn;
             }
+            // Once the allocation is forced the read is NOT resolved — not
+            // here and not in `optimize_getfield`. `virtualize.py:184-195
+            // optimize_GETFIELD_GC_*` folds only under
+            // `opinfo.is_virtual()` and otherwise emits; upstream has no
+            // counterpart to resolve afterwards because
+            // `jtransform.py:1004-1009 handle_getfield_typeptr` deletes the
+            // read at codewriter time, so no typeptr getfield ever reaches
+            // the optimizer.
+            //
+            // Answering from the layout's canonical class here is unsound:
+            // `force_box` empties the forced instance's field list
+            // (info.rs:1113-1118, so heap's `do_setfield` cannot
+            // MUST_ALIAS-elide the materializing SETFIELD_GC) and routes
+            // the header write into `OptHeap`, where it sits in
+            // `CachedField::lazy_set`. A retag to a user subclass would be
+            // discarded and the base class answered instead. Resolving it
+            // in `OptHeap` does not close the hole either: reads and writes
+            // of this header carry different descr spellings, and the
+            // caches are keyed by `Arc::as_ptr` while `structinfo_setfield`
+            // slots by `field_slot_index`, so the two do not meet. Removing
+            // that split is the prerequisite for folding this read at all.
             // `optimize_setfield_gc` panics on a slot its descr does not
             // identify, but a spelling that only ever appears on reads never
             // reaches that check, and this is the side that resolves it.
@@ -1037,26 +1037,27 @@ impl OptVirtualize {
             // RPython doesn't need this because GUARD_CLASS reads the class
             // directly from the object, not via a separate field read.
             let is_typeptr = op.with_field_descr(|fd| fd.is_typeptr()).unwrap_or(false);
-            if field_val.is_none() && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI) {
-                if is_typeptr {
-                    let vtable = match &info {
-                        PtrInfo::Virtual(vinfo) => vinfo
-                            .descr
-                            .as_size_descr()
-                            .map(|sd| sd.vtable())
-                            .filter(|&v| v != 0),
-                        PtrInfo::VirtualStruct(vinfo) => vinfo
-                            .descr
-                            .as_size_descr()
-                            .map(|sd| sd.vtable())
-                            .filter(|&v| v != 0),
-                        _ => None,
-                    };
-                    if let Some(vtable) = vtable {
-                        let b = ctx.materialize_operand_at(op.pos.get());
-                        ctx.make_constant_box(&b, Value::Int(vtable as i64));
-                        return OptimizationResult::Remove;
-                    }
+            if field_val.is_none()
+                && matches!(op.opcode, majit_ir::OpCode::GetfieldGcI)
+                && is_typeptr
+            {
+                let vtable = match &info {
+                    PtrInfo::Virtual(vinfo) => vinfo
+                        .descr
+                        .as_size_descr()
+                        .map(|sd| sd.vtable())
+                        .filter(|&v| v != 0),
+                    PtrInfo::VirtualStruct(vinfo) => vinfo
+                        .descr
+                        .as_size_descr()
+                        .map(|sd| sd.vtable())
+                        .filter(|&v| v != 0),
+                    _ => None,
+                };
+                if let Some(vtable) = vtable {
+                    let b = ctx.materialize_operand_at(op.pos.get());
+                    ctx.make_constant_box(&b, Value::Int(vtable as i64));
+                    return OptimizationResult::Remove;
                 }
             }
             // virtualize.py:188-189: a field the trace never stored reads the
@@ -1100,10 +1101,10 @@ impl OptVirtualize {
         }
         // virtualize.py:192: self.make_nonnull(op.getarg(0))
         // optimizer.py:437-448: only set NonNull if no existing PtrInfo.
-        if !struct_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = struct_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !struct_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = struct_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1122,11 +1123,11 @@ impl OptVirtualize {
                 .as_ref()
                 .and_then(|b| {
                     ctx.with_ptr_info_mut(b, |info| {
-                        if let PtrInfo::VirtualArray(vinfo) = info {
-                            if idx < vinfo.items.len() {
-                                vinfo.items[idx] = value_op.clone();
-                                return true;
-                            }
+                        if let PtrInfo::VirtualArray(vinfo) = info
+                            && idx < vinfo.items.len()
+                        {
+                            vinfo.items[idx] = value_op.clone();
+                            return true;
                         }
                         false
                     })
@@ -1154,10 +1155,10 @@ impl OptVirtualize {
             vt.invalidate_array(ab, ctx);
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
-        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = array_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1171,34 +1172,30 @@ impl OptVirtualize {
     ) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
 
-        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
-            if let PtrInfo::VirtualArray(vinfo) = info {
-                if let Some(index) = ctx
-                    .resolve_operand_operand_opt(&op.arg(1))
-                    .and_then(|b_| ctx.get_constant_int_box(&b_))
-                {
-                    // info.py:580-582: getitem returns None for
-                    // negative, out-of-range, or uninitialized slots.
-                    // virtualize.py:282-284: None → InvalidLoop.
-                    if index < 0 || (index as usize) >= vinfo.items.len() {
-                        return OptimizationResult::InvalidLoop(
-                            "virtual array getitem index out of range",
-                        );
-                    }
-                    let item_ref = vinfo.items[index as usize].to_opref();
-                    if item_ref.is_none() {
-                        return OptimizationResult::InvalidLoop(
-                            "virtual array getitem from uninitialized slot",
-                        );
-                    }
-                    let b_old = Operand::from_bound_op(op_rc);
-                    let b_item = ctx
-                        .get_box_replacement_operand_opt(item_ref)
-                        .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
-                    ctx.make_equal_to(&b_old, &b_item);
-                    return OptimizationResult::Remove;
-                }
+        if let Some(info) = array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+            && let PtrInfo::VirtualArray(vinfo) = info
+            && let Some(index) = ctx
+                .resolve_operand_operand_opt(&op.arg(1))
+                .and_then(|b_| ctx.get_constant_int_box(&b_))
+        {
+            // info.py:580-582: getitem returns None for
+            // negative, out-of-range, or uninitialized slots.
+            // virtualize.py:282-284: None → InvalidLoop.
+            if index < 0 || (index as usize) >= vinfo.items.len() {
+                return OptimizationResult::InvalidLoop("virtual array getitem index out of range");
             }
+            let item_ref = vinfo.items[index as usize].to_opref();
+            if item_ref.is_none() {
+                return OptimizationResult::InvalidLoop(
+                    "virtual array getitem from uninitialized slot",
+                );
+            }
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_item = ctx
+                .get_box_replacement_operand_opt(item_ref)
+                .unwrap_or_else(|| ctx.materialize_operand_at(item_ref));
+            ctx.make_equal_to(&b_old, &b_item);
+            return OptimizationResult::Remove;
         }
         // Standard virtualizable array read-after-write: the value-stack /
         // array field of the standard virtualizable frame is tracked in
@@ -1210,24 +1207,22 @@ impl OptVirtualize {
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
-        {
-            if let Some(item_ref) = self
+            && let Some(item_ref) = self
                 .vable
                 .as_ref()
                 .zip(array_box.as_ref())
                 .and_then(|(vt, ab)| vt.tracked_array_element(ab, index, ctx))
-            {
-                let b_old = ctx.materialize_operand_at(op.pos.get());
-                let b_item = ctx.materialize_operand_at(item_ref);
-                ctx.make_equal_to(&b_old, &b_item);
-                return OptimizationResult::Remove;
-            }
+        {
+            let b_old = ctx.materialize_operand_at(op.pos.get());
+            let b_item = ctx.materialize_operand_at(item_ref);
+            ctx.make_equal_to(&b_old, &b_item);
+            return OptimizationResult::Remove;
         }
         // virtualize.py:287: self.make_nonnull(op.getarg(0))
-        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = array_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1245,10 +1240,10 @@ impl OptVirtualize {
             return OptimizationResult::Remove;
         }
         // virtualize.py:273: self.make_nonnull(op.getarg(0))
-        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = array_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1275,39 +1270,37 @@ impl OptVirtualize {
 
         if let Some(PtrInfo::VirtualArrayStruct(vinfo)) =
             array_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-        {
-            if let Some(index) = ctx
+            && let Some(index) = ctx
                 .resolve_operand_operand_opt(&op.arg(1))
                 .and_then(|b_| ctx.get_constant_int_box(&b_))
-            {
-                // info.py:651-656 _compute_index: negative or out-of-range → -1
-                // info.py:663-668 getinteriorfield_virtual: -1 → None
-                // virtualize.py:394-396: None → InvalidLoop
-                if index < 0 || (index as usize) >= vinfo.element_fields.len() {
-                    return OptimizationResult::InvalidLoop(
-                        "virtual interior field index out of range",
-                    );
-                }
-                let fld = get_field(&vinfo.element_fields[index as usize], field_idx);
-                if fld.is_none() {
-                    return OptimizationResult::InvalidLoop(
-                        "virtual interior field from uninitialized slot",
-                    );
-                }
-                let fld = fld.unwrap();
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_fld = ctx
-                    .get_box_replacement_operand_opt(fld)
-                    .unwrap_or_else(|| ctx.materialize_operand_at(fld));
-                ctx.make_equal_to(&b_old, &b_fld);
-                return OptimizationResult::Remove;
+        {
+            // info.py:651-656 _compute_index: negative or out-of-range → -1
+            // info.py:663-668 getinteriorfield_virtual: -1 → None
+            // virtualize.py:394-396: None → InvalidLoop
+            if index < 0 || (index as usize) >= vinfo.element_fields.len() {
+                return OptimizationResult::InvalidLoop(
+                    "virtual interior field index out of range",
+                );
             }
+            let fld = get_field(&vinfo.element_fields[index as usize], field_idx);
+            if fld.is_none() {
+                return OptimizationResult::InvalidLoop(
+                    "virtual interior field from uninitialized slot",
+                );
+            }
+            let fld = fld.unwrap();
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_fld = ctx
+                .get_box_replacement_operand_opt(fld)
+                .unwrap_or_else(|| ctx.materialize_operand_at(fld));
+            ctx.make_equal_to(&b_old, &b_fld);
+            return OptimizationResult::Remove;
         }
         // virtualize.py:399: self.make_nonnull(op.getarg(0))
-        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = array_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1341,15 +1334,15 @@ impl OptVirtualize {
                 .as_ref()
                 .and_then(|b| {
                     ctx.with_ptr_info_mut(b, |info| {
-                        if let PtrInfo::VirtualArrayStruct(vinfo) = info {
-                            if elem_idx < vinfo.element_fields.len() {
-                                set_field(
-                                    &mut vinfo.element_fields[elem_idx],
-                                    field_idx,
-                                    value_op.clone(),
-                                );
-                                return true;
-                            }
+                        if let PtrInfo::VirtualArrayStruct(vinfo) = info
+                            && elem_idx < vinfo.element_fields.len()
+                        {
+                            set_field(
+                                &mut vinfo.element_fields[elem_idx],
+                                field_idx,
+                                value_op.clone(),
+                            );
+                            return true;
                         }
                         false
                     })
@@ -1360,10 +1353,10 @@ impl OptVirtualize {
             }
         }
         // virtualize.py:413: self.make_nonnull(op.getarg(0))
-        if !array_box.as_ref().map_or(false, |b| ctx.has_ptr_info(b)) {
-            if let Some(b) = array_box.as_ref() {
-                ctx.set_ptr_info(b, PtrInfo::nonnull());
-            }
+        if !array_box.as_ref().is_some_and(|b| ctx.has_ptr_info(b))
+            && let Some(b) = array_box.as_ref()
+        {
+            ctx.set_ptr_info(b, PtrInfo::nonnull());
         }
         OptimizationResult::PassOn
     }
@@ -1571,99 +1564,94 @@ impl OptVirtualize {
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
+            && let Some(descr) = op.getdescr()
+            && let Some(ad) = descr.as_array_descr()
         {
-            if let Some(descr) = op.getdescr() {
-                if let Some(ad) = descr.as_array_descr() {
-                    // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
-                    // `assert not descr.is_array_of_pointers()` at
-                    // setrawbuffer_item. Upstream's `_I/_F`-only
-                    // surface guarantees this; pyre carries the
-                    // assertion through the materialisation path,
-                    // so a virtualisation handler that admits a
-                    // pointer descr would panic at resume time.
-                    // Reject pointer descrs at entry instead.
-                    if ad.is_array_of_pointers() {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
-                        }
-                        return OptimizationResult::PassOn;
-                    }
-                    // virtualize.py:310-316 _unpack_arrayitem_raw_op:
-                    // `offset = basesize + (itemsize*index)`. RPython
-                    // int is unbounded so this is always
-                    // representable; in Rust we emulate that by using
-                    // checked arithmetic and falling through (== "no
-                    // optimisation") on i64 overflow rather than
-                    // wrapping into a stale offset that could match a
-                    // sibling write. `itemsize`/`basesize` come from
-                    // `unpack_arraydescr_size` (RPython unbounded
-                    // int); `usize → i64` via `try_from` so a
-                    // pathological descr that exceeds `i64::MAX`
-                    // bails rather than wrapping into a negative.
-                    let itemsize_u = ad.item_size();
-                    let basesize_u = ad.base_size();
-                    let (Ok(basesize), Ok(itemsize)) =
-                        (i64::try_from(basesize_u), i64::try_from(itemsize_u))
-                    else {
+            // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+            // `assert not descr.is_array_of_pointers()` at
+            // setrawbuffer_item. Upstream's `_I/_F`-only
+            // surface guarantees this; pyre carries the
+            // assertion through the materialisation path,
+            // so a virtualisation handler that admits a
+            // pointer descr would panic at resume time.
+            // Reject pointer descrs at entry instead.
+            if ad.is_array_of_pointers() {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            }
+            // virtualize.py:310-316 _unpack_arrayitem_raw_op:
+            // `offset = basesize + (itemsize*index)`. RPython
+            // int is unbounded so this is always
+            // representable; in Rust we emulate that by using
+            // checked arithmetic and falling through (== "no
+            // optimisation") on i64 overflow rather than
+            // wrapping into a stale offset that could match a
+            // sibling write. `itemsize`/`basesize` come from
+            // `unpack_arraydescr_size` (RPython unbounded
+            // int); `usize → i64` via `try_from` so a
+            // pathological descr that exceeds `i64::MAX`
+            // bails rather than wrapping into a negative.
+            let itemsize_u = ad.item_size();
+            let basesize_u = ad.base_size();
+            let (Ok(basesize), Ok(itemsize)) =
+                (i64::try_from(basesize_u), i64::try_from(itemsize_u))
+            else {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            };
+            let Some(item_offset) = itemsize
+                .checked_mul(index)
+                .and_then(|m| basesize.checked_add(m))
+            else {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            };
+            let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
+                Some((p, o)) => Some((p, o)),
+                None if matches!(
+                    ctx.get_box_replacement_operand_opt(array_ref)
+                        .as_ref()
+                        .and_then(|b| ctx.peek_ptr_info(b)),
+                    Some(PtrInfo::VirtualRawBuffer(_))
+                ) =>
+                {
+                    Some((array_ref, 0))
+                }
+                None => None,
+            };
+            if let Some((parent, base_offset)) = resolved {
+                let parent_box = ctx.get_box_replacement_operand_opt(parent);
+                if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
+                    parent_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
+                {
+                    // rawbuffer.py:89/120 store offsets as
+                    // signed: `self.offsets[i] > offset` is a
+                    // signed compare. A negative
+                    // `lookup_offset` is a valid lookup key
+                    // and matches an entry written at the
+                    // same negative offset.
+                    let Some(lookup_offset) = base_offset.checked_add(item_offset) else {
                         if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
                             ctx.make_nonnull(&array_box);
                         }
                         return OptimizationResult::PassOn;
                     };
-                    let Some(item_offset) = itemsize
-                        .checked_mul(index)
-                        .and_then(|m| basesize.checked_add(m))
-                    else {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
-                        }
-                        return OptimizationResult::PassOn;
-                    };
-                    let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
-                        Some((p, o)) => Some((p, o)),
-                        None if matches!(
-                            ctx.get_box_replacement_operand_opt(array_ref)
-                                .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(b)),
-                            Some(PtrInfo::VirtualRawBuffer(_))
-                        ) =>
-                        {
-                            Some((array_ref, 0))
-                        }
-                        None => None,
-                    };
-                    if let Some((parent, base_offset)) = resolved {
-                        let parent_box = ctx.get_box_replacement_operand_opt(parent);
-                        if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
-                            parent_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-                        {
-                            // rawbuffer.py:89/120 store offsets as
-                            // signed: `self.offsets[i] > offset` is a
-                            // signed compare. A negative
-                            // `lookup_offset` is a valid lookup key
-                            // and matches an entry written at the
-                            // same negative offset.
-                            let Some(lookup_offset) = base_offset.checked_add(item_offset) else {
-                                if let Some(array_box) =
-                                    ctx.get_box_replacement_operand_opt(array_ref)
-                                {
-                                    ctx.make_nonnull(&array_box);
-                                }
-                                return OptimizationResult::PassOn;
-                            };
-                            // rawbuffer.py:120 read_value ↔ getitem_raw +
-                            // InvalidRawOperation: an `Err` here matches
-                            // the upstream `except InvalidRawOperation:
-                            // pass` arm — fall through to
-                            // make_nonnull + emit.
-                            if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr)
-                            {
-                                let b_old = Operand::from_bound_op(op_rc);
-                                let b_val = ctx.get_box_replacement_operand(val_ref);
-                                ctx.make_equal_to(&b_old, &b_val);
-                                return OptimizationResult::Remove;
-                            }
-                        }
+                    // rawbuffer.py:120 read_value ↔ getitem_raw +
+                    // InvalidRawOperation: an `Err` here matches
+                    // the upstream `except InvalidRawOperation:
+                    // pass` arm — fall through to
+                    // make_nonnull + emit.
+                    if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, &descr) {
+                        let b_old = Operand::from_bound_op(op_rc);
+                        let b_val = ctx.get_box_replacement_operand(val_ref);
+                        ctx.make_equal_to(&b_old, &b_val);
+                        return OptimizationResult::Remove;
                     }
                 }
             }
@@ -1703,99 +1691,91 @@ impl OptVirtualize {
         if let Some(index) = ctx
             .resolve_operand_operand_opt(&op.arg(1))
             .and_then(|b_| ctx.get_constant_int_box(&b_))
+            && let Some(descr) = op.getdescr()
+            && let Some(ad) = descr.as_array_descr()
         {
-            if let Some(descr) = op.getdescr() {
-                if let Some(ad) = descr.as_array_descr() {
-                    // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
-                    // `assert not descr.is_array_of_pointers()`. A
-                    // pointer descr stored into the virtual rawbuffer's
-                    // `descrs[]` would panic at resume materialisation,
-                    // so reject it at entry. Upstream's `_I/_F`-only
-                    // surface guarantees this never reaches the
-                    // optimiser.
-                    if ad.is_array_of_pointers() {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
-                        }
-                        return OptimizationResult::PassOn;
+            // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+            // `assert not descr.is_array_of_pointers()`. A
+            // pointer descr stored into the virtual rawbuffer's
+            // `descrs[]` would panic at resume materialisation,
+            // so reject it at entry. Upstream's `_I/_F`-only
+            // surface guarantees this never reaches the
+            // optimiser.
+            if ad.is_array_of_pointers() {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            }
+            // virtualize.py:310-316 _unpack_arrayitem_raw_op:
+            // `offset = basesize + (itemsize*index)`. RPython
+            // int is unbounded so this is always
+            // representable; bail on i64 overflow rather than
+            // wrap into a colliding offset. `usize → i64` via
+            // `try_from` for descr sizes that exceed
+            // `i64::MAX` (no upstream analogue but defensive
+            // against unbounded-int → i64 narrowing).
+            let itemsize_u = ad.item_size();
+            let basesize_u = ad.base_size();
+            let (Ok(basesize), Ok(itemsize)) =
+                (i64::try_from(basesize_u), i64::try_from(itemsize_u))
+            else {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            };
+            let Some(item_offset) = itemsize
+                .checked_mul(index)
+                .and_then(|m| basesize.checked_add(m))
+            else {
+                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                    ctx.make_nonnull(&array_box);
+                }
+                return OptimizationResult::PassOn;
+            };
+            let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
+                Some((p, o)) => Some((p, o)),
+                None if matches!(
+                    ctx.get_box_replacement_operand_opt(array_ref)
+                        .as_ref()
+                        .and_then(|b| ctx.peek_ptr_info(b)),
+                    Some(PtrInfo::VirtualRawBuffer(_))
+                ) =>
+                {
+                    Some((array_ref, 0))
+                }
+                None => None,
+            };
+            if let Some((parent, base_offset)) = resolved {
+                // rawbuffer.py:89 keeps `offsets` sorted by
+                // signed compare; a negative store_offset is
+                // a legitimate write key.
+                let Some(store_offset) = base_offset.checked_add(item_offset) else {
+                    if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
+                        ctx.make_nonnull(&array_box);
                     }
-                    // virtualize.py:310-316 _unpack_arrayitem_raw_op:
-                    // `offset = basesize + (itemsize*index)`. RPython
-                    // int is unbounded so this is always
-                    // representable; bail on i64 overflow rather than
-                    // wrap into a colliding offset. `usize → i64` via
-                    // `try_from` for descr sizes that exceed
-                    // `i64::MAX` (no upstream analogue but defensive
-                    // against unbounded-int → i64 narrowing).
-                    let itemsize_u = ad.item_size();
-                    let basesize_u = ad.base_size();
-                    let (Ok(basesize), Ok(itemsize)) =
-                        (i64::try_from(basesize_u), i64::try_from(itemsize_u))
-                    else {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
+                    return OptimizationResult::PassOn;
+                };
+                let outcome = ctx.get_box_replacement_operand_opt(parent).and_then(|b| {
+                    ctx.with_ptr_info_mut(&b, |info| {
+                        if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                            Some(
+                                vinfo
+                                    .write_value(store_offset, itemsize_u, descr.clone(), value_ref)
+                                    .is_ok(),
+                            )
+                        } else {
+                            None
                         }
-                        return OptimizationResult::PassOn;
-                    };
-                    let Some(item_offset) = itemsize
-                        .checked_mul(index)
-                        .and_then(|m| basesize.checked_add(m))
-                    else {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
-                        }
-                        return OptimizationResult::PassOn;
-                    };
-                    let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
-                        Some((p, o)) => Some((p, o)),
-                        None if matches!(
-                            ctx.get_box_replacement_operand_opt(array_ref)
-                                .as_ref()
-                                .and_then(|b| ctx.peek_ptr_info(b)),
-                            Some(PtrInfo::VirtualRawBuffer(_))
-                        ) =>
-                        {
-                            Some((array_ref, 0))
-                        }
-                        None => None,
-                    };
-                    if let Some((parent, base_offset)) = resolved {
-                        // rawbuffer.py:89 keeps `offsets` sorted by
-                        // signed compare; a negative store_offset is
-                        // a legitimate write key.
-                        let Some(store_offset) = base_offset.checked_add(item_offset) else {
-                            if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref)
-                            {
-                                ctx.make_nonnull(&array_box);
-                            }
-                            return OptimizationResult::PassOn;
-                        };
-                        let outcome = ctx.get_box_replacement_operand_opt(parent).and_then(|b| {
-                            ctx.with_ptr_info_mut(&b, |info| {
-                                if let PtrInfo::VirtualRawBuffer(vinfo) = info {
-                                    Some(
-                                        vinfo
-                                            .write_value(
-                                                store_offset,
-                                                itemsize_u,
-                                                descr.clone(),
-                                                value_ref,
-                                            )
-                                            .is_ok(),
-                                    )
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                        // rawbuffer.py:89 write_value ↔ setitem_raw +
-                        // InvalidRawOperation: an `Err` here matches the
-                        // upstream `except InvalidRawOperation: pass` and
-                        // falls through to make_nonnull + emit.
-                        if let Some(Some(true)) = outcome {
-                            return OptimizationResult::Remove;
-                        }
-                    }
+                    })
+                });
+                // rawbuffer.py:89 write_value ↔ setitem_raw +
+                // InvalidRawOperation: an `Err` here matches the
+                // upstream `except InvalidRawOperation: pass` and
+                // falls through to make_nonnull + emit.
+                if let Some(Some(true)) = outcome {
+                    return OptimizationResult::Remove;
                 }
             }
         }
@@ -2229,14 +2209,14 @@ impl Optimization for OptVirtualize {
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
-                            if self.optimize_jit_force_virtual(op, op_rc, ctx) {
-                                return OptimizationResult::Remove;
-                            }
-                        }
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    if ei.oopspecindex == OopSpecIndex::JitForceVirtual
+                        && self.optimize_jit_force_virtual(op, op_rc, ctx)
+                    {
+                        return OptimizationResult::Remove;
                     }
                 }
                 OptimizationResult::PassOn
@@ -2281,16 +2261,15 @@ impl Optimization for OptVirtualize {
             // OS_JIT_FORCE_VIRTUALIZABLE and the target is virtual, remove.
             OpCode::CondCallN => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
-                            && op.num_args() >= 3
-                        {
-                            if Self::is_virtual(op.arg(2).to_opref(), ctx) {
-                                return OptimizationResult::Remove;
-                            }
-                        }
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
+                        && op.num_args() >= 3
+                        && Self::is_virtual(op.arg(2).to_opref(), ctx)
+                    {
+                        return OptimizationResult::Remove;
                     }
                 }
                 OptimizationResult::PassOn
@@ -2323,61 +2302,52 @@ impl Optimization for OptVirtualize {
             // standard force_box path.
             OpCode::CallN | OpCode::CallR | OpCode::CallI => {
                 let __descr_arc_descr = op.getdescr();
-                if let Some(ref descr) = __descr_arc_descr.as_ref() {
-                    if let Some(cd) = descr.as_call_descr() {
-                        let ei = cd.get_extra_info();
-                        // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
-                        if ei.oopspecindex == OopSpecIndex::RawMallocVarsizeChar {
-                            // virtualize.py:242-247 do_RAW_MALLOC_VARSIZE_CHAR:
-                            //   sizebox = self.get_constant_box(op.getarg(1))
-                            //   if sizebox is None:
-                            //       return self.emit(op)
-                            //   self.make_virtual_raw_memory(sizebox.getint(), op)
-                            //   self.last_emitted_operation = REMOVED
-                            if op.num_args() >= 2 {
-                                if let Some(size) =
-                                    ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false))
-                                {
-                                    // virtualize.py:53 func = source_op.getarg(0).getint()
-                                    let func =
-                                        op.arg(0).get_box_replacement(false).const_int().expect(
-                                            "virtualize.py:53 source_op.getarg(0) must be ConstInt",
-                                        );
-                                    self.make_virtual_raw_memory(
-                                        size as usize,
-                                        func,
-                                        op,
-                                        op_rc,
-                                        ctx,
-                                    );
-                                    self.last_emitted_was_removed = true;
-                                    return OptimizationResult::Remove;
-                                }
-                            }
-                            return OptimizationResult::PassOn;
-                        }
-                        // virtualize.py:230 do_RAW_FREE
-                        if ei.oopspecindex == OopSpecIndex::RawFree {
-                            // virtualize.py:249-253 do_RAW_FREE:
-                            //   opinfo = getrawptrinfo(op.getarg(1))
-                            //   if opinfo and opinfo.is_virtual():
-                            //       return
-                            //   return self.emit(op)
-                            if op.num_args() >= 2 {
-                                if Self::is_virtual(op.arg(1).to_opref(), ctx) {
-                                    return OptimizationResult::Remove;
-                                }
-                            }
-                            return OptimizationResult::PassOn;
-                        }
-                        // virtualize.py:232-236 OS_JIT_FORCE_VIRTUALIZABLE
-                        //   info = getptrinfo(op.getarg(1))
-                        //   if info and info.is_virtual():
-                        //       return
-                        //   # falls off (no else branch matches) → REMOVED
-                        if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable {
+                if let Some(descr) = __descr_arc_descr.as_ref()
+                    && let Some(cd) = descr.as_call_descr()
+                {
+                    let ei = cd.get_extra_info();
+                    // virtualize.py:228 do_RAW_MALLOC_VARSIZE_CHAR
+                    if ei.oopspecindex == OopSpecIndex::RawMallocVarsizeChar {
+                        // virtualize.py:242-247 do_RAW_MALLOC_VARSIZE_CHAR:
+                        //   sizebox = self.get_constant_box(op.getarg(1))
+                        //   if sizebox is None:
+                        //       return self.emit(op)
+                        //   self.make_virtual_raw_memory(sizebox.getint(), op)
+                        //   self.last_emitted_operation = REMOVED
+                        if op.num_args() >= 2
+                            && let Some(size) =
+                                ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false))
+                        {
+                            // virtualize.py:53 func = source_op.getarg(0).getint()
+                            let func =
+                                op.arg(0).get_box_replacement(false).const_int().expect(
+                                    "virtualize.py:53 source_op.getarg(0) must be ConstInt",
+                                );
+                            self.make_virtual_raw_memory(size as usize, func, op, op_rc, ctx);
+                            self.last_emitted_was_removed = true;
                             return OptimizationResult::Remove;
                         }
+                        return OptimizationResult::PassOn;
+                    }
+                    // virtualize.py:230 do_RAW_FREE
+                    if ei.oopspecindex == OopSpecIndex::RawFree {
+                        // virtualize.py:249-253 do_RAW_FREE:
+                        //   opinfo = getrawptrinfo(op.getarg(1))
+                        //   if opinfo and opinfo.is_virtual():
+                        //       return
+                        //   return self.emit(op)
+                        if op.num_args() >= 2 && Self::is_virtual(op.arg(1).to_opref(), ctx) {
+                            return OptimizationResult::Remove;
+                        }
+                        return OptimizationResult::PassOn;
+                    }
+                    // virtualize.py:232-236 OS_JIT_FORCE_VIRTUALIZABLE
+                    //   info = getptrinfo(op.getarg(1))
+                    //   if info and info.is_virtual():
+                    //       return
+                    //   # falls off (no else branch matches) → REMOVED
+                    if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable {
+                        return OptimizationResult::Remove;
                     }
                 }
                 // virtualize.py:237-238 else: return self.emit(op)
@@ -2770,7 +2740,7 @@ impl majit_ir::SizeDescr for VRefSizeDescr {
         // JIT_VIRTUAL_REF_VTABLE magic value at offset 0
         // (super_.typeptr). NEW_WITH_VTABLE writes it at allocation
         // time, matching RPython's gc.new_with_vtable().
-        crate::virtualref::JIT_VIRTUAL_REF_VTABLE as usize
+        crate::virtualref::JIT_VIRTUAL_REF_VTABLE
     }
     fn is_immutable(&self) -> bool {
         false
@@ -3204,7 +3174,7 @@ mod tests {
         ctx.snapshot_boxes = snapshots;
         for &(opref, ref val) in constants {
             let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, val.clone());
+            ctx.make_constant_box(&b, *val);
         }
 
         let mut pass = OptVirtualize::new();
@@ -5447,7 +5417,7 @@ mod tests {
         let mut ctx = OptContext::new(ops.len());
         for &(opref, ref val) in constants {
             let b = ctx.materialize_operand_at(opref);
-            ctx.make_constant_box(&b, val.clone());
+            ctx.make_constant_box(&b, *val);
         }
 
         let mut pass = OptVirtualize::new();

@@ -767,10 +767,8 @@ fn encode_sequence(
         out.push_wtf8(&encoded);
         item_index += 1;
     }
-    if !first {
-        if let Some(indent) = &indent {
-            append_indent(&mut out, indent, level.max(0));
-        }
+    if !first && let Some(indent) = &indent {
+        append_indent(&mut out, indent, level.max(0));
     }
     out.push_char(']');
     Ok(out)
@@ -903,10 +901,8 @@ fn encode_dict(
         })?;
         out.push_wtf8(&encoded);
     }
-    if !first {
-        if let Some(indent) = &indent {
-            append_indent(&mut out, indent, level.max(0));
-        }
+    if !first && let Some(indent) = &indent {
+        append_indent(&mut out, indent, level.max(0));
     }
     out.push_char('}');
     Ok(out)

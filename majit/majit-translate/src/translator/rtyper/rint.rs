@@ -826,7 +826,7 @@ pub fn rtype_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     hop.llops
         .borrow_mut()
         .convertvar(v_res, repr.as_ref(), r_result.as_ref())
-        .map(|v| Some(v))
+        .map(Some)
 }
 
 pub fn rtype_add_ovf(hop: &HighLevelOp) -> RTypeResult {

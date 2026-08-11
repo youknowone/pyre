@@ -216,14 +216,14 @@ impl HostCode {
             code.flags.bits(),
             code.instructions.clone(),
             code.constants.iter().cloned().collect(),
-            code.names.iter().cloned().collect(),
-            code.varnames.iter().cloned().collect(),
+            code.names.to_vec(),
+            code.varnames.to_vec(),
             code.source_path.clone(),
             code.obj_name.clone(),
             firstlineno,
-            code.linetable.iter().copied().collect(),
-            code.freevars.iter().cloned().collect(),
-            code.cellvars.iter().cloned().collect(),
+            code.linetable.to_vec(),
+            code.freevars.to_vec(),
+            code.cellvars.to_vec(),
             code.exceptiontable.clone(),
         )
     }
@@ -408,8 +408,7 @@ mod test {
     use rustpython_compiler::{Mode, compile as rp_compile};
 
     fn compile_source(src: &str) -> CodeObject {
-        rp_compile(src, Mode::Exec, "<pyre>".into(), Default::default())
-            .expect("compile should succeed")
+        rp_compile(src, Mode::Exec, "<pyre>", Default::default()).expect("compile should succeed")
     }
 
     // RPython basis: test_objspace.py shapes these round-trips by calling

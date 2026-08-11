@@ -411,9 +411,9 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
         OpCode::IntAnd => a & b,
         OpCode::IntOr => a | b,
         OpCode::IntXor => a ^ b,
-        OpCode::IntLshift if b >= 0 && b < 64 => a << b,
-        OpCode::IntRshift if b >= 0 && b < 64 => a >> b,
-        OpCode::UintRshift if b >= 0 && b < 64 => (a as u64 >> b as u64) as i64,
+        OpCode::IntLshift if (0..64).contains(&b) => a << b,
+        OpCode::IntRshift if (0..64).contains(&b) => a >> b,
+        OpCode::UintRshift if (0..64).contains(&b) => (a as u64 >> b as u64) as i64,
         OpCode::IntLt => (a < b) as i64,
         OpCode::IntLe => (a <= b) as i64,
         OpCode::IntGt => (a > b) as i64,
@@ -432,7 +432,7 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
             let r = a % b;
             if (r != 0) && ((r ^ b) < 0) { r + b } else { r }
         }
-        OpCode::IntSignext if b >= 1 && b <= 8 => {
+        OpCode::IntSignext if (1..=8).contains(&b) => {
             // blackhole.py:568 bhimpl_int_signext → support.py:30 int_signext.
             crate::support::int_signext(a, b)
         }
@@ -580,15 +580,15 @@ pub fn execute_nonspec_const(
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => return Ok(Some(a)),
             _ => {}
         }
-        if let Value::Int(i) = a {
-            if let Some(folded) = execute_unary_int_const(opnum, i) {
-                return Ok(Some(Value::Int(folded)));
-            }
+        if let Value::Int(i) = a
+            && let Some(folded) = execute_unary_int_const(opnum, i)
+        {
+            return Ok(Some(Value::Int(folded)));
         }
-        if let Value::Float(f) = a {
-            if let Some(folded) = execute_unary_float_const(opnum, f) {
-                return Ok(Some(Value::Float(folded)));
-            }
+        if let Value::Float(f) = a
+            && let Some(folded) = execute_unary_float_const(opnum, f)
+        {
+            return Ok(Some(Value::Float(folded)));
         }
         if let Some(folded) = execute_cast_const(opnum, a) {
             return Ok(Some(folded));
@@ -607,22 +607,22 @@ pub fn execute_nonspec_const(
         // `llmodel.py:478 read_int_at_mem`'s NotImplementedError and
         // would propagate to crash upstream — pyre matches via
         // fail-loud `unreachable!()`.
-        if let (Value::Ref(struct_ref), Some(d)) = (a, descr) {
-            if let Some(fd) = d.as_field_descr() {
-                return Ok(Some(match opnum {
-                    OpCode::GetfieldGcI => match fd.field_size() {
-                        1 | 2 | 4 | 8 => Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)),
-                        sz => unreachable!(
-                            "GETFIELD_GC_I: unsupported field_size {} \
+        if let (Value::Ref(struct_ref), Some(d)) = (a, descr)
+            && let Some(fd) = d.as_field_descr()
+        {
+            return Ok(Some(match opnum {
+                OpCode::GetfieldGcI => match fd.field_size() {
+                    1 | 2 | 4 | 8 => Value::Int(cpu.bh_getfield_gc_i(struct_ref.0, fd)),
+                    sz => unreachable!(
+                        "GETFIELD_GC_I: unsupported field_size {} \
                              (llmodel.py:478 raises NotImplementedError)",
-                            sz
-                        ),
-                    },
-                    OpCode::GetfieldGcR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
-                    OpCode::GetfieldGcF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
-                    _ => return Err(()),
-                }));
-            }
+                        sz
+                    ),
+                },
+                OpCode::GetfieldGcR => Value::Ref(cpu.bh_getfield_gc_r(struct_ref.0, fd)),
+                OpCode::GetfieldGcF => Value::Float(cpu.bh_getfield_gc_f(struct_ref.0, fd)),
+                _ => return Err(()),
+            }));
         }
         // ARRAYLEN_GC — withdescr arity-1.
         // `executor.py:do_arraylen_gc` → `cpu.bh_arraylen_gc(array, ad)`.
@@ -630,15 +630,14 @@ pub fn execute_nonspec_const(
         // arraydescr is expected to carry a `len_descr` (registered
         // by the backend's array metadata), so a missing one is a
         // bug — fail-loud per `llmodel.py:585 assert isinstance(...)`.
-        if let (Value::Ref(array), Some(d)) = (a, descr) {
-            if let Some(ad) = d.as_array_descr() {
-                if opnum == OpCode::ArraylenGc {
-                    let len = cpu.bh_arraylen_gc(array, ad).expect(
-                        "ARRAYLEN_GC: arraydescr missing len_descr (llmodel.py:585 asserts)",
-                    );
-                    return Ok(Some(Value::Int(len)));
-                }
-            }
+        if let (Value::Ref(array), Some(d)) = (a, descr)
+            && let Some(ad) = d.as_array_descr()
+            && opnum == OpCode::ArraylenGc
+        {
+            let len = cpu
+                .bh_arraylen_gc(array, ad)
+                .expect("ARRAYLEN_GC: arraydescr missing len_descr (llmodel.py:585 asserts)");
+            return Ok(Some(Value::Int(len)));
         }
         // STRLEN / UNICODELEN — by the time the fold is entered,
         // `protect_speculative_string / _unicode` has already validated
@@ -666,10 +665,10 @@ pub fn execute_nonspec_const(
 
     // ── arity == 2 row of EXECUTE_BY_NUM_ARGS ──
     if arity == 2 {
-        if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1]) {
-            if let Some(folded) = execute_binary_int_const(opnum, a, b) {
-                return Ok(Some(Value::Int(folded)));
-            }
+        if let (Value::Int(a), Value::Int(b)) = (argboxes[0], argboxes[1])
+            && let Some(folded) = execute_binary_int_const(opnum, a, b)
+        {
+            return Ok(Some(Value::Int(folded)));
         }
         if let (Value::Float(a), Value::Float(b)) = (argboxes[0], argboxes[1]) {
             if let Some(folded) = execute_binary_float_const(opnum, a, b) {
@@ -679,10 +678,10 @@ pub fn execute_nonspec_const(
                 return Ok(Some(Value::Int(folded)));
             }
         }
-        if let (Value::Ref(a), Value::Ref(b)) = (argboxes[0], argboxes[1]) {
-            if let Some(folded) = execute_ptr_compare_const(opnum, a.0, b.0) {
-                return Ok(Some(Value::Int(folded)));
-            }
+        if let (Value::Ref(a), Value::Ref(b)) = (argboxes[0], argboxes[1])
+            && let Some(folded) = execute_ptr_compare_const(opnum, a.0, b.0)
+        {
+            return Ok(Some(Value::Int(folded)));
         }
         // GETARRAYITEM_GC_PURE_I/R/F — withdescr arity-2 (array, index).
         // `executor.py:do_getarrayitem_gc_pure_*` →
@@ -691,25 +690,25 @@ pub fn execute_nonspec_const(
         // `optimizer.py:865-867` validated the gcref/index pre-fold;
         // unsupported `item_size` matches `llmodel.py:478`'s
         // NotImplementedError, fail-loud via `unreachable!()`.
-        if let (Value::Ref(array), Value::Int(index), Some(d)) = (argboxes[0], argboxes[1], descr) {
-            if let Some(ad) = d.as_array_descr() {
-                return Ok(Some(match opnum {
-                    OpCode::GetarrayitemGcPureI => {
-                        let v = cpu.bh_getarrayitem_gc_i(array, index, ad).expect(
-                            "GETARRAYITEM_GC_PURE_I: unsupported item_size \
+        if let (Value::Ref(array), Value::Int(index), Some(d)) = (argboxes[0], argboxes[1], descr)
+            && let Some(ad) = d.as_array_descr()
+        {
+            return Ok(Some(match opnum {
+                OpCode::GetarrayitemGcPureI => {
+                    let v = cpu.bh_getarrayitem_gc_i(array, index, ad).expect(
+                        "GETARRAYITEM_GC_PURE_I: unsupported item_size \
                              (llmodel.py:478 raises NotImplementedError)",
-                        );
-                        Value::Int(v)
-                    }
-                    OpCode::GetarrayitemGcPureR => {
-                        Value::Ref(cpu.bh_getarrayitem_gc_r(array, index, ad))
-                    }
-                    OpCode::GetarrayitemGcPureF => {
-                        Value::Float(cpu.bh_getarrayitem_gc_f(array, index, ad))
-                    }
-                    _ => return Err(()),
-                }));
-            }
+                    );
+                    Value::Int(v)
+                }
+                OpCode::GetarrayitemGcPureR => {
+                    Value::Ref(cpu.bh_getarrayitem_gc_r(array, index, ad))
+                }
+                OpCode::GetarrayitemGcPureF => {
+                    Value::Float(cpu.bh_getarrayitem_gc_f(array, index, ad))
+                }
+                _ => return Err(()),
+            }));
         }
         // STRGETITEM / UNICODEGETITEM — protect_speculative_string /
         // _unicode has validated str_descr / unicode_descr is
@@ -739,10 +738,9 @@ pub fn execute_nonspec_const(
         // `bhimpl_int_between(a, b, c): return a <= b < c`.
         if let (Value::Int(a), Value::Int(b), Value::Int(c)) =
             (argboxes[0], argboxes[1], argboxes[2])
+            && opnum == OpCode::IntBetween
         {
-            if opnum == OpCode::IntBetween {
-                return Ok(Some(Value::Int((a <= b && b < c) as i64)));
-            }
+            return Ok(Some(Value::Int((a <= b && b < c) as i64)));
         }
     }
 

@@ -112,9 +112,9 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
                 "structseq object has no field {name}"
             )));
         };
-        if entry.extra_fields.iter().any(|n| n == &name) {
+        if entry.extra_fields.iter().any(|n| n == name) {
             Resolved::Extra
-        } else if let Some(idx) = entry.fields.iter().position(|n| n == &name) {
+        } else if let Some(idx) = entry.fields.iter().position(|n| n == name) {
             Resolved::Positional(idx)
         } else {
             Resolved::Missing
@@ -123,10 +123,10 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     match resolved {
         Resolved::Extra => {
             let w_dict = crate::baseobjspace::getdict_native(inst);
-            if !w_dict.is_null() {
-                if let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, &name) } {
-                    return Ok(v);
-                }
+            if !w_dict.is_null()
+                && let Some(v) = unsafe { pyre_object::w_dict_getitem_str(w_dict, name) }
+            {
+                return Ok(v);
             }
             Err(PyError::attribute_error(format!(
                 "structseq object has no field {name}"
@@ -325,7 +325,7 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let attr = unsafe { pyre_object::w_str_get_value(attr_obj) };
     let cls = unsafe { (*inst).w_class };
     // `attr not in type(self).__dict__` — own-dict membership, not MRO.
-    let in_type_dict = crate::type_dict_contains(cls, &attr);
+    let in_type_dict = crate::type_dict_contains(cls, attr);
     if !in_type_dict {
         let cls_name = unsafe { pyre_object::w_type_get_name(cls) };
         return Err(PyError::attribute_error(format!(
@@ -365,12 +365,12 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // explicit None is different and is rejected by both PyPy's
     // `isinstance(dict, builtin_dict)` and CPython 3.14's `PyDict_Check`.
     let dict_arg = args.get(2).copied().filter(|d| !d.is_null());
-    if let Some(d) = dict_arg {
-        if !unsafe { pyre_object::is_dict(d) } {
-            return Err(PyError::type_error(format!(
-                "{name} takes a dict as second arg, if any"
-            )));
-        }
+    if let Some(d) = dict_arg
+        && !unsafe { pyre_object::is_dict(d) }
+    {
+        return Err(PyError::type_error(format!(
+            "{name} takes a dict as second arg, if any"
+        )));
     }
 
     // `_structseq.py:102-107` — a 1-field structseq wraps its scalar arg;
@@ -425,7 +425,7 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
                     return true;
                 }
                 let key = unsafe { pyre_object::w_str_get_value(key) };
-                !allowed.iter().any(|name| name == &key)
+                !allowed.iter().any(|name| name == key)
             });
         if has_unexpected {
             return Err(PyError::type_error(
@@ -458,10 +458,10 @@ fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // as None; fall back to the integer timestamps at body slots 7..9.
     if name == "os.stat_result" && body.len() > 9 {
         for (slot, ename) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
-            if let Some(entry) = extras.iter_mut().find(|(n, _)| *n == ename) {
-                if unsafe { pyre_object::is_none(entry.1) } {
-                    entry.1 = body[slot];
-                }
+            if let Some(entry) = extras.iter_mut().find(|(n, _)| *n == ename)
+                && unsafe { pyre_object::is_none(entry.1) }
+            {
+                entry.1 = body[slot];
             }
         }
     }

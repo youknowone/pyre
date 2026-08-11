@@ -582,10 +582,10 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
     if is_str(obj) {
         let s = w_str_get_wtf8(obj);
         let mut cps = s.code_points();
-        if let Some(cp) = cps.next() {
-            if cps.next().is_none() {
-                return Ok(cp);
-            }
+        if let Some(cp) = cps.next()
+            && cps.next().is_none()
+        {
+            return Ok(cp);
         }
         let n = s.code_points().count();
         return Err(PyError::type_error(format!(

@@ -341,11 +341,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         }
                         (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::nl_item
                     };
-                    if item == libc::CODESET {
-                        if let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset() {
+                    if item == libc::CODESET
+                        && let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset() {
                             return Ok(crate::typedef::charp2uni(&bytes));
                         }
-                    }
                     // `interp_locale.py:151-154` — unknown items raise
                     // ValueError("unsupported langinfo constant").  POSIX
                     // nl_langinfo never returns NULL for valid items, so a
@@ -356,7 +355,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // `interp_locale.py:153` decodes via utf-8 + surrogateescape.
                     let s = unsafe { std::ffi::CStr::from_ptr(p) };
-                    return Ok(crate::typedef::charp2uni(s.to_bytes()));
+                    Ok(crate::typedef::charp2uni(s.to_bytes()))
                 }
                 #[cfg(not(all(
                     unix,
@@ -394,9 +393,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                     let c2 = std::ffi::CString::new(s2.as_bytes())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                    return Ok(pyre_object::w_int_new(
+                    Ok(pyre_object::w_int_new(
                         rustpython_host_env::locale::strcoll(&c1, &c2) as i64,
-                    ));
+                    ))
                 }
                 #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
                 {

@@ -1,3 +1,7 @@
+// Macro lowering constructors deliberately spell out each independent input;
+// preserving those boundaries is clearer than an opaque configuration tuple.
+#![allow(clippy::too_many_arguments)]
+
 /// Proc macros for the majit JIT framework.
 ///
 /// rpython/rlib/jit.py decorator equivalents:
@@ -201,23 +205,22 @@ fn rewrite_jit_inline_ref_param_fields(
             // must run before `record_ref_field_local`/the default visitor
             // descend, so `x` stays a plain (non-ref) local bound to the
             // allocator call's usize result rather than a ref-field local.
-            if let syn::Stmt::Local(local) = stmt {
-                if let Some(init) = &mut local.init {
-                    if let syn::Expr::Struct(s) = &*init.expr {
-                        let segs: Vec<String> = s
-                            .path
-                            .segments
-                            .iter()
-                            .map(|seg| seg.ident.to_string())
-                            .collect();
-                        if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
-                            let field_args: Vec<syn::Expr> =
-                                s.fields.iter().map(|f| f.expr.clone()).collect();
-                            init.expr = Box::new(syn::parse_quote! {
-                                #alloc_func(#(#field_args),*)
-                            });
-                        }
-                    }
+            if let syn::Stmt::Local(local) = stmt
+                && let Some(init) = &mut local.init
+                && let syn::Expr::Struct(s) = &*init.expr
+            {
+                let segs: Vec<String> = s
+                    .path
+                    .segments
+                    .iter()
+                    .map(|seg| seg.ident.to_string())
+                    .collect();
+                if let Some(alloc_func) = self.struct_allocs.get(&segs).cloned() {
+                    let field_args: Vec<syn::Expr> =
+                        s.fields.iter().map(|f| f.expr.clone()).collect();
+                    *init.expr = syn::parse_quote! {
+                        #alloc_func(#(#field_args),*)
+                    };
                 }
             }
             if let syn::Stmt::Local(local) = stmt {
@@ -227,60 +230,59 @@ fn rewrite_jit_inline_ref_param_fields(
         }
 
         fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
-            if let syn::Expr::Assign(assign) = expr {
-                if let syn::Expr::Field(lhs) = &*assign.left {
-                    if let Some(struct_path) = self.local_ref_struct_of_base(&lhs.base) {
-                        let base = (*lhs.base).clone();
-                        let member = lhs.member.clone();
-                        let member_name = match &lhs.member {
-                            syn::Member::Named(id) => id.to_string(),
-                            _ => String::new(),
-                        };
-                        let mut rhs = (*assign.right).clone();
-                        self.visit_expr_mut(&mut rhs);
-                        if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
-                            *expr = syn::parse_quote! {
-                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
-                            };
-                        } else {
-                            *expr = syn::parse_quote! {
-                                unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
-                            };
-                        }
-                        return;
-                    }
+            if let syn::Expr::Assign(assign) = expr
+                && let syn::Expr::Field(lhs) = &*assign.left
+                && let Some(struct_path) = self.local_ref_struct_of_base(&lhs.base)
+            {
+                let base = (*lhs.base).clone();
+                let member = lhs.member.clone();
+                let member_name = match &lhs.member {
+                    syn::Member::Named(id) => id.to_string(),
+                    _ => String::new(),
+                };
+                let mut rhs = (*assign.right).clone();
+                self.visit_expr_mut(&mut rhs);
+                if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
+                    *expr = syn::parse_quote! {
+                        unsafe { (*(#base as *mut #struct_path)).#member = #rhs as *mut #pointee }
+                    };
+                } else {
+                    *expr = syn::parse_quote! {
+                        unsafe { (*(#base as *mut #struct_path)).#member = #rhs }
+                    };
                 }
+                return;
             }
 
-            if let syn::Expr::Field(field) = expr {
-                if let Some(struct_path) = self.local_ref_struct_of_base(&field.base) {
-                    let base = (*field.base).clone();
-                    let member = field.member.clone();
-                    let member_name = match &field.member {
-                        syn::Member::Named(id) => id.to_string(),
-                        _ => String::new(),
+            if let syn::Expr::Field(field) = expr
+                && let Some(struct_path) = self.local_ref_struct_of_base(&field.base)
+            {
+                let base = (*field.base).clone();
+                let member = field.member.clone();
+                let member_name = match &field.member {
+                    syn::Member::Named(id) => id.to_string(),
+                    _ => String::new(),
+                };
+                if self.field_pointee(&struct_path, &member_name).is_some() {
+                    *expr = syn::parse_quote! {
+                        {
+                            let __majit_getfield_obj = #base;
+                            unsafe {
+                                (*(__majit_getfield_obj as *const #struct_path)).#member as usize
+                            }
+                        }
                     };
-                    if self.field_pointee(&struct_path, &member_name).is_some() {
-                        *expr = syn::parse_quote! {
-                            {
-                                let __majit_getfield_obj = #base;
-                                unsafe {
-                                    (*(__majit_getfield_obj as *const #struct_path)).#member as usize
-                                }
+                } else {
+                    *expr = syn::parse_quote! {
+                        {
+                            let __majit_getfield_obj = #base;
+                            unsafe {
+                                (*(__majit_getfield_obj as *const #struct_path)).#member
                             }
-                        };
-                    } else {
-                        *expr = syn::parse_quote! {
-                            {
-                                let __majit_getfield_obj = #base;
-                                unsafe {
-                                    (*(__majit_getfield_obj as *const #struct_path)).#member
-                                }
-                            }
-                        };
-                    }
-                    return;
+                        }
+                    };
                 }
+                return;
             }
 
             syn::visit_mut::visit_expr_mut(self, expr);
@@ -951,15 +953,15 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .into();
         }
     }
-    if let Some(virtualizable) = &virtualizable {
-        if !args.reds.iter().any(|red| red == virtualizable) {
-            return syn::Error::new(
-                virtualizable.span(),
-                "`virtualizable` must name one of the red variables",
-            )
-            .to_compile_error()
-            .into();
-        }
+    if let Some(virtualizable) = &virtualizable
+        && !args.reds.iter().any(|red| red == virtualizable)
+    {
+        return syn::Error::new(
+            virtualizable.span(),
+            "`virtualizable` must name one of the red variables",
+        )
+        .to_compile_error()
+        .into();
     }
 
     let doc = format!("JIT driver: greens=[{greens_joined}], reds=[{reds_joined}]");
@@ -2856,7 +2858,7 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
     let helper_addr_exprs: Vec<proc_macro2::TokenStream> =
-        discovered.iter().map(|h| impl_addr_expr(h)).collect();
+        discovered.iter().map(impl_addr_expr).collect();
 
     // Structured impl-method registry:
     //   `(module_path_with_crate, impl_type_as_written, method, fnaddr)`.

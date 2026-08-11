@@ -323,12 +323,12 @@ unsafe fn alloc_mapdict_storage_block(cap: usize) -> *mut ItemsBlock {
 unsafe fn alloc_items_block_gc(cap: usize) -> *mut ItemsBlock {
     if itemsblock_gc_enabled() {
         let payload = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
-        if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload) {
-            if !raw.is_null() {
-                let block = raw as *mut ItemsBlock;
-                unsafe { (*block).capacity = cap };
-                return block;
-            }
+        if let Some(raw) = crate::gc_hook::try_gc_alloc(PY_OBJECT_ARRAY_GC_TYPE_ID, payload)
+            && !raw.is_null()
+        {
+            let block = raw as *mut ItemsBlock;
+            unsafe { (*block).capacity = cap };
+            return block;
         }
     }
     unsafe { alloc_items_block(cap) }
@@ -934,7 +934,7 @@ impl IndexMut<usize> for FixedObjectArray {
 /// remembered set via the old→young write barrier.
 pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArray {
     let len = values.len();
-    let payload = FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
+    let payload = FIXED_ARRAY_ITEMS_OFFSET + std::mem::size_of_val(values);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(PY_OBJECT_ARRAY_GC_TYPE_ID, payload);
     let block = if !raw.is_null() {
         raw as *mut FixedObjectArray

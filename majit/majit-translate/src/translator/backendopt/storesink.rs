@@ -95,7 +95,7 @@ pub fn storesink_graph(graph: &FunctionGraph) {
             added_some_same_as = true;
         }
 
-        let exits: Vec<LinkRef> = block.borrow().exits.iter().cloned().collect();
+        let exits: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits {
             let target = match link.borrow().target.clone() {
                 Some(t) => t,
@@ -278,12 +278,12 @@ fn _storesink_block(block: &BlockRef, cache: &mut Cache) -> bool {
                 // Upstream `:93-103`: reading an immutable field of
                 // a non-null constant pointer folds to the field
                 // value directly.
-                if let Hlvalue::Constant(c) = &arg0 {
-                    if let Some(folded) = fold_constant_getfield(c, &field_name) {
-                        do_replace(op, folded, &mut replacements);
-                        added_some_same_as = true;
-                        continue;
-                    }
+                if let Hlvalue::Constant(c) = &arg0
+                    && let Some(folded) = fold_constant_getfield(c, &field_name)
+                {
+                    do_replace(op, folded, &mut replacements);
+                    added_some_same_as = true;
+                    continue;
                 }
                 // Upstream `:104-110`: cache the (anchor, field) ->
                 // result pair for later getfield calls.
@@ -311,12 +311,12 @@ fn _storesink_block(block: &BlockRef, cache: &mut Cache) -> bool {
                 // upstream `:117-119 except RuntimeError: pass`); we
                 // treat the Err arm the same way and fall through to
                 // the cache path.
-                if let Hlvalue::Constant(c) = &arg0 {
-                    if let Some(folded) = fold_constant_cast_pointer(c, &result_ct) {
-                        do_replace(op, folded, &mut replacements);
-                        added_some_same_as = true;
-                        continue;
-                    }
+                if let Hlvalue::Constant(c) = &arg0
+                    && let Some(folded) = fold_constant_cast_pointer(c, &result_ct)
+                {
+                    do_replace(op, folded, &mut replacements);
+                    added_some_same_as = true;
+                    continue;
                 }
                 let key = CacheKey::Cast(arg0, result_ct);
                 if let Some(res) = cache.get(&key).cloned() {

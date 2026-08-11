@@ -486,7 +486,7 @@ impl Sig {
             }
         }
         // upstream: `inputcells[:] = args_s`.
-        for (slot, new_s) in inputcells.iter_mut().zip(args_s.into_iter()) {
+        for (slot, new_s) in inputcells.iter_mut().zip(args_s) {
             *slot = new_s;
         }
         Ok(())
@@ -606,14 +606,14 @@ pub fn enforce_signature_return(
     inferredtype: &SomeValue,
 ) -> Result<Option<SomeValue>, SignatureError> {
     let s_sigret = finish_type(sigtype, bookkeeper, func_name)?;
-    if let Some(ref s_sig) = s_sigret {
-        if !s_sig.contains(inferredtype) {
-            return Err(SignatureError(format!(
-                "{func_name:?} return value:\nexpected {expected:?},\n     got {got:?}",
-                expected = s_sig,
-                got = inferredtype
-            )));
-        }
+    if let Some(ref s_sig) = s_sigret
+        && !s_sig.contains(inferredtype)
+    {
+        return Err(SignatureError(format!(
+            "{func_name:?} return value:\nexpected {expected:?},\n     got {got:?}",
+            expected = s_sig,
+            got = inferredtype
+        )));
     }
     Ok(s_sigret)
 }

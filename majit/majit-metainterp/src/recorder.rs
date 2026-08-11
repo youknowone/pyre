@@ -294,12 +294,11 @@ impl Trace {
         // sits at `self.ops[r.raw() - n]`. Confirm `op.pos` matches before
         // binding, falling back to `from_opref` on any mismatch.
         let n = self.inputargs.len();
-        if let Some(idx) = (r.raw() as usize).checked_sub(n) {
-            if let Some(op) = self.ops.get(idx) {
-                if op.pos.get().raw() == r.raw() {
-                    return Operand::from_bound_op(op);
-                }
-            }
+        if let Some(idx) = (r.raw() as usize).checked_sub(n)
+            && let Some(op) = self.ops.get(idx)
+            && op.pos.get().raw() == r.raw()
+        {
+            return Operand::from_bound_op(op);
         }
         // S3/#124: a ResOp operand always has a dense producer in `ops`
         // (positions are op_count order; opencoder.py:640 asserts).

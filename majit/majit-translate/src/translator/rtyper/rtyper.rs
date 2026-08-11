@@ -1227,23 +1227,23 @@ impl RPythonTyper {
         // (or both sides be NaN).
         let s_result = hop.s_result.borrow().clone();
         let s_result_is_constant = s_result.as_ref().map(|s| s.is_constant()).unwrap_or(false);
-        if s_result_is_constant {
-            if let Hlvalue::Constant(rc) = &resultvar {
-                if expected.is_primitive() && !matches!(expected, LowLevelType::Void) {
-                    let s_const = s_result
-                        .as_ref()
-                        .and_then(|s| s.const_().cloned())
-                        .expect("s_result.is_constant() implies const_() is Some");
-                    assert!(
-                        constant_result_values_agree(&rc.value, &s_const),
-                        "translate_hl_to_ll: Constant result mismatch \
+        if s_result_is_constant
+            && let Hlvalue::Constant(rc) = &resultvar
+            && expected.is_primitive()
+            && !matches!(expected, LowLevelType::Void)
+        {
+            let s_const = s_result
+                .as_ref()
+                .and_then(|s| s.const_().cloned())
+                .expect("s_result.is_constant() implies const_() is Some");
+            assert!(
+                constant_result_values_agree(&rc.value, &s_const),
+                "translate_hl_to_ll: Constant result mismatch \
                          — resultvar.value = {:?}, s_result.const = {:?} \
                          (rtyper.py:456-458)",
-                        rc.value,
-                        s_const,
-                    );
-                }
-            }
+                rc.value,
+                s_const,
+            );
         }
 
         // rtyper.py:460 resulttype = resultvar.concretetype.
@@ -2839,19 +2839,19 @@ impl HighLevelOp {
         }
 
         // Non-constant integer bounds must be proved non-negative.
-        if let SomeValue::Integer(si) = &s_start {
-            if !si.nonneg {
-                return Err(TyperError::message(
-                    "slice start must be proved non-negative",
-                ));
-            }
+        if let SomeValue::Integer(si) = &s_start
+            && !si.nonneg
+        {
+            return Err(TyperError::message(
+                "slice start must be proved non-negative",
+            ));
         }
-        if let SomeValue::Integer(si) = &s_stop {
-            if !si.nonneg {
-                return Err(TyperError::message(
-                    "slice stop must be proved non-negative",
-                ));
-            }
+        if let SomeValue::Integer(si) = &s_stop
+            && !si.nonneg
+        {
+            return Err(TyperError::message(
+                "slice stop must be proved non-negative",
+            ));
         }
 
         // v_start = inputconst(Signed, 0) when start is a constant None, else inputarg.
@@ -6732,7 +6732,7 @@ mod tests {
         let _ptr_obj::Func(func_obj) = llfn._obj().unwrap() else {
             panic!("expected _ptr_obj::Func");
         };
-        assert_eq!(func_obj.graph.is_some(), true);
+        assert!(func_obj.graph.is_some());
     }
 
     #[test]

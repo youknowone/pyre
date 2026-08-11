@@ -1633,7 +1633,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let error = std::io::Error::last_os_error();
                 return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
             }
-            return Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0));
+            Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0))
         }
         #[cfg(any(not(unix), feature = "sandbox"))]
         {
@@ -1684,7 +1684,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
                 }
             }
-            return Ok(pyre_object::w_none());
+            Ok(pyre_object::w_none())
         }
         #[cfg(any(not(unix), feature = "sandbox"))]
         {
@@ -3390,8 +3390,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `path_type.__fspath__(path)` — the descriptor read off the
                 // type is unbound, so `path` is supplied as the sole argument.
                 let path_type = crate::typedef::r#type(arg);
-                if let Some(pt) = path_type {
-                    if let Some(fspath_fn) =
+                if let Some(pt) = path_type
+                    && let Some(fspath_fn) =
                         unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
                     {
                         let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
@@ -3410,7 +3410,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             crate::gateway::short_type_name(result)
                         )));
                     }
-                }
                 Err(crate::PyError::type_error(format!(
                     "expected str, bytes or os.PathLike object, not {}",
                     crate::gateway::short_type_name(arg)
@@ -3895,15 +3894,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             nlink: st.st_nlink as i64,
             uid: st.st_uid as i64,
             gid: st.st_gid as i64,
-            size: st.st_size as i64,
-            atime: st.st_atime as i64,
-            mtime: st.st_mtime as i64,
-            ctime: st.st_ctime as i64,
-            atime_ns: whole_ns(st.st_atime as i64, st.st_atime_nsec as i64),
-            mtime_ns: whole_ns(st.st_mtime as i64, st.st_mtime_nsec as i64),
-            ctime_ns: whole_ns(st.st_ctime as i64, st.st_ctime_nsec as i64),
+            size: st.st_size,
+            atime: st.st_atime,
+            mtime: st.st_mtime,
+            ctime: st.st_ctime,
+            atime_ns: whole_ns(st.st_atime, st.st_atime_nsec),
+            mtime_ns: whole_ns(st.st_mtime, st.st_mtime_nsec),
+            ctime_ns: whole_ns(st.st_ctime, st.st_ctime_nsec),
             blksize: st.st_blksize as i64,
-            blocks: st.st_blocks as i64,
+            blocks: st.st_blocks,
             rdev: st.st_rdev as i64,
         }
     }
@@ -4378,11 +4377,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // the entry carries one (every unix `scandir` path, name or descriptor),
         // with no stat; `-1` means it has none and the stat paths below answer
         // instead.
-        if let Some(de) = W_DirEntry::from_obj(args[0]) {
-            if de.enum_ino != -1 {
+        if let Some(de) = W_DirEntry::from_obj(args[0])
+            && de.enum_ino != -1 {
                 return Ok(pyre_object::w_int_new(de.enum_ino));
             }
-        }
         let (w_path, path) = dir_entry_path(args[0])?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
@@ -5109,7 +5107,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    return Ok(pyre_object::w_int_new(getuid() as i64));
+                    Ok(pyre_object::w_int_new(getuid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -5132,7 +5130,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    return Ok(pyre_object::w_int_new(geteuid() as i64));
+                    Ok(pyre_object::w_int_new(geteuid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -5155,7 +5153,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    return Ok(pyre_object::w_int_new(getgid() as i64));
+                    Ok(pyre_object::w_int_new(getgid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -5178,7 +5176,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    return Ok(pyre_object::w_int_new(getegid() as i64));
+                    Ok(pyre_object::w_int_new(getegid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -7591,7 +7589,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `error == 0` without `handle_posix_error`, so a refused
                     // call is False and not an `OSError` — including the EINVAL
                     // a mode outside `R_OK | W_OK | X_OK` can draw.
-                    return Ok(pyre_object::w_bool_from(ret == 0));
+                    Ok(pyre_object::w_bool_from(ret == 0))
                 }
             }),
         );
@@ -8386,7 +8384,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         /// hosts that do not implement them, and `None` is neither the value
         /// nor the type the caller can compare against a limit.
         fn indeterminate_limit(limit: Option<libc::c_long>) -> i64 {
-            limit.map_or(-1, |v| v as i64)
+            limit.map_or(-1, |v| v)
         }
 
         /// `posixmodule.c conv_confname`: an `int` passes through, a `str` is

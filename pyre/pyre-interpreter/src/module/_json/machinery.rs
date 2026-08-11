@@ -100,13 +100,13 @@ pub(super) fn scan_string(
                             let mut lookahead = chars.clone();
                             if let (Some((_, (_, slash))), Some((u_i, (_, u)))) =
                                 (lookahead.next(), lookahead.next())
+                                && slash == '\\'
+                                && u == 'u'
                             {
-                                if slash == '\\' && u == 'u' {
-                                    let second = decode_hex(&mut lookahead, char_offset + u_i)?;
-                                    if let Some(trail) = second.to_trail_surrogate() {
-                                        decoded = lead.merge(trail).into();
-                                        chars = lookahead;
-                                    }
+                                let second = decode_hex(&mut lookahead, char_offset + u_i)?;
+                                if let Some(trail) = second.to_trail_surrogate() {
+                                    decoded = lead.merge(trail).into();
+                                    chars = lookahead;
                                 }
                             }
                         }

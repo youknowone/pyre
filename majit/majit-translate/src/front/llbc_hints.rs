@@ -328,19 +328,19 @@ fn decode_str_const(value: &serde_json::Value) -> Option<String> {
     }
     let obj = value.as_object()?;
     for key in ["Str", "str"] {
-        if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str() {
-                return Some(s.to_string());
-            }
+        if let Some(v) = obj.get(key)
+            && let Some(s) = v.as_str()
+        {
+            return Some(s.to_string());
         }
     }
     // `ConstantExpr` nests the literal under `kind` →
     // `{"Literal": {"Str": spec}}`; descend through both wrappers.
     for key in ["kind", "Literal"] {
-        if let Some(nested) = obj.get(key) {
-            if let Some(s) = decode_str_const(nested) {
-                return Some(s);
-            }
+        if let Some(nested) = obj.get(key)
+            && let Some(s) = decode_str_const(nested)
+        {
+            return Some(s);
         }
     }
     None

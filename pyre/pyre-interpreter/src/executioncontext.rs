@@ -664,14 +664,13 @@ impl ExecutionContext {
         // is the line-by-line port of the isinstance check.
         if let Some(args) = args {
             unsafe {
-                if crate::is_function_with_fixed_code(w_func) {
-                    if let Some(w_firstarg) = args.firstarg() {
-                        if !w_firstarg.is_null() {
-                            let w_type = crate::typedef::r#type(w_firstarg)
-                                .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-                            w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
-                        }
-                    }
+                if crate::is_function_with_fixed_code(w_func)
+                    && let Some(w_firstarg) = args.firstarg()
+                    && !w_firstarg.is_null()
+                {
+                    let w_type = crate::typedef::r#type(w_firstarg)
+                        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+                    w_func = crate::descr_function_get(w_func, w_firstarg, w_type);
                 }
             }
         }
@@ -697,11 +696,9 @@ impl ExecutionContext {
     pub fn call_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() || self.profilefunc.is_some() {
             self._trace(frame, "call", pyre_object::w_none(), None)?;
-            if self.profilefunc.is_some() {
-                if !frame.is_null() {
-                    unsafe {
-                        (*frame).getorcreatedebug(-1).is_being_profiled = true;
-                    }
+            if self.profilefunc.is_some() && !frame.is_null() {
+                unsafe {
+                    (*frame).getorcreatedebug(-1).is_being_profiled = true;
                 }
             }
         }
@@ -758,10 +755,10 @@ impl ExecutionContext {
             // the ticker is negative (a signal / fired action), so the
             // residual call adds nothing to the no-signal hot path.
             let self_ptr = self as *mut ExecutionContext;
-            if perform_pending_actions(self_ptr as i64, frame as i64) != 0 {
-                if let Some(err) = crate::call::take_call_error() {
-                    return Err(err);
-                }
+            if perform_pending_actions(self_ptr as i64, frame as i64) != 0
+                && let Some(err) = crate::call::take_call_error()
+            {
+                return Err(err);
             }
         }
         Ok(())
@@ -930,10 +927,10 @@ impl ExecutionContext {
             // through the same residual boundary as `bytecode_trace` so a
             // signal delivered during exception handling propagates.
             let self_ptr = self as *mut ExecutionContext;
-            if perform_pending_actions(self_ptr as i64, frame as i64) != 0 {
-                if let Some(err) = crate::call::take_call_error() {
-                    return Err(err);
-                }
+            if perform_pending_actions(self_ptr as i64, frame as i64) != 0
+                && let Some(err) = crate::call::take_call_error()
+            {
+                return Err(err);
             }
         }
         Ok(())
@@ -1291,9 +1288,7 @@ impl ExecutionContext {
             // → eval_frame_plain) propagates the error up so the
             // tracefunc behaves like an inline raise from the executing
             // frame.
-            if let Err(err) = call_result {
-                return Err(err);
-            }
+            call_result?;
         }
 
         // executioncontext.py:404-428 Profile cases

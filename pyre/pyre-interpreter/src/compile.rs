@@ -20,7 +20,7 @@ pub use rustpython_compiler_core::bytecode::{
 /// can read its `python_location` / `python_end_location` / `source_path`.
 pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
     crate::module::thread::ensure_runtime_thread();
-    rp_compile(source, mode, "<string>".into(), default_compile_opts())
+    rp_compile(source, mode, "<string>", default_compile_opts())
 }
 
 /// The `CompileOpts` for an implicit compile (script / `-c` / import): the
@@ -55,7 +55,7 @@ pub fn compile_source_with_opts(
     opts: CompileOpts,
 ) -> Result<CodeObject, CompileError> {
     crate::module::thread::ensure_runtime_thread();
-    rp_compile(source, mode, filename.into(), opts)
+    rp_compile(source, mode, filename, opts)
 }
 
 /// Scan the first two lines of `source` for a PEP 263 coding cookie

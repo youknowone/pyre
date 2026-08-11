@@ -2371,10 +2371,10 @@ pub fn translate_op(
                         // branch below and mints a distinct `Tuple<f64,f64>`
                         // per site → `commonbase` None → UnionError at a join.
                         if matches!(
-                            majit_ir::descr::strip_instantiation_suffix(&name),
+                            majit_ir::descr::strip_instantiation_suffix(name),
                             "Tuple" | "Array" | "Closure"
                         ) {
-                            call_registry.bookkeeper().intern_class_by_qualname(&name)
+                            call_registry.bookkeeper().intern_class_by_qualname(name)
                         } else {
                             HostObject::new_class(name.clone(), Vec::new())
                         }
@@ -2441,7 +2441,7 @@ pub fn translate_op(
                                     || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
                             });
                         if is_enum_variant {
-                            bk.intern_enum_variant_host(owner_tail.unwrap(), &name)
+                            bk.intern_enum_variant_host(owner_tail.unwrap(), name)
                         } else {
                             // A closure env ctor.  Normal struct ctors keep the
                             // dotted qualname (`_init_classdef`'s
@@ -2557,7 +2557,7 @@ pub fn translate_op(
                     })?;
                     let base_root = call_registry
                         .bookkeeper()
-                        .registered_trait_family_base_root(&trait_root);
+                        .registered_trait_family_base_root(trait_root);
                     let mut ops = Vec::with_capacity(3);
                     // Narrow the receiver to the family base classdef when the
                     // trait is a registered dispatch family.
@@ -3297,11 +3297,11 @@ pub(crate) fn derive_subject_inputcells(
                 // `SomeList(elem)` so a `len()` / iteration on the receiver
                 // resolves as a list op instead of `getattr` over the
                 // classdef-less `SomeInstance(None)` shell.
-                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref()) {
-                    if majit_ir::descr::is_list_container_spelling(root) {
-                        cells.push(bk.project_pyre_field_type(root));
-                        continue;
-                    }
+                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                    && majit_ir::descr::is_list_container_spelling(root)
+                {
+                    cells.push(bk.project_pyre_field_type(root));
+                    continue;
                 }
                 // String-typed params are string values, not class
                 // instances: `String` and `str` both map to the byte
@@ -3448,10 +3448,10 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![legacy.startblock];
     while let Some(id) = stack.pop() {
-        if seen.insert(id) {
-            if let Some(block) = by_id.get(&id) {
-                stack.extend(block.exits.iter().rev().map(|e| e.target));
-            }
+        if seen.insert(id)
+            && let Some(block) = by_id.get(&id)
+        {
+            stack.extend(block.exits.iter().rev().map(|e| e.target));
         }
     }
     seen
@@ -3529,37 +3529,37 @@ pub fn function_graph_to_flowspace(
                 let Some(result_var) = legacy_op.result.as_ref() else {
                     continue;
                 };
-                if let Hlvalue::Constant(c) = &hlvalue {
-                    if let Some(ct) = &c.concretetype {
-                        let legacy_ct = if is_fn_const_define(&legacy_op.kind) {
-                            // The rtyper-side carrier is a real LLPtr so
-                            // direct-call resolution can materialise
-                            // `getfunctionptr` from the function graph.  The
-                            // legacy/codewriter side must still see the
-                            // synthetic define's declared Int slot: later
-                            // jtransform materialises funcptr values as
-                            // `ConstInt(fnaddr)` and the assembler encodes
-                            // them through the `i` argcode.
-                            LowLevelType::Signed
-                        } else {
-                            ct.clone()
-                        };
-                        constant_concretetypes.insert(result_var.clone(), legacy_ct.clone());
-                        // Also stamp the lltype onto the legacy graph's
-                        // orphan Variable cell for this const-define
-                        // result.  The rtyper consumes `Hlvalue::Constant`
-                        // surfaces for const-defines and never reads the
-                        // legacy Variable cell directly, so the write is
-                        // additive — `RPythonTyper.specialize` won't
-                        // overwrite this slot.  Downstream consumers
-                        // reading `FunctionGraph::concretetype_of(&v)`
-                        // (RPython parity for `getkind(v.concretetype)`)
-                        // then see the const kind inline, without
-                        // depending on the post-rtyper
-                        // `apply_to_graph(constant_concretetypes, …)`
-                        // bridge.
-                        result_var.set_concretetype(Some(legacy_ct));
-                    }
+                if let Hlvalue::Constant(c) = &hlvalue
+                    && let Some(ct) = &c.concretetype
+                {
+                    let legacy_ct = if is_fn_const_define(&legacy_op.kind) {
+                        // The rtyper-side carrier is a real LLPtr so
+                        // direct-call resolution can materialise
+                        // `getfunctionptr` from the function graph.  The
+                        // legacy/codewriter side must still see the
+                        // synthetic define's declared Int slot: later
+                        // jtransform materialises funcptr values as
+                        // `ConstInt(fnaddr)` and the assembler encodes
+                        // them through the `i` argcode.
+                        LowLevelType::Signed
+                    } else {
+                        ct.clone()
+                    };
+                    constant_concretetypes.insert(result_var.clone(), legacy_ct.clone());
+                    // Also stamp the lltype onto the legacy graph's
+                    // orphan Variable cell for this const-define
+                    // result.  The rtyper consumes `Hlvalue::Constant`
+                    // surfaces for const-defines and never reads the
+                    // legacy Variable cell directly, so the write is
+                    // additive — `RPythonTyper.specialize` won't
+                    // overwrite this slot.  Downstream consumers
+                    // reading `FunctionGraph::concretetype_of(&v)`
+                    // (RPython parity for `getkind(v.concretetype)`)
+                    // then see the const kind inline, without
+                    // depending on the post-rtyper
+                    // `apply_to_graph(constant_concretetypes, …)`
+                    // bridge.
+                    result_var.set_concretetype(Some(legacy_ct));
                 }
                 constant_hlvalues.insert(result_var.clone(), hlvalue);
             }
@@ -3686,22 +3686,22 @@ pub fn function_graph_to_flowspace(
     let returnblock_ref = graph.returnblock.clone();
     let exceptblock_ref = graph.exceptblock.clone();
 
-    if let Some(legacy_exceptblock) = legacy.blocks.iter().find(|b| b.id == legacy.exceptblock) {
-        if legacy_exceptblock.inputargs.len() == 2 {
-            let mut except_inputargs = Vec::with_capacity(2);
-            for legacy_var in legacy_exceptblock.inputargs.iter() {
-                let var = seed_variable(legacy_var);
-                value_to_var_candidates
-                    .entry(legacy_var.clone())
-                    .or_default()
-                    .push(var.clone());
-                value_to_var
-                    .entry(legacy_var.clone())
-                    .or_insert_with(|| var.clone());
-                except_inputargs.push(Hlvalue::Variable(var));
-            }
-            exceptblock_ref.borrow_mut().inputargs = except_inputargs;
+    if let Some(legacy_exceptblock) = legacy.blocks.iter().find(|b| b.id == legacy.exceptblock)
+        && legacy_exceptblock.inputargs.len() == 2
+    {
+        let mut except_inputargs = Vec::with_capacity(2);
+        for legacy_var in legacy_exceptblock.inputargs.iter() {
+            let var = seed_variable(legacy_var);
+            value_to_var_candidates
+                .entry(legacy_var.clone())
+                .or_default()
+                .push(var.clone());
+            value_to_var
+                .entry(legacy_var.clone())
+                .or_insert_with(|| var.clone());
+            except_inputargs.push(Hlvalue::Variable(var));
         }
+        exceptblock_ref.borrow_mut().inputargs = except_inputargs;
     }
 
     let graph_ref = Rc::new(RefCell::new(graph));
@@ -3752,12 +3752,10 @@ pub fn function_graph_to_flowspace(
                     class_root: _,
                 },
             ) = (legacy_op.result.as_ref(), &legacy_op.kind)
+                && legacy_block.inputargs.contains(result_var)
+                && let Some(existing) = value_map.get(result_var).cloned()
             {
-                if legacy_block.inputargs.contains(result_var) {
-                    if let Some(existing) = value_map.get(result_var).cloned() {
-                        name_to_value.entry(name.clone()).or_insert(existing);
-                    }
-                }
+                name_to_value.entry(name.clone()).or_insert(existing);
             }
         }
 
@@ -3914,12 +3912,11 @@ pub fn function_graph_to_flowspace(
                 continue;
             }
             translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
-            if let Some(result_var) = legacy_op.result.as_ref() {
-                if let Some(name) = legacy.value_name_for(result_var) {
-                    if let Some(value) = value_map.get(result_var).cloned() {
-                        name_to_value.insert(name.to_string(), value);
-                    }
-                }
+            if let Some(result_var) = legacy_op.result.as_ref()
+                && let Some(name) = legacy.value_name_for(result_var)
+                && let Some(value) = value_map.get(result_var).cloned()
+            {
+                name_to_value.insert(name.to_string(), value);
             }
         }
 

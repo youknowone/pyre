@@ -450,6 +450,12 @@ pub struct PropagateExceptionDescr {
 unsafe impl Send for PropagateExceptionDescr {}
 unsafe impl Sync for PropagateExceptionDescr {}
 
+impl Default for PropagateExceptionDescr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PropagateExceptionDescr {
     pub fn new() -> Self {
         Self {

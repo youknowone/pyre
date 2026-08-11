@@ -887,7 +887,7 @@ impl VirtualState {
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
-                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
+                let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
                 }
@@ -940,7 +940,7 @@ impl VirtualState {
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
                     .and_then(|b| ctx.peek_ptr_info(b));
-                let is_virtual = info_snapshot.as_ref().map_or(false, |pi| pi.is_virtual());
+                let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(());
                 }
@@ -1104,17 +1104,16 @@ impl VirtualState {
                 // raises VirtualStatesCantMatch.
                 if let (Some(expected), Some(actual)) =
                     (node.info.info_type(), ctx.opref_type(resolved_for_store))
+                    && expected != actual
                 {
-                    if expected != actual {
-                        if crate::majit_log_enabled() {
-                            eprintln!(
-                                "[label-type-mismatch] slot={} expected={:?} actual={:?} \
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[label-type-mismatch] slot={} expected={:?} actual={:?} \
                                  source={:?} resolved={:?}",
-                                slot, expected, actual, opref, resolved_for_store
-                            );
-                        }
-                        return Err(());
+                            slot, expected, actual, opref, resolved_for_store
+                        );
                     }
+                    return Err(());
                 }
                 if let Some(dst) = boxes.get_mut(slot) {
                     *dst = resolved_for_store;
@@ -1478,12 +1477,11 @@ impl VirtualState {
         // the Ptr leaf. The `(Constant(_), _)` arm below is therefore never
         // entered with a virtual incoming; do NOT add a separate
         // `other.is_virtual()` arm there — it would be dead code.
-        if !expected_info.is_virtual() {
-            if let Some(expected_type) = expected_info.info_type() {
-                if !info_type_matches(expected_type, incoming_info) {
-                    return Err(());
-                }
-            }
+        if !expected_info.is_virtual()
+            && let Some(expected_type) = expected_info.info_type()
+            && !info_type_matches(expected_type, incoming_info)
+        {
+            return Err(());
         }
 
         // virtualstate.py:96-101 try/except VirtualStatesCantMatch wrapper.
@@ -1539,7 +1537,7 @@ impl VirtualState {
                     state.extra_guards.push(GuardRequirement::GuardValue {
                         arg_index: arg_idx,
                         box_opref,
-                        expected_value: val.clone(),
+                        expected_value: *val,
                     });
                     Ok(())
                 } else {
@@ -2846,15 +2844,14 @@ fn export_single_value_inner(
     // (behaviorally identical to NotVirtualStateInfoInt with an unbounded
     // `intbound`: `_generate_guards_unkown`'s `is_within_range(MININT, MAXINT)`
     // is always true → no guard).
-    if tp == Type::Int {
-        if let Some(widened) = ctx
+    if tp == Type::Int
+        && let Some(widened) = ctx
             .get_box_replacement_operand_opt(opref)
             .and_then(|b| ctx.peek_intbound_box(&b))
             .map(|b| b.widen())
             .filter(|b| !b.is_unbounded())
-        {
-            return VirtualStateInfo::IntBounded(widened);
-        }
+    {
+        return VirtualStateInfo::IntBounded(widened);
     }
     VirtualStateInfo::Unknown(tp)
 }

@@ -165,13 +165,13 @@ pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     // Every producer-specific identity minted by `seq_iter_type_for` carries
     // the same `W_SeqIterObject` payload, so all of them answer yes here.
     let tp = unsafe { (*obj).ob_type };
-    tp == &SEQ_ITER_TYPE as *const PyType
-        || tp == &STR_ASCII_ITER_TYPE as *const PyType
-        || tp == &STR_ITER_TYPE as *const PyType
-        || tp == &BYTES_ITER_TYPE as *const PyType
-        || tp == &BYTEARRAY_ITER_TYPE as *const PyType
-        || tp == &MEMORY_ITER_TYPE as *const PyType
-        || tp == &ARRAY_ITER_TYPE as *const PyType
+    std::ptr::eq(tp, &SEQ_ITER_TYPE)
+        || std::ptr::eq(tp, &STR_ASCII_ITER_TYPE)
+        || std::ptr::eq(tp, &STR_ITER_TYPE)
+        || std::ptr::eq(tp, &BYTES_ITER_TYPE)
+        || std::ptr::eq(tp, &BYTEARRAY_ITER_TYPE)
+        || std::ptr::eq(tp, &MEMORY_ITER_TYPE)
+        || std::ptr::eq(tp, &ARRAY_ITER_TYPE)
 }
 
 /// `memory_iterator` — the one producer-specific `W_SeqIterObject` identity
@@ -182,7 +182,7 @@ pub unsafe fn is_memory_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &MEMORY_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &MEMORY_ITER_TYPE)
 }
 
 /// `bytearray_iterator` — the one producer-specific `W_SeqIterObject` identity
@@ -195,7 +195,7 @@ pub unsafe fn is_bytearray_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &BYTEARRAY_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &BYTEARRAY_ITER_TYPE)
 }
 
 /// `array.arrayiterator` — carries `__reduce__` / `__setstate__` but, unlike
@@ -205,7 +205,7 @@ pub unsafe fn is_array_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &ARRAY_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &ARRAY_ITER_TYPE)
 }
 
 #[inline]
@@ -213,7 +213,7 @@ pub unsafe fn is_list_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &LIST_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &LIST_ITER_TYPE)
 }
 
 #[inline]
@@ -221,7 +221,7 @@ pub unsafe fn is_list_reverse_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &LIST_REVERSE_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &LIST_REVERSE_ITER_TYPE)
 }
 
 #[inline]
@@ -229,7 +229,7 @@ pub unsafe fn is_tuple_iter(obj: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    !obj.is_null() && (*obj).ob_type == &TUPLE_ITER_TYPE as *const PyType
+    !obj.is_null() && std::ptr::eq((*obj).ob_type, &TUPLE_ITER_TYPE)
 }
 
 #[inline]

@@ -343,37 +343,35 @@ impl VecScheduleState {
     /// not reached for real loop bodies.
     fn vectorization_info_for_op(&self, op: &Op) -> majit_ir::VectorizationInfo {
         // resoperation.py:170-180 primitive_array_access branch.
-        if op.opcode.is_primitive_array_access_opcode() {
-            if let Some(descr) = op.getdescr() {
-                if let Some(arr) = majit_ir::descr::descr_arc_as_array_descr(descr) {
-                    if arr.is_array_of_primitives() {
-                        let datatype = match op.result_type() {
-                            Type::Int => 'i',
-                            Type::Float => 'f',
-                            Type::Ref => 'r',
-                            Type::Void => 'v',
-                        };
-                        let bytesize = arr.item_size() as i8;
-                        let signed = arr.is_item_signed();
-                        let mut info = majit_ir::VectorizationInfo::new();
-                        info.setinfo(datatype, bytesize, signed);
-                        return info;
-                    }
-                }
-            }
+        if op.opcode.is_primitive_array_access_opcode()
+            && let Some(descr) = op.getdescr()
+            && let Some(arr) = majit_ir::descr::descr_arc_as_array_descr(descr)
+            && arr.is_array_of_primitives()
+        {
+            let datatype = match op.result_type() {
+                Type::Int => 'i',
+                Type::Float => 'f',
+                Type::Ref => 'r',
+                Type::Void => 'v',
+            };
+            let bytesize = arr.item_size() as i8;
+            let signed = arr.is_item_signed();
+            let mut info = majit_ir::VectorizationInfo::new();
+            info.setinfo(datatype, bytesize, signed);
+            return info;
         }
 
         // resoperation.py:187-190 is_typecast branch (INT_SIGNEXT static
         // gating returns None per `cast_to_bytesize_static`; the dynamic
         // INT_SIGNEXT bytesize is stamped in `int_signext_vecinfo` at
         // setup time and read back through the forwarded vecinfo cache).
-        if op.opcode.is_typecast() {
-            if let Some(bytesize) = op.opcode.cast_to_bytesize_static() {
-                let (_ft, tt) = op.opcode.cast_types();
-                let mut info = majit_ir::VectorizationInfo::new();
-                info.setinfo(tt, bytesize as i8, true);
-                return info;
-            }
+        if op.opcode.is_typecast()
+            && let Some(bytesize) = op.opcode.cast_to_bytesize_static()
+        {
+            let (_ft, tt) = op.opcode.cast_types();
+            let mut info = majit_ir::VectorizationInfo::new();
+            info.setinfo(tt, bytesize as i8, true);
+            return info;
         }
 
         // resoperation.py:192-209 else branch:
@@ -414,20 +412,20 @@ impl VecScheduleState {
                 i += 1;
                 arg = op.arg(i);
             }
-            if !arg.is_constant() {
-                if let Some(vinfo) = self.get_forwarded_vecinfo(arg.to_opref()) {
-                    if vinfo.datatype != '\x00' && vinfo.bytesize != -1 {
-                        datatype = vinfo.datatype;
-                        tp = match datatype {
-                            'i' => Type::Int,
-                            'f' => Type::Float,
-                            'r' => Type::Ref,
-                            _ => tp,
-                        };
-                        signed = vinfo.signed;
-                        bytesize = vinfo.bytesize;
-                    }
-                }
+            if !arg.is_constant()
+                && let Some(vinfo) = self.get_forwarded_vecinfo(arg.to_opref())
+                && vinfo.datatype != '\x00'
+                && vinfo.bytesize != -1
+            {
+                datatype = vinfo.datatype;
+                tp = match datatype {
+                    'i' => Type::Int,
+                    'f' => Type::Float,
+                    'r' => Type::Ref,
+                    _ => tp,
+                };
+                signed = vinfo.signed;
+                bytesize = vinfo.bytesize;
             }
         }
 
@@ -721,7 +719,7 @@ impl VecScheduleState {
         for arg in args {
             self.expanded_map
                 .entry(*arg)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((vecop, index));
             index += 1;
         }
@@ -745,10 +743,7 @@ impl VecScheduleState {
         // A vecop is valid only if it appears at every position — intersect.
         let mut possible: indexmap::IndexMap<OpRef, bool> = indexmap::IndexMap::new();
         for (i, arg) in args.iter().enumerate() {
-            let expansions = match self.expanded_map.get(arg) {
-                Some(e) => e,
-                None => return None,
-            };
+            let expansions = self.expanded_map.get(arg)?;
             // schedule.py:617-618: filter by index match AND possible.get(vecop, True)
             let candidates: Vec<OpRef> = expansions
                 .iter()
@@ -944,10 +939,10 @@ pub fn assemble_scattered_values(
     // schedule.py:424: check which vector boxes these args reside in
     let mut vectors: Vec<(usize, OpRef)> = Vec::new();
     for &a in &args_at_index {
-        if let Some((pos, vecop)) = state.getvector_of_box(a) {
-            if vectors.is_empty() || vectors.last().map(|v| v.1) != Some(vecop) {
-                vectors.push((pos, vecop));
-            }
+        if let Some((pos, vecop)) = state.getvector_of_box(a)
+            && (vectors.is_empty() || vectors.last().map(|v| v.1) != Some(vecop))
+        {
+            vectors.push((pos, vecop));
         }
     }
 
@@ -1296,12 +1291,12 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[OpRc])
     // INT_SIGNEXT is excluded by the static-bytesize gate (see
     // TODO in `vectorization_info_for_op`): the dynamic
     // arg1.value path needs const-pool threading.
-    if first_op.opcode.is_typecast() {
-        if let Some(bs) = first_op.opcode.cast_to_bytesize_static() {
-            let (_ft, tt) = first_op.opcode.cast_types();
-            datatype = tt;
-            bytesize = bs as i8;
-        }
+    if first_op.opcode.is_typecast()
+        && let Some(bs) = first_op.opcode.cast_to_bytesize_static()
+    {
+        let (_ft, tt) = first_op.opcode.cast_types();
+        datatype = tt;
+        bytesize = bs as i8;
     }
     let mut vecop =
         state.create_vec_op(vec_opcode, &args, datatype, bytesize as i32, signed, count);

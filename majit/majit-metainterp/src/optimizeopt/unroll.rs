@@ -426,14 +426,12 @@ impl UnrollOptimizer {
     fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usize> {
         let mut slots = Vec::new();
         for map in maps {
-            for slot in map.iter_mut() {
-                if let Some(boxes) = slot {
-                    for sb in boxes {
-                        if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref {
-                            if !gcref.is_null() {
-                                slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
-                            }
-                        }
+            for boxes in map.iter_mut().flatten() {
+                for sb in boxes {
+                    if let majit_ir::OpRef::ConstPtr(gcref) = sb.opref
+                        && !gcref.is_null()
+                    {
+                        slots.push((&mut sb.opref as *mut majit_ir::OpRef) as usize);
                     }
                 }
             }
@@ -1395,24 +1393,23 @@ impl UnrollOptimizer {
                                 .potential_extra_ops
                                 .iter()
                                 .any(|(k, _)| *k == arg || *k == resolved);
-                            if !needs_force {
-                                if let Some((_, produced)) =
+                            if !needs_force
+                                && let Some((_, produced)) =
                                     exported_short_boxes_produced.iter().find(|(_, produced)| {
                                         let source = produced.res.to_opref();
                                         source != arg
                                             && final_ctx.get_replacement_opref(source) == arg
                                     })
-                                {
-                                    let preamble_op = crate::optimizeopt::info::PreambleOp {
-                                        op: produced.res.clone(),
-                                        invented_name: produced.invented_name,
-                                        preamble_op: produced.preamble_op.clone(),
-                                        same_as_source: produced.same_as_source.clone(),
-                                    };
-                                    let source = final_ctx.force_op_from_preamble_op(&preamble_op);
-                                    let _ = opt_p2.force_box(source, &mut final_ctx);
-                                    continue;
-                                }
+                            {
+                                let preamble_op = crate::optimizeopt::info::PreambleOp {
+                                    op: produced.res.clone(),
+                                    invented_name: produced.invented_name,
+                                    preamble_op: produced.preamble_op.clone(),
+                                    same_as_source: produced.same_as_source.clone(),
+                                };
+                                let source = final_ctx.force_op_from_preamble_op(&preamble_op);
+                                let _ = opt_p2.force_box(source, &mut final_ctx);
+                                continue;
                             }
                             if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
@@ -1460,10 +1457,10 @@ impl UnrollOptimizer {
             ) {
                 continue;
             }
-            if let Some(slot) = produced.label_arg_idx {
-                if slot < slot_to_original.len() {
-                    slot_to_original[slot] = Some(produced.res.to_opref());
-                }
+            if let Some(slot) = produced.label_arg_idx
+                && slot < slot_to_original.len()
+            {
+                slot_to_original[slot] = Some(produced.res.to_opref());
             }
         }
         // shortpreamble.py:416-425 parity: attach PtrInfo to each short
@@ -1967,10 +1964,8 @@ impl UnrollOptimizer {
             for line in majit_ir::format_trace(&combined, &consts_p2).lines() {
                 crate::debug::debug_print(line);
             }
-            let mut sorted_consts: Vec<_> = consts_p2
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect::<Vec<_>>();
+            let mut sorted_consts: Vec<_> =
+                consts_p2.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
             sorted_consts.sort_by_key(|(k, _)| *k);
             crate::debug::debug_print(&format!("consts_p2: {sorted_consts:?}"));
         }
@@ -2488,7 +2483,7 @@ impl ExportedState {
         // above any position they reference so the retrace's fresh
         // OpRef namespace cannot collide with them.
         for ia in &self.partial_trace_inputargs {
-            high = high.max((ia.index as u32).saturating_add(1));
+            high = high.max(ia.index.saturating_add(1));
         }
         for op in &self.partial_trace_operations {
             let pos = op.pos.get();
@@ -3087,10 +3082,11 @@ impl OptUnroll {
             .map(|ia_opref| {
                 let idx = ia_opref.raw() as usize;
                 let want_ty = ia_opref.ty().unwrap_or(majit_ir::Type::Void);
-                if let Some(rc) = ctx.inputarg_refs.get(idx).cloned() {
-                    if rc.tp == want_ty && rc.index == idx as u32 {
-                        return rc;
-                    }
+                if let Some(rc) = ctx.inputarg_refs.get(idx).cloned()
+                    && rc.tp == want_ty
+                    && rc.index == idx as u32
+                {
+                    return rc;
                 }
                 // `inputarg_refs[idx]` is the canonical `InputArgRc` for this
                 // OpRef once `ensure_inputarg_bindings` / `materialize_operand_at`'s
@@ -3486,7 +3482,7 @@ impl OptUnroll {
                     let resolved_has_info = ctx
                         .get_box_replacement_operand_opt(jump_arg)
                         .as_ref()
-                        .map_or(false, |b| ctx.has_ptr_info(b));
+                        .is_some_and(|b| ctx.has_ptr_info(b));
                     if !resolved_has_info {
                         // Try label arg at same index
                         if let Some(&label_arg) = label.get(i) {
@@ -3671,7 +3667,7 @@ impl OptUnroll {
                 let resolved_has_info = ctx
                     .get_box_replacement_operand_opt(jump_arg)
                     .as_ref()
-                    .map_or(false, |b| ctx.has_ptr_info(b));
+                    .is_some_and(|b| ctx.has_ptr_info(b));
                 if !resolved_has_info {
                     let jump_box = ctx.get_box_replacement_operand_opt(jump_arg);
                     let short_box = ctx.get_box_replacement_operand_opt(short_inputarg);
@@ -3726,10 +3722,10 @@ impl OptUnroll {
         if let Some(ref phase1) = short_preamble.phase1_inputargs {
             for (i, phase1_inputarg) in phase1.iter().enumerate() {
                 let phase1_inputarg = *phase1_inputarg;
-                if let Some(&jump_arg) = jump_args.get(i) {
-                    if !mapping.contains_key(&phase1_inputarg) {
-                        mapping.insert(phase1_inputarg, jump_arg);
-                    }
+                if let Some(&jump_arg) = jump_args.get(i)
+                    && !mapping.contains_key(&phase1_inputarg)
+                {
+                    mapping.insert(phase1_inputarg, jump_arg);
                 }
             }
         }
@@ -4350,24 +4346,22 @@ impl OptUnroll {
                 Value::Void => None,
             }
         };
-        if resolved.is_constant() {
-            if let Some(value) = ctx
+        if resolved.is_constant()
+            && let Some(value) = ctx
                 .get_box_replacement_operand_opt(resolved)
                 .and_then(|cb| cb.const_value())
-            {
-                return synthesize_const_info(value);
-            }
+        {
+            return synthesize_const_info(value);
         }
         // make_constant mirrors optimizer.py:432 as `Forwarded::Const(constval)`.
         // The walker has advanced to the constbox terminal — surface RPython's
         // ConstPtrInfo / FloatConstInfo / IntBound dispatch via const_value().
         let resolved_box = ctx.get_box_replacement_operand_opt(opref);
-        if let Some(b) = resolved_box.as_ref() {
-            if b.is_constant() {
-                if let Some(value) = b.const_value() {
-                    return synthesize_const_info(value);
-                }
-            }
+        if let Some(b) = resolved_box.as_ref()
+            && b.is_constant()
+            && let Some(value) = b.const_value()
+        {
+            return synthesize_const_info(value);
         }
         // unroll.py:432-443 _expand_info uses self.optimizer.getinfo(arg) which
         // dispatches by op.type ('r' → getptrinfo, 'i' → getintbound). The Rust
@@ -4390,16 +4384,13 @@ impl OptUnroll {
         // therefore never entered the `exported_int_bounds` side table. Mirror
         // `export_arg_int_bounds` (intbounds.rs): skip Const/non-Int values and
         // unbounded bounds.
-        if let Some(box_op) = resolved_box.as_ref() {
-            if !resolved.is_constant()
-                && matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int))
-            {
-                if let Some(bound) = ctx.peek_intbound_box(box_op) {
-                    if !bound.is_unbounded() {
-                        return Some(OpInfo::int_bound(bound));
-                    }
-                }
-            }
+        if let Some(box_op) = resolved_box.as_ref()
+            && !resolved.is_constant()
+            && matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int))
+            && let Some(bound) = ctx.peek_intbound_box(box_op)
+            && !bound.is_unbounded()
+        {
+            return Some(OpInfo::int_bound(bound));
         }
         // Fallback: read from `exported_int_bounds`
         // side table.  RPython's `IntBound` flows through
@@ -4802,7 +4793,7 @@ fn assemble_peeled_trace_with_jump_args(
     // `<=0 ∧ >=0 ⇒ ==0`), and dropping that label slot while the jump keeps
     // rebinding it desyncs the label/jump contract and orphans the head guard's
     // operand. RPython performs no such filter.
-    let mut full_label_args: Vec<OpRef> = label_args.iter().copied().collect();
+    let mut full_label_args: Vec<OpRef> = label_args.to_vec();
     debug_assert!(
         full_label_args.iter().all(|arg| !arg.is_constant()),
         "base label arg is an inline-Const OpRef; LEVEL_CONSTANT virtual-state \
@@ -5048,16 +5039,17 @@ fn assemble_peeled_trace_with_jump_args(
         let Some(&extended_label_arg) = full_label_args.get(extra_label_start_idx + i) else {
             continue;
         };
-        if let Some(&jump_source) = filtered_extra_jump_args.get(i) {
-            if !jump_source.is_none() && jump_source != source_slot {
-                let b_js = ctx.materialize_operand_at(jump_source);
-                let b_ela = match ctx.get_box_replacement_operand_opt(extended_label_arg) {
-                    Some(b) => b,
-                    None => ctx.materialize_operand_at(extended_label_arg),
-                };
-                ctx.make_equal_to(&b_js, &b_ela);
-                assembly_alias_remap.insert(jump_source, extended_label_arg);
-            }
+        if let Some(&jump_source) = filtered_extra_jump_args.get(i)
+            && !jump_source.is_none()
+            && jump_source != source_slot
+        {
+            let b_js = ctx.materialize_operand_at(jump_source);
+            let b_ela = match ctx.get_box_replacement_operand_opt(extended_label_arg) {
+                Some(b) => b,
+                None => ctx.materialize_operand_at(extended_label_arg),
+            };
+            ctx.make_equal_to(&b_js, &b_ela);
+            assembly_alias_remap.insert(jump_source, extended_label_arg);
         }
     }
     for op in p2_ops.iter() {
@@ -5105,10 +5097,10 @@ fn assemble_peeled_trace_with_jump_args(
             if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                 return mapped;
             }
-            if let Some(&mapped) = body_result_remap.get(&arg) {
-                if seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg) {
-                    return mapped;
-                }
+            if let Some(&mapped) = body_result_remap.get(&arg)
+                && (seen_body_defs.contains(&arg) || !visible_before_label.contains(&arg))
+            {
+                return mapped;
             }
             arg
         };
@@ -5338,15 +5330,14 @@ fn assemble_peeled_trace_with_jump_args(
         // label, so snapshot refs to label args stay intact.
         if let Some(fa) = new_op.fail_args_mut() {
             for a in fa.iter_mut() {
-                if let Some(&mapped) = body_result_remap.get(&a.to_opref()) {
-                    if seen_body_defs.contains(&a.to_opref())
-                        && !visible_before_label.contains(&a.to_opref())
-                    {
-                        *a = match emitted_at.get(&mapped) {
-                            Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
-                            None => majit_ir::operand::Operand::from_opref(mapped),
-                        };
-                    }
+                if let Some(&mapped) = body_result_remap.get(&a.to_opref())
+                    && seen_body_defs.contains(&a.to_opref())
+                    && !visible_before_label.contains(&a.to_opref())
+                {
+                    *a = match emitted_at.get(&mapped) {
+                        Some(rc) => majit_ir::operand::Operand::from_bound_op(rc),
+                        None => majit_ir::operand::Operand::from_opref(mapped),
+                    };
                 }
             }
         }
@@ -6857,8 +6848,7 @@ mod tests {
 
         let masked = OpRef::int_op(58);
         let dependent = OpRef::int_op(59);
-        let mut ctx =
-            crate::optimizeopt::OptContext::with_inputarg_types(128, &vec![Type::Int; 128]);
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(128, &[Type::Int; 128]);
 
         let mask_op = {
             let mut op = Op::new(

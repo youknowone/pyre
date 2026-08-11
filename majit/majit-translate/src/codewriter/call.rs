@@ -1425,10 +1425,11 @@ impl CallControl {
         self.immutable_array_types.clear();
         for (struct_name, fields) in self.immutable_fields_by_struct.iter() {
             for (field_name, rank) in fields {
-                if rank.is_array() && rank.is_immutable() {
-                    if let Some(field_ty) = self.struct_fields.field_type(struct_name, field_name) {
-                        self.immutable_array_types.insert(field_ty.to_string());
-                    }
+                if rank.is_array()
+                    && rank.is_immutable()
+                    && let Some(field_ty) = self.struct_fields.field_type(struct_name, field_name)
+                {
+                    self.immutable_array_types.insert(field_ty.to_string());
                 }
             }
         }
@@ -1820,14 +1821,12 @@ impl CallControl {
                 // descriptors.  `set_all_interiorfielddescrs` is
                 // `OnceLock` (first-call wins) so re-populating on
                 // cache hit is safe.
-                if is_struct {
-                    if let Some(struct_name) = elem_ref {
-                        let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
-                        let (descrs, _) =
-                            all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
-                        if !descrs.is_empty() {
-                            ad_arc.set_all_interiorfielddescrs(descrs);
-                        }
+                if is_struct && let Some(struct_name) = elem_ref {
+                    let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
+                    let (descrs, _) =
+                        all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
+                    if !descrs.is_empty() {
+                        ad_arc.set_all_interiorfielddescrs(descrs);
                     }
                 }
                 let key = majit_ir::effectinfo::DescrSetMember::Array {
@@ -3094,17 +3093,17 @@ impl CallControl {
     ) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
         let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
         for jd in &self.jitdrivers_sd {
-            if let Some(vinfo) = &jd.virtualizable_info {
-                if vinfo.is_vtypeptr(vtypeptr_id) {
-                    // Dedupe by Arc identity so the upstream
-                    // `assert len(seen) == 1` translates to "at most one
-                    // distinct VirtualizableInfo per VTYPEPTR".
-                    let seen_already = seen
-                        .iter()
-                        .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
-                    if !seen_already {
-                        seen.push(std::sync::Arc::clone(vinfo));
-                    }
+            if let Some(vinfo) = &jd.virtualizable_info
+                && vinfo.is_vtypeptr(vtypeptr_id)
+            {
+                // Dedupe by Arc identity so the upstream
+                // `assert len(seen) == 1` translates to "at most one
+                // distinct VirtualizableInfo per VTYPEPTR".
+                let seen_already = seen
+                    .iter()
+                    .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
+                if !seen_already {
+                    seen.push(std::sync::Arc::clone(vinfo));
                 }
             }
         }
@@ -3138,10 +3137,10 @@ impl CallControl {
     /// the `(GTYPE, fieldname) in green_fields` membership test.
     pub fn could_be_green_field(&self, gtype: &str, fieldname: &str) -> bool {
         for jd in &self.jitdrivers_sd {
-            if let Some(gfinfo) = &jd.greenfield_info {
-                if gfinfo.contains_green_field(gtype, fieldname) {
-                    return true;
-                }
+            if let Some(gfinfo) = &jd.greenfield_info
+                && gfinfo.contains_green_field(gtype, fieldname)
+            {
+                return true;
             }
         }
         false
@@ -4098,7 +4097,7 @@ impl CallControl {
                         if let Some(name) = first_name {
                             let all_same = matches.iter().all(|p| {
                                 self.function_graphs
-                                    .get(*p)
+                                    .get(p)
                                     .map(|g| g.name == name)
                                     .unwrap_or(false)
                             });
@@ -4133,10 +4132,10 @@ impl CallControl {
             } => {
                 // call.py:181 getfunctionptr(graph) — resolved_path
                 // is the graph identity key stamped by the producer.
-                if let Some(path) = resolved_path {
-                    if self.function_graphs.contains_key(path) {
-                        return Some(path.clone());
-                    }
+                if let Some(path) = resolved_path
+                    && self.function_graphs.contains_key(path)
+                {
+                    return Some(path.clone());
                 }
                 // `call.py:97` direct_call → `funcobj.graph` — inherent
                 // method receivers carry a canonical `module::Type`
@@ -4242,7 +4241,7 @@ impl CallControl {
             .map(|g| g.name.as_str())?;
         let all_same = matches.iter().all(|p| {
             self.function_graphs
-                .get(*p)
+                .get(p)
                 .map(|g| g.name == first_graph_name)
                 .unwrap_or(false)
         });
@@ -4452,10 +4451,10 @@ impl CallControl {
         receiver_root: Option<&str>,
         resolved_path: Option<&CallPath>,
     ) -> Option<&FunctionGraph> {
-        if let Some(path) = resolved_path {
-            if let Some(g) = self.function_graphs.get(path) {
-                return Some(g);
-            }
+        if let Some(path) = resolved_path
+            && let Some(g) = self.function_graphs.get(path)
+        {
+            return Some(g);
         }
         let impls = self.impls_for_method_name(name);
         if impls.is_empty() {
@@ -4488,10 +4487,10 @@ impl CallControl {
             // would fall through and resolve to an unrelated type that
             // happens to be the table's unique owner of the same
             // method name (`pop` → dict-strategy pop).
-            if let Some(path) = self.suffix_match_impl_method(receiver, name) {
-                if let Some(g) = self.function_graphs.get(&path) {
-                    return Some(g);
-                }
+            if let Some(path) = self.suffix_match_impl_method(receiver, name)
+                && let Some(g) = self.function_graphs.get(&path)
+            {
+                return Some(g);
             }
             // Known concrete struct receiver with no matching impl
             // graph anywhere: do NOT fall through to the
@@ -5306,7 +5305,7 @@ impl CallControl {
     /// RPython call.py:337-355 — `_canraise()` returns the tri-state
     /// `{False, "mem", True}` collapsed here to [`CanRaise`].
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
-        if let Some(&result) = cache.can_raise.get(&path) {
+        if let Some(&result) = cache.can_raise.get(path) {
             return result;
         }
         let mut seen = HashSet::new();
@@ -5355,11 +5354,11 @@ impl CallControl {
     /// Cached version of analyze_forces_virtualizable for a CallTarget.
     /// RPython: VirtualizableAnalyzer external calls → bottom_result (False).
     fn cached_forces_virtualizable_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.forces_virtualizable.get(&path) {
+        if let Some(&result) = cache.forces_virtualizable.get(path) {
             return result;
         }
         let mut seen = HashSet::new();
-        let result = self.analyze_forces_virtualizable(&path, &mut seen);
+        let result = self.analyze_forces_virtualizable(path, &mut seen);
         cache.forces_virtualizable.insert(path.clone(), result);
         result
     }
@@ -5389,11 +5388,11 @@ impl CallControl {
     /// Cached version of analyze_random_effects for a CallTarget.
     /// RPython: RandomEffectsAnalyzer defaults to False for external calls.
     fn cached_random_effects_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.random_effects.get(&path) {
+        if let Some(&result) = cache.random_effects.get(path) {
             return result;
         }
         let mut seen = HashSet::new();
-        let result = self.analyze_random_effects(&path, &mut seen);
+        let result = self.analyze_random_effects(path, &mut seen);
         cache.random_effects.insert(path.clone(), result);
         result
     }
@@ -5422,11 +5421,11 @@ impl CallControl {
 
     /// Cached version of analyze_can_invalidate for a CallTarget.
     fn cached_can_invalidate_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_invalidate.get(&path) {
+        if let Some(&result) = cache.can_invalidate.get(path) {
             return result;
         }
         let mut seen = HashSet::new();
-        let result = self.analyze_can_invalidate(&path, &mut seen);
+        let result = self.analyze_can_invalidate(path, &mut seen);
         cache.can_invalidate.insert(path.clone(), result);
         result
     }
@@ -5457,11 +5456,11 @@ impl CallControl {
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
     /// graphanalyze.py:60: analyze_external_call → bottom_result() (False).
     fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
-        if let Some(&result) = cache.can_collect.get(&path) {
+        if let Some(&result) = cache.can_collect.get(path) {
             return result;
         }
         let mut seen = HashSet::new();
-        let result = self.analyze_can_collect(&path, &mut seen);
+        let result = self.analyze_can_collect(path, &mut seen);
         cache.can_collect.insert(path.clone(), result);
         result
     }
@@ -5581,10 +5580,10 @@ impl CallControl {
         // RPython call.py:259-280 indirect_call branch: family-wide
         // validation. Reject families mixing elidable/loopinvariant/
         // call_aroundstate with ordinary members.
-        if let CallShape::Indirect(Some(graphs)) = shape {
-            if let Err(err) = self.check_indirect_call_family(graphs) {
-                panic!("getcalldescr: {err}");
-            }
+        if let CallShape::Indirect(Some(graphs)) = shape
+            && let Err(err) = self.check_indirect_call_family(graphs)
+        {
+            panic!("getcalldescr: {err}");
         }
 
         // RPython call.py:220-234 signature validation:
@@ -6261,7 +6260,7 @@ pub fn effectinfo_from_writeanalyze(
 
     // effectinfo.py:201-206: single_write_descr_array
     let single_write_descr_array = if array_write_descrs.len() == 1 {
-        Some(array_write_descrs.iter().next().unwrap().0.clone())
+        Some(array_write_descrs.first().unwrap().0.clone())
     } else {
         None
     };
@@ -6575,10 +6574,10 @@ pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     // Angle brackets: Vec<T>, Box<T>, etc.  Checked after the slice
     // form so `[Rc<T>]` yields `Rc<T>`, not `T` — matches the front-end's
     // `StructFieldRegistry` array-element-type convention.
-    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>')) {
-        if start < end {
-            return Some(s[start + 1..end].trim().to_string());
-        }
+    if let (Some(start), Some(end)) = (s.find('<'), s.rfind('>'))
+        && start < end
+    {
+        return Some(s[start + 1..end].trim().to_string());
     }
     None
 }
@@ -6718,14 +6717,12 @@ fn collect_readwrite_effects(
                     // struct layout is not registered with `cc.struct_fields`
                     // (analyzer-unknown owner — matches PyPy's
                     // `consider_struct=False` filter at effectinfo.py:380).
-                    if let Some(owner) = field.owner_root.as_deref() {
-                        if !field_read_descrs.iter().any(|d| d.0.index() == idx) {
-                            if let Some(descr) =
-                                cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
-                            {
-                                field_read_descrs.push((descr.0, Some(descr.1)));
-                            }
-                        }
+                    if let Some(owner) = field.owner_root.as_deref()
+                        && !field_read_descrs.iter().any(|d| d.0.index() == idx)
+                        && let Some(descr) =
+                            cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
+                    {
+                        field_read_descrs.push((descr.0, Some(descr.1)));
                     }
                 }
                 // RPython: ("struct", T, fieldname)
@@ -6734,14 +6731,12 @@ fn collect_readwrite_effects(
                     write_fields.push(idx);
                     // RPython: effectinfo.py:301-305 — same as FieldRead's
                     // implicit `add_struct` walk, just into `write_descrs_fields`.
-                    if let Some(owner) = field.owner_root.as_deref() {
-                        if !field_write_descrs.iter().any(|d| d.0.index() == idx) {
-                            if let Some(descr) =
-                                cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
-                            {
-                                field_write_descrs.push((descr.0, Some(descr.1)));
-                            }
-                        }
+                    if let Some(owner) = field.owner_root.as_deref()
+                        && !field_write_descrs.iter().any(|d| d.0.index() == idx)
+                        && let Some(descr) =
+                            cc.fielddescrof_keyed(idx, owner, field.owner_id, &field.name)
+                    {
+                        field_write_descrs.push((descr.0, Some(descr.1)));
                     }
                 }
                 // RPython: ("readarray", T)
@@ -6892,12 +6887,10 @@ fn collect_readwrite_effects(
                     if !interior_read_descrs
                         .iter()
                         .any(|d| d.0.index() == ifield_idx)
-                    {
-                        if let Some(descr) =
+                        && let Some(descr) =
                             cc.interiorfielddescrof_keyed(ifield_idx, &resolved_id, &field.name)
-                        {
-                            interior_read_descrs.push((descr.0, Some(descr.1)));
-                        }
+                    {
+                        interior_read_descrs.push((descr.0, Some(descr.1)));
                     }
                     // effectinfo.py:327-340: synthesizes `("readarray", T)`
                     // for every `("readinteriorfield", T, _)` so the
@@ -6963,12 +6956,10 @@ fn collect_readwrite_effects(
                     if !interior_write_descrs
                         .iter()
                         .any(|d| d.0.index() == ifield_idx)
-                    {
-                        if let Some(descr) =
+                        && let Some(descr) =
                             cc.interiorfielddescrof_keyed(ifield_idx, &resolved_id, &field.name)
-                        {
-                            interior_write_descrs.push((descr.0, Some(descr.1)));
-                        }
+                    {
+                        interior_write_descrs.push((descr.0, Some(descr.1)));
                     }
                     // effectinfo.py:327-340: synthesizes `("array", T)`
                     // for every `("interiorfield", T, _)` so the implicit
@@ -7253,7 +7244,7 @@ fn all_interiorfielddescrs(
         bool,
         majit_ir::descr::ArrayFlag,
     )> = Vec::new();
-    for (_i, (field_name, field_type_str)) in fields.iter().enumerate() {
+    for (field_name, field_type_str) in fields.iter() {
         let (flag, field_type, field_size) = get_type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;

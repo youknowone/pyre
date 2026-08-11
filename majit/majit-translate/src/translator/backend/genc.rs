@@ -189,10 +189,9 @@ impl CBuilder {
                     Ok(crate::config::config::ConfigValue::Value(
                         crate::config::config::OptionValue::Bool(true)
                     ))
-                ) {
-                    if let Some(parent) = pypy_include_dir.parent() {
-                        include_dirs.push(parent.join("revdb"));
-                    }
+                ) && let Some(parent) = pypy_include_dir.parent()
+                {
+                    include_dirs.push(parent.join("revdb"));
                 }
             }
             Err(_) => {
@@ -520,7 +519,7 @@ impl ExternalCompilationInfo {
         };
         let mut unique_others: Vec<&ExternalCompilationInfo> = Vec::new();
         for other in others {
-            if !unique_others.iter().any(|seen| *seen == *other) {
+            if !unique_others.contains(other) {
                 unique_others.push(*other);
             }
         }

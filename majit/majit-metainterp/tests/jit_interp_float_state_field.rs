@@ -50,7 +50,7 @@ mod scalar {
             pc += 1;
             match opcode {
                 OP_NOP => {}
-                OP_TOUCH_F => state.f = state.f + 1.5,
+                OP_TOUCH_F => state.f += 1.5,
                 _ => break,
             }
         }
@@ -71,13 +71,13 @@ mod scalar {
         assert!(
             bodies
                 .iter()
-                .any(|body| body.iter().any(|&b| b == BC_LOAD_STATE_FIELD_FLOAT)),
+                .any(|body| body.contains(&BC_LOAD_STATE_FIELD_FLOAT)),
             "float read must lower to load_state_field_float; bodies: {bodies:?}"
         );
         assert!(
             bodies
                 .iter()
-                .any(|body| body.iter().any(|&b| b == BC_STORE_STATE_FIELD_FLOAT)),
+                .any(|body| body.contains(&BC_STORE_STATE_FIELD_FLOAT)),
             "float write must lower to store_state_field_float; bodies: {bodies:?}"
         );
 
@@ -133,7 +133,7 @@ mod scalar_toplevel {
             pc += 1;
             // Top-level float write — reaches the `stmt_modifies_jit_state`
             // gate in `lower_dispatch_body` rather than the arm-inline path.
-            state.f = state.f + 1.5;
+            state.f += 1.5;
             match opcode {
                 OP_NOP => {}
                 _ => break,
@@ -154,7 +154,7 @@ mod scalar_toplevel {
         assert!(
             bodies
                 .iter()
-                .any(|body| body.iter().any(|&b| b == BC_STORE_STATE_FIELD_FLOAT)),
+                .any(|body| body.contains(&BC_STORE_STATE_FIELD_FLOAT)),
             "a top-level float write must lower to store_state_field_float; bodies: {bodies:?}"
         );
     }
@@ -194,7 +194,7 @@ mod virt_array {
             pc += 1;
             match opcode {
                 OP_NOP => {}
-                OP_TOUCH_REGS => state.regs[0] = state.regs[0] + 1.25,
+                OP_TOUCH_REGS => state.regs[0] += 1.25,
                 _ => break,
             }
         }
@@ -218,13 +218,13 @@ mod virt_array {
         assert!(
             bodies
                 .iter()
-                .any(|body| body.iter().any(|&b| b == BC_GETARRAYITEM_VABLE_F)),
+                .any(|body| body.contains(&BC_GETARRAYITEM_VABLE_F)),
             "float virt array read must lower to getarrayitem_vable_f; bodies: {bodies:?}"
         );
         assert!(
             bodies
                 .iter()
-                .any(|body| body.iter().any(|&b| b == BC_SETARRAYITEM_VABLE_F)),
+                .any(|body| body.contains(&BC_SETARRAYITEM_VABLE_F)),
             "float virt array write must lower to setarrayitem_vable_f; bodies: {bodies:?}"
         );
     }
@@ -436,8 +436,8 @@ mod virt_array_with_float_scalar {
             match opcode {
                 OP_NOP => {}
                 OP_STEP => {
-                    state.stack[0] = state.stack[0] + 1;
-                    state.acc = state.acc + 1.5;
+                    state.stack[0] += 1;
+                    state.acc += 1.5;
                     // Read-only: a MUTATED plain `[int]` is refused outright
                     // (it is not restored on deopt), so the fixed array is
                     // loop-carried but never written.

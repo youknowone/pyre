@@ -978,10 +978,10 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        if let Some(caches) = self.caches.lock().unwrap().as_mut() {
-            if let Some(cache) = caches.get(key) {
-                cache.lock().unwrap().cell = Some(w_to_store);
-            }
+        if let Some(caches) = self.caches.lock().unwrap().as_mut()
+            && let Some(cache) = caches.get(key)
+        {
+            cache.lock().unwrap().cell = Some(w_to_store);
         }
     }
 
@@ -1021,13 +1021,13 @@ impl ModuleDictStrategy {
         key: &str,
     ) -> Option<PyObjectRef> {
         let removed = storage.remove(key)?;
-        if let Some(caches) = self.caches.lock().unwrap().as_mut() {
-            if let Some(cache) = caches.get(key) {
-                // `celldict.py:117-121`: zero out the per-key cache
-                // so LOAD_GLOBAL falls through to the builtins
-                // fallback (or NameError) on the next read.
-                cache.lock().unwrap().cell = None;
-            }
+        if let Some(caches) = self.caches.lock().unwrap().as_mut()
+            && let Some(cache) = caches.get(key)
+        {
+            // `celldict.py:117-121`: zero out the per-key cache
+            // so LOAD_GLOBAL falls through to the builtins
+            // fallback (or NameError) on the next read.
+            cache.lock().unwrap().cell = None;
         }
         self.mutated();
         Some(removed)
@@ -1301,9 +1301,10 @@ pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
     if w_dict.is_null() {
         return;
     }
-    if (*(w_dict as *const crate::pyobject::PyObject)).ob_type
-        != &crate::dictmultiobject::MODULE_DICT_TYPE as *const crate::pyobject::PyType
-    {
+    if !std::ptr::eq(
+        (*(w_dict as *const crate::pyobject::PyObject)).ob_type,
+        &crate::dictmultiobject::MODULE_DICT_TYPE,
+    ) {
         return;
     }
     let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
@@ -1335,7 +1336,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         strategy.register_version_watcher(&flag);
         // Before a structural change the watching loop is still valid.
-        assert_eq!(flag.load(Ordering::Acquire), false);
+        assert!(!flag.load(Ordering::Acquire));
         // `mutated()` reassigns `version` and must invalidate the loop.
         strategy.mutated();
         assert!(flag.load(Ordering::Acquire));

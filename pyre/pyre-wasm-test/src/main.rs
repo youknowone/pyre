@@ -2,7 +2,7 @@ use pyre_interpreter::*;
 use std::cell::RefCell;
 
 thread_local! {
-    static TEST_OUTPUT: RefCell<String> = RefCell::new(String::new());
+    static TEST_OUTPUT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 fn capture_print(bytes: &[u8]) {

@@ -1,3 +1,31 @@
+// This backend is a token-level port of RPython's assemblers. Several Clippy
+// rewrites are unsafe inside `dynasm!` because register operands use macro
+// conversions that look redundant after expansion; indexed register-allocation
+// loops and helper signatures also intentionally track the upstream source.
+#![allow(
+    clippy::borrow_deref_ref,
+    clippy::collapsible_if,
+    clippy::doc_lazy_continuation,
+    clippy::empty_line_after_doc_comments,
+    clippy::manual_is_multiple_of,
+    clippy::manual_range_contains,
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::new_without_default,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::single_match,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_mut_passed,
+    clippy::unnecessary_unwrap,
+    clippy::useless_conversion,
+    clippy::wrong_self_convention
+)]
+
 /// rpython/jit/backend/ parity:
 /// Direct machine code generation via dynasm-rs with in-place patching.
 ///

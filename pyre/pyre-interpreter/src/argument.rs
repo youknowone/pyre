@@ -1563,7 +1563,7 @@ pub fn collect_keyword_args(
 
 #[inline]
 fn mapping_contains(mapping: &[isize], target: isize) -> bool {
-    mapping.iter().any(|&j| j == target)
+    mapping.contains(&target)
 }
 
 /// pypy/interpreter/argument.py:523-641 — `ArgErr` exception hierarchy.

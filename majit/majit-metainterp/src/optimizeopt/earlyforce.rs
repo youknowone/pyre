@@ -22,11 +22,11 @@ pub fn is_raw_free(op: &Op, opnum: OpCode) -> bool {
         return false;
     }
     let __descr_arc_descr = op.getdescr();
-    if let Some(ref descr) = __descr_arc_descr.as_ref() {
-        if let Some(cd) = descr.as_call_descr() {
-            let ei = cd.get_extra_info();
-            return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
-        }
+    if let Some(descr) = __descr_arc_descr.as_ref()
+        && let Some(cd) = descr.as_call_descr()
+    {
+        let ei = cd.get_extra_info();
+        return ei.oopspecindex == majit_ir::OopSpecIndex::RawFree;
     }
     false
 }

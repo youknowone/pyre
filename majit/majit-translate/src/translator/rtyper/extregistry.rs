@@ -1236,7 +1236,7 @@ mod tests {
 
     fn meta_for(name: &str, greens: &[&str], reds: &[&str]) -> Arc<JitDriverMeta> {
         let id = HostObject::new_instance(
-            HostObject::new_class(&format!("pkg.extregistry.{name}"), vec![]),
+            HostObject::new_class(format!("pkg.extregistry.{name}"), vec![]),
             vec![],
         );
         Arc::new(JitDriverMeta {

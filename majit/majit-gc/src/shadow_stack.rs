@@ -1145,7 +1145,7 @@ pub fn resume_ref_roots_depth() -> usize {
 /// precondition — the cache slice they write into has to be forwardable in
 /// place by a collection their allocations trigger — instead of arguing it.
 pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
-    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().iter().any(|&(p, _)| p as *const i64 == ptr))
+    RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().iter().any(|&(p, _)| std::ptr::eq(p, ptr)))
 }
 
 /// Register a ref slice as a GC root for the blackhole resume
@@ -1314,10 +1314,8 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
         let guard = EXTRA_ROOT_WALKERS.read().unwrap();
         *guard
     };
-    for slot in walkers.iter() {
-        if let Some(walker) = slot {
-            walker(&mut visitor);
-        }
+    for walker in walkers.iter().flatten() {
+        walker(&mut visitor);
     }
 }
 
@@ -1657,7 +1655,7 @@ mod tests {
             gcref.0 = 0xDEAD;
         });
         assert_eq!(jf_top_ptr(), GcRef(0xDEAD));
-        assert_eq!(majit_jf_shadow_stack_get_top_jf_ptr(), 0xDEAD as i64);
+        assert_eq!(majit_jf_shadow_stack_get_top_jf_ptr(), 0xDEAD_i64);
         pop_jf_to(0);
     }
 

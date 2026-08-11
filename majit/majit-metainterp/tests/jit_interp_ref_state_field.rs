@@ -40,6 +40,7 @@ impl BytecodeExt for [u8] {
     env = Bytecode,
     state_fields = { a: int, sel: ref(Stack) },
 )]
+#[allow(clippy::self_assignment)]
 #[allow(unused_assignments, unused_variables)]
 fn ref_minimal(program: &Bytecode, threshold: u32) -> i64 {
     let mut driver: JitDriver<RefTestState> = JitDriver::new(threshold);
@@ -97,13 +98,13 @@ fn ref_state_field_lowers_load_and_store_state_field_ref() {
     assert!(
         bodies
             .iter()
-            .any(|body| body.iter().any(|&b| b == BC_LOAD_STATE_FIELD_REF)),
+            .any(|body| body.contains(&BC_LOAD_STATE_FIELD_REF)),
         "ref read must lower to load_state_field_ref; bodies: {bodies:?}"
     );
     assert!(
         bodies
             .iter()
-            .any(|body| body.iter().any(|&b| b == BC_STORE_STATE_FIELD_REF)),
+            .any(|body| body.contains(&BC_STORE_STATE_FIELD_REF)),
         "ref write must lower to store_state_field_ref; bodies: {bodies:?}"
     );
 }
