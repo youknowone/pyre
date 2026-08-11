@@ -3420,6 +3420,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     == callee_code_key
         };
 
+    // Keep the closure cells as red operands.  A MAKE_FUNCTION in the caller's
+    // loop creates a fresh function and fresh enclosing cells on every
+    // iteration; the trace-time cell pointers are only the concrete shadow
+    // used while walking.  PyPy threads the live closure cells into each
+    // callee MIFrame through setup_call, so folding them to constants here
+    // collapses distinct inlined frames onto the tracing iteration's cells.
+    // Specializer-owned callees which cannot be read through
+    // `callable_guard_op` retain the already-pinned concrete cells.
+    let mut freevar_cell_ops: Vec<OpRef> = concrete_freevar_cells
+        .iter()
+        .map(|&cell| ctx.trace_ctx.const_ref(cell as i64))
+        .collect();
+
     if !guards_the_callee_function {
         // Those sites resolve the callee through their own guarded path (a
         // type version tag, a receiver class guard); all this has to pin is
@@ -3434,12 +3447,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
     } else {
         // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
-        // The three constants this inline bakes — the code object below, the
-        // globals namespace in `InlineCalleeConsts`, and the freevar cells
-        // baked into the callee frame — are exactly the `?`-fields
-        // `_immutable_fields_ = ['code?', 'w_func_globals?', 'closure?[*]',
-        // 'defs_w?[*]']` names, so guard each of them off the live function.
-        // `defs_w` has its own guard below.
+        // The code object below and globals namespace in `InlineCalleeConsts`
+        // are baked constants, so guard those `?`-fields off the live
+        // function. `defs_w` has its own guard below. Closure cells differ:
+        // `closure?[*]` permits a pure live read, but the cells themselves are
+        // red inputs to the callee frame and must not be pinned to the tracing
+        // iteration.
         //
         // Reading them live is what `f.__code__ = g.__code__` needs: pinning
         // the object pins none of its fields.  Upstream is safe there because
@@ -3468,12 +3481,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         )?;
         if !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
-            // `MAKE_FUNCTION`, so guarding its identity would reintroduce the
-            // per-iteration failure.  The cells are what this inline bakes and
-            // what the enclosing frame keeps stable, so read the tuple live and
-            // guard each element instead.  The element count needs no guard of
-            // its own: `code` above pins `co_freevars`, and a closure always
-            // has exactly that many cells.
+            // `MAKE_FUNCTION`, so read its cells live and thread those red
+            // operands into the new callee frame. The element count needs no
+            // guard of its own: `code` above pins `co_freevars`, and a closure
+            // always has exactly that many cells.
             let closure_op = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 callable_guard_op,
@@ -3488,6 +3499,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 closure_op,
                 crate::descr::tuple_wrappeditems_descr(),
             );
+            freevar_cell_ops.clear();
             for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
                 let index_op = ctx.trace_ctx.const_int(i as i64);
                 let cell_op = crate::state::trace_items_block_getitem_value_pure(
@@ -3499,13 +3511,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                     cell_op,
                     majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
                 );
-                let cell_const = ctx.trace_ctx.const_ref(cell as i64);
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardValue, &[cell_op, cell_const], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .replace_box(cell_op, cell_const);
+                freevar_cell_ops.push(cell_op);
             }
         }
     }
@@ -3893,14 +3899,10 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
             let param_boxes: Vec<OpRef> = (0..seeded_locals).map(|i| callee_args[i]).collect();
-            let freevar_cells: Vec<OpRef> = concrete_freevar_cells
-                .iter()
-                .map(|&cell| ctx.trace_ctx.const_ref(cell as i64))
-                .collect();
             let callee_frame = crate::helpers::emit_new_pyframe_inline_with_params(
                 ctx.trace_ctx,
                 &param_boxes,
-                &freevar_cells,
+                &freevar_cell_ops,
                 nlocals,
                 frame_array_size,
                 nlocals + ncells,
@@ -4381,9 +4383,12 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
             // same live cell instead of manufacturing an unstamped
             // GetarrayitemGcR result.  This callee shape has no fresh cellvars
             // (rejected above), so existing freevars begin at `nlocals`.
-            for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
+            for (i, (&cell, &value)) in concrete_freevar_cells
+                .iter()
+                .zip(&freevar_cell_ops)
+                .enumerate()
+            {
                 let slot = (callee_code.varnames.len() + i) as i64;
-                let value = sub_wc.trace_ctx.const_ref(cell as i64);
                 let shadow = sub_wc.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(

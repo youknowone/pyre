@@ -4588,7 +4588,20 @@ fn run_perfn_walk<Sym: WalkSym>(
                     // exact-coordinate walk mirror here.  Resolution and GC
                     // rooting are shared with the established escape/qmut
                     // mid-expression handoff.
-                    if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
+                    if !crate::jitcode_dispatch::fbw_foriter_inflight_active() {
+                        // A function-entry trace can reach the same kept-stack
+                        // abort without any FOR_ITER carrier.  Its live MIFrame
+                        // mirror is already the complete continuation; requiring
+                        // an iterator entry here discarded that state and
+                        // replayed from function entry after eager effects had
+                        // run (a recursive closure's `need.add` lost one item).
+                        crate::jitcode_dispatch::flush_with_latched_stack(
+                            ctx,
+                            cf_addr,
+                            resume_py_pc,
+                            stack,
+                        )
+                    } else if crate::jitcode_dispatch::fbw_foriter_inflight_completed_at_resume(
                         cf_addr,
                         resume_py_pc,
                     ) {
