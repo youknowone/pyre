@@ -244,7 +244,10 @@ pub fn transform_dead_code(ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
         // rebinds the attribute which changes subsequent comparisons).
         let exits_snapshot: Vec<LinkRef> = block.borrow().exits.to_vec();
         for link in exits_snapshot {
-            let followed = ann.links_followed.borrow().contains(&LinkKey::of(&link));
+            let followed = ann
+                .links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link));
             if followed {
                 continue;
             }
@@ -390,7 +393,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     // upstream: `self.links_followed[errlink] = True`.
     ann.links_followed
         .borrow_mut()
-        .insert(LinkKey::of(&errlink));
+        .insert(LinkKey::of(&errlink), errlink.clone());
 
     // upstream: `etype, evalue = graph.exceptblock.inputargs`.
     let (etype_rc, evalue_rc) = {
@@ -1019,7 +1022,9 @@ mod tests {
         // Mark the single exit as followed so transform_dead_code
         // doesn't prune it.
         for link in &start.borrow().exits {
-            ann.links_followed.borrow_mut().insert(LinkKey::of(link));
+            ann.links_followed
+                .borrow_mut()
+                .insert(LinkKey::of(link), link.clone());
         }
 
         transform_graph(&ann, None, Some(&[start.clone()]));
@@ -1066,7 +1071,9 @@ mod tests {
             .borrow_mut()
             .insert(BlockKey::of(&start), start.clone());
         for link in &start.borrow().exits {
-            ann.links_followed.borrow_mut().insert(LinkKey::of(link));
+            ann.links_followed
+                .borrow_mut()
+                .insert(LinkKey::of(link), link.clone());
         }
 
         transform_graph(&ann, None, Some(&[start.clone()]));
@@ -1116,7 +1123,9 @@ mod tests {
         start.closeblock(vec![left.clone(), right.clone()]);
 
         // Only the false branch is followed.
-        ann.links_followed.borrow_mut().insert(LinkKey::of(&left));
+        ann.links_followed
+            .borrow_mut()
+            .insert(LinkKey::of(&left), left.clone());
         ann.annotated
             .borrow_mut()
             .insert(BlockKey::of(&start), Some(graph.clone()));

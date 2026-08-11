@@ -13,7 +13,7 @@
 
 use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::super::flowspace::model::{
@@ -98,7 +98,10 @@ pub struct RPythonAnnotator {
     /// entire monotonically-growing annotator session for every subject.
     subject_annotation_snapshots: RefCell<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
     /// RPython `self.links_followed = {}` (annrpython.py:39).
-    pub links_followed: RefCell<HashSet<LinkKey>>,
+    /// Retains each link because the key is its address: a link removed from a
+    /// block's `exits` would otherwise be freed, and a later link allocated at
+    /// that address would read back as already followed.
+    pub links_followed: RefCell<IndexMap<LinkKey, LinkRef>>,
     /// RPython `self.notify = {}` (annrpython.py:40).
     /// The ordered container is required because the key hashes on a
     /// pointer and the loop over the values produces a work order.
@@ -533,7 +536,7 @@ impl RPythonAnnotator {
                 all_blocks: RefCell::new(IndexMap::new()),
                 added_blocks: RefCell::new(None),
                 subject_annotation_snapshots: RefCell::new(None),
-                links_followed: RefCell::new(HashSet::new()),
+                links_followed: RefCell::new(IndexMap::new()),
                 notify: RefCell::new(IndexMap::new()),
                 fixed_graphs: RefCell::new(IndexMap::new()),
                 blocked_blocks: RefCell::new(IndexMap::new()),
@@ -1168,7 +1171,10 @@ impl RPythonAnnotator {
         let graphs: Vec<GraphRef> = match block_subset {
             None => self.translator.graphs.borrow().clone(),
             Some(blocks) => {
-                let mut seen: HashMap<GraphKey, GraphRef> = HashMap::new();
+                // The ordered container is required because the key hashes
+                // on a pointer and the loop over the values produces a work
+                // order.
+                let mut seen: IndexMap<GraphKey, GraphRef> = IndexMap::new();
                 let annotated = self.annotated.borrow();
                 for block in blocks {
                     let key = BlockKey::of(block);
@@ -1911,7 +1917,7 @@ impl RPythonAnnotator {
 
         let lkey = LinkKey::of(link);
         drop(link_borrow);
-        self.links_followed.borrow_mut().insert(lkey);
+        self.links_followed.borrow_mut().insert(lkey, link.clone());
         // Internal flowin produces concrete SomeValue per link arg (None
         // is upstream's "unannotated caller arg" signal that originates
         // from the call-site interface, not from intra-graph flow).
@@ -2101,7 +2107,7 @@ impl RPythonAnnotator {
         }
 
         let lkey = LinkKey::of(link);
-        self.links_followed.borrow_mut().insert(lkey);
+        self.links_followed.borrow_mut().insert(lkey, link.clone());
         let inputs_s_opt: Vec<Option<SomeValue>> = inputs_s.into_iter().map(Some).collect();
         self.addpendingblock(graph, &target_rc, &inputs_s_opt);
     }
@@ -3323,7 +3329,11 @@ mod tests {
         ann.follow_link(&graph, &link, &HashMap::new());
 
         // links_followed should record this link.
-        assert!(ann.links_followed.borrow().contains(&LinkKey::of(&link)));
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&link))
+        );
         // target.inputargs[0].annotation should be SomeInteger.
         let bound = {
             let t = target.borrow();

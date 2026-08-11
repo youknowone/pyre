@@ -6146,6 +6146,9 @@ fn canonicalize_keyed_descrs(
         descrs.push(descr);
         keys.push(key?);
     }
+    // The raw set stays in pointer order for identity dedup and lookup, while
+    // the member order crossing into the artifact is determined by content.
+    keys.sort();
     Some((descrs, keys))
 }
 

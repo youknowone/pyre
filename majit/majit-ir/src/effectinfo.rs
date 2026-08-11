@@ -35,7 +35,7 @@ impl std::error::Error for UnsupportedFieldExc {}
 /// these tuples.  The key alone identifies the slot; what it does *not* carry
 /// is the layout needed to create the descr when the slot is empty, which is
 /// what [`DescrMintSpec`] adds.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DescrSetMember {
     /// `descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname)` —
     /// `_cache_field[Struct(struct_id)][field_name]`.
