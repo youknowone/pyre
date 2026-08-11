@@ -5825,6 +5825,21 @@ struct InflightForiter {
     body_completed: bool,
 }
 
+/// Concrete iterator state to restore when a bridge walk is abandoned.
+#[derive(Clone, Copy)]
+enum BridgeIterJournalEntry {
+    Range {
+        iter: pyre_object::PyObjectRef,
+        pre_current: i64,
+        pre_remaining: i64,
+    },
+    Tuple {
+        iter: pyre_object::PyObjectRef,
+        pre_seq: pyre_object::PyObjectRef,
+        pre_index: i64,
+    },
+}
+
 thread_local! {
     /// Undo log for the walked region's eagerly executed list stores:
     /// `(list, key, displaced_value)` triples pushed by the `STORE_SUBSCR`
@@ -5956,15 +5971,15 @@ thread_local! {
     static FBW_FORITER_INFLIGHT: std::cell::RefCell<Vec<InflightForiter>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Undo log for a bridge/retrace recording walk's eager range-iterator
-    /// cursor advance.  The main walk leaves the advance unjournaled and relies
-    /// on in-flight FOR_ITER forward-delivery to recover the consumed item on
+    /// Undo log for a bridge/retrace recording walk's eager iterator cursor
+    /// mutation.  The main walk leaves the mutation unjournaled and relies on
+    /// in-flight FOR_ITER forward-delivery to recover the consumed item on
     /// abort; the bridge/retrace abort path has no such delivery, so a bridge
-    /// walk records `(iter, pre_current, pre_remaining)` here and restores the
-    /// cursor when it does NOT commit — leaving the recording side-effect
-    /// neutral so the interpreter resume re-consumes the item exactly once.
+    /// walk restores each entry when it does NOT commit — leaving the recording
+    /// side-effect neutral so interpreter resume re-consumes the item exactly
+    /// once.
     /// Only populated while `is_bridge_trace`; empty (no-op) on the main walk.
-    static FBW_BRIDGE_ITER_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>> =
+    static FBW_BRIDGE_ITER_JOURNAL: std::cell::RefCell<Vec<BridgeIterJournalEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
     static FBW_UNJOURNALED_VALUE_UNAVAILABLE: std::cell::Cell<bool> =
@@ -6174,7 +6189,7 @@ struct FbwStoreJournalRootArea {
     traceback_store:
         *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>>,
     foriter: *const std::cell::RefCell<Vec<InflightForiter>>,
-    bridge_iter: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64, i64)>>,
+    bridge_iter: *const std::cell::RefCell<Vec<BridgeIterJournalEntry>>,
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     active_session: *const std::cell::Cell<*const std::cell::RefCell<WalkSession>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
@@ -6603,16 +6618,18 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
-    // The bridge/retrace iterator cursor journal holds a range iterator across
-    // the rest of an authoritative bridge walk. When the parent compiled trace
-    // materialized that iterator via `NewWithVtable` (`CallMallocNursery`) it is
-    // nursery-resident, so a minor collection during the remaining walk moves it
-    // before the non-commit rollback restores its cursor — forward each iterator
-    // so `w_range_iter_set_cursor` writes through the live pointer, not a stale
-    // moved one. The `(pre_current, pre_remaining)` pair are plain scalars.
+    // Forward journal refs so rollback remains valid across moving GC.
     let bridge_iter = unsafe { &mut *(*area.bridge_iter).as_ptr() };
     for entry in bridge_iter.iter_mut() {
-        visitor(unsafe { &mut *(&mut entry.0 as *mut pyre_object::PyObjectRef).cast() });
+        match entry {
+            BridgeIterJournalEntry::Range { iter, .. } => {
+                visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
+            }
+            BridgeIterJournalEntry::Tuple { iter, pre_seq, .. } => {
+                visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
+                visitor(unsafe { &mut *(pre_seq as *mut pyre_object::PyObjectRef).cast() });
+            }
+        }
     }
     // gh#467: the latched forward-flush operand stack (callable + args) is
     // nursery-resident across the abort unwind — the flush boxes Int/Float

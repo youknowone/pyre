@@ -602,19 +602,58 @@ pub(crate) fn fbw_bridge_iter_journal_push(
     pre_current: i64,
     pre_remaining: i64,
 ) {
-    FBW_BRIDGE_ITER_JOURNAL.with(|j| j.borrow_mut().push((iter, pre_current, pre_remaining)));
+    FBW_BRIDGE_ITER_JOURNAL.with(|j| {
+        j.borrow_mut().push(BridgeIterJournalEntry::Range {
+            iter,
+            pre_current,
+            pre_remaining,
+        })
+    });
+}
+
+/// Record tuple-iterator state before a bridge walk mutates it.
+pub(crate) fn fbw_bridge_tuple_iter_journal_push(
+    iter: pyre_object::PyObjectRef,
+    pre_seq: pyre_object::PyObjectRef,
+    pre_index: i64,
+) {
+    FBW_BRIDGE_ITER_JOURNAL.with(|j| {
+        j.borrow_mut().push(BridgeIterJournalEntry::Tuple {
+            iter,
+            pre_seq,
+            pre_index,
+        })
+    });
 }
 
 /// Non-commit epilogue for a bridge/retrace recording walk: restore each
-/// range iterator to the cursor it held before the walk advanced it, in
-/// reverse push order.  The interpreter resume then re-consumes the item the
-/// aborted recording had taken, so the iteration is executed exactly once.
+/// iterator to the state it held before the walk mutated it, in reverse push
+/// order.  The interpreter resume then re-consumes the item the aborted
+/// recording had taken, so the iteration is executed exactly once.
 pub(crate) fn fbw_bridge_iter_journal_rollback() {
     FBW_BRIDGE_ITER_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
-        while let Some((iter, pre_current, pre_remaining)) = entries.pop() {
-            unsafe {
-                pyre_object::functional::w_range_iter_set_cursor(iter, pre_current, pre_remaining);
+        while let Some(entry) = entries.pop() {
+            match entry {
+                BridgeIterJournalEntry::Range {
+                    iter,
+                    pre_current,
+                    pre_remaining,
+                } => unsafe {
+                    pyre_object::functional::w_range_iter_set_cursor(
+                        iter,
+                        pre_current,
+                        pre_remaining,
+                    );
+                },
+                BridgeIterJournalEntry::Tuple {
+                    iter,
+                    pre_seq,
+                    pre_index,
+                } => unsafe {
+                    pyre_object::w_tuple_iter_set_seq(iter, pre_seq);
+                    pyre_object::w_tuple_iter_set_index(iter, pre_index);
+                },
             }
         }
     });

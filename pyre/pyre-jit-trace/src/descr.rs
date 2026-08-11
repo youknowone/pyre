@@ -1084,6 +1084,77 @@ static SEQ_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// PyPy `iterobject.py W_TupleIterObject` fields.
+static TUPLE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::iterobject::W_TupleIterObject>(),
+        <pyre_object::iterobject::W_TupleIterObject as pyre_object::lltype::GcType>::type_id(),
+        &pyre_object::iterobject::TUPLE_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                std::mem::offset_of!(pyre_object::iterobject::W_TupleIterObject, seq),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                std::mem::offset_of!(pyre_object::iterobject::W_TupleIterObject, index),
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+        ],
+        "W_TupleIterObject",
+        "iterobject::W_TupleIterObject",
+    )
+});
+
+/// PyPy `functional.py W_Zip` fields.
+static W_ZIP_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::functional::W_Zip>(),
+        <pyre_object::functional::W_Zip as pyre_object::lltype::GcType>::type_id(),
+        &pyre_object::functional::ZIP_TYPE as *const _ as usize,
+        &[
+            (
+                "w_iterators",
+                std::mem::offset_of!(pyre_object::functional::W_Zip, w_iterators),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "strict",
+                std::mem::offset_of!(pyre_object::functional::W_Zip, strict),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "iteration_progress",
+                std::mem::offset_of!(pyre_object::functional::W_Zip, iteration_progress),
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_Zip",
+        "functional::W_Zip",
+    )
+});
+
 /// `stop` carries no accessor of its own — the GET_ITER virtualization derives
 /// the cursor from `start` / `step` / `length` — but it is a pointer-shaped
 /// slot, so it belongs in the census for the same reason `FUNCTION_DESCR_GROUP`
@@ -2415,6 +2486,31 @@ pub fn seq_iter_index_descr() -> DescrRef {
     field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 1)
 }
 
+/// Field descriptor for `W_TupleIterObject.seq`.
+pub fn tuple_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&TUPLE_ITER_DESCR_GROUP, 0)
+}
+
+/// Field descriptor for `W_TupleIterObject.index`.
+pub fn tuple_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&TUPLE_ITER_DESCR_GROUP, 1)
+}
+
+/// Immutable iterator-list edge of `functional.py W_Zip`.
+pub fn zip_iterators_descr() -> DescrRef {
+    field_descr_from_group(&W_ZIP_DESCR_GROUP, 0)
+}
+
+/// Mutable `strict` flag of `functional.py W_Zip` (`__setstate__`).
+pub fn zip_strict_descr() -> DescrRef {
+    field_descr_from_group(&W_ZIP_DESCR_GROUP, 1)
+}
+
+/// `_iteration_progress`, updated while one zip row is fetched.
+pub fn zip_iteration_progress_descr() -> DescrRef {
+    field_descr_from_group(&W_ZIP_DESCR_GROUP, 2)
+}
+
 /// Resolve one [`RANGE_DESCR_GROUP`] field by byte offset, so the accessors
 /// below stay correct however the census is ordered.  They were positional
 /// until `stop` joined the census and shifted every later slot.
@@ -3464,6 +3560,16 @@ pub fn w_long_size_descr() -> DescrRef {
 /// Size descriptor for canonical `W_TupleObject`.
 pub fn w_tuple_size_descr() -> DescrRef {
     W_TUPLE_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `iterobject.py W_TupleIterObject`.
+pub fn tuple_iter_size_descr() -> DescrRef {
+    TUPLE_ITER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `functional.py W_Zip`.
+pub fn w_zip_size_descr() -> DescrRef {
+    W_ZIP_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for `W_SpecialisedTupleObject_ii`.
@@ -6190,6 +6296,8 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_UNICODE_DESCR_GROUP,
         &*RANGE_ITER_DESCR_GROUP,
         &*SEQ_ITER_DESCR_GROUP,
+        &*TUPLE_ITER_DESCR_GROUP,
+        &*W_ZIP_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
         &*W_METHOD_DESCR_GROUP,
         &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,

@@ -7549,6 +7549,182 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     Ok(Some(DispatchOutcome::Continue))
 }
 
+/// Virtualize PyPy's exact `zip(tuple0, tuple1, strict=True)` allocation chain.
+pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // CALL_KW keeps the keyword-name tuple after all argument values:
+    // [callable, null_or_self, p, q, strict, kwnames].
+    if r_args.len() != 6 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let [
+        ConcreteValue::Ref(callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(tuple0),
+        ConcreteValue::Ref(tuple1),
+        ConcreteValue::Ref(strict),
+        ConcreteValue::Ref(kwnames),
+    ] = arg_concretes.as_slice()
+    else {
+        return Ok(None);
+    };
+    let zip_callable = pyre_interpreter::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE);
+    if callable.is_null()
+        || !std::ptr::eq(*callable, zip_callable)
+        || !null_or_self.is_null()
+        || kwnames.is_null()
+        || unsafe { !pyre_object::is_tuple(*kwnames) }
+        || unsafe { pyre_object::w_tuple_len(*kwnames) } != 1
+        || !std::ptr::eq(*strict, pyre_object::w_bool_from(true))
+    {
+        return Ok(None);
+    }
+    let Some(keyword) = (unsafe { pyre_object::w_tuple_getitem(*kwnames, 0) }) else {
+        return Ok(None);
+    };
+    if unsafe {
+        !pyre_object::is_str(keyword)
+            || pyre_object::w_str_get_wtf8(keyword).as_str().ok() != Some("strict")
+    } {
+        return Ok(None);
+    }
+    let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
+    let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    for tuple in [*tuple0, *tuple1] {
+        if tuple.is_null()
+            || unsafe {
+                !std::ptr::eq((*tuple).ob_type, tuple_type)
+                    || !std::ptr::eq((*tuple).w_class, tuple_class)
+            }
+        {
+            return Ok(None);
+        }
+    }
+
+    // Recognition is complete; build the authentic shadow before emitting.
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(*tuple0);
+    pyre_object::gc_roots::pin_root(*tuple1);
+    let concrete_iter0 = pyre_object::w_tuple_iter_new(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(root_base)
+    });
+    pyre_object::gc_roots::pin_root(concrete_iter0);
+    let iter0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let concrete_iter1 = pyre_object::w_tuple_iter_new(unsafe {
+        pyre_object::gc_roots::shadow_stack_get(root_base + 1)
+    });
+    pyre_object::gc_roots::pin_root(concrete_iter1);
+    let iter1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let concrete_list = pyre_object::w_list_new(vec![
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iter0_slot) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(iter1_slot) },
+    ]);
+    pyre_object::gc_roots::pin_root(concrete_list);
+    let list_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let concrete_zip = pyre_object::functional::w_zip_new(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(list_slot) },
+        true,
+    );
+    if concrete_zip.is_null() {
+        drop(roots);
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
+    }
+    pyre_object::gc_roots::pin_root(concrete_zip);
+    let zip_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], *callable)?;
+    for (arg_op, concrete) in [(r_args[5], *kwnames), (r_args[4], *strict)] {
+        if !arg_op.is_constant() {
+            let expected = ctx.trace_ctx.const_ref(concrete as i64);
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[arg_op, expected])?;
+            ctx.trace_ctx.heap_cache_mut().replace_box(arg_op, expected);
+        }
+    }
+
+    let zero = ctx.trace_ctx.const_int(0);
+    let mut iterator_ops = Vec::with_capacity(2);
+    for (tuple_op, concrete_slot) in [(r_args[2], iter0_slot), (r_args[3], iter1_slot)] {
+        walker_guard_class(ctx, op.pc, tuple_op, tuple_type as i64)?;
+        walker_guard_exact_w_class(ctx, op.pc, tuple_op, tuple_class)?;
+        let iterator = ctx.trace_ctx.record_op_with_descr(
+            OpCode::NewWithVtable,
+            &[],
+            crate::descr::tuple_iter_size_descr(),
+        );
+        ctx.trace_ctx.heap_cache_mut().new_object(iterator);
+        let seq_descr = crate::descr::tuple_iter_seq_descr();
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[iterator, tuple_op],
+            seq_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(iterator, seq_descr.index(), tuple_op);
+        let index_descr = crate::descr::tuple_iter_index_descr();
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[iterator, zero],
+            index_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(iterator, index_descr.index(), zero);
+        ctx.trace_ctx.heap_cache_mut().class_now_known(
+            iterator,
+            &pyre_object::iterobject::TUPLE_ITER_TYPE as *const _ as i64,
+        );
+        // Re-read after allocations that may move the shadow.
+        let concrete_iter = unsafe { pyre_object::gc_roots::shadow_stack_get(concrete_slot) };
+        ctx.trace_ctx.set_opref_concrete(
+            iterator,
+            Value::Ref(majit_ir::GcRef(concrete_iter as usize)),
+        );
+        iterator_ops.push(iterator);
+    }
+
+    let iterator_list = crate::helpers::emit_object_list_inline(ctx.trace_ctx, &iterator_ops);
+    ctx.trace_ctx.set_opref_concrete(
+        iterator_list,
+        Value::Ref(majit_ir::GcRef(
+            unsafe { pyre_object::gc_roots::shadow_stack_get(list_slot) } as usize,
+        )),
+    );
+    let zip = ctx.trace_ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_zip_size_descr(),
+    );
+    ctx.trace_ctx.heap_cache_mut().new_object(zip);
+    for (value, descr) in [
+        (iterator_list, crate::descr::zip_iterators_descr()),
+        (ctx.trace_ctx.const_int(1), crate::descr::zip_strict_descr()),
+        (zero, crate::descr::zip_iteration_progress_descr()),
+    ] {
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[zip, value], descr.clone());
+        ctx.trace_ctx
+            .heapcache_setfield_cached(zip, descr.index(), value);
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(zip, &pyre_object::functional::ZIP_TYPE as *const _ as i64);
+    ctx.trace_ctx.set_opref_concrete(
+        zip,
+        Value::Ref(majit_ir::GcRef(
+            unsafe { pyre_object::gc_roots::shadow_stack_get(zip_slot) } as usize,
+        )),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', zip)?;
+    drop(roots);
+    Ok(Some(()))
+}
+
 /// Unrolling bound for [`try_walker_specialize_builtin_locals`].
 ///
 /// The modelled expansion is a straight-line unroll of `fast2locals`' slot
@@ -11813,6 +11989,20 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // `W_Zip.iter_w` is identity; exact-class guards preserve overrides.
+    let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
+    let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
+    if unsafe {
+        !range_obj.is_null()
+            && std::ptr::eq((*range_obj).ob_type, zip_type)
+            && std::ptr::eq((*range_obj).w_class, zip_class)
+    } {
+        walker_guard_class(ctx, op_pc, range_op, zip_type as i64)?;
+        walker_guard_exact_w_class(ctx, op_pc, range_op, zip_class)?;
+        ctx.vstack_last_ref = range_op;
+        return Ok(Some(range_op));
+    }
+
     let (concrete_start, concrete_step, concrete_length, concrete_mul, concrete_one_past) = unsafe {
         if !pyre_object::functional::is_w_range(range_obj)
             || !pyre_object::functional::is_exact_w_range(range_obj)
@@ -11991,6 +12181,318 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
 ///
 /// The continuation item is a normal virtualizable `W_IntObject`; allocation
 /// removal elides it until an escaping consumer or a deopt needs a real box.
+fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    zip_op: OpRef,
+    zip_obj: pyre_object::PyObjectRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+
+    let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
+    let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
+    let (iterators_obj, inner_objs, steps, strict) = unsafe {
+        if zip_obj.is_null()
+            || !std::ptr::eq((*zip_obj).ob_type, zip_type)
+            || !std::ptr::eq((*zip_obj).w_class, zip_class)
+        {
+            return Ok(None);
+        }
+        let iterators_obj = pyre_object::functional::w_zip_get_iterators(zip_obj);
+        if iterators_obj.is_null()
+            || !pyre_object::is_list(iterators_obj)
+            || !pyre_object::is_exact_builtin_instance(iterators_obj)
+        {
+            return Ok(None);
+        }
+        let list = &*(iterators_obj as *const pyre_object::listobject::W_ListObject);
+        if list.strategy != pyre_object::listobject::ListStrategy::Object
+            || pyre_object::w_list_len(iterators_obj) != 2
+        {
+            return Ok(None);
+        }
+        let Some(inner0) = pyre_object::w_list_getitem(iterators_obj, 0) else {
+            return Ok(None);
+        };
+        let Some(inner1) = pyre_object::w_list_getitem(iterators_obj, 1) else {
+            return Ok(None);
+        };
+
+        let mut steps = Vec::with_capacity(2);
+        for inner in [inner0, inner1] {
+            if !pyre_object::is_tuple_iter(inner)
+                || !std::ptr::eq((*inner).ob_type, &pyre_object::iterobject::TUPLE_ITER_TYPE)
+            {
+                return Ok(None);
+            }
+            let seq = pyre_object::w_tuple_iter_seq(inner);
+            let index = pyre_object::w_tuple_iter_index(inner);
+            if seq.is_null()
+                || !pyre_object::is_tuple(seq)
+                || !pyre_object::is_exact_builtin_instance(seq)
+                || index < 0
+            {
+                return Ok(None);
+            }
+            let len = pyre_object::w_tuple_len(seq) as i64;
+            let item = pyre_object::w_tuple_getitem(seq, index);
+            steps.push((seq, index, len, item));
+        }
+        (
+            iterators_obj,
+            [inner0, inner1],
+            steps,
+            pyre_object::functional::w_zip_get_strict(zip_obj),
+        )
+    };
+    let concrete_continues = steps.iter().all(|step| step.3.is_some());
+    let concrete_exhausted = steps.iter().all(|step| step.1 >= step.2);
+    // Mixed bounds must fall through to the interpreter's strict error path.
+    if !concrete_continues && !(strict && concrete_exhausted) {
+        return Ok(None);
+    }
+
+    // Reproduce PyPy's unrolled arity-two `W_Zip.next_w` shape.
+    walker_guard_class(ctx, op_pc, zip_op, zip_type as i64)?;
+    walker_guard_exact_w_class(ctx, op_pc, zip_op, zip_class)?;
+    let iterators_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        zip_op,
+        crate::descr::zip_iterators_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        iterators_op,
+        Value::Ref(majit_ir::GcRef(iterators_obj as usize)),
+    );
+
+    let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
+    walker_guard_class(ctx, op_pc, iterators_op, list_type)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        iterators_op,
+        pyre_object::get_instantiate(&pyre_object::LIST_TYPE),
+    )?;
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iterators_op,
+        crate::descr::list_strategy_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        strategy,
+        Value::Int(pyre_object::listobject::ListStrategy::Object as i64),
+    );
+    let object_strategy = ctx
+        .trace_ctx
+        .const_int(pyre_object::listobject::ListStrategy::Object as i64);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[strategy, object_strategy])?;
+    let list_len = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iterators_op,
+        crate::descr::list_length_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(list_len, Value::Int(2));
+    let two = ctx.trace_ctx.const_int(2);
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[list_len, two])?;
+    let iterator_block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        iterators_op,
+        crate::descr::list_items_descr(),
+    );
+
+    let mut inner_ops = Vec::with_capacity(2);
+    for (index, inner_obj) in inner_objs.into_iter().enumerate() {
+        let index_op = ctx.trace_ctx.const_int(index as i64);
+        let inner_op =
+            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, iterator_block, index_op);
+        ctx.trace_ctx
+            .set_opref_concrete(inner_op, Value::Ref(majit_ir::GcRef(inner_obj as usize)));
+        inner_ops.push(inner_op);
+    }
+
+    // Guard both cursors before either is advanced.
+    let tuple_iter_type =
+        &pyre_object::iterobject::TUPLE_ITER_TYPE as *const pyre_object::PyType as i64;
+    let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType as i64;
+    let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    let mut emitted_steps = Vec::with_capacity(2);
+    let mut both_match = None;
+    for (inner_op, (seq_obj, index, len, item_obj)) in
+        inner_ops.iter().copied().zip(steps.iter().copied())
+    {
+        walker_guard_class(ctx, op_pc, inner_op, tuple_iter_type)?;
+        let seq_op = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            inner_op,
+            crate::descr::tuple_iter_seq_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq_obj as usize)));
+        walker_guard_class(ctx, op_pc, seq_op, tuple_type)?;
+        walker_guard_exact_w_class(ctx, op_pc, seq_op, tuple_class)?;
+        let raw_index = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            inner_op,
+            crate::descr::tuple_iter_index_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(raw_index, Value::Int(index));
+        let items = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            seq_op,
+            crate::descr::tuple_wrappeditems_descr(),
+        );
+        let raw_len = crate::state::opimpl_arraylen_gc(
+            ctx.trace_ctx,
+            items,
+            crate::state::pyobject_gcarray_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(raw_len, Value::Int(len));
+        let matches_arm = if concrete_continues {
+            let zero = ctx.trace_ctx.const_int(0);
+            let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw_index, zero]);
+            ctx.trace_ctx
+                .set_opref_concrete(nonnegative, Value::Int((index >= 0) as i64));
+            let in_bounds = ctx
+                .trace_ctx
+                .record_op(OpCode::IntLt, &[raw_index, raw_len]);
+            ctx.trace_ctx
+                .set_opref_concrete(in_bounds, Value::Int((index < len) as i64));
+            let matches = ctx
+                .trace_ctx
+                .record_op(OpCode::IntAnd, &[nonnegative, in_bounds]);
+            ctx.trace_ctx
+                .set_opref_concrete(matches, Value::Int((index >= 0 && index < len) as i64));
+            matches
+        } else {
+            let matches = ctx
+                .trace_ctx
+                .record_op(OpCode::IntGe, &[raw_index, raw_len]);
+            ctx.trace_ctx
+                .set_opref_concrete(matches, Value::Int((index >= len) as i64));
+            matches
+        };
+        both_match = Some(match both_match {
+            None => matches_arm,
+            Some(prior) => {
+                let both = ctx
+                    .trace_ctx
+                    .record_op(OpCode::IntAnd, &[prior, matches_arm]);
+                ctx.trace_ctx.set_opref_concrete(both, Value::Int(1));
+                both
+            }
+        });
+        emitted_steps.push((inner_op, raw_index, items, item_obj));
+    }
+    walker_emit_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardTrue,
+        &[both_match.expect("zip arity-two recognition emitted two cursors")],
+    )?;
+
+    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body);
+
+    if concrete_exhausted {
+        // PyPy clears both exhausted tuple iterators before StopIteration.
+        let strict_op = crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            zip_op,
+            crate::descr::zip_strict_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(strict_op, Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[strict_op])?;
+        let null_ref = ctx.trace_ctx.const_ref(0);
+        for (inner_op, step) in inner_ops.into_iter().zip(steps.iter()) {
+            let seq_descr = crate::descr::tuple_iter_seq_descr();
+            ctx.trace_ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[inner_op, null_ref],
+                seq_descr.clone(),
+            );
+            ctx.trace_ctx
+                .heapcache_setfield_cached(inner_op, seq_descr.index(), null_ref);
+            let inner_obj = walker_concrete_ref_object(ctx, inner_op)
+                .expect("zip tuple iterator concrete survived exhaustion emission");
+            if ctx.trace_ctx.is_bridge_trace {
+                let pre_seq = unsafe { pyre_object::w_tuple_iter_seq(inner_obj) };
+                fbw_bridge_tuple_iter_journal_push(inner_obj, pre_seq, step.1);
+            }
+            unsafe { pyre_object::w_tuple_iter_set_seq(inner_obj, pyre_object::PY_NULL) };
+        }
+        let zero = ctx.trace_ctx.const_int(0);
+        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
+        return Ok(Some(null_item));
+    }
+
+    let one = ctx.trace_ctx.const_int(1);
+    let mut item_ops = Vec::with_capacity(2);
+    for (inner_op, raw_index, items, item_obj) in emitted_steps {
+        let item_op =
+            crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items, raw_index);
+        let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[raw_index, one]);
+        let concrete_index = steps[item_ops.len()].1;
+        ctx.trace_ctx
+            .set_opref_concrete(next_index, Value::Int(concrete_index + 1));
+        let index_descr = crate::descr::tuple_iter_index_descr();
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[inner_op, next_index],
+            index_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(inner_op, index_descr.index(), next_index);
+        let item_obj = item_obj.expect("continue-arm zip step has an item");
+        ctx.trace_ctx
+            .set_opref_concrete(item_op, Value::Ref(majit_ir::GcRef(item_obj as usize)));
+        item_ops.push(item_op);
+    }
+
+    let tuple_op =
+        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, item_ops[0], item_ops[1]);
+
+    // Advance the authentic shadows and retain the yielded pair for abort.
+    let concrete_tuple = pyre_object::w_specialised_tuple_oo_new(
+        steps[0].3.expect("continue-arm zip step has item 0"),
+        steps[1].3.expect("continue-arm zip step has item 1"),
+    );
+    if concrete_tuple.is_null() {
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+    }
+    for (inner_op, step) in inner_ops.into_iter().zip(steps.iter()) {
+        let inner_obj = walker_concrete_ref_object(ctx, inner_op)
+            .expect("zip tuple iterator concrete survived tuple allocation");
+        if ctx.trace_ctx.is_bridge_trace {
+            let pre_seq = unsafe { pyre_object::w_tuple_iter_seq(inner_obj) };
+            fbw_bridge_tuple_iter_journal_push(inner_obj, pre_seq, step.1);
+        }
+        unsafe { pyre_object::w_tuple_iter_set_index(inner_obj, step.1 + 1) };
+    }
+    let concrete_item0 = unsafe {
+        pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(concrete_tuple, 0)
+    };
+    let concrete_item1 = unsafe {
+        pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(concrete_tuple, 1)
+    };
+    for (item_op, concrete_item) in item_ops.into_iter().zip([concrete_item0, concrete_item1]) {
+        ctx.trace_ctx
+            .set_opref_concrete(item_op, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+    }
+    ctx.trace_ctx.set_opref_concrete(
+        tuple_op,
+        Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+    );
+    fbw_foriter_inflight_capture(concrete_tuple, body);
+    ctx.vstack_last_ref = tuple_op;
+    Ok(Some(tuple_op))
+}
+
 pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -12022,6 +12524,9 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
         return Ok(None);
     };
+    if unsafe { pyre_object::functional::is_zip(iter_obj) } {
+        return try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj);
+    }
     let (concrete_current, concrete_remaining, concrete_step) = unsafe {
         if !pyre_object::functional::is_range_iter(iter_obj) {
             return Ok(None);

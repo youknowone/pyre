@@ -5362,6 +5362,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // Virtualize PyPy's exact `zip(tuple0, tuple1, strict=True)` shape.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.pyre_helper == majit_ir::PyreHelperKind::CallKw
+        && try_walker_specialize_builtin_zip(ctx, code, op, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
     // frame: model `fast2locals`' fastlocals reads as `getarrayitem_vable_r`
     // plus a non-forcing dict-build chain — the shape the meta-tracer produces

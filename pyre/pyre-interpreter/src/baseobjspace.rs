@@ -16041,7 +16041,85 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_iterators = zo::w_zip_get_iterators(obj);
             pyre_object::gc_roots::pin_root(w_iterators);
             let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let strict = zo::w_zip_get_strict(obj);
+            let length =
+                pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(iterators_slot))
+                    as usize;
+
+            // Match PyPy's direct arity-one/two `W_Zip.next_w` paths.
+            if length == 0 {
+                return Err(PyError::stop_iteration());
+            }
+            if length == 1 {
+                let iterator = pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                    0,
+                )
+                .unwrap();
+                let item = next(iterator)?;
+                return Ok(pyre_object::w_tuple_new(vec![item]));
+            }
+            if length == 2 {
+                let iterator0 = pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                    0,
+                )
+                .unwrap();
+                let iterator1 = pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                    1,
+                )
+                .unwrap();
+                pyre_object::gc_roots::pin_root(iterator0);
+                let iterator0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                pyre_object::gc_roots::pin_root(iterator1);
+                let iterator1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                zo::w_zip_set_iteration_progress(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    0,
+                );
+
+                let item0 = match next(pyre_object::gc_roots::shadow_stack_get(iterator0_slot)) {
+                    Ok(item) => item,
+                    Err(first_stop) if first_stop.kind == PyErrorKind::StopIteration => {
+                        if !zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+                        {
+                            return Err(first_stop);
+                        }
+                        return match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
+                            Ok(_) => Err(strict_zip_error("zip", 1, "longer")),
+                            Err(second_stop) if second_stop.kind == PyErrorKind::StopIteration => {
+                                Err(first_stop)
+                            }
+                            Err(other) => Err(other),
+                        };
+                    }
+                    Err(other) => return Err(other),
+                };
+                pyre_object::gc_roots::pin_root(item0);
+                let item0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                zo::w_zip_set_iteration_progress(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                    1,
+                );
+                let item1 = match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
+                    Ok(item) => item,
+                    Err(second_stop) if second_stop.kind == PyErrorKind::StopIteration => {
+                        if zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
+                            return Err(strict_zip_error("zip", 1, "shorter"));
+                        }
+                        return Err(second_stop);
+                    }
+                    Err(other) => return Err(other),
+                };
+                pyre_object::gc_roots::pin_root(item1);
+                let item1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                return Ok(pyre_object::w_specialised_tuple_oo_new(
+                    pyre_object::gc_roots::shadow_stack_get(item0_slot),
+                    pyre_object::gc_roots::shadow_stack_get(item1_slot),
+                ));
+            }
+
+            let strict = zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             return match pull_iterator_tuple(
                 pyre_object::gc_roots::shadow_stack_get(iterators_slot),
                 strict,
