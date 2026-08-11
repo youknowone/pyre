@@ -17,6 +17,21 @@ Return the size of object in bytes.";
 /// call the bound method, require a non-negative Py_ssize_t result, then add
 /// the pre-header used by a heap type.  Pyre has no physical CPython object
 /// pre-header, but exposes the 3.14 logical size required by `sys.getsizeof`.
+///
+/// Answering with a size is a deliberate divergence from this module's
+/// counterpart. `pypy/module/sys/vm.py:355-358` returns `w_default` unchanged
+/// and raises `TypeError` when no default was supplied, for the reason its own
+/// `getsizeof_missing` text gives: maps are shared across instances, equal
+/// strings may share their data, and some sequences materialise their items as
+/// you read them, so a per-object number would be inconsistent with reality
+/// there. That argument is about an object model where the storage backing a
+/// value is shared and lazily created; pyre's objects have the layout the
+/// question assumes, so the number is answerable and is answered.
+///
+/// The divergence is confined to producing a number. Both terms of that number
+/// are read off the type rather than off the instance's storage, which is what
+/// keeps it from re-acquiring the inconsistency the upstream text warns about
+/// (see the pre-header comment below).
 fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.base();
