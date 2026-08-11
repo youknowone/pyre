@@ -1302,7 +1302,7 @@ impl W_Deque {
             Some(m) => out.push_str(&format!("], maxlen={m})")),
             None => out.push_str("])"),
         }
-        Ok(pyre_object::w_str_from_wtf8(out))
+        Ok(pyre_object::w_str_from_wtf8_managed(out))
     }
 
     #[getter]
