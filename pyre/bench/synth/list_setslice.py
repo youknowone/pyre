@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=1.4
+# Re-recorded at twice the slowest native ratio: macOS 0.2x, Ubuntu 0.7x,
+# Windows 0.5x.  The lower ceiling also lowers the derived speed floor.
 # Benchmark: integer list setslice (per-strategy ops)
 # Exercises W_ListObject slice assignment: lst[a:b] = [...] on Integer strategy.
 # PYPYLOG confirms: guard_class(IntegerListStrategy) + new_array(3, ArrayS 8).
