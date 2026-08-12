@@ -14669,7 +14669,7 @@ fn init_method_wrapper_type(ns: PyObjectRef) {
                     let type_name = crate::typedef::r#type(w_self)
                         .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
                         .unwrap_or("object");
-                    Ok(pyre_object::w_str_new(&format!(
+                    Ok(pyre_object::w_str_new_managed(&format!(
                         "<method-wrapper '{name}' of {type_name} object at {}>",
                         crate::display::repr_addr(w_self as usize)
                     )))
