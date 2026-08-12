@@ -57,15 +57,37 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
         expected_kind
     ));
     let _roots = pyre_object::gc_roots::push_roots();
+    // Read every pinned value back out of its slot instead of reusing the
+    // local that was handed to `pin_root`.  `pin_root` normalizes the address
+    // it publishes once a second mutator has existed (`gc_roots.rs`
+    // `RootScope::pin_root`), so past that point the caller's copy can still
+    // name the pre-forwarding object while the slot names the live one — and
+    // these values are baked into the trace as `ConstPtr`s, which outlive the
+    // walk.  Same shape as the zip/tuple concrete-shadow build below.
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(exc);
-    let args_storage = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
-    let args_len = unsafe { pyre_object::w_list_len(args_storage) };
+    let args_storage = unsafe {
+        pyre_object::interp_exceptions::w_exception_get_args_storage(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        )
+    };
+    let args_storage_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args_storage);
+    let args_len = unsafe {
+        pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(args_storage_slot))
+    };
     let mut concrete_args = Vec::with_capacity(args_len);
     for index in 0..args_len {
-        let arg = unsafe { pyre_object::w_list_getitem(args_storage, index as i64) }
-            .expect("recorded exception args were validated before trace emission");
+        let arg = unsafe {
+            pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(args_storage_slot),
+                index as i64,
+            )
+        }
+        .expect("recorded exception args were validated before trace emission");
+        let arg_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(arg);
-        concrete_args.push(arg);
+        concrete_args.push(unsafe { pyre_object::gc_roots::shadow_stack_get(arg_slot) });
     }
     let args = concrete_args
         .iter()
