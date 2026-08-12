@@ -183,7 +183,7 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
-use majit_metainterp::{TraceCtx, default_effect_info};
+use majit_metainterp::{TraceCtx, VableArrayStore, default_effect_info};
 
 // jitcode_dispatch submodules (extracted from this file). Their `pub`
 // items are re-exported so `crate::jitcode_dispatch::` paths stay stable.
@@ -5612,14 +5612,27 @@ pub(crate) struct GuardCaptureScope<'a> {
     /// gated kept-stack path.
     pub branch_guard_kept_recovered: &'a [(u16, OpRef)],
 
-    /// Stamp the resume position on the most-recent *guard* op instead of the
-    /// last recorded op. Needed whenever the guard being captured is not the
-    /// last thing recorded: `_nonstandard_virtualizable` (pyjitpl.py:1120)
-    /// emits its promote `GUARD_VALUE` and then `emit_force_virtualizable`
-    /// records GETFIELD_GC / PTR_NE / COND_CALL on top of it, so the default
-    /// last-op stamp lands on the COND_CALL and leaves the guard holding the
-    /// recorder's placeholder resume position.
-    pub stamp_last_guard_op: bool,
+    /// Select which already-recorded guard op receives the resume position.
+    /// Needed whenever the guard being captured is not the last thing recorded:
+    /// `_nonstandard_virtualizable` (pyjitpl.py:1120) emits its promote
+    /// `GUARD_VALUE` and then `emit_force_virtualizable` records GETFIELD_GC /
+    /// PTR_NE / COND_CALL on top of it, so the default last-op stamp lands on
+    /// the COND_CALL and leaves the guard holding the recorder's placeholder
+    /// resume position.
+    pub guard_stamp: GuardStampTarget,
+}
+
+/// Which already-recorded guard op a capture stamps its resume position on.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) enum GuardStampTarget {
+    /// The last recorded op — the guard IS that op.
+    #[default]
+    LastOp,
+    /// The guard op `from_end` guards back from the most recent one
+    /// (`0` == the most recent). Needed when a guard is emitted inside a
+    /// helper that records further ops before the caller can capture, and
+    /// when one opcode emits more than one guard.
+    GuardFromEnd(usize),
 }
 
 /// `rlib/jit.py` `max_unroll_recursion` default (= warmstate

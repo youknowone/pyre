@@ -172,6 +172,7 @@ pub use trace_ctx::MergePoint;
 pub use trace_ctx::ReconstructRecipe;
 pub use trace_ctx::TraceCtx;
 pub use trace_ctx::VableArrayStore;
+pub use trace_ctx::VableEntryWrite;
 
 /// Compute green key from code pointer and PC.
 /// Must use the same hash as the front-end's make_green_key — the full

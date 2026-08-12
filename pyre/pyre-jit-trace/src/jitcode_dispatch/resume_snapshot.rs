@@ -113,13 +113,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
 /// emits nothing — gate on a full-body walk being active so this is a
 /// no-op (one cheap `num_guards` read) outside it.  The non-standard
 /// fact is cached per box
-/// after the first access, so at most one such guard is emitted per
-/// inlined frame and `walker_capture_snapshot_for_last_guard`'s
-/// "last guard" target is unambiguous.
+/// after the first access. An array access can still emit a second promote
+/// guard for its index, so every guard minted by one opcode is captured in
+/// emission order.
 pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     guards_before: usize,
+    write: Option<majit_metainterp::VableEntryWrite>,
 ) -> Result<(), DispatchError> {
     // The non-standard virtualizable's internal promote GuardValue is
     // emitted only inside a full-body walk against a callee frame that is
@@ -137,6 +138,24 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         // guard, so there is nothing to capture.
         return Ok(());
     }
+    let restored = write.and_then(|w| {
+        ctx.trace_ctx
+            .swap_virtualizable_entry(w.index, w.prev_box, w.prev_value)
+            .map(|current| (w.index, current))
+    });
+    let result = walker_capture_inline_nonstandard_vable_guard_inner(ctx, op_pc, guards_before);
+    if let Some((index, (op, value))) = restored {
+        ctx.trace_ctx.swap_virtualizable_entry(index, op, value);
+    }
+    result
+}
+
+fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    guards_before: usize,
+) -> Result<(), DispatchError> {
+    let minted = ctx.trace_ctx.num_guards() - guards_before;
     if !ctx.fbw_mode.inline_subwalk {
         // The walk's own root frame reached the non-standard path: it is
         // writing a `vable` field of a frame that is not
@@ -163,14 +182,17 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
         // `record_guard_with_snapshot`), which is not a decodable resume
         // coordinate — `frame_value_count_at` fails loud on it if the
         // optimizer does not remove the guard.
-        return walker_capture_snapshot_for_last_guard_scoped(
-            ctx,
-            op_pc,
-            GuardCaptureScope {
-                stamp_last_guard_op: true,
-                ..GuardCaptureScope::default()
-            },
-        );
+        for from_end in (0..minted).rev() {
+            walker_capture_snapshot_for_last_guard_scoped(
+                ctx,
+                op_pc,
+                GuardCaptureScope {
+                    guard_stamp: GuardStampTarget::GuardFromEnd(from_end),
+                    ..GuardCaptureScope::default()
+                },
+            )?;
+        }
+        return Ok(());
     }
     // Same buildability precondition as `walker_capture_snapshot_for_last_guard`:
     // every virtualizable box must carry `OpRef::ty()` or the snapshot
@@ -209,14 +231,17 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     let publish_inline_frames =
         (n_parents == 0 && n_callees == 1) || (n_parents > 0 && n_parents == n_callees);
     if publish_inline_frames {
-        return walker_capture_multi_frame_inline_snapshot(
-            ctx,
-            op_pc,
-            false,
-            parent_frames,
-            GuardCaptureScope::default(),
-            true,
-        );
+        for from_end in (0..minted).rev() {
+            walker_capture_multi_frame_inline_snapshot(
+                ctx,
+                op_pc,
+                false,
+                parent_frames.clone(),
+                GuardCaptureScope::default(),
+                GuardStampTarget::GuardFromEnd(from_end),
+            )?;
+        }
+        return Ok(());
     }
     // The guard is not the last recorded op: `emit_force_virtualizable`
     // records GETFIELD_GC / PTR_NE / COND_CALL after the promote, so stamp
@@ -240,17 +265,20 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
-    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     let nsvable_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, nsvable_pc_word)?;
-    ctx.trace_ctx
-        .capture_snapshot_for_last_guard_op_with_vable_vref(
-            &ctx.outer_active_boxes,
-            ctx.outer_jitcode_index,
-            nsvable_pc_word,
-            nsvable_py_pc,
-            &vable_boxes,
-            &vref_boxes,
-        );
+    for from_end in (0..minted).rev() {
+        let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+        ctx.trace_ctx
+            .capture_snapshot_for_last_guard_op_with_vable_vref(
+                &ctx.outer_active_boxes,
+                ctx.outer_jitcode_index,
+                nsvable_pc_word,
+                nsvable_py_pc,
+                &vable_boxes,
+                &vref_boxes,
+                from_end,
+            );
+    }
     Ok(())
 }
 
@@ -378,7 +406,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 after_residual_call,
                 parent_frames,
                 scope,
-                false,
+                GuardStampTarget::LastOp,
             );
         }
     }
@@ -1140,7 +1168,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
             publish_single_frame_snapshot(
                 ctx,
-                scope.stamp_last_guard_op,
+                scope.guard_stamp,
                 &active,
                 jitcode_index,
                 pc_word,
@@ -1175,7 +1203,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     let active = std::mem::take(&mut ctx.outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
-        scope.stamp_last_guard_op,
+        scope.guard_stamp,
         &active,
         ctx.outer_jitcode_index,
         arm_pc_word,
@@ -1188,16 +1216,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
 }
 
 /// Attach a freshly built single-frame snapshot to the guard this capture is
-/// for.  `stamp_last_guard_op` picks the recorder-side target: the default
-/// stamps the last recorded op (the guard IS that op), while a guard that
-/// records further non-guard ops after itself — the
-/// `_nonstandard_virtualizable` promote, whose `emit_force_virtualizable`
-/// tail records GETFIELD_GC / PTR_NE / COND_CALL — must stamp the last
-/// *guard* op instead.
+/// for. `guard_stamp` picks the recorder-side target: the default stamps the
+/// last recorded op (the guard IS that op), while a guard that records further
+/// ops after itself — the `_nonstandard_virtualizable` promote, whose
+/// `emit_force_virtualizable` tail records GETFIELD_GC / PTR_NE / COND_CALL —
+/// or shares an opcode with another guard must stamp the corresponding guard
+/// op instead.
 #[allow(clippy::too_many_arguments)]
 fn publish_single_frame_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    stamp_last_guard_op: bool,
+    guard_stamp: GuardStampTarget,
     active: &[OpRef],
     jitcode_index: u32,
     pc: u32,
@@ -1205,20 +1233,29 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
     vable_boxes: &[majit_metainterp::recorder::SnapshotTagged],
     vref_boxes: &[majit_metainterp::recorder::SnapshotTagged],
 ) {
-    let capture = if stamp_last_guard_op {
-        majit_metainterp::TraceCtx::capture_snapshot_for_last_guard_op_with_vable_vref
-    } else {
-        majit_metainterp::TraceCtx::capture_snapshot_for_last_guard_with_vable_vref
-    };
-    capture(
-        ctx.trace_ctx,
-        active,
-        jitcode_index,
-        pc,
-        py_pc,
-        vable_boxes,
-        vref_boxes,
-    );
+    match guard_stamp {
+        GuardStampTarget::LastOp => ctx
+            .trace_ctx
+            .capture_snapshot_for_last_guard_with_vable_vref(
+                active,
+                jitcode_index,
+                pc,
+                py_pc,
+                vable_boxes,
+                vref_boxes,
+            ),
+        GuardStampTarget::GuardFromEnd(from_end) => ctx
+            .trace_ctx
+            .capture_snapshot_for_last_guard_op_with_vable_vref(
+                active,
+                jitcode_index,
+                pc,
+                py_pc,
+                vable_boxes,
+                vref_boxes,
+                from_end,
+            ),
+    }
 }
 
 /// Build the paused caller frame for a multi-frame inline snapshot (#68),
@@ -2270,7 +2307,7 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     parent_frames: Vec<InlineParentFrame>,
-    stamp_last_guard_op: bool,
+    guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
@@ -2292,20 +2329,22 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
         frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
     }
-    if stamp_last_guard_op {
-        ctx.trace_ctx
+    match guard_stamp {
+        GuardStampTarget::GuardFromEnd(from_end) => ctx
+            .trace_ctx
             .capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
                 &frames,
                 &vable_boxes,
                 &vref_boxes,
-            );
-    } else {
-        ctx.trace_ctx
+                from_end,
+            ),
+        GuardStampTarget::LastOp => ctx
+            .trace_ctx
             .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
                 &frames,
                 &vable_boxes,
                 &vref_boxes,
-            );
+            ),
     }
     Ok(())
 }
@@ -2326,15 +2365,15 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // The `_nonstandard_virtualizable` promote guard is not the last recorded op
     // (`emit_force_virtualizable` records GETFIELD_GC / PTR_NE / COND_CALL after
     // it), so its caller stamps the resume position on the last *guard* op.
-    // Straight-line / branch inline guards ARE the last op and pass `false`.
-    stamp_last_guard_op: bool,
+    // Straight-line / branch inline guards ARE the last op and pass `LastOp`.
+    guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if ctx.fbw_mode.transparent_helper_subwalk {
         return walker_capture_transparent_helper_snapshot(
             ctx,
             callee_op_pc,
             parent_frames,
-            stamp_last_guard_op,
+            guard_stamp,
         );
     }
     if !ctx.trace_ctx.vable_snapshot_buildable() {
@@ -2656,20 +2695,22 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         callee_boxes.as_slice(),
     ));
 
-    if stamp_last_guard_op {
-        ctx.trace_ctx
+    match guard_stamp {
+        GuardStampTarget::GuardFromEnd(from_end) => ctx
+            .trace_ctx
             .capture_snapshot_for_last_guard_op_multi_frame_with_vable_vref(
                 &frames,
                 &vable_boxes,
                 &vref_boxes,
-            );
-    } else {
-        ctx.trace_ctx
+                from_end,
+            ),
+        GuardStampTarget::LastOp => ctx
+            .trace_ctx
             .capture_snapshot_for_last_guard_multi_frame_with_vable_vref(
                 &frames,
                 &vable_boxes,
                 &vref_boxes,
-            );
+            ),
     }
     Ok(())
 }

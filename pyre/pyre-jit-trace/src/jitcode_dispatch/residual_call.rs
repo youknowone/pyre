@@ -4075,7 +4075,7 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     for (slot, value, concrete) in slots {
         let index = ctx.trace_ctx.const_int(slot);
         let guards_before = ctx.trace_ctx.num_guards();
-        ctx.trace_ctx.vable_setarrayitem_indexed(
+        let write = match ctx.trace_ctx.vable_setarrayitem_indexed(
             pc,
             callee_frame,
             index,
@@ -4085,8 +4085,14 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
             value,
             concrete,
             false,
-        );
-        walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before)?;
+        ) {
+            VableArrayStore::Stored(write) => write,
+            // The out-of-vable store recorded nothing, so there is no pre-store
+            // entry to roll back. Whether it should abort the trace is tracked
+            // separately.
+            VableArrayStore::OutOfVable => None,
+        };
+        walker_capture_inline_nonstandard_vable_guard(ctx, pc, guards_before, write)?;
     }
     if let Some(shadow) = ctx.callee_shadow.as_mut()
         && shadow.frame_box == callee_frame

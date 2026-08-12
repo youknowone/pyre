@@ -184,7 +184,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             .vable_getfield_float(pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
-    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
     // `_resint`/`_resref`/`_resfloat` is filled at construction time.
@@ -331,7 +331,8 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
     // JitCode PC, pass through.
     let guards_before = ctx.trace_ctx.num_guards();
-    ctx.trace_ctx
+    let write = ctx
+        .trace_ctx
         .vable_setfield(op.pc, obj, descr, value, concrete);
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
@@ -344,7 +345,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     ) {
         crate::state::store_live_frame_static_int(frame, field_index, value);
     }
-    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, write)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
@@ -535,7 +536,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         ),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
-    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let shadow_value = shadow_value.unwrap_or(Value::Void);
     // When the read missed every concrete channel (`Void`) but we are inside
     // an inlined callee, fall back to the per-frame concrete-locals shadow —
@@ -810,7 +811,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             .unwrap_or(Value::Void);
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let guards_before = ctx.trace_ctx.num_guards();
-    ctx.trace_ctx.vable_setarrayitem_indexed(
+    let write = match ctx.trace_ctx.vable_setarrayitem_indexed(
         op.pc,
         vable,
         index,
@@ -820,7 +821,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         value,
         concrete,
         is_stack_push,
-    );
+    ) {
+        VableArrayStore::Stored(write) => write,
+        // The out-of-vable store recorded nothing, so there is no pre-store
+        // entry to roll back. Whether it should abort the trace is tracked
+        // separately.
+        VableArrayStore::OutOfVable => None,
+    };
     if index_value >= 0
         && let Some(frame) = current_inline_vable_target(ctx, vable)
     {
@@ -836,7 +843,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         shadow.set_opref(index_value, value);
         shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
     }
-    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, write)?;
     // A Ref stored to the operand-stack region of the vable array is an
     // operand-stack push (`pyframe.pushvalue` lowers to
     // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). Retain the
@@ -908,7 +915,7 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     let result = ctx
         .trace_ctx
         .vable_arraylen_vable(op.pc, vable, vable_struct_ptr, fdescr, adescr);
-    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before)?;
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;

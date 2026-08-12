@@ -2804,10 +2804,11 @@ impl TraceCtx {
     }
 
     /// Like [`Self::capture_snapshot_for_last_guard_with_vable_vref`] but stamps
-    /// the resume position on the most-recent *guard* op rather than the
-    /// last recorded op.  Used when a guard is emitted inside a helper
-    /// (the `_nonstandard_virtualizable` PTR_EQ promote) that records
-    /// further non-guard ops before the caller can capture.
+    /// the resume position on the guard op `from_end` guards back from the
+    /// most recent one rather than the last recorded op.  Used when a guard is
+    /// emitted inside a helper (the `_nonstandard_virtualizable` PTR_EQ
+    /// promote) that records further ops before the caller can capture, and
+    /// when one opcode emits more than one guard.
     pub fn capture_snapshot_for_last_guard_op_with_vable_vref(
         &mut self,
         active_boxes: &[OpRef],
@@ -2816,6 +2817,7 @@ impl TraceCtx {
         py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
+        from_end: usize,
     ) {
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
@@ -2828,7 +2830,7 @@ impl TraceCtx {
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
         });
-        self.set_last_guard_op_resume_position(snapshot_id);
+        self.set_guard_op_resume_position_from_end(from_end, snapshot_id);
     }
 
     /// Multi-frame variant of [`Self::capture_snapshot_for_last_guard`].
@@ -2891,9 +2893,9 @@ impl TraceCtx {
     }
 
     /// Like [`Self::capture_snapshot_for_last_guard_multi_frame_with_vable_vref`] but
-    /// stamps the resume position on the most-recent *guard* op rather than the
-    /// last recorded op — the multi-frame analog of
-    /// [`Self::capture_snapshot_for_last_guard_op_with_vable_vref`].  Used when a
+    /// stamps the resume position on the guard op `from_end` guards back from
+    /// the most recent one rather than the last recorded op — the multi-frame
+    /// analog of [`Self::capture_snapshot_for_last_guard_op_with_vable_vref`]. Used when a
     /// guard emitted inside a helper (the `_nonstandard_virtualizable` PTR_EQ
     /// promote) records further non-guard ops (`emit_force_virtualizable`'s
     /// GETFIELD_GC / PTR_NE / COND_CALL) before the caller captures, yet the
@@ -2903,6 +2905,7 @@ impl TraceCtx {
         frames: &[(u32, u32, u32, &[OpRef])],
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
+        from_end: usize,
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
@@ -2922,7 +2925,7 @@ impl TraceCtx {
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
         });
-        self.set_last_guard_op_resume_position(snapshot_id);
+        self.set_guard_op_resume_position_from_end(from_end, snapshot_id);
     }
 
     fn encode_snapshot_boxes(
