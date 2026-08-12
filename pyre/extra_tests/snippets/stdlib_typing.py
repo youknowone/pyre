@@ -229,3 +229,73 @@ generic_alias_subclass = GenericAliasSubclass(list, int)
 assert type(generic_alias_subclass) is GenericAliasSubclass
 assert generic_alias_subclass.__origin__ is list
 assert generic_alias_subclass.__args__ == (int,)
+
+
+# A constant bound is evaluated by `_typing._ConstEvaluator`, whose format
+# argument goes through the integer index protocol.
+const_evaluator = TypeVar("ConstBound", bound=int).evaluate_bound
+assert type(const_evaluator).__name__ == "_ConstEvaluator"
+assert const_evaluator(annotationlib.Format.STRING) == "int"
+assert const_evaluator(annotationlib.Format.VALUE) is int
+
+
+class IndexedFormat:
+    def __index__(self):
+        return 4
+
+
+assert const_evaluator(IndexedFormat()) == "int"
+
+
+class UnequalInt(int):
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return 0
+
+
+# The argument is normalized to an exact `int`, so a subclass whose `__eq__`
+# refuses every comparison still selects the STRING branch by its value.
+assert const_evaluator(UnequalInt(4)) == "int"
+assert const_evaluator(UnequalInt(1)) is int
+
+
+class NonIntIndex:
+    def __index__(self):
+        return "4"
+
+
+try:
+    const_evaluator(NonIntIndex())
+except TypeError as error:
+    assert str(error) == "__index__ returned non-int (type str)", error
+else:
+    raise AssertionError("_ConstEvaluator accepted a non-int __index__ result")
+
+try:
+    const_evaluator(1.0)
+except TypeError as error:
+    assert str(error) == "'float' object cannot be interpreted as an integer", error
+else:
+    raise AssertionError("_ConstEvaluator accepted a float format")
+
+immutable_message = (
+    "cannot set '__call__' attribute of immutable type '_typing._ConstEvaluator'"
+)
+try:
+    del type(const_evaluator).__call__
+except TypeError as error:
+    assert str(error) == immutable_message, error
+else:
+    raise AssertionError("_ConstEvaluator.__call__ was deletable")
+
+try:
+    type(const_evaluator).__call__ = None
+except TypeError as error:
+    assert str(error) == immutable_message, error
+else:
+    raise AssertionError("_ConstEvaluator.__call__ was assignable")
+
+# A refused write leaves every constant evaluator in the process callable.
+assert const_evaluator(annotationlib.Format.STRING) == "int"
