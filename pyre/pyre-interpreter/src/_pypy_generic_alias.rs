@@ -843,22 +843,27 @@ pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     if !unionable(x) || !unionable(y) {
         return Ok(w_not_implemented());
     }
-    // `_create_union` (`_pypy_generic_alias.py:336`): `if self == other:
-    // return self` — equality with identity short-circuit; a raising
-    // `__eq__` propagates.
-    if crate::baseobjspace::eq_w(x, y)? {
-        return Ok(x);
-    }
-    // `UnionType((self, other))` — `__parameters__` is `_collect_parameters`
-    // of the RAW operands (`_pypy_generic_alias.py:264`), computed once at
-    // construction; `_args` is `add_recurse` over the operands
-    // (`_pypy_generic_alias.py:253-262`): map `None` → `NoneType`, flatten
-    // nested unions, and drop members already present by `==`.
-    let parameters = collect_parameters(w_tuple_new(vec![x, y]))?;
-    let mut members: Vec<PyObjectRef> = Vec::new();
-    add_recurse(x, &mut members)?;
-    add_recurse(y, &mut members)?;
-    Ok(w_union_from_members(members, parameters))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let input_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(x);
+    pyre_object::gc_roots::pin_root(y);
+    // CPython 3.14 `_Py_union_type_or`: initialize a unionbuilder, then add
+    // the operands in order.  The builder, rather than an eager `x == y`,
+    // decides duplicates inside the construction-time hash partition.
+    let raw_args = w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(input_base),
+        pyre_object::gc_roots::shadow_stack_get(input_base + 1),
+    ]);
+    pyre_object::gc_roots::pin_root(raw_args);
+    let raw_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let parameters = collect_parameters(pyre_object::gc_roots::shadow_stack_get(raw_args_slot))?;
+    build_union(
+        &[
+            pyre_object::gc_roots::shadow_stack_get(input_base),
+            pyre_object::gc_roots::shadow_stack_get(input_base + 1),
+        ],
+        parameters,
+    )
 }
 
 /// `UnionType(items)` construction used by `typing.Union[items]`.
@@ -873,16 +878,21 @@ pub(crate) fn union_from_items(items: &[PyObjectRef]) -> crate::PyResult {
     if items.len() == 1 {
         return Ok(normalize_none(items[0]));
     }
-    let parameters = collect_parameters(w_tuple_new(items.to_vec()))?;
-    let mut members: Vec<PyObjectRef> = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in items {
-        add_recurse(item, &mut members)?;
+        pyre_object::gc_roots::pin_root(item);
     }
-    if members.len() == 1 {
-        Ok(members[0])
-    } else {
-        Ok(w_union_from_members(members, parameters))
-    }
+    let current_items = || {
+        (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(item_base + i))
+            .collect::<Vec<_>>()
+    };
+    let raw_args = w_tuple_new(current_items());
+    pyre_object::gc_roots::pin_root(raw_args);
+    let raw_args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let parameters = collect_parameters(pyre_object::gc_roots::shadow_stack_get(raw_args_slot))?;
+    build_union(&current_items(), parameters)
 }
 
 /// `typing._type_convert(arg)` for the string operands accepted by
@@ -914,55 +924,213 @@ pub(crate) fn typing_type_convert(arg: PyObjectRef) -> crate::PyResult {
     )
 }
 
-/// `add_recurse(arg)` (`_pypy_generic_alias.py:253-262`) — the deduplicating
-/// flatten body of `UnionType.__init__`.  `None` becomes `NoneType`, a nested
-/// `UnionType` is spliced member-by-member, and a member is appended only when
-/// not already present (`arg not in res`: `==` with identity short-circuit, a
-/// raising `__eq__` propagating).
-fn add_recurse(arg: PyObjectRef, res: &mut Vec<PyObjectRef>) -> Result<(), crate::PyError> {
-    let arg = normalize_none(arg);
-    if unsafe { pyre_object::is_union(arg) } {
-        let inner = unsafe { pyre_object::w_union_get_args(arg) };
-        let n = unsafe { pyre_object::w_tuple_len(inner) };
-        for i in 0..n {
-            if let Some(a) = unsafe { pyre_object::w_tuple_getitem(inner, i as i64) } {
-                add_recurse(a, res)?;
-            }
-        }
-        return Ok(());
-    }
-    for &existing in res.iter() {
-        // `arg not in res` — `list.__contains__` compares `item == arg` with an
-        // identity short-circuit (`PyObject_RichCompareBool`); a raising
-        // `__eq__` propagates.
-        if crate::baseobjspace::eq_w(existing, arg)? {
-            return Ok(());
-        }
-    }
-    res.push(arg);
-    Ok(())
+/// CPython 3.14 `unionbuilder`.  Slots, rather than a side table keyed by
+/// objects, are the transient equivalent of its owned list/set references and
+/// keep every member live across user `__hash__` / `__eq__` callbacks.
+struct UnionBuilder {
+    hashable_set_slot: usize,
+    member_slots: Vec<usize>,
+    unhashable_slots: Vec<usize>,
 }
 
-/// `UnionType.__eq__` (`_pypy_generic_alias.py:270-273`) —
-/// `set(self.__args__) == set(other.__args__)`.  Both arg tuples are
-/// deduplicated at construction, so equal length plus subset is set
-/// equality.
+impl UnionBuilder {
+    fn new() -> Self {
+        let hashable_set = pyre_object::w_set_new();
+        let hashable_set_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(hashable_set);
+        Self {
+            hashable_set_slot,
+            member_slots: Vec::new(),
+            unhashable_slots: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, arg: PyObjectRef) -> Result<(), crate::PyError> {
+        let arg = normalize_none(arg);
+        if unsafe { pyre_object::is_union(arg) } {
+            pyre_object::gc_roots::pin_root(arg);
+            let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let inner = unsafe {
+                pyre_object::w_union_get_args(pyre_object::gc_roots::shadow_stack_get(arg_slot))
+            };
+            pyre_object::gc_roots::pin_root(inner);
+            let inner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let n = unsafe {
+                pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(inner_slot))
+            };
+            for i in 0..n {
+                let member = unsafe {
+                    pyre_object::w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(inner_slot),
+                        i as i64,
+                    )
+                };
+                if let Some(member) = member {
+                    self.add(member)?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Keep this candidate rooted for the builder's whole lifetime.  A
+        // duplicate leaves one unused slot, matching the temporary strong
+        // reference held by CPython's builder call and avoiding a nested root
+        // scope that would also discard newly accepted member slots.
+        pyre_object::gc_roots::pin_root(arg);
+        let arg_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let unhashable = match crate::builtins::try_hash_value(
+            pyre_object::gc_roots::shadow_stack_get(arg_slot),
+        ) {
+            Ok(hash) => {
+                let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+                let key = unsafe { pyre_object::dictmultiobject::object_key_hashed(arg, hash) };
+                let set = pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot);
+                let present = unsafe { pyre_object::w_set_contains_key_checked(set, key) }
+                    .map_err(|_| crate::baseobjspace::take_pending_hash_error())?;
+                if present {
+                    return Ok(());
+                }
+                unsafe { pyre_object::w_set_add_hashed_checked(set, arg, hash) }
+                    .map_err(crate::baseobjspace::map_set_update_error)?;
+                false
+            }
+            Err(_) => {
+                // `unionbuilder_add_single_unchecked` clears the exception
+                // from PyObject_Hash: any failed hash classifies this member
+                // as unhashable.  Equality failures during list containment
+                // remain observable.
+                for &slot in &self.unhashable_slots {
+                    if crate::baseobjspace::eq_w(
+                        pyre_object::gc_roots::shadow_stack_get(slot),
+                        pyre_object::gc_roots::shadow_stack_get(arg_slot),
+                    )? {
+                        return Ok(());
+                    }
+                }
+                true
+            }
+        };
+
+        self.member_slots.push(arg_slot);
+        if unhashable {
+            self.unhashable_slots.push(arg_slot);
+        }
+        Ok(())
+    }
+
+    fn finish(self, parameters: PyObjectRef) -> crate::PyResult {
+        let members: Vec<_> = self
+            .member_slots
+            .iter()
+            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+            .collect();
+        match members.as_slice() {
+            [] => Err(crate::PyError::type_error(
+                "Cannot take a Union of no types.",
+            )),
+            [member] => Ok(*member),
+            _ => {
+                let hashable_args = pyre_object::w_frozenset_new();
+                unsafe {
+                    pyre_object::w_set_copy_storage_from(
+                        hashable_args,
+                        pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot),
+                    )
+                };
+                let unhashable_args = if self.unhashable_slots.is_empty() {
+                    pyre_object::PY_NULL
+                } else {
+                    pyre_object::w_tuple_new(
+                        self.unhashable_slots
+                            .iter()
+                            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                            .collect(),
+                    )
+                };
+                Ok(pyre_object::w_union_from_parts(
+                    members,
+                    hashable_args,
+                    unhashable_args,
+                    parameters,
+                ))
+            }
+        }
+    }
+}
+
+fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(parameters);
+    let parameters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let item_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let mut builder = UnionBuilder::new();
+    for i in 0..items.len() {
+        builder.add(pyre_object::gc_roots::shadow_stack_get(item_base + i))?;
+    }
+    builder.finish(pyre_object::gc_roots::shadow_stack_get(parameters_slot))
+}
+
+/// CPython 3.14 `unions_equal`: compare the construction-time hashable
+/// frozensets, then compare both directions of the unhashable tuple partition.
 pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate::PyError> {
     unsafe {
-        let aa = w_union_get_args(a);
-        let bb = w_union_get_args(b);
-        let na = w_tuple_len(aa);
-        let nb = w_tuple_len(bb);
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(a);
+        let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(b);
+        let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let ah = w_union_get_hashable_args(a);
+        let bh = w_union_get_hashable_args(b);
+        if !crate::baseobjspace::eq_w(ah, bh)? {
+            return Ok(false);
+        }
+        let aa = w_union_get_unhashable_args(pyre_object::gc_roots::shadow_stack_get(a_slot));
+        let bb = w_union_get_unhashable_args(pyre_object::gc_roots::shadow_stack_get(b_slot));
+        if aa.is_null() || bb.is_null() {
+            return Ok(aa.is_null() && bb.is_null());
+        }
+        pyre_object::gc_roots::pin_root(aa);
+        let aa_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        pyre_object::gc_roots::pin_root(bb);
+        let bb_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let na = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(aa_slot));
+        let nb = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(bb_slot));
         if na != nb {
             return Ok(false);
         }
         for i in 0..na {
-            let Some(x) = w_tuple_getitem(aa, i as i64) else {
+            let Some(x) =
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(aa_slot), i as i64)
+            else {
                 return Ok(false);
             };
             let mut found = false;
             for j in 0..nb {
-                if let Some(y) = w_tuple_getitem(bb, j as i64)
+                if let Some(y) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(bb_slot), j as i64)
+                    && crate::baseobjspace::eq_w(x, y)?
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+        for i in 0..nb {
+            let Some(x) =
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(bb_slot), i as i64)
+            else {
+                return Ok(false);
+            };
+            let mut found = false;
+            for j in 0..na {
+                if let Some(y) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(aa_slot), j as i64)
                     && crate::baseobjspace::eq_w(x, y)?
                 {
                     found = true;
@@ -974,6 +1142,35 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
             }
         }
         Ok(true)
+    }
+}
+
+/// CPython 3.14 `union_hash` over the stored construction-time partitions.
+pub(crate) fn union_hash_value(union: PyObjectRef) -> Result<i64, crate::PyError> {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(union);
+        let union_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let unhashable = w_union_get_unhashable_args(union);
+        if !unhashable.is_null() {
+            pyre_object::gc_roots::pin_root(unhashable);
+            let unhashable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(unhashable_slot));
+            for i in 0..n {
+                if let Some(member) = w_tuple_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(unhashable_slot),
+                    i as i64,
+                ) {
+                    crate::builtins::try_hash_value(member)?;
+                }
+            }
+            return Err(crate::PyError::type_error(format!(
+                "union contains {n} unhashable elements"
+            )));
+        }
+        crate::baseobjspace::hash_w_strict(w_union_get_hashable_args(
+            pyre_object::gc_roots::shadow_stack_get(union_slot),
+        ))
     }
 }
 

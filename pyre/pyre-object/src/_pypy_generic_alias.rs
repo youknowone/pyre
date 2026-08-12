@@ -162,16 +162,24 @@ mod tests {
 
 /// Python union type object (PEP 604).
 ///
-/// Layout: `[ob_type | args | parameters]`
+/// Layout: `[ob_type | args | hashable_args | unhashable_args | parameters]`
 ///
 /// - `args`: tuple of the union members (deduplicated, flattened)
+/// - `hashable_args`: construction-time hashable members as a frozenset
+/// - `unhashable_args`: construction-time unhashable members as a tuple, or
+///   `PY_NULL` when every member was hashable
 /// - `parameters`: tuple of free type variables — `__parameters__`
 ///
 /// PyPy equivalent: UnionType in _pypy_generic_alias.py
 #[pyre_class("types.UnionType", type_id = 22, static_name = "UNION")]
 pub struct UnionType {
-    /// Tuple of union member types — PyPy: UnionType._args
+    /// CPython 3.14 `unionobject.args`.
     pub args: PyObjectRef,
+    /// CPython 3.14 `unionobject.hashable_args`.
+    pub hashable_args: PyObjectRef,
+    /// CPython 3.14 `unionobject.unhashable_args`; `PY_NULL` represents its
+    /// C NULL state rather than Python `None`.
+    pub unhashable_args: PyObjectRef,
     /// Tuple of free type variables, `_collect_parameters(args)` computed at
     /// construction from the raw constructor operands — PyPy:
     /// `UnionType.__parameters__`.
@@ -187,31 +195,50 @@ pub unsafe fn is_union(obj: PyObjectRef) -> bool {
     py_type_check(obj, &UNION_TYPE)
 }
 
-/// Allocate a UnionType from already-flattened/deduplicated members and a
-/// precomputed parameters tuple — the body of `UnionType.__init__` after
-/// `add_recurse`.  `UnionType(())` (the empty-substitution case of
-/// `UnionType.__getitem__`) uses this with an empty member list.
-pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) -> PyObjectRef {
-    let args = crate::w_tuple_new(members);
+/// CPython 3.14 `make_union`: allocate a union from the builder's finalized
+/// `args`, `hashable_args`, and optional `unhashable_args` partitions.
+pub fn w_union_from_parts(
+    members: Vec<PyObjectRef>,
+    hashable_args: PyObjectRef,
+    unhashable_args: PyObjectRef,
+    parameters: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
-    crate::gc_roots::pin_root(args);
+    crate::gc_roots::pin_root(hashable_args);
+    crate::gc_roots::pin_root(unhashable_args);
     crate::gc_roots::pin_root(parameters);
-    // PyPy's `UnionType` is GC-owned and keeps `_args` / `_parameters`
-    // reachable.  The stable managed bridge preserves that ownership while
-    // interpreter methods still carry raw `PyObjectRef` receivers.
+    let member_base = crate::gc_roots::shadow_stack_len();
+    for member in members {
+        crate::gc_roots::pin_root(member);
+    }
+    let args = crate::w_tuple_new(
+        (member_base..crate::gc_roots::shadow_stack_len())
+            .map(crate::gc_roots::shadow_stack_get)
+            .collect(),
+    );
+    crate::gc_roots::pin_root(args);
+    let args_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // CPython's unionobject is GC-owned and traverses all four object fields.
+    // The stable managed bridge preserves that ownership while interpreter
+    // methods still carry raw `PyObjectRef` receivers.
     let obj = UnionType::allocate_stable(UnionType {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
         args: std::ptr::null_mut(),
+        hashable_args: std::ptr::null_mut(),
+        unhashable_args: std::ptr::null_mut(),
         parameters: std::ptr::null_mut(),
     });
     unsafe {
-        (*(obj as *mut UnionType)).args = crate::gc_roots::shadow_stack_get(save_point);
-        (*(obj as *mut UnionType)).parameters = crate::gc_roots::shadow_stack_get(save_point + 1);
+        (*(obj as *mut UnionType)).args = crate::gc_roots::shadow_stack_get(args_slot);
+        (*(obj as *mut UnionType)).hashable_args = crate::gc_roots::shadow_stack_get(save_point);
+        (*(obj as *mut UnionType)).unhashable_args =
+            crate::gc_roots::shadow_stack_get(save_point + 1);
+        (*(obj as *mut UnionType)).parameters = crate::gc_roots::shadow_stack_get(save_point + 2);
         crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
     obj
@@ -223,6 +250,22 @@ pub fn w_union_from_members(members: Vec<PyObjectRef>, parameters: PyObjectRef) 
 /// `obj` must point to a valid `UnionType`.
 pub unsafe fn w_union_get_args(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const UnionType)).args
+}
+
+/// Get the construction-time hashable member frozenset.
+///
+/// # Safety
+/// `obj` must point to a valid `UnionType`.
+pub unsafe fn w_union_get_hashable_args(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const UnionType)).hashable_args
+}
+
+/// Get the construction-time unhashable member tuple, or `PY_NULL`.
+///
+/// # Safety
+/// `obj` must point to a valid `UnionType`.
+pub unsafe fn w_union_get_unhashable_args(obj: PyObjectRef) -> PyObjectRef {
+    (*(obj as *const UnionType)).unhashable_args
 }
 
 /// Get the `__parameters__` tuple of a UnionType.
@@ -280,7 +323,7 @@ mod union_tests {
         // members.
         let a = w_int_new(1); // stand-in for int type
         let b = w_int_new(2); // stand-in for str type
-        let union = w_union_from_members(vec![a, b], no_params());
+        let union = w_union_from_parts(vec![a, b], crate::w_frozenset_new(), PY_NULL, no_params());
         unsafe {
             assert!(is_union(union));
             let args = w_union_get_args(union);

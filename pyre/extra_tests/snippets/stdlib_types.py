@@ -31,6 +31,36 @@ def _function_type_kwdefaults():
 _function_type_kwdefaults()
 
 
+def _union_unhashable_partition_is_stable():
+    is_hashable = False
+
+    class UnhashableMeta(type):
+        def __hash__(self):
+            if is_hashable:
+                return 1
+            raise TypeError("not hashable")
+
+    class A(metaclass=UnhashableMeta):
+        pass
+
+    class B(metaclass=UnhashableMeta):
+        pass
+
+    union = A | B
+    assert union.__args__ == (A, B)
+    with assert_raises(TypeError) as raised:
+        hash(union)
+    assert str(raised.exception) == "not hashable"
+
+    is_hashable = True
+    with assert_raises(TypeError) as raised:
+        hash(union)
+    assert str(raised.exception) == "union contains 2 unhashable elements"
+
+
+_union_unhashable_partition_is_stable()
+
+
 def _run_missing_type_params_regression():
     args = _ast.arguments(
         posonlyargs=[],

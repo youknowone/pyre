@@ -13404,30 +13404,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             return Ok(origin_hash ^ args_hash);
         }
         if pyre_object::is_union(obj) {
-            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
-            // `hash(frozenset(self.__args__))`, order-independent so it
-            // agrees with `__eq__`'s set equality.
-            let args = pyre_object::w_union_get_args(obj);
-            // `try_hash_value` runs each member's `__hash__`, which may collect;
-            // `args` is a raw local re-read in the loop, so pin it.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(args);
-            let n = pyre_object::w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
-            let mut hashes = Vec::with_capacity(n);
-            for i in 0..n {
-                if let Some(item) = pyre_object::w_tuple_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(args_slot),
-                    i as i64,
-                ) {
-                    // Preserve frozenset construction's fallible element-hash
-                    // phase.  Building a low-level frozenset first would use
-                    // its stored infallible digest path and hide an
-                    // unhashable union member.
-                    hashes.push(try_hash_value(item)?);
-                }
-            }
-            return Ok(_hash_frozenset(&hashes));
+            return crate::_pypy_generic_alias::union_hash_value(obj);
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
@@ -13915,19 +13892,10 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             return hash_value(origin) ^ hash_value(args);
         }
         if pyre_object::is_union(obj) {
-            // UnionType.__hash__ (`_pypy_generic_alias.py:275`) —
-            // `hash(frozenset(self.__args__))`.  Resolved here too so the
-            // infallible `hash_w`/`hash_value` path agrees with the
-            // fallible `try_hash_value` one.
-            let args = pyre_object::w_union_get_args(obj);
-            let n = w_tuple_len(args);
-            let mut members = Vec::with_capacity(n);
-            for i in 0..n {
-                if let Some(item) = w_tuple_getitem(args, i as i64) {
-                    members.push(item);
-                }
-            }
-            return hash_value(pyre_object::w_frozenset_from_items(&members));
+            // Strict callers take the Result-bearing arm above.  The
+            // callback-only infallible path reads the already-built hashable
+            // partition and never repartitions against mutable hash slots.
+            return hash_value(pyre_object::w_union_get_hashable_args(obj));
         }
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);

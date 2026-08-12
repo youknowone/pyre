@@ -9558,12 +9558,10 @@ fn union_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let union_args = unsafe { pyre_object::w_union_get_args(self_) };
     let newargs = crate::_pypy_generic_alias::subs_parameters(self_, union_args, params, items)?;
     if newargs.is_empty() {
-        // `if len(newargs) == 0: return UnionType(())` — unreachable for a
-        // real union (always ≥1 member), kept for parity.
-        return Ok(pyre_object::w_union_from_members(
-            Vec::new(),
-            pyre_object::w_tuple_new(vec![]),
-        ));
+        // Unreachable for a real union (always ≥1 member).  Route even this
+        // defensive branch through the authoritative builder; an empty union
+        // is rejected rather than manufacturing an object without partitions.
+        return crate::_pypy_generic_alias::union_from_items(&[]);
     }
     // `curr = newargs[0]; for i in range(1, len(newargs)): curr |= newargs[i]`.
     //
@@ -19549,6 +19547,11 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             "object.__new__(X): X is not a type object ({name})"
         )));
     }
+    // CPython 3.14 `object_new`: calling `object.__new__(type)` cannot bypass
+    // a NULL `tp_new` / `Py_TPFLAGS_DISALLOW_INSTANTIATION`.  `type_call`
+    // performs the same check for ordinary `type()`, but the descriptor is
+    // independently callable as `type.__new__(type)`.
+    crate::call::check_type_instantiable(cls)?;
     // objectobject.py descr__new__ — surplus arguments are accepted only
     // when __new__ or __init__ is overridden; the bare object() takes
     // none.  A type that overrides __new__ but forwards excess args to
