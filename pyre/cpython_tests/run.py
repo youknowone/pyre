@@ -706,6 +706,12 @@ def main() -> int:
     if accounted != expected:
         print(f"  {'UNACCOUNTED':12s} {expected - accounted}  "
               f"(buckets sum to {accounted}, {expected} were selected)")
+        # Nonzero, and before the analysis below. `check.py` reads this
+        # runner's exit code and never this line, so printing alone hands it a
+        # pass over a summary short by exactly this many modules. Returning
+        # here also stops `--report` and `--update-baseline` from recording a
+        # table that is missing a result.
+        return 1
 
     # Regression / improvement analysis vs baseline.
     regressions: list[str] = []
