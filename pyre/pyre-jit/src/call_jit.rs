@@ -2030,7 +2030,7 @@ fn jit_blackhole_resume_from_guard(
 /// (`result.values`).  The collector is moving, so a minor collection
 /// triggered while `blackhole_from_resumedata` lazily materializes virtuals
 /// (`getvirtual_ptr` → allocator) relocates the boxed objects and leaves the
-/// copy holding from-space pointers; `decode_ref` (resume.rs:1575) then reads
+/// copy holding from-space pointers; `resume.rs::decode_ref` then reads
 /// a stale pointer for a box-sourced slot and the blackhole dereferences
 /// freed memory.  Resume *constants* are already forwarded by
 /// `rd_consts_root_walker_area`, but the box-sourced slots here are not.

@@ -5499,7 +5499,7 @@ impl Optimizer {
         // safe one (no false positives), but it does mean a trace whose
         // `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
         // still slips past here and is caught only by the reader's
-        // `assert!(vable_size > 0)` at `resume.rs:7030`.
+        // `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
         opt.minimum_virtualizable_size = config.static_field_offsets.len() as i64;
         opt.add_pass(Box::new(OptIntBounds::new()));
         opt.add_pass(Box::new(OptRewrite::new()));
