@@ -1127,33 +1127,12 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
     }
 }
 
-/// `true` iff `kind` is side-effect-free and may be removed from the
-/// graph when its result has no readers.  Direct port of RPython
-/// `simplify.py:405-417 CanRemove` set + the lltype-level
-/// `lloperation.enum_ops_without_sideeffects()` extension that
-/// `simplify.py:414-416` unions in.
+/// `true` iff `kind` is side-effect-free for the existing folding,
+/// CSE, and control-flow-shape consumers of this predicate.
 ///
-/// Pure ops correspond to RPython:
-///   - flowspace pure: `add sub mul div mod ... lt le eq ... bool len
-///     hash getattr getitem`-family (`simplify.py:407-412`).
-///   - lltype pure: `int_add int_lt ... getfield(_pure)
-///     getarrayitem(_pure) getinteriorfield ... cast_*` from
-///     `enum_ops_without_sideeffects`.
-///
-/// Side-effecting ops correspond to RPython `setfield setarrayitem
-/// setinteriorfield` (writes), `direct_call indirect_call` (calls
-/// without elidable EI), every `*guard*` opname (control-flow guards),
-/// and the JIT marker family (`jit_marker`, `debug_merge_point`,
-/// `loop_header`, `live`, `record_known_result`,
-/// `record_quasiimmut_field`, `jit_debug`).
-///
-/// Used by `model::prune_dead_phis` to mirror PyPy
-/// `simplify.py:441-445`'s split: pure ops route their args via
-/// `dependencies[op.result] += op.args` (args become live only if
-/// the result becomes live), while non-pure ops add their args
-/// directly to `read_vars` (args always live).  Without the split,
-/// a phi feeding only a dead pure op would be kept alive via the
-/// pure op's args even though both should die together.
+/// Dead-operation removal uses [`can_remove_op`] instead.  RPython keeps
+/// `LLOp.is_pure()` (`lloperation.py:82-93`) and `CanRemove`
+/// (`simplify.py:411-423`) as distinct predicates.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
         // `new` / `new_with_vtable` / `new_array_clear` heap-allocate fresh
@@ -1215,19 +1194,18 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py:542-548`).
         | OpKind::NewTuple { .. }
-        // `newlist` is `PureOperation` — a fresh list allocation has no
-        // observable effect on existing state.
+        // `newlist` subclasses `HLOperation` (`operation.py:551-557`), not
+        // `PureOperation`; its DCE authorization comes from the high-level
+        // `simplify.py:411-418 CanRemove` list alone.
         | OpKind::NewList { .. }
-        // `getslice` is a `PureOperation` (`operation.py:461`,
-        // `pure=True`) — the slice copy reads the source and allocates a
-        // fresh list, with no observable effect on existing state.
+        // `getslice` is registered `pure=True` for flowspace folding/CSE
+        // (`operation.py:461`), but its possible exception excludes it from
+        // dead-op removal; see `can_remove_op`.
         | OpKind::GetSlice { .. }
-        // `isinstance` lowers to `int_between` over `obj.typeptr`'s
-        // subclass-range fields plus an optional null branch — all
-        // pure reads, classified `canfold=True` upstream
-        // (`lloperation.py instance_isinstance`).  Keeping dead
-        // `IsInstance` results alive would block prune_dead_phis Step
-        // 5 even though the predicate is side-effect-free.
+        // The high-level `isinstance` entry in `simplify.py:411-418`
+        // `CanRemove` authorizes DCE.  Its lowering reads subclass-range
+        // fields and emits `int_between`; there is no
+        // `instance_isinstance` lloperation row.
         | OpKind::IsInstance { .. }
         // `LoadStatic` reads a `static` declaration's compile-time
         // address — equivalent to `LOAD_GLOBAL` → Constant lookup,
@@ -1306,6 +1284,22 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
             opname.as_str(),
             "strlen" | "unicodelen" | "strgetitem" | "unicodegetitem"
         ),
+    }
+}
+
+/// `true` iff `kind` may be removed when its result has no readers.
+/// Models RPython `simplify.py:411-423 CanRemove`, including the default
+/// `raising_is_ok=False` used by `enum_ops_without_sideeffects()`.
+///
+/// This is deliberately a restriction of [`is_pure_op`], so switching the
+/// dead-op pass to this predicate cannot authorize any new removal.
+pub fn can_remove_op(kind: &OpKind) -> bool {
+    match kind {
+        // `getslice` is absent from `simplify.py:411-418 CanRemove` and is
+        // raising at `lloperation.py:578`, so
+        // `enum_ops_without_sideeffects()` does not add it either.
+        OpKind::GetSlice { .. } => false,
+        _ => is_pure_op(kind),
     }
 }
 
@@ -1418,11 +1412,10 @@ fn is_pure_binop_opname(opname: &str) -> bool {
     // Pyre's BinOp arrives here pre-rtyper (frontend names like
     // `add`); the post-rtyper shape is also accepted so a future
     // post-rtyper DCE call site requires no further widening.
-    let prefix_match = opname
+    let integer_prefix_match = opname
         .strip_prefix("int_")
-        .or_else(|| opname.strip_prefix("uint_"))
-        .or_else(|| opname.strip_prefix("float_"));
-    if let Some(suffix) = prefix_match {
+        .or_else(|| opname.strip_prefix("uint_"));
+    if let Some(suffix) = integer_prefix_match {
         return matches!(
             suffix,
             "add"
@@ -1441,6 +1434,15 @@ fn is_pure_binop_opname(opname: &str) -> bool {
                 | "ne"
                 | "gt"
                 | "ge"
+        );
+    }
+    if let Some(suffix) = opname.strip_prefix("float_") {
+        // `lloperation.py:246-261` defines only arithmetic through true
+        // division and the six comparisons, and explicitly leaves
+        // `float_mod` to `math.fmod`.
+        return matches!(
+            suffix,
+            "add" | "sub" | "mul" | "truediv" | "lt" | "le" | "eq" | "ne" | "gt" | "ge"
         );
     }
     false
@@ -1558,6 +1560,42 @@ mod tests {
     use crate::call::CallControl;
     use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
     use crate::parse::CallPath;
+
+    #[test]
+    fn dead_op_removal_and_float_purity_use_their_rpython_tables() {
+        let getslice = OpKind::GetSlice { args: vec![] };
+        assert!(is_pure_op(&getslice));
+        assert!(!can_remove_op(&getslice));
+
+        for name in [
+            "float_add",
+            "float_sub",
+            "float_mul",
+            "float_truediv",
+            "float_lt",
+            "float_le",
+            "float_eq",
+            "float_ne",
+            "float_gt",
+            "float_ge",
+        ] {
+            assert!(is_pure_binop_opname(name), "{name} is an lltype float op");
+        }
+        for name in [
+            "float_floordiv",
+            "float_mod",
+            "float_lshift",
+            "float_rshift",
+            "float_and",
+            "float_or",
+            "float_xor",
+        ] {
+            assert!(
+                !is_pure_binop_opname(name),
+                "{name} is absent from the lltype float table"
+            );
+        }
+    }
 
     #[test]
     fn lowered_blackhole_op_purity_is_opname_aware() {

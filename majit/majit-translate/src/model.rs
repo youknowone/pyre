@@ -3894,7 +3894,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      `Block::canraise()` mirrors the upstream
 ///      `block.exitswitch is c_last_exception` check; the raising
 ///      op is the last entry in `block.operations`.
-///        - If `is_pure_op(kind)` AND the op is not the raising_op
+///        - If `can_remove_op(kind)` AND the op is not the raising_op
 ///          AND `op.result.is_some()`: route operands via
 ///          `dependencies[op.result] += operands`
 ///          (`simplify.py:444-445 dependencies[op.result].
@@ -3979,7 +3979,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 pub fn prune_dead_phis(graph: &mut FunctionGraph) {
-    use crate::inline::is_pure_op;
+    use crate::inline::can_remove_op;
     use std::collections::HashMap;
     let start = graph.startblock;
     let return_block = graph.returnblock;
@@ -4110,7 +4110,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             // `simplify.py:441-445`:
             //   if not canremove(op, block):    read_vars.update(args)
             //   else:                           dependencies[result] += args
-            let removable = is_pure_op(&op.kind) && Some(i) != raising_op_idx;
+            let removable = can_remove_op(&op.kind) && Some(i) != raising_op_idx;
             if let Some(result_var) = op.result.clone()
                 && removable
             {
@@ -4231,7 +4231,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 Some(r) => !read_vars.contains(r),
                 None => false,
             };
-            if dead && is_pure_op(&op.kind) && Some(i) != raising_op_idx {
+            if dead && can_remove_op(&op.kind) && Some(i) != raising_op_idx {
                 dead_op_positions.push((block.id, i));
             }
         }
@@ -6711,6 +6711,38 @@ mod tests {
         assert!(
             entry_exit.args.is_empty(),
             "predecessor link arg matching the pruned phi must be removed"
+        );
+    }
+
+    #[test]
+    fn prune_dead_phis_keeps_dead_raising_getslice() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let list = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let start = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let stop = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let slice = graph
+            .push_op_var(
+                entry,
+                OpKind::GetSlice {
+                    args: vec![list, start, stop],
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, None);
+
+        prune_dead_phis(&mut graph);
+
+        assert!(
+            graph
+                .block(entry)
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&slice)),
+            "dead getslice must remain because `simplify.CanRemove` excludes it"
         );
     }
 
