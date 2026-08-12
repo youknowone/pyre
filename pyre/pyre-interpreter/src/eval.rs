@@ -1071,6 +1071,8 @@ pub unsafe fn walk_pyframe_roots_area(
                     let d = &mut *(*frame).debugdata;
                     let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
                     visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
+                    let w_extra_locals_slot = &mut d.w_extra_locals as *mut PyObjectRef;
+                    visitor(&mut *(w_extra_locals_slot as *mut majit_ir::GcRef));
                     let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
                     visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
                     let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;
@@ -1421,6 +1423,8 @@ pub fn walk_suspended_generator_frame(
             let d = &mut *(*frame).debugdata;
             let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
             visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
+            let w_extra_locals_slot = &mut d.w_extra_locals as *mut PyObjectRef;
+            visitor(&mut *(w_extra_locals_slot as *mut majit_ir::GcRef));
             let w_f_trace_slot = &mut d.w_f_trace as *mut PyObjectRef;
             visitor(&mut *(w_f_trace_slot as *mut majit_ir::GcRef));
             let hidden_operationerr_slot = &mut d.hidden_operationerr as *mut PyObjectRef;

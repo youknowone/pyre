@@ -150,8 +150,13 @@ pub mod frame_locals_proxy {
                 }
                 return Ok(());
             }
-            let backing = self.frame().get_or_create_w_locals();
-            crate::baseobjspace::setitem(backing, key, value).map(|_| ())
+            // CPython 3.14 `framelocalsproxy_setitem`: a key which is not a
+            // writable fast local goes into the frame object's separate
+            // `f_extra_locals` exact dict.  In particular, a PEP 709 hidden
+            // local is read from the fast slot but proxy writes of the same
+            // name do not mutate that slot or the module/eval locals mapping.
+            let extra = self.frame().get_or_create_extra_locals();
+            crate::baseobjspace::setitem(extra, key, value).map(|_| ())
         }
 
         fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
@@ -212,7 +217,7 @@ pub mod frame_locals_proxy {
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            crate::baseobjspace::delitem(self.frame().get_or_create_w_locals(), key)
+            crate::baseobjspace::delitem(self.frame().get_or_create_extra_locals(), key)
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
@@ -279,7 +284,7 @@ pub mod frame_locals_proxy {
         fn update(&mut self, other: PyObjectRef) -> Result<(), crate::PyError> {
             // frameobject.c `framelocalsproxy_merge` applies only the incoming
             // mapping's keys.  Starting from the proxy snapshot would also
-            // replay every existing hidden local into the backing namespace.
+            // replay every existing fast local into `f_extra_locals`.
             let incoming = unsafe { pyre_object::w_dict_new() };
             let result = crate::baseobjspace::call_method(incoming, "update", &[other]);
             if result.is_null() {
@@ -321,8 +326,8 @@ pub mod frame_locals_proxy {
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let backing = self.frame().get_or_create_w_locals();
-            let result = crate::baseobjspace::call_method(backing, "pop", call_args);
+            let extra = self.frame().get_or_create_extra_locals();
+            let result = crate::baseobjspace::call_method(extra, "pop", call_args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("pop failed")))
@@ -349,6 +354,15 @@ pub mod frame_locals_proxy {
         }
 
         fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+            // CPython 3.14 `framelocalsproxy_repr` brackets the materialized
+            // dict repr with `Py_ReprEnter/Leave(self)`.  The guard must name
+            // the proxy, not the temporary dict: `proxy[1] = proxy` then
+            // renders as `{1: {...}}` instead of recursively materializing a
+            // fresh dict forever.
+            let self_obj = self as *const FrameLocalsProxy as PyObjectRef;
+            let Some(_guard) = crate::display::ReprGuard::enter(self_obj) else {
+                return Ok(rustpython_wtf8::Wtf8Buf::from_string("{...}".to_string()));
+            };
             unsafe { crate::display::py_repr_wtf8(self.mapping()?) }
         }
     }
@@ -1456,6 +1470,13 @@ pub struct FrameDebugData {
     /// arbitrary `__getitem__` mapping here.  `STORE/LOAD/DELETE_NAME`
     /// route through `space.setitem/getitem/delitem(w_locals, ...)`.
     pub w_locals: PyObjectRef,
+    /// CPython 3.14 `PyFrameObject.f_extra_locals` — keys written through a
+    /// `FrameLocalsProxy` which do not name a writable fast local.  This is
+    /// deliberately separate from `w_locals`: for a non-optimized eval/class
+    /// frame with a live PEP 709 hidden local, the proxy exposes its fast
+    /// locals plus this dict, not the original module/class locals mapping
+    /// (`Objects/frameobject.c:187-213,246-317,370-405`).
+    pub w_extra_locals: PyObjectRef,
     /// pyframe.py:37
     pub w_f_trace: PyObjectRef,
     /// pyframe.py:40
@@ -1482,6 +1503,7 @@ impl FrameDebugData {
     pub fn new(_pycode: *const (), init_lineno: isize) -> Self {
         Self {
             w_locals: pyre_object::PY_NULL,
+            w_extra_locals: pyre_object::PY_NULL,
             w_f_trace: pyre_object::PY_NULL,
             is_being_profiled: false,
             is_in_line_tracing: false,
@@ -2519,6 +2541,28 @@ impl PyFrame {
             .map_or(pyre_object::PY_NULL, |data| data.w_locals)
     }
 
+    /// CPython 3.14 `PyFrameObject.f_extra_locals`, allocated by
+    /// `framelocalsproxy_setitem` only when a proxy write does not target a
+    /// writable fast local.  It is always an exact dict and is not the
+    /// module/class/exec mapping kept in [`Self::get_w_locals`].
+    fn get_or_create_extra_locals(&mut self) -> PyObjectRef {
+        let existing = self
+            .getdebug_data()
+            .map_or(pyre_object::PY_NULL, |data| data.w_extra_locals);
+        if !existing.is_null() {
+            return existing;
+        }
+        let extra = unsafe { pyre_object::w_dict_new() };
+        self.getorcreate_debug_data(-1).w_extra_locals = extra;
+        extra
+    }
+
+    #[inline]
+    fn get_extra_locals(&self) -> PyObjectRef {
+        self.getdebug_data()
+            .map_or(pyre_object::PY_NULL, |data| data.w_extra_locals)
+    }
+
     /// pyframe.py:540-545 getdictscope — runs `fast2locals` then returns
     /// `self.debugdata.w_locals` (the locals mapping object).
     ///
@@ -2542,27 +2586,12 @@ impl PyFrame {
     /// Module and class frames keep handing back their real namespace, which
     /// is what makes a module-level `locals() is globals()` still hold.
     pub fn frame_locals_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if !self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
-            && self.has_active_hidden_locals()
+        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+            || self.has_active_hidden_locals()
         {
             return self.frame_locals_proxy_snapshot();
         }
-        let w_locals = self.getdictscope()?;
-        if w_locals.is_null() || !self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
-            return Ok(w_locals);
-        }
-        let _roots = pyre_object::gc_roots::push_roots();
-        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_locals);
-        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-        // `dict_update_value` walks a mapping's `keys()`, so both sides are
-        // reloaded across it as well as across the `w_dict_new` above.
-        crate::opcode_ops::dict_update_value(
-            pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
-            pyre_object::gc_roots::shadow_stack_get(locals_slot),
-        )?;
-        Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
+        self.getdictscope()
     }
 
     /// CPython 3.14 `_PyFrame_HasHiddenLocals`: a non-optimized module/class
@@ -2573,43 +2602,70 @@ impl PyFrame {
             .any(|index| hidden_local(code, index) && !locals_w!(self)[index].is_null())
     }
 
-    /// Materialize the current contents of CPython's FrameLocalsProxy.
-    /// Optimized frames use their regular fast-to-locals snapshot.  For a
-    /// non-optimized frame, copy the real module/class namespace and overlay
-    /// only currently-bound hidden comprehension locals; never write those
-    /// temporary bindings into the real namespace.
+    /// Materialize the current contents of CPython 3.14's
+    /// `FrameLocalsProxy`: every bound locals-plus slot followed by the
+    /// frame object's separate `f_extra_locals` dict.  The original
+    /// non-optimized `f_locals` mapping is deliberately absent while a PEP
+    /// 709 hidden slot makes the proxy active; CPython's
+    /// `framelocalsproxy_keys/getitem` read only the fast array and
+    /// `f_extra_locals` (`Objects/frameobject.c:187-213,370-405`).
     pub fn frame_locals_proxy_snapshot(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED) {
-            let w_locals = self.getdictscope()?;
-            let snapshot = unsafe { pyre_object::w_dict_new() };
-            crate::opcode_ops::dict_update_value(snapshot, w_locals)?;
-            return Ok(snapshot);
+        let roots = pyre_object::gc_roots::push_roots();
+        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(unsafe { pyre_object::w_dict_new() });
+
+        // `framelocalsproxy_getitem` gives a live fast local priority over an
+        // equal key in `f_extra_locals`.  Copy extras first, then overlay the
+        // fast slots to preserve that ordering in the materialized dict.
+        let extra = self.get_extra_locals();
+        if !extra.is_null() {
+            let extra_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(extra);
+            crate::opcode_ops::dict_update_value(roots.get(snapshot_slot), roots.get(extra_slot))?;
         }
 
-        let _roots = pyre_object::gc_roots::push_roots();
-        let backing_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(self.get_or_create_w_locals());
-        let snapshot_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(unsafe { pyre_object::w_dict_new() });
-        crate::opcode_ops::dict_update_value(
-            pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
-            pyre_object::gc_roots::shadow_stack_get(backing_slot),
-        )?;
         let code = self.code();
-        for index in 0..code.varnames.len() {
-            if !hidden_local(code, index) {
+        let mut insert_slot =
+            |index: usize, name: &str, cell_slot: bool| -> Result<(), crate::PyError> {
+                if index >= locals_w!(self).len() {
+                    return Ok(());
+                }
+                let slot = locals_w!(self)[index];
+                let value = if cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) }
+                {
+                    unsafe { pyre_object::w_cell_get(slot) }
+                } else {
+                    slot
+                };
+                if value.is_null() {
+                    return Ok(());
+                }
+                // `setitem_str_object` allocates the string key and can move
+                // `value`; keep it in a shadow-stack slot and reload it for
+                // the store.
+                let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                roots.pin_root(value);
+                setitem_str_object(roots.get(snapshot_slot), name, roots.get(value_slot))
+            };
+
+        for (index, name) in code.varnames.iter().enumerate() {
+            let cell_slot = index < code.localspluskinds.len()
+                && code.localspluskinds[index] & crate::bytecode::CO_FAST_CELL != 0;
+            insert_slot(index, name.as_ref(), cell_slot)?;
+        }
+        let mut index = code.varnames.len();
+        for name in code.cellvars.iter() {
+            if code.varnames.iter().any(|local| local == name) {
                 continue;
             }
-            let value = locals_w!(self)[index];
-            if !value.is_null() {
-                setitem_str_object(
-                    pyre_object::gc_roots::shadow_stack_get(snapshot_slot),
-                    &code.varnames[index],
-                    value,
-                )?;
-            }
+            insert_slot(index, name.as_ref(), true)?;
+            index += 1;
         }
-        Ok(pyre_object::gc_roots::shadow_stack_get(snapshot_slot))
+        for name in code.freevars.iter() {
+            insert_slot(index, name.as_ref(), true)?;
+            index += 1;
+        }
+        Ok(roots.get(snapshot_slot))
     }
 
     /// Test-helper constructor — creates a frame with a fresh execution
@@ -3476,6 +3532,9 @@ impl PyFrame {
             let w_locals = had_locals.then(|| unsafe { pyre_object::w_dict_new() });
             let d = self.getorcreate_debug_data(-1);
             d.w_f_trace = pyre_object::PY_NULL;
+            // CPython `frame_tp_clear` drops `f_extra_locals`; proxy-only
+            // writes must not survive an explicit frame clear.
+            d.w_extra_locals = pyre_object::PY_NULL;
             if let Some(w_locals) = w_locals {
                 d.w_locals = w_locals;
             }
