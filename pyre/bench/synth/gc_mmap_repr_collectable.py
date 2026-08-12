@@ -8,7 +8,7 @@ import mmap
 # imports on Windows so callers can feature-detect it, but it does not expose
 # mmap.mmap there.
 if not hasattr(mmap, "mmap"):
-    print("mmap repr results are collectable (mmap unavailable)")
+    print("mmap repr results are collectable")
     raise SystemExit
 
 mapping = mmap.mmap(-1, 1)
