@@ -3008,6 +3008,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
@@ -3100,6 +3101,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
@@ -3380,6 +3382,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -3647,6 +3650,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -3898,6 +3902,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -3988,6 +3993,11 @@ pub struct ResumeGuardCopiedDescr {
     /// lives on the descr.  Same per-emission scoping as
     /// `source_op_index` / `rd_locs` — owned per copied descr.
     force_token_slots: UnsafeCell<Vec<usize>>,
+    /// Pyre-only per-emission slot: this guard is the eval-breaker word's
+    /// back-edge poll.  Same per-emission scoping as `source_op_index`; a
+    /// copy guards the same back edge as its donor, so the optimizer stamps
+    /// each copy as it emits it.
+    back_edge_poll: std::sync::atomic::AtomicBool,
     /// Pyre-only per-emission failure counter for bridge compilation
     /// thresholds.  PyPy carries the equivalent jitcounter hash in
     /// `compile.py:683 AbstractResumeGuardDescr._attrs_ ('status',)`
@@ -4134,6 +4144,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4312,6 +4323,14 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
+    fn is_back_edge_poll(&self) -> bool {
+        self.back_edge_poll
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_back_edge_poll(&self) {
+        self.back_edge_poll
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Per-emission `force_token_slots` (see field comment).  Owned
     /// per copied descr so each emission's GC-root classification
     /// stays distinct — PyPy bakes the equivalent map inline per
@@ -4450,6 +4469,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 force_token_slots: UnsafeCell::new(Vec::new()),
+                back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4571,6 +4591,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         self.inner.set_source_op_index(source_op_index);
     }
+    fn is_back_edge_poll(&self) -> bool {
+        self.inner.is_back_edge_poll()
+    }
+    fn set_back_edge_poll(&self) {
+        self.inner.set_back_edge_poll();
+    }
     fn force_token_slots(&self) -> Vec<usize> {
         self.inner.force_token_slots()
     }
@@ -4654,6 +4680,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4694,6 +4721,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge_code_ptr_cache: Box::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4858,6 +4886,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 force_token_slots: UnsafeCell::new(Vec::new()),
+                back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
@@ -5078,6 +5107,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -5580,6 +5610,7 @@ mod fail_descr_tests {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 force_token_slots: UnsafeCell::new(Vec::new()),
+                back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),

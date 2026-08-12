@@ -39,7 +39,7 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{
@@ -167,6 +167,12 @@ pub struct ResumeGuardDescr {
     /// the meta Arc is the single source of truth.  Sorted and deduped
     /// at write time so `is_force_token_slot` can use `binary_search`.
     pub force_token_slots: UnsafeCell<Vec<usize>>,
+    /// This guard is the eval-breaker word's back-edge poll, not a check on
+    /// traced values.  Stamped once per emission by the optimizer, which is
+    /// where the guard's condition chain is still in hand; read by the
+    /// statistics counter to keep scheduled exits out of the guard-failure
+    /// total.  See `descr.rs FailDescr::is_back_edge_poll`.
+    pub back_edge_poll: AtomicBool,
     /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
     /// drives `must_compile` via `jitcounter.tick(status_hash)` in
     /// RPython.  Pyre keeps a raw per-descr counter:
@@ -302,6 +308,7 @@ impl Descr for ResumeGuardDescr {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             force_token_slots: UnsafeCell::new(Vec::new()),
+            back_edge_poll: AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -447,6 +454,12 @@ impl FailDescr for ResumeGuardDescr {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
+    fn is_back_edge_poll(&self) -> bool {
+        self.back_edge_poll.load(Ordering::Relaxed)
+    }
+    fn set_back_edge_poll(&self) {
+        self.back_edge_poll.store(true, Ordering::Relaxed);
+    }
     fn force_token_slots(&self) -> Vec<usize> {
         // Safety: single-threaded JIT.
         unsafe { (&*self.force_token_slots.get()).clone() }
@@ -578,6 +591,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         force_token_slots: UnsafeCell::new(Vec::new()),
+        back_edge_poll: AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),

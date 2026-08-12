@@ -1747,6 +1747,7 @@ pub(crate) struct JitStatsCounters {
     loops_aborted: usize,
     bridges_compiled: usize,
     guard_failures: usize,
+    back_edge_polls: usize,
 }
 
 /// Snapshot of cumulative JIT compilation statistics.
@@ -1756,7 +1757,20 @@ pub struct JitStats {
     pub retraces_compiled: usize,
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
+    /// Guards that failed because the compiled code's assumption did not hold.
+    /// Excludes the eval-breaker back-edge poll, which is counted separately —
+    /// see `back_edge_polls`.
     pub guard_failures: usize,
+    /// Failures of the eval-breaker word's back-edge poll: a compiled loop
+    /// leaving machine code so the interpreter can service a signal, a
+    /// stop-the-world request, or an owed collection.
+    ///
+    /// Split out because it measures *when* a collection landed rather than
+    /// anything about the compiled code, which makes it move with the heap
+    /// schedule and the host while `loops_compiled` / `bridges_compiled` sit
+    /// still. Folded into `guard_failures` it made that total unusable as an
+    /// exact-match baseline.
+    pub back_edge_polls: usize,
     /// issue compilation-panic: non-`InvalidLoop` panics swallowed during compilation
     /// (graceful degradation in release). Non-zero means the JIT was
     /// silently disabled for some traces by an internal bug.
@@ -2257,8 +2271,14 @@ impl<M: Clone> MetaInterp<M> {
         !is_finish && !Self::is_jump_exit(is_finish, fail_index)
     }
 
+    /// `back_edge_poll` splits the total: a failing eval-breaker poll left
+    /// machine code because the collector asked for a safepoint, not because
+    /// the compiled code assumed something that turned out false. Only the
+    /// tally is split — the census, the per-guard warm-state counter, and the
+    /// hook see every failure, since bridge-compilation thresholds and guard
+    /// attribution still apply to the poll.
     #[inline]
-    fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32) {
+    fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32, back_edge_poll: bool) {
         if guardlog_enabled() {
             eprintln!("@@@GUARD key={green_key} fail={fail_index}");
         }
@@ -2268,7 +2288,12 @@ impl<M: Clone> MetaInterp<M> {
                 green_key, fail_index
             );
         }
-        self.stats.guard_failures += 1;
+        let tally = if back_edge_poll {
+            &mut self.stats.back_edge_polls
+        } else {
+            &mut self.stats.guard_failures
+        };
+        *tally += 1;
         crate::guard_census_record(green_key, fail_index);
         self.warm_state.log_guard_failure(fail_index);
         if let Some(ref hook) = self.hooks.on_guard_failure {
@@ -4301,6 +4326,7 @@ impl<M: Clone> MetaInterp<M> {
             loops_aborted: self.stats.loops_aborted,
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
+            back_edge_polls: self.stats.back_edge_polls,
             internal_compile_panics: self.internal_compile_panics,
         }
     }
@@ -10026,7 +10052,11 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         if Self::should_record_guard_failure(effective_is_finish, fail_index) {
-            self.record_guard_failure_event(green_key, fail_index);
+            let back_edge_poll = result
+                .descr_arc
+                .as_fail_descr()
+                .is_some_and(|fd| fd.is_back_edge_poll());
+            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
         }
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -10110,7 +10140,10 @@ impl<M: Clone> MetaInterp<M> {
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            self.record_guard_failure_event(green_key, fail_index);
+            let back_edge_poll = descr_arc
+                .as_fail_descr()
+                .is_some_and(|fd| fd.is_back_edge_poll());
+            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
         }
 
         let exit_arity = exit_types.len();
@@ -10288,7 +10321,10 @@ impl<M: Clone> MetaInterp<M> {
         // in handle_fail → must_compile (compile.py:701-784).
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            self.record_guard_failure_event(green_key, fail_index);
+            let back_edge_poll = descr_arc
+                .as_fail_descr()
+                .is_some_and(|fd| fd.is_back_edge_poll());
+            self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
         }
 
         let exit_arity = exit_types.len();

@@ -4055,6 +4055,30 @@ pub trait FailDescr: Descr {
         );
     }
 
+    /// Pyre-only per-emission slot: this guard is the eval-breaker word's
+    /// back-edge poll rather than a check on traced values.
+    ///
+    /// Its failures are scheduled exits — the collector armed the word and the
+    /// loop has to leave machine code for the request to be serviced — so they
+    /// describe when a collection landed, not what the compiled code assumed.
+    /// The statistics counter reads this to keep the two apart
+    /// (`crate::eval_breaker_word::is_back_edge_poll_guard` decides it).
+    /// Default `false` for non-resume FailDescrs.
+    fn is_back_edge_poll(&self) -> bool {
+        false
+    }
+
+    /// Pyre-only per-emission slot write.  See `is_back_edge_poll`.  Default
+    /// panics — only Resume-family guards own the slot.  Callers must gate by
+    /// `is_resume_guard() || is_resume_guard_copied()`.
+    fn set_back_edge_poll(&self) {
+        panic!(
+            "set_back_edge_poll invoked on a FailDescr that does not \
+             carry the per-emission back_edge_poll slot (only \
+             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
+        );
+    }
+
     /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
     /// — packs `ST_BUSY_FLAG` + type tag + hash on the resume-guard
     /// descr.  `compile.py:741-745` `self.status` read for
