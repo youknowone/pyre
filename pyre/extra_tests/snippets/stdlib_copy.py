@@ -41,3 +41,16 @@ for comparison in (
 
 
 print("stdlib copy ok")
+
+# Immutable tuples are returned directly, while deepcopy's memo bookkeeping
+# for list/tuple members matches CPython 3.14.
+immutable_tuple = ((1, 2), 3)
+assert copy.deepcopy(immutable_tuple) is immutable_tuple
+
+memo = {}
+copy.deepcopy([1, 2, 3, 4], memo)
+assert len(memo) == 2, memo
+
+memo = {}
+copy.deepcopy([(1, 2)], memo)
+assert len(memo) == 2, memo

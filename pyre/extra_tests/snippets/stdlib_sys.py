@@ -183,6 +183,76 @@ with assert_raises(TypeError):
 with assert_raises(TypeError):
     sys.getsizeof("x", 1, 2)
 
+# CPython 3.14 adds a two-word PyGC_Head according to the type's GC flag, not
+# the object's current tracked state, plus two managed-prefix words for heap
+# instances with a managed dict or weakref slot.
+pointer_size = (sys.maxsize.bit_length() + 7) // 8
+gc_head = 2 * pointer_size
+managed_prefix = 2 * pointer_size
+
+
+class SizeofPlain:
+    pass
+
+
+class SizeofSlotted:
+    __slots__ = ("a",)
+
+
+class SizeofWeakSlot:
+    __slots__ = ("__weakref__",)
+
+
+def sizeof_function():
+    pass
+
+
+def sizeof_generator():
+    yield 1
+
+
+import weakref as sizeof_weakref
+
+no_preheader = [
+    object(), None, Ellipsis, NotImplemented, 5, 2**300, True, 1.5, 1j,
+    "abc", b"abc", bytearray(b"a"), range(3), sizeof_function.__code__,
+    int, type, object,
+]
+gc_only = [
+    [], (), (1,), {1: 2}, {1}, frozenset({1}), slice(1), memoryview(b"ab"),
+    map(str, []), filter(None, []), zip(), enumerate([]), reversed([]), sys,
+    sizeof_function, sizeof_generator(), len, list.append, object.__init__,
+    property(), staticmethod(sizeof_function), classmethod(sizeof_function),
+    sizeof_weakref.ref(SizeofPlain()), SizeofPlain, SizeofSlotted(),
+]
+gc_and_managed = [SizeofPlain(), SizeofWeakSlot()]
+
+for expected, group in (
+    (0, no_preheader),
+    (gc_head, gc_only),
+    (gc_head + managed_prefix, gc_and_managed),
+):
+    for obj in group:
+        actual = sys.getsizeof(obj) - type(obj).__sizeof__(obj)
+        assert actual == expected, (type(obj).__name__, actual, expected)
+
+
+class NegativeSizeof:
+    def __sizeof__(self):
+        return -1
+
+
+class NonIntegerSizeof:
+    def __sizeof__(self):
+        return "x"
+
+
+with assert_raises(ValueError):
+    sys.getsizeof(NegativeSizeof())
+with assert_raises(TypeError):
+    sys.getsizeof(NonIntegerSizeof())
+assert sys.getsizeof([], 123) == sys.getsizeof([])
+
 
 def test_getframemodulename():
     return sys._getframemodulename()

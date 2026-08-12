@@ -77,3 +77,33 @@ try:
     assert False, "eval with code containing free variables should fail"
 except NameError as e:
     pass
+
+
+# CPython 3.14: PEP 709 hidden comprehension locals belong to the eval frame,
+# not to the mapping supplied as eval's locals argument.
+import sys as eval_sys
+
+
+class EvalLocals(dict):
+    def __getitem__(self, key):
+        if key == "sys":
+            return eval_sys
+        return dict.__getitem__(self, key)
+
+    def keys(self):
+        raise AssertionError("eval locals must not back FrameLocalsProxy")
+
+
+eval_locals = EvalLocals()
+snapshots = eval("[locals() for i in (2, 3)]", {"sys": eval_sys}, eval_locals)
+assert snapshots == [{"i": 2}, {"i": 3}], snapshots
+assert eval_locals == {}, eval_locals
+
+observed = eval(
+    "[(lambda p: (p.__setitem__('z', 3), dict(p)))"
+    "(sys._getframe().f_locals) for i in (1,)]",
+    {"sys": eval_sys},
+    eval_locals,
+)
+assert observed == [(None, {"i": 1, "z": 3})], observed
+assert eval_locals == {}, eval_locals

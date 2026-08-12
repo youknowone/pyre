@@ -4038,12 +4038,12 @@ fn run_perfn_walk<Sym: WalkSym>(
         // blackhole opcode.
         let walk_abort_adopted = !trace_too_long_adopted
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
-                && !matches!(
-                    error,
-                    crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
-                        | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
-                        | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
-                ))
+            && !matches!(
+                error,
+                crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
+                    | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                    | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
+            ))
             && walk_abort_leg_enabled()
             && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::WalkAbort);
         if walk_abort_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {

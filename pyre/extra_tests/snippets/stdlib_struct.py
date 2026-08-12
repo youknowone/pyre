@@ -118,3 +118,28 @@ with assert_raises(TypeError):
     struct.pack_into("ii", bytearray(8), 0, 1, 2, extra=3)
 with assert_raises(TypeError):
     _s.pack_into(bytearray(8), 0, 1, 2, extra=3)
+
+# CPython 3.14 Struct.__sizeof__: the fixed seven-word object prefix plus a
+# four-word compiled-format entry for every code and the terminal sentinel.
+word = struct.calcsize("P")
+expected_codes = {
+    "": 0,
+    "i": 1,
+    "10i": 1,
+    "2s": 1,
+    "0i": 0,
+    "  i  h": 2,
+    "@i": 1,
+    "100x": 0,
+    "2p": 1,
+}
+for format_string, code_count in expected_codes.items():
+    expected_size = 7 * word + (code_count + 1) * 4 * word
+    assert struct.Struct(format_string).__sizeof__() == expected_size
+
+
+class StructWithSlot(struct.Struct):
+    __slots__ = ("extra",)
+
+
+assert StructWithSlot("").__sizeof__() == 12 * word
