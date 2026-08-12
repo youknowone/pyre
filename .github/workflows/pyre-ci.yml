@@ -314,8 +314,15 @@ jobs:
       # backend through `majit-metainterp/{dynasm,cranelift}`). Test EXECUTION is
       # cheap (~7s for the whole workspace); the cost this avoids is the second
       # backend's compile+link of those otherwise-identical harnesses.
+      #
+      # `cpyext` rides along here rather than in its own step. It is off by
+      # default (see pyre-interpreter's feature table), so its one test —
+      # pyrex's cpyext_smoke, which is backend-independent and compiles out
+      # off macOS/Linux — needs SOME leg that enables it, and this leg already
+      # recompiles the pyrex/pyre-interpreter stack under a second feature set.
+      # A dedicated step would compile that stack a third time instead.
       run: |
-        cargo test --no-default-features --features cranelift \
+        cargo test --no-default-features --features cranelift,cpyext \
           -p majit-metainterp -p majit-backend-cranelift \
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \

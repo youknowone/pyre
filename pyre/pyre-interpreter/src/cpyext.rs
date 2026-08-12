@@ -6,7 +6,7 @@
 //! refcounted mirror (`cpyext/pyobject.py`) and links it to the moving GC object.
 
 #![cfg(all(
-    feature = "host_env",
+    feature = "cpyext",
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 ))]

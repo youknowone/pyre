@@ -858,7 +858,9 @@ fn init_string_module(ns: PyObjectRef) {
 /// first `get_config_var` call rather than the `None` the `.get()` readers
 /// take. Both are 0 here — pyre is neither build, which is what an empty
 /// `sys.abiflags` already says. `EXT_SUFFIX` and `SOABI` name pyre's own
-/// cpyext ABI (never CPython's ABI tag), matching `_imp.extension_suffixes()`.
+/// cpyext ABI (never CPython's ABI tag) and track `_imp.extension_suffixes()`:
+/// a `cpyext` build names one, and without the feature there is no extension
+/// ABI to name, so both keys stay absent for the `.get()` readers.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -874,7 +876,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
                     );
                 }
                 #[cfg(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 ))]
@@ -2048,14 +2050,14 @@ enum FindInfo {
     SourceFile { pathname: PathBuf },
     /// A pyre-ABI C extension was found.
     #[cfg(all(
-        feature = "host_env",
+        feature = "cpyext",
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]
     ExtensionFile { pathname: PathBuf },
     /// A package whose initializer is a pyre-ABI C extension.
     #[cfg(all(
-        feature = "host_env",
+        feature = "cpyext",
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]
@@ -2161,6 +2163,7 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
         // Check for package: <dir>/<partname>/__init__.py
         let pkg_dir = dir.join(partname);
         #[cfg(all(
+            feature = "cpyext",
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]
@@ -2183,6 +2186,7 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
         // accepted: advertising CPython's tag would falsely promise its object
         // layout ABI.
         #[cfg(all(
+            feature = "cpyext",
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]
@@ -3021,7 +3025,7 @@ fn load_part(
 
     let module = match info {
         #[cfg(all(
-            feature = "host_env",
+            feature = "cpyext",
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]
@@ -3029,7 +3033,7 @@ fn load_part(
             crate::cpyext::load_extension_module(modulename, &pathname)?
         }
         #[cfg(all(
-            feature = "host_env",
+            feature = "cpyext",
             not(feature = "sandbox"),
             any(target_os = "macos", target_os = "linux")
         ))]

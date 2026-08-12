@@ -6,6 +6,34 @@ Instead, a C extension sees a fixed-address, reference-counted mirror carrying
 an `ob_pyre_link` to the interpreter's GC object.  The interpreter's global GC
 root walker forwards that link while an external C reference owns it.
 
+## Build option
+
+Extension loading is behind the non-default `cpyext` cargo feature. The switch
+itself is upstream's: `has_so_extension` (`pypy/module/imp/importing.py:60`)
+reads `config.objspace.usemodules.cpyext` and gates `create_dynamic`
+(`pypy/module/imp/interp_imp.py:49-51`). Build it with
+
+```sh
+cargo build --release -p pyrex --bin pyre-dynasm \
+  --no-default-features --features dynasm,cpyext
+```
+
+The feature also decides whether `_imp.extension_suffixes()` answers with a
+suffix. **That part is a deliberate divergence**: upstream
+`extension_suffixes` (`pypy/module/imp/interp_imp.py:11-15`) answers
+unconditionally, so a `--withoutmod-cpyext` PyPy still names a suffix whose
+`create_dynamic` then raises. A suffix names a loader, so pyre keeps the two
+together — without the feature the import path advertises nothing it cannot
+load, which is also what pyre answered before extension loading existed.
+
+The consequence is why the feature is off rather than on:
+`importlib._bootstrap_external.EXTENSION_SUFFIXES` is that call's result, and
+`test_importlib/extension` skips its whole suite while the list is empty. A
+non-empty list un-skips 39 tests that load CPython's `_testsinglephase` and
+`_testmultiphase`; the ABI header below builds neither yet. Turn the feature on
+by default once slices 1–5 below land and both modules build (slice 6 is
+Windows packaging, which the os gates make irrelevant to the default).
+
 The initial macOS/Linux supported slice is deliberately narrow but end-to-end:
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;

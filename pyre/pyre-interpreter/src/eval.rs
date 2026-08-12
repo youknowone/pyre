@@ -1167,7 +1167,7 @@ pub unsafe fn walk_pyframe_roots_area(
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_global_prebuilt_roots(visitor);
     #[cfg(all(
-        feature = "host_env",
+        feature = "cpyext",
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]

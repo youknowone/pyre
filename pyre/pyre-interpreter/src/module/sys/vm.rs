@@ -1139,7 +1139,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
-        feature = "host_env",
+        feature = "cpyext",
         not(feature = "sandbox"),
         any(target_os = "macos", target_os = "linux")
     ))]

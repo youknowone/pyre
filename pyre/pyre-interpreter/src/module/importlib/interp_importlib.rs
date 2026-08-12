@@ -109,7 +109,7 @@ pub fn register_machinery(ns: pyre_object::PyObjectRef) {
         "EXTENSION_SUFFIXES",
         pyre_object::w_list_new({
             #[cfg(all(
-                feature = "host_env",
+                feature = "cpyext",
                 not(feature = "sandbox"),
                 any(target_os = "macos", target_os = "linux")
             ))]
@@ -117,7 +117,7 @@ pub fn register_machinery(ns: pyre_object::PyObjectRef) {
                 vec![pyre_object::w_str_new(crate::cpyext::extension_suffix())]
             }
             #[cfg(not(all(
-                feature = "host_env",
+                feature = "cpyext",
                 not(feature = "sandbox"),
                 any(target_os = "macos", target_os = "linux")
             )))]
@@ -147,7 +147,7 @@ pub fn register_machinery(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_str_new(".pyc"),
                 ];
                 #[cfg(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 ))]

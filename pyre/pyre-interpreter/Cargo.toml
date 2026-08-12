@@ -20,6 +20,21 @@ test-hooks = []
 # trampoline instead of the real syscall. Implies host_env (same call surface,
 # swapped bodies); the real-vs-trampoline choice lives only inside host_seam.
 sandbox = ["host_env", "dep:pyre-sandbox"]
+# Load C extension modules built against pyre's own ABI. The build-time switch
+# is upstream's: `has_so_extension` reads `config.objspace.usemodules.cpyext`
+# (imp/importing.py:60) and gates `create_dynamic` (imp/interp_imp.py:49-51).
+# Implies host_env — the loader is a host `dlopen` — and stays unavailable
+# under `sandbox`, which exists to keep the process off exactly those calls.
+#
+# It also gates `extension_suffixes`, which upstream answers unconditionally
+# (imp/interp_imp.py:11-15). Deliberate divergence: a suffix names a loader, so
+# without one nothing on the import path should advertise it. The consequence
+# is why the feature is off by default —
+# `importlib._bootstrap_external.EXTENSION_SUFFIXES` is that call's result, and
+# a non-empty list un-skips `test_importlib/extension`, whose tests load
+# CPython's `_testsinglephase` / `_testmultiphase`. The ABI header pyre ships
+# builds neither yet. See pyre/docs/cpyext.md.
+cpyext = ["host_env"]
 cranelift = ["majit-metainterp/cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
 # Embed the pure-Python stdlib closure needed for `import re` into the binary

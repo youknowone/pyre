@@ -5,7 +5,11 @@ fn main() {
         "PyGILState_Ensure",
         "PyGILState_Release",
     ];
-    if std::env::var_os("CARGO_FEATURE_SANDBOX").is_none()
+    // The C-API entry points a loaded extension resolves against. They exist
+    // only in a `cpyext` build, and the same predicate gates the loader itself
+    // (see pyre-interpreter's `cpyext` feature).
+    if std::env::var_os("CARGO_FEATURE_CPYEXT").is_some()
+        && std::env::var_os("CARGO_FEATURE_SANDBOX").is_none()
         && matches!(target.as_str(), "macos" | "linux")
     {
         symbols.extend([

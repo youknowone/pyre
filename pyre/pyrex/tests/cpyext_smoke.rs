@@ -5,6 +5,7 @@
 //! back into the executable's exported `PyModule_Create2`.
 
 #![cfg(all(
+    feature = "cpyext",
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 ))]

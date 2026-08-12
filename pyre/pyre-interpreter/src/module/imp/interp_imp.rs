@@ -1109,6 +1109,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "create_dynamic",
+        // interp_imp.py:49 create_dynamic. Without the `cpyext` feature this is
+        // the `has_so_extension() == False` branch, which is the default build:
+        // the spec's `name` and `origin` are read and rejected for an embedded
+        // null before reporting the unsupported load, matching
+        // `_imp_create_dynamic_impl`. Raising ImportError (rather than being
+        // absent) matches the meta-path `hasattr` probe while still letting
+        // `except ImportError` fall back to a pure-Python module.
         crate::make_builtin_function_with_arity(
             "create_dynamic",
             |args| {
@@ -1118,7 +1125,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 };
                 #[cfg(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 ))]
@@ -1126,7 +1133,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     return crate::cpyext::create_dynamic(spec);
                 }
                 #[cfg(not(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 )))]
@@ -1214,7 +1221,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "extension_suffixes",
             |_| {
                 #[cfg(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 ))]
@@ -1224,7 +1231,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     )]));
                 }
                 #[cfg(not(all(
-                    feature = "host_env",
+                    feature = "cpyext",
                     not(feature = "sandbox"),
                     any(target_os = "macos", target_os = "linux")
                 )))]
