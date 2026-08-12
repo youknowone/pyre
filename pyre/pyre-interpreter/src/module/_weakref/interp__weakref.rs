@@ -732,7 +732,9 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         format!("; to '{}'", objtype_name)
     };
     let addr = w_self as usize;
-    Ok(pyre_object::w_str_new(&format!(
+    // W_WeakrefBase.descr__repr__ delegates to W_Root.getrepr, whose result
+    // is `space.newtext(...)` for refs and both proxy kinds, live or dead.
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<{} at {}{}>",
         type_name,
         crate::display::repr_addr(addr),
