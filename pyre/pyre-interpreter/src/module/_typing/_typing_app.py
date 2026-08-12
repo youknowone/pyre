@@ -125,8 +125,10 @@ class _ConstEvaluator(metaclass=_ConstEvaluatorMeta):
         raise TypeError("cannot create '_typing._ConstEvaluator' instances")
 
     def __call__(self, format, /):
-        format = _index(format)
-        if format == 4:  # annotationlib.Format.STRING
+        # The parameter keeps CPython's name; the converted value gets its own
+        # local so the builtin stays reachable in this scope.
+        format_value = _index(format)
+        if format_value == 4:  # annotationlib.Format.STRING
             if isinstance(self._value, tuple):
                 return "(" + ", ".join(map(_typing_type_repr, self._value)) + ")"
             return _typing_type_repr(self._value)
