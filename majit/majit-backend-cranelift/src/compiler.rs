@@ -8014,17 +8014,24 @@ pub struct CraneliftBackend {
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     /// `asmmemmgr.py:28` `AsmMemoryManager` parity — the CPU owns the
     /// accounting `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. Cranelift
-    /// has no `AsmMemoryManager` of its own: `JITModule` owns the executable
-    /// mapping and does not publish its arena size, so `record_block` is given
-    /// the finalized code size for both figures rather than a page-rounded
-    /// number nothing measured.
+    /// has no `AsmMemoryManager` of its own: the memory lives inside
+    /// `JITModule`'s provider, which does not publish what it mapped, so
+    /// `record_block` is given the finalized code size for both figures.
+    ///
+    /// That makes `allocated` an *under*count, not a page-rounded one: the
+    /// default `SystemMemoryProvider` page-rounds its anonymous mappings, so
+    /// the pages it holds exceed the machine-code length recorded here.
     asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
-    /// Lifetime tokens for the blocks recorded above. `JITModule` frees its
-    /// mapping when this backend drops, so holding the tokens for the
-    /// backend's whole life gives back `used` at exactly the point the code
-    /// stops existing. `allocated` is not given back, which is
-    /// `asmmemmgr.py:90`'s shape: an arena counts once and is never
-    /// un-counted.
+    /// Lifetime tokens for the blocks recorded above. They are held for the
+    /// backend's whole life because nothing shorter is correct: the default
+    /// provider does not free on drop. `Memory`'s `Drop` `mem::forget`s every
+    /// allocation ("leak memory to guarantee validity of function pointers"),
+    /// and the only release is `unsafe JITModule::free_memory(self)`, which
+    /// consumes the module and which this backend never calls. So the code
+    /// outlives the process's use of it, and `used` is given back at backend
+    /// teardown rather than when the code stops existing. `allocated` is never
+    /// given back, which is `asmmemmgr.py:90`'s shape: an arena counts once
+    /// and is never un-counted.
     asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     module: JITModule,
     func_ctx: FunctionBuilderContext,

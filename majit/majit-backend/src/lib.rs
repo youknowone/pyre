@@ -1713,13 +1713,29 @@ pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 /// The counters are upstream's, but the allocator under them is not.
 /// `total_memory_allocated` is monotonic there because the arena it counts is
 /// *retained*: `free` puts the range back on a reuse list and the mapping
-/// stays, so the figure is the capacity the process still holds. Here every
-/// compiled block instead carries its own executable mapping, unmapped when
-/// the block is reaped, so the same monotonic figure over-reports once code is
-/// freed and grows without bound across compile/invalidate cycles. The fix is
-/// the missing allocator — a real reusable `AsmMemoryManager` with the free
-/// list of `asmmemmgr.py:53-90` — not a subtraction here, which would make the
-/// number honest while leaving the semantics further from upstream.
+/// stays, so the figure is the capacity the process still holds. Pyre has no
+/// such arena, and what `allocated` means differs per backend:
+///
+/// - dynasm gives every compiled block its own `ExecutableBuffer`, whose
+///   `memmap2` mapping really is unmapped on drop, so the monotonic figure
+///   *over*-reports once code is freed and grows across compile/invalidate
+///   cycles.
+/// - cranelift records the finalized machine-code length, while the provider
+///   inside `JITModule` page-rounds its mappings and never frees them, so the
+///   figure *under*-reports.
+/// - wasm has no pyre-owned executable mapping at all — the host compiler owns
+///   the code — so what it records is encoded module bytes, a different
+///   quantity from retained capacity.
+///
+/// The fix is the missing allocator — a real reusable `AsmMemoryManager` with
+/// the free list of `asmmemmgr.py:53-90` — not a subtraction here, which would
+/// make one number honest while leaving the semantics further from upstream.
+/// It is blocked on the emission APIs: `dynasmrt`'s `ExecutableBuffer` has no
+/// constructor over caller-owned memory (only `VecAssembler::new(baseaddr)`
+/// can target a chosen address, and copying a finalized buffer is unsound
+/// because `AbsToRel`/`RelToAbs` relocations bake the old base), and
+/// `cranelift-jit` exports `JITMemoryProvider` but not the `JITMemoryKind` its
+/// `allocate` takes, so the trait cannot be implemented outside that crate.
 #[derive(Default)]
 pub struct AsmMemoryManagerStats {
     total_memory_allocated: AtomicUsize,

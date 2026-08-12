@@ -2227,6 +2227,12 @@ impl majit_backend::Backend for WasmBackend {
                 || op.opcode == majit_ir::OpCode::Jump
                 || op.opcode.is_call_assembler()
         });
+        // The encoded module length, which is what this target can measure:
+        // the host runtime owns the compiled code, so there is no pyre-owned
+        // executable mapping and no retained capacity to report. It is read
+        // before any host compilation, and on native builds no host exists at
+        // all, so it is a submitted-bytes figure rather than
+        // `asmmemmgr.py:90`'s mapped arena.
         let code_size = wasm_bytes.len();
 
         // Instantiate via the host binding on wasm32, or store bytes for
