@@ -10709,8 +10709,10 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
 /// allocation and `args_w` store as its builtin base; only `w_class` differs.
 ///
 /// Returns `None` (fall through to the generic residual) for any non-matching
-/// shape: an overriding or uncacheable subclass, a non-trivial-args kind
-/// (OSError / Unicode errors store extra fields), or a null concrete arg.
+/// shape: an overriding or uncacheable subclass, an unsupported
+/// non-trivial-args kind, or a null concrete arg.  OSError's parsed fields and
+/// SystemExit's code field are emitted alongside the base exception fields;
+/// the remaining non-trivial constructors stay on the runtime path.
 pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -10864,15 +10866,40 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         pyre_object::interp_exceptions::ExcKind::OSError
             | pyre_object::interp_exceptions::ExcKind::FileNotFoundError
     );
+    let is_system_exit = kind == pyre_object::interp_exceptions::ExcKind::SystemExit;
     // `W_OSError._parse_init_args` / `_init_error`
     // (`interp_exceptions.py`) fill the flattened slots only for 2..=5
     // arguments.  Outside that range the ordinary args-only emit is exact.
     // Unicode constructors still require their dedicated parsing and remain
     // residual.
     let fills_os_error_slots = is_os_error_family && (2..=5).contains(&args.len());
-    if !kind.has_trivial_args_constructor() && !is_os_error_family {
+    if !kind.has_trivial_args_constructor() && !is_os_error_family && !is_system_exit {
         return Ok(None);
     }
+
+    // `interp_exceptions.py:993-998 W_SystemExit.descr_init` stores one
+    // argument verbatim and several as the tuple selected by `newtuple`.
+    // Settle the multi-argument representation before emitting any guards so
+    // an unsupported unboxed pair can still decline without leaving trace
+    // state behind.
+    let system_exit_code = if !is_system_exit || args.is_empty() {
+        None
+    } else if args.len() == 1 {
+        Some((Some(args[0]), None))
+    } else {
+        let concrete_code = unsafe { pyre_object::interp_exceptions::w_exception_get_code(exc) };
+        let code_type = unsafe { (*concrete_code).ob_type };
+        if std::ptr::eq(code_type, &pyre_object::TUPLE_TYPE) {
+            Some((None, Some((false, concrete_code))))
+        } else if std::ptr::eq(
+            code_type,
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+        ) {
+            Some((None, Some((true, concrete_code))))
+        } else {
+            return Ok(None);
+        }
+    };
 
     let exact_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .is_some_and(|w_os_error| std::ptr::eq(concrete_callable, w_os_error));
@@ -11025,6 +11052,32 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     };
     let new_op =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, emitted_w_class, args_list);
+
+    if let Some((direct_code, tuple_shape)) = system_exit_code {
+        let code = if let Some((specialised_oo, concrete_code)) = tuple_shape {
+            let code = if specialised_oo {
+                crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, args[0], args[1])
+            } else {
+                crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, args)
+            };
+            ctx.trace_ctx.set_opref_concrete(
+                code,
+                majit_ir::Value::Ref(majit_ir::GcRef(concrete_code as usize)),
+            );
+            code
+        } else {
+            direct_code.expect("SystemExit code has neither direct nor tuple value")
+        };
+        let descr = crate::descr::w_exception_slot_descr(
+            kind,
+            pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code,
+        );
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[new_op, code], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(new_op, descr_index, code);
+    }
 
     if fills_os_error_slots {
         use pyre_interpreter::baseobjspace::ExceptionAttrSlot;
