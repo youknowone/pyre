@@ -10376,7 +10376,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
                             "descriptor '__repr__' requires a 'getset_descriptor' object but received a '{received}'"
                         )));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         getset_descriptor_repr(descr)
                     }))
                 },
