@@ -39,21 +39,45 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// They affect generated graphs, so Cargo and the content cache must both see
 /// their values; otherwise an A/B can silently restore the opposite setting.
 
-/// Outputs whose bytes are this build-script process's own addresses, by
-/// construction: `fnaddr_bindings` is `(path, build_fnaddr)` and the two
-/// `*_bindings` tables are `(name, build_addr)`, captured so
-/// `runtime_fnaddr_patch` can re-pair them with the runtime's addresses (see
-/// the comments at their write sites). ASLR moves them on every process, so
-/// two processes always disagree and that disagreement is not a defect.
+/// Outputs carrying this build-script process's own addresses, by
+/// construction. ASLR moves them on every process, so two processes always
+/// disagree and that disagreement is not a defect.
+///
+/// The three `*_bindings` tables are nothing but addresses: `fnaddr_bindings`
+/// is `(path, build_fnaddr)` and the other two are `(name, build_addr)`,
+/// captured so `runtime_fnaddr_patch` can re-pair them with the runtime's
+/// addresses (see the comments at their write sites).
+///
+/// The other three carry the values those tables exist to repair — the
+/// codewriter bakes `pyre_interpreter::jit_trace_fnaddrs()` addresses into
+/// `JitCode.fnaddr` and funcptr/static-data entries of `JitCode.constants_i`,
+/// which `runtime_fnaddr_patch::patch_constants_i_fnaddrs` and
+/// `patch_static_addr_constants` overwrite after deserialization. They reach
+/// `jitcodes.bin` directly, `descrs.bin` through `BhDescr::JitCode.fnaddr`
+/// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`), and
+/// `jit_metadata.json` through the same pipeline serialized as JSON.
 ///
 /// Excluded from the cross-process verdict only. Within one process the
-/// addresses are the same, so `DeterminismCheck::InProcess` still judges
-/// them — a difference there would be real.
+/// addresses are the same, so `DeterminismCheck::InProcess` still judges every
+/// one of them — a difference there is real, and `jitcodes.bin` / `descrs.bin`
+/// moving between two in-process generations is the defect that mode was
+/// written for.
 ///
-/// Caching them is still sound: a restore serves this table and the
-/// `constants_i` baked against it from the *same* generation, so they stay
+/// What decides the cross-process verdict after these exclusions:
+/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `indirectcalltargets.bin`,
+/// `jit_drivers.bin`, `insns.bin`, `ei_descr_mints.bin`, `liveness.bin`.
+/// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
+/// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
+/// `i64` there, so a change in jitcode population, order or body length still
+/// moves it while an address change alone does not.
+///
+/// Caching them is still sound: a restore serves these tables and the
+/// `constants_i` baked against them from the *same* generation, so they stay
 /// consistent with each other.
 const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
+    "jit_metadata.json",
+    "jitcodes.bin",
+    "descrs.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
@@ -380,7 +404,9 @@ fn preflight_llbc_or_fail() {
 // written by the same producer, so both are parsed by `llbc_fingerprint`
 // rather than once per reader here.  `tests/llbc_fingerprint_format_test.rs`
 // pins that module against the driver's real output.
-use llbc_fingerprint::{FreshnessMode, freshness_policy, parse_fingerprint_stdout, stamp_field};
+use llbc_fingerprint::{
+    FingerprintFields, FreshnessMode, freshness_policy, parse_fingerprint_fields, stamp_field,
+};
 
 /// Wait for the fingerprint oracle with a deadline.
 ///
@@ -389,7 +415,7 @@ use llbc_fingerprint::{FreshnessMode, freshness_policy, parse_fingerprint_stdout
 /// thread and a timeout abandons the child.  Every non-answer — spawn failure,
 /// non-zero exit, unparseable stdout — collapses to `None`, i.e. silence: an
 /// unavailable oracle must not break offline, hermetic or vendored builds.
-fn llbc_fingerprint_output(child: std::process::Child) -> Option<String> {
+fn llbc_fingerprint_output(child: std::process::Child) -> Option<FingerprintFields> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
@@ -402,31 +428,37 @@ fn llbc_fingerprint_output(child: std::process::Child) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_fingerprint_stdout(&stdout)
+    parse_fingerprint_fields(&stdout)
 }
 
-/// Ask the extraction driver what the current sources hash to.
+/// Ask the extraction driver what the current inputs hash to.
 ///
 /// `scripts/llbc_extract.py` prints the same `key=value` lines it writes into
-/// the stamp, and its `source=` field is the same `source_fingerprint()` call
-/// `stamp_for` records — so there is one implementation of the digest and it
-/// is not this one.  Parsed by `llbc_fingerprint::parse_fingerprint_stdout`,
-/// which reads the field by name. The driver may add fields, as it did for
-/// `external=`; a reader that models the output as one bare value stops
-/// answering as soon as that happens.
+/// the stamp, and its `source=` / `external=` fields are the same
+/// `source_fingerprint()` / `external_fingerprint()` calls `stamp_for` records
+/// — so there is one implementation of each digest and it is not this one.
+/// Parsed by `llbc_fingerprint::parse_fingerprint_fields`, which reads the
+/// fields by name. The driver may add more, as it did for `external=`; a
+/// reader that models the output as one bare value stops answering as soon as
+/// that happens.
+///
+/// Both fields, because they cover disjoint input sets and only their
+/// conjunction says "current": `source=` stops at the repository boundary, so
+/// a package patched to a sibling checkout — or a proc macro built from one —
+/// moves `external=` alone.
 ///
 /// `CARGO_FEATURES` and `LLBC_LAYOUT_TARGETS` are replayed out of the stamp:
 /// `fingerprint_inputs` (`scripts/llbc_extract.py:255-360`) walks the
 /// dependency closure under the feature set and the cross-target layout set in
 /// force at extraction time, so recomputing under this build's defaults would
 /// report a difference the sources do not have.
-fn llbc_source_fingerprint(
+fn llbc_current_fingerprint(
     repo_root: &std::path::Path,
     driver: &std::path::Path,
     crate_name: &str,
     features: &str,
     layout_targets: &str,
-) -> Option<String> {
+) -> Option<FingerprintFields> {
     for python in ["python3", "python"] {
         let spawned = std::process::Command::new(python)
             .arg(driver)
@@ -460,6 +492,14 @@ fn llbc_source_fingerprint(
 /// The oracle is the extractor's own stamp.  `scripts/llbc_extract.py:643-652`
 /// already skips a crate whose stamp still matches, so this is the comparison
 /// the producer trusts, evaluated by the consumer.
+///
+/// Both of the stamp's fingerprint fields are compared, not just `source=`.
+/// The two cover disjoint input sets: `source=` hashes what `git ls-files`
+/// reaches and stops at the repository boundary, `external=` hashes what the
+/// closure reaches outside it.  A package patched to a sibling checkout moves
+/// only the second, and comparing one field would consume a frozen artefact as
+/// current for exactly that edit — feeding stale bodies and layouts into
+/// codegen.  The standalone `--check` compares both; so does this.
 ///
 /// A stale artefact fails the build.  It was warning-only, on the argument
 /// that the build still works for everything whose layout did not move; the
@@ -509,10 +549,26 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     }
     let driver = repo_root.join("scripts").join("extract-llbc.py");
     if !driver.is_file() {
+        // An oracle that cannot be found cannot answer, which is the unknown
+        // case — not the fresh one — and returning quietly here would spell
+        // "nobody checked" exactly like "checked and current" for every crate
+        // at once.  The checkouts this fires in (a vendored tree, a source
+        // archive, a partial clone) did not set
+        // `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, so they get an acknowledgement
+        // rather than silence.  One line, and the exit status is untouched:
+        // failing here would break the builds the fallback exists for.
+        println!(
+            "cargo::warning=LLBC FRESHNESS UNKNOWN: no crate was checked \
+             (scripts/extract-llbc.py is not present); the artefacts in build/llbc may or may \
+             not match the current sources"
+        );
         return;
     }
     let llbc_dir = repo_root.join("build").join("llbc");
-    let mut stale: Vec<(&str, String, String)> = Vec::new();
+    // `(crate, field, recorded, current)`. One crate can be stale on both
+    // fields, and which one moved is the difference between "your own sources
+    // changed" and "a dependency in another checkout changed".
+    let mut stale: Vec<(&str, &'static str, String, String)> = Vec::new();
     // Freshness has THREE outcomes, and the third used to be spelled the same
     // way as "fresh": silence.  A crate whose stamp is unreadable, or whose
     // oracle does not answer, is *unknown* — and "nobody checked" is not a
@@ -531,20 +587,32 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             }
             continue;
         };
-        let Some(recorded) = stamp_field(&stamp, "source=") else {
+        let Some(recorded_source) = stamp_field(&stamp, "source=") else {
             unknown.push((crate_name, "stamp carries no source= line"));
+            continue;
+        };
+        // Required, not defaulted: an empty `external=` is a positive claim
+        // that nothing outside the repository was folded in, and a stamp too
+        // old to carry the field never made it.
+        let Some(recorded_external) = stamp_field(&stamp, "external=") else {
+            unknown.push((crate_name, "stamp carries no external= line"));
             continue;
         };
         let features = stamp_field(&stamp, "features=").unwrap_or_default();
         let layout_targets = stamp_field(&stamp, "layout_targets=").unwrap_or_default();
         let current =
-            llbc_source_fingerprint(repo_root, &driver, crate_name, &features, &layout_targets);
+            llbc_current_fingerprint(repo_root, &driver, crate_name, &features, &layout_targets);
         let Some(current) = current else {
             unknown.push((crate_name, "the fingerprint oracle did not answer"));
             continue;
         };
-        if current != recorded {
-            stale.push((crate_name, recorded, current));
+        for (field, recorded, current) in [
+            ("source", recorded_source, current.source),
+            ("external", recorded_external, current.external),
+        ] {
+            if recorded != current {
+                stale.push((crate_name, field, recorded, current));
+            }
         }
     }
     // Reported as a warning and never promoted by `PYRE_LLBC_STRICT`: the
@@ -570,17 +638,21 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     } else {
         "cargo::warning"
     };
-    for (crate_name, recorded, current) in &stale {
+    for (crate_name, field, recorded, current) in &stale {
         println!(
-            "{directive}=LLBC STALE: {crate_name}.ullbc was extracted at source={recorded}, \
-             sources now hash to {current}"
+            "{directive}=LLBC STALE: {crate_name}.ullbc was extracted at {field}={recorded}, \
+             the tree now has {field}={current}"
         );
     }
-    let crates = stale
-        .iter()
-        .map(|(crate_name, _, _)| *crate_name)
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Deduplicated: a crate stale on both fields contributed two lines above,
+    // and the re-extraction takes it once.
+    let mut stale_crates: Vec<&str> = Vec::new();
+    for &(crate_name, ..) in &stale {
+        if !stale_crates.contains(&crate_name) {
+            stale_crates.push(crate_name);
+        }
+    }
+    let crates = stale_crates.join(" ");
     println!(
         "{directive}=Field offsets read out of these artefacts may name the wrong bytes; \
          re-extract with: python3 scripts/extract-llbc.py {crates}"
@@ -1100,9 +1172,25 @@ fn real_main() {
         }
     };
     if !reproducible {
+        // What the refusal actually costs differs by mode, so only the
+        // consequence is chosen and the report is written once. `AgainstCache`
+        // reaches a `false` verdict only when an entry already exists — that
+        // entry is what it compared against — and `store_codegen_cache`
+        // returns early when it does, so there was never a store to refuse.
+        // Saying "refusing to store them" there would tell a reader the bad
+        // outputs were kept out of the cache while the unverified entry sits
+        // in it, ready for the next ordinary build to restore.
+        let consequence = match determinism_check {
+            DeterminismCheck::AgainstCache => format!(
+                "nothing was stored — the entry it disagreed with was already there and stays, \
+                 so the next ordinary build restores it; remove {} to stop that",
+                cache_dir.display()
+            ),
+            _ => "refusing to store them".to_string(),
+        };
         println!(
             "cargo::warning=codegen determinism: the outputs at cache key {cache_key} are not \
-             reproducible; refusing to store them"
+             reproducible; {consequence}"
         );
         return;
     }
@@ -1178,6 +1266,7 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     emit_rerun_if_changed_recursive(&format!("{repo_root}/majit/majit-translate/src"));
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
+    println!("cargo::rerun-if-changed=src/llbc_fingerprint.rs");
     println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS_ROWS");
@@ -1368,8 +1457,8 @@ fn codegen_outputs_match(
     }
     if !host_addressed.is_empty() {
         eprintln!(
-            "[pyre-jit-trace build.rs] codegen determinism: {} host-address table(s) differ from \
-             {label} as expected, excluded from the verdict: {}",
+            "[pyre-jit-trace build.rs] codegen determinism: {} host-addressed output(s) differ \
+             from {label} as expected, excluded from the verdict: {}",
             host_addressed.len(),
             host_addressed.join(" ")
         );

@@ -141,10 +141,49 @@ pub fn freshness_policy(strict: Option<&str>, skip: Option<&str>) -> FreshnessPo
 ///
 /// Deliberately no bare-digest fallback.  Accepting the pre-`external=` shape
 /// would let this keep silently honouring a format the driver no longer emits,
-/// which is the mechanism that produced that defect; the two version together
-/// in one repository, so refusing an unmodelled shape is the safe direction.
+/// which is the mechanism that produced that defect; the two versions travel
+/// together in one repository, so refusing an unmodelled shape is the safe
+/// direction.
+///
+/// One half of the answer.  A consumer deciding whether an artefact is current
+/// wants [`parse_fingerprint_fields`], which reads the other half too.
 pub fn parse_fingerprint_stdout(stdout: &str) -> Option<String> {
     let source = stamp_field(stdout, "source=")?;
     let is_hash = source.len() == 64 && source.bytes().all(|b| b.is_ascii_hexdigit());
     is_hash.then_some(source)
+}
+
+/// Both fingerprint fields, as one answer.
+///
+/// They are separate fields because they answer different questions whose
+/// remedies differ: `source=` hashes this repository's tracked inputs,
+/// `external=` everything the dependency closure reaches outside it — a
+/// `[patch]`ed package in a sibling checkout, a proc macro built from another
+/// tree.  Editing one of those moves `external=` and leaves `source=` exactly
+/// where it was, so a reader of one field accepts a frozen artefact whose
+/// bodies and layouts came from source that has since changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FingerprintFields {
+    /// `source=`, validated as a bare sha256.
+    pub source: String,
+    /// `external=` verbatim: one `<root label>=<digest>` per out-of-repo
+    /// group, space-separated, and empty when the whole closure lives in this
+    /// repository — the common case.  Kept opaque; this side does not model
+    /// the encoding, only whether the value moved.
+    pub external: String,
+}
+
+/// Parse both fields out of `--fingerprint`'s stdout.
+///
+/// `external=` is required rather than defaulted to empty.  The driver prints
+/// it on every invocation, so an output without it is a shape this reader does
+/// not model, and defaulting would read "nothing outside the repo" off an
+/// answer that never made that claim.  Its absence collapses to `None` — the
+/// oracle did not answer — which is the same disposition an unparseable digest
+/// gets, and which a caller reports rather than passes over in silence.
+pub fn parse_fingerprint_fields(stdout: &str) -> Option<FingerprintFields> {
+    Some(FingerprintFields {
+        source: parse_fingerprint_stdout(stdout)?,
+        external: stamp_field(stdout, "external=")?,
+    })
 }
