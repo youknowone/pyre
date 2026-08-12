@@ -9626,7 +9626,7 @@ fn union_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__repr__' requires a 'types.UnionType' object",
         ));
     }
-    Ok(pyre_object::w_str_from_wtf8(unsafe {
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
         crate::display::py_repr_wtf8(self_)?
     }))
 }
