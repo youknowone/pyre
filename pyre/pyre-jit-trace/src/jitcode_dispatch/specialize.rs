@@ -10259,22 +10259,13 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     len_before: usize,
 ) -> Result<(), DispatchError> {
     let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(inner_self) };
-    // `w_list_append` unboxes its `value` inside an inline sub-walk.  A
-    // virtual range item must be materialized at that call boundary: otherwise
-    // the sub-walk's snapshot exports its raw payload as a loop-carried scalar,
-    // which makes a module-cell reload retain the trace-entry value.  The
-    // identity ptr→int→ptr pair is the normal forcing shape: it preserves the
-    // live SSA Ref while making the virtual allocation observable to the
-    // optimizer, so the descended `plain_int_w` reads the current iteration's
-    // payload (as the real `w_list_append` call does).
-    let value_as_int = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[value_op]);
-    ctx.trace_ctx
-        .set_opref_concrete(value_as_int, Value::Int(value as usize as i64));
-    let value_op = ctx
-        .trace_ctx
-        .record_op(OpCode::CastIntToPtr, &[value_as_int]);
-    ctx.trace_ctx
-        .set_opref_concrete(value_op, Value::Ref(majit_ir::GcRef(value as usize)));
+    // Keep the original Ref box across the helper-frame boundary.  For a
+    // virtual W_IntObject/W_FloatObject, its cached payload field is the live
+    // SSA box recorded by `trace_box_int`/`trace_box_float`; the descended
+    // `plain_int_w`/float unbox therefore forwards that field exactly like
+    // `OptVirtualize.optimize_GETFIELD_GC_I/F` in
+    // `rpython/jit/metainterp/optimizeopt/virtualize.py`.  Making the Ref's
+    // identity observable here would force an otherwise non-escaping virtual.
     // Stamp the receiver concrete (the sub-walk reads it as ref-arg 0; its
     // strategy switch needs the concrete receiver).
     ctx.trace_ctx.set_opref_concrete(
