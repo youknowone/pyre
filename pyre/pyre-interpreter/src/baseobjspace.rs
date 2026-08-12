@@ -4118,11 +4118,60 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     if std::ptr::eq(w_one, w_two) {
         return true;
     }
-    // CPython 3.14 `Py_Is` is pointer equality.  In particular, it does not
-    // use PyPy's value/bit-derived identity for separately boxed int, float,
-    // or complex objects.  The remaining branches are only the immutable
-    // objects pyre actually canonicalizes.
+    // `W_AbstractIntObject.is_w` (intobject.py:44-53): two plain `int`s
+    // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
+    // identical when their values are equal.  `bool`
+    // (`W_BoolObject.is_w` is pure pointer identity, boolobject.py:25)
+    // and `int` subclasses (`user_overridden_class`) keep pointer
+    // identity — the exact-type gate excludes both (a `bool`'s
+    // `w_class` is `bool`, a subclass instance's is the subclass), so
+    // they fall through to the `ptr::eq` above.
+    //
+    // Tagged immediates need no special case: `is_exact_type` reports a
+    // tagged int as an exact `int` (never a subclass — those stay boxed),
+    // and `range_obj_to_bigint` reads its value through the tag-aware
+    // `w_int_get_value`. Two equal-valued immediates already matched the
+    // `ptr::eq` above (identical bit patterns); an immediate and a boxed
+    // int of the same value fall here and compare equal by value.
     unsafe {
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::INT_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::INT_TYPE)
+        {
+            // `space.bigint_w(self).eq(space.bigint_w(w_other))`
+            // (intobject.py:51-53). A `W_LongObject` stores a `BigInt`
+            // pointer, so it must be read as a bigint, not as an i64.
+            return pyre_object::functional::range_obj_to_bigint(w_one)
+                == pyre_object::functional::range_obj_to_bigint(w_two);
+        }
+        // `W_FloatObject.is_w` (floatobject.py:196-204): two plain
+        // `float`s are identical when their bit patterns are equal
+        // (`float2longlong`), so `0.0 is -0.0` is false and a NaN is its
+        // own identity. `float` subclasses (`user_overridden_class`) keep
+        // pointer identity — the exact-type gate excludes them.
+        //
+        // This has to stay in step with `function::immutable_unique_id`, which
+        // derives `id()` from the same bits, and with `FloatListStrategy`,
+        // which unboxes and reboxes list elements: pointer identity here would
+        // make `a is b` false while `id(a) == id(b)` stayed true, and would
+        // make `[a][0] is a` false.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::FLOAT_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::FLOAT_TYPE)
+        {
+            return pyre_object::floatobject::w_float_get_value(w_one).to_bits()
+                == pyre_object::floatobject::w_float_get_value(w_two).to_bits();
+        }
+        // `W_ComplexObject.is_w` (complexobject.py:287-301): two plain
+        // `complex`es are identical when both component bit patterns are
+        // equal (`float2longlong`). `complex` subclasses
+        // (`user_overridden_class`) keep pointer identity.
+        if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::COMPLEX_TYPE)
+            && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::COMPLEX_TYPE)
+        {
+            return pyre_object::complexobject::w_complex_get_real(w_one).to_bits()
+                == pyre_object::complexobject::w_complex_get_real(w_two).to_bits()
+                && pyre_object::complexobject::w_complex_get_imag(w_one).to_bits()
+                    == pyre_object::complexobject::w_complex_get_imag(w_two).to_bits();
+        }
         // `W_AbstractTupleObject.is_w` (tupleobject.py:47-55): a `tuple` is
         // identical to another only when both are the empty tuple — "empty
         // tuples are unique-ified". Non-empty tuples keep pointer identity
