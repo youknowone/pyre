@@ -99,6 +99,50 @@ class MarshalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             marshal.dumps([orig], allow_code=False)
 
+    def test_code_roundtrip_retains_runtime_constants(self):
+        code = compile("None", "<marshal>", "eval")
+        for value in ([], {}, {1}, (1, [2])):
+            replaced = code.replace(co_consts=(value,))
+            loaded = marshal.loads(marshal.dumps(replaced))
+            self.assertEqual(loaded.co_consts, (value,))
+
+    def test_file_readinto_error_is_not_treated_as_absent(self):
+        class BrokenReadInto:
+            def readinto(self, buffer):
+                raise AttributeError("inside readinto")
+
+            def read(self, count):
+                raise AssertionError("read fallback was used")
+
+        with self.assertRaisesRegex(AttributeError, "inside readinto"):
+            marshal.load(BrokenReadInto())
+
+    def test_file_reader_bounds_a_hostile_length_request(self):
+        class TruncatedHugeBytes:
+            def __init__(self):
+                # TYPE_STRING followed by a positive 2 GiB-1 size.
+                self.data = bytearray(b"s\xff\xff\xff\x7f")
+                self.requests = []
+
+            def readinto(self, buffer):
+                self.requests.append(len(buffer))
+                count = min(len(buffer), len(self.data))
+                buffer[:count] = self.data[:count]
+                del self.data[:count]
+                return count
+
+        source = TruncatedHugeBytes()
+        with self.assertRaises(EOFError):
+            marshal.load(source)
+        self.assertLessEqual(max(source.requests), 1024 * 1024)
+
+    def test_code_field_strings_honor_old_wire_versions(self):
+        code = compile("None", "x", "eval")
+        # Short ASCII (`z`) was introduced by marshal version 4. Version 3
+        # code fields must use a long string tag and remain loadable.
+        data = marshal.dumps(code, 3)
+        self.assertEqual(eval(marshal.loads(data)), None)
+
     def test_argument_binding(self):
         data = marshal.dumps([1, 2, 3])
 

@@ -764,6 +764,24 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
     }
 }
 
+/// Runtime-marshal counterpart of [`w_code_fill_consts_from_tuple`].  The
+/// compiler-core reader supplies exact wrapped constants separately from its
+/// `ConstantData` shape table, so no temporary Python tuple is needed here.
+pub(crate) unsafe fn w_code_fill_consts_from_objects(obj: PyObjectRef, constants: &[PyObjectRef]) {
+    let code = unsafe { &*(obj as *const PyCode) };
+    if code.co_consts_w.is_null() {
+        return;
+    }
+    let slots = unsafe { &*code.co_consts_w };
+    let count = slots.len().min(constants.len());
+    for (slot, &value) in slots.iter().zip(constants).take(count) {
+        slot.store(value, std::sync::atomic::Ordering::Release);
+    }
+    if count != 0 {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
+}
+
 /// Preserve the existing wrapped constant array when `code.replace()` changes
 /// fields other than `co_consts`. PyPy copies an already-wrapped list; pyre
 /// must therefore copy only source slots that have already been realized,
