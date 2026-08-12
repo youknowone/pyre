@@ -895,6 +895,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_dict_setitem_str",
         pyre_object::dictmultiobject::w_dict_setitem_str as *const (),
     );
+    // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
+    // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
+    // `wtf8_surrogate_key_str_object` wraps the cold lone-surrogate
+    // `to_wtf8_buf` + `w_str_from_wtf8` into one objectptr call.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::wtf8_key_is_utf8",
+        "pyre_object::wtf8_key_is_utf8",
+        pyre_object::dictmultiobject::wtf8_key_is_utf8 as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::wtf8_surrogate_key_str_object",
+        "pyre_object::wtf8_surrogate_key_str_object",
+        pyre_object::dictmultiobject::wtf8_surrogate_key_str_object as *const (),
+    );
     // The typed int/bytes dict-storage leaves residualise their
     // `IndexMap::{insert,get}` (an external-crate heap store/lookup the tracer
     // cannot model): the stores return `()`, the lookups `Option<PyObjectRef>`.
@@ -1050,6 +1066,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::baseobjspace::lookup_in_type_where_uncached",
         "pyre_interpreter::lookup_in_type_where_uncached",
         lookup_in_type_where_uncached as *const (),
+    );
+    // #346: the WTF-8 twin of the projection above. `lookup_in_type_wtf8_uncached`
+    // maps the tuple-payload `Option<(PyObjectRef, PyObjectRef)>` of the already
+    // opaque `lookup_where_pair_wtf8_uncached` to the value; tracing that `.map`
+    // walls the annotator on the tuple's classdef-less payload, so it is
+    // `#[dont_look_inside]` and residualises to the single-word `Option`.
+    let lookup_in_type_wtf8_uncached: unsafe fn(
+        pyre_object::PyObjectRef,
+        &rustpython_wtf8::Wtf8,
+    ) -> Option<pyre_object::PyObjectRef> = crate::baseobjspace::lookup_in_type_wtf8_uncached;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::lookup_in_type_wtf8_uncached",
+        "pyre_interpreter::lookup_in_type_wtf8_uncached",
+        lookup_in_type_wtf8_uncached as *const (),
     );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /

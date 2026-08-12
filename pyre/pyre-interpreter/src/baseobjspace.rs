@@ -9031,7 +9031,15 @@ pub(crate) unsafe fn lookup_where_pair_wtf8_uncached(
     lookup_where_wtf8(w_type, name)
 }
 
-#[inline]
+/// Mirror of the `&str` twin [`lookup_in_type_where_uncached`] and the
+/// `objspace/std/mapdict.rs` slot residuals. The inner
+/// `lookup_where_pair_wtf8_uncached` is already `#[dont_look_inside]`,
+/// returning `Option<(PyObjectRef, PyObjectRef)>`; tracing this `.map`
+/// projection over that tuple-payload `Option` walls the annotator on a
+/// classdef-less payload read, so the projection also carries
+/// `#[dont_look_inside]` and residualises to the single-word
+/// `Option<PyObjectRef>`.
+#[majit_macros::dont_look_inside]
 pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
     w_type: PyObjectRef,
     name: &Wtf8,

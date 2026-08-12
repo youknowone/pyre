@@ -12704,15 +12704,20 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve the WTF-8 string wrappers `Wtf8::new(&str) -> &Wtf8` and
-    /// `Wtf8Buf::from_string(String) -> Wtf8Buf` to their sole string
+    /// `Wtf8Buf::from_string(String) -> Wtf8Buf`, and the reverse reinterpret
+    /// `wtf8_key_as_str_unchecked(&Wtf8) -> &str`, to their sole string
     /// argument.  Rust's `&str` / `String` / `Wtf8` / `Wtf8Buf` all map
     /// to the single immutable rpy_string value (`project_pyre_field_type`
     /// — `s_unicode0`, matching upstream's one string type in `rstr.py`),
     /// so the wrap is an identity at the annotation level; the boxing the
     /// callers want (`box_str_constant`) happens downstream on the bound
-    /// value.  Both bodies are Opaque in the LLBC (external
+    /// value.  The `Wtf8` bodies are Opaque in the LLBC (external
     /// `rustpython_wtf8` crate), leaving the generic `Call` permanently
-    /// unliftable.
+    /// unliftable; `wtf8_key_as_str_unchecked` is a pyre free fn whose
+    /// `from_utf8_unchecked` body is likewise left unlifted by folding the
+    /// call away.  It is matched by leaf name because its qualified path
+    /// (`pyre_object::dictmultiobject::wtf8_key_as_str_unchecked`) differs
+    /// between the defining-crate LLBC and a cross-crate caller.
     fn wtf8_string_identity_alias(
         &self,
         segments: &[String],
@@ -12721,14 +12726,16 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return None;
         };
-        matches!(
+        let is_wrap = matches!(
             segments,
             [a, b] if matches!(
                 (a.as_str(), b.as_str()),
                 ("Wtf8", "new") | ("Wtf8Buf", "from_string")
             )
-        )
-        .then(|| arg.clone())
+        );
+        let is_str_reinterpret =
+            matches!(segments, [.., leaf] if leaf == "wtf8_key_as_str_unchecked");
+        (is_wrap || is_str_reinterpret).then(|| arg.clone())
     }
 
     /// The unwrapped ADT body `Value` a [`TyRef`] resolves to, following

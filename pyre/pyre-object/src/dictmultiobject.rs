@@ -3433,13 +3433,48 @@ pub unsafe fn w_dict_delitem_str_no_proxy(obj: PyObjectRef, key: &str) -> bool {
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
+/// Whether `key`'s WTF-8 bytes are valid UTF-8 (no lone surrogate).
+///
+/// Residualised (`dont_look_inside`) so the `Result<&str, Utf8Error>` that
+/// `as_str` returns never crosses the trace boundary; the residual is a
+/// single-word `bool`.  The wtf8-keyed dict adapters branch on this in place
+/// of `match key.as_str()`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn wtf8_key_is_utf8(key: &rustpython_wtf8::Wtf8) -> bool {
+    key.as_str().is_ok()
+}
+
+/// Reinterpret `key`'s bytes as `&str` without re-validating.
+///
+/// Only ever called on the branch [`wtf8_key_is_utf8`] already validated, so
+/// the reinterpret is infallible.  Folded to identity in
+/// `front/mir.rs::wtf8_string_identity_alias` (`&Wtf8` and `&str` share the
+/// one immutable string value), so the call disappears and this body is never
+/// lifted.
+pub unsafe fn wtf8_key_as_str_unchecked(key: &rustpython_wtf8::Wtf8) -> &str {
+    core::str::from_utf8_unchecked(key.as_bytes())
+}
+
+/// Wrap a lone-surrogate `key` into a `W_UnicodeObject` for the object-keyed
+/// slow path.
+///
+/// Residualised (`dont_look_inside`) as one objectptr call wrapping both
+/// `to_wtf8_buf` (external, unliftable) and `w_str_from_wtf8`.  Deliberately
+/// not a global `to_wtf8_buf` identity fold: other callers mutate the owned
+/// `Wtf8Buf`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn wtf8_surrogate_key_str_object(key: &rustpython_wtf8::Wtf8) -> PyObjectRef {
+    crate::w_str_from_wtf8(key.to_wtf8_buf())
+}
+
 pub unsafe fn w_dict_getitem_wtf8(
     obj: PyObjectRef,
     key: &rustpython_wtf8::Wtf8,
 ) -> Option<PyObjectRef> {
-    match key.as_str() {
-        Ok(s) => w_dict_getitem_str(obj, s),
-        Err(_) => w_dict_lookup(obj, crate::w_str_from_wtf8(key.to_wtf8_buf())),
+    if wtf8_key_is_utf8(key) {
+        w_dict_getitem_str(obj, wtf8_key_as_str_unchecked(key))
+    } else {
+        w_dict_lookup(obj, wtf8_surrogate_key_str_object(key))
     }
 }
 
@@ -3473,9 +3508,10 @@ pub unsafe fn w_dict_getitem_wtf8_checked(
     obj: PyObjectRef,
     key: &rustpython_wtf8::Wtf8,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
-    match key.as_str() {
-        Ok(s) => w_dict_getitem_str_checked(obj, s),
-        Err(_) => w_dict_lookup_checked(obj, crate::w_str_from_wtf8(key.to_wtf8_buf())),
+    if wtf8_key_is_utf8(key) {
+        w_dict_getitem_str_checked(obj, wtf8_key_as_str_unchecked(key))
+    } else {
+        w_dict_lookup_checked(obj, wtf8_surrogate_key_str_object(key))
     }
 }
 
@@ -3492,9 +3528,10 @@ pub unsafe fn w_dict_setitem_wtf8(
     key: &rustpython_wtf8::Wtf8,
     value: PyObjectRef,
 ) {
-    match key.as_str() {
-        Ok(s) => w_dict_setitem_str(obj, s, value),
-        Err(_) => w_dict_store(obj, crate::w_str_from_wtf8(key.to_wtf8_buf()), value),
+    if wtf8_key_is_utf8(key) {
+        w_dict_setitem_str(obj, wtf8_key_as_str_unchecked(key), value);
+    } else {
+        w_dict_store(obj, wtf8_surrogate_key_str_object(key), value);
     }
 }
 
