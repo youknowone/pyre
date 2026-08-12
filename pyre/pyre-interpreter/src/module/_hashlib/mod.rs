@@ -473,7 +473,10 @@ pub unsafe fn w_hmac_dealloc(obj: PyObjectRef) {
 mod hmac_class {
     use super::*;
 
-    #[crate::pyre_methods]
+    // lib_pypy/_hashlib/__init__.py:232: `class HMAC(HASH)`.  HMAC keeps its
+    // own native payload layout, but its Python type relationship is the same
+    // TypeDef inheritance PyPy exposes.
+    #[crate::pyre_methods(base = hash_state_class::type_object())]
     impl W_Hmac {
         #[staticmethod]
         fn __new__(
@@ -566,13 +569,23 @@ mod hmac_class {
 fn resolve_hmac_digestmod(digestmod: PyObjectRef) -> Result<&'static str, crate::PyError> {
     let name_obj = if unsafe { is_str(digestmod) } {
         digestmod
-    } else if unsafe {
-        pyre_object::py_type_check(digestmod, &crate::function::BUILTIN_FUNCTION_TYPE)
-    } {
-        crate::baseobjspace::getattr_str(digestmod, "__name__")?
     } else {
-        return Err(unsupported_digestmod("unsupported hash type"));
+        match crate::baseobjspace::getattr_str(digestmod, "__name__") {
+            Ok(name) => name,
+            // PyPy's structural rule is to accept every object that exposes
+            // `__name__` (lib_pypy/_hashlib/__init__.py:547-554).  CPython
+            // 3.14 additionally normalizes a missing name to the module's
+            // public UnsupportedDigestmodError; preserve both without
+            // restricting the accepted object type again.
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {
+                return Err(unsupported_digestmod("unsupported hash type"));
+            }
+            Err(err) => return Err(err),
+        }
     };
+    if !unsafe { is_str(name_obj) } {
+        return Err(unsupported_digestmod("unsupported hash type"));
+    }
     let name = unsafe { w_str_get_wtf8(name_obj) };
     let bytes = name.as_bytes();
     let bytes = bytes.strip_prefix(b"openssl_").unwrap_or(bytes);
@@ -671,11 +684,8 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     check_digest_name(hash_name)?;
     let requested = unsafe { w_str_get_wtf8(hash_name) };
-    let name = lookup_digest_name(requested.as_bytes()).ok_or_else(|| {
-        crate::PyError::value_error(format!(
-            "[digital envelope routines] unsupported: {requested}"
-        ))
-    })?;
+    let name = lookup_digest_name(requested.as_bytes())
+        .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
     let password = read_hash_buffer(password)?;
     let salt = read_hash_buffer(salt)?;
     let iterations = crate::baseobjspace::int_w(crate::baseobjspace::space_index(iterations)?)?;
@@ -694,7 +704,7 @@ fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         _ => pyre_native::hash::digest_output_size(name).unwrap_or(0),
     };
     let result = pyre_native::hash::compute_pbkdf2_hmac(name, &password, &salt, iterations, dklen)
-        .ok_or_else(|| crate::PyError::value_error("unsupported hash type"))?;
+        .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
     Ok(w_bytes_from_bytes(&result))
 }
 
@@ -788,8 +798,11 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 
     // RFC 7914's dominant allocation is V[N] with 128*r-byte entries. OpenSSL
-    // also needs B[p] and a working block. Honor an explicit caller limit;
-    // maxmem=0 retains OpenSSL's implementation-defined default behavior.
+    // also needs B[p] and a working block.  PyPy passes maxmem=0 through to
+    // EVP_PBE_scrypt (lib_pypy/_hashlib/__init__.py:430-433), where OpenSSL
+    // applies its private 32 MiB default.  The Rust backend has no such layer,
+    // so spell out that same default here rather than treating zero as
+    // unlimited memory.
     let memory = usize::try_from(n)
         .ok()
         .and_then(|n| n.checked_mul(r as usize))
@@ -799,9 +812,15 @@ fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .ok_or_else(|| {
             crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
         })?;
-    if maxmem != 0 && memory > maxmem {
+    const OPENSSL_DEFAULT_SCRYPT_MAXMEM: usize = 32 * 1024 * 1024;
+    let effective_maxmem = if maxmem == 0 {
+        OPENSSL_DEFAULT_SCRYPT_MAXMEM
+    } else {
+        maxmem
+    };
+    if memory > effective_maxmem {
         return Err(crate::PyError::value_error(
-            "Invalid parameter combination for n, r, p, maxmem",
+            "[digital envelope routines] memory limit exceeded",
         ));
     }
     let output = pyre_native::hash::compute_scrypt(&password, &salt, log_n, r, p, dklen)
@@ -834,6 +853,26 @@ fn blake2_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let key = read_hash_buffer(arg(3))?;
     let salt = read_hash_buffer(arg(4))?;
     let person = read_hash_buffer(arg(5))?;
+    let (max_key_size, salt_size, person_size) = match name {
+        "blake2b" => (64, 16, 16),
+        "blake2s" => (32, 8, 8),
+        _ => unreachable!(),
+    };
+    if key.len() > max_key_size {
+        return Err(crate::PyError::value_error(format!(
+            "maximum key length is {max_key_size} bytes"
+        )));
+    }
+    if salt.len() > salt_size {
+        return Err(crate::PyError::value_error(format!(
+            "maximum salt length is {salt_size} bytes"
+        )));
+    }
+    if person.len() > person_size {
+        return Err(crate::PyError::value_error(format!(
+            "maximum person length is {person_size} bytes"
+        )));
+    }
     let index =
         |position| crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg(position))?);
     let digest_size = usize::try_from(index(2)?)

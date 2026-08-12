@@ -99,12 +99,6 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                     "digest_size must be between 1 and %d bytes" %
                     cls.MAX_DIGEST_SIZE
                 )
-            if len(key) > cls.MAX_KEY_SIZE:
-                raise ValueError("maximum key length is %d bytes" % cls.MAX_KEY_SIZE)
-            if len(salt) > cls.SALT_SIZE:
-                raise ValueError("maximum salt length is %d bytes" % cls.SALT_SIZE)
-            if len(person) > cls.PERSON_SIZE:
-                raise ValueError("maximum person length is %d bytes" % cls.PERSON_SIZE)
             if not 0 <= fanout <= 255:
                 raise ValueError("fanout must be between 0 and 255")
             if not 1 <= depth <= 255:
