@@ -2591,7 +2591,10 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let w_name = resolve(3, "name");
     let w_argdefs = resolve(4, "argdefs");
     let w_closure = resolve(5, "closure");
-    let w_kwdefaults = crate::builtins::kwarg_get(kwargs, "kwdefaults").unwrap_or(PY_NULL);
+    // Python 3.14's sixth constructor parameter is positional-or-keyword.
+    // Keep it in the same slot resolver as `code` through `closure`; reading
+    // only the kwargs dict silently discarded the positional value.
+    let w_kwdefaults = resolve(6, "kwdefaults");
 
     if w_code.is_null() || !unsafe { crate::pycode::is_code(w_code) } {
         return Err(crate::PyError::type_error(
@@ -2644,7 +2647,9 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     if !w_kwdefaults.is_null() && !unsafe { pyre_object::is_none(w_kwdefaults) } {
         if !unsafe { pyre_object::is_dict(w_kwdefaults) } {
-            return Err(crate::PyError::type_error("kwdefaults must be a dict"));
+            return Err(crate::PyError::type_error(
+                "arg 6 (kwdefaults) must be None or dict",
+            ));
         }
         unsafe { function_set_kwdefaults(func, w_kwdefaults) };
     }
