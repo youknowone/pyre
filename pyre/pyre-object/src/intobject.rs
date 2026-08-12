@@ -199,10 +199,12 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// `SyntheticTransparentCtor` for the `PyObject` header survives lowering as
 /// a call to a `symbolic_fnaddr` hash, which a descending sub-jitcode walk
 /// cannot record and declines on. The boundary keeps both shapes out of the
-/// trace, and costs nothing where the arm is unreachable:
-/// `gc_interp::enabled()` is false on the native backends, whose
-/// `malloc_typed` arm is fused into a `NewWithVtable`. Drop it once the wasm
-/// backend lowers an offset-0 field store faithfully.
+/// trace. It is not free anywhere: `gc_interp::enabled()` reads
+/// `PYRE_GC_INTERP` and answers true for every value except exactly `0`
+/// (`gc_interp.rs` `enabled_from_env`), so it is on by default on every
+/// target and this arm — not the `malloc_typed` one `fuse_boxing_alloc`
+/// rewrites into a `NewWithVtable` — is the arm [`w_int_new`] takes. Drop the
+/// boundary once the wasm backend lowers an offset-0 field store faithfully.
 ///
 /// Spelled `*mut PyObject` rather than `PyObjectRef` so the attribute emits
 /// its `extern "C"` call trampoline: the macro recognises raw pointers
