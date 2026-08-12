@@ -6354,11 +6354,11 @@ impl OptContext {
         let mut memo = ResumeDataLoopMemo::new();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
         // arms the `resume.py:236-239` length check inside `number()`. This
-        // call site used to hardcode `-1`, so the check — ported faithfully at
-        // `resume.rs:3951-3958` — was disabled for every guard ever numbered,
+        // call site used to hardcode `-1`, so the check — ported faithfully in
+        // `resume.rs::number` — was disabled for every guard ever numbered,
         // and a 0-length vable section reached the backend unremarked. It then
         // surfaced only if the guard was actually deopted, as
-        // `assert!(vable_size > 0)` at `resume.rs:7030`.
+        // `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
         let Ok(numb_state) = memo.number(&snapshot, &env, self.minimum_virtualizable_size) else {
             return;
         };

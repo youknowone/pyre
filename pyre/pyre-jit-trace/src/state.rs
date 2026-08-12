@@ -6199,8 +6199,8 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///        preserved.
 ///      - **Resume-data numbering** (port of `resume.py:148-181
 ///        ResumeDataLoopMemo.large_ints / .refs`):
-///        `resume.rs:3460-3490 ResumeDataLoopMemo.large_ints /
-///        .refs` memo separately dedups constants when assigning
+///        `resume.rs::ResumeDataLoopMemo`'s `large_ints` / `refs`
+///        memo separately dedups constants when assigning
 ///        resume numbering tags.
 fn copy_constants<F>(registers: &mut Vec<OpRef>, constants: &[i64], targetindex: usize, mut mint: F)
 where
@@ -6284,7 +6284,7 @@ impl PyreSym {
     /// `ConstClass(constants[i])`'s fresh-Box allocation
     /// (`history.py:220/261/307`). Per-value dedup, where it exists
     /// upstream, lives in the resume memo
-    /// (`resume.rs:3460-3490 ResumeDataLoopMemo.large_ints / .refs`
+    /// (`resume.rs::ResumeDataLoopMemo`'s `large_ints` / `refs` fields,
     /// per `resume.py:148-181`), not in the constant pool. Re-entering
     /// this helper therefore overwrites the trailing slots with freshly
     /// minted OpRefs across all three banks, matching `copy_constants`
