@@ -30,6 +30,17 @@ fn strict_one_promotes_to_error() {
     assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
 }
 
+/// `PYRE_LLBC_STRICT=0` is the only value that lets a stale artefact through
+/// without failing the build — `build.rs` picks `cargo::warning` over
+/// `cargo::error` from exactly this mode — so a regression folding the off
+/// switch back into `Strict` would pass every other case in this file.
+#[test]
+fn strict_zero_demotes_to_a_warning() {
+    let p = freshness_policy(Some("0"), None);
+    assert_eq!(p.mode, FreshnessMode::Warn);
+    assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+}
+
 /// The opt-out is honoured, but it announces itself. Returning silently would
 /// make "opted out" and "checked and fresh" the same absence of output — the
 /// conflation the UNKNOWN channel exists to prevent.
