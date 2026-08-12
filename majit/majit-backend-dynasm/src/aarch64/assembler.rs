@@ -3387,9 +3387,11 @@ impl<'a> AssemblerARM64<'a> {
                     let rv = r.value;
                     dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
-                }
+                // aarch64/regalloc.py:964-966 keeps malloc's result in the
+                // selected result register (x0); it does not eagerly mirror
+                // every result into its jitframe slot.  Regalloc emits the
+                // eventual spill when a guard or register-pressure boundary
+                // actually needs one.
             }
             // aarch64/assembler.py:715 malloc_cond_varsize_frame
             OpCode::CallMallocNurseryVarsizeFrame => {
@@ -6546,9 +6548,11 @@ impl<'a> AssemblerARM64<'a> {
             return;
         }
 
-        // x0 = nursery_free, x1 = new_free, x2 = scratch, x3 = nursery_top
-        self.emit_mov_imm64(2, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+        // aarch64/assembler.py:682-708 uses only x0/x1 plus the reserved IP
+        // scratch registers.  Keep x2..x13 available to regalloc on the fast
+        // path; the collecting slow path spills/restores them below.
+        self.emit_mov_imm64(16, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
 
         if total_size < 4096 {
             let ts = total_size as u32;
@@ -6558,18 +6562,18 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(3, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
-        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+        self.emit_mov_imm64(17, nt_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        // Fast path: bump nursery_free, zero header, return payload ptr
-        self.emit_mov_imm64(2, nf_addr as i64);
+        // Fast path: x16 still holds &nursery_free; bump it, zero the header,
+        // and return the payload pointer.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x2]       // *nursery_free = new_free
+            ; str x1, [x16]      // *nursery_free = new_free
             ; str xzr, [x0]      // zero GcHeader
         );
         let hs = gc_hdr as u32;
@@ -6685,8 +6689,11 @@ impl<'a> AssemblerARM64<'a> {
             return;
         }
 
-        self.emit_mov_imm64(2, nf_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x2]);
+        // As in upstream malloc_cond, x0/x1 are the only managed registers
+        // clobbered by the fast path; nursery addresses live in reserved IP
+        // scratch registers.
+        self.emit_mov_imm64(16, nf_addr as i64);
+        dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x16]);
 
         if size < 4096 {
             let sz = size as u32;
@@ -6696,17 +6703,29 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        self.emit_mov_imm64(3, nt_addr as i64);
-        dynasm!(self.mc ; .arch aarch64 ; ldr x3, [x3]);
-        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x3);
+        // Aheui's live nursery places the top slot immediately after the free
+        // slot. Reuse x16 as the address base when the allocator reports that
+        // layout; custom allocators with independent slots retain the general
+        // path.
+        if nt_addr == nf_addr.wrapping_add(std::mem::size_of::<usize>()) {
+            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, 8]);
+        } else {
+            self.emit_mov_imm64(17, nt_addr as i64);
+            dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x17]);
+        }
+        dynasm!(self.mc ; .arch aarch64 ; cmp x1, x17);
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b.hi =>slow_path);
 
-        self.emit_mov_imm64(2, nf_addr as i64);
+        // x16 still holds nf_addr from the load above: the intervening add,
+        // top load, compare, and branch only write x0, x1, x17, and flags.
+        // Keep that address live on the fast arm instead of materializing the
+        // same 64-bit constant a second time.  The slow arm has its own call
+        // sequence and does not join at this store.
         dynasm!(self.mc ; .arch aarch64
-            ; str x1, [x2]       // *nursery_free = new_free
+            ; str x1, [x16]      // *nursery_free = new_free
             ; b =>done
         );
 

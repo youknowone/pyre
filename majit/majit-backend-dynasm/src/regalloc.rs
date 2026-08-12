@@ -5379,10 +5379,11 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, arglocs, result_loc, output);
     }
 
-    /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
-    /// Spill ALL registers: the nursery bump path clobbers x0-x3 (aarch64)
-    /// or ecx/edx/rax (x86). The slow path may trigger GC.
-    /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
+    /// aarch64/regalloc.py:958 / x86/regalloc.py:1013
+    /// prepare/consider_call_malloc_nursery parity. Move or spill only the
+    /// nursery bump registers. The AArch64 emitter uses x0/x1 plus reserved IP
+    /// scratch registers; collecting slow paths save/restore the other
+    /// managed registers on both native architectures.
     fn consider_call_malloc_nursery(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
@@ -5394,7 +5395,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -5453,7 +5454,7 @@ impl<'a> RegAlloc<'a> {
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],
-            SAVE_ALL_REGS,
+            SAVE_DEFAULT_REGS,
             &mut self.longevity,
             &mut self.fm,
             &mut self.pending_moves,
@@ -6312,6 +6313,58 @@ mod tests {
         assert!(reg2 == reg0 || reg2 == reg1);
         // The spilled variable should now be in the frame
         assert!(fm.get_frame_depth() >= 1);
+    }
+
+    #[test]
+    fn test_fixed_nursery_malloc_keeps_unrelated_live_register_bound() {
+        // aarch64/regalloc.py:958-970 and x86/regalloc.py:1013-1034 move
+        // values away from the two malloc-cond registers only.  In
+        // particular, a live Ref in any other managed register stays there;
+        // the collecting slow path saves and restores it through the
+        // jitframe.  SAVE_ALL_REGS at this call site used to turn every such
+        // binding into an eager spill in the allocation fast path.
+        let live_ref = OpRef::input_arg_ref(0);
+        let malloc_result = OpRef::ref_op(0);
+        let size = OpRef::const_int(16);
+        let inputargs = vec![InputArg::from_type(Type::Ref, live_ref.raw())];
+
+        let malloc = Op::new(OpCode::CallMallocNursery, &[rb(size)]);
+        malloc.pos.set(malloc_result);
+        let finish = Op::new(OpCode::Finish, &[rb(live_ref), rb(malloc_result)]);
+        finish.pos.set(OpRef::int_op(1));
+        finish.setfailargs(vec![].into());
+        finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
+        let ops = vec![malloc, finish];
+
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let unrelated = all_core_regs()
+            .into_iter()
+            .find(|reg| !MALLOC_NURSERY_CLOBBER.contains(reg))
+            .expect("architecture must expose a managed register outside malloc clobbers");
+        ra.rm.force_allocate_reg(
+            live_ref,
+            &[],
+            Some(unrelated),
+            false,
+            &mut ra.longevity,
+            &mut ra.fm,
+        );
+        ra.pending_moves.clear();
+        ra.rm.spill_moves.clear();
+
+        let mut output = Vec::new();
+        ra.consider_call_malloc_nursery(&ops[0], 0, &mut output);
+
+        assert_eq!(
+            ra.rm.reg_bindings_get(live_ref, &ra.longevity),
+            Some(unrelated),
+            "fixed nursery allocation must preserve unrelated live bindings"
+        );
+        assert!(
+            !has_move_from(&output, &Loc::Reg(unrelated)),
+            "fixed nursery allocation must not spill an unrelated live register"
+        );
     }
 
     #[test]
