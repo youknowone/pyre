@@ -88,6 +88,21 @@ default from the enclosing accessor's return, not from its `env::var` line — a
 when a census over a name list comes back unanimous, put a member whose answer
 you already know into the same run.
 
+⛔ **A `Read sites:` row is a count and a file list; the symbol lives one field
+below.** These rows used to carry line numbers, and the line numbers went stale
+silently: a rebase moved every one of them while every cited file still existed
+and every cited line stayed inside its file, so nothing about a dead citation
+looked wrong from here. A file path is not perishable that way, and neither is a
+symbol. ⇒ Re-location is `rg <accessor> <file>` — the `Read sites:` row supplies
+the files, the `Accessor:` field supplies the symbol. Do not write the accessor
+into the `Read sites:` row: that is one fact stated twice, one line apart, and
+the two copies are then free to disagree. Where a gate's reads sit in more than
+one enclosing function, name every one of them in `Accessor:` and pair none of
+them with a file — pairing puts the file list in a second place and re-opens the
+same drift. Where a gate has no single accessor, say so in that field
+explicitly: a stated absence is a third value, and an empty field reads as
+unexamined rather than as none.
+
 ## The `Introduced:` line, and what it is not
 
 Every row carries the commit that first put the gate's name in the tree, from
@@ -156,6 +171,14 @@ DEAD, and **3 of the 33 are not rot at all** — each for a different reason:
 | `1f81807bcfde` (`majit-rlib/src/rbigint.rs:5`) | `pypy/main` +15 refs | **another project.** Our mainline was never the applicable history |
 | `3ccbd1f5f4d` (`cel-jit/cel/Cargo.toml`) | `origin/cel` | **our repo, another branch.** A cargo `rev =` pin is *supposed* to name the feature branch |
 | `a4e191f71b5` (the harvest) | `upstream/wasmi` | **ours, pre-squash.** A stale remote pins the object so it is never gc'd — while the harvest's squash row for it stays correct |
+
+⚠ The `path:line` coordinates in that first column are a **frozen census record**
+and are deliberately **not** converted to the file-plus-accessor form the
+`Read sites:` rows below use. They state where each sha stood on the census date
+beside them; rewriting them into a present-tense locator would restate a dated
+measurement as a standing fact, and the date is the whole reason the counts are
+readable. Re-locate any of these by searching for the sha itself — a hex token is
+its own search key, which is exactly what a line number is not.
 
 The last one is why this is a wrong shape rather than a missing case: it is alive
 on a remote **and** correctly filed as rot, both at once. Three questions had
@@ -275,7 +298,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_BH_DEBUG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:220`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `bh_debug_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-06-17 in `dffea4d86b0` — majit: typed state-field JIT — ref fields, virtualized arrays, green-pc dispatch (#195)
@@ -283,7 +306,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_BH_NULL_ARG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs:7556`
+- Read sites: 1 — `majit/majit-metainterp/src/blackhole.rs`
 - Accessor: `bh_null_arg_report()`
 - What it does: `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a residual call, with the jitcode coordinate, before the callee can dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the CallFn `null_or_self` slot), so this reports rather than aborts.
 - Introduced: 2026-08-05 in `eaad8f9dfe5` — jit: fix symbolic-fnaddr misclassification on aarch64 Linux; blackhole null-arg diagnostic (#1030)
@@ -292,16 +315,16 @@ is evidence about the day it was written.
 
 ### `MAJIT_BRIDGE_DEBUG`
 
-- Read sites: 3 — `majit/majit-macros/src/jit_interp/codegen_state.rs:1841`, `majit/majit-macros/src/jit_interp/codegen_state.rs:2681`, `majit/majit-metainterp/src/lib.rs:308`
-- Accessor: `ref_identity_slots_end()`
+- Read sites: 5 — `majit/majit-macros/src/jit_interp/codegen_state.rs`, `majit/majit-metainterp/src/lib.rs`
+- Accessor: `ref_identity_slots_end()`; also read inline in `setup_bridge_sym()` and `bridge_debug_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-06-26 in `769911b5c57` — majit: trace-compile pipeline fixes — O(1) compile, is_gc_managed guard gating, pool-array reads, macro bridges (#263)
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_BRIDGE_DIAG`
 
-- Read sites: 2 — `majit/majit-macros/src/jit_interp/codegen_state.rs:2651`, `majit/majit-metainterp/src/resume_box_reader.rs:911`
-- Accessor: `setup_bridge_sym()`
+- Read sites: 2 — `majit/majit-macros/src/jit_interp/codegen_state.rs`, `majit/majit-metainterp/src/resume_box_reader.rs`
+- Accessor: `setup_bridge_sym()`; also read inline in `replay_pending_fields()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-31 in `5a9f4e7c1f1` — jit: run a tracing abort through convert_and_run_from_pyjitpl; gate write barriers on the collector's descriptor (#895)
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -309,7 +332,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_BRIDGE_FUEL_LOG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs:489`
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: read inline in `bridge_fuel_take()`
 - What it does: "reports each one taken" — the one clause `MAJIT_MAX_BRIDGES`'s doc comment spends on it; it has none of its own. Read off the site, not quoted: set, each bridge that takes fuel prints `@@@FUEL bridge #<n>` to stderr, so the log line and the bisection index are the same number.
 - Introduced: 2026-08-10 in `36666ef933c` — jit: a dead-var link-arg trim scoped on the wrong reachability, a shared-receiver locals_w_mut!, bridge opt-fuel, and 91 stale CPython-suite baseline entries (#1138)
@@ -318,7 +341,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_CLOSEDBG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:215`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `closedbg_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -326,7 +349,8 @@ is evidence about the day it was written.
 
 ### `MAJIT_CL_GCSTORE_LOG`
 
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs:12761`
+- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
+- Accessor: read inline in `do_compile()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-05-01 in `27e96e3d93e` — Activate PyPyJitDriver extra_reds=[ec], bridge resume + cranelift fib_recursive
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -334,23 +358,29 @@ is evidence about the day it was written.
 
 ### `MAJIT_COVERAGE_AUDIT`
 
-- Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs:445`
+- Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs`
 - Accessor: `assemble_with_callcontrol()`
 - What it does: "Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate every Variable referenced in `ssarepr.insns` that has no regalloc coloring in any class. Complements the `MAJIT_COVERAGE_PANIC=1` path (which panics at the first gap hit during `write_insn`) by surfacing the full per-graph gap catalogue in one build." — quoted from the comment directly above the read at `assembler.rs:437-444`.
+  ⚠ That range is kept as a line span deliberately and is **not** a relocation
+  recipe: it states how far the quoted comment runs, which is what lets a reader
+  tell a complete quotation from a truncated one. The `Accessor:` field above is
+  what locates the comment; the span only says how much of it is reproduced here.
 - Introduced: 2026-04-24 in `e6eb6cadecf` — jit_codewriter/assembler + build.rs: MAJIT_COVERAGE_AUDIT walker + deterministic pipeline.insns serialization
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_COVERAGE_PANIC`
 
-- Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs:480`
+- Read sites: 1 — `majit/majit-translate/src/codewriter/assembler.rs`
+- Accessor: read inline in `assemble_with_callcontrol()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-04-23 in `bd3f98d09e2` — eval-restack: canonical op-shape pass + liveness must-definedness
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_DEBUG_DECLARES`
 
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs:9104`
+- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
+- Accessor: read inline in `do_compile()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-03-21 in `46dd371dacc` — Debug: detect undeclared variables in resolve_opref
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -358,7 +388,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_DIAG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:272`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `diag_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
   ⚠ A tally surfaced by this gate can name an outcome while counting only the
@@ -397,7 +427,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_DUMP`
 
-- Read sites: 1 — `majit/majit-backend-dynasm/src/lib.rs:61`
+- Read sites: 1 — `majit/majit-backend-dynasm/src/lib.rs`
 - Accessor: `majit_dump_enabled()`
 - What it does: Whether `MAJIT_DUMP` is set, cached at first access.
 - Introduced: 2026-04-08 in `e963c88b42d` — dynasm: fix aarch64 FP register save, trampoline bridge logic
@@ -405,7 +435,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_DUMP_BYTECODE`
 
-- Read sites: 1 — `pyre/pyre-jit/src/eval.rs:9562`
+- Read sites: 1 — `pyre/pyre-jit/src/eval.rs`
 - Accessor: `dump_bytecode_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-03-27 in `730ffbc9766` — Squashed commit of the following:
@@ -413,7 +443,8 @@ is evidence about the day it was written.
 
 ### `MAJIT_DUMP_CLIF`
 
-- Read sites: 2 — `majit/majit-backend-cranelift/src/compiler.rs:9181`, `majit/majit-backend-cranelift/src/compiler.rs:14502`
+- Read sites: 2 — `majit/majit-backend-cranelift/src/compiler.rs`
+- Accessor: read inline in `do_compile()`, at both sites
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-04-06 in `b0783026f7e` — Emit SameAs for label args without preamble definitions
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -421,7 +452,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_DUMP_LIVENESS`
 
-- Read sites: 1 — `majit/majit-macros/src/jit_interp/jitcode_lower/liveness.rs:470`
+- Read sites: 1 — `majit/majit-macros/src/jit_interp/jitcode_lower/liveness.rs`
 - Accessor: `maybe_dump_liveness()`
 - What it does: Print per-marker live sets to stderr when `MAJIT_DUMP_LIVENESS` is set in the proc-macro build environment. `label` is the lowerer scope being dumped (e.g. helper name) so concurrent expansions are distinguishable.
 - Introduced: 2026-05-01 in `b9f47181e8c` — state-field JIT snapshot + observer + Phase 4 Epic B per-pc liveness infra
@@ -429,7 +460,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_DUMP_SSAREPR`
 
-- Read sites: 1 — `pyre/pyre-jit/src/jit/assembler.rs:634`
+- Read sites: 1 — `pyre/pyre-jit/src/jit/assembler.rs`
 - Accessor: `dump_assembled_ssarepr()`
 - What it does: Print the assembled instruction stream, byte position first, for graphs whose name matches `MAJIT_DUMP_SSAREPR`. A blackhole failure reports a raw `(jitcode, position)` pair; without the stream there is no way back from that byte offset to the op that wrote it or to the register operands it reads.  The env lookup is cached because `try_assemble` runs per graph on the tracing path.
 - Introduced: 2026-08-01 in `93f455ce984` — jit: close the Context.run finally-skip (five divergences) and harden the exception-channel boundaries (#937)
@@ -438,7 +469,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_FAILVALS`
 
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs:500`
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: `failvals_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -447,7 +478,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_FIELD_POS_UNRESOLVED`
 
-- Read sites: 1 — `majit/majit-ir/src/descr.rs:746`
+- Read sites: 1 — `majit/majit-ir/src/descr.rs`
 - Accessor: `field_position_unresolved_limit()`
 - What it does: How many rows the knob asks for: `MAJIT_FIELD_POS_UNRESOLVED=<n>`, or the whole table for `1` / any non-numeric value. `None` when unset. A cap is a parameter, not a constant. `size_shell_owner_sample`'s sibling diagnostic hardcodes 24 and prints it against a count of 155 — so the rows it shows are the alphabetically-first sixth of a `BTreeSet`, which is the one thing a reader must not compute a proportion from. Whoever asks a census for names is asking a question about the whole population; let them say how much of it they want.
 - Introduced: 2026-08-08 in `8c57bb2b206` (re-pointed 2026-08-11, DOOMED) — majit-ir/pyre: name the field_pos_unresolved mints
@@ -455,7 +486,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_GC_BH_PROBE`
 
-- Read sites: 1 — `majit/majit-gc/src/lib.rs:2723`
+- Read sites: 1 — `majit/majit-gc/src/lib.rs`
 - Accessor: `bh_probe_enabled()`
 - What it does: Whether the blackhole-object probe is enabled.
 - Introduced: 2026-08-06 in `d1fef848351` — jit: exception-path and iteration inlining, with an object-strategy args_w (#1033)
@@ -464,7 +495,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_GC_DRAIN_CENSUS`
 
-- Read sites: 1 — `majit/majit-gc/src/lib.rs:132`
+- Read sites: 1 — `majit/majit-gc/src/lib.rs`
 - Accessor: `drain_census_dump_interval()`
 - What it does: Set `MAJIT_GC_DRAIN_CENSUS` to a positive integer to also dump the running summary every that many collections. The end-of-run summary is unreachable for the runs this census is most needed on — a collection storm that has to be killed rather than waited out — so those need the periodic line.
 - Introduced: 2026-08-04 in `7a7d9174088` — jit: resume past the residual at a forced-vable escape; narrow the nested-break gate (#945)
@@ -473,7 +504,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_GC_LIFETIME_LOG`
 
-- Read sites: 1 — `majit/majit-gc/src/lib.rs:99`
+- Read sites: 1 — `majit/majit-gc/src/lib.rs`
 - Accessor: `gc_lifetime_log_enabled()`
 - What it does: `MAJIT_GC_LIFETIME_LOG` — trace remembered-set adds and old-gen frees. Read once.  The gate sits in the write barrier and the old-gen sweep, and `std::env::var_os` takes the environment lock and scans it linearly on every call, so asking per event costs whether or not the variable is set.  Same shape as `majit_metainterp::majit_log_enabled`.
 - Introduced: 2026-07-30 in `e5546b2ed36` — jit: enforce the recursion-unroll bound once; frame and tuple owner roots (#887)
@@ -482,7 +513,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_GC_NURSERY_POISON`
 
-- Read sites: 2 — `majit/majit-gc/src/nursery.rs:89`, `majit/majit-gc/src/oldgen.rs:62`
+- Read sites: 2 — `majit/majit-gc/src/nursery.rs`, `majit/majit-gc/src/oldgen.rs`
 - Accessor: `new()`
 - What it does: **UNRECORDED** — no doc comment describes the gate. Read off the sites, not quoted: the two reads initialise `poison_on_reset` (`nursery.rs`) and `poison_on_alloc` (`oldgen.rs`).
 - Introduced: 2026-07-14 in `13c2cdf41b2` — gc: incminimark parity — nursery zero-fill removal, ArenaCollection port, incremental sweep (#516)
@@ -490,14 +521,15 @@ is evidence about the day it was written.
 
 ### `MAJIT_GC_STRESS`
 
-- Read sites: 1 — `majit/majit-gc/src/collector.rs:764`
+- Read sites: 1 — `majit/majit-gc/src/collector.rs`
+- Accessor: read inline in `with_config()`, behind `#[cfg(feature = "gc_stress")]`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-06-12 in `ca1c642f18b` — mapdict instance storage, method cache, JIT attr/call ops
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_GUARDLOG`
 
-- Read sites: 2 — `majit/majit-metainterp/src/jitdriver.rs:496`, `majit/majit-metainterp/src/pyjitpl.rs:114`
+- Read sites: 2 — `majit/majit-metainterp/src/jitdriver.rs`, `majit/majit-metainterp/src/pyjitpl.rs`
 - Accessor: `guardlog_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -505,15 +537,15 @@ is evidence about the day it was written.
 
 ### `MAJIT_GUARD_CENSUS`
 
-- Read sites: 2 — `majit/majit-metainterp/src/lib.rs:1074`, `pyre/pyrex/src/lib.rs:880`
-- Accessor: `guard_census_enabled()`
+- Read sites: 2 — `majit/majit-metainterp/src/lib.rs`, `pyre/pyrex/src/lib.rs`
+- Accessor: `guard_census_enabled()`; also read inline in `maybe_print_jit_stats()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-08-04 in `7a7d9174088` — jit: resume past the residual at a forced-vable escape; narrow the nested-break gate (#945)
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_HEAPDBG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:259`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `heapdbg_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -521,16 +553,16 @@ is evidence about the day it was written.
 
 ### `MAJIT_J2PLAN_LOG`
 
-- Read sites: 2 — `majit/majit-backend-dynasm/src/lib.rs:68`, `majit/majit-backend-dynasm/src/aarch64/assembler.rs:2175`
-- Accessor: `majit_j2plan_log_enabled()`
+- Read sites: 2 — `majit/majit-backend-dynasm/src/aarch64/assembler.rs`, `majit/majit-backend-dynasm/src/lib.rs`
+- Accessor: `majit_j2plan_log_enabled()`; also read inline in `_assemble()`
 - What it does: Whether `MAJIT_J2PLAN_LOG` is set, cached at first access.
 - Introduced: 2026-04-29 in `2a416afb259` — Add j2 planning path to dynasm regalloc
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_LEAF3_PROV`
 
-- Read sites: 1 — `majit/majit-metainterp/src/resume.rs:101`
-- Accessor: `leaf3_prov_enabled()`
+- Read sites: 1 — `majit/majit-metainterp/src/resume.rs`
+- Accessor: `leaf3_prov_enabled()` — the whole of it: a five-line function whose only statement is a `LazyLock` holding the sole `std::env::var` read. ⚠ Relocate by the accessor, not by the gate name: the name occurs a second time in the same file, as a comment at the census site, and a bare name search returns both.
 - What it does: `=1` emits one `[leaf3-prov]` line per `consume_vable_info` call naming the vable identity slot's resume tag, its value, and whether it is `NULLREF`. Census, not a check: the assert at the same site refuses one value on the override arm, while this reports the whole distribution on every call. Off, it is one cached bool read. Count with `rg -c '\[leaf3-prov\]'`; the numerator is `rg -c 'nullref=yes'`.
 - Introduced: 2026-08-10 — find by symbol: `git log -S 'MAJIT_LEAF3_PROV' -- majit/majit-metainterp/src/resume.rs`.
   ⚠ Cited by symbol rather than sha deliberately: this landed on a branch whose shas do not survive its next rebase, and a dead sha in this column reads exactly like a live one.
@@ -538,23 +570,23 @@ is evidence about the day it was written.
 
 ### `MAJIT_LLBC_EXTRACTION`
 
-- Read sites: 2 — `pyre/pyre-jit-trace/build.rs:140` (`cargo::rerun-if-env-changed=`), `pyre/pyre-jit-trace/build.rs:141` (`env::var_os`)
-- Accessor: `main()`
+- Read sites: 2 — `pyre/pyre-jit-trace/build.rs`
+- Accessor: `main()` — one `cargo::rerun-if-env-changed=` declaration and one `env::var_os` read, on adjacent lines
 - What it does: **UNRECORDED** — no doc comment describes the gate; the one above `main()` describes the build script. Read off the site, not quoted: `=1` calls `emit_llbc_extraction_placeholders()` and returns early, so the extraction does not run.
 - Introduced: 2026-07-16 in `6564959c41f` — jit: make MaJIT portal translation driver-generic (#573)
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_LOG`
 
-- Read sites: 20 — `majit/majit-ir/src/debug.rs:72`, `majit/majit-trace/src/logger.rs:13`, `majit/majit-backend-cranelift/src/compiler.rs:81`, `majit/majit-backend-cranelift/src/compiler.rs:3586`, …
-- Accessor: `majit_log_enabled()`
+- Read sites: 19 — `majit/majit-backend-cranelift/src/compiler.rs`, `majit/majit-backend-dynasm/src/lib.rs`, `majit/majit-gc/src/lib.rs`, `majit/majit-gc/src/rewrite.rs`, `majit/majit-ir/src/debug.rs`, `majit/majit-metainterp/src/lib.rs`, `majit/majit-trace/src/logger.rs`
+- Accessor: no single accessor — `majit_log_enabled()` is defined once per crate and several sites read the environment inline; relocate with `rg -w MAJIT_LOG <file>`.
 - What it does: Whether `MAJIT_LOG` is set, cached at first access.  Mirrors PyPy's `PYPYLOG` env-var check (`rpython/rlib/debug.py:31-38`).
 - Introduced: 2026-03-11 in `10142a8fdc5` — add trace dump via MAJIT_LOG env var and Display for Op
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_LOG_JTET`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:293`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `log_jtet_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-04-07 in `4b6f1d54d7d` — unroll/virtualstate: opt-in MAJIT_LOG_JTET for jump_to_existing_trace failures
@@ -562,7 +594,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_LOG_OPT`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:303`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `log_opt_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-03-18 in `472bbc9912d` — RPython parity: unicode force, chain following, GC methods
@@ -570,15 +602,15 @@ is evidence about the day it was written.
 
 ### `MAJIT_MACRO_DEBUG`
 
-- Read sites: 8 — `majit/majit-macros/src/jit_interp/jitcode_lower/dispatch.rs` :2356, :2705; `majit/majit-macros/src/jit_interp/jitcode_lower/lower_stmt.rs` :188, :242, :279, :339, :374, :382
-- Accessor: `try_inline_dispatch_arm()`
-- What it does: **UNRECORDED** — no doc comment describes the gate. Read off the sites, not quoted: all 7 reads guard an `eprintln!` and nothing else. The prose around them documents the lowering decisions being printed, not what the gate is for.
+- Read sites: 8 — `majit/majit-macros/src/jit_interp/jitcode_lower/dispatch.rs`, `majit/majit-macros/src/jit_interp/jitcode_lower/lower_stmt.rs`
+- Accessor: `try_inline_dispatch_arm()`; also read inline in `lower_dispatch_chain()`, `lower_return_stmt()` and `lower_stmt_fallback()`
+- What it does: **UNRECORDED** — no doc comment describes the gate. Read off the sites, not quoted: every read guards an `eprintln!` and nothing else. The prose around them documents the lowering decisions being printed, not what the gate is for.
 - Introduced: 2026-06-17 in `dffea4d86b0` — majit: typed state-field JIT — ref fields, virtualized arrays, green-pc dispatch (#195)
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_MAX_BRIDGES`
 
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs:478`
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: `bridge_fuel_take()`
 - What it does: `=N` (diagnostic): allow the first N bridge compilations and behave as `MAJIT_NO_BRIDGE` from then on. Bisecting N names the bridge whose compilation first produces a wrong value, at seconds per run rather than a rebuild per arm. Consumes fuel only when the rest of `should_bridge` already held, so the count is bridges actually taken — place it last in the `&&` chain.
 - Introduced: 2026-08-10 in `36666ef933c` — jit: a dead-var link-arg trim scoped on the wrong reachability, a shared-receiver locals_w_mut!, bridge opt-fuel, and 91 stale CPython-suite baseline entries (#1138)
@@ -587,7 +619,8 @@ is evidence about the day it was written.
 
 ### `MAJIT_MINT_INDEX_CENSUS`
 
-- Read sites: 1 — `pyre/pyre-jit-trace/build.rs:957`
+- Read sites: 1 — `pyre/pyre-jit-trace/build.rs`
+- Accessor: read inline in `real_main()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-08-09 in `05ed5528648` (re-pointed 2026-08-11, DOOMED) — majit: record whether a fielddescrof mint resolved its index_in_parent
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -595,7 +628,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_MPTRACE`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:244`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `mptrace_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -603,7 +636,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_NO_BRIDGE`
 
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs:467`
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: `no_bridge_enabled()`
 - What it does: `MAJIT_NO_BRIDGE`: suppress bridge recording so every guard failure resumes through the blackhole.  Public because a frontend that owns its own guard-failure entry point has to honour it there too — gating only the jitdriver-internal paths leaves the variable set but inert, which reads as "bridges are off" while they keep recording.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -611,8 +644,8 @@ is evidence about the day it was written.
 
 ### `MAJIT_OPREF_VARIANT_AUDIT`
 
-- Read sites: 1 — `majit/majit-ir/src/opref_audit.rs:125`
-- Accessor: read inline in `mode()`
+- Read sites: 1 — `majit/majit-ir/src/opref_audit.rs`
+- Accessor: read inline in `resolve_mode()`
 - What it does: `=1` reports, `=abort` panics on the first collision of two `OpRef` variants on one `raw()` key. Off, it is one thread-local read and a return. State and mode are thread-local so two tests in parallel cannot read each other's collisions or silence one another.
 - Introduced: 2026-08-10 in `d922882072c` (re-pointed 2026-08-11, DOOMED) — majit-ir: add a debug-gated detector for two OpRef variants on one raw() key
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -620,7 +653,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_OPTRACE`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:267`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `optrace_enabled()`
 - What it does: Per-op trace of `run_to_end`'s dispatch loop (frame depth, pc, raw opcode). Diagnostic for pinpointing the op that faults a hardware-signal crash (SIGBUS/SIGSEGV) which `catch_unwind` cannot capture.
 - Introduced: 2026-07-21 in `b159a2fd9eb` — jit: genericize the trace walker over WalkSym; unify interpreter/GC subclass ranges (#205 C2) (#646)
@@ -629,7 +662,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_PCSEQ`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:249`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `pcseq_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -637,7 +670,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_PORTAL_INLINE`
 
-- Read sites: 1 — `majit/majit-metainterp/src/pyjitpl/dispatch.rs:1028`
+- Read sites: 1 — `majit/majit-metainterp/src/pyjitpl/dispatch.rs`
 - Accessor: `portal_inline_experiment_enabled()`
 - What it does: [FR] WIP gate for the state-field recursive-portal Inline re-entry rework. OFF by default: the state-field `portal_jitcode`-None path keeps its clean-abort fallback so existing consumers are unaffected. Set `MAJIT_PORTAL_INLINE=1` to exercise the experimental inline path.
 - Introduced: 2026-07-03 in `5fef244feb1` — majit: switch dispatch, split_dispatch routing, and back-edge builder pooling for the wasmi JIT tier (#307)
@@ -646,7 +679,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_PROBE_LIVENESS`
 
-- Read sites: 1 — `pyre/pyre-jit/src/call_jit.rs:26`
+- Read sites: 1 — `pyre/pyre-jit/src/call_jit.rs`
 - Accessor: `majit_probe_liveness_enabled()`
 - What it does: Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
 - Introduced: 2026-04-27 in `d0fd3c227a3` — eval2: autogenintrules port + Phase 0/1/2 epic groundwork
@@ -654,7 +687,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_REG_WRITE_AUDIT`
 
-- Read sites: 1 — `majit/majit-ir/src/reg_write_audit.rs:131`
+- Read sites: 1 — `majit/majit-ir/src/reg_write_audit.rs`
 - Accessor: read inline in `resolve()`, cached per thread by `enabled()`
 - What it does: debug-gated attribution for writes into a frame's `int_regs` — which code last wrote the slot a reader is about to read. The register file is written from ten production sites across two files and a value read out of it carries no record of which of them put it there; other instruments in the area report what a slot *holds*, not where it *came from*. Writers are not named by hand: `#[track_caller]` makes each note carry its own call site, so a site cannot be mislabelled and a site that moves re-reports itself at the new position. Off, every entry point is one thread-local read and a return. All state is thread-local, matching `opref_audit`, because a trace is recorded on one thread and a process-global table would let two tests in parallel attribute each other's writes. — condensed from the module's own doc header.
 - Default polarity: **OFF**. The read is `Ok(v) if v != "0" && !v.is_empty()`, so unset, empty and `=0` are all off and any other value turns it on; the doc header spells the intended form `=1`. It is not a default-ON experiment, so no epic's close disposes of it.
@@ -664,8 +697,8 @@ is evidence about the day it was written.
 
 ### `MAJIT_SIBLING_TARGET_DIR`
 
-- Read sites: 1 — `scripts/check-sibling-consumers.py:219` (`os.environ.get`)
-- Accessor: read inline in `check()`
+- Read sites: 1 — `scripts/check-sibling-consumers.py`
+- Accessor: read inline in `check()`, via `os.environ.get`
 - What it does: a value, not a switch: the target directory the sibling-consumer check builds into, defaulting to `<tmpdir>/majit-sibling`. Sourced to the comment above the read: the sibling trees are read-only to this workspace and the shared `target/` is contended, so the check needs a third location; setting this to a persistent path is what keeps those builds incremental. Unset it and every run is a cold build into a temp dir.
 - Introduced: 2026-08-10 in `4a587477004` (re-pointed 2026-08-11, DOOMED) — scripts: add a local check that compiles the path-dep sibling consumer trees
   ⚠ Introduced here and never revisited: as of 2026-08-10 no other commit's diff changes an occurrence of the name, this file excluded — see the conventions above.
@@ -689,7 +722,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_SMALLIR`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:298`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `smallir_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -697,7 +730,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_SPDIAG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs:458`
+- Read sites: 1 — `majit/majit-metainterp/src/jitdriver.rs`
 - Accessor: `spdiag_enabled()`
 - What it does: Diagnostic env gates read once and cached — these are checked on the hot back-edge / guard-failure paths that run every loop iteration, so re-reading the environment per call would add a syscall to each iteration.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -705,7 +738,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_STALL_WINDOW`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:330`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `stall_window()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-06-26 in `769911b5c57` — majit: trace-compile pipeline fixes — O(1) compile, is_gc_managed guard gating, pool-array reads, macro bridges (#263)
@@ -713,15 +746,15 @@ is evidence about the day it was written.
 
 ### `MAJIT_STATS`
 
-- Read sites: 3 — `majit/majit-trace/src/logger.rs:12`, `pyre/pyrex/src/lib.rs:799`, `pyre/pyre-wasm-runner/src/main.rs:896`
-- Accessor: `stats_enabled()`
+- Read sites: 3 — `majit/majit-trace/src/logger.rs`, `pyre/pyre-wasm-runner/src/main.rs`, `pyre/pyrex/src/lib.rs`
+- Accessor: `stats_enabled()`; also read inline in `run()` and `maybe_print_jit_stats()`
 - What it does: Whether JIT statistics collection is enabled. Checks MAJIT_STATS=1 or MAJIT_LOG=1.
 - Introduced: 2026-03-11 in `349bde9c5df` — add IntFloorDiv opcode, guard optimization pass, jitlog profiling, bridge infrastructure
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_STEP_LIMIT`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:340`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `step_limit()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-06-26 in `769911b5c57` — majit: trace-compile pipeline fixes — O(1) compile, is_gc_managed guard gating, pool-array reads, macro bridges (#263)
@@ -729,7 +762,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_STRICT`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:202`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `jit_strict_mode()`
 - What it does: Strict JIT mode: a non-`InvalidLoop` panic during compilation is a bug and must fail loudly rather than silently degrade to the interpreter and mask the bug behind correct output. Enabled in debug builds (`cargo test`) and whenever `MAJIT_STRICT` is set (release benches / CI); off in plain release so production keeps graceful degradation. Cached like `majit_log_enabled`.
 - Introduced: 2026-04-20 in `161f03843a2` — virtualstate: strict leaf-store type check
@@ -744,7 +777,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_TLDBG`
 
-- Read sites: 1 — `majit/majit-metainterp/src/lib.rs:254`
+- Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
 - Accessor: `tldbg_enabled()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-07-03 in `2cc8179f2a7` — single-pass / walker-as-tracer tracing scaffold (aheui logo --jit) (#311)
@@ -752,7 +785,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_VERIFY`
 
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs:88`
+- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
 - Accessor: `majit_verify_enabled()`
 - What it does: Whether `MAJIT_VERIFY` is set, cached at first access.
 - Introduced: 2026-04-03 in `fd8f25c0f1d` — RPython parity: call_assembler bridge dispatch, inputarg types, exit_types
@@ -760,7 +793,7 @@ is evidence about the day it was written.
 
 ### `MAJIT_X2_PROBE`
 
-- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs:55`
+- Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
 - Accessor: `drop()`
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Introduced: 2026-05-19 in `92d6da40c0e` — cranelift: unify backend descr identity + in-code closing-jump dispatch (#68)
