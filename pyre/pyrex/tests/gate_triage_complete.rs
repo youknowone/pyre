@@ -1,6 +1,12 @@
-//! `pyre/gate-triage.md` and the tree's `PYRE_*` environment gates must name the
-//! same set — every gate read from a workspace member's Rust or from this
-//! project's own Python has a live entry, and every live entry has a reader.
+//! A triage document and the environment gates it owns must name the same set —
+//! every gate read from a workspace member's Rust or from this project's own
+//! Python has a live entry, and every live entry has a reader.
+//!
+//! **Namespaces.** A gate's prefix selects which document owns it, and both
+//! brakes run once per namespace against that document. See `NAMESPACES` for
+//! the current set; adding a namespace is one row there plus the document it
+//! names. A namespace joins only when that document has been written and
+//! audited, not merely to make this test pass.
 //!
 //! The charter (§3.6) says a gate is a staging area, not a home, and
 //! `gate-triage.md` is the standing list of what to retire and when. That list
@@ -29,6 +35,13 @@
 //! here; the one remaining `PYRE_*` name outside both languages,
 //! `PYRE_CLASS_DESCRIPTORS`, is a linkme distributed slice and not an env var at
 //! all (`gate-triage.md` §2).
+//!
+//! **What this file cannot see, stated so it is not mistaken for coverage.** A
+//! gate named only in a comment is invisible here by construction — `READ_FORMS`
+//! matches reads, and the fixture below pins `PYRE_MENTIONED_IN_A_COMMENT` as
+//! *not* a gate. So a doc-comment citing a gate that no longer exists, or never
+//! did, passes both brakes. That failure is real and separately tracked; it is
+//! not what this test is for, and widening the prefix does not reach it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -120,6 +133,84 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// occur in Python, nor `environ.get(` in Rust.
 const READ_FORMS: [&str; 4] = ["env::var", "host_os::var", "getenv", "environ.get"];
 
+/// Cargo's build-script declaration that the build depends on a gate:
+/// `println!("cargo::rerun-if-env-changed=NAME")`.
+///
+/// Counted as a read, and it has to be, because a build script can reach the
+/// environment through an indirection no textual scan can follow.
+/// `pyre-jit-trace/build.rs:490` binds `std::env::var_os` to a **closure** and
+/// passes the gate name to that:
+///
+/// ```ignore
+/// let env_switch = |name: &str| std::env::var_os(name).map(…);
+/// let strict_var = env_switch("PYRE_LLBC_STRICT");
+/// ```
+///
+/// so `PYRE_LLBC_STRICT` and `PYRE_LLBC_SKIP_FINGERPRINT_CHECK` have no
+/// `env::var("NAME")` anywhere in the tree. Without this form both read as
+/// retired, and the second brake tells you to move two **live** gates into a
+/// retirement section — destroying true documentation to fix a false reading.
+///
+/// This does not relax the "a mention is not a read" rule the read forms exist
+/// to enforce. A stale `rerun-if-env-changed` is not inert the way a stale
+/// comment is: it is live build configuration deciding when Cargo reruns the
+/// script, so it cannot rot unobserved the way `PYRE_FBW_REC_UNROLL` rotted
+/// inside a document for a month.
+const CARGO_ENV_DEP: &str = "rerun-if-env-changed=";
+
+/// A gate namespace: the prefix its names carry, and the document that owns them.
+///
+/// A prefix assigns ownership, and both brakes below run once per namespace
+/// against that namespace's own document. `pyre-wasm-runner/src/main.rs:140`
+/// already filters guest environment names on `PYRE_` **or** `MAJIT_`, so two
+/// prefixes is an existing convention in this tree rather than a new one.
+///
+/// **Why a namespace owns a document rather than sharing one.** `majit/**` is
+/// consumed by `cel-jit` and `wasmi-majit` by rev, not only by pyre. Recording
+/// majit's gates in a pyre document would put majit's retirement charter behind
+/// a dependency those consumers do not have, and would stale the pyre document
+/// every time majit adds a gate — visible only from pyre's test suite.
+struct GateNamespace {
+    prefix: &'static str,
+    doc: &'static str,
+}
+
+/// WARNING: **Adding a row here is a data change: it arms both brakes over a whole
+/// namespace at once, and they fail with one entry per undocumented name.**
+///
+/// `MAJIT_` was added in "gate-triage: catalog the MAJIT_* gates and arm the
+/// brake's second namespace" (`1d670fa7c9c` as of 2026-08-11 — branch-local,
+/// so re-derive from the subject), together with the `majit/gate-triage.md`
+/// it names — the two cannot land separately in either order without a red.
+/// Every function below is parameterized over the namespace so that adoption is
+/// exactly this one row plus the document; see
+/// `both_brakes_are_parameterized_over_the_namespace` for the proof that a
+/// second namespace works, run against a synthetic document.
+///
+/// WARNING: Neither brake reads the documents' contents — they compare NAMES. A row
+/// whose retirement condition is `UNRECORDED` (or empty) satisfies them exactly
+/// as well as a filled one. `UNRECORDED` rows remain common in
+/// `majit/gate-triage.md`; green here is evidence that every gate is *listed*,
+/// and no evidence that anything is *described*. That hole is deliberate: a
+/// catalog of plausible guesses would satisfy the brakes permanently while
+/// describing nothing, which is worse than the absence, because the absence is
+/// legible and a plausible sentence is not.
+const NAMESPACES: [GateNamespace; 2] = [
+    GateNamespace {
+        prefix: "PYRE_",
+        doc: "pyre/gate-triage.md",
+    },
+    GateNamespace {
+        prefix: "MAJIT_",
+        doc: "majit/gate-triage.md",
+    },
+];
+
+/// The namespace owning this gate name, if any.
+fn namespace_of(name: &str) -> Option<&'static GateNamespace> {
+    NAMESPACES.iter().find(|ns| name.starts_with(ns.prefix))
+}
+
 /// Gate names this text reads from the environment.
 ///
 /// Matches the read forms above rather than every mention of the name, so a gate
@@ -143,9 +234,21 @@ fn gates_read_by(text: &str) -> Vec<&str> {
             };
             let Some(end) = rest.find('"') else { continue };
             let name = &rest[..end];
-            if name.starts_with("PYRE_") {
+            if namespace_of(name).is_some() {
                 found.push(name);
             }
+        }
+    }
+    // The build-script dependency declaration, which carries its name bare
+    // rather than as a quoted call argument.
+    for (at, _) in text.match_indices(CARGO_ENV_DEP) {
+        let rest = &text[at + CARGO_ENV_DEP.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        if namespace_of(name).is_some() {
+            found.push(name);
         }
     }
     found
@@ -163,6 +266,7 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         crate::host_seam::ops::getenv(b"PYRE_E");
         os.environ.get("PYRE_F")
         os.getenv("PYRE_G")
+        println!("cargo::rerun-if-env-changed=PYRE_H");
         # a gate written into a child's environment is not a read of ours
         env["PYRE_NOT_A_READ_EITHER"] = "1"
         // PYRE_MENTIONED_IN_A_COMMENT
@@ -176,7 +280,7 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
     assert_eq!(
         got,
         vec![
-            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G"
+            "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G", "PYRE_H"
         ]
     );
 }
@@ -196,14 +300,19 @@ fn is_history_heading(heading: &str) -> bool {
     lower.contains("retired") || lower.contains("dead") || lower.contains("not gates")
 }
 
-/// The `PYRE_*` names this line spells out, in the order it spells them.
+/// The names carrying `prefix` that this line spells out, in the order it
+/// spells them.
 ///
 /// Tokenized rather than substring-searched: `contains("PYRE_A")` is satisfied
 /// by a documented `PYRE_ANCHOR_STRICT`, so a new gate whose name is a prefix of
 /// a listed one would slip through the brake unnoticed.
-fn pyre_names_in(line: &str) -> Vec<&str> {
+///
+/// The same tokenization keeps the two namespaces apart where they overlap in
+/// text: `PYRE_MAJIT_STATS_ANCESTOR` contains `MAJIT_`, and the preceding-
+/// character guard is what stops it being read as a majit gate.
+fn gate_names_in<'a>(line: &'a str, prefix: &str) -> Vec<&'a str> {
     let mut names = Vec::new();
-    for (at, _) in line.match_indices("PYRE_") {
+    for (at, _) in line.match_indices(prefix) {
         // A name preceded by a name character is the tail of a longer token.
         if line[..at]
             .chars()
@@ -240,17 +349,33 @@ fn pyre_names_in(line: &str) -> Vec<&str> {
 ///
 /// "retired", not "retire": §4 is a live section whose gates are the ones that
 /// "retire when the epic closes".
-fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
+///
+/// A line that *negates* the word is refused rather than read either way — see
+/// `negates_retirement`.
+fn gates_documented_in<'a>(triage: &'a str, prefix: &str) -> BTreeSet<&'a str> {
     let mut live_names: BTreeSet<&str> = BTreeSet::new();
     let mut retired_subjects: BTreeSet<&str> = BTreeSet::new();
     let mut live = true;
-    for line in triage.lines() {
+    for (at, line) in triage.lines().enumerate() {
         if let Some(heading) = line.strip_prefix("## ") {
             live = !is_history_heading(heading);
         }
-        let names = pyre_names_in(line);
-        if line.to_ascii_lowercase().contains("retired") {
+        let names = gate_names_in(line, prefix);
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("retired") {
             if let Some(&subject) = names.first() {
+                assert!(
+                    !negates_retirement(&lower),
+                    "line {} of the {prefix}* triage document names {subject} beside a \
+                     negated `retired`, so the scan cannot tell whether the line records \
+                     a retirement:\n  {line}\n\n\
+                     The scan reads `retired` as a verdict on the line's first name and \
+                     would drop {subject} from the live set wherever else the document \
+                     writes it — which a line saying it is *not* retired does not ask \
+                     for. Either state the retirement plainly, or write the note without \
+                     the word.",
+                    at + 1
+                );
                 retired_subjects.insert(subject);
             }
         } else if live {
@@ -259,6 +384,29 @@ fn gates_documented_in(triage: &str) -> BTreeSet<&str> {
     }
     live_names.retain(|name| !retired_subjects.contains(name));
     live_names
+}
+
+/// Does this line say a gate is *not* retired?
+///
+/// The scan cannot recover intent from prose: it reads `retired` anywhere on a
+/// line as a verdict on that line's first gate name, so a negation makes it
+/// conclude the opposite of what the line says, and the gate is dropped from the
+/// live set everywhere. That drop is silent in the direction that matters —
+/// `every_live_triage_entry_still_has_a_reader` simply stops checking a name it
+/// no longer sees, so a documented gate whose reader is gone passes.
+///
+/// Refusing is not the same as guessing the other way. A negation is where the
+/// two readings are furthest apart and the parse has no way to choose, so it
+/// says so and names the line.
+///
+/// Scoped to lines that would actually drop a name: the phrasing already appears
+/// in `pyre/gate-triage.md`'s §1b, as the "Deferred, not retired" heading over a
+/// list, and that line spells no gate name — nothing is dropped, so nothing is
+/// refused. When this landed, neither document had a line satisfying both halves.
+fn negates_retirement(lowercased_line: &str) -> bool {
+    ["not retired", "never retired", "not yet retired"]
+        .iter()
+        .any(|negation| lowercased_line.contains(negation))
 }
 
 /// A documented token that is a wildcard's stem rather than a gate.
@@ -323,17 +471,30 @@ fn read_sites(root: &Path) -> BTreeSet<(String, String)> {
     sites
 }
 
-#[test]
-fn every_live_pyre_gate_has_a_gate_triage_entry() {
-    let root = repo_root();
-    let triage_path = root.join("pyre/gate-triage.md");
-    let triage = std::fs::read_to_string(&triage_path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", triage_path.display()));
-    let documented = gates_documented_in(&triage);
+/// The triage document owning `ns`, read from disk.
+fn triage_text(root: &Path, ns: &GateNamespace) -> String {
+    let path = root.join(ns.doc);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
 
-    // Two anchors on the live/history split, because a heading reword would
-    // otherwise change what this test accepts without failing. One on each side:
-    // a retired name must not count, and a listed live name must.
+fn namespace(prefix: &str) -> &'static GateNamespace {
+    NAMESPACES
+        .iter()
+        .find(|ns| ns.prefix == prefix)
+        .expect("NAMESPACES names this prefix")
+}
+
+/// The live/history split in `gate-triage.md` is load-bearing for both brakes,
+/// and a heading reword would otherwise change what they accept without failing.
+/// Anchored on each side: a retired name must not count, a listed live name must.
+#[test]
+fn pyre_triage_live_history_split_holds_at_four_anchors() {
+    let root = repo_root();
+    let ns = namespace("PYRE_");
+    // Bound, not inlined: the returned set borrows the document text.
+    let triage = triage_text(&root, ns);
+    let documented = gates_documented_in(&triage, ns.prefix);
+
     assert!(
         !documented.contains("PYRE_SINGLE_PASS"),
         "PYRE_SINGLE_PASS is named only in a retirement section and has no read \
@@ -356,56 +517,148 @@ fn every_live_pyre_gate_has_a_gate_triage_entry() {
         "PYRE_JD1 is listed live in §6a but did not count as documented — \
          is_history_heading is excluding a live section"
     );
+}
 
-    let missing: BTreeSet<(String, String)> = read_sites(&root)
-        .into_iter()
-        .filter(|(name, _)| !documented.contains(name.as_str()))
-        .collect();
+#[test]
+fn every_live_gate_has_a_triage_entry() {
+    let root = repo_root();
+    let sites = read_sites(&root);
 
-    if !missing.is_empty() {
-        let listed = missing
+    for ns in &NAMESPACES {
+        let triage = triage_text(&root, ns);
+        let documented = gates_documented_in(&triage, ns.prefix);
+        let missing: Vec<&(String, String)> = sites
             .iter()
-            .map(|(name, file)| format!("  {name}  ({file})"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        panic!(
-            "{} PYRE_* gate(s) are read from the environment but have no entry in \
-             pyre/gate-triage.md:\n{listed}\n\n\
+            .filter(|(name, _)| name.starts_with(ns.prefix) && !documented.contains(name.as_str()))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{} {}* gate(s) are read from the environment but have no entry in \
+             {}:\n{}\n\n\
              Add a row for each: what it gates, its default polarity, and — for a \
              default-ON experiment — the epic whose close retires it.",
-            missing.len()
+            missing.len(),
+            ns.prefix,
+            ns.doc,
+            missing
+                .iter()
+                .map(|(name, file)| format!("  {name}  ({file})"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }
 
 #[test]
-fn every_live_gate_triage_entry_still_has_a_reader() {
+fn every_live_triage_entry_still_has_a_reader() {
     let root = repo_root();
-    let triage_path = root.join("pyre/gate-triage.md");
-    let triage = std::fs::read_to_string(&triage_path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", triage_path.display()));
-
     let read: BTreeSet<String> = read_sites(&root)
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    let stale: Vec<&str> = gates_documented_in(&triage)
-        .into_iter()
-        .filter(|name| !is_wildcard_stem(name) && !read.contains(*name))
-        .collect();
+
+    for ns in &NAMESPACES {
+        let triage = triage_text(&root, ns);
+        let stale: Vec<&str> = gates_documented_in(&triage, ns.prefix)
+            .into_iter()
+            .filter(|name| !is_wildcard_stem(name) && !read.contains(*name))
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "{} name(s) are listed live in {} but nothing in the tree reads \
+             them:\n{}\n\n\
+             Deleting the row loses why the gate existed. Move each to a retirement \
+             section (§1c) naming the change that removed its reader — that is what \
+             stops the next reader of this name from passing on an obituary.",
+            stale.len(),
+            ns.doc,
+            stale
+                .iter()
+                .map(|name| format!("  {name}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
+/// Both brakes must actually run per namespace, against that namespace's own
+/// document — not against the first one, and not against a union of all of them.
+///
+/// This is the whole content of the generalization, and the live brakes cannot
+/// demonstrate it. `every_live_gate_has_a_triage_entry` and
+/// `every_live_triage_entry_still_has_a_reader` do already call per namespace,
+/// but a union of documents that are each individually correct is still correct
+/// for every name in either — so a union bug is invisible against the committed
+/// documents whatever `NAMESPACES` holds. Making it visible needs each side
+/// wrong in the specific way a union would hide, which this test cannot do to a
+/// real triage document without editing it. So the proof is run here on
+/// synthetic text: a two-namespace world where each side is wrong in the way the
+/// union would hide.
+///
+/// `EX_ELSEWHERE` is an `EX_` gate written **only** in the `SYN_` document. It
+/// must not count as documented for `EX_`, and the positive control on the line
+/// above is what makes that absence mean something: the same call against the
+/// document that does spell it finds it. Without the control, a scan that had
+/// stopped working entirely would pass this test.
+#[test]
+fn both_brakes_are_parameterized_over_the_namespace() {
+    let ex_doc = "## §1 live\n`EX_KNOWN` gates a thing.\n";
+    let syn_doc = "## §1 live\n`SYN_KNOWN` gates a thing.\n`EX_ELSEWHERE` is named here.\n";
 
     assert!(
-        stale.is_empty(),
-        "{} name(s) are listed live in pyre/gate-triage.md but nothing in the tree \
-         reads them:\n{}\n\n\
-         Deleting the row loses why the gate existed. Move each to a retirement \
-         section (§1c) naming the change that removed its reader — that is what \
-         stops the next reader of this name from passing on an obituary.",
-        stale.len(),
-        stale
-            .iter()
-            .map(|name| format!("  {name}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        gates_documented_in(ex_doc, "EX_").contains("EX_KNOWN"),
+        "prefix scan missed its own name"
+    );
+    assert!(
+        gates_documented_in(syn_doc, "SYN_").contains("SYN_KNOWN"),
+        "prefix scan missed its own name"
+    );
+
+    // Positive control: the name is findable by this scan, in the document that
+    // spells it.
+    assert!(
+        gates_documented_in(syn_doc, "EX_").contains("EX_ELSEWHERE"),
+        "the control failed — the scan cannot find EX_ELSEWHERE anywhere, so the \
+         assertion below would pass for the wrong reason"
+    );
+    // The check: it is not documented for `EX_`, because `EX_`'s document does
+    // not spell it. A scan over the union of all documents would pass the
+    // control and fail here — which is the failure that makes one shared
+    // document unsafe, and the reason `MAJIT_` cannot simply be pointed at
+    // `pyre/gate-triage.md`.
+    assert!(
+        !gates_documented_in(ex_doc, "EX_").contains("EX_ELSEWHERE"),
+        "a name absent from its own namespace's document counted as documented — \
+         the lookup is not per document"
+    );
+
+    // Retirement is per document too: the same name may be live in one and
+    // retired in the other, and each document governs only its own namespace.
+    let retired = gates_documented_in("## §1 live\n`EX_KNOWN` retired 2026-01-01.\n", "EX_");
+    assert!(
+        !retired.contains("EX_KNOWN"),
+        "a retirement line in the namespace's own document did not retire its subject"
+    );
+}
+
+/// `PYRE_MAJIT_STATS_ANCESTOR` and friends spell `MAJIT_` inside a `PYRE_` name.
+///
+/// The preceding-character guard in `gate_names_in` is the only thing keeping
+/// them out of a future `MAJIT_` namespace, and it is one `continue` in a loop —
+/// cheap to lose in an edit, and its loss would silently move four documented
+/// pyre gates into majit's ledger.
+#[test]
+fn a_prefix_appearing_inside_a_longer_name_is_not_a_gate_of_that_namespace() {
+    let line = "`PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `MAJIT_LOG`";
+    assert_eq!(
+        gate_names_in(line, "MAJIT_"),
+        vec!["MAJIT_LOG"],
+        "a `MAJIT_` embedded in a `PYRE_MAJIT_*` name was read as a majit gate"
+    );
+    assert_eq!(
+        gate_names_in(line, "PYRE_"),
+        vec!["PYRE_MAJIT_STATS_ANCESTOR", "PYRE_MAJIT_STATS_ROOT_ONLY"]
     );
 }

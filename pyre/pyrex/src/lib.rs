@@ -811,6 +811,7 @@ fn maybe_print_jit_stats() {
     }
     maybe_print_mc_diag();
     maybe_print_gc_diag();
+    maybe_print_cell_census();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -907,6 +908,14 @@ fn maybe_print_jit_stats() {
     // Whether those slots were filled CORRECTLY, which the line above
     // cannot say. See `field_position_jit_stats`.
     eprintln!("[jit-stats] {}", pyre_jit::field_position_jit_stats());
+    // Which mints those `field_pos_unresolved` are. Off unless
+    // `MAJIT_FIELD_POS_UNRESOLVED`, and it takes `all_descrs_len` because the
+    // table needs a denominator that is not one of its own numbers: a run that
+    // never loaded the descr universe records nothing, and so does a tree with
+    // nothing wrong.
+    for line in pyre_jit::field_position_unresolved_report(all_descrs_len) {
+        eprintln!("[jit-stats] {line}");
+    }
 }
 
 /// Names for the `MC_DIAG` tallies, in index order — the array
@@ -916,16 +925,6 @@ fn maybe_print_jit_stats() {
 /// program diffable field by field.
 use majit_metainterp::MC_DIAG_LABELS as MC_DIAG_FIELDS;
 
-/// Print the guard-failure → bridge-trace gate tallies. Until this existed the
-/// counters were bumped on every backend but only readable through the wasm
-/// guest export, so the question "did this guard failure ever reach a bridge,
-/// or was it short-circuited by the decline blacklist" could not be asked of a
-/// native run at all.
-///
-/// Deliberately NOT under the `[jit-stats]` prefix: `check.py`'s
-/// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
-/// silently replace the committed per-bench baseline. Its own env gate keeps it
-/// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
 /// Print the GC's deterministic pressure counters.
 ///
 /// The perf question this answers is the one a loaded machine's clock cannot:
@@ -947,6 +946,16 @@ fn maybe_print_gc_diag() {
     );
 }
 
+/// Print the guard-failure → bridge-trace gate tallies. Until this existed the
+/// counters were bumped on every backend but only readable through the wasm
+/// guest export, so the question "did this guard failure ever reach a bridge,
+/// or was it short-circuited by the decline blacklist" could not be asked of a
+/// native run at all.
+///
+/// Deliberately NOT under the `[jit-stats]` prefix: `check.py`'s
+/// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
+/// silently replace the committed per-bench baseline. Its own env gate keeps it
+/// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
 fn maybe_print_mc_diag() {
     if std::env::var_os("PYRE_MC_DIAG").is_none() {
         return;
@@ -956,6 +965,56 @@ fn maybe_print_mc_diag() {
         line.push_str(&format!(" {name}={}", majit_metainterp::mc_diag(i)));
     }
     eprintln!("{line}");
+}
+
+/// Print the JIT cell table's occupancy at exit.
+///
+/// `WarmEnterState.cells` is an `IndexMap` keyed by the whole green-key hash,
+/// and nothing production-reachable removes an entry from it: `install_new_cell`
+/// prunes only within one bucket, which needs a hash collision, and `gc_cells` —
+/// the whole-table sweep — has `test_gc_cells` as its only caller. So the
+/// table's size is a function of the workload rather than of any bound, and the
+/// number nobody had was how fast it grows on a real program.
+///
+/// Read it as a ladder: the level alone is a workload fact, the slope across
+/// runs of increasing size is the rate. `loops_compiled` on the `[jit-stats]`
+/// line is the arming witness — a run that compiled nothing exercised no cell
+/// mint, and its `cells` says nothing about growth.
+///
+/// WARNING: `pinned_refs` is structurally 0 here, and that zero is not a measurement
+/// of pinning. `RetainedGreens` retains through `majit_ir::set_ref_resolver`,
+/// which no pyre frontend calls — the whole tree's only callers are in
+/// `warmstate.rs`'s own tests — so a stored `Ref` green owns nothing and the
+/// column reports the hook's absence, not an empty pinned set. A nonzero value
+/// here means somebody registered a resolver and this paragraph is stale.
+///
+/// Same prefix discipline as [`maybe_print_gc_diag`]: not `[jit-stats]`, and
+/// behind its own env gate, so the committed per-bench baselines never see it.
+/// STOP: It must stay off that line: `cells` is a function of the workload AND of
+/// host state, and `check.py` gates jit-stats rows on exact equality. A counter
+/// earns a gated row by being a function of the program alone.
+fn maybe_print_cell_census() {
+    if std::env::var_os("PYRE_CELL_CENSUS").is_none() {
+        return;
+    }
+    let stats = pyre_jit::eval::driver_pair()
+        .0
+        .meta_interp()
+        .warm_state_ref()
+        .get_stats();
+    // Unconditional once the gate is set, including on a zero: a missing line
+    // then means the probe is not in the binary, which is a different fact from
+    // an empty table and must not print the same bytes.
+    eprintln!(
+        "[jit-cell-census] cells={} compiled={} tracing={} invalidated={} \
+         dont_trace_here={} pinned_refs={}",
+        stats.num_cells,
+        stats.num_compiled,
+        stats.num_tracing,
+        stats.num_invalidated,
+        stats.num_disable_noninlinable_function,
+        stats.num_pinned_refs,
+    );
 }
 
 /// Shared top-level launcher bootstrap for `run_source` and `run_module`:

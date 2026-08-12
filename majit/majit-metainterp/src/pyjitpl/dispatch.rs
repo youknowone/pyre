@@ -1342,10 +1342,29 @@ where
     /// escaped during this CALL_MAY_FORCE.  Returns the still-rooted
     /// [`ActiveStandardVirtualizable`] so the caller can read the heap object
     /// before dropping the shadow-stack root.
+    ///
+    /// Two signals meet here.  The token check is the upstream one and answers
+    /// "did the callee force the virtualizable".  It cannot answer for a callee
+    /// handed the array's raw base address: such a callee never touches the
+    /// token, and an `#[jit_interp]` machine has no token to touch
+    /// (`without_vable_token`), so the check returns `false` for precisely the
+    /// calls most able to invalidate the trace.  `take_raw_base_escape` carries
+    /// that case — see [`crate::virtualizable::raise_raw_base_escape`].
     fn escaped_standard_virtualizable(
         active: Option<ActiveStandardVirtualizable>,
     ) -> Option<ActiveStandardVirtualizable> {
-        active.filter(|active| unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) })
+        // Drained before the `filter`, and unconditionally: with no active
+        // virtualizable there is nothing to filter, and a signal left standing
+        // would abort the next, unrelated residual call.
+        let raw_base_escape = crate::virtualizable::take_raw_base_escape();
+        active.filter(|active| {
+            // Evaluated first and not short-circuited past: on a token-bearing
+            // virtualizable this call is what clears the token back to NONE,
+            // and skipping it would trip the `== 0` assert in
+            // `tracing_before_residual_call` at the next call instead.
+            let forced = unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) };
+            forced || raw_base_escape
+        })
     }
 
     fn finalize_standard_virtualizable_may_force(
@@ -1717,6 +1736,11 @@ where
             // Preserve that mutation instead of restoring the pre-snapshot
             // state-field materialization save.
             if Some(idx) != root_inflight_int_result {
+                majit_ir::reg_write_audit::note_int_write(
+                    self.frames.frames[0].int_regs.as_ptr() as usize,
+                    idx,
+                    saved_int_regs[idx],
+                );
                 self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
                 self.frames.frames[0].int_values[idx] = saved_int_values[idx];
             }
@@ -2975,6 +2999,11 @@ where
                 match kind {
                     JitArgKind::Int => {
                         let (value, concrete) = self.read_int_reg(caller_src);
+                        majit_ir::reg_write_audit::note_int_write(
+                            portal_frame.int_regs.as_ptr() as usize,
+                            callee_dst,
+                            Some(value),
+                        );
                         portal_frame.int_regs[callee_dst] = Some(value);
                         portal_frame.int_values[callee_dst] = Some(concrete);
                     }
@@ -4706,6 +4735,28 @@ where
                     .unwrap_or(0);
                 self.set_int_reg(dest, Some(result), Some(len as i64));
             }
+            jitcode::insns::BC_ARRAYBASE_VABLE => {
+                // Same `rdd>i` operand triple as `arraylen_vable` above, hence
+                // the shared decoder.
+                let (vable_reg, array_idx, dest) = {
+                    let frame = self.frames.current_mut();
+                    frame.read_vable_arraylen()
+                };
+                let Some((_vable_opref, fdescr, _adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                // An unresolvable base aborts rather than defaulting: the walk
+                // really executes the residual call this address feeds, so a
+                // placeholder would be handed to a live callee.
+                let Some((result, addr)) = ctx.vable_arraybase_vable(vable_struct_ptr, fdescr)
+                else {
+                    return TraceAction::Abort;
+                };
+                self.set_int_reg(dest, Some(result), Some(addr));
+            }
             jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE => {
                 let vable_reg = self.frames.current_mut().next_reg() as usize;
                 let vable_opref = self.resolve_vable_box(vable_reg);
@@ -6247,6 +6298,11 @@ where
                     match kind {
                         JitArgKind::Int => {
                             let (value, concrete) = self.read_int_reg(caller_src);
+                            majit_ir::reg_write_audit::note_int_write(
+                                sub_frame.int_regs.as_ptr() as usize,
+                                callee_dst,
+                                Some(value),
+                            );
                             sub_frame.int_regs[callee_dst] = Some(value);
                             sub_frame.int_values[callee_dst] = Some(concrete);
                         }
@@ -8502,6 +8558,11 @@ where
 
         for (callee_dst, caller_src) in args_i.into_iter().enumerate() {
             let (value, concrete) = self.read_int_reg(caller_src);
+            majit_ir::reg_write_audit::note_int_write(
+                sub_frame.int_regs.as_ptr() as usize,
+                callee_dst,
+                Some(value),
+            );
             sub_frame.int_regs[callee_dst] = Some(value);
             sub_frame.int_values[callee_dst] = Some(concrete);
         }
@@ -8540,6 +8601,7 @@ where
 
     fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
+        majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, reg, opref);
         frame.int_regs[reg] = opref;
         frame.int_values[reg] = value;
     }
@@ -10080,8 +10142,8 @@ pub fn build_state_field_snapshot(
     // `boxes[-1]` per `TraceCtx::init_virtualizable_boxes`) is moved
     // to the FRONT, then the rest follow in original order.  The
     // resume reader (`resume.py:1404 consume_vable_info` ↔
-    // `resume.rs:6477`) reads the first entry as the virtualizable
-    // pointer, so this reorder is load-bearing.
+    // `resume.rs::consume_vable_info`) reads the first entry as the
+    // virtualizable pointer, so this reorder is load-bearing.
     // `opencoder.py:718-726 _list_of_boxes_virtualizable` /
     // `opencoder.py:712-717 _list_of_boxes` encode every list element
     // unconditionally via `_add_box_to_storage(box)` — no per-element
@@ -10103,7 +10165,7 @@ pub fn build_state_field_snapshot(
 /// reorder for the virtualizable box list.  `virtualizable_boxes[-1]` is the
 /// virtualizable identity (placed there by
 /// `TraceCtx::init_virtualizable_boxes`); the snapshot moves it to slot 0 so
-/// the resume reader's `consume_vable_info` (`resume.rs:6477`, mirroring
+/// the resume reader's `consume_vable_info` (in `resume.rs`, mirroring
 /// `resume.py:1404`) reads the identity first.  Each entry must carry
 /// `OpRef::ty()`; misshapen entries panic rather than silently shrink the
 /// snapshot relative to upstream.

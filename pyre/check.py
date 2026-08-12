@@ -696,6 +696,31 @@ def _jit_panic_reason(stderr):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _jit_stats_merged(stderr):
+    """Every `[jit-stats]` line merged into one `key -> value` map, UNFILTERED.
+
+    `None` when the run printed no such line at all, which is a different
+    condition from printing one with no keys.
+
+    Split out from `_jit_stats_snapshot` because the two callers want opposite
+    things. A committed baseline may only contain the host-stable surface, so
+    the snapshot narrows to `JITSTATS_SNAPSHOT_FIELDS`; a *non-vacuity* check
+    has to read a counter precisely because it is NOT recorded — see
+    `JITSTATS_DENOMINATOR_FIELDS`. Narrowing first would hide it.
+    """
+    fields = {}
+    seen = False
+    for line in stderr.splitlines():
+        if not line.startswith("[jit-stats]"):
+            continue
+        seen = True
+        for token in line[len("[jit-stats]") :].split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+    return fields if seen else None
+
+
 def _jit_stats_snapshot(stderr):
     """Return every jit-stats line merged into normalized key/value text.
 
@@ -719,17 +744,8 @@ def _jit_stats_snapshot(stderr):
     questions: merging arms the floor, the filter keeps the recorded surface
     host-stable.
     """
-    fields = {}
-    seen = False
-    for line in stderr.splitlines():
-        if not line.startswith("[jit-stats]"):
-            continue
-        seen = True
-        for token in line[len("[jit-stats]") :].split():
-            if "=" in token:
-                key, value = token.split("=", 1)
-                fields[key] = value
-    if not seen:
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
         return None
     fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
     # This watches what the JIT compiles, never how well. A regression that
@@ -849,6 +865,252 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_store_journal_rollback_failed",
 )
 
+# A badness counter is a NUMERATOR. Zero is its healthy value — and zero is also
+# what it reads when the census that feeds it never ran. The two are
+# indistinguishable on the gated surface, so a counter whose denominator is
+# reachable is paired with it here and checked for non-vacuity.
+#
+# STOP: Only `field_pos_spec_misplaced` qualifies, and the asymmetry is the whole
+# point of the pairing rather than an omission:
+#
+# (Cited by SYMBOL below, not by line: every line number this block used to
+# carry had drifted — +87 on the two census fns, +201 on the mint factories,
+# +181 on the unresolved arm — while the claims themselves were all still true.
+# A symbol re-derives its location; a line number is a cached answer.)
+#
+# * `census_spec_positions` (`majit-ir/src/descr.rs`) is the FIRST statement of
+#   both descr-group mint factories and counts `field_specs.len()`
+#   unconditionally. Its coverage predicate is "a descr group was minted", which
+#   nothing filters. `field_pos_spec_checked` is therefore a real denominator: it
+#   falls to zero only if minting itself stops.
+# * `census_attached_index` (same file) is called from three sites, and every one
+#   of them bumps only inside a parent lookup that has ALREADY SUCCEEDED —
+#   verified at all three, where this note previously named two:
+#     - `pyre-jit-trace/src/descr.rs`  `if let Some((pos, _)) = ...find(...)`
+#     - `majit-metainterp/src/pyjitpl/dispatch.rs`  `if let Some(expected)`
+#     - `majit-translate/src/codewriter/assembler.rs`
+#           `if let Some(parent_spec) && let Some(pos) = ...position(...)`
+#   (all three are runtime-reachable: `majit-translate` is an ordinary
+#   dependency of `pyre-jit`, so the codewriter runs in-process at startup.)
+#
+#   ⇒ The attached census's population is exactly the FOUND-in-parent set and
+#   the unresolved rows are exactly the NOT-found set: DISJOINT BY CONSTRUCTION,
+#   which is stronger than "filtered by the same condition" and is what
+#   `dispatch.rs:166` says in as many words ("not counted either way").
+#
+#   ⇒ So `field_pos_attached_misplaced` is a badness counter for a DIFFERENT
+#   defect than the unresolved rows track: a field that IS in its parent's list
+#   under a stored `index_in_parent` naming another slot. For that defect
+#   `field_pos_attached_checked` is a sound denominator — nonzero on 1025 of
+#   the 1233 cells the corpus sweep covered. The blindness is fatal only to the
+#   claim "this pair covers the unresolved population", which it never made.
+#
+#   STOP: What actually blocks the pairing is narrower, empirical, and BOTH
+#   available forms are closed:
+#     - UNCONDITIONAL (`checked == 0` — the form the spec half ships) would red
+#       the 208 of 1233 cells where `attached_checked` is 0. `spec_checked` is
+#       never 0 (floor 13), which is the entire reason that form works there.
+#     - GUARDED (`checked == 0 and loops_compiled > 0`) fires on 0 of those 208:
+#       `attached_checked == 0` occurred ONLY where `loops_compiled == 0`, so the
+#       guard's exclusion set is a superset of its firing set and the predicate
+#       is STRUCTURALLY UNFIRABLE. Shippable-and-vacuous is worse than
+#       unshipped — no reds, no suppression pressure, so nothing ever prompts a
+#       re-examination.
+#   ⇒ The attached half stays unpaired as a DECISION, not an omission. Its
+#   release condition is an input separating the two sets: a fixture with
+#   `attached_checked == 0` AND `loops_compiled > 0`. None exists in 1233 cells.
+#
+#   WARNING: TWO 208s, AND NOTHING HAS CHECKED THEY ARE THE SAME 208. The cells with
+#   `attached_checked == 0` number 208, and the cells below the superseded
+#   `spec_checked` floor quoted further down also number 208. Different
+#   predicates, equal counts, set identity UNVERIFIED. Do not read the
+#   coincidence as a shared cause.
+#
+#   That uncovered population is already counted, and it is not empty:
+#   `field_pos_unresolved` (the `FIELD_INDEX_UNRESOLVED` arm of
+#   `derive_index_in_parent` — parent resolved, non-empty, field absent from it)
+#   is emitted on the same line and read by nothing.
+#
+#   STOP: AN EARLIER REVISION CLOSED THAT SENTENCE WITH "Gating it is the open
+#   item", and this note then grew a block 20 lines below stating the opposite
+#   without sweeping the clause. Split it: gating its MAGNITUDE is CLOSED, not
+#   open — the host measurement below (153/154/156 on ONE commit) forbids
+#   recording any value at all. What could still be open is a NON-VACUITY gate,
+#   which asserts the census ran and never quotes a number; that needs a
+#   per-fixture non-exercise arm, because 83 of 411 fixtures on wasm read 0
+#   legitimately.
+#
+#   STOP: IT IS NOT FIXTURE-INVARIANT, and a note here said for some time that it
+#   was. Swept over all 411 fixtures on wasm it takes EIGHT distinct values:
+#   158 (231 fixtures), 0 (83), 195 (66), 159 (15), 161 (6), 196 (5), 198 (3),
+#   199 (2). The claim rested on three fixtures that all read 158 — but 158 is
+#   the MODE at 56%, so three agreeing samples were never evidence of
+#   invariance. Whatever gates this counter has to be per-fixture; there is no
+#   single number to compare against.
+#
+#   What it IS: a deterministic function of (fixture, backend). The same sweep
+#   on dynasm gives the same eight values in the same shape, and re-running the
+#   divergent fixtures reproduces every reading exactly (23/23), so none of the
+#   spread is run-to-run noise. Across the two backends 388 of 411 fixtures
+#   agree outright. Of the 23 that do not, 21 are a fixture that reaches the
+#   `field_pos_spec_checked=13` floor on one backend and not the other — an
+#   EXERCISE difference, not a counter disagreement — and only 2 are exercised
+#   on both and still differ (`exception_metadata_jitstress` 195/196,
+#   `trace_too_long_effect_replay` 161/199), both with different
+#   `spec_checked` as well, i.e. a different descr universe got minted.
+#
+#   STOP: AND IT MUST NOT BE RECORDED ANYWAY — IT IS HOST-DEPENDENT, MEASURED.
+#   A per-fixture, per-backend baseline is well defined and would be the shape
+#   `<fixture>.<backend>.jitstats` already has, so this looked writable. It is
+#   not. In ONE CI run (31258456255, one commit, the same startup program on
+#   each host) `pyre/check.py` printed:
+#
+#       ubuntu-24.04    field_pos_unresolved=153   field_pos_spec_checked=1727,1753
+#       windows-latest  field_pos_unresolved=154   field_pos_spec_checked=1749,1750
+#       macos-latest    field_pos_unresolved=156   field_pos_spec_checked=1779,1789
+#
+#   Three hosts, three values, same program. `unresolved` is single-valued per
+#   host, so those three are directly comparable; `spec_checked` prints twice
+#   per job (two measurement points), and BOTH of a host's values sit outside
+#   both of every other host's. The rest of the family moves the same way —
+#   `parent_absent` 1273 / 1265,1266 / 1290,1300 and `parent_empty`
+#   2455 / 2395,2396 / 2475,2479, again with no value shared between hosts.
+#   None of the ubuntu or windows readings is even REACHABLE on macOS: the whole
+#   411-fixture macOS corpus produces `field_pos_unresolved` in
+#   {0,158,159,161,195,196,198,199} and `field_pos_spec_checked` in {13} plus
+#   1832..1966, so 153/154 and 1749/1753 lie outside both. Recording any of it
+#   would red every host but one, on every fixture, forever.
+#
+#   ⭐ This is exactly what `_jit_stats_vacuous`' docstring already predicted for
+#   the denominator — "it counts the descr universe ... Recording a value would
+#   red every host but one" — and the same three logs show that universe itself
+#   moving underneath: `all_descrs` 5749 / 5650 / 5807, `descr_set_resolved`
+#   1617 / 1635 / 1655. The prediction was filed as an inference from a shared
+#   cause; it is now a measurement, and it covers the numerator too. Non-vacuity
+#   stays the whole claim for this family: the magnitude asserts nothing that
+#   survives a change of host.
+#
+#   ⭐ AND THE SPREAD IS NOT A SPREAD — IT IS ONE BLOCK, AND IT HAS A NAME.
+#   The eight values are two clusters with nothing between them: {158,159,161}
+#   on 252 fixtures and {195,196,198,199} on 76. The offset is exactly +37 and
+#   it maps the low cluster onto the high one term by term (158->195, 159->196,
+#   161->198; only 199 has no low counterpart). Naming the rows with
+#   `MAJIT_FIELD_POS_UNRESOLVED=1` on one fixture from each cluster and diffing:
+#   37 rows only in the high fixture, 0 only in the low one — the low set is a
+#   STRICT SUBSET — and all 37 are `W_BaseException.<field>`. For that pair
+#   `spec_checked - unresolved` is 1676 on BOTH sides, so the 37 extra specs
+#   mint and all 37 fail; not one of them resolves.
+#
+#   What those 37 rows say: each is an owner-qualified key (`W_BaseException.
+#   w_class`) searched in a six-entry parent list spelled `PyTraceback.w_class|
+#   PyTraceback.frame|...`. A different class. `caller_index` runs 0..36, their
+#   index in their own 37-field list, against `parent_fields=6`. That is #131's
+#   territory and this is the biggest single block in it.
+#
+#   STOP: Do not repeat the reading I had to withdraw: "the field owner differs
+#   from the parent list's owner" is true of 158 of 158 rows on the LOW fixture
+#   too, and it means nothing there, because most parent lists are spelled BARE
+#   (`_hints`, `ob`, `locals_cells_stack_w`) so they HAVE no readable owner.
+#   Only 47 of 195 rows have a fully owner-qualified parent list. Of those, 44
+#   name a genuinely different class and 3 are the same class under a different
+#   path spelling (`pyre_object::objectobject::W_ObjectObject` vs
+#   `W_ObjectObject`) — a separate defect that a last-path-segment comparison
+#   sees and a first-dot-segment comparison reports as a false mismatch.
+#
+#   ⇒ The counter is not a quantity wanting a ceiling. It is a fixed background
+#   plus one block that appears exactly when a fixture touches exceptions. The
+#   within-cluster spread {158,159,161} survives the +37 shift unchanged, so it
+#   is a second, independent and still unexplained axis.
+#
+#   STOP: And its zero is the vacuous kind. Every zero row sits at
+#   `field_pos_spec_checked=13`, the floor recorded below — the JIT minted
+#   almost nothing, so nothing could be unresolved. That is "not exercised"
+#   wearing the healthy value, on 83 of 411 fixtures under wasm and 62 under
+#   dynasm. Baselining those at 0 buys permanently green cells for a reason
+#   unrelated to the defect, and because the two counts differ the vacuous
+#   population is itself backend-specific. Any gate here needs a non-exercise
+#   arm — the `spec_checked` floor is the signal that says which rows it is.
+#
+#   Two obstacles remain:
+#     - it cannot borrow the "a field absent from a baseline reads as 0" trick
+#       the badness fields rely on, because its values are not 0; and
+#     - the wasm obstacle is CLEARED. All four `field_position_census` members
+#       now cross the guest boundary, so 8 of the 17 counters
+#       `field_position_jit_stats` emits reach wasm, where 4 did. (WARNING: that 17 is
+#       the field-position family; `pyre-wasm-runner` also happens to ask for
+#       exactly 17 counters in total, a different and larger population.) The
+#       exports had to come first for a reason the runner's own
+#       refusal cannot supply: that refusal fires for a name the runner ASKS
+#       for and cannot resolve, so a counter nobody asks for is invisible to
+#       it, and `_jit_stats_change` reads a field absent from a run as 0 — the
+#       healthy value. A gate added before the exports would have been
+#       vacuously green on wasm on day one and nothing would have said so.
+#   WARNING: Two earlier revisions of this note made the same mistake in different
+#   words: one claimed 158 holds "on all three backends" when the counter was
+#   not emitted on wasm at all, the next claimed fixture-invariance from three
+#   agreeing fixtures. Both were three-fixture readings of an eight-valued
+#   quantity. What the wasm export actually bought is the corpus sweep above —
+#   the number was cheap to check and nobody had checked it.
+#
+# Measured across the whole corpus — 411 fixtures x 3 backends = 1233 cells,
+# every one of which printed a `[jit-stats]` line: `field_pos_spec_checked`
+# ranges 13-1957 and is never 0 (per backend: dynasm 13-1956, cranelift
+# 13-1957, wasm 13-1936).
+#
+# STOP: Read the FLOOR, not the typical value. An earlier revision of this comment
+# cited "1822-1922" from a 16-cell sample; 208 of the 1233 cells (17%) sit
+# BELOW that floor, and the ~69-per-backend fixtures that never reach the
+# descr universe check exactly 13. "Never 0" survives that correction; the
+# margin it implied does not. A future producer that skips the census on a
+# 13-check fixture is a much smaller signal than 1900 would suggest.
+#
+# It does NOT track `loops_compiled` — `getframe_force_cancel_journal` compiles
+# 0 loops and still checks 1822 — so this is deliberately not conditioned on the
+# fixture having compiled something. Startup work, not compile work. (The
+# conjunct is also inert on this corpus: `checked == 0` never co-occurs with
+# `loops_compiled > 0`, so adding it could only weaken the gate later.)
+# ⭐ The predicate is still reachable rather than tautologically unsatisfiable:
+# 75 fixtures per backend have a healthy denominator with `loops_compiled == 0`,
+# so denominator and compilation are not the same axis.
+#
+# ✅ WASM: this pairing is safe by construction, but do NOT generalise it. Both
+# halves of THIS pair cross the guest boundary — the wasm column above is real
+# measurement, not inference.
+#
+# STOP: THIS SENTENCE USED TO SAY "only four counters do", naming
+# `field_pos_{spec,attached}_{checked,misplaced}` and listing
+# `field_pos_{parent_absent,parent_empty,rederived,unresolved}` among the
+# counters with no wasm path. It was TRUE WHEN WRITTEN and was falsified about
+# four hours later by the commit whose subject is "wasm: export the four
+# field_position_census counters and ask for them", which added exactly those
+# four exports and the runner asks for them.
+#   WARNING: That commit was `f905ce6a997` when this was written and the tree it names
+#   is gone. Its successor `2678cb00b30` is DOOMED — on HEAD, not on
+#   origin/main — so re-pointing hex to hex only restarts the clock. Look it up
+#   by the subject above.
+# The whole `field_pos_*` family — all EIGHT of them —
+# now crosses. What still does not: `positional_*` (2), `key_*` (2) and
+# `size_shell_*` (5), the other nine counters in the same emitted line. Pairing
+# any of THOSE would gate on nothing on wasm.
+#
+# ⭐ Worth keeping because of what it cost, not because of the number: this
+# sentence is the stated REASON those counters are not paired in a gate, so a
+# stale figure here does not turn a gate red — it silently keeps a gate from
+# existing, for a reason that stopped being true. Check the export list, not
+# this comment, before concluding a counter cannot be gated on wasm.
+#
+# STOP: And the runner's own refusal machinery cannot catch that class. It exits 1
+# when a counter it ASKS FOR is missing, which refuses a guest module older than
+# the runner — but an unasked-for counter is not "missing", it simply never
+# appears. The guard is complete only over the names someone remembered to write
+# down, which is the same shape as the defect it guards against. A guard against
+# WRONG entries is not a guard against MISSING ones. That is the mechanism
+# behind #18, and it is why the four exports named above were absent without
+# anything ever going red over it.
+JITSTATS_DENOMINATOR_FIELDS = {
+    "field_pos_spec_misplaced": "field_pos_spec_checked",
+}
+
 # The count-valued counters, and what a move in either direction means:
 #
 # * `guard_failures` counts every guard failure that re-enters the metainterp,
@@ -863,8 +1125,43 @@ JITSTATS_BADNESS_FIELDS = (
 #   makes the tracer stop admitting a frame at all — a widened
 #   `unsupported_jit_shape` predicate, a pre-trace decline — aborts nothing
 #   (`loops_aborted` holds) and *lowers* `guard_failures` (the compiled guards
-#   that used to fail are gone), so a fall here is the only signal that a hot
-#   loop went back to running interpreted.
+#   that used to fail are gone), so a fall here is the signal that a hot loop
+#   went back to running interpreted.
+#
+#   WARNING: It answers WHETHER something was compiled, never WHICH SHAPE, and the
+#   difference is measured rather than argued (#137). The counter is bumped once
+#   per compile and a straight-line FINISH trace is one of them, so across three
+#   cells of one sweep it read 1 for a flat cell (zero `Label`, zero `Jump`), 2
+#   for a second flat cell, and 1 for a peeled loop. A fall to zero therefore
+#   still means the frame stopped being admitted; but a frame that keeps being
+#   admitted and compiles a straight line where it used to compile a loop holds
+#   the counter exactly, and this gate cannot see that. When the question is
+#   which shape was compiled, read the `MAJIT_LOG` trace dump — `Label`/`Jump`
+#   presence separates the two directly, with no counter in between.
+#
+#   STOP: An earlier revision of this comment called that narrowing "terminal, not
+#   a TODO", on the grounds that the dump is a log and a gate reads counters so
+#   no in-process shape signal exists to adopt. That is WRONG, and the wrong
+#   half is the part that tells the next reader to stop looking. The shape is
+#   computable in-process at a backend-neutral point: `Backend::compile_loop`
+#   (majit-backend/src/lib.rs:1710) hands EVERY backend `ops: &[OpRc]`, and
+#   `OpCode::Label` / `OpCode::Jump` are majit-ir types, not backend-local ones.
+#   `majit-backend-wasm` already computes exactly this predicate over that slice
+#   for its own codegen (`is_resumable_peeled` / `resumable_label_count`,
+#   codegen.rs:4777-4800). So a shape counter is available to be built.
+#
+#   What is missing is a DECISION, not a signal — the new majit counter was
+#   declined, deliberately, and that is a different kind of boundary from an
+#   impossibility: a decision has a release condition and can be revisited,
+#   whereas "terminal" retires the question for everyone who reads this next.
+#   Until someone reverses it, the narrowing above is exactly what this row
+#   asserts, and the `MAJIT_LOG` dump remains the only instrument that answers
+#   the shape question today.
+#
+#   Judge any other reader of `loops_compiled` by the contract it states rather
+#   than by the field's name — the name says "loops", the quantity is
+#   "compiles", and a check whose own message says "nothing compiled" is
+#   already correct.
 # * `bridges_compiled` is that same signal one level down: guards that stop
 #   earning a bridge keep re-entering the metainterp forever. It was left
 #   ungated for a long time on the grounds that it "moves in both directions
@@ -893,9 +1190,18 @@ JITSTATS_BADNESS_FIELDS = (
 # against a file checked into the repo:
 #
 # * `all_descrs` and `descr_set_resolved` are HOST-DEPENDENT — the Charon/LLBC
-#   extraction runs per host, so the same commit reads `all_descrs` 1168 on
-#   macOS, 1396 on ubuntu and 1365 on windows. Committing either makes every
-#   host but one disagree.
+#   extraction runs per host, so the same commit reads a different count on
+#   each. ⭐ NOW MEASURED, one CI run (31258456255), one commit, all three hosts:
+#   `all_descrs` 5749 (ubuntu) / 5650 (windows) / 5807,5813 (macos), and
+#   `descr_set_resolved` 1617 / 1635 / 1655. Three hosts, three values, both
+#   counters — and macOS alone prints TWO `all_descrs`, so the count is not even
+#   invariant within a host. My local macOS tree reads 5797 (fixture-invariant
+#   across arith_int_bool and array_deopt_resume) — a further value, but off a
+#   different branch, so it is not part of the same-commit comparison.
+#   (The 1396 / 1365 / 1168 figures this note used to carry were flagged
+#   UNVERIFIED and are superseded; they were ~4x low, i.e. stale rather than
+#   wrong about the direction.) Committing either counter makes every host but
+#   one disagree.
 # * the `mc_diag` tallies include contention counters (`busy_skip`,
 #   `stfe_cell_busy`, `stfe_tick`) that move with machine load.
 # * `PYRE_WASM_JIT_STATS=1` adds wall-clock (`compile_ms`) and repeated
@@ -926,7 +1232,8 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain. `retraces_compiled` has the same polarity: a fall means an
+# is the gain — within the limit recorded above, that it counts compiles and not
+# loop-shaped ones. `retraces_compiled` has the same polarity: a fall means an
 # assembled retrace stopped being attached. The blackhole adoption counters are
 # inverted the same way: a fall means the interpreter stopped receiving an
 # image and went back to replay.
@@ -1003,6 +1310,46 @@ def _jit_stats_change(saved, current):
         else:
             regressions.append(f"{field} {old} -> {new}")
     return regressions, improvements
+
+
+def _jit_stats_vacuous(stderr):
+    """Return why a gated badness counter is vacuous this run, or "".
+
+    `_jit_stats_change` above reads a badness counter's 0 as "nothing is wrong".
+    That is only true while the census producing it actually ran. When it did
+    not, the counter is 0 for the opposite reason and the gate reports green on
+    an instrument that saw nothing — the same shape as the "absent from BOTH
+    sides compares equal forever" hole documented there, except that this one
+    cannot be spotted by re-recording, because the digit is identical either way.
+
+    So the denominator is read from the run and required to be non-zero. It is
+    deliberately NOT compared against a baseline: it counts the descr universe,
+    which is host-dependent for the same reason `all_descrs` is excluded from
+    `JITSTATS_SNAPSHOT_FIELDS` — see that exclusion note above rather than a
+    copy of its figures here, because a number restated in a second place
+    acquires a younger-looking citation and outlives the correction of the
+    first. Recording a value would red every host but one. Non-vacuity is the
+    whole claim — the number's magnitude asserts nothing.
+
+    STOP: This catches TOTAL loss of a census, not partial: a NEW producer that
+    mints descrs without calling `census_spec_positions` lowers the denominator
+    without zeroing it, and is invisible here. Adding a producer means adding
+    the census call; nothing enforces that.
+    """
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
+        return ""  # the caller already failed this run for the missing line
+    for numerator, denominator in JITSTATS_DENOMINATOR_FIELDS.items():
+        raw = fields.get(denominator)
+        if raw is not None and raw.isdigit() and int(raw) > 0:
+            continue
+        return (
+            f"{denominator}={raw if raw is not None else '<absent>'} — "
+            f"the census behind `{numerator}` did not run, so that counter's 0 "
+            f"means 'nothing was checked', not 'nothing is misplaced', and its "
+            f"gate passed without inspecting anything"
+        )
+    return ""
 
 
 def _jit_stats_context(current):
@@ -1374,6 +1721,12 @@ class Check:
         # baseline is a bench nobody recorded, an absent line is a bench that
         # stopped reporting.
         self.jitstats_absent = []
+        # Benches whose run printed the line, but with a badness counter's
+        # census denominator at zero — the counter's gate passed on an
+        # instrument that inspected nothing. Tracked apart from
+        # `jitstats_absent` because the line IS there and every other gate on it
+        # is still meaningful; only the paired counters are void.
+        self.jitstats_vacuous = []
 
     # ── backend helpers ──
 
@@ -1611,6 +1964,11 @@ class Check:
         #   "recorded and clean" — which is how the floor came to cover 3 of 340
         #   synthetic fixtures without anyone noticing.
         # * A counter that moved, in either direction.
+        # * A badness counter reading 0 because its census never ran, rather
+        #   than because nothing is wrong — `JITSTATS_DENOMINATOR_FIELDS`. The
+        #   other three disarms are visible as an absence (no line, no file, no
+        #   move); this one is invisible, because a disarmed census and a clean
+        #   one print the same digit.
         if self.args.snapshot_mode != "record":
             if jitstats is None:
                 self.jitstats_absent.append(f"{backend}/{name}")
@@ -1625,6 +1983,10 @@ class Check:
                     f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
                     f"`pyre/check.py --snapshot --backend {backend}`"
                 )
+            vacuous = _jit_stats_vacuous(stderr)
+            if vacuous:
+                self.jitstats_vacuous.append(f"{backend}/{name}")
+                return "fail", vacuous
             regressions, improvements = _jit_stats_change(
                 jitstats_path.read_text(encoding="utf-8"), jitstats
             )
@@ -1976,6 +2338,42 @@ class Check:
             and float(exec_b) <= EXEC_TIME_FLOOR_S
         )
 
+    def _baseline_exec_time_thin(self, baseline, baseline_time):
+        """Whether a baseline clears the floor but not the floor gate's bar.
+
+        Reporting only -- no caller of this changes a verdict.
+
+        The two directions of the ratio gate trust different amounts of
+        baseline.  The ceiling arms as soon as the baseline is anything above
+        `EXEC_TIME_FLOOR_S`; the floor declines until it reaches
+        `FLOOR_GATE_MIN_BASELINE_S`, ten times that, because execution time is a
+        difference of two measured values and a few times the floor is mostly
+        its own error.  Both readings are defensible on their own and they are
+        not consistent with each other: in the band between them the ceiling
+        judges a number the floor has already been told is too small to judge.
+        A row there prints an unmarked ratio, so it reads exactly like a
+        measurement, which is the one thing it is not.
+
+        Measured on this tree (macos arm64, pypy startup 0.0090s median-of-5,
+        3 samples per fixture, pyre binaries not involved -- clamping is a
+        property of the denominator alone): of the 338 fixtures carrying a
+        `max-pypy-ratio` header, 245 are clamped, 81 land in this band, and 12
+        clear `FLOOR_GATE_MIN_BASELINE_S`.  So ~24% of the ceilings are armed
+        on a denominator this file elsewhere declines to divide by, and only
+        ~4% sit on one both directions accept.
+
+        The band is not a defect by itself and the marker does not treat it as
+        one -- a ceiling on a thin baseline is still a lower bound worth
+        having.  It is a claim about how much a printed ratio is worth, and
+        until now nothing distinguished those rows from the 12.
+        """
+        exec_b = self._exec_time(baseline, baseline_time)
+        return (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and EXEC_TIME_FLOOR_S < float(exec_b) < FLOOR_GATE_MIN_BASELINE_S
+        )
+
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
         baseline_cmd, expected_output, baseline_key, minimum=None,
@@ -2161,7 +2559,17 @@ class Check:
             den = self._exec_time("pypy", pypy_val)
             if den in (None, "-") or float(den) <= 0 or num in (None, "-"):
                 return "-"
-            marker = "~" if self._baseline_exec_time_clamped("pypy", pypy_val) else ""
+            # Display only: neither marker reaches a verdict. `~` says no gate
+            # was applied; `?` says one was, against a baseline under the bar
+            # the floor gate uses. An unmarked ratio now means both directions
+            # of the gate accepted the denominator, which is what a reader has
+            # been entitled to assume all along.
+            if self._baseline_exec_time_clamped("pypy", pypy_val):
+                marker = "~"
+            elif self._baseline_exec_time_thin("pypy", pypy_val):
+                marker = "?"
+            else:
+                marker = ""
             return f"{marker}{float(num) / float(den):.1f}x"
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
@@ -2469,7 +2877,24 @@ class Check:
         # `N to run,` rather than the runner's own "no regressions": a
         # selection that came out empty prints every counter as zero and
         # still exits 0, which reads as a pass and tests nothing.
-        selected = re.search(r"^(\d+) to run,", output, re.M)
+        #
+        # The other two counters are read for a second reason.  Invoked
+        # without `--full`, `--update-baseline` or `--strict-baseline`,
+        # run.py sets `gate_pass_only` and deselects every module whose
+        # baseline verdict is not PASS, so this stage gates roughly half the
+        # suite and the half it declines to run is precisely the half that
+        # does not work yet -- a change aimed at a CRASH or IMPORTERROR
+        # module lands where this gate has no signal either way.  That is a
+        # property of what the stage selects, not a defect to fix here;
+        # printing the counters beside the pass is what keeps the number
+        # that ran from being read as the whole suite.  `--full` reports the
+        # rest without gating it, `--strict-baseline` gates unrecorded
+        # improvements, which is the arm that sees a fix land in the gap.
+        selected = re.search(
+            r"^(\d+) to run, (\d+) skipped(?:, (\d+) not gated \(non-PASS\))?,",
+            output,
+            re.M,
+        )
         if code == 124:
             detail = f"timeout (>{CPYTHON_SUITE_TIMEOUT_S}s)"
         elif selected is None:
@@ -2488,7 +2913,13 @@ class Check:
             self._append_comparison(backend, name, "-", "-", "FAIL")
             return
         self._record(backend, True, name, "")
-        print(f"{green('PASS')}  {selected.group(1)} modules, {elapsed:.0f}s")
+        ran, not_run, degated = (
+            selected.group(1), selected.group(2), selected.group(3) or "0",
+        )
+        print(
+            f"{green('PASS')}  {ran} gated, {degated} not gated, "
+            f"{not_run} skipped, {elapsed:.0f}s"
+        )
         self._append_comparison(backend, name, "-", "-", f"{elapsed:.0f}s")
 
     # ── synthetic parity suite ──
@@ -2666,6 +3097,14 @@ class Check:
                 "  ~ pypy exec clamped to floor; ratio is not a measurement, "
                 "and no ratio gate is applied to it"
             )
+        # Sniffing the rendered cell, like the line above: no other cell value
+        # contains a `?` (they are times, ratios, FAIL/WRONG/UNSTABLE/skip/-).
+        if any("?" in c[b] for c in self.comparisons for b in cols):
+            print(
+                "  ? pypy exec is above the floor but under "
+                "FLOOR_GATE_MIN_BASELINE_S; the ceiling is applied, the floor "
+                "gate declines the same baseline as too small to judge"
+            )
         print("  " + "─" * (54 + 19 * len(cols)))
         for c in self.comparisons:
             row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
@@ -2702,6 +3141,7 @@ class Check:
                 (yellow, "jit-stats unstable (not gated)", self.jitstats_unstable),
                 (red, "jit-stats baseline missing", self.jitstats_missing),
                 (red, "jit-stats line absent", self.jitstats_absent),
+                (red, "jit-stats census vacuous", self.jitstats_vacuous),
             ):
                 if benches:
                     print(

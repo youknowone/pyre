@@ -248,6 +248,9 @@ needs trimming to the subset that runs.
   in a form that contradicts it.
 - Check `git status` and `git rev-parse --show-toplevel` before staging to confirm correct worktree.
 - When rebasing/cherry-picking, verify the fix isn't already on main first (`git log main --grep=...`).
+- If `git commit` reports unmerged files you did not create, run `git ls-files -u`,
+  report it, and do not resolve them — resolving another agent's conflict is a
+  merge operation on their work.
 
 ## Debugging Discipline
 - When adding trace/debug logs, verify the code path is actually reached (check gating, feature flags) before running the test.

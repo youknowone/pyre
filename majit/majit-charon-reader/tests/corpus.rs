@@ -26,10 +26,18 @@ fn loads_fixture_corpus() {
     // + `option_source` and `option_question_mark` (the Option `?` fixture)
     // + `bool_then_some` (the eager `then_some` sibling, no closure).
     //
+    // + 9 for the header-first class universe: `cel_w_type`, `cel_new_int`,
+    // `cel_add`, `w_int_add`, `lltype::malloc_typed`, the fixture's
+    // `pyobject::get_instantiate`, and the initializer bodies of the three
+    // items that are declarations in the source —
+    // `CEL_INT_CLASS`, `CEL_DOUBLE_CLASS` and the
+    // `_immutable_fields_W_IntObject` marker. A `static`/`const` carries its
+    // initializer as a function body, so it lands in `iter_local_fns` too.
+    //
     // + 2 for the host-registered callback table: `host_registry_dispatch`
     // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,
     // not an item, so it contributes no body.
-    assert_eq!(local_count, 14, "14 local fns expected");
+    assert_eq!(local_count, 23, "23 local fns expected");
 }
 
 #[test]

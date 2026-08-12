@@ -2590,12 +2590,57 @@ mod tests {
         );
     }
 
+    /// STOP: AN INJECTABLE `CheckpointRuntime` IS NOT A SUFFICIENT RE-ENABLE
+    /// CONDITION, and this is the doc both ignored tests point at.
+    ///
+    /// Under `auto='run'` the token is consumed on the first pass, the inner
+    /// loop breaks and `runtime.fork()` decides everything after it — so on
+    /// that route an injected non-forking runtime does cut the hazard, and
+    /// `read_line` is never called.
+    ///
+    /// It does not cut the other route. `restartable_point` selects
+    /// `restartable_point_nofork` under `cfg(windows)`, and that entry
+    /// forwards `None` as its `auto` argument: the caller's `Some("run")` is
+    /// parked in `NoForkRuntime`'s `_ignored_auto`, a field written once and
+    /// read nowhere (upstream discards it the same way at
+    /// `unixcheckpoint.py:69-73`). With no token the prompt loop calls
+    /// `read_line` on iteration 1 — *before* `runtime.fork()` is consulted at
+    /// all — so the `P: CheckpointRuntime` seam sits downstream of the read
+    /// that spins and cannot reach it. A source already at EOF returns
+    /// `Ok(0)` there forever, emitting two lines per iteration, bounded only
+    /// by the sink's capacity.
+    ///
+    /// Re-enabling therefore needs an injectable source and sink as well as
+    /// an injectable runtime. `restartable_point_fork_with` already takes
+    /// `R: BufRead` / `W: Write`; the three public entries bind
+    /// `io::stdin().lock()` / `io::stdout().lock()` internally and expose no
+    /// seam.
+    ///
+    /// WARNING: The second route is READ FROM SOURCE AND UNMEASURED: it is compiled
+    /// out wherever the first one is selected, and whether a non-interactive
+    /// source reports EOF or blocks there is unknown. Both outcomes —
+    /// unbounded output, or an indefinite hang — are failures, which is why
+    /// the fence holds either way.
+    ///
+    /// WARNING: THE DISCARDED `auto` HAS NO TEST COVERAGE. All five tests beside
+    /// `restartable_point_fork_with` call it directly, including
+    /// `nofork_returns_after_run_or_cont`, which is named for the nofork
+    /// entry and passes `Some("run")` itself rather than going through
+    /// `restartable_point_nofork`. Nothing anywhere exercises the discard.
+    ///
+    /// WARNING: An earlier form of this reason claimed the contract "is exercised by
+    /// `pyre/check.py`". Searching that script for `restartable_point`,
+    /// `unixcheckpoint` and `fork_before` matches nothing, and `fork_before`
+    /// is set nowhere in the tree, so the claim is unsupported; it is dropped
+    /// rather than restated, since check.py invokes binaries and it was never
+    /// traced transitively.
     #[test]
     #[ignore = "task_jittest_lltype calls the real `restartable_point(auto='run')`, \
-                which now matches upstream `unixcheckpoint.py:13-16` (skip prompt) and \
+                which matches upstream `unixcheckpoint.py:13-16` (skip prompt) and \
                 falls through to `RealRuntime::fork`, forking the test runner. \
-                Re-enable once the driver accepts an injectable CheckpointRuntime; \
-                in production the contract still holds and is exercised by `pyre/check.py`."]
+                Re-enable once the driver accepts an injectable source and sink \
+                as well as an injectable CheckpointRuntime — see this test's doc \
+                comment for why a runtime seam alone does not cut the prompt loop."]
     fn task_jittest_lltype_calls_unixcheckpoint_first() {
         // Upstream `:371-372`: `unixcheckpoint.restartable_point(auto='run')`
         // runs *before* the jittest module is imported. The local port
@@ -2750,11 +2795,19 @@ mod tests {
     /// Rust `restartable_point` matches upstream `unixcheckpoint.py:13-16`
     /// (skip prompt under `auto='run'`, then fall through to
     /// `RealRuntime::fork`), this test would fork the test runner.
-    /// Re-enable once the driver accepts an injectable runtime.
+    ///
+    /// STOP: Re-enabling needs an injectable source and sink as well as an
+    /// injectable runtime, for the reason written out on
+    /// `task_jittest_lltype_calls_unixcheckpoint_first`: on the route where
+    /// `restartable_point_nofork` discards `auto`, the prompt loop reads
+    /// before `runtime.fork()` is consulted, so a runtime seam is downstream
+    /// of the read and cannot cut it.
     #[test]
     #[ignore = "_event 'pre' calls the real `restartable_point(auto='run')`, which \
-                now follows upstream and would fork the test runner. \
-                Re-enable when the driver accepts an injectable CheckpointRuntime."]
+                follows upstream and would fork the test runner. \
+                Re-enable when the driver accepts an injectable source and sink \
+                as well as an injectable CheckpointRuntime — see \
+                task_jittest_lltype_calls_unixcheckpoint_first's doc comment."]
     fn event_pre_fork_before_matching_goal_propagates_unixcheckpoint_error() {
         // `fork_before` is a `ChoiceOption` per `translationoption.rs:399-414`
         // (upstream `translationoption.py:146-150`); the raw value is

@@ -139,6 +139,8 @@ mod tests {
         }
     }
 
+    /// The `code: str` green this case used to carry was removed with the #146
+    /// refusal; `ref` / `int` coverage is unchanged.
     #[test]
     fn typed_specs_carry_their_tags() {
         let specs = parse_specs("[pc, env: ref, val: int]").unwrap();

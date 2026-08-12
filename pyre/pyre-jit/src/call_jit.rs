@@ -3100,7 +3100,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// Derive the (`green_key`, `trace_id`, `fail_index`) bridge-source identity
 /// strictly from the failing guard's descr Arc.
 ///
-/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr, deadframe)`
+/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr, deadframe)`
 /// reads identity from `resumedescr` directly: `resumedescr.rd_loop_token
 /// .loop_token_wref()` (line 2897) yields the owning `JitCellToken`,
 /// `resumedescr.get_resumestorage()` (line 2893) yields the `ResumeGuardDescr`
@@ -3130,7 +3130,7 @@ pub(crate) fn bridge_source_identity_from_descr(
 
 /// Outcome of `trace_and_compile_from_bridge`.
 ///
-/// `pyjitpl.py:2884 handle_guard_failure` never returns — it raises
+/// `pyjitpl.py:2914 handle_guard_failure` never returns — it raises
 /// `ContinueRunningNormally` (bridge attached, resume in compiled code),
 /// switches to the blackhole, or raises `DoneWithThisFrame` when
 /// `interpret()` runs the resumed frames forward to a `Finish`.  Pyre
@@ -3169,7 +3169,7 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 /// Traces the alternative path from the guard failure point and compiles
 /// a bridge.
 ///
-/// pyjitpl.py:2884 handle_guard_failure:
+/// pyjitpl.py:2914 handle_guard_failure:
 ///   initialize_state_from_guard_failure(resumedescr, deadframe)
 ///   prepare_resume_from_failure(deadframe, inputargs, resumedescr, excdata)
 ///   self.interpret()
@@ -3194,7 +3194,7 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
 pub fn trace_and_compile_from_bridge(
-    // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+    // pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
     // threads `resumedescr` (the descr) as the canonical identity source
     // through the entire bridge tracer.  Pyre's backend FailDescr Arc
     // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
@@ -3257,7 +3257,7 @@ pub fn trace_and_compile_from_bridge(
         info
     };
 
-    // pyjitpl.py:2890-2911 handle_guard_failure parity:
+    // pyjitpl.py:2914-2935 handle_guard_failure parity:
     // RPython creates a fresh MetaInterp and calls
     // initialize_state_from_guard_failure(resumedescr, deadframe)
     // which internally calls rebuild_from_resumedata (resume.py:1042).
@@ -3881,7 +3881,7 @@ pub fn trace_and_compile_from_bridge(
 /// Checks must_compile (jitcounter.tick), and if threshold reached,
 /// traces the alternate path via trace_and_compile_from_bridge.
 ///
-/// pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+/// pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
 /// — descr identity is the only argument crossing the C-ABI boundary;
 /// the receiver derives `(green_key, trace_id, fail_index)` from the
 /// recovered Arc, mirroring `compile.py:706-708 _trace_and_compile_
@@ -3895,7 +3895,7 @@ fn jit_ca_handle_guard_failure(
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
     }
-    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2890 — RPython's
+    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
     // `handle_guard_failure` unwinds to the top-level `execute_token` before any
     // tracing decision, so a guard never fires while another trace is open).
     // pyre's CALL_ASSEMBLER guard callback runs synchronously from the backend
@@ -7037,7 +7037,19 @@ pub fn cranelift_resumedata_deopt(
     _bridge_num_inputs: usize,
 ) -> bool {
     use majit_backend::Backend;
+    // `rd_loop_token_clt` — the descr → owning-driver chain step 2b walks.
+    use majit_ir::FailDescr;
     use majit_metainterp::resume;
+
+    // Entry counter, paired with the hand-off counter further down. Four early
+    // returns sit between them, so a zero at the hand-off alone cannot say
+    // whether this callback is never invoked or invoked and always bailing.
+    if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ENTRIES: AtomicU64 = AtomicU64::new(0);
+        let n = ENTRIES.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[deopt-probe] entry #{n} descr_addr={descr_addr:#x}");
+    }
 
     // 1. Recover descr Arc.
     let (driver, driver_vinfo) = crate::eval::driver_pair();
@@ -7054,6 +7066,43 @@ pub fn cranelift_resumedata_deopt(
     };
     let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
         return false;
+    };
+
+    // 2b. Derive whether the owning driver is novable, instead of taking it as
+    //     a parameter.  `blackhole_resume_via_rd_numb` is handed this by each
+    //     of its five call sites; this callback is invoked through a backend
+    //     registration with no such caller to ask, and a sixth hand-threaded
+    //     literal would be one more place for the two to drift.
+    //     `compile.py:168` records the owning driver on the JitCellToken, so
+    //     descr → clt → token → slot index answers it from the guard alone.
+    //
+    //     A driver with no `virtualizable_info` emits resume data with no
+    //     vable section, so handing `consume_vable_info` a vinfo for one of
+    //     those decodes `vable_size = 0` and trips its `assert!(vable_size
+    //     > 0)`.  The blackhole twin makes exactly this distinction; this is
+    //     the same guard on the deopt side.
+    //
+    //     WARNING: Unexercised.  Measured 0 entries to this function across six
+    //     `pyre/bench` workloads which between them compiled 11 traces and
+    //     took 2263 guard failures, so no behavioural test covers the choice
+    //     below — it rests on this derivation being equivalent to the literal
+    //     the blackhole path is handed.
+    let novable = match rgd
+        .rd_loop_token_clt()
+        .and_then(|clt_any| {
+            clt_any.downcast_ref::<std::sync::Arc<majit_backend::CompiledLoopToken>>()
+        })
+        .and_then(|clt| clt.upgrade_loop_token())
+        .and_then(|token| token.outermost_jitdriver_index)
+        .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+    {
+        Some(has_vinfo) => !has_vinfo,
+        // No owning driver recoverable — a synthetic descr, an evicted token,
+        // or a slot the staticdata no longer holds.  Decline rather than
+        // guess: either default is wrong for one driver kind, and the
+        // `recovery_layout` walker this `false` selects is already the path
+        // every guard failure takes today.
+        None => return false,
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
@@ -7100,7 +7149,25 @@ pub fn cranelift_resumedata_deopt(
     reader.prepare(rd_virtuals_slice, rd_pendingfields);
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
-    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None, None);
+    // Counts the hand-off below, paired with the entry counter at the top.
+    // `novable` is derived at step 2b, so the two counters together also say
+    // how many guards reached the vable decision at all versus bailing at one
+    // of the four early returns between them.
+    if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[deopt-probe] cranelift vinfo hand-off #{n} descr_addr={descr_addr:#x} novable={novable}"
+        );
+    }
+    // Mirrors `blackhole_resume_via_rd_numb`'s `vinfo_arg`: a novable driver's
+    // resume data has no vable section, so pass no vinfo and the decoder skips
+    // `consume_vable_info` entirely rather than decoding `vable_size = 0` into
+    // its `assert!(vable_size > 0)`.
+    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
+        if novable { None } else { Some(vinfo_dyn) };
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), vinfo_arg, None, None);
 
     // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
     //    blackhole_resume_via_rd_numb's resolve_jitcode (line 1891),

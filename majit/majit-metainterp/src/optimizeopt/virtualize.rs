@@ -235,13 +235,19 @@ impl VirtualizableTracker {
         };
         // Input-layout seeding applies only to the initial loop/preamble entry
         // (`inputarg_base == 0`), whose inputargs carry the
-        // `[frame, vable_scalars..., array_items...]` layout. A bridge
-        // (`inputarg_base > 0`) inherits only the failing guard's live boxes as
-        // inputargs (frame first, then the surviving reds), NOT the unpacked
-        // vable scalar/array slots; it re-establishes the virtualizable fields
-        // from the explicit SetfieldGc/SetarrayitemGc reconstruction ops the
-        // resume path records into the bridge body. So the bridge frame is
-        // seeded as an empty Virtualizable and populated by those ops.
+        // `[frame, vable_scalars..., array_items...]` layout. The gate is the
+        // BASE and not `building_bridge` because the seeding below addresses
+        // slots with UNSHIFTED raw indices (`input_arg_typed(flat_input_idx)`),
+        // which name this run's inputargs only when the base is 0.
+        //
+        // A bridge inherits only the failing guard's live boxes as inputargs
+        // (frame first, then the surviving reds), NOT the unpacked vable
+        // scalar/array slots; it re-establishes the virtualizable fields from
+        // the explicit SetfieldGc/SetarrayitemGc reconstruction ops the resume
+        // path records into the bridge body. So the bridge frame is seeded as
+        // an empty Virtualizable and populated by those ops. An unrolled
+        // Phase 2 body is also shifted and also skips the seeding, but keeps
+        // the resolved identity slot — see `identity_input_ref`.
         let base = ctx.inputarg_base;
         if base == 0 {
             let mut flat_input_idx = 1usize + self.config.vable_input_offset;

@@ -22,6 +22,15 @@ name = "pyre-dynasm"
 path = "src/bin/pyre-dynasm.rs"
 required-features = ["dynasm"]
 
+# Allocation-site census. Declared rather than left to auto-discovery so that
+# what `--all-targets` builds is visible here; it carries no `required-features`
+# because nothing in it is feature-gated, and its own `#[global_allocator]` does
+# not collide with `mimalloc` (that one is declared in the bin targets above,
+# not in `lib.rs`, and an example links the library).
+[[example]]
+name = "allocsites"
+path = "examples/allocsites.rs"
+
 [features]
 default = ["dynasm", "mimalloc"]
 jit = []  # meta feature: enabled by cranelift or dynasm

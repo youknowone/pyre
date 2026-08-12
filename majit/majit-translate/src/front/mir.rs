@@ -1049,9 +1049,11 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     );
     // Coverage gate. Every `skipped` entry is a function whose MIR shape
     // the driver could not lower — already after the reverse-postorder
-    // retry in `lower_fun_decl`. The single known, tracked gap is an
-    // "uninitialised local read" that even RPO could not bind (a genuine
-    // loop-carried def — none in the current snapshot); such a function
+    // retry in `lower_fun_decl`. The tracked gaps are exactly the shapes
+    // `is_known_lowering_gap` recognises; its arms are the only statement
+    // of that set that cannot go stale. (One of them, an "uninitialised
+    // local read" that even RPO could not bind, needs a genuine
+    // loop-carried def — none in the current snapshot.) Such a function
     // would degrade the program by being dropped to a residual call,
     // never a correctness loss. Any *other* lowering failure likewise
     // degrades to a residual call — matching `exceptiontransform.py:212`,
@@ -1068,8 +1070,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .partition(|(_, msg)| is_known_lowering_gap(msg));
         if std::env::var("PYRE_MIR_FRONTEND_DEBUG").is_ok() && !tracked.is_empty() {
             eprintln!(
-                "[mir-frontend] {} function(s) skipped via the tracked \
-                 uninitialised-local gap:",
+                "[mir-frontend] {} function(s) skipped via a shape \
+                 `is_known_lowering_gap` recognises — the per-function \
+                 message below names which one; all degrade to a \
+                 residual call:",
                 tracked.len()
             );
             for (name, msg) in tracked.iter().take(20) {

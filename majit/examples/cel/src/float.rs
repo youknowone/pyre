@@ -37,6 +37,13 @@ const R4: usize = 5;
 const R5: usize = 6;
 const R6: usize = 7;
 const NUM_REGS: usize = 8;
+/// Result slot, one register past the program's own file. The `; state` merge
+/// point can leave the dispatch loop with `pc` still at the walk-segment start,
+/// so the result has to come out of `state` after the loop rather than off
+/// `program[pc + 1]`. It rides the virtualizable bank because a `ret: float`
+/// state field is rejected outright ("state_fields float scalars are not
+/// supported with recursive portal fresh allocation yet").
+const RET: usize = NUM_REGS;
 
 const BODY_PC: usize = 0;
 
@@ -76,7 +83,7 @@ fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) ->
         n,
         base_a,
         base_b,
-        regs: vec![0.0; NUM_REGS],
+        regs: vec![0.0; NUM_REGS + 1],
     };
 
     {
@@ -87,7 +94,7 @@ fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) ->
     }
 
     loop {
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         match opcode {
             OP_LOAD_A => {
@@ -136,10 +143,23 @@ fn mainloop(program: &Code, base_a: i64, base_b: i64, n: i64, threshold: u32) ->
                 }
                 pc += 2;
             }
-            OP_RETURN => return state.regs[program[pc + 1] as usize],
+            // Stores into `RET` and then leaves through an in-arm `return`, never
+            // `{ store; break }`: `classify.rs` `is_break_expr` requires the arm
+            // body to be exactly `break`, so a composite body classifies
+            // `Lowerable` and its tail `break` reaches `lower_stmt_fallback`,
+            // which guards an enclosed `return` but not an enclosed `break` —
+            // the statement is inert and is silently dropped, leaving the
+            // lowered arm to fall through to the dispatch back-edge.
+            OP_RETURN => {
+                state.regs[RET] = state.regs[program[pc + 1] as usize];
+                return state.regs[RET];
+            }
             _ => panic!("bad opcode {opcode}"),
         }
     }
+    // Reached only when the merge point broke out on a walk that already ran the
+    // terminal opcode, so the result is whatever that opcode parked in `RET`.
+    state.regs[RET]
 }
 
 /// Clean interpreter of the identical bytecode — the honest per-op non-JIT
@@ -251,7 +271,7 @@ mod count {
         }
 
         loop {
-            jit_merge_point!();
+            jit_merge_point!(driver, program, pc; state);
             let opcode = program[pc];
             match opcode {
                 OP_COUNT_GE => {
@@ -274,10 +294,14 @@ mod count {
                     }
                     pc += 2;
                 }
-                OP_RETURN_COUNT => return state.count,
+                // The `; state` merge point can leave the loop with `pc` still at
+                // the walk-segment start, so the result has to come out of
+                // `state` after the loop rather than off `program[pc + ..]`.
+                OP_RETURN_COUNT => break,
                 _ => panic!("bad opcode {opcode}"),
             }
         }
+        state.count
     }
 
     fn clean_interp_count(program: &Code, base_a: i64, base_b: i64, n: i64) -> i64 {
@@ -331,7 +355,7 @@ mod count {
         assert_eq!(clean, off, "{label}: clean vs JIT-off count");
         assert_eq!(clean, on, "{label}: clean vs JIT-on count");
         assert_eq!(off_c, 0, "{label}: JIT-off must not compile");
-        assert!(on_c >= 1, "{label}: JIT-on must compile at least one trace");
+        assert_eq!(on_c, 1, "{label}: JIT-on must compile exactly one trace");
         println!("[{label} n={n}] count={on} compiles off={off_c} on={on_c} aborts on={on_a}");
         on
     }
@@ -383,12 +407,12 @@ mod twobank {
     const R_I: usize = 0;
     const R_ACC: usize = 1;
     const R_N: usize = 2;
-    const R_ONE: usize = 3;
+    pub(super) const R_ONE: usize = 3;
     const R_STRIDE: usize = 4;
     const R_EA: usize = 5;
     const R_BASE_A: usize = 6;
     const R_BASE_B: usize = 7;
-    const R_BOOL: usize = 8;
+    pub(super) const R_BOOL: usize = 8;
     const NUM_INT: usize = 9;
 
     const F_A: usize = 0;
@@ -400,6 +424,16 @@ mod twobank {
     struct TwoBankState {
         regs: Vec<i64>,
         fregs: Vec<f64>,
+        /// What `OP_RETURN` hands back.
+        ///
+        /// The `; state` merge point leaves the loop through `break` before it
+        /// assigns the walk's resume pc, so after the loop `pc` still names the
+        /// position the walk started from and `program[pc + 1]` — the operand
+        /// saying which register holds the result — cannot be read there. An
+        /// `int` scalar is the direct carrier; it is only available since the
+        /// `VirtualizableConfig::identity_input_index` fix, before which a
+        /// scalar declared beside a `[.. ; virt]` array aborted every trace.
+        ret: i64,
     }
 
     #[majit_macros::jit_interp(
@@ -409,6 +443,7 @@ mod twobank {
         state_fields = {
             regs: [int; virt],
             fregs: [float; virt],
+            ret: int,
         },
     )]
     fn mainloop_twobank(program: &Code, threshold: u32) -> i64 {
@@ -425,6 +460,7 @@ mod twobank {
         let mut state = TwoBankState {
             regs: vec![0; NUM_INT],
             fregs: vec![0.0; NUM_FLOAT],
+            ret: 0,
         };
 
         {
@@ -435,7 +471,11 @@ mod twobank {
         }
 
         loop {
-            jit_merge_point!();
+            // `; state` selects the single-executor close: the walk's final
+            // state is transferred into `state` here and the native loop resumes
+            // at the close pc, instead of discarding the walk outcome and
+            // re-running the circuit the walk already executed.
+            jit_merge_point!(driver, program, pc; state);
             let opcode = program[pc];
             match opcode {
                 OP_LOAD => {
@@ -483,10 +523,24 @@ mod twobank {
                     }
                     pc += 4;
                 }
-                OP_RETURN => return state.regs[program[pc + 1] as usize],
+                // Stores into `ret` and then leaves through an in-arm `return`,
+                // never `{ store; break }`: `classify.rs` `is_break_expr`
+                // requires the arm body to be exactly `break`, so a composite
+                // body classifies `Lowerable` and its tail `break` reaches
+                // `lower_stmt_fallback`, which guards an enclosed `return` but
+                // not an enclosed `break` — the statement is inert and is
+                // silently dropped, leaving the lowered arm to fall through to
+                // the dispatch back-edge.
+                OP_RETURN => {
+                    state.ret = state.regs[program[pc + 1] as usize];
+                    return state.ret;
+                }
                 _ => panic!("bad opcode {opcode}"),
             }
         }
+        // Reached only when the merge point broke out on a walk that already ran
+        // the terminal opcode, so the result is whatever it parked in `ret`.
+        state.ret
     }
 
     fn clean_twobank(program: &Code) -> i64 {
@@ -536,7 +590,20 @@ mod twobank {
     }
 
     // count rows where a[i] >= b[i]
-    fn program(n: i64, base_a: i64, base_b: i64) -> Vec<i64> {
+    /// The counting program, over `accumuland`.
+    ///
+    /// `R_BOOL` is the flagship shape (`acc += a[i] >= b[i]`). `R_ONE` counts
+    /// EVERY row instead, and that variant is not a stylistic alternative — it
+    /// is the only version of this gate that can see a duplicated iteration.
+    /// With `R_BOOL` the answer only moves if the duplicated row's predicate is
+    /// true, and the row a threshold-8 trace duplicates is always around row 9,
+    /// whose predicate happens to be false on these columns: a real +1-iteration
+    /// miscompile was measured here reporting `count=99821` at n=200000 and
+    /// `count=99828` at n=200017 — matching the clean interpreter at both
+    /// lengths, gate green, while actually running one extra row. Comparing
+    /// against a clean oracle does not rescue a value that is blind to the
+    /// defect; the accumulator has to move on every row.
+    fn program(n: i64, base_a: i64, base_b: i64, accumuland: usize) -> Vec<i64> {
         let mut p = vec![
             OP_LOAD,
             0,
@@ -580,7 +647,7 @@ mod twobank {
             R_BOOL as i64,
             OP_ADD,
             R_ACC as i64,
-            R_BOOL as i64,
+            accumuland as i64,
             R_ACC as i64,
             OP_ADD,
             R_I as i64,
@@ -596,10 +663,16 @@ mod twobank {
         p
     }
 
-    pub(super) fn run_gate(label: &str, n: i64, col_a: &[f64], col_b: &[f64]) -> i64 {
+    pub(super) fn run_gate(
+        label: &str,
+        n: i64,
+        col_a: &[f64],
+        col_b: &[f64],
+        accumuland: usize,
+    ) -> i64 {
         let base_a = col_a.as_ptr() as i64;
         let base_b = col_b.as_ptr() as i64;
-        let prog = program(n, base_a, base_b);
+        let prog = program(n, base_a, base_b, accumuland);
 
         COMPILES.store(0, Ordering::Relaxed);
         ABORTS.store(0, Ordering::Relaxed);
@@ -617,7 +690,7 @@ mod twobank {
         assert_eq!(clean, off, "{label}: clean vs JIT-off");
         assert_eq!(clean, on, "{label}: clean vs JIT-on");
         assert_eq!(off_c, 0, "{label}: JIT-off must not compile");
-        assert!(on_c >= 1, "{label}: JIT-on must compile at least one trace");
+        assert_eq!(on_c, 1, "{label}: JIT-on must compile exactly one trace");
         println!(
             "[twobank {label} n={n}] count={on} compiles off={off_c} on={on_c} aborts on={on_a}"
         );
@@ -631,7 +704,7 @@ mod twobank {
             .unwrap_or(1_000_000);
         let base_a = col_a.as_ptr() as i64;
         let base_b = col_b.as_ptr() as i64;
-        let prog = program(n, base_a, base_b);
+        let prog = program(n, base_a, base_b, R_BOOL);
         let mut clean = Vec::new();
         let mut jit = Vec::new();
         for _ in 0..5 {
@@ -763,7 +836,7 @@ fn run_gate(label: &str, prog: &Code, n: i64, col_a: &[f64], col_b: &[f64]) -> f
     assert_eq!(clean.to_bits(), off.to_bits(), "{label}: clean vs JIT-off");
     assert_eq!(clean.to_bits(), on.to_bits(), "{label}: clean vs JIT-on");
     assert_eq!(off_c, 0, "{label}: JIT-off must not compile");
-    assert!(on_c >= 1, "{label}: JIT-on must compile at least one trace");
+    assert_eq!(on_c, 1, "{label}: JIT-on must compile exactly one trace");
     println!(
         "[{label} n={n}] bits={:#018x} value={on:.17e} compiles off={off_c} on={on_c} aborts off={off_a} on={on_a}",
         on.to_bits()
@@ -800,10 +873,29 @@ fn perf_probe(label: &str, prog: &Code, col_a: &[f64], col_b: &[f64]) {
     );
 }
 
-pub fn run() {
-    let max_n = 1_100_000usize;
-    let col_a = make_col(max_n, 0x2545_F491_4F6C_DD1D);
-    let col_b = make_col(max_n, 0x9E37_79B9_7F4A_7C15);
+/// The two columns, `n` rows each. `make_col`'s LCG runs from a fixed seed, so a
+/// short column is a prefix of a long one and a gate reads the same values
+/// whatever length was allocated for it.
+fn make_cols(n: usize) -> (Vec<f64>, Vec<f64>) {
+    (
+        make_col(n, 0x2545_F491_4F6C_DD1D),
+        make_col(n, 0x9E37_79B9_7F4A_7C15),
+    )
+}
+
+/// The longest column any gate below reads.
+const GATE_MAX_N: usize = 200_017;
+
+/// Every gate in this probe and none of the timing. Allocates its own columns at
+/// the gate row count rather than the perf probes' 1.1M rows.
+///
+/// The `on_c >= 1` inside each `run_gate` says a trace was minted for that loop.
+/// It does not say the trace has a real body — an empty dispatch still compiles
+/// one whose whole optimized body is `Finish()` — so that half is tier liveness
+/// only. The absolute trip-count assertions are a separate property (they catch
+/// a loop that ran the wrong number of rows) and do not certify the body either.
+pub(crate) fn run_gates() {
+    let (col_a, col_b) = make_cols(GATE_MAX_N);
 
     // Bit-exact correctness gate on every program, plus a guard-resume length
     // variant (steady-state accumulate never hits a float resume otherwise).
@@ -829,16 +921,53 @@ pub fn run() {
         count_primary, count_resume,
         "count: guard-resume variant should use a distinct length"
     );
+    // The same loop with an absolute assertion on the trip count. `count` above
+    // accumulates a predicate, so a duplicated iteration only moves it when that
+    // row's `a[i] >= b[i]` happens to hold — and the duplicated row is always the
+    // one the trace closes on, so the gate can agree with the clean oracle while
+    // the loop runs an extra row. Passing one column as BOTH operands makes the
+    // predicate true for every row, which turns `count` into the trip count and
+    // makes that extra row visible.
+    for n in [200_000i64, 200_017] {
+        let rows = count::run_gate_count(&format!("count-rows n={n}"), n, &col_a, &col_a);
+        assert_eq!(
+            rows, n,
+            "count: the loop ran {rows} rows for n={n} — one extra iteration is \
+             the signature of a terminal arm whose `break` was dropped"
+        );
+    }
 
+    // Two-bank de-risk: int virt-array + float virt-array in one state.
+    let tb_primary = twobank::run_gate("count-ge", 200_000, &col_a, &col_b, twobank::R_BOOL);
+    let tb_resume = twobank::run_gate("count-ge-resume", 200_017, &col_a, &col_b, twobank::R_BOOL);
+    assert_ne!(tb_primary, tb_resume, "twobank: distinct lengths");
+    // The same loop with an every-row accumulator, and an absolute assertion on
+    // the trip count rather than only agreement with the clean interpreter. The
+    // gate above compares against a clean oracle and still cannot see a
+    // duplicated iteration (see `twobank::program`); this one can, because a
+    // trip count is the thing being asserted.
+    for n in [200_000i64, 200_017] {
+        let rows = twobank::run_gate(&format!("rows n={n}"), n, &col_a, &col_b, twobank::R_ONE);
+        assert_eq!(
+            rows, n,
+            "twobank: the loop ran {rows} rows for n={n} — one extra iteration \
+             is the signature of a terminal arm whose `break` was dropped"
+        );
+    }
+
+    black_box(col_a);
+    black_box(col_b);
+}
+
+pub fn run() {
+    run_gates();
+
+    let max_n = 1_100_000usize;
+    let (col_a, col_b) = make_cols(max_n);
     perf_probe("acc", &acc_program(), &col_a, &col_b);
     perf_probe("dot", &dot_program(), &col_a, &col_b);
     perf_probe("compute", &compute_program(), &col_a, &col_b);
     count::perf_probe_count(&col_a, &col_b);
-
-    // Two-bank de-risk: int virt-array + float virt-array in one state.
-    let tb_primary = twobank::run_gate("count-ge", 200_000, &col_a, &col_b);
-    let tb_resume = twobank::run_gate("count-ge-resume", 200_017, &col_a, &col_b);
-    assert_ne!(tb_primary, tb_resume, "twobank: distinct lengths");
     twobank::perf_probe(&col_a, &col_b);
 
     black_box(col_a);

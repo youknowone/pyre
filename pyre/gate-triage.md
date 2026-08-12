@@ -26,6 +26,140 @@ default-ON gate that was safely retirable then; §1c records readers deleted by
 closed epics after the original audit, including the six gates retired on
 2026-08-12.
 
+## Conventions
+
+Two rules for reading this file are stated in §6 and are not restated here:
+**spell every name in full at least once**, and **a retirement row documents
+nothing, wherever it sits**. §6 also records why an example there carries no
+name — naming a gate in a live section *enters it in the census*, so a name
+written outside a history section needs a live read site or the second brake
+fails. Four more rules follow.
+
+### A sha in this file is an annotation; the subject beside it is the citation
+
+Rows here cite two different kinds of commit and they have different lifetimes.
+An **upstream PR sha** (`git merge-base --is-ancestor <sha> origin/main` RC=0) is
+permanent. A **branch-local sha is not**: it is rewritten by the next rebase, and
+`git cat-file -e` and `git show` keep succeeding afterwards, so "the sha still
+resolves" is not a check. Find a commit by its subject instead:
+
+    git log --format=%h -1 --fixed-strings --grep='<the subject on the row>'
+
+Prefer citing the upstream PR. When a branch commit was squash-merged, the PR
+sha is the durable name for it and the branch sha names nothing — say so on the
+row rather than listing both as if they were two commits. The three-class test
+(DURABLE / DOOMED / DEAD) is written out once, in `majit/gate-triage.md`.
+
+### A number in a heading is one of three things, and only one is checkable
+
+1. **A membership count** — it counts what its own section contains, so it is
+   derivable from the section and a brake may enforce it. There are seven:
+   §1 (5), §1b (4), §1c (11), §2 (12), §3 (13), §6a (4), §6b (11).
+2. **A dated measurement** — §6's *66* is a reading of the tree on 2026-08-07
+   (the table under that heading gives the whole census), and §1e's *339 files*
+   is another. Preserved in place per N7. ⛔ **Never brake-enforce one**:
+   re-keying it overwrites a dated reading with a present-day one and destroys
+   the only record of what the audit found. Today's subsection total is 69, and
+   that is not evidence the 66 is wrong.
+3. **A soft count** — the Headline's *~119* / *~20* and §5's *~34* are
+   approximate by intent; the `~` is the marker. Also never enforceable.
+
+### Member vs mention: a member is a name in its entry's KEY POSITION
+
+Prose is excluded everywhere. A key position may hold more than one name — §4's
+first row keys on two — so the unit is the *name in the position*, not the row.
+The position is fixed by each section's own shape, and the shapes differ:
+
+| shape | sections | a member is a name |
+|---|---|---|
+| table | §1, §1b, §1c, §1d, §3, §4, §6a, §6d, §7 | in the **first cell** of a body row |
+| labelled bullets | §2 | **before** the em dash of a top-level `-` item |
+| labelled bullets | §5 | **after** the em dash, following the bold label |
+| name list | §6b, §6c | inside the **terminal comma-separated list block** |
+
+⛔ §2 and §5 read in opposite directions, so "bullet section" is not a rule.
+⛔ For a list section the rule is the *block*, not "every backticked name in the
+section": §6b happens to read the same either way — its body is nothing but the
+list — and §6c is the case that separates them, since its prose names
+`PYRE_LLBC_STRICT`, which moved to §6d and is not a member.
+
+⭐ This distinction is not a convenience imposed on the file; the file already
+draws it, in place. Every non-member name inside a count-bearing section is
+disclaimed **in the very cell that contains it**: §2's `PYRE_JIT` ("the env var
+is `PYRE_JIT`" — i.e. precisely not one of §2's non-gates), §6a's `PYRE_NO_JD1`
+(an off-switch spelling inside `PYRE_JD1`'s own row), §1c's
+`PYRE_PROBE_AUTHORITATIVE` ("is separate and remains live") and, in the same
+section, the rec-unroll successor knob ("was never listed here"). A
+name-counting instrument calls all four drifted. One did, reporting *5 of 7
+headings drifted*; that result is an artefact of having no membership rule and
+is void.
+
+⚠ Measured 2026-08-11 under the rule above, by enumerating each section's
+members rather than totalling names: **all seven membership counts are correct**
+— 5, 4, 11, 12, 13, 4, 11. That is a snapshot, not a property. §6c's own literal
+went 51 → 53 → 52 in three days and was then deleted rather than re-keyed
+(`ecf55a993ad` — re-pointed 2026-08-11, DOOMED; subject: "gate-triage: move
+PYRE_LLBC_STRICT to its own section and state 6c's criterion"), and §6c stands
+at 53 members today. A count literal is
+maintenance debt whether or not a brake watches it, and deleting it with the
+reason recorded — what §6c did — stays available for the other seven.
+
+### Anchor a census to the READ FORM — and make the anchor admit the variants
+
+A census keyed on a **name** counts mentions; one keyed on a **use** counts uses.
+That much is why `gate_triage_complete.rs:136` greps `READ_FORMS`, not bare
+names. The trap is one level down: **an anchored pattern is only as good as the
+spellings it admits, and a too-tight anchor fails toward zero** — the direction
+that reads as "nothing uses this".
+
+Measured 2026-08-11 on `PYRE_PORTAL_RCA`, the one member of this registry with
+out-of-tree readers:
+
+| sweep | result |
+|---|---|
+| bare name, all three trees | **9 files** — docs, prose, a script's own docstring |
+| anchored `env::var\("PYRE_PORTAL_RCA` | **0** ⛔ |
+| anchored admitting `var_os` | **4 sites** — 1 in-tree, 3 external |
+
+The four are `majit/majit-metainterp/src/jitdriver.rs:504` (ours),
+`wasmi/…/majit/kernel.rs:3758`, `cel-jit/cel/examples/rca125p.rs:162`,
+`cel-jit/cel/examples/rca128.rs:411`. Every reader spells it
+`std::env::var_os(…).is_some()`, and `env::var\(` cannot match `var_os(` —
+so the tight anchor reported **zero external consumers for the only gate that
+has any**.
+
+⭐ The brake is immune by construction, and for a reason worth copying: its
+`READ_FORMS` entries are matched as **substrings**, so `env::var` is contained
+in `env::var_os` and both are caught. ⇒ **Reuse `READ_FORMS`; do not hand-write
+a read pattern.**
+
+⛔ **Run the bare-name sweep as the positive control for the anchored sweep, in
+the same pass.** A `0` from an anchored pattern sitting beside a non-zero
+bare-name count is a **pattern defect until proven otherwise** — that is the
+only reason the zero above was caught rather than filed. A census that cannot
+distinguish *nothing uses it* from *my pattern missed it* has two states and one
+word for them, and the word it picks is the reassuring one.
+
+### A check that can fail to run needs a third word
+
+The rule above is one instance of a shape this tree has now grown three
+independent answers to, none of them coordinated:
+
+| mechanism | the third state, spelled distinctly |
+|---|---|
+| `scripts/llbc_extract.py:1647-1651` | keeps `unstamped` as its own list and **refuses to stamp** what it cannot justify — *"reported as freshness UNKNOWN, not as fresh"* |
+| `scripts/check-sibling-consumers.py:291-294` | `checked == 0` prints **"NOTHING WAS CHECKED … This is not a pass"** and returns `2`, beside `0` clean and `1` broken |
+| `MC_DIAG` slot 67 `bridge_unattempted_close` | separates *an attempt was declined* from *no attempt was made*; before it ("majit-metainterp: count a close the gate never attempted under its own slot", `cd5875a6edc` re-pointed 2026-08-11, DOOMED) both rendered as slot 50 reading zero |
+
+⇒ **A two-valued oracle over a three-valued world spells one state as another,
+and it picks the reassuring one.** "Nobody checked" is not a licence to read a
+result; it is the absence of the check that would grant one.
+
+⛔ The third value must be a **distinct word, not a missing line**. Silence is
+already spelled the same as *fine*, which is how each of the three read before
+it was fixed — a stale artefact read as fresh, an absent consumer tree read as a
+pass, an unattempted close read as no declines.
+
 ## §1 — Retired this pass (5)
 
 Hardwired ON. Behaviour is byte-identical (each was default-ON already; only
@@ -247,16 +381,16 @@ after the 2026-07-05 audit; this pass removes their stale registry rows. The
 
 | gate | reader deleted by | note |
 |---|---|---|
-| PYRE_57_INLINE_NEXT | PR#387 (`e18ec90cac1`); follow-up `c6cfcb758c2` retired the kill-switch | stale §4 row removed |
+| PYRE_57_INLINE_NEXT | PR#387 (`e18ec90cac1`), which *carries* the kill-switch retirement ("jit: retire PYRE_57_INLINE_NEXT kill-switch") — squashed in, not a later follow-up | stale §4 row removed |
 | PYRE_SINGLE_PASS | PR#427 (`57849b62664`) | stale §1b keep mention and §5 list entry removed |
 | PYRE_AUTHORITATIVE | PR#427 (`57849b62664`) + PR#415 (`7e3db1cc490`) | stale §1b keep mention and §5 list entry removed; `PYRE_PROBE_AUTHORITATIVE` is separate and remains live |
 | PYRE_INNER_CLOSE | PR#427 (`57849b62664`) | stale §1b keep mention and §5 list entry removed |
 | PYRE_NO_INNER_CLOSE | PR#427 (`57849b62664`); issue #152 closed 2026-07-13 | stale §1b keep mention, §4 row, and §5 list entry removed |
-| PYRE_P2_COMPILE | PR#607 (`e1c43d3ff08`); follow-up `ca2640e797b` removed the gate | stale §5 deferred entry removed |
+| PYRE_P2_COMPILE | PR#607 (`e1c43d3ff08`), which *carries* the removal ("Remove PYRE_P2_COMPILE gate") — squashed in, not a later follow-up | stale §5 deferred entry removed |
 | PYRE_P2_FRAMESTACK | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
 | PYRE_P2_FS_COMPILE | PR#374 (`9a97c47f6e9`) | stale §5 deferred entry removed |
 | PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
-| PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
+| PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`), which *carries* the drop ("majit: full same_greenkey close gate for primary traces, drop PYRE_SAME_GREENKEY") — squashed in, not a later follow-up | stale §1b deferred mention and §5 list entry removed |
 | PYRE_FBW_REC_UNROLL | PR#374 (`9a97c47f6e9`) deleted `fbw_unroll_bound()` | stale §5 config-switch entry removed 2026-08-08. The successor knob `PYRE_FBW_REC_UNROLL_DEPTH` was never listed here and its reader `fbw_max_rec_unroll_depth()` is gone too (PR#887, `e5546b2ed36`) — both names read from nothing |
 | PYRE_TWO_PHASE_RTYPE | #346 closed; the annotate-all → rtype-all prepass is the production pipeline | OFF return deleted and `run_two_phase_prepass_if_enabled` made unconditional 2026-08-12 |
 | PYRE_TUPLE_PER_SHAPE_CLASSDEF | #346 closed; per-shape tuple classdefs are the settled fix for cross-shape attribute unions | single-global-`Tuple` OFF path and reader deleted 2026-08-12 |
@@ -814,8 +948,8 @@ census verified); they are not live gates and cost nothing.
 | PYRE_S8B_HARNESS | retired census; "82/82 agreement" measurement kept |
 | PYRE_MODULE_LOOP_TRACE | retired switch; historical note kept |
 | PYRE_FULL_BODY_WALK | retired switch; the full-body walk is the sole tracer, so the OFF path (the deleted trait leg) is gone (#344) |
-| `_MULTIFRAME` | retired switch; reader and OFF path deleted once `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe` identity answer (§1d). Flipped default-ON and retired 2026-07-30; `_MULTIFRAME_DEPTH` is a separate live depth bound and is not this gate |
-| `_BLACKHOLE_RESUME` | retired switch; reader and OFF path deleted after #754 closed, with the multi-frame twin's retirement unblocking removal; it was flipped default-ON on 2026-07-25 |
+| `PYRE_FBW_MULTIFRAME` | retired switch; reader and OFF path deleted once `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe` identity answer (§1d). Flipped default-ON and retired 2026-07-30 (`0135f56fbc0`, #901; introduced #763). `PYRE_FBW_MULTIFRAME_DEPTH` is a separate live depth bound and is not this gate |
+| `PYRE_FBW_BLACKHOLE_RESUME` | retired switch; reader and OFF path deleted after #754 closed, with the multi-frame twin's retirement unblocking removal; it was flipped default-ON on 2026-07-25 and retired 2026-07-30 (`0135f56fbc0`, #901) |
 | `PYRE_CARRIER_EXC_RESUME` | retired experiment; reader (`carrier_exc_resume_enabled`), the `setup_bridge_sym` pre-seed it guarded, `TraceCtx::bridge_guard_exc` and the `guard_exc` parameter of `start_bridge_tracing` all deleted 2026-08-06. The ON path measured inert — structurally redundant with the ungated walk-start `seed_standing_exception_for_walk` on the single-frame leg, and never exercised on the multi-frame carrier leg it was written for. §1b keeps the seed-site probe and both corpus runs |
 
 ## §4 — Live default-ON gates KEPT (retire when the epic closes)
@@ -847,7 +981,8 @@ Kept as-is; listed for completeness.
   `PYRE_RTYPER_VERBOSE`, `PYRE_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
-  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
+  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_ALLOCSITES`,
+  `PYRE_CELL_CENSUS`, `PYRE_DEOPT_PROBE`.
 - **Default-OFF experiments (none remaining)** — triaged in §1b/§1c (4 retired
   in the 2026-07-05 pass; `PYRE_P2_DRAIN` retired with
   the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
@@ -955,6 +1090,45 @@ Polarity below follows this file's rule, with one correction it needed: an
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
+⛔ **"Inert unless set" has two readings, and they do not always agree.** State
+which one you are applying before using this section to settle anything:
+
+1. **Is *unset* the active state?** — a gate whose unset branch enforces or
+   changes behaviour fails this.
+2. **Would deleting the env read change behaviour for someone who never sets
+   it?** — a gate whose unset branch matches the code's behaviour without the
+   gate passes this.
+
+**This section uses reading 2.** Reading 1 is stricter, and a member can pass 2
+while failing 1 — that is not hypothetical, it is how `PYRE_LLBC_STRICT` sat
+here until 2026-08-10 (now §6d). Leaving the criterion unstated re-admits that
+member on the next audit run by someone holding the other reading.
+
+⚠ Audited member-by-member on 2026-08-10: every name below passes reading 2.
+Two notes the list itself cannot carry:
+
+- `PYRE_LLBC_SKIP_FINGERPRINT_CHECK` **stays here** and is correctly filed under
+  *both* readings — unset simply means the check runs, and the gate only skips.
+  It is not a pair with `PYRE_LLBC_STRICT`, which is the natural assumption and
+  is wrong: they differ in exactly the way the two readings differ.
+- `PYRE_PORTAL_RCA` is the only member with readers **outside this workspace**:
+  three, in `cel-jit` (two probe examples) and `wasmi` (the majit kernel).
+  ⇒ This section's criterion is about *behaviour when unset*; it says nothing
+  about **rename safety**, and a name in a bulk list carries no protection.
+  Renaming any gate here breaks out-of-workspace readers silently, because the
+  brake only checks names against this repository. That hazard is live for this
+  member and dormant for the rest.
+
+⚠ The heading carried `(52)` against a list of 54 distinct names. The count is
+**gone rather than corrected**: it drifted by two without anyone noticing, and
+re-keying it to 54 would fix the instance and keep the defect. `rg -o
+'PYRE_[A-Z0-9_]+' ` over the section is the live answer. A brake asserting
+*heading count == member count* is not implementable here today, because this
+file has no rule separating a **member** from a **mention** — §6a's `(4)` is
+correct against four table rows while five distinct names appear in its body,
+one of them inside a "retire when" sentence. Any count brake needs that rule
+first.
+
 `PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
 `PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
@@ -964,7 +1138,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_FBW_MF_DIAG`, `PYRE_FBW_STRICT_DIAG`, `PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
 `PYRE_GC_DIAG`, `PYRE_GC_FREELIST_DIAG`, `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
-`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
+`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
 `PYRE_M73_LASTINSTR_AUDIT`, `PYRE_M73_MIDBODY_CARRY_AUDIT`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,

@@ -1568,6 +1568,27 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "arraylen_vable result");
     }
 
+    /// Address of item 0 of virtualizable array `array_idx`, as an int.
+    ///
+    /// Operand layout is byte-for-byte the `arraylen_vable` triple above, so
+    /// both decode through `read_vable_arraylen`.
+    ///
+    /// WARNING: Emitting this is an escape: the address outlives the op and lets a
+    /// callee permute items that are the trace's own SSA values. Callers must
+    /// pair it with [`crate::virtualizable::raise_raw_base_escape`] — the
+    /// macro's lowering is the only caller, and it does.
+    pub fn vable_arraybase_with_base(&mut self, dest: u16, vable_reg: u16, array_idx: u16) {
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(dest);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("arraybase_vable/rdd>i");
+        self.push_reg_u8(vable_reg, "arraybase_vable base");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "arraybase_vable result");
+    }
+
     pub fn vable_force_with_base(&mut self, vable_reg: u16) {
         self.touch_ref_reg(vable_reg);
         self.write_insn("hint_force_virtualizable/r");

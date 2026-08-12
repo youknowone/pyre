@@ -109,32 +109,53 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
 /// and panic.  A callee frame is non-standard whether reached by an
 /// inline sub-walk or compiled as its own Finish portal (via
 /// call_user_function_with_eval); the production main frame IS the
-/// standard virtualizable, so the check short-circuits at Step 1 and
+/// standard virtualizable, so *that* check short-circuits at Step 1 and
 /// emits nothing — gate on a full-body walk being active so this is a
 /// no-op (one cheap `num_guards` read) outside it.  The non-standard
 /// fact is cached per box
 /// after the first access, so at most one such guard is emitted per
 /// inlined frame and `walker_capture_snapshot_for_last_guard`'s
 /// "last guard" target is unambiguous.
+///
+/// WARNING: The `_nonstandard_virtualizable` short-circuit is NOT the only way a
+/// `vable_*` call can record a guard, so "standard virtualizable ⇒ nothing
+/// emitted" does not hold in general.  `TraceCtx::get_arrayitem_vable_index`
+/// promotes a non-constant index *after* that check has already
+/// short-circuited, on the standard path.  In the majit walker that promote
+/// is unreachable because `pyjitpl/dispatch.rs` hoists
+/// `implement_guard_value` and passes a constant index; `vable_ops.rs` passes
+/// the raw index register and does not.  Consequently the `fbw_mode` gate
+/// below is narrower than the set of guards `vable_*` can emit: outside a
+/// full-body walk such a guard would get no snapshot from here.  Tracked as
+/// task #44 — do not widen the gate on the strength of this note alone, the
+/// reachability of a non-constant index at those call sites is unmeasured.
 pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     guards_before: usize,
 ) -> Result<(), DispatchError> {
-    // The non-standard virtualizable's internal promote GuardValue is
-    // emitted only inside a full-body walk against a callee frame that is
-    // not the production standard virtualizable: either an inline sub-walk's
-    // callee heap frame, or a callee compiled as its own Finish portal
-    // (reached via call_user_function_with_eval). Outside a full-body walk
-    // the frame is always the standard virtualizable and emits no such
-    // guard.
+    // The non-standard virtualizable's `_nonstandard_virtualizable` promote
+    // GuardValue is emitted inside a full-body walk against a callee frame
+    // that is not the production standard virtualizable: either an inline
+    // sub-walk's callee heap frame, or a callee compiled as its own Finish
+    // portal (reached via call_user_function_with_eval).
     if ctx.fbw_mode.snapshot_sym.is_null() {
         return Ok(());
     }
     if ctx.trace_ctx.num_guards() <= guards_before {
-        // Standard virtualizable (the production main frame): the
-        // `_nonstandard_virtualizable` check short-circuited and emitted no
-        // guard, so there is nothing to capture.
+        // No guard was recorded by the call this wraps, so there is nothing
+        // to capture.
+        //
+        // The test is deliberately on the OBSERVED guard count and not on
+        // "is this the standard virtualizable". An earlier version of this
+        // comment claimed the standard virtualizable emits no guard here and
+        // that a short-circuited `_nonstandard_virtualizable` was the only
+        // way to reach this branch. That is false:
+        // `TraceCtx::get_arrayitem_vable_index` promotes a non-constant index
+        // on the STANDARD path too, so a guard can appear with no
+        // non-standard frame anywhere in sight. The code is right and the
+        // claim was wrong — but a reader who believed it would conclude the
+        // capture below is dead on the standard vable and stop looking.
         return Ok(());
     }
     if !ctx.fbw_mode.inline_subwalk {

@@ -20,6 +20,14 @@ const OP_GE: i64 = 6; // [GE, a, b, dst]  dst = (regs[a] >= regs[b]) as {0,1}
 
 struct VmState {
     regs: Vec<i64>,
+    /// What `OP_RETURN` hands back.
+    ///
+    /// The `; state` merge point leaves the loop through `break` before it
+    /// assigns the walk's resume pc, so after the loop `pc` still names the
+    /// position the walk started from and `program[pc + 1]` — the operand
+    /// saying which register holds the result — cannot be read there. The
+    /// result has to arrive in `state`.
+    ret: i64,
 }
 
 #[majit_macros::jit_interp(
@@ -28,6 +36,7 @@ struct VmState {
     greens = [pc, program],
     state_fields = {
         regs: [int; virt],
+        ret: int,
     },
 )]
 fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
@@ -43,6 +52,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let _stacksize: i32 = 0;
     let mut state = VmState {
         regs: vec![0; num_regs],
+        ret: 0,
     };
 
     {
@@ -53,7 +63,11 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     }
 
     loop {
-        jit_merge_point!();
+        // `; state` selects the single-executor close: the walk's final state is
+        // transferred into `state` here and the native loop resumes at the close
+        // pc, instead of discarding the walk outcome and re-running the circuit
+        // the walk already executed.
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         match opcode {
             OP_LOAD => {
@@ -105,14 +119,29 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 }
                 pc += 4;
             }
+            // Stores into `ret` and then leaves through an in-arm `return`,
+            // never `{ store; break }`: `classify.rs` `is_break_expr` requires
+            // the arm body to be exactly `break`, so a composite body classifies
+            // `Lowerable` and its tail `break` reaches `lower_stmt_fallback`,
+            // which guards an enclosed `return` but not an enclosed `break` —
+            // the statement is inert and is silently dropped, leaving the
+            // lowered arm to fall through to the dispatch back-edge.
             OP_RETURN => {
                 let r = program[pc + 1] as usize;
-                return state.regs[r];
+                state.ret = state.regs[r];
+                return state.ret;
             }
-            _ => break,
+            // Was `_ => break` with the panic below the loop. The loop now has a
+            // second way out — the merge point's own `break` on a walk that
+            // reached a terminal return — so falling out of it no longer
+            // identifies a bad opcode, and the panic moves into the arm that
+            // actually saw one.
+            _ => panic!("fell off end of code"),
         }
     }
-    panic!("fell off end of code");
+    // Reached only when the merge point broke out on a walk that already ran the
+    // terminal opcode, so the result is whatever that opcode parked in `ret`.
+    state.ret
 }
 
 /// Clean interpreter of the identical bytecode — the honest "good non-JIT
@@ -297,18 +326,22 @@ fn time_ns_per_row<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
-/// Run one program: 3-way equality gate (small n) then interleaved A/B/C
-/// timing (large n). `hold` keeps the backing column buffers alive.
-fn run_program(
-    label: &str,
-    num_regs: usize,
-    prog_at: &dyn Fn(i64) -> Vec<i64>,
-    hold: &[&Vec<i64>],
-) {
-    let gn: i64 = std::env::var("CELGATE_N")
+/// How many rows the equality gate runs. Far below the timing row count: the
+/// gate's three properties hold at any length past the trace threshold.
+fn gate_n() -> i64 {
+    std::env::var("CELGATE_N")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(300_000);
+        .unwrap_or(300_000)
+}
+
+/// One program's correctness + tier-liveness gate, with no timing in it.
+///
+/// `on_c >= 1` says a trace was minted for the loop. It does not say the trace
+/// has a real body — an empty dispatch still compiles one whose whole optimized
+/// body is `Finish()` — so this is the liveness half only.
+fn gate_program(label: &str, num_regs: usize, prog_at: &dyn Fn(i64) -> Vec<i64>) {
+    let gn = gate_n();
     let gprog = prog_at(gn);
     COMPILES.store(0, Ordering::Relaxed);
     ABORTS.store(0, Ordering::Relaxed);
@@ -326,15 +359,29 @@ fn run_program(
         "{label}: clean vs JIT-on divergence -> miscompile"
     );
     assert_eq!(off_c, 0, "{label}: JIT-off must never compile");
+    // Was a printed `!!` note and an early return, which is a diagnostic and not
+    // a gate: the three assertions above are all satisfied by the interpreter
+    // answering alone, so with the JIT tier inert this probe printed its warning
+    // and still exited 0.
+    assert!(
+        on_c >= 1,
+        "{label}: JIT-on compiled nothing (aborts={on_a}) — the raw_load \
+         red-index read does not close the trace"
+    );
     println!(
         "[{label} gate n={gn}] result={on} (clean==off==on ok)  compiles: off={off_c} on={on_c}  aborts(on)={on_a}"
     );
-    if on_c == 0 {
-        println!(
-            "  !! {label}: JIT-on did NOT compile (aborts={on_a}) — raw_load red-index read does not close the trace"
-        );
-        return;
-    }
+}
+
+/// Run one program: the gate above, then interleaved A/B/C timing (large n).
+/// `hold` keeps the backing column buffers alive.
+fn run_program(
+    label: &str,
+    num_regs: usize,
+    prog_at: &dyn Fn(i64) -> Vec<i64>,
+    hold: &[&Vec<i64>],
+) {
+    gate_program(label, num_regs, prog_at);
 
     let n: i64 = 20_000_000;
     let prog = prog_at(n);
@@ -355,21 +402,62 @@ fn run_program(
     black_box(hold);
 }
 
+/// REAL data columns: LCG-filled, distinct, non-foldable. The LCG runs from a
+/// fixed seed, so a short column is a prefix of a long one and the gate reads
+/// the same rows whatever length was allocated for it.
+fn make_cols(n: i64) -> (Vec<i64>, Vec<i64>) {
+    (
+        make_col(n, 0x2545F4914F6CDD1D),
+        make_col(n, 0x9E3779B97F4A7C15u64 as i64),
+    )
+}
+
+type ProgramSpec = (&'static str, usize, Box<dyn Fn(i64) -> Vec<i64>>);
+
+/// The programs this probe covers, as `(label, num_regs, builder)`. `run` gates
+/// and then times each; [`run_gates`] gates each and stops there. Both walk this
+/// one list, so a program added here reaches the test as well as the binary.
+fn programs(base_a: i64, base_b: i64) -> Vec<ProgramSpec> {
+    vec![
+        (
+            "SUM   ",
+            SUM_REGS,
+            Box::new(move |k| sum_program(k, base_a)),
+        ),
+        (
+            "POLICY",
+            POL_REGS,
+            Box::new(move |k| policy_program(k, base_a, base_b)),
+        ),
+    ]
+}
+
+/// Every program's gate at [`gate_n`] rows, with none of the timing. The columns
+/// are allocated to the gate's own length rather than the timing length — two
+/// 20M-row buffers is 320 MB the gate never reads past the first `gate_n` rows
+/// of.
+#[cfg(test)]
+pub(crate) fn run_gates() {
+    let (col_a, col_b) = make_cols(gate_n());
+    let base_a = col_a.as_ptr() as i64;
+    let base_b = col_b.as_ptr() as i64;
+    for (label, num_regs, prog_at) in programs(base_a, base_b) {
+        gate_program(label, num_regs, &prog_at);
+    }
+    black_box((&col_a, &col_b));
+}
+
 pub fn run() {
     let n: i64 = 20_000_000;
-    // REAL data columns: LCG-filled, distinct, non-foldable.
-    let col_a = make_col(n, 0x2545F4914F6CDD1D);
-    let col_b = make_col(n, 0x9E3779B97F4A7C15u64 as i64);
+    let (col_a, col_b) = make_cols(n);
     let base_a = col_a.as_ptr() as i64;
     let base_b = col_b.as_ptr() as i64;
 
     println!("columnar red-index reads via raw_load_i (base in register file)\n");
-    run_program("SUM   ", SUM_REGS, &|k| sum_program(k, base_a), &[&col_a]);
-    println!();
-    run_program(
-        "POLICY",
-        POL_REGS,
-        &|k| policy_program(k, base_a, base_b),
-        &[&col_a, &col_b],
-    );
+    for (i, (label, num_regs, prog_at)) in programs(base_a, base_b).into_iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        run_program(label, num_regs, &prog_at, &[&col_a, &col_b]);
+    }
 }

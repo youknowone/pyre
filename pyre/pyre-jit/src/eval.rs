@@ -5447,6 +5447,37 @@ fn green_key_from_pycode(next_instr: usize, w_pycode: pyre_object::PyObjectRef) 
     Some(make_green_key(code_ptr, next_instr))
 }
 
+/// The typed `GreenKey` behind [`green_key_from_pycode`]'s `u64`.
+///
+/// `interp_jit.py:67-70` declares the portal greens as `[next_instr,
+/// is_being_profiled, pycode]`; `make_green_key` hashes exactly that tuple
+/// and returns only the hash, which is enough to find a warmstate bucket and
+/// not enough to pick a cell out of one (`JitCell.comparekey`,
+/// warmstate.py:575-582). Callers that read a cell take this; callers that
+/// only tick a counter can keep the hash.
+///
+/// `is_being_profiled` is folded to `false` here **because
+/// [`make_green_key`] folds it to `false`** — the two must agree or the typed
+/// and hash paths would resolve to different cells. That fold is itself a
+/// parity gap (upstream splits cells on the flag, pyre never does), tracked
+/// separately; it is not this function's to change.
+fn green_key_typed_from_pycode(
+    next_instr: usize,
+    w_pycode: pyre_object::PyObjectRef,
+) -> Option<majit_ir::GreenKey> {
+    // Safety: as `green_key_from_pycode` — `PyCode` is an owned pointer to a
+    // `CodeObject`.
+    let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
+    if code_ptr.is_null() {
+        return None;
+    }
+    Some(majit_ir::pypyjit_greenkey(
+        next_instr,
+        false,
+        code_ptr as u64,
+    ))
+}
+
 /// RPython interp_jit.py helper: get_printable_location.
 pub fn get_printable_location(
     next_instr: usize,
@@ -5555,13 +5586,16 @@ pub fn get_jitcell_at_key(
     _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    let key = green_key_from_pycode(next_instr, w_pycode);
+    // warmstate.py:607-609 `get_jit_cell_at_key(greenkey)` unwraps the
+    // greenkey and hands the green *args* to `get_jitcell`. The green args
+    // are this function's own parameters, so the typed key costs no plumbing.
+    let key = green_key_typed_from_pycode(next_instr, w_pycode);
     let (driver, _) = driver_pair();
     w_bool_from(key.is_some_and(|green_key| {
         driver
             .meta_interp_mut()
             .warm_state_mut()
-            .get_cell(green_key)
+            .get_cell_for_key(&green_key)
             .is_some()
     }))
 }
@@ -5574,14 +5608,17 @@ pub fn dont_trace_here(
     _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+    // warmstate.py:644-646 `dont_trace_here(*greenargs)` reaches its cell
+    // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
+    // args are this function's parameters.
+    let Some(green_key) = green_key_typed_from_pycode(next_instr, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
         .warm_state_mut()
-        .disable_noninlinable_function(green_key);
+        .disable_noninlinable_function_for_key(&green_key);
 }
 
 /// interp_jit.py:233 — `@dont_look_inside`
@@ -5592,17 +5629,29 @@ pub fn mark_as_being_traced(
     _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) {
-    let Some(green_key) = green_key_from_pycode(next_instr, w_pycode) else {
+    // warmstate.py:649-651 `mark_as_being_traced(*greenargs)` reaches its cell
+    // through `_ensure_jit_cell_at_key(*greenargs)`, by comparekey. The green
+    // args are this function's parameters.
+    let Some(green_key) = green_key_typed_from_pycode(next_instr, w_pycode) else {
         return;
     };
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
         .warm_state_mut()
-        .mark_as_being_traced(green_key);
+        .mark_as_being_traced_for_key(&green_key);
 }
 
 /// interp_jit.py:245 — `@dont_look_inside`
+///
+/// Keeps the bare hash **by the same rule that sends its siblings through a
+/// typed key**: `JitCell._trace_next_iteration` (warmstate.py:617-619) hashes
+/// the greenargs and calls `jitcounter.change_current_fraction(hash, 0.98)` —
+/// it never looks a cell up, so a hash is all the identity the operation
+/// has. Upstream makes the same call reachable by hash alone as
+/// `trace_next_iteration_hash` (warmstate.py:622-623), which is the only
+/// bare-hash entry point it offers. Route a cell read here and this comment
+/// stops being true.
 #[majit_macros::dont_look_inside]
 pub fn trace_next_iteration(
     _space: pyre_object::PyObjectRef,

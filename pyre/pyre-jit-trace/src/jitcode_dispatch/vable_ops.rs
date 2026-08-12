@@ -429,6 +429,48 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     Ok((fdescr, adescr))
 }
 
+/// `pyjitpl.py:1201-1216 _get_arrayitem_vable_index` opens with
+/// `indexbox = self.implement_guard_value(indexbox, pc)`: the flat array slot
+/// is derived from the index's *recording-time* value, so the trace is only
+/// sound if it also pins that value.
+///
+/// The promote is hoisted here, to the index read, rather than left to
+/// `TraceCtx::get_arrayitem_vable_index`, for the reason
+/// `pyjitpl/dispatch.rs` states at its own six `BC_*ARRAYITEM_VABLE_*` sites:
+/// promoting at the call site gets the guard a full-framestack,
+/// vable-carrying snapshot, where the callee can only build the minimal one
+/// `TraceCtx::promote_int` produces without an `MIFrameStack`.
+///
+/// Mirrors `guard_value_record` (`arith.rs`) step for step, including the
+/// `replace_box` and register-bank rewrite — the callee's promote discards
+/// its promoted box, so nothing downstream ever saw the pinned value.
+///
+/// Note the caller's `VableArrayIndexNotConcrete` gate does not make this
+/// redundant: it resolves a *concrete value* via `TraceCtx::concrete_of_opref`,
+/// which succeeds for a non-constant OpRef carrying a recorded concrete, so a
+/// non-constant index reaches the array path with that gate satisfied.
+fn walker_promote_vable_array_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    index: OpRef,
+    index_value: i64,
+) -> Result<OpRef, DispatchError> {
+    if index.is_constant() {
+        return Ok(index);
+    }
+    let expected = ctx.trace_ctx.const_int(index_value);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[index, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx.replace_box(index, expected);
+    for slot in ctx.registers_i.iter_mut() {
+        if *slot == index {
+            *slot = expected;
+        }
+    }
+    Ok(expected)
+}
+
 /// `getarrayitem_vable_<i|r|f>/ridd>X` handler. Operand layout `ridd>X`:
 /// 1B r-reg(vable) + 1B i-reg(index) + 2B fdescr(VableArray) + 2B
 /// adescr(Array) + 1B X-dst.
@@ -506,6 +548,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
+    let index = walker_promote_vable_array_index(ctx, op.pc, index, index_value)?;
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
     let (result, shadow_value) = match dst_bank {
@@ -773,6 +816,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
+    let index = walker_promote_vable_array_index(ctx, op.pc, index, index_value)?;
     let encoded_value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,

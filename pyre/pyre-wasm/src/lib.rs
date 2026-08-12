@@ -527,6 +527,60 @@ pub extern "C" fn pyre_jit_field_pos_attached_checked() -> u64 {
     pyre_jit::field_position_counts().attached_checked
 }
 
+/// The four `derive_index_in_parent` dispositions, the rest of the
+/// `field_position_census`.
+///
+/// `unresolved` — parent resolved, non-empty, field absent from it — is the
+/// population the `attached_*` pair structurally cannot see: both halves of
+/// that pair are counted inside a lookup that must first succeed, so a field
+/// its parent does not contain is counted by neither and numerator and
+/// denominator read healthy together. It is the only counter that reports it.
+///
+/// STOP: These are exported because a counter nobody asks for cannot be caught by
+/// the runner's refusal. That refusal fires for a name it ASKS for and cannot
+/// resolve; an absent name it never lists produces no error and no value, and
+/// `_jit_stats_change` reads a field absent from a run as zero — the healthy
+/// value. So the wasm blindness here was never going to surface as a failure,
+/// on any tree, however long it stood.
+///
+/// Unlike the `*_misplaced` pair above, these four are not host-dependent: the
+/// census counts name-resolution dispositions, not offset rankings, so wasm32's
+/// 4-byte word does not move them. On the three fixtures with a dynasm figure
+/// on record (`arith_int_bool`, `array_deopt_resume`,
+/// `getframe_force_cancel_journal`) wasm agrees exactly, at 158.
+///
+/// STOP: Host-independent is NOT fixture-independent, and the first thing these
+/// exports bought was the refutation of that confusion. Swept over all 411
+/// fixtures on wasm, `field_pos_unresolved` takes eight distinct values —
+/// 158 (231 fixtures), 0 (83), 195 (66), 159 (15), 161 (6), 196 (5), 198 (3),
+/// 199 (2). A note in `check.py` had called it fixture-invariant on the
+/// strength of three fixtures that all read 158; 158 is the mode at 56%, so
+/// three agreeing samples were never evidence. The number could not be read
+/// here at all until this export existed, which is the whole reason it does.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_parent_absent() -> u64 {
+    pyre_jit::field_position_counts().parent_absent
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_parent_empty() -> u64 {
+    pyre_jit::field_position_counts().parent_empty
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_rederived() -> u64 {
+    pyre_jit::field_position_counts().rederived
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_unresolved() -> u64 {
+    pyre_jit::field_position_counts().unresolved
+}
+
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 

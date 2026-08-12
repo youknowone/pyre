@@ -410,11 +410,128 @@ def load_baseline(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def expected_status(baseline: dict, module: str, backend: str) -> str | None:
+# Keys that live inside a module entry alongside the per-backend verdicts but
+# are not themselves a verdict. A module entry is `{backend: STATUS, ...}` plus
+# these; anything walking an entry generically has to exclude them. Today no
+# lookup can collide with one — `--backend` is an argparse `choices` pair — so
+# this is the written-down shape of the entry, not a live guard.
+NON_BACKEND_ENTRY_KEYS = ("reason", "provenance")
+
+
+def expected_cell(baseline: dict, module: str, backend: str) -> tuple[str | None, str | None]:
+    """The recorded status for `(module, backend)`, and WHICH backend produced it.
+
+    The second element is the load-bearing half. When a module has no cell for
+    the requested backend the lookup falls back to `dynasm`, so the verdict a
+    cranelift run is graded against can be a measurement that was never taken
+    on cranelift. That substitution is invisible in the returned status — it is
+    the string "PASS" either way — which is why the source is returned beside
+    it rather than left for the caller to re-derive.
+
+    Measured over the committed baseline: of the 200 modules a cranelift gate
+    run selects, 115 (58%) are graded against dynasm's cell. The dynasm gate
+    borrows nothing, so the asymmetry is total and one-directional. Of the 434
+    recorded modules cranelift has its own cell for 87, and where both exist
+    they agree in 87 of 87 — which is the reason this has never been noticed
+    and is NOT evidence that it is safe: the agreement is measured on the 87,
+    and the substitution is applied to the other 347.
+
+    WARNING: Those five literals are a snapshot; the run prints its own count on the
+    selection line, so read that rather than this paragraph for any live claim.
+    """
+    entry = baseline.get("modules", {}).get(module)
+    if entry is None:
+        return None, None
+    own = entry.get(backend)
+    if own:
+        return own, backend
+    borrowed = entry.get("dynasm")
+    return (borrowed, "dynasm") if borrowed else (None, None)
+
+
+def cell_provenance(baseline: dict, module: str, backend: str) -> dict | None:
+    """The axis `(module, backend)`'s status was measured along, or None.
+
+    None means the cell predates this key, not that the cell is axis-free: every
+    status in the file was measured along some axis, and for the cells written
+    before provenance existed that axis is simply unrecorded. Callers must
+    report the two states separately — an unrecorded axis cannot be compared,
+    and folding it into "agrees" would let the whole pre-existing file read as
+    verified.
+    """
     entry = baseline.get("modules", {}).get(module)
     if entry is None:
         return None
-    return entry.get(backend) or entry.get("dynasm")
+    return entry.get("provenance", {}).get(backend)
+
+
+def run_axis(args: argparse.Namespace, binary: Path) -> dict:
+    """Everything that decides what a status MEANS, taken from the run itself.
+
+    A recorded PASS is a claim about a `(backend, binary, mode, jit, stdlib)`
+    tuple, and the baseline used to record only the first of those — implicitly,
+    as the cell's key. Comparing a run to a cell recorded under `--no-jit`, or
+    against a different stdlib snapshot, is not a regression check; the two
+    numbers are about different things and nothing said so.
+
+    Derived here and nowhere else, then handed to every consumer (`--report` and
+    the baseline both), so the axis a run records cannot disagree with the axis
+    it ran: a second hand-written copy beside the first has no way to be wrong
+    loudly. In particular `backend` is not taken as a bare argument any more —
+    `--binary` overrides the backend's own path, so `args.backend` alone is a
+    label that a caller can make false, and `binary` beside it is the thing that
+    actually produced the statuses.
+    """
+    return {
+        "backend": args.backend,
+        # Name only, not the resolved path: the absolute path is host state and
+        # would rewrite every cell on a different machine without any of them
+        # having been re-measured.
+        "binary": binary.name,
+        "mode": args.mode,
+        "jit": not args.no_jit,
+        "stdlib_version": stdlib_version(),
+    }
+
+
+def axis_drift_report(baseline: dict, selected: list[str], axis: dict) -> list[str]:
+    """Lines describing how the selected cells' axes differ from this run's.
+
+    Scoped to cells this backend measured itself. A borrowed cell differs on
+    `backend` by definition and on `binary` as a consequence, so folding it in
+    would restate the borrowed set under two more headings; the borrowed count
+    is its own line and this one is about the rest.
+
+    Reports, never gates. Which of these differences invalidates a comparison
+    is a judgement nobody has made yet, and turning an unrecorded axis into a
+    red would fail every run against today's file — where the count is the
+    whole population, because no cell in it was written by a version that
+    recorded an axis at all.
+    """
+    unrecorded = 0
+    differing: dict[str, int] = {}
+    compared = 0
+    for m in selected:
+        _status, src = expected_cell(baseline, m, axis["backend"])
+        if src != axis["backend"]:
+            continue
+        prov = cell_provenance(baseline, m, src)
+        if prov is None:
+            unrecorded += 1
+            continue
+        compared += 1
+        for key, value in axis.items():
+            if key == "backend":
+                continue
+            if prov.get(key) != value:
+                differing[key] = differing.get(key, 0) + 1
+    own = compared + unrecorded
+    lines = [f"{compared} of {own} own-backend cells carry a recorded axis, "
+             f"{unrecorded} predate it"]
+    for key in sorted(differing):
+        lines.append(f"  axis drift: {differing[key]} of {compared} recorded "
+                     f"under a different {key} (this run: {axis[key]!r})")
+    return lines
 
 
 # ── main ─────────────────────────────────────────────────────────────
@@ -476,6 +593,9 @@ def main() -> int:
 
     baseline = load_baseline(args.baseline)
     modules = discover_modules(args.filter)
+    # One producer, every consumer below. `--report` writes it, the baseline
+    # stores it per cell, and the drift check compares against it.
+    axis = run_axis(args, binary)
 
     if args.list:
         for m in modules:
@@ -507,8 +627,12 @@ def main() -> int:
     to_run: list[str] = []
     skipped: list[str] = []
     deselected = 0
+    # Modules selected for this run whose expected status came from ANOTHER
+    # backend's cell. Counted during selection rather than recomputed later so
+    # the number reports the set actually gated, not a re-derivation of it.
+    borrowed_gated: list[str] = []
     for m in modules:
-        exp = expected_status(baseline, m, args.backend)
+        exp, exp_src = expected_cell(baseline, m, args.backend)
         is_skip = (exp == "SKIP") or (m in KNOWN_SKIPS)
         if is_skip and not args.full and not args.update_baseline:
             skipped.append(m)
@@ -517,13 +641,26 @@ def main() -> int:
             deselected += 1
             continue
         to_run.append(m)
+        if exp_src is not None and exp_src != args.backend:
+            borrowed_gated.append(m)
 
-    print(f"pyre CPython suite — backend={args.backend} mode={args.mode} "
-          f"jit={'off' if args.no_jit else 'on'} jobs={args.jobs}")
+    # Printed from `axis`, not from `args` beside it: this header names the run
+    # whose statuses the baseline will record, and a hand-written second copy
+    # can say `dynasm` over a cranelift measurement without anything noticing.
+    print(f"pyre CPython suite — backend={axis['backend']} mode={axis['mode']} "
+          f"jit={'on' if axis['jit'] else 'off'} jobs={args.jobs}")
     print(f"binary: {binary}")
     extra = f", {deselected} not gated (non-PASS)" if deselected else ""
     print(f"{len(to_run)} to run, {len(skipped)} skipped{extra}, "
-          f"timeout={args.timeout}s\n")
+          f"timeout={args.timeout}s")
+    # The denominator this run's verdict actually rests on. Printed even when
+    # it is 0, because "0 borrowed" and "nobody counted" are different states
+    # and only the printed line distinguishes them.
+    print(f"{len(borrowed_gated)} of {len(to_run)} gated against another "
+          f"backend's recorded status")
+    for line in axis_drift_report(baseline, to_run, axis):
+        print(line)
+    print()
 
     results: dict[str, tuple[str, str]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
@@ -574,11 +711,16 @@ def main() -> int:
     regressions: list[str] = []
     improvements: list[str] = []
     for m, (status, detail) in sorted(results.items()):
-        exp = expected_status(baseline, m, args.backend)
+        exp, exp_src = expected_cell(baseline, m, args.backend)
+        # Name the backend a verdict is measured against whenever it is not the
+        # one under test. Without it a regression line reads as this backend
+        # having gone from PASS to FAIL, when what happened may be that this
+        # backend was never recorded passing.
+        via = "" if exp_src in (None, args.backend) else f" (expected from {exp_src})"
         if exp == "PASS" and status != "PASS":
-            regressions.append(f"{m}: PASS -> {status}  {detail}")
+            regressions.append(f"{m}: PASS -> {status}{via}  {detail}")
         elif exp != "PASS" and status == "PASS":
-            improvements.append(f"{m}: {exp or 'new'} -> PASS")
+            improvements.append(f"{m}: {exp or 'new'} -> PASS{via}")
 
     if improvements:
         print(f"\n── improvements ({len(improvements)}) ──")
@@ -587,10 +729,7 @@ def main() -> int:
 
     if args.report:
         report = {
-            "backend": args.backend,
-            "mode": args.mode,
-            "jit": not args.no_jit,
-            "stdlib_version": stdlib_version(),
+            **axis,
             "counts": counts,
             "modules": {m: {"status": s, "detail": d}
                         for m, (s, d) in sorted(results.items())},
@@ -601,9 +740,14 @@ def main() -> int:
         print(f"\nreport written: {args.report}")
 
     if args.update_baseline:
-        write_baseline(args.baseline, baseline, results, args.backend)
+        write_baseline(args.baseline, baseline, results, axis)
         print(f"\nbaseline written: {args.baseline} "
               f"({sum(1 for s, _ in results.values() if s == 'PASS')} PASS recorded)")
+        # Read the file as written, not as loaded: this bless repairs some of
+        # what these would otherwise name, and a report naming a cell the same
+        # run just corrected is wrong the moment it prints.
+        for line in phantom_row_report(baseline) + stale_curated_cell_report(baseline):
+            print(line)
         return 0
 
     if regressions:
@@ -624,9 +768,79 @@ def main() -> int:
     return 0
 
 
-def write_baseline(path: Path, baseline: dict, results: dict, backend: str) -> None:
+def phantom_row_report(baseline: dict) -> list[str]:
+    """Lines naming baseline rows that no longer have a discoverable module.
+
+    Reported, never removed, for two reasons.
+
+    Such a row is inert: selection iterates the discovered modules, so a row
+    nothing discovers is never selected, never run and never gated. It costs
+    file size and nothing else.
+
+    And removal has no safe predicate available at the call site. It would have
+    to be keyed on whatever module set the caller happens to hold, which is
+    `discover_modules(args.filter)` — so a filtered bless would delete every row
+    outside the filter. Discovery is therefore re-taken unfiltered here rather
+    than passed in: the set a removal would need is precisely the one the caller
+    cannot supply.
+    """
+    rows = baseline.get("modules", {})
+    phantom = sorted(set(rows) - set(discover_modules(None)))
+    if not phantom:
+        return []
+    return [f"{len(phantom)} of {len(rows)} baseline rows have no discoverable "
+            f"module (carried unchanged, not gated):"] + [f"  ? {m}" for m in phantom]
+
+
+def stale_curated_cell_report(baseline: dict) -> list[str]:
+    """Lines naming cells on a curated-skip row that still record a measurement.
+
+    A module can join `KNOWN_SKIPS` long after its row was recorded, and
+    `write_baseline` only ever touches rows the run produced a result for — so
+    a curated module that no run has selected since keeps whatever verdict it
+    last measured.
+
+    Reported, never synced to SKIP, for two reasons.
+
+    The cell decides nothing. Selection reads
+    `(exp == "SKIP") or (m in KNOWN_SKIPS)`, so the curated table has already
+    won before the recorded status is consulted. What the cell uniquely holds
+    is what the module did the last time it actually ran, which no other source
+    records; writing SKIP over it adds nothing where the decision is made and
+    destroys the only thing it carries. If the module later leaves
+    `KNOWN_SKIPS`, that measurement is what should come back — not a SKIP a
+    sync manufactured.
+
+    And a SKIP here would be a status with no axis under it. A curated cell
+    carries no provenance because it records a decision rather than a
+    measurement, so writing one into a cell this run did not measure fabricates
+    a measurement-shaped record of a non-measurement.
+    """
+    rows = baseline.get("modules", {})
+    stale = [(m, backend, status)
+             for m, entry in sorted(rows.items()) if m in KNOWN_SKIPS
+             for backend, status in sorted(entry.items())
+             if backend not in NON_BACKEND_ENTRY_KEYS and status != "SKIP"]
+    if not stale:
+        return []
+    return [f"{len(stale)} cell(s) on {len({m for m, _, _ in stale})} curated-skip "
+            f"row(s) still record a measurement (reported, not synced — the "
+            f"curated table governs selection, so these are stale and inert):"] + [
+        f"  * {m} [{backend}] {status}" for m, backend, status in stale]
+
+
+def write_baseline(path: Path, baseline: dict, results: dict, axis: dict) -> None:
+    backend = axis["backend"]
     modules = baseline.setdefault("modules", {})
+    # File-scoped and last-writer-wins: a two-backend baseline carries whichever
+    # value the more recent bless wrote, for both. Kept for the readers that
+    # already expect the key; `provenance[backend]["stdlib_version"]` is the one
+    # that is actually per-measurement.
     baseline["stdlib_version"] = stdlib_version()
+    # Everything except the cell's own key. `backend` identifies the cell, so
+    # repeating it inside would be a second copy free to disagree with the key
+    # it sits under.
+    cell_axis = {k: v for k, v in axis.items() if k != "backend"}
     for m, (status, _detail) in results.items():
         entry = modules.setdefault(m, {})
         # A curated KNOWN_SKIP stays SKIP regardless of what the run observed
@@ -634,9 +848,47 @@ def write_baseline(path: Path, baseline: dict, results: dict, backend: str) -> N
         # `results` (phantom skips that no longer exist) are simply not added.
         if m in KNOWN_SKIPS:
             entry[backend] = "SKIP"
-            entry.setdefault("reason", KNOWN_SKIPS[m])
+            # Refreshed rather than `setdefault`: KNOWN_SKIPS is the curated
+            # source of truth for these rows, and a write-once `reason` means an
+            # edit to the table never reaches the file.
+            #
+            # Per ROW, not per cell. The skip decision carries no backend — the
+            # selection predicate reads `m in KNOWN_SKIPS` on its own — unlike
+            # `provenance`, which is per cell because it describes a measurement
+            # and each backend measures its own.
+            #
+            # The branch scopes this to curated modules, which is what keeps it
+            # safe: a `reason` written into the baseline by hand to annotate a
+            # non-PASS status is a different producer recording a different
+            # thing, and no curated text is ever written over it from here.
+            #
+            # A curated row carrying a DIFFERENT reason is the one case where
+            # the refresh destroys something, because that is where the two
+            # producers meet: a hand-written rationale can only be told from a
+            # superseded curated one by reading both. Printed rather than
+            # refused — the curated table is still the source of truth for
+            # these rows — but never silently.
+            recorded = entry.get("reason")
+            if recorded is not None and recorded != KNOWN_SKIPS[m]:
+                # Leading blank line: the improvements block prints immediately
+                # above, and an unseparated `  ! ` line reads as one of its rows.
+                print(f"\n  ! {m}: recorded `reason` replaced by the curated text")
+                print(f"      was    : {recorded}")
+                print(f"      curated: {KNOWN_SKIPS[m]}")
+            entry["reason"] = KNOWN_SKIPS[m]
+            # No provenance: this cell records a decision, and the run's axis
+            # did not produce it. Any provenance already there described a
+            # measurement that the SKIP has now replaced, so it is dropped
+            # rather than carried — a stale axis under a status it never
+            # described is worse than none.
+            prov = entry.get("provenance")
+            if prov is not None:
+                prov.pop(backend, None)
+                if not prov:
+                    del entry["provenance"]
         else:
             entry[backend] = status
+            entry.setdefault("provenance", {})[backend] = dict(cell_axis)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")

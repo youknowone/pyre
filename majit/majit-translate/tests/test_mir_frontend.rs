@@ -748,3 +748,346 @@ fn option_question_mark_lifts_to_direct_option_switch() {
     );
     assert_eq!(none_ctor, 1, "the None arm builds the normal None return");
 }
+
+// The header-first class universe (`W_Root` shape).
+//
+// Three lowering premises a class-based, `Arc`-free value universe rests
+// on. Each degrades silently when it does not hold — a worse graph, never
+// an error — so each is pinned here rather than discovered downstream.
+//
+// The fourth premise (an `_immutable_fields_<Struct>` marker folding the
+// payload read to a pure getfield) is NOT checkable at this layer:
+// `harvest_immutable_fields_from_llbcs` feeds `CallControl`, which the
+// codewriter consumes (`codewriter/jtransform.rs`), well past
+// `lower_function`. The corpus carries the marker
+// (`_immutable_fields_W_IntObject`) so a codewriter-level test can pick
+// it up; the `FieldRead.pure` flag here stays `false` by construction.
+/// Premise 1 — a `(*w).ob_type` read off a raw pointer arrives as a
+/// *typed* field read: `front::mir` narrows the classdef-less deref base
+/// through `__pyre_cast_instance/<pointee root>` first, so the read
+/// resolves an owner root and a struct id instead of blocking the
+/// annotator on a classdef-less instance.
+#[test]
+fn cel_header_read_narrows_to_a_typed_field_read() {
+    use majit_translate::model::{CallTarget, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "cel_w_type").expect("lowering");
+    assert_eq!(graph.name, "charon_corpus::cel_w_type");
+
+    let mut narrows = 0usize;
+    let mut typed_header_reads = 0usize;
+    let mut untyped_field_reads = 0usize;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.as_slice()
+                    == ["__pyre_cast_instance".to_string(), "CelObject".to_string()] =>
+                {
+                    narrows += 1
+                }
+                OpKind::FieldRead { field, .. } if field.name == "ob_type" => {
+                    if field.owner_root.as_deref() == Some("CelObject") && field.owner_id.is_some()
+                    {
+                        typed_header_reads += 1;
+                    } else {
+                        untyped_field_reads += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(narrows, 1, "the deref base is narrowed exactly once");
+    assert_eq!(typed_header_reads, 1, "ob_type reads as a typed FieldRead");
+    assert_eq!(
+        untyped_field_reads, 0,
+        "no classdef-less header read survives the narrow",
+    );
+}
+
+/// Premise 2 — the boxing cluster fuses to one `NewWithVtable`, but only
+/// once the class-static's address resolves to a constant.
+///
+/// Both halves are asserted, because the failing half is silent:
+/// `fuse_boxing_alloc` declines with a bare `continue` when
+/// `resolve_vtable_addr` returns 0, leaving `lltype::malloc_typed` a
+/// residual call and emitting no diagnostic. In a pure-translate fixture
+/// the `&CEL_INT_CLASS` read lowers to a residual `FunctionPath` call
+/// rather than a `ConstRefAddr`, exactly as the decline's own comment
+/// describes for `HostStaticAddrs.pytypes` being empty. Substituting the
+/// constants the production driver would supply isolates those inputs:
+/// everything else about the cluster — the single by-value `malloc_typed`
+/// argument, the `SyntheticTransparentCtor` aggregate, both header fields,
+/// and the payload store — already matches.
+#[test]
+fn cel_boxing_cluster_fuses_once_the_class_address_resolves() {
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+
+    const CLASS_ADDR: i64 = 0x00C0_FFEE;
+    let attrs = std::collections::HashMap::from([(
+        "W_IntObject".to_string(),
+        vec![
+            ("ob_header".to_string(), ValueType::Ref(None)),
+            ("intval".to_string(), ValueType::Int),
+        ],
+    )]);
+
+    let llbc = load_corpus();
+
+    // Without a resolvable class address the cluster is left alone.
+    let mut graph = lower_function(llbc, "cel_new_int").expect("lowering");
+    assert_eq!(
+        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        0,
+        "an unresolvable class-static address declines the fuse, silently",
+    );
+
+    // Stand in for the driver-supplied static address.
+    let mut graph = lower_function(llbc, "cel_new_int").expect("lowering");
+    let mut substituted = 0usize;
+    for b in &mut graph.blocks {
+        for op in &mut b.operations {
+            let is_class_static = matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("CEL_INT_CLASS")
+            );
+            if is_class_static {
+                op.kind = OpKind::ConstRefAddr(CLASS_ADDR);
+                substituted += 1;
+            }
+        }
+    }
+    assert_eq!(
+        substituted, 2,
+        "ob_type and w_class each read the class static",
+    );
+
+    assert_eq!(
+        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
+        1,
+        "the cluster fuses once the class address is a constant",
+    );
+
+    let mut fused = Vec::new();
+    let mut payload_stores = 0usize;
+    let mut residual_mallocs = 0usize;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
+                OpKind::FieldWrite { field, .. } if field.name == "intval" => payload_stores += 1,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("malloc_typed") => {
+                    residual_mallocs += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        fused,
+        vec![("W_IntObject".to_string(), CLASS_ADDR)],
+        "one NewWithVtable carrying the real class pointer",
+    );
+    // Two: the re-emitted store after the `NewWithVtable`, plus the original
+    // aggregate store, which is dead but not yet swept — `fuse_boxing_alloc`
+    // leaves that to the `remove_dead_aggregates` pass in
+    // `simplify_lowered_graph`.
+    assert_eq!(payload_stores, 2, "the intval payload store is re-emitted");
+    assert_eq!(
+        residual_mallocs, 0,
+        "the malloc_typed call is consumed, not left residual",
+    );
+}
+
+/// Premise 2, continued — the real lowering, with no hand substitution:
+/// supplying the class-static's address through the one channel that
+/// exists for it (`HostStaticAddrs.pytypes`) is by itself enough to make
+/// the cluster fuse, and the narrow the address lowers through carries
+/// the crate's OWN class root (`CelClass`), not pyre's `PyType`.
+///
+/// The fuse happens inside `lower_fun_decl_*` — `simplify_lowered_graph`
+/// runs `fuse_boxing_alloc` (`front/mir.rs:2561`) — so the assertion is
+/// on the lowered graph's contents, and a second explicit
+/// `fuse_boxing_alloc` here would report `0` for the trivial reason that
+/// nothing is left to fuse. The sibling test above keeps the
+/// hand-substituted half, so the two remain distinguishable: that one
+/// isolates `fuse_boxing_alloc`'s input, this one pins the whole path
+/// from the LLBC to the `NewWithVtable`.
+///
+/// The root matters beyond the fuse: `cel_add` compares `(*a).ob_type`
+/// (typed `CelClass`) against `&CEL_INT_CLASS`, and `rtype_is_` lowers
+/// that pointer identity only when both sides carry the same instance
+/// root. Stamping pyre's `PyType` on a `CelClass` would type the two
+/// sides apart.
+#[test]
+fn cel_boxing_cluster_fuses_from_the_host_supplied_class_address() {
+    use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+
+    const CLASS_ADDR: i64 = 0x00C0_FFEE;
+    let llbc = load_corpus();
+    let static_addrs = majit_translate::HostStaticAddrs {
+        pytypes: &[("CEL_INT_CLASS", CLASS_ADDR)],
+        ..Default::default()
+    };
+
+    let fd = llbc.local_fn("cel_new_int").expect("cel_new_int in corpus");
+    let graph = lower_fun_decl_with_static_addrs(llbc, fd, static_addrs).expect("lowering");
+
+    let mut fused = Vec::new();
+    let mut payload_stores = 0usize;
+    let mut residual_mallocs = 0usize;
+    let mut residual_class_reads = 0usize;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::NewWithVtable { owner, vtable } => fused.push((owner.clone(), *vtable)),
+                OpKind::FieldWrite { field, .. } if field.name == "intval" => payload_stores += 1,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => match segments.last().map(String::as_str) {
+                    Some("malloc_typed") => residual_mallocs += 1,
+                    Some("CEL_INT_CLASS") => residual_class_reads += 1,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        fused,
+        vec![("W_IntObject".to_string(), CLASS_ADDR)],
+        "the real lowering fuses to one NewWithVtable carrying the class pointer",
+    );
+    assert_eq!(
+        residual_mallocs, 0,
+        "no residual lltype::malloc_typed survives",
+    );
+    assert_eq!(
+        residual_class_reads, 0,
+        "the class-static read resolved to the host address, not a residual call",
+    );
+    // One, not the two the hand-substituted sibling sees: the whole-graph
+    // lowering runs `remove_dead_aggregates` after the fuse, so the
+    // orphaned aggregate store is already swept here.
+    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
+
+    // The class root is the corpus's own, derived from `CEL_INT_CLASS`'s
+    // declared type. `cel_add` is the function that keeps the narrow live:
+    // in `cel_new_int` the fuse consumes the whole `ob_header.ob_type`
+    // chain, so the cast is swept along with it.
+    //
+    // Every narrow in the function is collected, not just the class
+    // static's, so the assertion reads the root off the graph instead of
+    // searching for the root it expects — a narrow stamped `PyType` shows
+    // up as a `PyType` row rather than as an empty result.
+    let add = llbc.local_fn("cel_add").expect("cel_add in corpus");
+    let add_graph = lower_fun_decl_with_static_addrs(llbc, add, static_addrs).expect("lowering");
+    let mut narrow_roots = std::collections::BTreeMap::new();
+    let mut class_addr_narrowed = 0usize;
+    for b in &add_graph.blocks {
+        for op in &b.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.first().map(String::as_str) != Some("__pyre_cast_instance") {
+                continue;
+            }
+            let root = segments.get(1).cloned().unwrap_or_default();
+            *narrow_roots.entry(root.clone()).or_insert(0usize) += 1;
+            assert_eq!(
+                result_ty,
+                &ValueType::Ref(Some(root.clone())),
+                "a narrow's result type is its own root",
+            );
+            // The narrow whose operand is the host-supplied class address
+            // is the one this test is about.
+            let narrows_class_addr = add_graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|p| {
+                    p.result.as_ref() == args.first()
+                        && matches!(p.kind, OpKind::ConstRefAddr(a) if a == CLASS_ADDR)
+                });
+            if narrows_class_addr {
+                class_addr_narrowed += 1;
+                assert_eq!(
+                    root, "CelClass",
+                    "the class-static address narrows to the corpus's own class root",
+                );
+            }
+        }
+    }
+    assert_eq!(
+        class_addr_narrowed, 1,
+        "the host-supplied class address is narrowed exactly once",
+    );
+    assert_eq!(
+        narrow_roots,
+        std::collections::BTreeMap::from([
+            ("CelClass".to_string(), 1usize),
+            ("CelObject".to_string(), 2),
+            ("W_IntObject".to_string(), 2),
+        ]),
+        "no narrow in the corpus carries pyre's PyType root",
+    );
+}
+
+/// Premise 3 — an arm of the pointer-identity narrowing chain lowers to a
+/// direct `FunctionPath` call. This is the shape that can inline; a call
+/// through a function-pointer table or a `dyn` receiver instead reaches
+/// the `__dyn_call` placeholder, which stops the graph that consumes it.
+#[test]
+fn cel_narrowing_chain_arm_lowers_to_a_direct_call() {
+    use majit_translate::model::{CallTarget, OpKind};
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "cel_add").expect("lowering");
+
+    let mut direct_arm_calls = 0usize;
+    let mut dyn_calls = 0usize;
+    let mut header_reads = 0usize;
+    let mut identity_eqs = 0usize;
+    for b in &graph.blocks {
+        for op in &b.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => match segments.last().map(String::as_str) {
+                    Some("w_int_add") => direct_arm_calls += 1,
+                    Some("__dyn_call") => dyn_calls += 1,
+                    _ => {}
+                },
+                OpKind::FieldRead { field, .. } if field.name == "ob_type" => header_reads += 1,
+                OpKind::BinOp { op, .. } if op == "eq" => identity_eqs += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(direct_arm_calls, 1, "the taken arm is a direct call");
+    assert_eq!(
+        dyn_calls, 0,
+        "no arm degrades to the __dyn_call placeholder"
+    );
+    assert_eq!(header_reads, 2, "both receivers' class words are read");
+    assert_eq!(
+        identity_eqs, 2,
+        "type(a) is type(b), then the per-class shortcut",
+    );
+}

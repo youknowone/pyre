@@ -2847,7 +2847,7 @@ impl TraceCtx {
     /// responsible for deduplicating box positions across frames
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
-    /// `resume.rs:1898 _number_boxes`).
+    /// `resume.rs::_number_boxes`).
     pub fn capture_snapshot_for_last_guard_multi_frame(
         &mut self,
         frames: &[(u32, u32, u32, &[OpRef])],

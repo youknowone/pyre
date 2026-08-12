@@ -54,6 +54,115 @@ jobs:
     - name: Run cargo fmt --check
       run: cargo fmt --all -- --check
 
+  rustdoc-links:
+    name: rustdoc links (ratcheted crate list)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: cargo doc -D warnings on the cleared crates
+      # A RATCHET, not a flat gate, and the distinction is load-bearing.
+      #
+      # Nothing in this repository ran `cargo doc` before this job, so rustdoc's
+      # warn-by-default lints have never been read: when this job landed
+      # (4cd2cc56813) the 12 majit crates carried 400 warnings — 217
+      # `unresolved link`, 175 `private_intra_doc_links`, 8
+      # `invalid_html_tags`. That census is dated, not current. A workspace-wide
+      # `-D warnings` would therefore be red the day it lands, and a gate that is
+      # red on arrival gets `continue-on-error`'d or deleted rather than fixed.
+      #
+      # So this grades only the crates already at zero. To extend it: clear a
+      # crate, add its `-p` flag below, and that zero is locked in permanently.
+      # THIS LIST IS THE PROGRESS RECORD — a note elsewhere would rot, a `-p`
+      # flag cannot, because removing one is a visible diff.
+      #
+      # ⚠ A lint level is only half a gate; the other half is something that runs
+      # the tool. `[lints.rustdoc] … = "deny"` in a Cargo.toml would still be
+      # inert here, because no job invoked rustdoc at all. That is why the level
+      # lives in this job's env and not in the manifests.
+      #
+      # `--no-deps` keeps the verdict about this workspace's own doc comments; a
+      # dependency's warnings are not ours to fix and would make the gate hostage
+      # to a version bump. `--locked` because `Cargo.lock` is the first entry of
+      # the LLBC closure and a lockfile rewrite stales every extracted artefact.
+      #
+      # ⚠ SCOPE OF THE ZERO — THE THREE LINT FAMILIES DO NOT HAVE EQUAL REACH,
+      # so "this crate is clean" means different things for each. Measured by
+      # mutation on a private struct field and a `pub fn` one file apart:
+      #
+      #   invalid_html_tags        fires on private items      ⇒ whole crate
+      #   broken_intra_doc_links   does NOT fire on private     ⇒ public only
+      #   private_intra_doc_links  is by definition public-doc  ⇒ public only
+      #
+      # Link resolution runs only for items rustdoc renders, and it does not
+      # render private items without a flag; the HTML lint reads every doc
+      # comment it parses. So the unresolved-link zero below covers the public
+      # API and nothing more: the crates listed below read 0/0/0 here, while
+      # behind `--document-private-items` there is a real ungraded population.
+      # ⚠ THAT POPULATION'S SIZE IS DATED AND ITS SCOPE HAS SINCE MOVED. The
+      # recorded 18 unresolved + 2 private-item links were measured over the
+      # FOUR crates this job shipped with; `majit-metainterp` joined the list
+      # afterwards (0f76048be00) and was never folded into that figure, so the
+      # number for the current list is UNMEASURED rather than 20. Re-measure
+      # before citing it. Adding the flag is the obvious extension and is
+      # deliberately NOT taken, because it would make this job red the day it
+      # lands — the one property the ratchet exists to avoid.
+      #
+      # ⛔ Do not restate the CURRENT crate count in this comment. It drifted
+      # once already (the prose said "four" while the list below had grown to
+      # five); the `-p` list is the only statement of it that cannot go stale.
+      # Naming the count a past measurement was taken over is fine and is done
+      # above — that number describes a population, not the list.
+      #
+      # ARMED, not assumed — every claim above is a mutation that moved the rc:
+      #   pub fn + unresolved link      (majit-trace)   rc=101
+      #   public doc -> private item    (majit-macros)  rc=101
+      #   private field + `Vec<u8>`     (majit-trace)   rc=101  (HTML lint)
+      #   private field + broken link   (majit-trace)   rc=0    ⇐ the blind spot
+      # All four mutants reverted; the clean run documents every crate in the
+      # list below and returns 0. (Those four arms were taken over the four
+      # crates the job shipped with, so they do not cover the later additions.)
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: |
+        cargo doc --no-deps --locked \
+          -p majit-rlib \
+          -p majit-backend-cranelift \
+          -p majit-trace \
+          -p majit-macros \
+          -p majit-metainterp
+
+  backend-edge:
+    name: backend-edge (every metainterp dependent selects a backend)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    # No cache and no build: the script only runs `cargo tree`/`cargo metadata`,
+    # which resolve features WITHOUT running build scripts. That is the whole
+    # design -- the defect it catches is a feature-RESOLUTION failure, so it is
+    # decided before any compilation, and this leg stays readable even when the
+    # LLBC staleness gate is red. ~15s on 38 members.
+    #
+    # ⇒ It therefore needs NO `PYRE_LLBC_STRICT=0`. Measured 2026-08-10 with the
+    # env unset, in both states a runner can present: with all four `build/llbc`
+    # stamps stale (the tree-wide RC=101 state) and on a fresh checkout with no
+    # `build/llbc` at all -- 24/14/0 and RC=0 in both, creating no artefacts.
+    #
+    # ⛔ AND THE COST OF THAT: a green run here does NOT mean the workspace
+    # compiles. This leg never builds anything. Do not read it as a smoke test,
+    # and do not "fix" a red compile job by pointing at this one being green.
+    #
+    # ⚠ Deliberately NOT folded into an existing job: every other leg that
+    # touches cargo passes `--no-default-features --features dynasm`, which
+    # supplies a backend workspace-wide and is exactly what hides this defect.
+    - name: Check the backend-default edge
+      run: scripts/check-backend-edge.py
+
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
@@ -290,6 +399,24 @@ jobs:
           /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost
         sudo docker image prune --all --force || true
         df -h /
+    - name: Build test binaries (dynasm)
+      shell: bash
+      # Compile the test targets as their own step, so a build break and a test
+      # failure are DIFFERENT red steps.
+      #
+      # Why this is not redundant with the step below: `cargo test` compiles and
+      # runs in one command, and if compilation fails it prints no `test result:`
+      # line at all. The job goes red for the build error, and every test brake in
+      # the workspace — each one written to fail loudly on a real regression — is
+      # then indistinguishable in the log from a brake that passed. Measured: run
+      # 31313527437 died on one `E0063` in `majit-metainterp (lib test)` and
+      # emitted ZERO test results on all three hosts, so nothing the suite checks
+      # was actually checked, on any of them.
+      #
+      # With this step green, the next step's result is a statement about tests.
+      # Costs no extra compile time: the run below reuses these artifacts.
+      run: cargo test --all --no-run --no-default-features --features dynasm
+
     - name: Run cargo tests (dynasm)
       shell: bash
       # Only ONE full-workspace run. The dynasm pass runs the whole workspace
@@ -301,6 +428,20 @@ jobs:
       # relinking ~15 extra test binaries (the majit-translate harness alone
       # links >2900 tests).
       run: cargo test --all --no-default-features --features dynasm
+
+    - name: Build test binaries (cranelift)
+      shell: bash
+      # Same split as the dynasm leg above: compile first, so this leg's red
+      # means "does not build" and the next step's red means "tests failed".
+      # The crate list is kept identical to the run below — a build step that
+      # covers a different set than the step it vouches for is worse than none,
+      # because it certifies something nobody is about to run.
+      run: |
+        cargo test --no-run --no-default-features --features cranelift \
+          -p majit-metainterp -p majit-backend-cranelift \
+          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
+          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
+          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount -p cel
 
     - name: Run cargo tests (cranelift)
       shell: bash
@@ -314,12 +455,42 @@ jobs:
       # backend through `majit-metainterp/{dynasm,cranelift}`). Test EXECUTION is
       # cheap (~7s for the whole workspace); the cost this avoids is the second
       # backend's compile+link of those otherwise-identical harnesses.
+      #
+      # ⚠ `-p cel` here is a COMPILE CHECK ONLY and runs zero cel tests. All five
+      # of cel's gates self-ignore under `debug_assertions` (they compare
+      # wrapping i64 and bit-exact float results, which a debug profile panics
+      # on), and this leg — like the dynasm leg above — is debug. The gates run
+      # in the release step below, which is dynasm-only, so no cel gate is
+      # exercised under cranelift anywhere in CI. Keeping `-p cel` is still worth
+      # it: it is what catches a cranelift-only compile break in the crate.
       run: |
         cargo test --no-default-features --features cranelift \
           -p majit-metainterp -p majit-backend-cranelift \
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
-          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
+          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount -p cel
+
+    - name: Run cel's release-only probe gates (Linux only)
+      # cel's five gate tests self-ignore under `debug_assertions` — they compare
+      # wrapping i64 and bit-exact float results across a clean interpreter, a
+      # JIT-off run and a JIT-on run, and a debug profile panics on the overflow
+      # instead of wrapping — so both `cargo test` steps above report them
+      # `ignored`. This is the step that runs them, and it is the only one: left
+      # unrun the crate is back where it was before it had tests, which is unable
+      # to fail a test run, only now with a green badge over it. The precedent
+      # this copies (the dispatcher-graph step in the pyre/check.py job) records
+      # what that costs: "left unrun it rots".
+      #
+      # Only the gate halves run here; each probe's timing loops stay in the
+      # binary (`cargo run -p cel --release`), where `probe` alone times nine
+      # interleaved rounds over 20M rows. The gates take under a second.
+      #
+      # Linux only, and dynasm only, because what this buys over the two steps
+      # above is a release profile, and paying for one on three hosts times two
+      # backends is four more release builds of the majit stack for the same
+      # assertions. A backend-specific miscompile on cranelift is not covered.
+      if: runner.os == 'Linux'
+      run: cargo test --release -p cel --no-default-features --features dynasm
 
   cargo-test-macos:
     name: cargo test (macos-latest)

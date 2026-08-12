@@ -25,6 +25,14 @@ const HI: i64 = i64::MAX; // `draw >= HI` ~always false, not foldable
 
 struct VmState {
     regs: Vec<i64>,
+    /// What `OP_RETURN` hands back.
+    ///
+    /// The `; state` merge point leaves the loop through `break` before it
+    /// assigns the walk's resume pc, so after the loop `pc` still names the
+    /// position the walk started from and `program[pc + 1]` — the operand
+    /// saying which register holds the result — cannot be read there. The
+    /// result has to arrive in `state`.
+    ret: i64,
 }
 
 #[majit_macros::jit_interp(
@@ -33,6 +41,7 @@ struct VmState {
     greens = [pc, program],
     state_fields = {
         regs: [int; virt],
+        ret: int,
     },
 )]
 fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
@@ -45,6 +54,7 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     let _stacksize: i32 = 0;
     let mut state = VmState {
         regs: vec![0; num_regs],
+        ret: 0,
     };
 
     {
@@ -55,7 +65,11 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
     }
 
     loop {
-        jit_merge_point!();
+        // `; state` selects the single-executor close: the walk's final state is
+        // transferred into `state` here and the native loop resumes at the close
+        // pc, instead of discarding the walk outcome and re-running the circuit
+        // the walk already executed.
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         match opcode {
             OP_LOAD => {
@@ -112,14 +126,29 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 }
                 pc += 4;
             }
+            // Stores into `ret` and then leaves through an in-arm `return`,
+            // never `{ store; break }`: `classify.rs` `is_break_expr` requires
+            // the arm body to be exactly `break`, so a composite body classifies
+            // `Lowerable` and its tail `break` reaches `lower_stmt_fallback`,
+            // which guards an enclosed `return` but not an enclosed `break` —
+            // the statement is inert and is silently dropped, leaving the
+            // lowered arm to fall through to the dispatch back-edge.
             OP_RETURN => {
                 let r = program[pc + 1] as usize;
-                return state.regs[r];
+                state.ret = state.regs[r];
+                return state.ret;
             }
-            _ => break,
+            // Was `_ => break` with the panic below the loop. The loop now has a
+            // second way out — the merge point's own `break` on a walk that
+            // reached a terminal return — so falling out of it no longer
+            // identifies a bad opcode, and the panic moves into the arm that
+            // actually saw one.
+            _ => panic!("fell off end of code"),
         }
     }
-    panic!("fell off end of code");
+    // Reached only when the merge point broke out on a walk that already ran the
+    // terminal opcode, so the result is whatever that opcode parked in `ret`.
+    state.ret
 }
 
 fn clean_interp(program: &Code, num_regs: usize) -> i64 {
@@ -470,7 +499,24 @@ fn time_ns<F: Fn() -> i64>(n: i64, f: F) -> f64 {
     t.elapsed().as_nanos() as f64 / n as f64
 }
 
-fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
+/// One regime's correctness + tier-liveness gate, with no timing in it.
+///
+/// `on_c == expect_compiles` says a trace was minted for each loop the regime
+/// has. It does not say a trace has a real body — an empty dispatch still
+/// compiles one whose whole optimized body is `Finish()` — so this is the
+/// liveness half only.
+///
+/// The count is pinned exactly rather than as `>= 1`. That is what separates the
+/// two comprehension regimes: `LOOP` compiles both the inner loop and the outer
+/// row loop, `UNROLL` compiles only the outer one because the inner is unrolled
+/// against the green length. A lower bound reads 1 as a pass for both and so
+/// cannot see the unroll stop happening — which is the property these two
+/// regimes exist to compare.
+///
+/// The `pass-rate` line moved here from below the timing loop with it: it
+/// reports the gate's own `on`, and is now printed before the timing rather than
+/// after.
+fn gate_regime(name: &str, prog: &[i64], n: i64, expect_compiles: usize) {
     COMPILES.store(0, Ordering::Relaxed);
     let clean = clean_interp(prog, NUM_REGS);
     let off = mainloop(prog, NUM_REGS, JIT_OFF);
@@ -484,6 +530,23 @@ fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
         "{name}: clean vs JIT-on divergence -> miscompile"
     );
     assert_eq!(off_c, 0, "{name}: JIT-off must not compile");
+    // Unlike `column` and `colscalar`, which are diagnostics that report either
+    // outcome, this probe's numbers only mean anything if a trace ran: a JIT
+    // that compiled nothing still answers correctly through the interpreter, so
+    // the three equality gates above stay green and the kill-bar below just
+    // prints FAIL. Nothing else here would change the exit code.
+    assert_eq!(
+        on_c, expect_compiles,
+        "{name}: JIT-on must compile exactly this regime's loops"
+    );
+    println!(
+        "[{name}] pass-rate={:.1}%  compiles(on)={on_c}",
+        100.0 * on as f64 / n as f64
+    );
+}
+
+fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize, expect_compiles: usize) {
+    gate_regime(name, prog, n, expect_compiles);
 
     let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..rounds {
@@ -492,10 +555,6 @@ fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
         a.push(time_ns(n, || mainloop(prog, NUM_REGS, JIT_ON)));
     }
     let (a, b, c) = (median(a), median(b), median(c));
-    println!(
-        "[{name}] pass-rate={:.1}%  compiles(on)={on_c}",
-        100.0 * on as f64 / n as f64
-    );
     println!("  (a) JIT-on {a:.3}  (b) clean {b:.3}  (c) JIT-off {c:.3}  ns/eval");
     println!(
         "  (b)/(a) clean-vs-trace = {:.2}x   kill-bar>=3x: {}",
@@ -504,36 +563,107 @@ fn run_regime(name: &str, prog: &[i64], n: i64, rounds: usize) {
     );
 }
 
-pub fn run() {
-    let n: i64 = 5_000_000;
-    println!("policy: account.balance >= txn.amount && !account.frozen  (slot-resolved)\n");
-    run_regime("SKEWED  ", &skewed_program(n), n, 5);
-    println!();
-    run_regime("UNBIASED", &unbiased_program(n), n, 5);
+/// One regime: the banner printed before it (if it opens a group), its name,
+/// its program, its row count, and how many timing rounds `run` gives it.
+struct Regime {
+    banner: Option<&'static str>,
+    name: String,
+    prog: Vec<i64>,
+    n: i64,
+    rounds: usize,
+    /// How many loops this regime's program compiles under JIT-on. Pinned per
+    /// regime rather than as a lower bound because the unrolled comprehension
+    /// differs from the looping one by exactly this count.
+    compiles: usize,
+}
+
+/// Every regime the probe covers, with the row counts divided by `scale`.
+///
+/// `run` walks this at `scale = 1`; [`run_gates`] walks the SAME list at a
+/// larger scale, so a regime added here is gated by the test as well as timed by
+/// the binary and the two cannot drift apart. Dividing is sound because what the
+/// gate asserts — three-way equality and a compiled loop — holds at any row
+/// count past the trace threshold.
+fn regimes(scale: i64) -> Vec<Regime> {
+    let n = 5_000_000 / scale;
+    let mut out = vec![
+        Regime {
+            banner: None,
+            name: "SKEWED  ".to_string(),
+            prog: skewed_program(n),
+            n,
+            rounds: 5,
+            compiles: 1,
+        },
+        Regime {
+            banner: Some(""),
+            name: "UNBIASED".to_string(),
+            prog: unbiased_program(n),
+            n,
+            rounds: 5,
+            compiles: 1,
+        },
+    ];
 
     // Comprehension: nested loop, ns/eval is per-ROW (each row runs `listlen`
     // inner iterations). Sweep listlen to find where the inner loop amortizes
     // its trace entry/exit. Lean (few rounds, small total work) because JIT-on
     // may thrash. Total inner work n*listlen kept ~1M.
-    println!("\ncomprehension (INNER LOOP): size(list.filter(x, x >= 0))  — sweep list length\n");
+    let mut banner =
+        Some("\ncomprehension (INNER LOOP): size(list.filter(x, x >= 0))  — sweep list length\n");
     for &listlen in &[8_i64, 64, 1024] {
-        let nc = (1_000_000 / listlen).max(4_000);
-        run_regime(
-            &format!("LOOP    len={listlen:<4}"),
-            &comprehension_program(nc, listlen),
-            nc,
-            3,
-        );
+        let nc = (1_000_000 / scale / listlen).max(4_000 / scale);
+        out.push(Regime {
+            banner: banner.take(),
+            name: format!("LOOP    len={listlen:<4}"),
+            prog: comprehension_program(nc, listlen),
+            n: nc,
+            rounds: 3,
+            // The inner comprehension loop and the outer row loop.
+            compiles: 2,
+        });
     }
 
-    println!("\ncomprehension (UNROLLED, green length) — same work, inner loop unrolled\n");
+    let mut banner =
+        Some("\ncomprehension (UNROLLED, green length) — same work, inner loop unrolled\n");
     for &listlen in &[8_i64, 64] {
-        let nc = (8_000_000 / listlen).max(50_000);
-        run_regime(
-            &format!("UNROLL  len={listlen:<4}"),
-            &comprehension_unrolled_program(nc, listlen),
-            nc,
-            5,
-        );
+        let nc = (8_000_000 / scale / listlen).max(50_000 / scale);
+        out.push(Regime {
+            banner: banner.take(),
+            name: format!("UNROLL  len={listlen:<4}"),
+            prog: comprehension_unrolled_program(nc, listlen),
+            n: nc,
+            rounds: 5,
+            // The outer row loop only: the inner one is unrolled.
+            compiles: 1,
+        });
+    }
+    out
+}
+
+/// How much smaller the gate-only walk is than the binary's. Chosen so the whole
+/// walk gates in well under a second; the trace threshold is 8, which every
+/// scaled row count still clears by three orders of magnitude.
+#[cfg(test)]
+const GATE_SCALE: i64 = 25;
+
+/// Every regime's gate, with none of the timing.
+#[cfg(test)]
+pub(crate) fn run_gates() {
+    for r in regimes(GATE_SCALE) {
+        if let Some(banner) = r.banner {
+            println!("{banner}");
+        }
+        gate_regime(&r.name, &r.prog, r.n, r.compiles);
+    }
+}
+
+pub fn run() {
+    println!("policy: account.balance >= txn.amount && !account.frozen  (slot-resolved)\n");
+    for r in regimes(1) {
+        if let Some(banner) = r.banner {
+            println!("{banner}");
+        }
+        run_regime(&r.name, &r.prog, r.n, r.rounds, r.compiles);
     }
 }

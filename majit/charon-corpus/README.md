@@ -73,6 +73,31 @@ out in issue #97:
 | `parse_one`         | `match` with guards, internal helper for #4 | 9         |
 | `desugar_mix`       | `?` + `for` + `match` + `break`             | 22        |
 
+Plus the header-first class universe — the `W_Root` shape a class-based,
+`Arc`-free value representation needs. Each of these degrades *silently*
+when its lowering premise does not hold (a worse graph, never an error),
+so each is pinned by an assertion in
+`majit-translate/tests/test_mir_frontend.rs`:
+
+| Function       | Premise it pins                                            |
+|----------------|------------------------------------------------------------|
+| `cel_w_type`   | `(*w).ob_type` narrows to a *typed* `FieldRead`             |
+| `cel_new_int`  | the boxing cluster fuses to one `NewWithVtable`             |
+| `cel_add`      | a narrowing-chain arm lowers to a direct `FunctionPath` call |
+
+`cel_new_int` also pins the *decline*: with no driver-supplied class-static
+address the `&CEL_INT_CLASS` read lowers to a residual `FunctionPath` call
+rather than a `ConstRefAddr`, so `resolve_vtable_addr` returns 0 and
+`fuse_boxing_alloc` skips the cluster with a bare `continue`. The test
+asserts both halves — the decline, and the fuse once that one input is a
+constant — because only the second half is visible in an op census.
+
+`_immutable_fields_W_IntObject` is a hand-written marker const (the shape
+`front::llbc_hints::harvest_immutable_fields_from_llbcs` reads) so a
+codewriter-level test can check the payload read folding to a pure
+getfield. `lower_function` is upstream of that consumer, so no assertion
+in `test_mir_frontend.rs` covers it.
+
 ## Findings
 
 ### 1. `.llbc` top-level shape

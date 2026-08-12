@@ -2421,6 +2421,7 @@ impl Optimizer {
             start_next_pos,
         );
         ctx.skip_flush_mode = self.skip_flush;
+        ctx.building_bridge = self.building_bridge;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         // Seed the canonical `find_producer_op` surface (`input_ops`) with
         // the input ops' producers so they resolve directly; `find_producer_op`

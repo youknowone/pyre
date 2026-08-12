@@ -106,6 +106,47 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
         if pc >= program.len() {
             break;
         }
+        // Still the legacy bare form, but no longer for the reason it was
+        // reverted: that blocker is fixed and the conversion is still not
+        // exercisable.
+        //
+        // The arms below match byte-character literals (`b'>'`, `b'+'`, …), and
+        // those lower now. "majit macros: accept byte and char literals in
+        // dispatch arm patterns" routes `Pat::Lit` through `pat_lit_int_value`,
+        // which takes `Lit::Byte` and `Lit::Char`; "majit macros: register a
+        // dispatch arm the lowerer drops for an unsupported pattern" makes the
+        // remaining skip path register instead of vanishing. This interpreter
+        // now names one: `BfState::b']' lowered to an abort stub`.
+        //
+        // The pre-fix reading is kept because it is why the bare form is here.
+        // Before those two, every arm was dropped through a bare `continue` that
+        // ran before any stub was built, so nothing registered and the dispatch
+        // was empty. On the converted form, `MAJIT_STATS=1 --nocapture`, exact
+        // binary: `Traces compiled: 1` but `Total ops recorded: 1` and
+        // `Total ops after opt: 1` — the compiled body was the bare `Finish()` of
+        // an empty dispatch, against the tla control's 21 recorded / 10 after opt
+        // / 1 guard failure on the same instrument. That is the measurement
+        // behind "`Traces compiled > 0` proves nothing on its own", which still
+        // holds. Its companion no longer does: an empty `degraded_dispatch_arms()`
+        // was compatible with total loss only while the skip path registered
+        // nothing, and it now registers.
+        //
+        // What blocks the conversion today:
+        // The tier is live and every trace runs away to `trace_limit` and is
+        // segmented. Tracing starts at `key=113`, the `[`, and records 1602
+        // repetitions of that one arm's guard — `GuardValue(v0, 0);
+        // IntEq(v2, 0); GuardFalse` — on unchanged operands, with no pc advance
+        // and no tape write. Convert only once that stops.
+        //
+        // STOP: The `pc = pc + 1` suspicion that used to be recorded here is
+        // REFUTED as the account of `main()`'s non-termination, and the
+        // refutation is one measurement: the identical 1602 repetitions appear
+        // for a SEVEN-pass program that finishes in 0.03s. The runaway is a
+        // fixed-size, per-trace-attempt event, not a trip-count-dependent one —
+        // ops recorded is 1205/2405/4805/9605 for `trace_limit`
+        // 1500/3000/6000/12000, i.e. a function of the limit and of nothing
+        // else. A quantity that does not move with the workload cannot explain
+        // a symptom that only the large workload shows. See #47.
         jit_merge_point!();
         let ch = program[pc];
 

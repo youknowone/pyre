@@ -8524,6 +8524,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "arraylen_vable/rdd>i".to_string(),
         majit_translate::insns::BC_ARRAYLEN_VABLE,
     );
+    // Registered for the same reason the array-build family below is: the
+    // abort this op provokes resumes through the blackhole over the jitcode
+    // that contains it, so leaving the byte unresolved would panic
+    // `dispatch_step` on the op's own failure path.
+    insns.insert(
+        "arraybase_vable/rdd>i".to_string(),
+        majit_translate::insns::BC_ARRAYBASE_VABLE,
+    );
     // GC array-build family — `BuildTuple` / `BuildList` / `BuildMap` /
     // `BuildSet` / `BuildString` lower to `new_array_clear` (alloc) +
     // unrolled `setarrayitem_gc_r` (fill) + a `new*_from_array` residual
@@ -9181,6 +9189,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setarrayitem_vable_i/riidd", handler_setarrayitem_vable_i);
     builder.wire_handler("setarrayitem_vable_r/rirdd", handler_setarrayitem_vable_r);
     builder.wire_handler("arraylen_vable/rdd>i", handler_arraylen_vable);
+    builder.wire_handler("arraybase_vable/rdd>i", handler_arraybase_vable);
     builder.wire_handler("getarrayitem_raw_i/iid>i", handler_getarrayitem_raw_i);
     builder.wire_handler("setarrayitem_raw_i/iiid", handler_setarrayitem_raw_i);
     builder.wire_handler("conditional_call_ir_v/iiIRd", handler_conditional_call_ir_v);
@@ -9994,6 +10003,32 @@ fn handler_arraylen_vable(
     let ainfo = &vinfo.array_fields[array_idx];
     let len = unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) };
     bh.registers_i[code[p] as usize] = len as i64;
+    Ok(p + 1)
+}
+
+/// `arraybase_vable/rdd>i` — item-0 address of a virtualizable array.
+///
+/// Wiring this is not optional even though a trace carrying the op always
+/// aborts: the abort resumes through the blackhole over this very jitcode, so
+/// an unwired byte panics `dispatch_step` on exactly the path the op creates.
+/// Operand layout is `arraylen_vable`'s, so the decode is line-for-line its
+/// sibling above.
+///
+/// No escape signal is raised here. The signal exists to abort a *trace*, and
+/// the blackhole is already running because that abort happened.
+fn handler_arraybase_vable(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let vable = bh.registers_r[code[p] as usize];
+    let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
+    let (field_descr, p) = read_descr(bh, code, p + 1);
+    let array_idx = field_descr.as_vable_array_index();
+    let (_, p) = read_descr(bh, code, p);
+    let ainfo = &vinfo.array_fields[array_idx];
+    let base = unsafe { crate::virtualizable::bhimpl_arraybase_vable(vable as *const u8, ainfo) };
+    bh.registers_i[code[p] as usize] = base as usize as i64;
     Ok(p + 1)
 }
 

@@ -619,10 +619,69 @@ fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_i
         .collect()
 }
 
+thread_local! {
+    /// Scope key for the `translate_trace_iter` OpRef-variant audit: one value
+    /// per `prepare_bridge_trace_for_optimizer` call, never reused.
+    ///
+    /// The scope's only job is to keep two bridges' key tables apart. The
+    /// other two components of `note_key`'s slot are identical across bridges
+    /// by construction — the label is a literal and the key is a cache
+    /// position — and both production sites sit inside one
+    /// `translate_trace_iter_opref` call passing one scope value, so the scope
+    /// discriminates nothing WITHIN a call. Across calls is the only axis it
+    /// serves, and it is exactly the axis an address cannot carry: an address
+    /// identifies an object only while that object is alive, so a freed and
+    /// reallocated cache lands on the value its predecessor used and merges
+    /// the two bridges it was there to separate.
+    static AUDIT_PREPARE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Open a new audit scope, one per bridge preparation.
+///
+/// STOP: Bump this once per preparation, never inside `translate_trace_iter_opref`.
+/// That function runs once per OpRef — its three call sites are all per-operand
+/// closures — so minting there would give every note its own scope, driving
+/// `keys_seen` toward `notes` and making a collision unrepresentable. The audit
+/// would then report zero collisions because no two entries can share a table,
+/// which is byte-identical to what it reports when there is nothing wrong.
+///
+/// Wrapping is unreachable at one increment per compiled bridge and is spelled
+/// explicitly so the counter can never abort a debug build from an audit path.
+fn next_audit_prepare_generation() {
+    AUDIT_PREPARE_GENERATION.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The scope opened by the most recent `prepare_bridge_trace_for_optimizer` on
+/// this thread; 0 before any has run.
+///
+/// STOP: This reads a value the caller does not pass, so it is only meaningful
+/// below a `next_audit_prepare_generation` call. Every caller of
+/// `translate_trace_iter_opref` and `translate_trace_iter_box_map` is inside
+/// `prepare_bridge_trace_for_optimizer` and both functions are private to this
+/// module; a call sited anywhere else would file its keys under whichever
+/// bridge ran last.
+fn audit_prepare_generation() -> usize {
+    AUDIT_PREPARE_GENERATION.with(std::cell::Cell::get)
+}
+
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
     }
+    // Record which variants claim each SLOT of this cache — the query below
+    // and, once resolved, the operand the slot actually holds. Both are noted
+    // under `opref.raw()`, the slot, not under their own raws: they carry
+    // different raws by construction (`InputArgInt(0)` lands on a slot filled
+    // for `InputArgRef(4824)`), so keying each by its own raw files them
+    // apart and compares nothing.
+    //
+    // This is wider than the bank compare below, which fires only when the
+    // two banks disagree on `ty()`; `InputArgInt(n)` against `IntOp(n)` is the
+    // same `ty()` and passes it silently. The per-preparation generation
+    // scopes the keys to one bridge, so two bridges reusing a position are not
+    // a collision.
+    let audit_scope = audit_prepare_generation();
+    majit_ir::opref_audit::note_key("translate_trace_iter", audit_scope, opref.raw(), opref);
     // opencoder.py:286-289 `_get(self, i)` parity — `assert _cache[i] is
     // not None`. The bridge fresh-iterator
     // (`prepare_bridge_trace_for_optimizer`) writes `_cache[old_pos] =
@@ -705,6 +764,11 @@ fn prepare_bridge_trace_for_optimizer(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
+    // Open this bridge's audit scope before anything reads it. Every caller of
+    // `translate_trace_iter_opref` and `translate_trace_iter_box_map` is below
+    // this line, so the keys they file all carry this call's generation and no
+    // two preparations share one.
+    next_audit_prepare_generation();
     // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh

@@ -677,6 +677,16 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
+    /// Bridge mode from `optimizer.building_bridge` (unroll.py:183-236
+    /// `optimize_bridge`).
+    ///
+    /// A bridge's inputargs are rebuilt from the deadframe frame-first, so the
+    /// virtualizable identity sits at slot 0 whatever the front end's own
+    /// layout says. `inputarg_base` cannot carry that distinction: Phase 2
+    /// shifts the base as well (`unroll.rs` `phase2_inputarg_base`), so a
+    /// consumer keying on `inputarg_base != 0` treats an unrolled loop body as
+    /// a bridge. This flag is the discriminator; the base is the namespace.
+    pub building_bridge: bool,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -1064,8 +1074,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn is_virtual_raw(&self, opref: OpRef) -> bool {
         // info.py:865 `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
         // virtuals.  `get_type()` already classifies these as Int; mirror
-        // the classification here so resume encoding (`resume.rs:3672`)
-        // picks them up via TAGVIRTUAL instead of TAGBOX.
+        // the classification here so resume encoding
+        // (`ResumeDataLoopMemo::_number_boxes`, whose `Type::Int` arm calls
+        // `is_virtual_raw`) picks them up via TAGVIRTUAL instead of TAGBOX.
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
         resolved_box
             .as_ref()
@@ -1176,8 +1187,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             //         self.parent.visitor_walk_recursive(source_op, visitor)
             // ```
             //
-            // pyre's consumer (`resume.rs::encode_*` worklist at
-            // `resume.rs:3517`) drives the recursion off `get_virtual_fields`
+            // pyre's consumer (the virtual worklist in
+            // `ResumeDataLoopMemo::finish`) drives the recursion off
+            // `get_virtual_fields`
             // — registering the parent OpRef here lets the worklist enqueue
             // the parent and re-enter `get_virtual_fields` on it, which
             // matches RPython's `parent.visitor_walk_recursive(source_op,
@@ -1678,6 +1690,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -2300,6 +2313,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -6286,6 +6300,86 @@ impl OptContext {
         // separate section after vable_array. opencoder.py:767
         // create_top_snapshot writes both arrays into the snapshot.
         snapshot.vref_array = vref_oprefs;
+
+        // Does a `SnapshotBox`'s carried `tp` agree with the type its `OpRef`
+        // variant already encodes?  Counted over the whole Snapshot handed to
+        // resume numbering: every framestack cell, plus `vable_array`, plus
+        // `vref_array`.
+        //
+        // The claim being graded is `SnapshotBox`'s own doc: "SnapshotBox
+        // copies it from the OpRef variant at construction time".  That is
+        // stated unconditionally, and `SnapshotBox::untyped` already does not
+        // do it — so the doc is not a description of every producer, and the
+        // gap between the two constructors is what this counts.
+        //
+        // THREE-VALUED, and the third value is reported rather than dropped.
+        // A cell is `agree`, `disagree`, or `untyped`.  `untyped` is NOT a
+        // population that was checked and found clean: `impl From<OpRef> for
+        // SnapshotBox` yields `SnapshotBox::untyped`, so `tp: None` is the
+        // CONSTRUCTOR'S DEFAULT and every box built through that blanket
+        // conversion lands there without any producer having decided a type.
+        // Dropping it silently would leave a denominator made of whichever
+        // boxes happened to be built the other way.
+        //
+        // The denominator counts PRESENCE CELLS, not distinct boxes.  One
+        // `OpRef` may occupy several cells — the same refs appear in
+        // `fail_args` and in `vable_array` — and each cell is a separate
+        // chance for a `tp` to disagree.
+        //
+        // STOP: A ZERO HERE IS NOT EVIDENCE THAT THE TWO NUMBERING SPACES AGREE.
+        // `OpRef::ty()` collapses `ConstInt | InputArgInt | IntOp` onto
+        // `Some(Type::Int)`, so `InputArgInt(7)` answered by `IntOp(7)` is a
+        // variant collision AND a `tp` agreement at the same time.  This
+        // instrument is stated through the same lossy accessor as the hazard
+        // it is pointed at, so read it BESIDE `opref_audit`'s collision
+        // counts, never instead of them.
+        //
+        // WARNING: The criterion this implements arrived spelled `BANKFLIP`, a token
+        // that occurs nowhere in either repository's history; it named no
+        // emitted quantity, so it had never been checkable rather than having
+        // drifted.  It is resolved here to the agree/disagree/untyped split
+        // below.  The resolution is written down rather than applied quietly,
+        // because a silently-resolved criterion cannot be told apart from one
+        // that was checked.
+        //
+        // Gated through `opref_audit::enabled()` rather than on a gate of its
+        // own: no new environment literal is read here, and arming this in the
+        // same process as the variant audit is what makes the STOP: above
+        // observable at all.
+        if majit_ir::opref_audit::enabled() {
+            let mut agree = 0usize;
+            let mut disagree = 0usize;
+            let mut untyped = 0usize;
+            let cells = snapshot
+                .framestack
+                .iter()
+                .flat_map(|frame| frame.boxes.iter())
+                .chain(snapshot.vable_array.iter())
+                .chain(snapshot.vref_array.iter());
+            for cell in cells {
+                let encoded = cell.opref.ty();
+                match cell.tp {
+                    None => untyped += 1,
+                    Some(tp) if Some(tp) == encoded => agree += 1,
+                    Some(tp) => {
+                        disagree += 1;
+                        eprintln!(
+                            "[snapbox-tp] DISAGREE opref={:?} tp={:?} ty={:?}",
+                            cell.opref, tp, encoded
+                        );
+                    }
+                }
+            }
+            // Printed even when `disagree` is 0: a zero is only readable
+            // beside the cells that were actually visited.
+            eprintln!(
+                "[snapbox-tp] cells={} agree={} disagree={} untyped={}",
+                agree + disagree + untyped,
+                agree,
+                disagree,
+                untyped
+            );
+        }
 
         if crate::callee_rca_enabled() {
             let env = OptBoxEnv { ctx: self };

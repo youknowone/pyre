@@ -490,6 +490,20 @@ mod tests {
         }
     }
 
+    /// Factorial through the plain interpreter.
+    ///
+    /// STOP: **Not a JIT test.** It was named `jit_factorial` while its body only
+    /// ever called `interp::interpret` — no `jit.run`, no `mainloop`. The name
+    /// asserted a tier the body never touched, which is worse than a green
+    /// suite that cannot say which tier answered: there, at least, a
+    /// measurement is involved.
+    ///
+    /// The JIT twin is deliberately absent rather than forgotten. tiny2 is one
+    /// of #32's no-greens crates and `OP_LOOP_END` is an abort stub (#45), so a
+    /// JIT arm added today could not compile anything — it would be a gate over
+    /// a tier that cannot run, which is the cost #48 measured. Add the twin once
+    /// `greens` is declared and `]` lowers, and route it through
+    /// [`run_locked`] so it takes the probe lock (#54).
     #[test]
     fn interp_factorial() {
         let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }".split_whitespace().collect();

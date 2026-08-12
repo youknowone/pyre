@@ -1,7 +1,18 @@
 # Closure roadmap: flatten-graph residual + Path 4 epic (#238) + pc_map (#73), PyPy-faithful
 
 Status snapshot (2026-07-02, branch `flatten-graph`, HEAD `3c5191088ea` atop issue62 P2
-framestack commits). Every phase below is sliced so each slice lands gate-green
+framestack commits).
+
+> ⚠ **`3c5191088ea` is UNRESOLVABLE, not merely rewritten — do not go looking.**
+> The object itself is gone: `cat-file -e` and `rev-parse` both fail, no reflog
+> entry, no remote ref carries it, and it is absent from the nested `cel-jit`
+> repo (all five checked 2026-08-11 against `2e1a77f8a9e` as a live positive
+> control). Branch `flatten-graph` no longer exists either. So this one cannot be
+> re-pointed *and* its subject cannot be recovered — subject lookup, the usual
+> repair, needs an object to read the subject from. **The date is the
+> provenance.** Cf. the harvest's rule section for the four-state test.
+
+Every phase below is sliced so each slice lands gate-green
 (cargo test + check.py ×2 backends + 599-prog corpus sweep + adversarial refute WF for
 resume-zone slices). One green slice per session; never push.
 
@@ -78,6 +89,13 @@ so at py=207 the walker's `current_state.stack[residual_slot]` holds a non-Varia
 (Constant / NONE-sentinel / short stack). THAT is the real gap.
 
 ### ★ Phase 1 STATUS (2026-07-02): S1a DONE, S1b LANDED `d388c8fe6a6`, residual = 0
+
+> ⚠ **`d388c8fe6a6` is UNRESOLVABLE** — same five checks as line 3, same result.
+> This one is an *attribution* ("S1b landed as X"), the class that is normally
+> repaired by substituting the successor, and it cannot be: there is no object,
+> so there is no subject to search for and no patch-id to match a twin against.
+> **The prose below is the citation for what S1b did.**
+
 S1a census (PYRE_VSTACK_DIAG + push-chokepoint probe, all reverted) classified the
 22 residual slots: [EDGE-COPY] bucket EMPTY (recovered_hit=false everywhere);
 [MERGE] bucket EMPTY; ALL 22 were one root cause — **LoadConst's pushvalue lowering

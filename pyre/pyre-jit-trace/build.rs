@@ -926,6 +926,34 @@ fn real_main() {
         let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
 
+        // `MAJIT_MINT_INDEX_CENSUS=1`: how many `fielddescrof` mints resolved a
+        // slot for `index_in_parent`, and how many carried out the `0` they were
+        // initialised with. The split the emitted descr cannot record — an
+        // unwritten initialiser and a real slot-0 claim are the same bytes once
+        // this function returns.
+        //
+        // STOP: It has to be read HERE and nowhere else, for the reason the comment
+        // below already gives: pyre "mints in this process and resolves in
+        // another". The counters are process-global atomics in the mint process,
+        // so the runtime's `[jit-stats]` line — where every other `field_pos_*`
+        // counter is read — starts them at zero again and would report `0 0` on
+        // every run however many placeholders this build produced. That reading
+        // is worse than no counter: `placeholder=0` is exactly the value that
+        // says the hazard is absent.
+        //
+        // STOP: Gated, and `cargo::warning` only reaches a build script that
+        // actually RUNS. A cached build prints nothing, which reads the same as
+        // a clean census. Touch a source file in the analyzed set before
+        // trusting a silent run.
+        if std::env::var_os("MAJIT_MINT_INDEX_CENSUS").is_some() {
+            let [claimed, placeholder] = majit_ir::descr::GcCache::mint_index_census();
+            println!(
+                "cargo::warning=mint_index_census: claimed={claimed} placeholder={placeholder} \
+                 (fielddescrof mints; placeholder=0 means no descr in this build carries an \
+                 unresolved index_in_parent)"
+            );
+        }
+
         // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
         // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
         // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).

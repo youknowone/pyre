@@ -4995,6 +4995,45 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::ArraylenGc, &[array_opref], adescr)
     }
 
+    /// Address of item 0 of a virtualizable array field, as a constant int,
+    /// and raise the raw-base escape signal.
+    ///
+    /// `None` when the array's layout cannot be resolved. That is not a
+    /// recoverable miss to paper over with a zero or a recorded op: the walker
+    /// really performs the residual call this address is an argument to, so an
+    /// unresolved base would hand a live callee a wrong pointer and corrupt
+    /// memory. The caller aborts the trace instead.
+    ///
+    /// The address is read from the live heap object rather than recorded as
+    /// an operation because the trace does not survive: raising the escape
+    /// signal here means the enclosing CALL_MAY_FORCE aborts with
+    /// ABORT_ESCAPE before this constant can reach an optimizer or a backend.
+    /// Returns the trace-side constant and the same address as a concrete, so
+    /// the caller can stamp the destination register with both.
+    pub fn vable_arraybase_vable(
+        &mut self,
+        vable_struct_ptr: i64,
+        fdescr: DescrRef,
+    ) -> Option<(OpRef, i64)> {
+        if vable_struct_ptr == 0 {
+            return None;
+        }
+        let info = self.virtualizable_info.as_ref()?;
+        let array_idx = info.array_field_by_descr(&fdescr)?;
+        let array = info.array_fields.get(array_idx)?;
+        let base = unsafe {
+            crate::virtualizable::bhimpl_arraybase_vable(vable_struct_ptr as *const u8, array)
+        };
+        if base.is_null() {
+            return None;
+        }
+        // Raised only once the address is known to be real, so an aborted
+        // resolution above cannot leave a signal behind for the next call.
+        crate::virtualizable::raise_raw_base_escape();
+        let addr = base as usize as i64;
+        Some((self.const_int(addr), addr))
+    }
+
     /// Compute the flat index into virtualizable_boxes for an array element.
     /// Returns `None` if standard virtualizable is not active or the array field is unknown.
     fn vable_array_flat_index(&self, fdescr: &DescrRef, item_index: usize) -> Option<usize> {

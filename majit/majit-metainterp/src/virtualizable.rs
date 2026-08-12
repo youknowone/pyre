@@ -130,6 +130,42 @@ pub enum VableArrayStorage {
     },
 }
 
+thread_local! {
+    /// Set when a residual call was handed the raw base address of a
+    /// virtualizable array field, cleared when the escape check consumes it.
+    static RAW_BASE_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Report that the residual call now being recorded received the base address
+/// of a virtualizable array, so it may permute the items behind the tracer.
+///
+/// [`VirtualizableInfo::tracing_after_residual_call`] detects escape by asking
+/// whether the callee cleared the `vable_token`. A callee writing through a raw
+/// `*mut i64` never touches the token, and a machine built by `#[jit_interp]`
+/// has no token at all (`without_vable_token`), so that check reports "not
+/// escaped" for exactly the calls that are most able to invalidate the trace.
+/// The consequence is not a missed optimisation but a wrong answer: the array's
+/// items **are** the trace's SSA values, tracing would resume from the pre-call
+/// boxes, and the next store-back would write them over the permutation.
+///
+/// This channel carries the fact the token cannot. It is raised by the codegen
+/// of the base-address spelling itself — every user of that spelling raises it,
+/// and nothing else does.
+pub fn raise_raw_base_escape() {
+    RAW_BASE_ESCAPE.with(|flag| flag.set(true));
+}
+
+/// Consume the raw-base-address escape signal, returning whether it was raised.
+///
+/// WARNING: This **drains**. The signal describes one residual call, and a leftover
+/// would abort the next unrelated call instead — a false abort attributable to
+/// nothing at its own site. Drain it even when there is no active
+/// virtualizable to test, which is why the call sits outside
+/// `Option::filter` at the consuming site.
+pub fn take_raw_base_escape() -> bool {
+    RAW_BASE_ESCAPE.with(|flag| flag.replace(false))
+}
+
 /// Complete description of a virtualizable type.
 ///
 /// Mirrors RPython's `VirtualizableInfo` class from `virtualizable.py`.

@@ -82,6 +82,121 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
         if pc >= program.len() {
             break;
         }
+        // Still the bare observer/replay form. The `; state` single-executor
+        // close does not hold here yet, and `trip_count_gate` below is what
+        // says so: with `jit_merge_point!(driver, program, pc; state)` this
+        // function answers 1004 instead of 2002 at n=1001, i.e. it stops after
+        // `threshold` passes, and `jit_matches_interp_dual_loop`,
+        // `..._only_tape_b_in_body` and `..._wider_elements` fail with it too.
+        //
+        // The `; state` expansion ends in `if take_single_pass_finish() { break }`
+        // BEFORE it assigns the walk's resume pc, so a walk that reaches a
+        // terminal dispatch return leaves this loop with `pc` still naming the
+        // position the walk started from and the rest of the program unrun.
+        // That is not the terminal-arm question — this loop has no terminal arm,
+        // and it needs no `ret` state field, since the only thing after the loop
+        // is `sum(a) + sum(b)`, which both write-backs publish before the break.
+        //
+        // Two separate things put the walk on that terminal return when this was
+        // diagnosed; the first has since been fixed, the second has not. Both
+        // measured with `MAJIT_LOG=1` on an exact-path release test binary, and
+        // so were the 1004/2002 figures above — every number in this comment
+        // predates the arms lowering unless it says otherwise.
+        //
+        // 1. HISTORICAL — removed by "majit macros: accept byte and char
+        //    literals in dispatch arm patterns". Every arm below is spelled as a
+        //    byte-character literal, and the pattern extractors used to accept
+        //    `Pat::Lit` only for `Lit::Int`, so `lower_dispatch_chain` skipped
+        //    all ten and the dispatch body was empty: `regs i=5`,
+        //    `ops_before=1`, body `Finish()`, `Traces aborted: 0`, the walk
+        //    falling straight through to the function's typed return. The arms
+        //    lower today; that reading describes the pre-fix world only.
+        //
+        // 2. STILL TRUE, and now reached without respelling anything. The
+        //    experiment that established it respelled the arms as `const` u8s,
+        //    which restored a real dispatch (`regs i=22`, per-arm sub-JitCodes)
+        //    but not a working close: `degraded dispatch arm:
+        //    DualState::OP_LOOP_END lowered to an abort stub (arm body could not
+        //    be lowered to a sub-JitCode)`. `]` is the back-edge, so that stub is
+        //    reachable on every pass of every traced loop: `Traces compiled: 0`,
+        //    `Traces aborted: 333`. It is the `]` arm, not the `[` header — the
+        //    abort is merely *reported* at the trace-start pc.
+        //
+        // What blocked the conversion was once downstream of both: with the arms
+        // lowering, the deopt path was reached for the first time and panicked,
+        // `assertion failed: vable_size > 0` in the metainterp's resume, on both
+        // backends, failing this crate's gate tests before they read a counter.
+        // WARNING: THAT PANIC IS GONE — measured at HEAD, `run()` completes and the
+        // fixture returns 2002. Do not cite it as a live blocker; the blocker is
+        // the `b']'` lowering named below.
+        //
+        // Declaring `greens = [pc, program]` is NOT the missing piece. That was
+        // first recorded under the pre-fix regime, where it proved nothing
+        // because no arm lowered at all; the block above retracted it as
+        // untested once the arms started lowering. RE-MEASURED in an archive
+        // tree of `tlc: land ex-tlc's operand-less degraded-arm fixture`
+        // (`8d5e266eab1` as of 2026-08-11 — branch-local, so find it by that
+        // subject) with the arms lowering, both arms of one A/B:
+        //
+        //   no greens (as shipped): COMPILES=1  ops_before=4805  ops_after=5
+        //                           body [GuardValue, IntIsZero, GuardFalse,
+        //                                 GuardAlwaysFails, Finish]
+        //   greens = [pc, program]: COMPILES=0  ops_before=0     ops_after=0
+        //
+        // STOP: THE FIRST ROW NO LONGER DESCRIBES THIS CRATE. Both arms above were
+        // taken in a tree that is an ANCESTOR of the macro fix which made
+        // `while` bodies visible to the inertness probes, so neither was ever
+        // measured against the lowering this crate has today. RE-MEASURED at
+        // HEAD 2026-08-11 on a clean tree, attribute still carrying no greens
+        // at that point: COMPILES=0, ops_after=0, and `has_always_fails` is now
+        // FALSE. The walk's consequence is gone — `create_segmented_trace`
+        // never runs, so no attempt reaches `trace_limit * 4/5`. What happens
+        // instead is 2005 `BC_ABORT`s, every one at depth=2, i.e. inside a
+        // degraded arm stub.
+        //
+        // WARNING: `ops_before` is NOT READABLE at HEAD — the hook below underscores
+        // it. "Under 4800" follows from the absent segmentation, not from a
+        // counter, and no number should be written here until the hook keeps
+        // the argument.
+        //
+        // ⇒ The two arms are now the SAME degenerate, not different ones: the
+        // shipped arm has joined the greens arm at COMPILES=0. And 4805 was
+        // never a reading of this program — it is `trace_limit * 4/5 + 5` under
+        // the unoverridden `DEFAULT_TRACE_LIMIT` of 6000, which is the only
+        // reason braininterp printed the same digits.
+        //
+        // ⇒ THE ATTRIBUTE NOW DECLARES `greens = [pc, program]`, and that is
+        // where the A/B above stops being a decision and becomes a record. It
+        // was landed as an invariant — every crate declares greens, so the bare
+        // form can be refused at macro time — NOT as a repair, and the numbers
+        // say so: re-measured immediately after declaring, COMPILES=0,
+        // ops_after=0, has_jump=false, has_always_fails=false. Identical to the
+        // reading above. This crate is no closer to compiling a real loop than
+        // it was, and nothing here should be read as "dualtape now works".
+        //
+        // WARNING: IT DID MOVE ONE THING, AND ONLY A COMMITTED PIN CAUGHT IT: `b'['`
+        // went `UnlowerableStmt` → `GreenWriteback`, because `pc = p` is now a
+        // write to a green. Same arm, same outcome, different reported cause —
+        // see `jit_tier_degraded_arm_gate`, which failed on this and was
+        // re-taken rather than re-recorded.
+        //
+        // WARNING: The old reason for declaring greens LAST — "declaring them trades a
+        // zero-iteration trace for no trace" — had already EXPIRED before this
+        // landed: there was no trace left to trade. What remains outstanding is
+        // a lowering for `b']'`, which is what makes a non-degenerate body
+        // possible; greens were never going to supply that.
+        //
+        // WARNING: WHY THE GATES ARE SPLIT, and what a suite count does not tell you.
+        // The A/B above is unreadable from a pass/fail tally: in the no-greens
+        // arm the old combined gate failed `ops_after == 1` with 5, and in the
+        // greens arm it fails `compiles > 0` first — two different assertions,
+        // one identical `6 passed / 1 failed`. A count is NOT a state. So the
+        // assertions that hold in both arms now live in
+        // `jit_tier_liveness_gate`, which runs and passes, and the end-state
+        // grading lives in the `#[ignore]`d `jit_tier_shape_gate`. STOP: Whoever
+        // re-runs either arm must name the assertion that fired, never a line
+        // number or a tally: this comment moved that line by 16 the day it was
+        // written.
         jit_merge_point!();
         let ch = program[pc];
 
