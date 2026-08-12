@@ -1,3 +1,6 @@
+# CPython-suite gap: recursion tests do not compare cold and JIT-hot call depth.
+# parity-tests reason: this guards pyre's native budget across JIT guard resume.
+
 """`sys.setrecursionlimit` must keep deciding how deep recursion goes after
 the recursive function is JIT-hot.
 

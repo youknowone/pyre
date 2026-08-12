@@ -97,12 +97,15 @@ pub const MAX_STACK_SIZE: usize = 48 << 18;
 /// implementation default.
 ///
 /// [`effective_stack_length`] leaves a quarter of the stack to the Rust/C
-/// frames between the probe and the guard page, so 64 MiB buys a 48 MiB
-/// ceiling — four times [`MAX_STACK_SIZE`], i.e. `sys.setrecursionlimit` is
-/// honoured up to about 4000 before the clamp starts deciding instead.  At
-/// 8 MiB the clamp cut a thread's budget below what the *default* limit is
-/// worth, so the guard, not the limit, decided how deep a thread could
-/// recurse.
+/// frames between the probe and the guard page, so 20 MiB buys a 15 MiB
+/// ceiling.  That covers the measured guard-resume cost at the default limit
+/// (and the 90% lower bound at 2000 used by the parity fixture) without making
+/// `support.infinite_recursion(20_000)` consume the much larger interpreter
+/// thread before its native guard fires.  At 8 MiB the clamp cut a thread's
+/// budget below what the *default* limit is worth, so the guard, not the limit,
+/// decided how deep a thread could recurse; at 64 MiB highly nested pure-Python
+/// decoders spent minutes below the clamp and every default worker reserved an
+/// excessive amount of address space.
 ///
 /// The interpreter thread announces this too, though its own stack is much
 /// larger (`pyrex::INTERPRETER_THREAD_STACK_SIZE`).  `stack_length` is
@@ -112,7 +115,7 @@ pub const MAX_STACK_SIZE: usize = 48 << 18;
 /// path.  A single figure for all Python-running threads keeps that shared
 /// word meaningful; upstream gets the same uniformity for free because
 /// `_ll_stack_os_limit` reads `getrlimit`, which is process-wide.
-pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 20 * 1024 * 1024;
 
 /// Process-wide requested byte budget, corresponding to RPython's
 /// `MAX_STACK_SIZE * recursionlimit / 1000`.  This is semantic configuration
