@@ -15150,7 +15150,9 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         type_name.as_str()
     };
     if file_is_closed(self_obj) {
-        return Ok(w_str_new(&format!("<{repr_type} [closed]>")));
+        return Ok(pyre_object::w_str_new_managed(&format!(
+            "<{repr_type} [closed]>"
+        )));
     }
     let closefd = if file_closefd(self_obj) {
         "True"
@@ -15175,11 +15177,11 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             file_get_fd(self_obj).unwrap_or(-1)
         ))
     };
-    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-        format!("<{repr_type} "),
-        body,
-        ">"
-    )))
+    // W_FileIO.repr_w returns `space.newtext(...)` for the name, fd, and
+    // closed forms.
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        crate::display::wtf8_format!(format!("<{repr_type} "), body, ">"),
+    ))
 }
 
 /// `_io.FileIO.__init__` — PyPy `W_FileIO.descr_init`.
