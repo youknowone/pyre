@@ -2062,8 +2062,21 @@ fn socket_wait_readable(
     else {
         return Ok(());
     };
-    let timeout_ms = (timeout * 1000.0 + 0.5).min(i32::MAX as f64) as i32;
+    // A handled signal restarts the wait, so the deadline is computed once:
+    // reusing the full duration on every EINTR would let a steady signal
+    // stream extend a finite timeout without bound.  poll carries its timeout
+    // in milliseconds as a c_int, which bounds how long a single wait can ask
+    // for however long the caller requested.
+    let capped = timeout.min(i32::MAX as f64 / 1000.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(capped);
     loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(socket_converted_error("timeout", None, "timed out"));
+        }
+        // poll's resolution is one millisecond; a shorter remainder must still
+        // wait rather than degenerate into a busy loop.
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -3268,7 +3281,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         return Ok(r);
                     }
                     if errno != libc::EINTR {
-                        return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                        return Err(socket_io_err_for_operation(
+                            obj,
+                            std::io::Error::from_raw_os_error(errno),
+                        ));
                     }
                     // EINTR: deliver a pending signal, then retry
                     // (`converted_error` eintr_retry).
@@ -3329,7 +3345,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break r;
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        obj,
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3400,7 +3419,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break r;
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        obj,
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3475,7 +3497,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break r;
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        obj,
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3565,7 +3590,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break (r, msg.msg_flags, msg.msg_namelen);
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        args[0],
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3713,7 +3741,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break (r, msg.msg_flags, msg.msg_namelen, msg.msg_controllen);
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        args[0],
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -3934,7 +3965,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     break r;
                 }
                 if errno != libc::EINTR {
-                    return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+                    return Err(socket_io_err_for_operation(
+                        obj,
+                        std::io::Error::from_raw_os_error(errno),
+                    ));
                 }
                 // EINTR: deliver a pending signal, then retry
                 // (`converted_error` eintr_retry).
@@ -4200,7 +4234,15 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 };
                 let fd = socket_fd(obj)?;
                 socket_apply_timeout(fd, timeout)?;
-                socket_set_attr(obj, "_timeout", w_t);
+                // `gettimeout()` reports a float, and the timeout readers below
+                // recognise only that type; storing the caller's `int` verbatim
+                // would make `settimeout(1)` silently untimed.
+                let stored = if unsafe { pyre_object::is_none(w_t) } {
+                    w_t
+                } else {
+                    pyre_object::floatobject::w_float_new(timeout)
+                };
+                socket_set_attr(obj, "_timeout", stored);
                 Ok(pyre_object::w_none())
             },
             2,

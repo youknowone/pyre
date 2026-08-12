@@ -93,22 +93,32 @@ pub struct W_Certificate {
     pub der: PyObjectRef,
 }
 
+/// The `library` and `reason` an OpenSSL-shaped `[library: reason] text`
+/// message carries.
+fn split_library_reason(message: &str) -> Option<(&str, &str)> {
+    let close = message.find(']')?;
+    if !message.starts_with('[') {
+        return None;
+    }
+    message[1..close].split_once(": ")
+}
+
+fn set_library_reason(exception: PyObjectRef, message: &str) {
+    if let Some((library, reason)) = split_library_reason(message) {
+        let _ = crate::baseobjspace::setattr_str(exception, "library", w_str_new(library));
+        let _ = crate::baseobjspace::setattr_str(exception, "reason", w_str_new(reason));
+    }
+}
+
 fn ssl_error(message: impl Into<String>) -> crate::PyError {
     let message = message.into();
     let mut err = crate::PyError::os_error(message.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("_ssl.SSLError") {
-        if let Ok(exc) =
+    if let Some(cls) = crate::builtins::lookup_exc_class("_ssl.SSLError")
+        && let Ok(exc) =
             crate::builtins::exc_exception_new(&[cls, w_int_new(0), w_str_new(&message)])
-        {
-            if let Some(close) = message.find(']')
-                && message.starts_with('[')
-                && let Some((library, reason)) = message[1..close].split_once(": ")
-            {
-                let _ = crate::baseobjspace::setattr_str(exc, "library", w_str_new(library));
-                let _ = crate::baseobjspace::setattr_str(exc, "reason", w_str_new(reason));
-            }
-            err.exc_object = exc;
-        }
+    {
+        set_library_reason(exc, &message);
+        err.exc_object = exc;
     }
     err
 }
@@ -154,7 +164,10 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
         _ if verify_code.is_some() => "_ssl.SSLCertVerificationError",
         _ => "_ssl.SSLError",
     };
-    let mut error = ssl_error(message.clone());
+    // `ssl_error` would build a complete `_ssl.SSLError` only for the
+    // class-specific instance below to replace it, and WANT_READ/WANT_WRITE
+    // travel this path on every non-blocking handshake step.
+    let mut error = crate::PyError::os_error(message.clone());
     let public_errno = if verify_code.is_some() {
         pyre_native::ssl::TLS_ERROR_SSL
     } else {
@@ -167,13 +180,7 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
             w_str_new(&message),
         ])
     {
-        if let Some(close) = message.find(']')
-            && message.starts_with('[')
-            && let Some((library, reason)) = message[1..close].split_once(": ")
-        {
-            let _ = crate::baseobjspace::setattr_str(exception, "library", w_str_new(library));
-            let _ = crate::baseobjspace::setattr_str(exception, "reason", w_str_new(reason));
-        }
+        set_library_reason(exception, &message);
         if let Some(verify_code) = verify_code {
             let _ = crate::baseobjspace::setattr_str(
                 exception,
@@ -421,6 +428,19 @@ fn allocate_ssl_socket(
     server_side: bool,
     requested_session: *mut pyre_native::ssl::NativeSession,
 ) -> PyObjectRef {
+    // Offsets into the pinned-root array below.  The weakref boxing further
+    // down rewrites two of these slots by position, so a reorder of the array
+    // has to move these constants with it.
+    const CONTEXT_SLOT: usize = 0;
+    const SOCKET_SLOT: usize = 1;
+    const SOCKET_SEND_SLOT: usize = 2;
+    const SOCKET_RECV_SLOT: usize = 3;
+    const INCOMING_SLOT: usize = 4;
+    const OUTGOING_SLOT: usize = 5;
+    const OWNER_SLOT: usize = 6;
+    const SERVER_HOSTNAME_SLOT: usize = 7;
+    const SLOT_COUNT: usize = 8;
+
     let _ = ssl_socket_methods::type_object();
     let _roots = pyre_object::gc_roots::push_roots();
     for value in [
@@ -435,16 +455,13 @@ fn allocate_ssl_socket(
     ] {
         pyre_object::gc_roots::pin_root(value);
     }
-    let first = pyre_object::gc_roots::shadow_stack_len() - 8;
-    let rooted_socket = unsafe { pyre_object::gc_roots::shadow_stack_get(first + 1) };
-    if !unsafe { is_none(rooted_socket) } {
-        let weak_socket = pyre_object::weakref::w_gc_weakref_box_new_or_strong(rooted_socket);
-        pyre_object::gc_roots::shadow_stack_set(first + 1, weak_socket);
-    }
-    let rooted_owner = unsafe { pyre_object::gc_roots::shadow_stack_get(first + 6) };
-    if !unsafe { is_none(rooted_owner) } {
-        let weak_owner = pyre_object::weakref::w_gc_weakref_box_new_or_strong(rooted_owner);
-        pyre_object::gc_roots::shadow_stack_set(first + 6, weak_owner);
+    let first = pyre_object::gc_roots::shadow_stack_len() - SLOT_COUNT;
+    for slot in [SOCKET_SLOT, OWNER_SLOT] {
+        let rooted = unsafe { pyre_object::gc_roots::shadow_stack_get(first + slot) };
+        if !unsafe { is_none(rooted) } {
+            let weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(rooted);
+            pyre_object::gc_roots::shadow_stack_set(first + slot, weak);
+        }
     }
     W_SSLSocket::allocate_stable(W_SSLSocket {
         ob: PyObject {
@@ -452,14 +469,16 @@ fn allocate_ssl_socket(
             w_class: std::ptr::null_mut(),
         },
         backend,
-        context: unsafe { pyre_object::gc_roots::shadow_stack_get(first) },
-        socket: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 1) },
-        socket_send: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 2) },
-        socket_recv: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 3) },
-        incoming: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 4) },
-        outgoing: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 5) },
-        owner: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 6) },
-        server_hostname: unsafe { pyre_object::gc_roots::shadow_stack_get(first + 7) },
+        context: unsafe { pyre_object::gc_roots::shadow_stack_get(first + CONTEXT_SLOT) },
+        socket: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SLOT) },
+        socket_send: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SEND_SLOT) },
+        socket_recv: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_RECV_SLOT) },
+        incoming: unsafe { pyre_object::gc_roots::shadow_stack_get(first + INCOMING_SLOT) },
+        outgoing: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OUTGOING_SLOT) },
+        owner: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OWNER_SLOT) },
+        server_hostname: unsafe {
+            pyre_object::gc_roots::shadow_stack_get(first + SERVER_HOSTNAME_SLOT)
+        },
         server_side,
         shutdown_started: false,
         requested_session,
@@ -486,7 +505,9 @@ fn clone_requested_session(
     };
     let session = W_SSLSession::from_obj(value)
         .ok_or_else(|| crate::PyError::type_error("Value is not a SSLSession."))?;
-    if unsafe { pyre_native::ssl::session_context_identity(session.backend) } != context as usize {
+    if unsafe { pyre_native::ssl::session_context_identity(session.backend) }
+        != unsafe { pyre_native::ssl::context_identity(context) }
+    {
         return Err(crate::PyError::value_error(
             "Session refers to a different SSLContext.",
         ));
@@ -710,6 +731,9 @@ mod context_methods {
             }
             self.num_tickets = i32::try_from(value)
                 .map_err(|_| crate::PyError::overflow_error("num_tickets out of range"))?;
+            unsafe {
+                pyre_native::ssl::context_set_num_tickets(self.backend, self.num_tickets as usize)
+            };
             Ok(())
         }
 
@@ -776,28 +800,29 @@ mod context_methods {
                 Some(value) if !unsafe { is_none(value) } => path_string(value)?,
                 _ => cert_path.clone(),
             };
-            // OpenSSL asks its callback only after PEM parsing discovers an
+            // OpenSSL asks its callback only after parsing discovers an
             // encrypted key. Preserve that observable ordering: an irrelevant
-            // callback must not run for an unencrypted key file.
-            let password = if std::fs::read(&key_path).ok().is_some_and(|data| {
-                data.windows(b"ENCRYPTED PRIVATE KEY".len())
-                    .any(|window| window == b"ENCRYPTED PRIVATE KEY")
-                    || data
-                        .windows(b"Proc-Type: 4,ENCRYPTED".len())
-                        .any(|window| window == b"Proc-Type: 4,ENCRYPTED")
-            }) {
-                password_bytes(password.unwrap_or_else(w_none))?
-            } else {
-                None
+            // callback must not run for an unencrypted key file.  The backend
+            // reports which case it hit, so the container decides this rather
+            // than a scan of the file for header text.
+            let loaded = native_result(unsafe {
+                pyre_native::ssl::context_load_cert_chain(self.backend, &cert_path, &key_path, None)
+            })?;
+            if loaded {
+                return Ok(());
+            }
+            let Some(password) = password_bytes(password.unwrap_or_else(w_none))? else {
+                return Err(ssl_error("[SSL] PEM routines: bad password read"));
             };
             native_result(unsafe {
                 pyre_native::ssl::context_load_cert_chain(
                     self.backend,
                     &cert_path,
                     &key_path,
-                    password.as_deref(),
+                    Some(&password),
                 )
             })
+            .map(|_| ())
         }
 
         fn load_verify_locations(&mut self, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
@@ -895,19 +920,36 @@ mod context_methods {
             Ok(())
         }
 
+        /// `SSL_CTX_set_default_verify_paths` loads two independent sources: a
+        /// bundle file and a hashed directory.  `SSL_CERT_FILE` overrides only
+        /// the first and `SSL_CERT_DIR` only the second, so neither variable
+        /// may suppress the other's source.
         fn set_default_verify_paths(&mut self) -> Result<(), crate::PyError> {
-            if let Ok(Some(path)) = crate::host_seam::getenv(b"SSL_CERT_FILE") {
-                let path = String::from_utf8_lossy(&path).into_owned();
-                if std::path::Path::new(&path).is_file() {
-                    native_result(unsafe {
-                        pyre_native::ssl::context_load_verify_file(self.backend, &path)
-                    })?;
-                    // OpenSSL defers hashed `SSL_CERT_DIR` loading until chain
-                    // lookup, so it does not contribute to cert_store_stats here.
-                    return Ok(());
-                }
+            let env_path = |name: &[u8]| {
+                crate::host_seam::getenv(name)
+                    .ok()
+                    .flatten()
+                    .map(|value| String::from_utf8_lossy(&value).into_owned())
+            };
+            let cert_file =
+                env_path(b"SSL_CERT_FILE").filter(|path| std::path::Path::new(path).is_file());
+            match cert_file {
+                Some(path) => native_result(unsafe {
+                    pyre_native::ssl::context_load_verify_file(self.backend, &path)
+                })
+                .map(|_| ())?,
+                None => native_result(unsafe {
+                    pyre_native::ssl::context_load_native_roots(self.backend)
+                })
+                .map(|_| ())?,
             }
-            native_result(unsafe { pyre_native::ssl::context_load_native_roots(self.backend) })?;
+            let (_, default_dir) = pyre_native::ssl::default_verify_paths();
+            let cert_dir = env_path(b"SSL_CERT_DIR").unwrap_or(default_dir);
+            if std::path::Path::new(&cert_dir).is_dir() {
+                // OpenSSL defers hashed directory loading until chain lookup,
+                // so it does not contribute to cert_store_stats here.
+                unsafe { pyre_native::ssl::context_add_verify_dir(self.backend, &cert_dir) };
+            }
             Ok(())
         }
 
@@ -946,9 +988,15 @@ mod context_methods {
                 .map_err(ssl_error)
         }
 
+        /// The suites this context can actually negotiate, so a `set_ciphers()`
+        /// filter is visible to configuration auditing rather than only to
+        /// connection creation.
         fn get_ciphers(&self) -> PyObjectRef {
             let mut ciphers = Vec::with_capacity(pyre_native::ssl::cipher_count());
             for index in 0..pyre_native::ssl::cipher_count() {
+                if !unsafe { pyre_native::ssl::context_cipher_enabled(self.backend, index) } {
+                    continue;
+                }
                 let name = pyre_native::ssl::cipher_name(index);
                 let bits = pyre_native::ssl::cipher_bits(index);
                 ciphers.push(dict_from_pairs(&[
@@ -991,6 +1039,12 @@ mod context_methods {
             ])
         }
 
+        /// Validate the file the way `SSL_CTX_set_tmp_dh` would, then discard
+        /// the group.  rustls negotiates ECDHE only, so no finite-field DH
+        /// parameter can ever take effect; a server that set one still gets a
+        /// forward-secret key exchange, and `supports_kx_alias` reports no DHE
+        /// so callers can detect the gap.  Raising here instead would reject
+        /// `load_dh_params` outright for every caller.
         fn load_dh_params(&self, path: PyObjectRef) -> Result<(), crate::PyError> {
             if path.is_null() || unsafe { is_none(path) } {
                 return Err(crate::PyError::type_error(
@@ -1211,9 +1265,12 @@ mod context_methods {
         fn _set_alpn_protocols(&mut self, data: PyObjectRef) -> Result<(), crate::PyError> {
             let buffer = crate::baseobjspace::simple_buffer_bytes(data)?
                 .ok_or_else(|| crate::PyError::type_error("a bytes-like object is required"))?;
-            let protocols = parse_length_prefixed_protocols(buffer.as_bytes())?;
-            unsafe { pyre_native::ssl::context_set_alpn(self.backend, protocols) };
+            // `PyBuffer_Release` before propagating: a parse failure must not
+            // leave a `bytearray` argument permanently exported.
+            let parsed = parse_length_prefixed_protocols(buffer.as_bytes());
             buffer.release();
+            let protocols = parsed?;
+            unsafe { pyre_native::ssl::context_set_alpn(self.backend, protocols) };
             Ok(())
         }
 
@@ -1916,14 +1973,19 @@ mod ssl_socket_methods {
             }
             // CPython permits querying a lazily-created SSLObject before its
             // first handshake step.  There is no TLS channel to bind yet.
-            if self.backend.is_null() {
+            if self.backend.is_null()
+                || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
+            {
                 return Ok(w_none());
             }
-            Ok(
-                unsafe { pyre_native::ssl::connection_tls_unique(self.backend) }
-                    .map(|binding| w_bytes_from_bytes(&binding))
-                    .unwrap_or_else(w_none),
-            )
+            // RFC 5929 `tls-unique` is the TLS 1.2 Finished verify_data, which
+            // rustls does not expose.  Any substitute would agree only with
+            // another pyre peer, so a binding negotiated against an OpenSSL,
+            // Java, or Go implementation would fail authentication with no
+            // indication of why.  Report the gap instead of a private value.
+            Err(crate::PyError::value_error(
+                "'tls-unique' channel binding type not implemented",
+            ))
         }
 
         fn shutdown(&mut self) -> Result<PyObjectRef, crate::PyError> {
@@ -2190,11 +2252,12 @@ fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (cert_file, cert_dir) = pyre_native::ssl::default_verify_paths();
     Ok(w_tuple_new(vec![
         w_str_new("SSL_CERT_FILE"),
-        w_str_new("/etc/ssl/cert.pem"),
+        w_str_new(&cert_file),
         w_str_new("SSL_CERT_DIR"),
-        w_str_new("/etc/ssl/certs"),
+        w_str_new(&cert_dir),
     ]))
 }
 

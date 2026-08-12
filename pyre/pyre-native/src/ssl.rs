@@ -131,6 +131,10 @@ pub unsafe fn memory_bio_eof(bio: *const MemoryBio) -> bool {
 /// `_wrap_bio` is called; rustls configs themselves are intentionally not
 /// mutated after publication.
 pub struct Context {
+    /// Process-wide monotonic identity.  A freed context's address can be
+    /// reused by the allocator, so an `SSLSession` must not be matched to its
+    /// originating context by pointer value.
+    identity: usize,
     protocol: i32,
     check_hostname: bool,
     verify_mode: i32,
@@ -146,15 +150,27 @@ pub struct Context {
     // each immutable rustls ClientConfig; the certificate actually selected
     // for a successful chain is published to `root_der` after the handshake.
     capaths: Vec<std::path::PathBuf>,
+    // Materializing a hashed directory costs one read plus one PEM parse per
+    // entry, and a system store holds hundreds.  Cache the result against the
+    // directory list and their modification times so a connection pays only
+    // one stat per directory once the contents are stable.
+    capath_cache: Mutex<Option<(Vec<CapathStamp>, Arc<Vec<Vec<u8>>>)>>,
     crls: Vec<CertificateRevocationListDer<'static>>,
     cipher_suites: Option<Vec<rustls::SupportedCipherSuite>>,
     ecdh_curve: Option<EcdhCurve>,
     certified_keys: Vec<Arc<CertifiedKey>>,
+    num_tickets: Option<usize>,
     server_session_store: Arc<dyn rustls::server::StoresServerSessions>,
     server_ticketer: Arc<dyn rustls::server::ProducesTickets>,
     accept_count: AtomicUsize,
     session_hits: AtomicUsize,
 }
+
+/// One `capath` directory together with the modification time observed when
+/// its certificates were parsed.
+type CapathStamp = (std::path::PathBuf, Option<SystemTime>);
+
+static NEXT_CONTEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Copy)]
 enum EcdhCurve {
@@ -166,18 +182,63 @@ enum EcdhCurve {
 pub const PROTOCOL_TLS: i32 = 2;
 pub const PROTOCOL_TLS_CLIENT: i32 = 16;
 pub const PROTOCOL_TLS_SERVER: i32 = 17;
+pub const PROTOCOL_TLSV1_2: i32 = 5;
+pub const PROTOCOL_TLSV1_3: i32 = 6;
 pub const CERT_NONE: i32 = 0;
 pub const CERT_OPTIONAL: i32 = 1;
 pub const CERT_REQUIRED: i32 = 2;
-pub const DEFAULT_OPTIONS: u64 =
-    0x0000_0bfb | 0x0200_0000 | 0x0002_0000 | 0x0040_0000 | 0x0010_0000;
+
+/// `SSL_OP_*` bits the `_ssl` module publishes.  Both `DEFAULT_OPTIONS` and
+/// [`enabled_versions`] decode this space, so the two must not name the same
+/// bit differently.
+const OP_ALL: u64 = 0x0000_0bfb;
+const OP_NO_SSLV3: u64 = 0x0200_0000;
+const OP_NO_TLSV1_2: u64 = 0x0800_0000;
+const OP_NO_TLSV1_3: u64 = 0x2000_0000;
+const OP_NO_COMPRESSION: u64 = 0x0002_0000;
+const OP_CIPHER_SERVER_PREFERENCE: u64 = 0x0040_0000;
+const OP_ENABLE_MIDDLEBOX_COMPAT: u64 = 0x0010_0000;
+
+pub const DEFAULT_OPTIONS: u64 = OP_ALL
+    | OP_NO_SSLV3
+    | OP_NO_COMPRESSION
+    | OP_CIPHER_SERVER_PREFERENCE
+    | OP_ENABLE_MIDDLEBOX_COMPAT;
+
+/// `X509_V_FLAG_*` bits carried by `SSLContext.verify_flags`.
+const VERIFY_CRL_CHECK_LEAF: i32 = 4;
+const VERIFY_CRL_CHECK_CHAIN: i32 = 12;
+const VERIFY_X509_STRICT: i32 = 32;
+const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
+
+/// Revocation scope requested by `verify_flags`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrlScope {
+    Disabled,
+    EndEntityOnly,
+    FullChain,
+}
+
+fn crl_scope(verify_flags: i32) -> CrlScope {
+    if verify_flags & VERIFY_CRL_CHECK_LEAF == 0 {
+        CrlScope::Disabled
+    } else if verify_flags & VERIFY_CRL_CHECK_CHAIN == VERIFY_CRL_CHECK_CHAIN {
+        CrlScope::FullChain
+    } else {
+        CrlScope::EndEntityOnly
+    }
+}
 
 impl Context {
     fn new(protocol: i32) -> Result<Self, &'static str> {
         ensure_provider();
         if !matches!(
             protocol,
-            PROTOCOL_TLS | PROTOCOL_TLS_CLIENT | PROTOCOL_TLS_SERVER | 5 | 6
+            PROTOCOL_TLS
+                | PROTOCOL_TLS_CLIENT
+                | PROTOCOL_TLS_SERVER
+                | PROTOCOL_TLSV1_2
+                | PROTOCOL_TLSV1_3
         ) {
             return Err("invalid or unsupported protocol version");
         }
@@ -185,35 +246,57 @@ impl Context {
         let server_ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
             .map_err(|_| "failed to initialize TLS session ticket encryption")?;
         Ok(Self {
+            identity: NEXT_CONTEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
             protocol,
             check_hostname: client,
             verify_mode: if client { CERT_REQUIRED } else { CERT_NONE },
             verify_flags: 32768,
             options: DEFAULT_OPTIONS,
             minimum_version: match protocol {
-                5 => 0x303,
-                6 => 0x304,
+                PROTOCOL_TLSV1_2 => 0x303,
+                PROTOCOL_TLSV1_3 => 0x304,
                 _ => -2,
             },
             maximum_version: match protocol {
-                5 => 0x303,
-                6 => 0x304,
+                PROTOCOL_TLSV1_2 => 0x303,
+                PROTOCOL_TLSV1_3 => 0x304,
                 _ => -1,
             },
             alpn_protocols: Vec::new(),
             roots: rustls::RootCertStore::empty(),
             root_der: Vec::new(),
             capaths: Vec::new(),
+            capath_cache: Mutex::new(None),
             crls: Vec::new(),
             cipher_suites: None,
             ecdh_curve: None,
             certified_keys: Vec::new(),
+            num_tickets: None,
             server_session_store: rustls::server::ServerSessionMemoryCache::new(256),
             server_ticketer,
             accept_count: AtomicUsize::new(0),
             session_hits: AtomicUsize::new(0),
         })
     }
+}
+
+/// Stable identity for `SSLSession` ownership checks.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_identity(context: *const Context) -> usize {
+    unsafe { (*context).identity }
+}
+
+/// Bound the TLS 1.3 session tickets a server issues.  `None` keeps rustls'
+/// default; `Some(0)` disables resumption tickets entirely.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_set_num_tickets(context: *mut Context, tickets: usize) {
+    unsafe { (*context).num_tickets = Some(tickets) };
 }
 
 #[inline(never)]
@@ -355,35 +438,82 @@ fn read_pem_certificates(data: &[u8]) -> NativeResult<Vec<CertificateDer<'static
     Ok(certs)
 }
 
-fn read_private_key(data: &[u8], password: Option<&[u8]>) -> NativeResult<PrivateKeyDer<'static>> {
-    if let Some(password) = password {
-        use der::SecretDocument;
-        use pkcs8::EncryptedPrivateKeyInfoRef;
+/// An encrypted private key, in whichever container the file uses.
+enum EncryptedKey {
+    /// PKCS#8 `EncryptedPrivateKeyInfo`, either DER or its PEM armouring.
+    Pkcs8(Vec<u8>),
+    /// RFC 1421 `Proc-Type: 4,ENCRYPTED`.  The password callback still has to
+    /// run so the eventual failure names the container rather than reporting a
+    /// missing key.
+    Legacy,
+}
 
-        let pem = String::from_utf8_lossy(data);
-        if let Some(start) = pem.find("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
-            let tail = &pem[start..];
-            let end_marker = "-----END ENCRYPTED PRIVATE KEY-----";
-            let end = tail
-                .find(end_marker)
-                .ok_or_else(|| pem_error("unterminated encrypted private key"))?
-                + end_marker.len();
-            let (_, document) = SecretDocument::from_pem(&tail[..end])
-                .map_err(|error| pem_error(format!("bad encrypted private key: {error}")))?;
-            let encrypted = EncryptedPrivateKeyInfoRef::try_from(document.as_bytes())
-                .map_err(|error| pem_error(format!("bad encrypted private key: {error}")))?;
-            let decrypted = encrypted
-                .decrypt(password)
-                .map_err(|error| pem_error(format!("bad decrypt: {error}")))?;
-            return Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                decrypted.as_bytes().to_vec(),
-            )));
-        }
+/// True for an RFC 1421 header line marking the following key as encrypted.
+/// The space after the colon is conventional, not required.
+fn has_legacy_encryption_header(data: &[u8]) -> bool {
+    String::from_utf8_lossy(data).lines().any(|line| {
+        line.strip_prefix("Proc-Type:")
+            .is_some_and(|value| value.split_whitespace().collect::<String>() == "4,ENCRYPTED")
+    })
+}
+
+/// Recognize an encrypted private key from the parsed container rather than
+/// from a scan for header text, so DER `EncryptedPrivateKeyInfo` files are
+/// classified the same way as their PEM form.
+fn encrypted_private_key(data: &[u8]) -> NativeResult<Option<EncryptedKey>> {
+    use der::SecretDocument;
+    use pkcs8::EncryptedPrivateKeyInfoRef;
+
+    let pem = String::from_utf8_lossy(data);
+    if let Some(start) = pem.find("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+        let tail = &pem[start..];
+        let end_marker = "-----END ENCRYPTED PRIVATE KEY-----";
+        let end = tail
+            .find(end_marker)
+            .ok_or_else(|| pem_error("unterminated encrypted private key"))?
+            + end_marker.len();
+        let (_, document) = SecretDocument::from_pem(&tail[..end])
+            .map_err(|error| pem_error(format!("bad encrypted private key: {error}")))?;
+        return Ok(Some(EncryptedKey::Pkcs8(document.as_bytes().to_vec())));
+    }
+    if has_legacy_encryption_header(data) {
+        return Ok(Some(EncryptedKey::Legacy));
+    }
+    if EncryptedPrivateKeyInfoRef::try_from(data).is_ok() {
+        return Ok(Some(EncryptedKey::Pkcs8(data.to_vec())));
+    }
+    Ok(None)
+}
+
+/// Either the parsed key, or the fact that one cannot be produced without a
+/// password.
+enum PrivateKey {
+    Key(PrivateKeyDer<'static>),
+    PasswordRequired,
+}
+
+fn read_private_key(data: &[u8], password: Option<&[u8]>) -> NativeResult<PrivateKey> {
+    if let Some(encrypted) = encrypted_private_key(data)? {
+        let Some(password) = password else {
+            return Ok(PrivateKey::PasswordRequired);
+        };
+        let EncryptedKey::Pkcs8(der) = encrypted else {
+            return Err(pem_error("unsupported encrypted private key format"));
+        };
+        let encrypted = pkcs8::EncryptedPrivateKeyInfoRef::try_from(der.as_slice())
+            .map_err(|error| pem_error(format!("bad encrypted private key: {error}")))?;
+        let decrypted = encrypted
+            .decrypt(password)
+            .map_err(|error| pem_error(format!("bad decrypt: {error}")))?;
+        return Ok(PrivateKey::Key(PrivateKeyDer::Pkcs8(
+            PrivatePkcs8KeyDer::from(decrypted.as_bytes().to_vec()),
+        )));
     }
 
     rustls_pemfile::private_key(&mut Cursor::new(data))
         .map_err(pem_error)?
         .ok_or_else(|| pem_error("no private key found"))
+        .map(PrivateKey::Key)
 }
 
 /// Load and validate the context's certificate/private-key pair.
@@ -391,6 +521,11 @@ fn read_private_key(data: &[u8], password: Option<&[u8]>) -> NativeResult<Privat
 /// The replacement is committed only after parsing, provider key loading, and
 /// public/private key matching all succeed, so concurrent connection creation
 /// never observes a half-updated pair.
+///
+/// Returns `false` when the key turned out to be encrypted and no password was
+/// supplied; the caller obtains one and calls again.  Discovering that from the
+/// parse keeps an irrelevant password callback from running for an unencrypted
+/// key without pre-scanning the file for header text.
 ///
 /// # Safety
 /// `context` must point to a live [`Context`].
@@ -400,12 +535,15 @@ pub unsafe fn context_load_cert_chain(
     cert_path: &str,
     key_path: &str,
     password: Option<&[u8]>,
-) -> NativeResult<()> {
+) -> NativeResult<bool> {
     ensure_provider();
     let cert_data = std::fs::read(cert_path).map_err(io_error)?;
     let certs = read_pem_certificates(&cert_data)?;
     let key_data = std::fs::read(key_path).map_err(io_error)?;
-    let key = read_private_key(&key_data, password)?;
+    let key = match read_private_key(&key_data, password)? {
+        PrivateKey::Key(key) => key,
+        PrivateKey::PasswordRequired => return Ok(false),
+    };
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|error| pem_error(format!("unsupported private key: {error}")))?;
     let certified = CertifiedKey::new(certs, signing_key);
@@ -427,7 +565,7 @@ pub unsafe fn context_load_cert_chain(
     } else {
         context.certified_keys.push(certified);
     }
-    Ok(())
+    Ok(true)
 }
 
 fn parse_concatenated_der(mut data: &[u8]) -> NativeResult<Vec<Vec<u8>>> {
@@ -493,6 +631,10 @@ pub unsafe fn context_add_verify_dir(context: *mut Context, path: &str) {
     let path = std::path::PathBuf::from(path);
     if !context.capaths.iter().any(|known| known == &path) {
         context.capaths.push(path);
+        *context
+            .capath_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 }
 
@@ -536,6 +678,53 @@ unsafe fn context_add_verify_der(
         added += usize::from(context.add_root(der)?);
     }
     Ok(added)
+}
+
+/// Certificate bundles the platform's OpenSSL build would compile in as
+/// `X509_get_default_cert_file()`, most specific first.
+const DEFAULT_CERT_FILES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/tls/cacert.pem",
+    "/etc/ssl/cert.pem",
+    "/usr/local/share/certs/ca-root-nss.crt",
+    "/usr/local/etc/openssl/cert.pem",
+];
+
+/// Hashed certificate directories corresponding to
+/// `X509_get_default_cert_dir()`.
+const DEFAULT_CERT_DIRS: &[&str] = &[
+    "/etc/ssl/certs",
+    "/etc/pki/tls/certs",
+    "/system/etc/security/cacerts",
+    "/usr/local/share/certs",
+];
+
+/// The trust file and directory this platform actually carries, for
+/// `_ssl.get_default_verify_paths()`.  Reporting the historical
+/// `/etc/ssl/cert.pem` pair everywhere names a store most Linux distributions
+/// do not have.  The environment variables that shadow these values are
+/// applied by `ssl.py`, so the compiled-in defaults are returned unshadowed.
+#[inline(never)]
+pub fn default_verify_paths() -> (String, String) {
+    fn first_existing(
+        candidates: &[&'static str],
+        exists: fn(&std::path::Path) -> bool,
+    ) -> Option<&'static str> {
+        candidates
+            .iter()
+            .find(|candidate| exists(std::path::Path::new(candidate)))
+            .copied()
+    }
+    (
+        first_existing(DEFAULT_CERT_FILES, std::path::Path::is_file)
+            .unwrap_or("/etc/ssl/cert.pem")
+            .to_string(),
+        first_existing(DEFAULT_CERT_DIRS, std::path::Path::is_dir)
+            .unwrap_or("/etc/ssl/certs")
+            .to_string(),
+    )
 }
 
 /// Load trust anchors from the platform provider (Keychain on macOS, native
@@ -1078,15 +1267,44 @@ pub fn validate_cipher_string(pattern: &str) -> Result<(), &'static str> {
     parse_cipher_string(pattern).map(|_| ())
 }
 
+/// OpenSSL's name for each cipher suite rustls can negotiate.
+///
+/// `rustls::CipherSuite` renders through `Debug`, which carries no stability
+/// guarantee, and its TLS 1.2 spelling differs from OpenSSL's anyway.  Both
+/// `set_ciphers()` selection and `SSLSocket.cipher()` read this table so a
+/// rustls upgrade cannot silently change either.
+///
+/// A suite absent from this table is neither selectable nor reportable, so a
+/// provider gaining one has to be named here as well as in [`CIPHERS`].
+fn openssl_cipher_name(suite: rustls::SupportedCipherSuite) -> Option<&'static str> {
+    use rustls::CipherSuite;
+    Some(match suite.suite() {
+        CipherSuite::TLS13_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
+        CipherSuite::TLS13_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384",
+        CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => "TLS_CHACHA20_POLY1305_SHA256",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => "ECDHE-ECDSA-AES128-GCM-SHA256",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => "ECDHE-ECDSA-AES256-GCM-SHA384",
+        CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
+            "ECDHE-ECDSA-CHACHA20-POLY1305"
+        }
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => "ECDHE-RSA-AES128-GCM-SHA256",
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => "ECDHE-RSA-AES256-GCM-SHA384",
+        CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => "ECDHE-RSA-CHACHA20-POLY1305",
+        _ => return None,
+    })
+}
+
 fn cipher_pattern_matches(suite: rustls::SupportedCipherSuite, pattern: &str) -> bool {
     if suite.tls13().is_some() {
         return false;
     }
-    let name = format!("{:?}", suite.suite());
+    let Some(name) = openssl_cipher_name(suite) else {
+        return false;
+    };
     match pattern {
         "ALL" | "DEFAULT" | "HIGH" => true,
-        "AES128" => name.contains("AES_128"),
-        "AES256" => name.contains("AES_256"),
+        "AES128" => name.contains("AES128"),
+        "AES256" => name.contains("AES256"),
         "AESGCM" => name.contains("AES") && name.contains("GCM"),
         "CHACHA20" => name.contains("CHACHA20"),
         "ECDHE" | "KECDHE" => name.contains("ECDHE"),
@@ -1099,6 +1317,27 @@ fn cipher_pattern_matches(suite: rustls::SupportedCipherSuite, pattern: &str) ->
             compact_name.contains(&compact_pattern)
         }
     }
+}
+
+/// Whether the cipher named by [`cipher_name`] survives this context's
+/// `set_ciphers()` filter.  TLS 1.3 suites are never filtered, matching
+/// `SSL_CTX_set_cipher_list`.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_cipher_enabled(context: *const Context, index: usize) -> bool {
+    let context = unsafe { &*context };
+    let entry = CIPHERS[index];
+    let Some(selected) = &context.cipher_suites else {
+        return true;
+    };
+    if entry.protocol == "TLSv1.3" {
+        return true;
+    }
+    selected
+        .iter()
+        .any(|suite| openssl_cipher_name(*suite) == Some(entry.name))
 }
 
 fn parse_cipher_string(pattern: &str) -> Result<Vec<rustls::SupportedCipherSuite>, &'static str> {
@@ -1300,7 +1539,6 @@ impl rustls::client::danger::ServerCertVerifier for ExplicitEndEntityVerifier {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
             })?;
         let self_issued = certificate.subject() == certificate.issuer();
-        const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
         if !self_issued && self.verify_flags & VERIFY_X509_PARTIAL_CHAIN == 0 {
             return Err(original_error);
         }
@@ -1491,7 +1729,20 @@ fn is_capath_hash_name(name: &std::ffi::OsStr) -> bool {
         && suffix.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn capath_certificates(context: &Context) -> Vec<Vec<u8>> {
+fn capath_stamps(context: &Context) -> Vec<CapathStamp> {
+    context
+        .capaths
+        .iter()
+        .map(|directory| {
+            let modified = std::fs::metadata(directory)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            (directory.clone(), modified)
+        })
+        .collect()
+}
+
+fn read_capath_certificates(context: &Context) -> Vec<Vec<u8>> {
     let mut paths = Vec::new();
     for directory in &context.capaths {
         let Ok(entries) = std::fs::read_dir(directory) else {
@@ -1505,7 +1756,8 @@ fn capath_certificates(context: &Context) -> Vec<Vec<u8>> {
     }
     paths.sort();
 
-    let mut result = Vec::new();
+    let mut result: Vec<Vec<u8>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for path in paths {
         let Ok(data) = std::fs::read(path) else {
             continue;
@@ -1515,12 +1767,33 @@ fn capath_certificates(context: &Context) -> Vec<Vec<u8>> {
         };
         for certificate in certificates {
             let der = certificate.as_ref().to_vec();
-            if !result.iter().any(|known| known == &der) {
+            if seen.insert(der.clone()) {
                 result.push(der);
             }
         }
     }
     result
+}
+
+/// Materialize every certificate reachable through the context's hashed CA
+/// directories, reusing the previous scan while the directories are unchanged.
+fn capath_certificates(context: &Context) -> Arc<Vec<Vec<u8>>> {
+    if context.capaths.is_empty() {
+        return Arc::new(Vec::new());
+    }
+    let stamps = capath_stamps(context);
+    let mut cache = context
+        .capath_cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((cached_stamps, certificates)) = cache.as_ref()
+        && cached_stamps == &stamps
+    {
+        return certificates.clone();
+    }
+    let certificates = Arc::new(read_capath_certificates(context));
+    *cache = Some((stamps, certificates.clone()));
+    certificates
 }
 
 fn provider_for_context(context: &Context) -> Arc<rustls::crypto::CryptoProvider> {
@@ -1818,7 +2091,7 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
     let builder = rustls::ClientConfig::builder_with_provider(provider_for_context(context))
         .with_protocol_versions(enabled_versions(context)?)
         .map_err(|error| (0, format!("[SSL] invalid TLS configuration: {error}")))?;
-    let deferred_roots = capath_certificates(context);
+    let deferred_roots = capath_certificates(context).as_ref().clone();
     let mut roots = context.roots.clone();
     for der in &deferred_roots {
         // A hashed directory is intentionally tolerant of stale or malformed
@@ -1833,6 +2106,9 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
         let mut verifier_builder = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots));
         if !context.crls.is_empty() {
             verifier_builder = verifier_builder.with_crls(context.crls.clone());
+            if crl_scope(context.verify_flags) == CrlScope::EndEntityOnly {
+                verifier_builder = verifier_builder.only_check_end_entity_revocation();
+            }
         }
         let verifier = verifier_builder.build().map_err(|error| {
             (
@@ -1851,8 +2127,8 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
         let mut verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PolicyServerVerifier {
                 inner: verifier,
-                require_authority_key_identifier: context.verify_flags & 32 != 0,
-                require_crl: context.verify_flags & 12 != 0,
+                require_authority_key_identifier: context.verify_flags & VERIFY_X509_STRICT != 0,
+                require_crl: crl_scope(context.verify_flags) != CrlScope::Disabled,
                 has_crl: !context.crls.is_empty(),
             });
         if !context.check_hostname {
@@ -1885,11 +2161,31 @@ fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
     let builder = rustls::ServerConfig::builder_with_provider(provider_for_context(context))
         .with_protocol_versions(enabled_versions(context)?)
         .map_err(|error| (0, format!("[SSL] invalid TLS configuration: {error}")))?;
-    let wants_server_cert = if context.verify_mode == CERT_NONE || context.roots.is_empty() {
+    let wants_server_cert = if context.verify_mode == CERT_NONE {
         builder.with_no_client_auth()
     } else {
-        let verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(context.roots.clone()));
+        // A hashed directory is as much a trust source for client certificates
+        // as an eagerly loaded file, so it must reach the verifier.  Silently
+        // dropping client authentication when no root is configured would
+        // accept unauthenticated clients under CERT_REQUIRED.
+        let mut roots = context.roots.clone();
+        for der in capath_certificates(context).iter() {
+            let _ = roots.add(CertificateDer::from(der.clone()));
+        }
+        if roots.is_empty() {
+            return Err((
+                0,
+                "[SSL] client authentication requires at least one trusted CA certificate"
+                    .to_string(),
+            ));
+        }
+        let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+        if !context.crls.is_empty() {
+            verifier = verifier.with_crls(context.crls.clone());
+            if crl_scope(context.verify_flags) == CrlScope::EndEntityOnly {
+                verifier = verifier.only_check_end_entity_revocation();
+            }
+        }
         let verifier = if context.verify_mode == CERT_OPTIONAL {
             verifier.allow_unauthenticated()
         } else {
@@ -1905,6 +2201,9 @@ fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
     config.alpn_protocols = context.alpn_protocols.clone();
     config.session_storage = context.server_session_store.clone();
     config.ticketer = context.server_ticketer.clone();
+    if let Some(tickets) = context.num_tickets {
+        config.send_tls13_tickets = tickets;
+    }
     Ok(config)
 }
 
@@ -1917,10 +2216,10 @@ fn enabled_versions(
     let maximum = context.maximum_version;
     let tls12 = (minimum < 0 || minimum <= 0x303)
         && (maximum < 0 || maximum >= 0x303)
-        && context.options & 0x0800_0000 == 0;
+        && context.options & OP_NO_TLSV1_2 == 0;
     let tls13 = (minimum < 0 || minimum <= 0x304)
         && (maximum < 0 || maximum >= 0x304)
-        && context.options & 0x2000_0000 == 0;
+        && context.options & OP_NO_TLSV1_3 == 0;
     match (tls12, tls13) {
         (true, true) => Ok(rustls::DEFAULT_VERSIONS),
         (true, false) => Ok(TLS12_ONLY),
@@ -2035,41 +2334,33 @@ fn rustls_error(error: impl std::fmt::Display) -> (i32, String) {
     (TLS_ERROR_SSL, format!("[SSL] {error}"))
 }
 
+/// Map a rustls verification failure onto its OpenSSL X509 verification code.
+/// The accompanying text comes from [`certificate_verify_message`], the single
+/// code-to-message table, so `SSLCertVerificationError.verify_message` and the
+/// exception text cannot drift apart.
 #[allow(deprecated)] // rustls can still return the compatibility variant.
 fn certificate_error_details(error: &rustls::CertificateError) -> (i32, &'static str) {
     use rustls::CertificateError;
-    match error {
-        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-            (10, "certificate has expired")
-        }
-        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-            (9, "certificate is not yet valid")
-        }
-        CertificateError::Revoked => (23, "certificate revoked"),
-        CertificateError::UnknownIssuer => (20, "unable to get local issuer certificate"),
-        CertificateError::BadSignature => (7, "certificate signature failure"),
-        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
-            (62, "hostname mismatch")
-        }
-        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
-            (26, "unsuitable certificate purpose")
-        }
-        CertificateError::BadEncoding => (5, "unable to decode certificate"),
-        CertificateError::UnhandledCriticalExtension => (34, "unhandled critical extension"),
-        CertificateError::UnknownRevocationStatus => (3, "unable to get certificate CRL"),
+    let code = match error {
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => 10,
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => 9,
+        CertificateError::Revoked => 23,
+        CertificateError::UnknownIssuer => 20,
+        CertificateError::BadSignature => 7,
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => 62,
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => 26,
+        CertificateError::BadEncoding => 5,
+        CertificateError::UnhandledCriticalExtension => 34,
+        CertificateError::UnknownRevocationStatus => 3,
         CertificateError::ExpiredRevocationList
-        | CertificateError::ExpiredRevocationListContext { .. } => (12, "CRL has expired"),
+        | CertificateError::ExpiredRevocationListContext { .. } => 12,
         CertificateError::UnsupportedSignatureAlgorithm
         | CertificateError::UnsupportedSignatureAlgorithmContext { .. }
-        | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
-            (7, "certificate signature failure")
-        }
-        CertificateError::InvalidOcspResponse => (50, "application verification failure"),
-        CertificateError::ApplicationVerificationFailure | CertificateError::Other(_) => {
-            (1, "certificate verify failed")
-        }
-        _ => (1, "certificate verify failed"),
-    }
+        | CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => 7,
+        CertificateError::InvalidOcspResponse => 50,
+        _ => 1,
+    };
+    (code, certificate_verify_message(code))
 }
 
 fn rustls_protocol_error(error: rustls::Error) -> (i32, String) {
@@ -2203,17 +2494,17 @@ impl TlsConnection {
             let Some(inner) = self.inner.as_mut() else {
                 return Ok(());
             };
+            // rustls signals plaintext backpressure through `wants_read`; the
+            // corresponding `read_tls` failure carries only an unstable
+            // message string.
+            if !inner.wants_read() {
+                return Ok(());
+            }
             let mut cursor =
                 Cursor::new(&self.pending_received_tls[self.pending_received_tls_start..]);
             let read = match inner.read_tls(&mut cursor) {
                 Ok(0) => return Ok(()),
                 Ok(read) => read,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::Other
-                        && error.to_string() == "received plaintext buffer full" =>
-                {
-                    return Ok(());
-                }
                 Err(error) => return Err(rustls_error(error)),
             };
             self.pending_received_tls_start += read;
@@ -2325,7 +2616,7 @@ pub unsafe fn connection_new(
             client_config(context)?
         } else {
             let session = unsafe { &*session };
-            if session.context_identity != context as *const Context as usize {
+            if session.context_identity != context.identity {
                 return Err((0, "Session refers to a different SSLContext.".to_string()));
             }
             if session.server_name == name {
@@ -2360,7 +2651,7 @@ pub unsafe fn connection_new(
         pending_received_tls_start: 0,
         client_config: retained_client_config,
         client_session_store: retained_client_store,
-        context_identity: context as *const Context as usize,
+        context_identity: context.identity,
         server_context: std::ptr::null(),
         server_hit_counted: false,
     })))
@@ -2729,45 +3020,6 @@ pub unsafe fn connection_session(connection: *const TlsConnection) -> *mut Nativ
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// Return stable channel-binding bytes shared by both peers for TLS 1.2.
-/// rustls does not expose the Finished verify_data used by RFC 5929's
-/// historical `tls-unique` construction, so use its standard exporter with a
-/// private compatibility label. This preserves the binding's required peer
-/// equality and per-session uniqueness without exposing key material.
-///
-/// # Safety
-/// `connection` must point to a live connection.
-#[inline(never)]
-pub unsafe fn connection_tls_unique(connection: *const TlsConnection) -> Option<Vec<u8>> {
-    let inner = unsafe { (&*connection).inner.as_ref() }?;
-    if inner.is_handshaking() || inner.protocol_version()? != rustls::ProtocolVersion::TLSv1_2 {
-        return None;
-    }
-    let mut output = vec![0u8; 12];
-    inner
-        .export_keying_material(&mut output, b"EXPORTER-pyre-tls-unique", None)
-        .ok()?;
-    Some(output)
-}
-
-fn openssl_cipher_name(suite: rustls::SupportedCipherSuite) -> String {
-    let name = format!("{:?}", suite.suite());
-    if suite.tls13().is_some() {
-        // rustls' enum uses a `TLS13_` disambiguator while IANA/OpenSSL call
-        // these suites `TLS_AES_*` and `TLS_CHACHA20_*`.
-        return name
-            .strip_prefix("TLS13_")
-            .map(|suffix| format!("TLS_{suffix}"))
-            .unwrap_or(name);
-    }
-    name.strip_prefix("TLS_")
-        .unwrap_or(&name)
-        .replace("_WITH_", "-")
-        .replace("AES_128", "AES128")
-        .replace("AES_256", "AES256")
-        .replace('_', "-")
-}
-
 /// Negotiated OpenSSL-style cipher name and effective key size.
 ///
 /// # Safety
@@ -2775,11 +3027,7 @@ fn openssl_cipher_name(suite: rustls::SupportedCipherSuite) -> String {
 #[inline(never)]
 pub unsafe fn connection_cipher(connection: *const TlsConnection) -> Option<(String, i32)> {
     let suite = unsafe { (&*connection).inner.as_ref() }?.negotiated_cipher_suite()?;
-    let name = openssl_cipher_name(suite);
-    let bits = if name.contains("AES128") || name.contains("AES_128") {
-        128
-    } else {
-        256
-    };
-    Some((name, bits))
+    let name = openssl_cipher_name(suite)?;
+    let bits = if name.contains("AES128") { 128 } else { 256 };
+    Some((name.to_string(), bits))
 }
