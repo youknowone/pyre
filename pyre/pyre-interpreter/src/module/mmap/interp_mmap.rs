@@ -1168,7 +1168,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 // access / length / pos / offset.  Capitalised True /
                 // False matches CPython's bool repr.
                 if mmap_get_attr_i64(obj, "_ptr") == 0 {
-                    return Ok(pyre_object::w_str_new("<mmap.mmap closed=True>"));
+                    return Ok(pyre_object::w_str_new_managed("<mmap.mmap closed=True>"));
                 }
                 let len = mmap_get_attr_i64(obj, "_len");
                 let pos = mmap_get_attr_i64(obj, "_pos");
@@ -1180,7 +1180,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     x if x == MMAP_ACCESS_COPY => "ACCESS_COPY",
                     _ => "ACCESS_DEFAULT",
                 };
-                Ok(pyre_object::w_str_new(&format!(
+                // W_MMap.descr_repr returns `space.newtext(...)` for both
+                // live and closed mappings.
+                Ok(pyre_object::w_str_new_managed(&format!(
                     "<mmap.mmap closed=False, access={access_str}, length={len}, pos={pos}, offset={offset}>"
                 )))
             },
