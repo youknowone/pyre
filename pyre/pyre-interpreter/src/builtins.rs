@@ -16109,7 +16109,12 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             ));
         }
     }
-    // Append to __file_data__ and update on close.
+    // Write into the in-memory pathname backing at the stream's current
+    // position.  The Windows/non-Unix fallback must preserve FileIO's seek +
+    // overwrite semantics: `zipfile` writes a provisional local header, then
+    // seeks back and patches it.  Appending every write left the provisional
+    // bytes in place and produced an archive whose central directory pointed
+    // at a non-`PK\x03\x04` local header.
     unsafe {
         let mut prev = file_get_data(args[0]);
         let (bytes, len) = if pyre_object::is_str(args[1]) {
@@ -16124,22 +16129,45 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let len = data.len();
             (data, len)
         };
-        prev.extend_from_slice(&bytes);
+        let append = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
+            .ok()
+            .map(|mode| pyre_object::w_str_get_value(mode).contains('a'))
+            .unwrap_or(false);
+        let pos = if append {
+            prev.len()
+        } else {
+            file_get_pos(args[0])
+        };
+        let end = file_write_at(&mut prev, pos, &bytes)?;
         let _ = crate::baseobjspace::setattr_str(
             args[0],
             "__file_data__",
             pyre_object::bytesobject::w_bytes_from_bytes(&prev),
         );
+        file_set_pos(args[0], end);
         let _ = crate::baseobjspace::setattr_str(args[0], "__file_dirty__", w_bool_from(true));
-        let append = crate::baseobjspace::getattr_str(args[0], "__file_mode__")
-            .ok()
-            .map(|mode| pyre_object::w_str_get_value(mode).contains('a'))
-            .unwrap_or(false);
         if !append {
             file_flush_dirty(args[0])?;
         }
         Ok(w_int_new(len as i64))
     }
+}
+
+/// FileIO's position-aware write over the non-fd in-memory backing. Kept
+/// target-neutral so the seek-back behavior Windows relies on is covered by
+/// the ordinary test build too.
+fn file_write_at(data: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> Result<usize, crate::PyError> {
+    if pos > data.len() {
+        data.resize(pos, 0);
+    }
+    let end = pos
+        .checked_add(bytes.len())
+        .ok_or_else(|| crate::PyError::overflow_error("write position out of range"))?;
+    if end > data.len() {
+        data.resize(end, 0);
+    }
+    data[pos..end].copy_from_slice(bytes);
+    Ok(end)
 }
 
 fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -17980,6 +18008,18 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_memory_file_write_overwrites_at_the_seek_position() {
+        let mut data = b"PK\0\0payload".to_vec();
+        let end = file_write_at(&mut data, 2, b"\x03\x04").unwrap();
+        assert_eq!(end, 4);
+        assert_eq!(&data, b"PK\x03\x04payload");
+
+        let end = file_write_at(&mut data, 12, b"x").unwrap();
+        assert_eq!(end, 13);
+        assert_eq!(&data[11..], b"\0x");
+    }
 
     #[test]
     fn syntax_error_offsets_convert_utf8_bytes_to_characters() {
