@@ -11239,7 +11239,12 @@ fn incompatible_string_prefix_error(
 /// incomplete `\N{...` as either its own escape error or an unclosed f-string
 /// field.  Recover the decoder-first error, including the byte range relative
 /// to the literal contents used by the codec error message.
-fn malformed_unicode_name_escape(source: &str) -> Option<String> {
+/// The message a malformed `\N` escape produces, with the byte offset of the
+/// literal that carries it.
+///
+/// The caller needs the offset because this walks the whole source: the escape
+/// is only what gets reported when nothing earlier in the file already failed.
+fn malformed_unicode_name_escape(source: &str) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
@@ -11319,10 +11324,13 @@ fn malformed_unicode_name_escape(source: &str) -> Option<String> {
                 None
             };
             if let Some(malformed_end) = malformed_end {
-                return Some(format!(
-                    "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
-                    escape - content_start,
-                    malformed_end - content_start,
+                return Some((
+                    format!(
+                        "(unicode error) 'unicodeescape' codec can't decode bytes in position {}-{}: malformed \\N character escape",
+                        escape - content_start,
+                        malformed_end - content_start,
+                    ),
+                    token_start,
                 ));
             }
             escape += 2;
@@ -11611,8 +11619,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             );
         }
     }
-    if let Some(unicode_error) = malformed_unicode_name_escape(source) {
-        msg = unicode_error;
+    if let Some((unicode_error, literal_start)) = malformed_unicode_name_escape(source) {
+        // Both the decode and the parse are failures of the same compile, and
+        // the one reported is whichever comes first in the source. A literal
+        // that sits after the parser's own error keeps that error, so
+        // `1 +\nx = "\N"\n` still reports the incomplete expression on line 1.
+        let parser_start = match &e {
+            crate::compile::CompileError::Parse(parse_error) => {
+                Some(parse_error.raw_location.start().to_usize())
+            }
+            _ => None,
+        };
+        if parser_start.is_none_or(|start| start >= literal_start) {
+            msg = unicode_error;
+        }
     }
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
@@ -17937,13 +17957,19 @@ mod tests {
             (r"f'\N{'", "0-2"),
             (r"'\N{GREEK CAPITAL LETTER DELTA'", "0-28"),
         ] {
-            let message = malformed_unicode_name_escape(source).unwrap();
+            let (message, literal_start) = malformed_unicode_name_escape(source).unwrap();
             assert!(message.contains(&format!("position {range}:")), "{message}");
             assert!(message.ends_with(r"malformed \N character escape"));
+            assert_eq!(literal_start, 0);
         }
         assert_eq!(malformed_unicode_name_escape(r"r'\N'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\N{DELTA}'"), None);
         assert_eq!(malformed_unicode_name_escape(r"'\\N'"), None);
+        // The offset is what lets an earlier parse error keep the report.
+        assert_eq!(
+            malformed_unicode_name_escape("1 +\nx = \"\\N\"\n").map(|(_, start)| start),
+            Some(8)
+        );
     }
 
     #[test]
