@@ -1797,6 +1797,12 @@ pub enum DispatchOutcome {
         /// Codewrite-time resume-marker twin at the merge point op's jitcode
         /// offset, carried into the loop-close guards' snapshot words.
         loop_header_marker_jit_pc: Option<usize>,
+        /// Python instruction containing the explicit `loop_header` op that
+        /// preceded this merge-point crossing.  The codewriter emits that op in
+        /// the `JUMP_BACKWARD` block, so this is the owning back-edge opcode.
+        back_edge_pc: Option<usize>,
+        /// Resume-marker twin for [`Self::CloseLoop::back_edge_pc`].
+        back_edge_marker_jit_pc: Option<usize>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
     /// compiled targets, and the in-walk `compile_trace` attempt
@@ -1864,13 +1870,23 @@ impl PartialEq for DispatchOutcome {
                     jump_args: a_args,
                     loop_header_pc: a_pc,
                     loop_header_marker_jit_pc: a_marker,
+                    back_edge_pc: a_back_edge_pc,
+                    back_edge_marker_jit_pc: a_back_edge_marker,
                 },
                 Self::CloseLoop {
                     jump_args: b_args,
                     loop_header_pc: b_pc,
                     loop_header_marker_jit_pc: b_marker,
+                    back_edge_pc: b_back_edge_pc,
+                    back_edge_marker_jit_pc: b_back_edge_marker,
                 },
-            ) => a_args == b_args && a_pc == b_pc && a_marker == b_marker,
+            ) => {
+                a_args == b_args
+                    && a_pc == b_pc
+                    && a_marker == b_marker
+                    && a_back_edge_pc == b_back_edge_pc
+                    && a_back_edge_marker == b_back_edge_marker
+            }
             (
                 Self::CompileTracePending {
                     loop_header_pc: a_pc,
@@ -9991,6 +10007,7 @@ fn handle<Sym: WalkSym>(
                 _ => return Err(DispatchError::LoopHeaderJdIndexUnresolved { pc: op.pc }),
             };
             ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+            ctx.trace_ctx.seen_loop_header_jit_pc = Some(op.pc);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // RPython parity: `pyjitpl.py _opimpl_inline_call*`
@@ -11542,6 +11559,7 @@ fn handle<Sym: WalkSym>(
                 && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
             {
                 ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                ctx.trace_ctx.seen_loop_header_jit_pc = None;
             }
             if ctx.is_top_level
                 && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
@@ -11590,6 +11608,7 @@ fn handle<Sym: WalkSym>(
                 }
                 // pyjitpl.py: automatically add a loop_header.
                 ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                ctx.trace_ctx.seen_loop_header_jit_pc = None;
             }
             // pyjitpl.py.
             assert!(
@@ -11598,6 +11617,7 @@ fn handle<Sym: WalkSym>(
                  the following jit_merge_point's"
             );
             ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+            let back_edge_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
 
             // pyjitpl.py self.heapcache.reset()
             ctx.trace_ctx.heap_cache_mut().reset();
@@ -11861,20 +11881,29 @@ fn handle<Sym: WalkSym>(
                 // point in reverse and closes at the first same_greenkey hit,
                 // whichever loop that is, and `compile_loop` re-derives the
                 // green key from the merge point it closed at.
-                let loop_header_marker_jit_pc = {
+                let (loop_header_marker_jit_pc, back_edge_pc, back_edge_marker_jit_pc) = {
                     let sym_ptr = ctx.fbw_mode.snapshot_sym;
                     if sym_ptr.is_null() {
-                        None
+                        (None, None, None)
                     } else {
                         let sym = unsafe { &*sym_ptr };
                         if sym.jitcode().is_null() {
-                            None
+                            (None, None, None)
                         } else {
-                            unsafe {
-                                (&*sym.jitcode())
-                                    .payload
-                                    .resume_marker_for_jitcode_pc(op.pc)
-                            }
+                            let payload = unsafe { &(&*sym.jitcode()).payload };
+                            let back_edge_pc = back_edge_jit_pc.map(|jit_pc| {
+                                crate::py_coord::containing_py_pc_for_jitcode_pc(
+                                    &payload.metadata,
+                                    jit_pc,
+                                ) as usize
+                            });
+                            (
+                                payload.resume_marker_for_jitcode_pc(op.pc),
+                                back_edge_pc,
+                                back_edge_jit_pc.and_then(|jit_pc| {
+                                    payload.resume_marker_for_jitcode_pc(jit_pc)
+                                }),
+                            )
                         }
                     }
                 };
@@ -11883,6 +11912,8 @@ fn handle<Sym: WalkSym>(
                         jump_args: live_args,
                         loop_header_pc: next_instr,
                         loop_header_marker_jit_pc,
+                        back_edge_pc,
+                        back_edge_marker_jit_pc,
                     },
                     op.next_pc,
                 ))

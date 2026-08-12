@@ -11671,6 +11671,7 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next, code.len());
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
+    assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
 }
 

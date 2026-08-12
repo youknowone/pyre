@@ -895,7 +895,16 @@ impl MIFrame {
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        self.with_ctx(|this, ctx| this.close_loop_args_at(ctx, target_pc, header_marker_jit_pc))
+        let poll_resume_pc = self.orgpc;
+        self.with_ctx(|this, ctx| {
+            this.close_loop_args_at(
+                ctx,
+                target_pc,
+                header_marker_jit_pc,
+                poll_resume_pc,
+                header_marker_jit_pc,
+            )
+        })
     }
 
     #[doc(hidden)]
@@ -1985,8 +1994,9 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        poll_resume_pc: usize,
+        poll_resume_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
-        self.loop_close_marker_jit_pc = header_marker_jit_pc;
         // Mirror pypy/module/pypyjit/test_pypy_c/model.py's `--TICK--` shape:
         // load a process-global raw word through a baked constant address,
         // compare it, then guard the result. The folded eval-breaker word is a
@@ -2016,8 +2026,20 @@ impl MIFrame {
             let mask = ctx.const_int(majit_ir::eval_breaker_word::JIT_BREAKER_MASK as i64);
             let breaker_bits = ctx.record_op(OpCode::IntAnd, &[word, mask]);
             let armed = ctx.record_op(OpCode::IntIsTrue, &[breaker_bits]);
+            // The poll is synthesized while this MIFrame is anchored at the
+            // target merge point, but semantically it belongs to the
+            // JUMP_BACKWARD that reached that target.  Temporarily install the
+            // back-edge coordinates so guard flushing, liveness, last_instr,
+            // and the snapshot's JitCode/Python-PC pair all describe the same
+            // pre-opcode state.  Restore the header coordinates immediately:
+            // GuardFutureCondition below must retain its merge-point resume.
+            let header_orgpc = self.orgpc;
+            self.orgpc = poll_resume_pc;
+            self.loop_close_marker_jit_pc = poll_resume_marker_jit_pc;
             self.generate_guard(ctx, OpCode::GuardFalse, &[armed]);
+            self.orgpc = header_orgpc;
         }
+        self.loop_close_marker_jit_pc = header_marker_jit_pc;
         // pyjitpl.py:2954-2965 reached_loop_header: virtualizable_boxes
         // (read from locals_cells_stack_w[*] by virtualizable.py:86-98
         // read_boxes) are carried into the JUMP unchanged, including

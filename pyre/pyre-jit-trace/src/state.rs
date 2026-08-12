@@ -2898,6 +2898,8 @@ pub trait WalkSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        poll_resume_pc: usize,
+        poll_resume_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef>;
 }
 
@@ -3120,9 +3122,17 @@ impl WalkSym for PyreSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        poll_resume_pc: usize,
+        poll_resume_marker_jit_pc: Option<usize>,
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
-        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc)
+        frame.close_loop_args_at(
+            ctx,
+            target_pc,
+            header_marker_jit_pc,
+            poll_resume_pc,
+            poll_resume_marker_jit_pc,
+        )
     }
 }
 
@@ -13819,7 +13829,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, 0, None));
 
         assert_eq!(jump_args.len(), 10);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -13930,7 +13941,8 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args =
+            state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, 0, None));
 
         assert_eq!(
             jump_args.len(),

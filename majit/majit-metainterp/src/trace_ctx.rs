@@ -430,6 +430,14 @@ pub struct TraceCtx {
     /// jump), consumed and reset by the following `jit_merge_point`
     /// (pyjitpl.py:1559-1562).  `-1` = not seen.
     pub seen_loop_header_for_jdindex: i32,
+    /// JitCode coordinate of the explicit `loop_header` that set
+    /// [`Self::seen_loop_header_for_jdindex`].  The codewriter emits that op in
+    /// the `JUMP_BACKWARD` block, so its containing Python coordinate is the
+    /// back-edge instruction rather than the target `jit_merge_point`.
+    /// Consumed together with the driver-index stamp.  `None` covers automatic
+    /// loop headers and resume-at-position pre-arming, which have no explicit
+    /// back-edge op at that crossing.
+    pub seen_loop_header_jit_pc: Option<usize>,
     /// pyjitpl.py:2941-2942 `if isinstance(key, compile.ResumeAtPositionDescr):
     /// self.seen_loop_header_for_jdindex = self.jitdriver_sd.index` — a bridge
     /// grown from a guard `inline_short_preamble` replayed (unroll.py:337 /
@@ -1608,6 +1616,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,
             merge_point_resumed: false,
             callinfocollection: None,
@@ -1694,6 +1703,7 @@ impl TraceCtx {
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
             seen_loop_header_for_jdindex: -1,
+            seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,
             merge_point_resumed: false,
             callinfocollection: None,

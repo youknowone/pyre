@@ -3906,21 +3906,27 @@ fn run_perfn_walk<Sym: WalkSym>(
                 jump_args,
                 loop_header_pc,
                 loop_header_marker_jit_pc,
+                back_edge_pc,
+                back_edge_marker_jit_pc,
             },
             _end_pc,
         )) = &mut walk_result
         {
             let loop_header_pc = *loop_header_pc;
+            let poll_resume_pc = back_edge_pc.unwrap_or(loop_header_pc);
             let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
             WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
-            // `close_loop_args_at` reads the loop-header `orgpc` for the
-            // last_instr anchor, so pass that coordinate explicitly.
+            // The closing frame and GuardFutureCondition remain anchored at
+            // the loop header; the synthesized poll receives its owning
+            // back-edge coordinate separately.
             *jump_args = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
+                poll_resume_pc,
+                *back_edge_marker_jit_pc,
             );
         }
         // pyjitpl.py:3048-3091 raise_continue_running_normally parity: a
