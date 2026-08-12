@@ -442,6 +442,12 @@ pub(crate) fn after_fork_child() {
     crate::objspace::std::mapdict::after_fork_child();
     pyre_object::dictmultiobject::module_dict_locks_after_fork_child();
     crate::module::_collections::deque_locks_after_fork_child();
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    crate::cpyext::after_fork_child();
     majit_gc::shadow_stack::after_fork_child();
     majit_gc::gc_sync::after_fork_child();
 }

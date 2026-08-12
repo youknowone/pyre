@@ -1102,20 +1102,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "exec_dynamic",
         crate::make_builtin_function_with_arity(
             "exec_dynamic",
-            |_| Ok(pyre_object::w_int_new(0)),
+            |_| Ok(pyre_object::w_none()),
             1,
         ),
     );
     crate::module_ns_store(
         ns,
         "create_dynamic",
-        // interp_imp.py:49 create_dynamic — no C-extension support, the
-        // `has_so_extension() == False` branch. The spec's `name` and `origin`
-        // are read and rejected for an embedded null before reporting the
-        // unsupported load, matching `_imp_create_dynamic_impl`. Raising
-        // ImportError (rather than being absent) matches the meta-path
-        // `hasattr` probe while still letting `except ImportError` fall back to
-        // a pure-Python module.
         crate::make_builtin_function_with_arity(
             "create_dynamic",
             |args| {
@@ -1124,14 +1117,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "create_dynamic() missing required argument 'spec'",
                     ));
                 };
-                crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(spec, "name")?)?;
-                crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
-                    spec, "origin",
-                )?)?;
-                Err(crate::PyError::new(
-                    crate::PyErrorKind::ImportError,
-                    "Not implemented".to_string(),
-                ))
+                #[cfg(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                {
+                    return crate::cpyext::create_dynamic(spec);
+                }
+                #[cfg(not(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                )))]
+                {
+                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
+                        spec, "name",
+                    )?)?;
+                    crate::baseobjspace::text0_wtf8_w(crate::baseobjspace::getattr_str(
+                        spec, "origin",
+                    )?)?;
+                    Err(crate::PyError::new(
+                        crate::PyErrorKind::ImportError,
+                        "Not implemented".to_string(),
+                    ))
+                }
             },
             1,
         ),
@@ -1202,7 +1212,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "extension_suffixes",
         crate::make_builtin_function_with_arity(
             "extension_suffixes",
-            |_| Ok(pyre_object::w_list_new(vec![])),
+            |_| {
+                #[cfg(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                {
+                    return Ok(pyre_object::w_list_new(vec![pyre_object::w_str_new(
+                        crate::cpyext::extension_suffix(),
+                    )]));
+                }
+                #[cfg(not(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                )))]
+                {
+                    Ok(pyre_object::w_list_new(vec![]))
+                }
+            },
             0,
         ),
     );

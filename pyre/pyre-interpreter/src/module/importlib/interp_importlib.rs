@@ -107,7 +107,24 @@ pub fn register_machinery(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "EXTENSION_SUFFIXES",
-        pyre_object::w_list_new(vec![pyre_object::w_str_new(".so")]),
+        pyre_object::w_list_new({
+            #[cfg(all(
+                feature = "host_env",
+                not(feature = "sandbox"),
+                any(target_os = "macos", target_os = "linux")
+            ))]
+            {
+                vec![pyre_object::w_str_new(crate::cpyext::extension_suffix())]
+            }
+            #[cfg(not(all(
+                feature = "host_env",
+                not(feature = "sandbox"),
+                any(target_os = "macos", target_os = "linux")
+            )))]
+            {
+                vec![]
+            }
+        }),
     );
     crate::module_ns_store(
         ns,
@@ -125,11 +142,17 @@ pub fn register_machinery(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "all_suffixes",
             |_| {
-                Ok(pyre_object::w_list_new(vec![
+                let mut suffixes = vec![
                     pyre_object::w_str_new(".py"),
                     pyre_object::w_str_new(".pyc"),
-                    pyre_object::w_str_new(".so"),
-                ]))
+                ];
+                #[cfg(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                suffixes.push(pyre_object::w_str_new(crate::cpyext::extension_suffix()));
+                Ok(pyre_object::w_list_new(suffixes))
             },
             0,
         ),

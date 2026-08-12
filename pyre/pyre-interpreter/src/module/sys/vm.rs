@@ -1138,6 +1138,12 @@ pub fn exc_info_direct() -> PyObjectRef {
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    crate::cpyext::register_sys_dlopenflags(ns);
     module_ns_store(
         ns,
         "orig_argv",

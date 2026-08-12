@@ -857,9 +857,8 @@ fn init_string_module(ns: PyObjectRef) {
 /// spell `ABIFLAGS`, so on Windows a missing key is a `KeyError` out of the
 /// first `get_config_var` call rather than the `None` the `.get()` readers
 /// take. Both are 0 here — pyre is neither build, which is what an empty
-/// `sys.abiflags` already says. The other two keys `config_vars` carries,
-/// `EXT_SUFFIX` and `SOABI`, name an extension ABI; `_imp.extension_suffixes()`
-/// is empty, so there is none to name and they stay absent for `.get()`.
+/// `sys.abiflags` already says. `EXT_SUFFIX` and `SOABI` name pyre's own
+/// cpyext ABI (never CPython's ABI tag), matching `_imp.extension_suffixes()`.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -872,6 +871,23 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
                         vars,
                         pyre_object::w_str_new(name),
                         pyre_object::w_int_new(0),
+                    );
+                }
+                #[cfg(all(
+                    feature = "host_env",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                {
+                    pyre_object::w_dict_store(
+                        vars,
+                        pyre_object::w_str_new("SOABI"),
+                        pyre_object::w_str_new(crate::cpyext::soabi()),
+                    );
+                    pyre_object::w_dict_store(
+                        vars,
+                        pyre_object::w_str_new("EXT_SUFFIX"),
+                        pyre_object::w_str_new(crate::cpyext::extension_suffix()),
                     );
                 }
             }
@@ -2030,6 +2046,20 @@ enum FindInfo {
     /// A .py source file was found.
     #[cfg(feature = "host_env")]
     SourceFile { pathname: PathBuf },
+    /// A pyre-ABI C extension was found.
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    ExtensionFile { pathname: PathBuf },
+    /// A package whose initializer is a pyre-ABI C extension.
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    ExtensionPackage { dirpath: PathBuf, pathname: PathBuf },
     /// A package directory with __init__.py was found.
     #[cfg(feature = "host_env")]
     Package { dirpath: PathBuf },
@@ -2130,9 +2160,39 @@ fn find_in_dirs(partname: &str, dirs: &[PathBuf]) -> Option<FindInfo> {
     for dir in dirs {
         // Check for package: <dir>/<partname>/__init__.py
         let pkg_dir = dir.join(partname);
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        {
+            let init_extension =
+                pkg_dir.join(format!("__init__{}", crate::cpyext::extension_suffix()));
+            if with_source_provider(|p| p.is_file(&init_extension)) {
+                return Some(FindInfo::ExtensionPackage {
+                    dirpath: pkg_dir,
+                    pathname: init_extension,
+                });
+            }
+        }
         let init_file = pkg_dir.join("__init__.py");
         if with_source_provider(|p| p.is_file(&init_file)) {
             return Some(FindInfo::Package { dirpath: pkg_dir });
+        }
+
+        // FileFinder probes packages before files. Only pyre's own suffix is
+        // accepted: advertising CPython's tag would falsely promise its object
+        // layout ABI.
+        #[cfg(all(
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        {
+            let extension = dir.join(format!("{partname}{}", crate::cpyext::extension_suffix()));
+            if with_source_provider(|p| p.is_file(&extension)) {
+                return Some(FindInfo::ExtensionFile {
+                    pathname: extension,
+                });
+            }
         }
 
         // Check for source file: <dir>/<partname>.py
@@ -2960,6 +3020,37 @@ fn load_part(
     };
 
     let module = match info {
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        FindInfo::ExtensionFile { pathname } => {
+            crate::cpyext::load_extension_module(modulename, &pathname)?
+        }
+        #[cfg(all(
+            feature = "host_env",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        FindInfo::ExtensionPackage { dirpath, pathname } => {
+            let module = crate::cpyext::load_extension_module(modulename, &pathname)?;
+            let roots = pyre_object::gc_roots::push_roots();
+            let module_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(module);
+            let path = crate::gateway::fsdecode_os_str(dirpath.as_os_str());
+            let path_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(path);
+            let path_list =
+                pyre_object::w_list_new(vec![pyre_object::gc_roots::shadow_stack_get(path_slot)]);
+            let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+            crate::module_ns_store(
+                unsafe { pyre_object::w_module_get_w_dict(module) },
+                "__path__",
+                path_list,
+            );
+            module
+        }
         #[cfg(feature = "host_env")]
         FindInfo::SourceFile { pathname } => {
             match load_source_module(modulename, &pathname, None, execution_context) {

@@ -64,6 +64,12 @@ pub mod argument;
 pub mod astcompiler;
 pub mod baseobjspace;
 pub mod builtins;
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub mod cpyext;
 pub mod display;
 pub mod error;
 pub mod executioncontext;

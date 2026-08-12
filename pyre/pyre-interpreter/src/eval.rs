@@ -1166,6 +1166,17 @@ pub unsafe fn walk_pyframe_roots_area(
 /// faulthandler's — so it registers once for the process.
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_global_prebuilt_roots(visitor);
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    {
+        let mut forward = |slot: &mut PyObjectRef| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        };
+        crate::cpyext::walk_gc_roots(&mut forward);
+    }
     crate::executioncontext::walk_space_user_del_action_roots(visitor);
     crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
