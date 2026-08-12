@@ -418,7 +418,7 @@ pub fn main_entry(binary_name: &'static str) {
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         std::thread::Builder::new()
             .stack_size(INTERPRETER_THREAD_STACK_SIZE)
-            .spawn(|| {
+            .spawn(move || {
                 // Same first statement `_thread`'s worker runs
                 // (`module/thread/mod.rs`): announce the stack this thread is
                 // budgeted against, and capture the base here at the outermost

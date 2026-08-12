@@ -316,6 +316,10 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         # left CI runs that could only be re-run, never diagnosed.
         detail = f"signal/abort {death_signal(rc)} rc={rc} {last_stderr_line(err)}"
         return "CRASH", detail.strip()[:200]
+    if any(line.startswith("skipped: ") for line in out.splitlines()):
+        return "SKIP", next(
+            line for line in out.splitlines() if line.startswith("skipped: ")
+        )[:120]
     if rc == 0:
         return "PASS", ""
     last = last_stderr_line(err)
@@ -397,6 +401,18 @@ _RESOURCE_DRIVER = (
     "        print('skipped: %s' % exc)\n"
 )
 
+_RESOURCE_MODULE_DRIVER = (
+    "import runpy\n"
+    "from test import support\n"
+    "mod = {module!r}\n"
+    'if __name__ == "__main__":\n'
+    "    support.use_resources = {{}}\n"
+    "    try:\n"
+    "        runpy.run_module(mod, run_name='__main__', alter_sys=True)\n"
+    "    except support.ResourceDenied as exc:\n"
+    "        print('skipped: %s' % exc)\n"
+)
+
 # test_descr and test_enum assert fully qualified class/enum names. Running
 # their files as __main__ changes those names even on CPython, so preserve the
 # dotted identity that libregrtest gives them.  test_regrtest and the thread
@@ -471,6 +487,16 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             driver = Path(cwd) / "_pyre_script_main.py"
             driver.write_text(
                 _RESOURCE_DRIVER.format(path=str(module_path(module))),
+                encoding="utf-8",
+            )
+            cmd = [str(binary), str(driver)]
+        elif mode == "module" and module in DEFAULT_RESOURCE_MODULES:
+            # `pyre -m` would otherwise leave use_resources as None, which
+            # means every optional resource is enabled. Preserve module entry
+            # semantics while applying libregrtest's empty default resource set.
+            driver = Path(cwd) / "_pyre_resource_module_main.py"
+            driver.write_text(
+                _RESOURCE_MODULE_DRIVER.format(module=module),
                 encoding="utf-8",
             )
             cmd = [str(binary), str(driver)]

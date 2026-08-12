@@ -12763,19 +12763,17 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     // A frame-shaped block for the flush to land in.  `write_all_boxes` walks
     // every static field and the array pointer, so the buffer has to span the
     // whole struct and the array block needs its `[len][items]` header.
-    let frame_size = std::mem::size_of::<pyre_interpreter::PyFrame>();
-    let mut frame = vec![0u8; frame_size];
-    let mut array_block = vec![0u8; 64];
-    let frame_ptr = frame.as_mut_ptr();
+    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let mut array_block =
+        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
+    let frame_ptr = frame.as_mut_ptr() as *mut u8;
+    let array_ptr = array_block.as_mut_ptr() as *mut u8;
     unsafe {
-        let len_ptr = array_block
-            .as_mut_ptr()
-            .add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset)
-            as *mut i64;
+        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
         *len_ptr = 0;
         let slot =
             frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
-        *slot = array_block.as_mut_ptr();
+        *slot = array_ptr;
         let last_instr =
             frame_ptr.add(crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize;
         *last_instr = 11;
