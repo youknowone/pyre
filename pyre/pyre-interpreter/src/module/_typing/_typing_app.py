@@ -91,6 +91,23 @@ def _typing_type_repr(value):
     return f"{module}.{qualname}"
 
 
+def _index(value):
+    # `operator.index`, written out because this module loads before the
+    # pure-Python `operator` is importable.  An evaluator's format argument is
+    # a `Format` member, so it reaches here through the integer index
+    # protocol: a float or a string is a TypeError rather than a format that
+    # silently compares unequal to every member.
+    if isinstance(value, int):
+        return value
+    try:
+        index = type(value).__index__
+    except AttributeError:
+        raise TypeError(
+            f"{type(value).__name__!r} object cannot be interpreted as an integer"
+        ) from None
+    return index(value)
+
+
 class _ConstEvaluatorMeta(type):
     def __setattr__(cls, name, value):
         raise TypeError(
@@ -108,6 +125,7 @@ class _ConstEvaluator(metaclass=_ConstEvaluatorMeta):
         raise TypeError("cannot create '_typing._ConstEvaluator' instances")
 
     def __call__(self, format, /):
+        format = _index(format)
         if format == 4:  # annotationlib.Format.STRING
             if isinstance(self._value, tuple):
                 return "(" + ", ".join(map(_typing_type_repr, self._value)) + ")"
