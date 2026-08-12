@@ -366,10 +366,10 @@ struct UnwindTally {
     /// How many `on_unwind` targets' goto-chains execute *any*
     /// non-trivial statement before reaching UnwindResume/Abort.
     real_work: usize,
-    /// How many of those non-trivial chains carry a `Drop` terminator
-    /// somewhere in the chain (destructor cleanup, the most common
-    /// "looks like work" case).
-    real_work_drop_in_chain: usize,
+    /// How many of those non-trivial chains are destructor cleanup: the
+    /// source terminator is a `Drop` and the chain does not end at a
+    /// `Call` or a `Return`.
+    real_work_destructor_cleanup: usize,
     /// fn::bb examples of real-work unwind chains (capped).
     examples: Vec<String>,
     /// Goto-chain length histogram (0 = on_unwind target is itself the
@@ -412,6 +412,13 @@ fn classify_unwind_chain(
 ) -> (&'static str, bool, bool, usize) {
     let mut cur = start_bb;
     let mut did_real_work = false;
+    // NOTE: this flag is only observable on the arms that keep WALKING.
+    // The `Call`, `Return` and `Switch` arms return the instant they are
+    // reached, so they hand back whatever it held before the walk stopped
+    // — structurally `false` for a zero-hop chain, whatever the source
+    // terminator was. Do not use it as an exemption predicate; the caller
+    // keys the exemption on the source terminator and the eventual, both
+    // of which it already knows.
     let mut drop_in_chain = false;
     let mut hops = 0usize;
     // Bound the walk so a malformed/cyclic chain can't hang the test.
@@ -507,10 +514,19 @@ fn mir_on_unwind_target_taxonomy() {
                 classify_unwind_chain(blocks, on_unwind as usize);
             *tally.eventual.entry(eventual).or_default() += 1;
             *tally.chain_len_hist.entry(chain_len).or_default() += 1;
+            // A `Drop` terminator's unwind edge IS the destructor-cleanup
+            // continuation — precisely what this exemption exists for —
+            // while a chain ending in a `Call` or a `Return` may be a
+            // handler, which is the thing the assertion below exists to
+            // catch. So exempt on the SOURCE terminator plus the eventual,
+            // never on `drop_in_chain`: that flag is written only while
+            // walking and is unreachable at the arms that return at once.
+            let destructor_cleanup =
+                term_kind_label == "Drop" && !matches!(eventual, "Call" | "Return");
             if did_work {
                 tally.real_work += 1;
-                if drop_in_chain {
-                    tally.real_work_drop_in_chain += 1;
+                if destructor_cleanup {
+                    tally.real_work_destructor_cleanup += 1;
                 }
                 if tally.examples.len() < 40 {
                     tally.examples.push(format!(
@@ -549,12 +565,13 @@ fn mir_on_unwind_target_taxonomy() {
         tally.real_work
     );
     eprintln!(
-        "    of which carry a Drop (destructor) in the chain: {}",
-        tally.real_work_drop_in_chain
+        "    of which are destructor cleanup (Drop source, non-Call/Return \
+         eventual): {}",
+        tally.real_work_destructor_cleanup
     );
     eprintln!(
-        "    non-Drop real-work chains (genuine catch suspects): {}",
-        tally.real_work - tally.real_work_drop_in_chain
+        "    non-destructor real-work chains (genuine catch suspects): {}",
+        tally.real_work - tally.real_work_destructor_cleanup
     );
     if !tally.examples.is_empty() {
         eprintln!("\nreal-work examples (capped at 40):");
@@ -563,11 +580,10 @@ fn mir_on_unwind_target_taxonomy() {
         }
     }
 
-    // This test is observational: it never fails, it only prints the
-    // taxonomy. The decisive number to read is
-    // `non-Drop real-work chains` — if that is 0, every on_unwind path
-    // is a bare panic-propagation (UnwindResume/Abort) or pure
-    // destructor cleanup, and dropping it loses no try/except.
+    // The decisive number to read is `non-destructor real-work chains` —
+    // if that is 0, every on_unwind path is a bare panic-propagation
+    // (UnwindResume/Abort) or pure destructor cleanup, and dropping it
+    // loses no try/except.
     assert!(
         tally.total_call_terms > 0,
         "expected at least one Call/Assert/Drop terminator in the snapshot"
@@ -577,10 +593,10 @@ fn mir_on_unwind_target_taxonomy() {
     // other than pure destructor drop-glue. If this ever trips, the
     // corpus grew a Rust catch/cleanup that the front-graph driver would
     // silently drop, and the "drop on_unwind" adaptation must be revisited.
-    let non_drop_real_work = tally.real_work - tally.real_work_drop_in_chain;
+    let non_destructor_real_work = tally.real_work - tally.real_work_destructor_cleanup;
     assert_eq!(
-        non_drop_real_work, 0,
-        "found {non_drop_real_work} on_unwind chain(s) doing non-destructor \
+        non_destructor_real_work, 0,
+        "found {non_destructor_real_work} on_unwind chain(s) doing non-destructor \
          catch-like work; dropping on_unwind would lose semantics — see \
          examples above"
     );
@@ -707,20 +723,9 @@ fn dump_lowering_signatures() {
                 None => {}
             }
             for link in &blk.exits {
-                // The remaining Variable-carrying Link fields,
-                // `last_exception` / `last_exc_value`, are the only other
-                // operands a rebind could touch.  The flat MIR driver
-                // never populates them (rtyper-stage fields), so the
-                // signature omits them — assert that invariant so the
-                // omission is provably safe rather than an oversight.
-                // `exitcase` / `llexitcase` are deliberately omitted too,
-                // but carry no Variable (pure MIR-switch constants,
-                // RPO-invariant), so they need no guard.
-                assert!(
-                    link.last_exception.is_none() && link.last_exc_value.is_none(),
-                    "MIR-built Link carries last_exception/last_exc_value; \
-                     signature() must label them"
-                );
+                // `exitcase` / `llexitcase` are deliberately omitted: they
+                // carry no Variable (pure MIR-switch constants,
+                // RPO-invariant), so they need no label.
                 s.push_str(&format!("->{:?}(", link.target));
                 for a in &link.args {
                     match a {
@@ -729,6 +734,25 @@ fn dump_lowering_signatures() {
                     }
                 }
                 s.push(')');
+                // `last_exception` / `last_exc_value` are Variable-carrying
+                // Link fields a rebind can touch, so they are labelled like
+                // any other operand.  The flat MIR driver populates them:
+                // `lower_unstructured_with_static_addrs_and_attrs` runs
+                // `rewire_result_exc_call_sites`, `rewire_next_call_sites`
+                // and `rewire_checked_arith_call_sites`, and each assigns
+                // these fields on the exception exit it builds.  Omitting
+                // them would let a rebind of either move without moving
+                // the signature.
+                for (tag, arg) in [
+                    ("exc:", &link.last_exception),
+                    ("excv:", &link.last_exc_value),
+                ] {
+                    let Some(a) = arg else { continue };
+                    match a {
+                        LinkArg::Value(v) => s.push_str(&format!("{tag}{},", label(v.id()))),
+                        LinkArg::Const(_) => s.push_str(&format!("{tag}K,")),
+                    }
+                }
             }
             s.push(']');
         }
