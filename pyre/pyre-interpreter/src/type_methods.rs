@@ -2788,6 +2788,12 @@ fn format_spec_err(
         E::AlignmentFlag => crate::PyError::value_error(
             "'=' alignment flag is not allowed in complex format specifier",
         ),
+        E::NegativeZeroCoercionNotAllowed(type_name) => crate::PyError::value_error(format!(
+            "Negative zero coercion (z) not allowed in {type_name} format specifier"
+        )),
+        E::StringAlignmentFlag => {
+            crate::PyError::value_error("'=' alignment not allowed in string format specifier")
+        }
         E::NotImplemented(c, s) => crate::PyError::value_error(format!(
             "Format code '{c}' for object of type '{s}' not implemented yet"
         )),

@@ -829,19 +829,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "sethostname() requires 1 argument",
                         ));
                     }
-                    // `interp_func.py:408` fsencodes the str branch, but the
-                    // seam this reaches (`host_env::socket::sethostname`) takes
-                    // a `&str`, so a name spelling a byte with no UTF-8 form
-                    // has nowhere to travel; encoding here would only be undone
-                    // at the call. Closing this needs the seam to take bytes.
-                    let name = unsafe {
-                        if !pyre_object::is_str(args[0]) {
-                            return Err(crate::PyError::type_error(
-                                "sethostname: name must be a string",
-                            ));
-                        }
-                        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
-                    };
+                    // `interp_func.py:408` uses `space.fsencode_w`: accept
+                    // str/bytes/path-like input and preserve arbitrary host
+                    // bytes.  The pinned RustPython host seam now accepts
+                    // that byte representation directly.
+                    let name = crate::gateway::fsencode_bytes_w(args[0])?;
                     rustpython_host_env::socket::sethostname(&name).map_err(|e| {
                         crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
