@@ -15646,7 +15646,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '__repr__' requires a 'member_descriptor' object",
                         ));
                     }
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         member_descriptor_repr(member)
                     }))
                 },
