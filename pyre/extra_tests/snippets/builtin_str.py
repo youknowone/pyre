@@ -669,6 +669,21 @@ with AssertRaises(ValueError, msg="Invalid format specifier"):
 # Test e & E formatting
 assert "{:e}".format(10) == "1.000000e+01"
 assert "{:.2e}".format(11) == "1.10e+01"
+
+# PyPy newformat.py:_parse_int checks against sys.maxint before multiplying.
+# An overlong width or precision is a ValueError, never an interpreter panic.
+for oversized_spec in (
+    "1" * 10000 + "d",
+    "." + "1" * 10000 + "d",
+    "1" * 10000 + "." + "1" * 10000 + "d",
+):
+    try:
+        format(0, oversized_spec)
+    except ValueError as exc:
+        assert str(exc) == "Too many decimal digits in format string"
+    else:
+        raise AssertionError("oversized format field was accepted")
+
 assert "{:e}".format(10.0) == "1.000000e+01"
 assert "{:e}".format(-10.0) == "-1.000000e+01"
 assert "{:.2e}".format(10.0) == "1.00e+01"

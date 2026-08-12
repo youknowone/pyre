@@ -2013,7 +2013,26 @@ fn spec_chars(spec: &Wtf8) -> Vec<char> {
     spec.code_points().map(|cp| cp.to_char_lossy()).collect()
 }
 
-fn parse_spec(spec: &Wtf8) -> ParsedSpec {
+/// PyPy `newformat.py:_parse_int`: accumulate a decimal field only while it
+/// still fits in `sys.maxint` (`Py_ssize_t` in CPython).  Checking before the
+/// multiply is important: an overlong width or precision is a Python
+/// `ValueError`, not a Rust integer-overflow panic.
+fn parse_spec_int(chars: &[char], i: &mut usize) -> Result<usize, crate::PyError> {
+    let mut result = 0usize;
+    while *i < chars.len() && chars[*i].is_ascii_digit() {
+        let digit = (chars[*i] as u8 - b'0') as usize;
+        if result > ((isize::MAX as usize) - digit) / 10 {
+            return Err(crate::PyError::value_error(
+                "Too many decimal digits in format string",
+            ));
+        }
+        result = result * 10 + digit;
+        *i += 1;
+    }
+    Ok(result)
+}
+
+fn parse_spec(spec: &Wtf8) -> Result<ParsedSpec, crate::PyError> {
     let cps: Vec<CodePoint> = spec.code_points().collect();
     // The structural scan below tests for ASCII delimiters only, so it runs on
     // the lossy `char` view; a code point with no `char` matches none of them
@@ -2062,11 +2081,7 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
         i += 1;
     }
     let width_start = i;
-    let mut width = 0usize;
-    while i < n && chars[i].is_ascii_digit() {
-        width = width * 10 + (chars[i] as u8 - b'0') as usize;
-        i += 1;
-    }
+    let width = parse_spec_int(&chars, &mut i)?;
     let width_end = i;
     let mut grouping: Option<char> = None;
     if i < n && matches!(chars[i], ',' | '_') {
@@ -2080,12 +2095,8 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
     if i < n && chars[i] == '.' {
         let dot = i;
         i += 1;
-        let mut p = 0usize;
         let precision_start = i;
-        while i < n && chars[i].is_ascii_digit() {
-            p = p * 10 + (chars[i] as u8 - b'0') as usize;
-            i += 1;
-        }
+        let p = parse_spec_int(&chars, &mut i)?;
         if i < n && matches!(chars[i], ',' | '_') {
             fractional_grouping = Some(chars[i]);
             fractional_grouping_index = Some(i);
@@ -2118,7 +2129,7 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
     // width slice left by one; `float_engine_spec_with_width` indexes the
     // engine spec, so bias the recorded bounds to match.
     let z_shift = z_index.is_some() as usize;
-    ParsedSpec {
+    Ok(ParsedSpec {
         fill,
         align,
         sign,
@@ -2133,7 +2144,7 @@ fn parse_spec(spec: &Wtf8) -> ParsedSpec {
         width_start: width_start - z_shift,
         width_end: width_end - z_shift,
         invalid_trailing,
-    }
+    })
 }
 
 /// Complete the Python 3.14 syntax checks that are intentionally outside the
@@ -2573,7 +2584,7 @@ mod group_digits_tests {
 fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf, crate::PyError> {
     let parsed = rustpython_common::format::FormatSpec::parse(spec)
         .map_err(|e| format_spec_err(e, spec, type_name, true))?;
-    let p = parse_spec(spec);
+    let p = parse_spec(spec)?;
     if p.precision.is_some() || p.fractional_grouping.is_some() {
         return Err(crate::PyError::value_error(
             "Precision not allowed in integer format specifier",
@@ -2977,7 +2988,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
                 // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
                 pyre_object::w_long_get_value(val)
             };
-            let p = parse_spec(spec);
+            let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, &type_name)?;
             let parsed = FormatSpec::parse(&p.engine_spec);
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
@@ -3015,7 +3026,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             return format_finite_float(v, spec);
         }
         if let Some((re, im)) = crate::objspace::descroperation::complex_val(val) {
-            let p = parse_spec(spec);
+            let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, "complex")?;
             FormatSpec::parse(&p.engine_spec)
                 .map_err(|e| format_spec_err(e, spec, "complex", false))?;
@@ -3083,7 +3094,7 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             // but not a sign or `=` alignment, which are also disallowed for
             // strings.
             reject_string_sign_align(spec)?;
-            let p = parse_spec(spec);
+            let p = parse_spec(spec)?;
             validate_python314_spec_shape(&p, spec, "str")?;
             if p.no_neg_zero {
                 return Err(crate::PyError::value_error(
@@ -3203,19 +3214,11 @@ fn format_surrogate_str(body: &Wtf8, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyEr
         fill = CodePoint::from_char('0');
         i += 1;
     }
-    let mut width = 0usize;
-    while i < n && chars[i].is_ascii_digit() {
-        width = width * 10 + (chars[i] as u8 - b'0') as usize;
-        i += 1;
-    }
+    let width = parse_spec_int(&chars, &mut i)?;
     let mut precision: Option<usize> = None;
     if i < n && chars[i] == '.' {
         i += 1;
-        let mut p = 0usize;
-        while i < n && chars[i].is_ascii_digit() {
-            p = p * 10 + (chars[i] as u8 - b'0') as usize;
-            i += 1;
-        }
+        let p = parse_spec_int(&chars, &mut i)?;
         precision = Some(p);
     }
     if i < n {
@@ -3252,7 +3255,7 @@ fn format_surrogate_str(body: &Wtf8, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyEr
 /// point, then pad by code point.  The caller has already confirmed the
 /// spec parses and ends in `c`.
 fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
-    let p = parse_spec(spec);
+    let p = parse_spec(spec)?;
     // Rejection order matches the reference: grouping, then precision, then
     // sign, then alternate form — each beats the value range check.
     if let Some(sep) = p.grouping {
@@ -3302,7 +3305,7 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
 /// for the percentage type) padded to width.  Grouping only validates
 /// here — a non-finite value has no digits to separate.
 fn format_nonfinite(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
-    let p = parse_spec(spec);
+    let p = parse_spec(spec)?;
     validate_float_spec(spec, &p)?;
     let upper = matches!(p.ty, 'E' | 'F' | 'G');
     let word = match (v.is_nan(), upper) {
@@ -3389,7 +3392,7 @@ fn float_rounds_to_zero(v: f64, p: &ParsedSpec) -> bool {
 /// shared engine.  `validate_float_spec` still supplies the type and
 /// grouping-with-`n` messages before delegating.
 fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
-    let p = parse_spec(spec);
+    let p = parse_spec(spec)?;
     validate_float_spec(spec, &p)?;
     // PEP 682 `z`: a value that rounds to a zero magnitude renders its sign
     // away. Format the positive zero in its place so the padded result the
