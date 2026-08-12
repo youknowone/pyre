@@ -566,7 +566,7 @@ jobs:
     name: CPython suite (gate)
     # aarch64: the baseline is recorded on darwin-aarch64 and the JIT codegen is
     # arch-specific, so the gate runs where the baseline was observed.
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     timeout-minutes: 30
