@@ -9973,6 +9973,27 @@ pub(crate) unsafe fn has_object_getattribute(w_type: PyObjectRef) -> bool {
     getattribute_if_not_from_object(w_type).is_none()
 }
 
+/// Whether an `isinstance` miss can read `obj.__class__` without invoking
+/// app-level code.
+///
+/// `abstractinst.py:p_recursive_isinstance_type_w` performs that attribute
+/// read after the direct MRO test misses.  Inheriting
+/// `object.__getattribute__` is not sufficient: a subclass may still replace
+/// `__class__` with a property.  Require both the already-memoized default
+/// `__getattribute__` and the canonical `object.__class__` descriptor.
+/// `W_TypeObject.mutated` invalidates the memoized flag and the method cache
+/// whenever either lookup shape changes.
+pub unsafe fn isinstance_miss_class_lookup_is_pure(w_type: PyObjectRef) -> bool {
+    if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+        return false;
+    }
+    let Some(actual_class_descr) = lookup_in_type_where(w_type, "__class__") else {
+        return false;
+    };
+    lookup_in_type_where(crate::typedef::w_object(), "__class__")
+        .is_some_and(|object_class_descr| std::ptr::eq(actual_class_descr, object_class_descr))
+}
+
 /// typeobject.py:328-348 `setattr_if_not_from_object` — the `__setattr__`
 /// companion of [`getattribute_if_not_from_object`].
 pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
@@ -19005,6 +19026,24 @@ mod tests {
             mutated(t, None);
             assert!(!pyre_object::typeobject::w_type_get_uses_object_getattribute(t));
             assert!(!pyre_object::typeobject::w_type_get_uses_object_setattr(t));
+        }
+    }
+
+    #[test]
+    fn isinstance_miss_requires_canonical_object_class_descriptor() {
+        crate::typedef::init_typeobjects();
+        let t = crate::typedef::make_builtin_type("IsinstanceClassLookup", |_| {});
+        unsafe {
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(t, true);
+            assert!(isinstance_miss_class_lookup_is_pure(t));
+
+            // A `property` is the app-visible hazardous case.  Any MRO
+            // replacement is enough to prove the identity gate itself: only
+            // the canonical object getset may enter the replay-safe arm.
+            crate::type_dict_store(t, "__class__", pyre_object::w_int_new(7));
+            mutated(t, Some("__class__"));
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(t, true);
+            assert!(!isinstance_miss_class_lookup_is_pure(t));
         }
     }
 

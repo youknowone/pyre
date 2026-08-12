@@ -2830,11 +2830,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 && !operand.is_null()
                 && std::ptr::eq(callable, str_type)
                 && unsafe {
-                    pyre_object::is_int_or_long(operand)
-                        || pyre_object::is_float(operand)
-                        || pyre_object::is_complex(operand)
-                        || pyre_object::is_str(operand)
-                        || pyre_object::is_none(operand)
+                    pyre_object::is_exact_builtin_instance(operand)
+                        && (pyre_object::is_int_or_long(operand)
+                            || pyre_object::is_float(operand)
+                            || pyre_object::is_complex(operand)
+                            || pyre_object::is_str(operand)
+                            || pyre_object::is_none(operand))
                 }
         };
     // PyPy traces `space.iter(w_exact_unicode)` through
@@ -2858,7 +2859,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         && args.len() == 1
         && {
             let operand = args[0] as pyre_object::PyObjectRef;
-            !operand.is_null() && unsafe { pyre_object::is_str(operand) }
+            !operand.is_null()
+                && unsafe {
+                    pyre_object::is_str(operand) && pyre_object::is_exact_builtin_instance(operand)
+                }
         };
     // PyPy's `space.ord` reads the immutable unicode payload directly.  Match
     // both canonical builtin-code identity and the observed exact string so a
@@ -2876,9 +2880,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // then (only on a miss) `w_inst.__class__` (`abstractinst.py:74-86`).  A
     // hit is replay-safe directly.  A miss is replay-safe only when the
     // instance type has already proven and memoized that it inherits
-    // `object.__getattribute__`; type mutation invalidates that flag.  This
-    // covers the ordinary `isinstance(C0(), int)` false result without blessing
-    // an override that can run Python and mutate live heap.
+    // `object.__getattribute__` AND its MRO resolves `__class__` to the
+    // canonical `object.__class__` descriptor.  The first fact alone is not
+    // enough: `@property def __class__` retains the default getattribute path
+    // but runs user code here.  Type mutation invalidates both lookup facts.
     //
     // Require the canonical callable and an ordinary class whose metaclass is
     // exactly `type`; tuple/union classinfo and custom `__instancecheck__`
@@ -2899,7 +2904,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 })
                 && pyre_interpreter::typedef::r#type(object).is_some_and(|actual| unsafe {
                     pyre_interpreter::baseobjspace::isinstance_w(object, classinfo)
-                        || pyre_object::typeobject::w_type_get_uses_object_getattribute(
+                        || pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure(
                             actual.as_ptr(),
                         )
                 })
