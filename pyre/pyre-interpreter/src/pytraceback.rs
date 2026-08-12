@@ -176,9 +176,12 @@ pub fn w_pytraceback_new(
     // stays reachable across the allocation: on the `CURRENT_FRAME` /
     // `f_backref` chain, or pinned by hand.
     //
-    // Allocate the traceback itself into oldgen for the same reason —
-    // raw `*mut PyTraceback` readers and the exception `w_traceback`
-    // chain hold bare pointers.  Before the GC hook is wired
+    // This host-side constructor allocates the traceback itself into oldgen:
+    // its Rust caller can hold the returned pointer outside a translated
+    // GC-map slot before publishing it. JIT-emitted traceback nodes do not
+    // have that restriction: their live refs are GC-map roots or traced
+    // object fields, so their size descriptor keeps the ordinary movable
+    // nursery placement used upstream. Before the GC hook is wired
     // (bootstrap, tests) `try_gc_alloc_stable` returns `None`; fall
     // back to the leaked `malloc_typed` block.
     let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(

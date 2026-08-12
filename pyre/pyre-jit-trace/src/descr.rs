@@ -4066,7 +4066,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         PYTRACEBACK_W_CODE_OFFSET, PYTRACEBACK_W_NEXT_OFFSET,
     };
 
-    let group = build_object_descr_group_with_def_path(
+    build_object_descr_group_with_def_path(
         PYTRACEBACK_OBJECT_SIZE,
         PYTRACEBACK_GC_TYPE_ID,
         &PYTRACEBACK_TYPE as *const _ as usize,
@@ -4128,13 +4128,7 @@ static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         ],
         "",
         "",
-    );
-    // `w_pytraceback_new` allocates traceback nodes non-moving because raw
-    // `*mut PyTraceback` readers and the exception `w_traceback` chain keep
-    // bare pointers. A nursery allocation would move the node at the next
-    // minor collection while those copies retain its old address.
-    group.size_descr.set_non_moving(true);
-    group
+    )
 });
 
 pub fn pytraceback_size_descr() -> DescrRef {
@@ -4482,14 +4476,14 @@ mod tests {
     }
 
     #[test]
-    fn jit_emitted_raw_pointer_objects_are_non_moving() {
+    fn jit_emitted_tracebacks_are_movable_but_raw_pointer_objects_are_not() {
         let traceback_descr = pytraceback_size_descr();
         let traceback_size = traceback_descr
             .as_size_descr()
             .expect("PyTraceback SizeDescr");
         assert!(
-            traceback_size.non_moving(),
-            "raw traceback pointers are not rewritten when a minor collection moves an object"
+            !traceback_size.non_moving(),
+            "JIT traceback refs are GC-map roots or traced object fields and must use the nursery"
         );
 
         let instance_descr = w_object_object_size_descr();
