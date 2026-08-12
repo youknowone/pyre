@@ -116,14 +116,12 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
 /// there to pull the field into cache before the caller reads it. The
 /// prebuilt arm here returns without it, and cannot currently spell it: the
 /// pointer is derived from `&SMALL_INTS.0[idx]`, so writing through it is
-/// undefined rather than merely racy; the `unsafe impl Sync for PrebuiltInts`
-/// above rests on those entries staying immutable for process lifetime, which
-/// a store would break for concurrent callers; and `intval` is published to
-/// the JIT as an immutable field descr, which licenses the optimizer to drop
-/// the store in the traced arm anyway. Spelling it faithfully needs the
-/// payload behind an `UnsafeCell` and `intval` no longer described as
-/// immutable — until then the omission costs a cache hint and no semantics,
-/// and the arm is unreachable while `WITHPREBUILTINT` is false.
+/// undefined rather than merely racy, and the `unsafe impl Sync for
+/// PrebuiltInts` above rests on those entries staying immutable for process
+/// lifetime, which a store would break for concurrent callers. Spelling it
+/// faithfully needs the payload behind an `UnsafeCell` — until then the
+/// omission costs a cache hint and no semantics, and the arm is unreachable
+/// while `WITHPREBUILTINT` is false.
 ///
 /// Traced, not residualised, and `#[inline]` — `wrapint` carries no
 /// `@dont_look_inside` and its own comment reads "this whole function is
