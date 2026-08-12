@@ -4522,7 +4522,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         out.push_str("<DirEntry ");
         out.push_wtf8(&unsafe { crate::py_repr_wtf8(name)? });
         out.push_str(">");
-        Ok(pyre_object::w_str_from_wtf8(out))
+        // interp_scandir.py:230 returns `space.newtext(...)`: this rendered
+        // value is an ordinary collectable runtime string.
+        Ok(pyre_object::w_str_from_wtf8_managed(out))
     }
     /// `interp_scandir.py:463-465 descr_reduce_ex` — an entry names a live
     /// position in a directory listing, so it refuses to be pickled.  `%T` is
