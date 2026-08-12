@@ -13126,14 +13126,6 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name)? {
         return Ok(true);
     }
-    // `emit_module_dict_cell_fold` returns `false` for BOTH an absent name and
-    // a present-but-unfoldable one (`IntMutableCell` / strategy switched).
-    // Only an ABSENT name may fall through to the builtins fold — a
-    // present global shadows the builtin, so keep the residual (which reads the
-    // live globals slot) when the slot still exists.
-    if crate::state::module_dict_cell_slot_direct(w_globals, &name).is_some() {
-        return Ok(false);
-    }
 
     // Builtins fallback: the name is absent from the
     // `ns_ptr` module dict.  Mirror `bh_load_global_fn`'s second leg —
@@ -13176,6 +13168,43 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
         unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }
             .unwrap_or(pyre_object::PY_NULL)
     };
+    emit_builtins_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, w_builtin, &name)
+}
+
+/// Builtins-fallback half of the LOAD_GLOBAL and module-scope LOAD_NAME cell
+/// folds: the name resolves through the frame's builtin module rather than the
+/// module dict.  Mirrors `_load_global`'s second leg,
+/// `get_builtin().getdictvalue(varname)`, and is reached only once
+/// [`emit_module_dict_cell_fold`] has declined.
+///
+/// Two guards carry it.  (a) The name must stay ABSENT from the module dict,
+/// which pinning that dict's `version?` is what proves: the insert that would
+/// shadow the builtin runs `mutated()` and fails GUARD_NOT_INVALIDATED.
+/// (b) The builtins value itself folds through [`emit_namespace_cell_fold`],
+/// whose `QUASIIMMUT_FIELD` on the builtins dict fails the loop on a rebind or
+/// delete there.
+///
+/// Returns `Ok(false)` — the caller then keeps the live residual — for a name
+/// still present in the module dict, a missing or non-module builtin, an
+/// unfoldable builtins slot (absent / null / `IntMutableCell` / movable), or a
+/// movable builtins dict.
+fn emit_builtins_cell_fold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    w_globals: pyre_object::PyObjectRef,
+    w_builtin: pyre_object::PyObjectRef,
+    name: &str,
+) -> Result<bool, DispatchError> {
+    // `emit_module_dict_cell_fold` returns `false` for BOTH an absent name and
+    // a present-but-unfoldable one (`IntMutableCell` / strategy switched).
+    // Only an ABSENT name may fall through to the builtins fold — a
+    // present global shadows the builtin, so keep the residual (which reads the
+    // live globals slot) when the slot still exists.
+    if crate::state::module_dict_cell_slot_direct(w_globals, name).is_some() {
+        return Ok(false);
+    }
     if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
         return Ok(false);
     }
@@ -13183,7 +13212,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     if w_builtin_dict.is_null() {
         return Ok(false);
     }
-    let Some(b_slot) = crate::state::module_dict_cell_slot_direct(w_builtin_dict, &name) else {
+    let Some(b_slot) = crate::state::module_dict_cell_slot_direct(w_builtin_dict, name) else {
         return Ok(false);
     };
     let Some(b_stored) = crate::state::module_dict_cell_value_direct(w_builtin_dict, b_slot) else {
@@ -13238,6 +13267,13 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
 /// has a non-null `w_locals`, so the gate routes it to the live
 /// residual `bh_load_name_fn`.
+///
+/// Builtins fallback: when `name` is absent from the module dict, module-scope
+/// `LOAD_NAME` falls through via `load_global_value` to
+/// `frame.get_builtin().getdictvalue(name)`.  The builtins cell fold pins the
+/// module dict `version?` so a later global insertion that shadows the builtin
+/// fails GUARD_NOT_INVALIDATED, then folds the builtins dict cell like the
+/// LOAD_GLOBAL fallback.
 pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -13268,7 +13304,18 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)? {
+        return Ok(true);
+    }
+    emit_builtins_cell_fold(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        w_globals,
+        frame.get_builtin(),
+        name,
+    )
 }
 
 /// StoreName/StoreGlobal cell fold — module-scope store dual of
