@@ -2242,7 +2242,9 @@ crate::py_module! {
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("_ssl.SSLError").expect("SSLError installed"),
         ),
-        "OPENSSL_VERSION" => w_str_new("AWS-LC (rustls/0.23)"),
+        // OpenSSL-shaped compatibility fields are required by `ssl.py` and
+        // consumers such as urllib3, while the suffix names the real backend.
+        "OPENSSL_VERSION" => w_str_new("OpenSSL 3.0.0-compatible (AWS-LC/rustls 0.23)"),
         "OPENSSL_VERSION_NUMBER" => w_int_new(0x3000_0000),
         "OPENSSL_VERSION_INFO" => w_tuple_new(vec![w_int_new(3), w_int_new(0), w_int_new(0), w_int_new(0), w_int_new(15)]),
         "_OPENSSL_API_VERSION" => w_tuple_new(vec![w_int_new(3), w_int_new(0), w_int_new(0), w_int_new(0), w_int_new(15)]),

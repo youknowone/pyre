@@ -1140,6 +1140,25 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
     ]
 }
 
+/// The rclass hierarchy present in this interpreter configuration.
+///
+/// `_ssl` owns the final five native hierarchy slots and is compiled out of a
+/// sandbox build. Keep that configuration knowledge here, beside the module
+/// and alias gates, rather than leaking the `sandbox` feature into
+/// `pyre-object`.
+pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
+    let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
+    #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
+    {
+        const SSL_HIERARCHY_SLOTS: usize = 5;
+        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS]
+    }
+    #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
+    {
+        hierarchy
+    }
+}
+
 // ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──
 //
 // An embedder installs these to receive everything the interpreter writes to

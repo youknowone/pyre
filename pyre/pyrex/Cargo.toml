@@ -40,7 +40,7 @@ mimalloc = ["dep:mimalloc"]
 # gc_stress = ["pyre-jit/gc_stress"]
 # Build the interpreter as an RPython-style sandbox client: every mediated OS
 # call routes through host_seam's marshalling trampoline (see pyre-interpreter).
-sandbox = ["pyre-interpreter/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox"]
 # Backwards-compatible alias. The seccomp-bpf syscall allowlist is now installed
 # by default in any Linux `sandbox` build (see the install site in lib.rs and
 # pyre-sandbox::seccomp), so this adds nothing over `sandbox`; it is retained so

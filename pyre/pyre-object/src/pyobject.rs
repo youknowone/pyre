@@ -658,7 +658,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (169, Some(0)),
     // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
     // extend the append-only native rclass tail; wasm omits the host TLS
-    // module and therefore the hierarchy entries as well.
+    // module and therefore the hierarchy entries as well. Sandbox filtering
+    // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
     (170, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
@@ -687,18 +688,21 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
 /// `ll_isinstance` call (typically from `init_typeobjects` on the
 /// interpreter side). The later GC writeback consumes the same hierarchy,
 /// so either writer leaves byte-identical ranges.
-pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
+pub fn compute_subclass_ranges_from_hierarchy(
+    hierarchy: &[(u32, Option<u32>)],
+    alias_chains: &[&[SubclassRangeAlias]],
+) {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum WitnessElement {
         Cdef(u32),
         Max,
     }
 
-    let slots = SUBCLASS_RANGE_HIERARCHY
+    let slots = hierarchy
         .last()
         .map_or(0, |(type_id, _)| *type_id as usize + 1);
     let mut witnesses: Vec<Option<Vec<WitnessElement>>> = vec![None; slots];
-    for &(type_id, parent) in SUBCLASS_RANGE_HIERARCHY {
+    for &(type_id, parent) in hierarchy {
         let mut witness = match parent {
             Some(parent_id) => witnesses[parent_id as usize]
                 .clone()
@@ -716,8 +720,8 @@ pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
         is_max: bool,
     }
 
-    let mut peers = Vec::with_capacity(SUBCLASS_RANGE_HIERARCHY.len() * 2);
-    for &(type_id, _) in SUBCLASS_RANGE_HIERARCHY {
+    let mut peers = Vec::with_capacity(hierarchy.len() * 2);
+    for &(type_id, _) in hierarchy {
         let witness = witnesses[type_id as usize]
             .as_ref()
             .expect("every subclass-range typeid must have a witness");
@@ -763,6 +767,13 @@ pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
             assign_subclass_range(alias.pytype, range.0, range.1);
         }
     }
+}
+
+/// Compute ranges from the complete object-model census. Configuration-aware
+/// embedders should call [`compute_subclass_ranges_from_hierarchy`] with their
+/// active hierarchy instead.
+pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
+    compute_subclass_ranges_from_hierarchy(SUBCLASS_RANGE_HIERARCHY, alias_chains);
 }
 
 /// Lazy first-caller-wins gate around `compute_subclass_ranges_from`.

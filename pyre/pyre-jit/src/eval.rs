@@ -690,28 +690,28 @@ unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn memory_bio_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_session_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
@@ -775,7 +775,7 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 
 /// `_ssl._SSLContext` has the native-layout mapdict prefix plus the three
 /// Python callback/path references owned by the context wrapper.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
     let context = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLContext) };
@@ -786,14 +786,14 @@ unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 
 /// `ssl.MemoryBIO` is subclassable and therefore carries mapdict storage even
 /// though its rustls transport state contains no Python references.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, cached unbound
 /// socket methods, public owner, and hostname directly on the typed object.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let socket = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
@@ -3624,7 +3624,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // MemoryBIO are subclassable native layouts, so their marker walks the
     // mapdict prefix; Context additionally owns Python callbacks/path values.
     // Their sweep destructors release the opaque rustls allocations.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
         let context_descr = <pyre_interpreter::module::_ssl::W_SSLContext
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
@@ -3970,7 +3970,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         .collect();
     assert_eq!(
         actual_hierarchy,
-        pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY,
+        pyre_interpreter::active_subclass_range_hierarchy(),
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
     gc.freeze_types();

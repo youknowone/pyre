@@ -274,10 +274,10 @@ pub fn init_typeobjects() {
         // aliases from a later redundant write.
         let object_aliases = pyre_object::pyobject::all_subclass_range_aliases();
         let interpreter_aliases = crate::all_subclass_range_aliases();
-        pyre_object::pyobject::compute_subclass_ranges_from(&[
-            &object_aliases,
-            &interpreter_aliases,
-        ]);
+        pyre_object::pyobject::compute_subclass_ranges_from_hierarchy(
+            crate::active_subclass_range_hierarchy(),
+            &[&object_aliases, &interpreter_aliases],
+        );
         pyre_object::pyobject::mark_subclass_ranges_initialized();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
