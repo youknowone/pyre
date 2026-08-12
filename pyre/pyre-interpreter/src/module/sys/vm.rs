@@ -28,10 +28,12 @@ Return the size of object in bytes.";
 /// value is shared and lazily created; pyre's objects have the layout the
 /// question assumes, so the number is answerable and is answered.
 ///
-/// The divergence is confined to producing a number. Both terms of that number
-/// are read off the type rather than off the instance's storage, which is what
-/// keeps it from re-acquiring the inconsistency the upstream text warns about
-/// (see the pre-header comment below).
+/// The divergence is confined to producing a number, whose two terms come from
+/// different places. `size` is whatever the object's own `__sizeof__` returns,
+/// so it may read instance state — `list.__sizeof__` adds a word per allocated
+/// slot. The pre-header term is the one read off the type rather than off the
+/// instance's storage, which is what keeps that half from depending on the
+/// allocation that produced the object (see the pre-header comment below).
 fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.base();
