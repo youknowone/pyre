@@ -1771,7 +1771,9 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         "memory"
     };
-    Ok(w_str_new(&format!(
+    // baseobjspace.py:115-117 `getrepr` returns `space.newtext(...)` for
+    // both the live and released labels.
+    Ok(w_str_new_managed(&format!(
         "<{label} at {}>",
         crate::display::repr_addr(mv as usize)
     )))
