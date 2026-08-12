@@ -3192,7 +3192,27 @@ pub fn fuse_boxing_alloc(
                 continue;
             }
             let Some(result) = &op.result else { continue };
-            let agg = &args[0];
+            // The aggregate itself can reach the malloc as a `Block.inputargs`
+            // phi, not only its header: a constructor that builds the struct up
+            // front and then branches — `w_float_new` builds the `W_FloatObject`
+            // before `gc_interp::enabled()` and `try_gc_alloc_stable_raw`, each
+            // of which ends a block — leaves the ctor in a dominator.  Every
+            // lookup below keys on `%agg` by exact variable, so resolve the phi
+            // to the ctor it stands for before asking any of them.  A merge of
+            // two different aggregates has no single owner or payload set, and
+            // declines.  Using the root also keeps `Site.aggregate` naming the
+            // variable a `core::ptr::write` arm stores, which is what
+            // `sink_fused_boxing_aggregates_at_raw_writes` matches on.
+            let mut agg_roots = Vec::new();
+            if !store_roots(graph, &args[0], 8, &mut agg_roots) {
+                continue;
+            }
+            let Some((agg, other_roots)) = agg_roots.split_first() else {
+                continue;
+            };
+            if other_roots.iter().any(|root| root != agg) {
+                continue;
+            }
             // `%agg` must be a `SyntheticTransparentCtor` for a known boxing
             // struct.  Search graph-wide: the ctor and the malloc call land in
             // the same block, but the field stores feeding the aggregate may sit
@@ -7342,6 +7362,273 @@ mod tests {
                 residual,
                 expected == 0,
                 "{feed}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_resolves_an_aggregate_that_crosses_a_link() {
+        // The *aggregate* crosses the boundary, not only its header.
+        // `w_float_new` builds the whole `W_FloatObject` up front and then
+        // branches: `gc_interp::enabled()` and `try_gc_alloc_stable_raw` each
+        // end a block, so the ctor stays in a dominator while the malloc sees
+        // a `Block.inputargs` phi. Owner, payload stores and `ob_header` are
+        // all looked up by exact `%agg`, so without resolving the phi first
+        // the cluster declines for want of a ctor -- which is why the
+        // canonical float constructor never fused in production.
+        //
+        // The other arm stores the same aggregate through `core::ptr::write`.
+        // Fusing the malloc must not damage it: the write has to keep reading
+        // a fully constructed object. (Sinking that materialization to the
+        // write is an optimisation `sink_fused_boxing_aggregates_at_raw_writes`
+        // performs when it can match the variable; it is not required for
+        // correctness, so this asserts the object, not the sinking.)
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        fn ctor(graph: &mut FunctionGraph, blk: BlockId, name: &str) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(name),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some(name.into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+
+        // The whole cluster, built in the dominator.
+        let cast = |graph: &mut FunctionGraph| {
+            let ty = graph
+                .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
+                .unwrap();
+            call(graph, entry, &["__pyre_cast_instance", "PyType"], vec![ty])
+        };
+        let ob_type = cast(&mut graph);
+        let w_class_cast = cast(&mut graph);
+        let w_class = call(
+            &mut graph,
+            entry,
+            &["pyre_object", "pyobject", "get_instantiate"],
+            vec![w_class_cast],
+        );
+        let header = ctor(&mut graph, entry, "PyObject");
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let agg = ctor(&mut graph, entry, "W_FloatObject");
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", "W_FloatObject", &payload),
+            false,
+        );
+
+        // `gc_interp::enabled()` ends the dominator; the aggregate crosses.
+        let (probe, probe_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(entry, probe, vec![agg.clone()]);
+
+        // `try_gc_alloc_stable_raw` ends the next block, then the branch.
+        let raw = call(
+            &mut graph,
+            probe,
+            &["pyre_object", "gc_hook", "try_gc_alloc_stable_raw"],
+            vec![],
+        );
+        let (gc_arm, gc_args) = graph.create_block_with_arg_vars(2);
+        let (plain_arm, plain_args) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(probe).exitswitch = Some(ExitSwitch::Value(raw.clone()));
+        graph.closeblock(
+            probe,
+            vec![
+                Link::from_variables(
+                    &graph,
+                    vec![probe_args[0].clone(), raw.clone()],
+                    gc_arm,
+                    Some(ExitCase::Bool(true)),
+                ),
+                Link::from_variables(
+                    &graph,
+                    vec![probe_args[0].clone()],
+                    plain_arm,
+                    Some(ExitCase::Bool(false)),
+                ),
+            ],
+        );
+
+        // GC arm: write the aggregate into the raw allocation.
+        graph.push_op_var(
+            gc_arm,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["core", "ptr", "write"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                },
+                args: vec![gc_args[1].clone(), gc_args[0].clone()],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(gc_arm, Some(gc_args[1].clone()));
+
+        // Ordinary arm: the `malloc_typed` the fusion rewrites.
+        let ret = call(
+            &mut graph,
+            plain_arm,
+            &["pyre_object", "lltype", "malloc_typed"],
+            vec![plain_args[0].clone()],
+        );
+        graph.set_return(plain_arm, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "the aggregate's phi must resolve to its ctor"
+        );
+
+        let vtables: Vec<i64> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vtables, vec![FLOAT_TYPE_ADDR], "wrong vtable stamped");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "the fused cluster must leave no residual malloc_typed"
+        );
+
+        // The GC arm must still store a fully constructed object: whatever the
+        // write reads has to reach a `W_FloatObject` ctor carrying its header.
+        let written = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["core", "ptr", "write"]) =>
+                {
+                    Some(args[1].clone())
+                }
+                _ => None,
+            })
+            .expect("the raw write must survive the rewrite");
+        // Follow the links the way the pass does, then confirm the ctor and
+        // its header store are both still present for that root.
+        let mut roots: Vec<Var> = Vec::new();
+        let mut frontier = vec![written];
+        while let Some(var) = frontier.pop() {
+            if graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|o| o.result.as_ref() == Some(&var))
+            {
+                roots.push(var);
+                continue;
+            }
+            let Some((target, slot)) = graph.blocks.iter().find_map(|b| {
+                b.inputargs
+                    .iter()
+                    .position(|arg| arg == &var)
+                    .map(|slot| (b.id, slot))
+            }) else {
+                panic!("the written value is neither an op result nor an inputarg");
+            };
+            for b in &graph.blocks {
+                for link in &b.exits {
+                    if link.target == target {
+                        frontier
+                            .extend(link.args.get(slot).and_then(LinkArg::as_variable).cloned());
+                    }
+                }
+            }
+        }
+        assert!(!roots.is_empty(), "the written value resolves to nothing");
+        for root in &roots {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|o| {
+                    o.result.as_ref() == Some(root)
+                        && matches!(
+                            &o.kind,
+                            OpKind::Call { target: CallTarget::SyntheticTransparentCtor { name, .. }, .. }
+                                if name == "W_FloatObject"
+                        )
+                }),
+                "the raw write must still read a W_FloatObject ctor"
+            );
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|o| {
+                    matches!(&o.kind, OpKind::FieldWrite { base, field, .. }
+                        if base == root && field.name.as_str() == "ob_header")
+                }),
+                "the written aggregate must keep its ob_header store"
             );
         }
     }
