@@ -4739,32 +4739,35 @@ impl Assembler {
             std::collections::HashSet::new();
         for descr in &self.descrs {
             let (shape, effect) = match descr {
-                AssemblerDescr::Ready(crate::jitcode::BhDescr::Call { calldescr }) => (
-                    format!(
-                        "call|{}|{}|{}|{}|{:?}",
-                        calldescr.arg_classes,
-                        calldescr.result_type,
-                        calldescr.result_signed,
-                        calldescr.result_size,
-                        calldescr.result_erased
+                AssemblerDescr::Ready(descr) => match descr.as_ref() {
+                    crate::jitcode::BhDescr::Call { calldescr } => (
+                        format!(
+                            "call|{}|{}|{}|{}|{:?}",
+                            calldescr.arg_classes,
+                            calldescr.result_type,
+                            calldescr.result_signed,
+                            calldescr.result_size,
+                            calldescr.result_erased
+                        ),
+                        &calldescr.extra_info,
                     ),
-                    &calldescr.extra_info,
-                ),
-                AssemblerDescr::Ready(crate::jitcode::BhDescr::JitCode {
-                    jitcode_index,
-                    fnaddr,
-                    calldescr,
-                }) => (
-                    format!(
-                        "jitcode|{jitcode_index}|{fnaddr}|{}|{}|{}|{}|{:?}",
-                        calldescr.arg_classes,
-                        calldescr.result_type,
-                        calldescr.result_signed,
-                        calldescr.result_size,
-                        calldescr.result_erased
+                    crate::jitcode::BhDescr::JitCode {
+                        jitcode_index,
+                        fnaddr,
+                        calldescr,
+                    } => (
+                        format!(
+                            "jitcode|{jitcode_index}|{fnaddr}|{}|{}|{}|{}|{:?}",
+                            calldescr.arg_classes,
+                            calldescr.result_type,
+                            calldescr.result_signed,
+                            calldescr.result_size,
+                            calldescr.result_erased
+                        ),
+                        &calldescr.extra_info,
                     ),
-                    &calldescr.extra_info,
-                ),
+                    _ => continue,
+                },
                 _ => continue,
             };
             out.effect_keyed += 1;
