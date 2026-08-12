@@ -437,8 +437,8 @@ def refuse_inert_pathspecs(eng: Engine) -> None:
     today is then found on the next run, rather than the next time that one
     crate happens to be extracted.
 
-    ⛔ The DECISION is git's, and only git's. `Path.exists()` below feeds the
-    MESSAGE and nothing else — do not "simplify" this to an existence test. An
+    Git is the authority for this check. `Path.exists()` below feeds the
+    message and nothing else; do not replace the git query with it. An
     ignored file EXISTS on disk and is invisible to `git ls-files`, which is
     the entire defect. Filesystem-reachable and git-reachable are different
     predicates, and a check that conflates them answers a question nobody
@@ -446,15 +446,10 @@ def refuse_inert_pathspecs(eng: Engine) -> None:
     question about git. An `is_file()` test on a module about to be imported is
     a genuine filesystem question and stays correct.)
 
-    ⭐ The contrasting sibling now lives in ANOTHER REPO, so neither file shows
-    both halves of the rule on its own. A driver that declares
-    `external_inputs` may legitimately use `exists()` as a VERDICT on those,
-    and cel-jit's `refuse_absent_external_inputs` does: they are hashed by
-    reading their bytes, never through git, so the filesystem is the correct
-    oracle and the only one. Read alone, that function looks like the mistake
-    this one refuses; read alone, this one looks like a blanket ban on
-    `exists()`. Neither reading is right — the oracle has to match the channel
-    the input is carried on, and the two guards are on different channels.
+    Drivers may also declare `external_inputs`. Those inputs are hashed by
+    reading their bytes rather than through git, so filesystem existence is
+    the correct predicate for that separate channel. The authority must match
+    the channel that carries the input.
 
     `ls-files ∪ ls-files --others --exclude-standard` is the definition of
     git-reachable used here, matching `_collect_inputs` exactly. `ls-files
@@ -524,48 +519,28 @@ def _package_closure(
     """Path-dependency packages reachable from `target_ids` avoiding `exclude`.
 
     Pure graph reachability over cargo-metadata shapes: `by_id` maps package id
-    to package, `resolve_nodes` maps package id to its resolve node. Kept
+    to package, and `resolve_nodes` maps package id to its resolve node. Kept
     separate from `_collect_inputs` so `--self-test` can drive it on a synthetic
-    graph — the property below is about the WALK, and on a real tree it is
-    invisible, because a fingerprint that silently includes four extra files
-    still hashes to something and still compares equal to itself.
+    graph. A fingerprint with extra files still compares equal to itself, so a
+    real repository cannot expose an over-inclusive walk.
 
-    ⭐ The exclusion is applied HERE, in the walk, and not in the emission loop
+    The exclusion is applied here, in the walk, and not in the emission loop
     in `_collect_inputs` — excluding a package drops its whole EXCLUSIVELY-
     REACHED SUBTREE, not just its own files.
 
-    This used to filter only at emission, which dropped the named package's
-    sources and then walked through it anyway, so every dependency reachable
-    ONLY through it stayed in the fingerprint. Measured on this tree:
-    `pyre-interpreter` excludes `majit-translate`, and `majit-charon-reader` —
-    whose sole dependent-of-record IS `majit-translate` — rode in behind it, 4
-    files that no artefact references and that moved the fingerprint 3 times in
-    30 days.
-
     `continue` before appending is what makes it a subtree drop: the node is
-    neither emitted nor traversed. A package a NON-excluded parent also reaches
+    neither emitted nor traversed. A package a non-excluded parent also reaches
     is still pushed from that parent, so this computes "reachable by a path
     avoiding every excluded package" — which is the property the safety
     argument below needs, and it holds regardless of pop order. Both halves are
     load-bearing and `--self-test`'s diamond case checks them together: drop
     what only the excluded package reaches, keep what something else does.
 
-    ⛔ Do NOT ALSO widen `extract`'s artefact guard to the packages dropped
-    here. That guard's evidence is a substring search for the package's
-    underscored name, and its power is PER SYMBOL: `majit_translate` occurs 373
-    times in `pyre-jit.ullbc` (which excludes nothing), so the guard is
-    demonstrably able to fail for it. `majit_charon_reader` occurs 0 times in
-    ALL SIX artefacts this tree builds, `pyre-jit.ullbc` included — there is no
-    artefact that can serve as its positive control, so a widened guard would
-    pass for a reason unrelated to safety and read as verification.
-
-    The transitive drop is certified by INHERITANCE instead, and that is a
-    stronger argument than the substring test: the parent's guard establishes
-    the artefact holds zero references to the excluded package, and a package
-    reachable only through it cannot appear without it. The guard runs on every
-    extraction, so the certificate stays live — if the artefact ever does
-    reference the parent, the parent's guard fires and the exclusion (subtree
-    included) has to go.
+    Do not widen `extract`'s artefact guard to transitively dropped packages.
+    The guard searches for the explicitly excluded package's symbol, but a
+    transitive dependency may have no symbol that can serve as a positive
+    control. Its absence instead follows from the checked parent's absence: a
+    package reachable only through that parent cannot appear without it.
     """
     seen: set[str] = set()
     stack = list(target_ids)
@@ -622,10 +597,9 @@ def refuse_nested_repos(entries: list[str]) -> None:
     one shape where the fingerprint is WRONG rather than merely wide. The
     directory entry enters the input list, `source_fingerprint` finds it is not
     a file, and it hashes through the `<deleted>` branch — one constant token.
-    Measured on a synthetic tree: editing a file inside the nested repo, adding
-    a new `.rs` to it, and deleting the entire subtree all leave the digest
-    byte-identical. The stamp then claims to cover a path whose contents cannot
-    move it, and that digest is also the CI cache key.
+    Editing, adding, or deleting files inside such a repository leaves the
+    digest byte-identical. The stamp would then claim to cover a path whose
+    contents cannot move it, and that digest is also the CI cache key.
 
     Refusing rather than recursing is the direction the untracked leg's own
     argument points: it prefers a cost that is always a re-extraction over an
@@ -680,19 +654,9 @@ def _collect_inputs(
     admits path deps by `source is None`, which is how cargo spells BOTH an
     in-tree workspace member and a `[patch]` redirect into a sibling checkout —
     so a patched dependency was discovered, found to be out-of-root, and
-    discarded with no diagnostic. cel-jit patches `majit-{ir,macros,metainterp}`
-    to `../majit/*`, which pulls the rest of that workspace in by path, and
-    most of what that pulls landed here, `majit-macros` among them.
-
-    ⛔ NO NUMBER IS QUOTED FOR THAT CLOSURE, deliberately. Two careful
-    measurements of it disagree (11 members / 1 kept, and 10 packages / 9
-    out-of-root) and the disagreement is UNEXPLAINED — a `CARGO_FEATURES`
-    difference was proposed and then refuted, because swapping one backend
-    crate for another changes membership without changing the count. The
-    closure is not a stable set, and a figure written down here would be
-    quoted back as if it were. This is the empirical case for a driver
-    declaring a whole directory in `external_inputs` rather than a per-crate
-    list the walk derived.
+    discarded with no diagnostic. An out-of-tree consumer that patches a
+    dependency to a sibling workspace has this shape, including proc-macro
+    crates whose expansions become part of the extracted item bodies.
 
     `majit-macros` is a proc macro, so its expansion IS the extracted crate's
     item bodies. It was dropped by TWO independent gates, and finding the
@@ -770,17 +734,11 @@ def _collect_inputs(
                     external.append(package_dir / "Cargo.toml")
                 for target in package["targets"]:
                     kinds = set(target["kind"])
-                    # ⭐ A DENY-list, and the direction is the whole point. This
-                    # was `{"lib","bin","custom-build"} & kinds` — an allow-list
-                    # written from a remembered vocabulary rather than a
-                    # measured one, and it silently dropped THREE path-dep
-                    # packages in this tree: `majit-macros` and `pyre-macros`
-                    # (`proc-macro`) and `pyre-wasm` (`cdylib`). A proc macro is
-                    # the WORST possible omission — its expansion is inlined
-                    # into the consuming crate, so its sources are more coupled
-                    # to the artefact's item bodies than an ordinary `lib`'s
-                    # are. An allow-list that omits exactly that is the inverse
-                    # of the risk ordering.
+                    # This is a deny-list so new library-like target kinds are
+                    # admitted by default. The old allow-list omitted
+                    # `proc-macro` and `cdylib`; proc-macro expansions are
+                    # inlined into consuming crates, so their sources must be
+                    # fingerprinted.
                     #
                     # The package loop above appends `Cargo.toml` BEFORE this
                     # loop runs, which is what made the omission invisible: the
@@ -854,16 +812,15 @@ def external_input_groups(
     of `run_cli`, and a parameter of that name shadows the module-level
     function for the whole body.
 
-    ⭐ The GROUP, not the file and not the whole set, is the unit `external=`
+    The group, not the file and not the whole set, is the unit `external=`
     records a digest for, and that choice is the only reason `check` can name a
     mover. One digest over every out-of-root file fires identically whether a
     doc comment moved in a crate the artefact barely references or
     `majit-macros` did — a proc macro whose expansion IS the extracted crate's
     item bodies, so its movement voids every measurement already read out of
     the artefact. Same remedy (`--force`), very different consequence, and a
-    single digest cannot tell them apart. Per FILE is the other extreme and no
-    better: cel's declared closure is hundreds of files, and a report naming
-    hundreds of movers carries the same zero bits spelled longer.
+    single digest cannot tell them apart. Per-file reporting is the other
+    extreme and becomes unreadable for a large declared closure.
 
     Roots are deduped by label — the metadata walk runs once per layout
     platform and rediscovers the same packages — but files are NOT deduped
@@ -873,10 +830,10 @@ def external_input_groups(
 
     The label — not the absolute path — is what enters the digest, so two
     checkouts of the same layout in different directories agree. Labels are
-    relative to the artefact root, so a stamp survives relocating the whole
-    cohabitation (`<super>/{pyre,cel-jit,majit}`) as a unit; it does not
-    survive rearranging those repos RELATIVE to each other, which is the
-    correct sensitivity, because that changes which sources are compiled.
+    relative to the artefact root, so a stamp survives relocating a group of
+    sibling repositories as a unit. It does not survive rearranging them
+    relative to each other, which is correct because that changes which
+    sources are compiled.
 
     Directories are expanded here rather than at collection time so the walk
     sees the working tree at hashing time, matching `source=`'s
@@ -1217,11 +1174,10 @@ def file_mtime(path: Path) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# PROVENANCE: what the repository looked like around the build. Recorded beside
-# the artefact, reported by `check`, and NEVER gated on.
+# Provenance records what the repository looked like around the build. It is
+# stored beside the artefact, reported by `check`, and never used as a gate.
 #
-# ⛔ This does not go in the fingerprint stamp, and must not be moved there.
+# This does not go in the fingerprint stamp and must not be moved there.
 # Two independent reasons, either one sufficient:
 #
 #   * `check` compares the stamp as exact text and already has an arm for a
@@ -1238,7 +1194,7 @@ def file_mtime(path: Path) -> str:
 # the stamp answers "is this artefact current", the provenance answers "what
 # was going on when it was built". Only the first is allowed to fail a build.
 #
-# ⚠ THE FIRST SIDECARS THIS CODE WRITES DESCRIBE A TREE THAT CONTAINS THIS
+# The first sidecars this code writes describe a tree that contains this
 # CODE, and that is not an anomaly. This file is one of the engine sources
 # listed in every driver's base pathspecs, so it is hashed into `source=` for
 # EVERY crate: editing it re-stales all artefacts by construction, and the only
@@ -1248,7 +1204,7 @@ def file_mtime(path: Path) -> str:
 # it the other way round and the change lists ITSELF as an in-closure dirty
 # file, which is the correct report and looks like a defect.
 #
-# ⚠ AND THE GENERAL FORM, which outlives that one occasion: A NONZERO
+# More generally, a nonzero
 # `dirty_in_closure` IS A REPORT, NOT A DEFECT. An extraction is normally
 # batched into a window several people's work lands in, so a sidecar routinely
 # names files somebody else was editing. What it tells you is narrow and worth
@@ -1256,9 +1212,6 @@ def file_mtime(path: Path) -> str:
 # FOR THAT TREE and is not reproducible from any commit. Kill such a run only
 # if commit-reproducible artefacts are what you came for; the freshness
 # question was already answered, by the stamp, and the answer was yes.
-# ---------------------------------------------------------------------------
-
-
 def git_head(root: Path) -> str:
     """`HEAD`'s sha, or a LABELLED reason it is unavailable.
 
@@ -1348,14 +1301,11 @@ def provenance_for(
 ) -> str:
     """The provenance sidecar's text: the HEAD pair, and dirt CLASSIFIED.
 
-    ⭐ Both halves exist because of a specific failure they each fix.
+    Both halves exist because each detects a distinct failure.
 
-    `head_before`/`head_after` are a PAIR because a build that straddles a
+    `head_before`/`head_after` are a pair because a build that straddles a
     commit is only visible as one. A single post-hoc `rev-parse` records the
-    later sha and shows nothing unusual — the straddle that motivated this
-    (`e69f4388a3c` → `8dd18ba2bf4`, landing while an artefact was being
-    stamped) reads as an ordinary clean build under one sha, and as an obvious
-    straddle under two.
+    later revision and hides that source changed while the artefact was built.
 
     Every dirty path is classified against this crate's own fingerprint
     closure, because the bare porcelain is not actionable: three files dirty
@@ -1364,7 +1314,7 @@ def provenance_for(
     handed the unclassified list has to reconstruct the closure by hand, which
     is the step nobody takes.
 
-    ⚠ `in-closure` covers the IN-ROOT half only. The out-of-root inputs
+    `in-closure` covers the in-root half only. The out-of-root inputs
     `external=` hashes live in sibling checkouts this `git status` never sees,
     so `outside` means "not an input from this repository", never "cannot
     affect the artefact".
@@ -1389,7 +1339,7 @@ def provenance_for(
     # legible — and repeating the whole listing to say so would bury the one
     # that describes the stamped state.
     #
-    # ⚠ It is the WHOLE PORCELAIN, UNCLASSIFIED. `dirty_in_closure` and
+    # This is the complete unclassified porcelain output. `dirty_in_closure` and
     # `dirty_outside` below are a partition of a LATER snapshot, so the only
     # valid comparison is against their SUM; reading `dirty_before` against
     # either half alone compares a total to a part. And the two are SUPPOSED to
@@ -1484,7 +1434,7 @@ def dirty_report_lines(fields: dict[str, str], in_closure: list[str]) -> list[st
     omitted = fields.get("dirty_omitted", "0")
     if omitted not in ("0", "?"):
         lines.append(
-            f"      ⚠ {omitted} further dirty path(s) not listed — do not count"
+            f"      WARNING: {omitted} further dirty path(s) not listed — do not count"
             " the rows, the counts above are the exact ones"
         )
     lines.extend(f"      {entry}" for entry in in_closure)
@@ -1494,7 +1444,7 @@ def dirty_report_lines(fields: dict[str, str], in_closure: list[str]) -> list[st
 def report_provenance(dest: Path) -> None:
     """Print an artefact's provenance. Returns nothing and gates nothing.
 
-    ⛔ Absence is NOT a staleness signal and must never become one. Every
+    Absence is not a staleness signal. Every
     artefact extracted before this sidecar existed lacks it, and so does every
     artefact copied in from elsewhere; refusing on that would turn a reporting
     aid into a second, weaker freshness gate answering a question `source=`
@@ -1521,7 +1471,7 @@ def report_provenance(dest: Path) -> None:
         # current — `source=` is content-addressed and does not care which
         # commit the tree sat on. What a straddle costs is the ability to name
         # ONE tree this artefact came from.
-        print(f"    ⚠ built ACROSS a commit: {before} -> {after}")
+        print(f"    WARNING: built across a commit: {before} -> {after}")
     status = fields.get("dirty_status", "?")
     if status != "ok":
         print(f"    dirty state at build time: {status} — neither clean nor known")
@@ -1800,8 +1750,8 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         ):
             print(f"=== skipping {crate} -> {dest} (fingerprint unchanged) ===")
             # No provenance is written here on purpose. The sidecar describes
-            # THE ARTEFACT, and the artefact is the one the previous run built:
-            # re-stamping it with today's HEAD would claim this tree produced
+            # the artefact, and the artefact is the one the previous run built:
+            # re-stamping it with the current HEAD would claim this checkout produced
             # bytes it did not.
             continue
 
@@ -1904,7 +1854,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
         # Closing half of the provenance pair, and the sidecar write.
         #
-        # ⚠ This precedes the two guards below, both of which can end the run,
+        # This precedes the two guards below, both of which can end the run,
         # because the artefact at `dest` has ALREADY been rewritten by the
         # Charon build above. The invariant worth holding is "the provenance
         # beside an artefact describes the bytes in it" — leaving the write
@@ -2068,20 +2018,15 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
           - it does not distinguish "the guard passed" from "the guard was
             vacuous". A spec with empty `excluded_deps` runs an empty loop and
             writes an indistinguishable stamp.
-          - it does not cover the EXCLUSIVELY-REACHED SUBTREE the exclusion
-            also drops, and ⛔ widening the loop to cover it would be worse
-            than leaving it uncovered, because the guard's power is PER
-            SYMBOL. `majit_charon_reader` — dropped as `majit-translate`'s
-            subtree — occurs 0 times in ALL SIX artefacts this tree builds,
-            `pyre-jit.ullbc` included, so no artefact can serve as its
-            positive control and a widened guard would pass without
-            evidence. What actually certifies the subtree is INHERITANCE:
-            the walk drops a package only when EVERY path to it runs through
+          - it does not cover the exclusively reached subtree the exclusion
+            also drops, and widening the loop to cover it would be worse
+            than leaving it uncovered, because the guard's power is per
+            symbol. A transitively dropped package may have no matching symbol
+            in any artefact, so no artefact can serve as its positive control.
+            The subtree is instead certified by inheritance: the walk drops a
+            package only when every path to it runs through
             an excluded one, and the named package's absence is checked
             here, so a package that cannot appear without it cannot appear.
-            `pyre-object` is NOT a second witness for that absence — it does
-            not depend on `majit-translate` at all, so its exclusion is an
-            inert declaration and its 0 is uninformative.
           - `--force` re-extracts with the skip bypassed, and an excluded
             package's sources changing is BY CONSTRUCTION invisible to
             `source=`. So a forced run can write a violating artefact, raise at
@@ -2109,7 +2054,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     platform_key, charon_dest, _ = charon_paths(eng.charon_root)
     charon_stamp = charon_version(charon_dest)
     dest_dir = llbc_dest(eng.out_dir, eng.root)
-    # ⚠ `crates` is what was REQUESTED, and the epilogue's `unaccounted` check
+    # `crates` is what was requested, and the epilogue's `unaccounted` check
     # depends on it staying that way. Rebuilding this list from resolved specs
     # would drop a name the loop could not process before the epilogue ever saw
     # it, turning "this crate was never confirmed" back into silent success.
@@ -2282,7 +2227,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     # banner is where someone learns they are blocked.
     print(
         "\n"
-        "  ⚠ Re-extracting while a closure input is dirty re-stales the result\n"
+        "  WARNING: re-extracting while a closure input is dirty re-stales the result\n"
         "  the moment that edit changes again. The fingerprint is over the\n"
         "  WORKING TREE, so an uncommitted in-closure edit is invisible to\n"
         "  `git log` and to a --check taken a minute earlier. On a shared\n"
@@ -2327,9 +2272,8 @@ def self_test_exclusion_diamond() -> None:
 
     Two-sided, and neither side alone is sufficient:
 
-    * `behind_excluded` must be ABSENT. An engine that filters at emission
-      keeps it — that is the #152 defect, and this is the only assertion that
-      sees it.
+    * `behind_excluded` must be absent. An engine that filters at emission
+      keeps it, and this is the only assertion that sees that defect.
     * `shared` must be PRESENT. An engine that prunes by ancestry instead
       (dropping everything downstream of an excluded node) also passes the
       first assertion, and drops a package the tree genuinely depends on. That
@@ -2341,7 +2285,7 @@ def self_test_exclusion_diamond() -> None:
     are being read off a graph that might reach neither, and the excluded run
     would pass for a reason unrelated to exclusion.
 
-    ⚠ Not covered here: the `dep_kinds`/dev-edge filter in the same walk. It is
+    Not covered here: the `dep_kinds`/dev-edge filter in the same walk. It is
     a different property with a different failure mode and no fixture yet.
     """
     def pkg(name, source=None):
@@ -2391,7 +2335,7 @@ def self_test_exclusion_diamond() -> None:
                 "'behind_excluded' survived the exclusion — the exclusion is "
                 "being applied at emission rather than in the walk, so a "
                 "package reachable ONLY through an excluded one still moves "
-                "the fingerprint (the #152 defect)"
+                "the fingerprint"
             )
         if "shared" not in excluded:
             failures.append(
@@ -2715,8 +2659,8 @@ def run_cli(
         # is silently wrong.
         self_test_exclusion_diamond()
         # Same reason, one artefact along: `--check` renders provenance on every
-        # run and exercises neither of its conditional lines, because no sidecar
-        # this tree has written is anything but steady and untruncated.
+        # run and exercises neither of its conditional lines, because ordinary
+        # sidecars describe steady, complete extractions.
         self_test_provenance_rendering()
         # Same reason again: this one builds its own repository in a
         # temporary directory and never touches the worktree.
@@ -2745,7 +2689,6 @@ def run_cli(
 if __name__ == "__main__":
     raise SystemExit(
         "llbc_extract.py is the shared extraction ENGINE, not an entry point.\n"
-        "  pyre crates:  python3 scripts/extract-llbc.py ...\n"
-        "  cel crates:   python3 cel-jit/scripts/extract-llbc.py ...\n"
-        "Those wrappers supply the CrateSpec table this module needs."
+        "Use the repository's scripts/extract-llbc.py wrapper instead.\n"
+        "The wrapper supplies the CrateSpec table this module needs."
     )

@@ -8,8 +8,8 @@
 //! extended, after which every crate reports "not checked" and the build looks
 //! exactly like success.
 //!
-//! That is what happened: `2f0e44cde70` added an `external=` field, turning one
-//! bare digest into two `key=value` lines, and the consumer's bare-sha256 test
+//! Adding the `external=` field turned one bare digest into two `key=value`
+//! lines, and the consumer's bare-sha256 test
 //! stopped matching.  The unit cases below would all have passed on that broken
 //! code had they been written beforehand — they encode whatever shape their
 //! author believed in.  **Only `real_driver_output_parses` could have caught it**,
@@ -96,7 +96,7 @@ fn an_unknown_trailing_field_is_ignored() {
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
 }
 
-/// No bare-hash fallback. Accepting the pre-`2f0e44cde70` shape would let the
+/// No bare-hash fallback. Accepting the old single-value shape would let the
 /// consumer keep silently honouring a format the producer no longer emits —
 /// the exact mechanism that produced the defect. Driver and consumer version
 /// together in one repository, so strict is the safe direction.

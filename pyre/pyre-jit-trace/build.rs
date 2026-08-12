@@ -380,7 +380,7 @@ fn preflight_llbc_or_fail() {
 // written by the same producer, so both are parsed by `llbc_fingerprint`
 // rather than once per reader here.  `tests/llbc_fingerprint_format_test.rs`
 // pins that module against the driver's real output.
-use llbc_fingerprint::{freshness_policy, parse_fingerprint_stdout, stamp_field, FreshnessMode};
+use llbc_fingerprint::{FreshnessMode, freshness_policy, parse_fingerprint_stdout, stamp_field};
 
 /// Wait for the fingerprint oracle with a deadline.
 ///
@@ -411,9 +411,9 @@ fn llbc_fingerprint_output(child: std::process::Child) -> Option<String> {
 /// the stamp, and its `source=` field is the same `source_fingerprint()` call
 /// `stamp_for` records — so there is one implementation of the digest and it
 /// is not this one.  Parsed by `llbc_fingerprint::parse_fingerprint_stdout`,
-/// which reads the field by name; the driver adds fields (`external=` did,
-/// in `2f0e44cde70`) and a reader that models the output as one bare value
-/// stops answering the moment it does.
+/// which reads the field by name. The driver may add fields, as it did for
+/// `external=`; a reader that models the output as one bare value stops
+/// answering as soon as that happens.
 ///
 /// `CARGO_FEATURES` and `LLBC_LAYOUT_TARGETS` are replayed out of the stamp:
 /// `fingerprint_inputs` (`scripts/llbc_extract.py:255-360`) walks the
@@ -489,9 +489,10 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     println!("cargo::rerun-if-env-changed=PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
     // A non-UTF8 value is not `1`, so lossy conversion lands it in the
     // unrecognised arm and it is reported rather than read as unset.
-    let env_switch = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
-    let strict_var = env_switch("PYRE_LLBC_STRICT");
-    let skip_var = env_switch("PYRE_LLBC_SKIP_FINGERPRINT_CHECK");
+    let strict_var =
+        std::env::var_os("PYRE_LLBC_STRICT").map(|value| value.to_string_lossy().into_owned());
+    let skip_var = std::env::var_os("PYRE_LLBC_SKIP_FINGERPRINT_CHECK")
+        .map(|value| value.to_string_lossy().into_owned());
     let policy = freshness_policy(strict_var.as_deref(), skip_var.as_deref());
     let policy_directive = match policy.mode {
         FreshnessMode::Refuse => "cargo::error",

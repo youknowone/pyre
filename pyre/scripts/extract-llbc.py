@@ -19,11 +19,10 @@ from llbc_extract import CrateSpec, run_cli  # noqa: E402
 
 # `pyre-object` / `pyre-interpreter` exclude `majit-translate` from their
 # fingerprint: their `.ullbc` holds zero references to it, so a pure edit there
-# reuses the cached artefact. The exclusion also drops the subtree reachable
-# ONLY through it — on this tree that is `majit-charon-reader`, whose sole
-# dependent-of-record is `majit-translate`, worth 4 files to `pyre-interpreter`.
+# reuses the cached artefact. The exclusion also drops dependencies reachable
+# only through `majit-translate`.
 #
-# ⚠ Only `pyre-interpreter` is actually affected: `pyre-object` does not
+# Only `pyre-interpreter` is affected: `pyre-object` does not
 # depend on `majit-translate` at all, so its entry here is an inert
 # declaration and its input list is byte-identical with and without it. Do not
 # read that row as a second confirmation of anything.

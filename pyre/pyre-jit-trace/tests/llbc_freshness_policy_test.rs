@@ -14,7 +14,7 @@
 //! same as unset**, and **asking for strict while also asking to skip is a
 //! contradiction, not a precedence question.**
 
-use pyre_jit_trace::llbc_fingerprint::{freshness_policy, FreshnessMode};
+use pyre_jit_trace::llbc_fingerprint::{FreshnessMode, freshness_policy};
 
 #[test]
 fn both_unset_is_strict_and_says_nothing() {
