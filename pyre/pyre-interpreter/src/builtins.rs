@@ -9027,7 +9027,7 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let mut rendered = Wtf8Buf::with_capacity(message.len() + 32);
     rendered.push_wtf8(message);
     rendered.push_str(&format!(" ({count} sub-exception{suffix})"));
-    Ok(pyre_object::w_str_from_wtf8(rendered))
+    Ok(pyre_object::w_str_from_wtf8_managed(rendered))
 }
 
 fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9074,7 +9074,7 @@ fn exception_group_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     rendered.push_str(", ");
     rendered.push_wtf8(&exceptions_repr);
     rendered.push_str(")");
-    Ok(pyre_object::w_str_from_wtf8(rendered))
+    Ok(pyre_object::w_str_from_wtf8_managed(rendered))
 }
 
 fn make_exception_group_type(
