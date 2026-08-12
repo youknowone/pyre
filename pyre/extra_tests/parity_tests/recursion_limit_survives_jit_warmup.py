@@ -27,7 +27,7 @@ def deepest():
     """Recurse until RecursionError and report the depth reached."""
     best = [0]
 
-    def plain(n):
+    def plain(n) -> None:
         best[0] = n
         plain(n + 1)
 
@@ -67,7 +67,7 @@ failure = []
 def in_thread():
     try:
         check("thread", readings(), sys.getrecursionlimit())
-    except AssertionError as exc:  # surface it on the main thread
+    except BaseException as exc:  # surface every worker failure on the main thread
         failure.append(exc)
 
 

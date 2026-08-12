@@ -316,11 +316,13 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         # left CI runs that could only be re-run, never diagnosed.
         detail = f"signal/abort {death_signal(rc)} rc={rc} {last_stderr_line(err)}"
         return "CRASH", detail.strip()[:200]
-    if any(line.startswith("skipped: ") for line in out.splitlines()):
-        return "SKIP", next(
-            line for line in out.splitlines() if line.startswith("skipped: ")
-        )[:120]
     if rc == 0:
+        skipped = next(
+            (line for line in out.splitlines() if line.startswith("skipped: ")),
+            None,
+        )
+        if skipped:
+            return "SKIP", skipped[:120]
         return "PASS", ""
     last = last_stderr_line(err)
     ran = "Ran " in out or "Ran " in err or "FAILED (" in out or "FAILED (" in err
