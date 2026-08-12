@@ -113,3 +113,5 @@ for _ in range(N):
         other = other + 1
 print("dict hits", other)
 print("dict getter calls", len(calls) - before)
+
+print("OK")
