@@ -9539,6 +9539,12 @@ impl<M: Clone> MetaInterp<M> {
         let compile_time = Instant::now().saturating_duration_since(compile_start);
         match compile_loop_result {
             Ok(_) => {
+                // compile.py:204-207 record_loop_or_bridge registers every
+                // dependency against the artifact published by this compile.
+                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
+                if !self.last_quasi_immutable_deps.is_empty() {
+                    crate::mc_diag_bump(75);
+                }
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
@@ -12040,9 +12046,17 @@ impl<M: Clone> MetaInterp<M> {
 
         match compile_result {
             Ok(_) => {
+                // compile.py:204-207 record_loop_or_bridge registers every
+                // dependency against the artifact published by this compile.
+                self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 self.assign_guard_hashes(token.as_ref());
                 self.warm_state.memory_manager.keep_loop_alive(&token);
                 // compile.py:213 record_loop_or_bridge.
+                self.last_quasi_immutable_deps =
+                    std::mem::take(&mut optimizer.quasi_immutable_deps);
+                if !self.last_quasi_immutable_deps.is_empty() {
+                    crate::mc_diag_bump(76);
+                }
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
                     &entry_inputargs,

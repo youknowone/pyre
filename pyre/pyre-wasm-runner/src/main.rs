@@ -805,6 +805,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "unroll_cancelled_invalid_loop",
                 "unroll_free_retry_rescued",
                 "unroll_free_retry_failed",
+                "qmut_deps_simple_loop",
+                "qmut_deps_entry_bridge",
+                "qmut_deps_blackhole_arm",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
