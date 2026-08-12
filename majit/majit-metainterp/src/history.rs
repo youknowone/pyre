@@ -2895,7 +2895,7 @@ impl TraceCtx {
     /// Like [`Self::capture_snapshot_for_last_guard_multi_frame_with_vable_vref`] but
     /// stamps the resume position on the guard op `from_end` guards back from
     /// the most recent one rather than the last recorded op — the multi-frame
-    /// analog of [`Self::capture_snapshot_for_last_guard_op_with_vable_vref`]. Used when a
+    /// analog of [`Self::capture_snapshot_for_last_guard_op_with_vable_vref`].  Used when a
     /// guard emitted inside a helper (the `_nonstandard_virtualizable` PTR_EQ
     /// promote) records further non-guard ops (`emit_force_virtualizable`'s
     /// GETFIELD_GC / PTR_NE / COND_CALL) before the caller captures, yet the
