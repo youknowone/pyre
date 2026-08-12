@@ -2351,12 +2351,16 @@ fn append_journal_rollback_rewinds_length() {
 #[test]
 fn pop_end_journal_rollback_restores_item_and_length() {
     use pyre_object::listobject::{
-        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
+        w_list_new_with_strategy,
     };
     use pyre_object::{w_int_new, w_list_pop_end};
 
     super::fbw_store_journal_reset();
-    let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+    let list = w_list_new_with_strategy(
+        vec![w_int_new(10), w_int_new(20), w_int_new(30)],
+        ListStrategy::Integer,
+    );
     let len_before = unsafe { w_list_len(list) };
     let raw_item =
         unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) };
@@ -2375,12 +2379,16 @@ fn pop_end_journal_rollback_restores_item_and_length() {
 #[test]
 fn pop_end_journal_rollback_after_strategy_switch() {
     use pyre_object::listobject::{
-        W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new, w_list_uses_object_storage,
+        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_len, w_list_new_with_strategy,
+        w_list_uses_object_storage,
     };
     use pyre_object::{w_int_get_value, w_int_new, w_list_append, w_list_getitem, w_list_pop_end};
 
     super::fbw_store_journal_reset();
-    let list = w_list_new(vec![w_int_new(10), w_int_new(20), w_int_new(30)]);
+    let list = w_list_new_with_strategy(
+        vec![w_int_new(10), w_int_new(20), w_int_new(30)],
+        ListStrategy::Integer,
+    );
     let len_before = unsafe { w_list_len(list) };
     let raw_item =
         unsafe { ll_list_int_getitem_fast(&*(list as *const W_ListObject), len_before - 1) };
@@ -2399,13 +2407,17 @@ fn pop_end_journal_rollback_after_strategy_switch() {
 #[test]
 fn interleaved_append_pop_journal_rollback_restores_original() {
     use pyre_object::listobject::{
-        W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len, w_list_new,
+        ListStrategy, W_ListObject, ll_list_int_getitem_fast, w_list_allocated, w_list_len,
+        w_list_new_with_strategy,
     };
     use pyre_object::{w_int_new, w_list_append, w_list_pop_end};
 
     super::fbw_store_journal_reset();
     let original = [10, 20, 30];
-    let list = w_list_new(original.into_iter().map(w_int_new).collect());
+    let list = w_list_new_with_strategy(
+        original.into_iter().map(w_int_new).collect(),
+        ListStrategy::Integer,
+    );
 
     let len_before_append = unsafe { w_list_len(list) };
     let allocated_before_append = unsafe { w_list_allocated(list) };

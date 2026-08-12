@@ -579,11 +579,6 @@ pub(crate) unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
     }
 }
 
-/// Check if all items are plain ints for IntegerListStrategy.
-fn all_ints(items: &[PyObjectRef]) -> bool {
-    items.iter().all(|&item| unsafe { is_plain_int1(item) })
-}
-
 /// Whether an item may enter PyPy's unboxed FloatListStrategy.
 ///
 /// PyPy accepts every exact float because `W_FloatObject.is_w` treats equal
@@ -594,13 +589,6 @@ fn all_ints(items: &[PyObjectRef]) -> bool {
 #[inline]
 unsafe fn is_float_strategy_item(item: PyObjectRef) -> bool {
     !item.is_null() && is_plain_float_strict(item) && !w_float_get_value(item).is_nan()
-}
-
-/// Check if all items can use FloatListStrategy.
-fn all_floats(items: &[PyObjectRef]) -> bool {
-    items
-        .iter()
-        .all(|&item| unsafe { is_float_strategy_item(item) })
 }
 
 // rpython/rlib/longlong2float.py:90-150.  Keep these bit operations local to
@@ -648,12 +636,6 @@ unsafe fn int_or_float_encode_item(item: PyObjectRef) -> Option<i64> {
     } else {
         None
     }
-}
-
-fn all_int_or_float(items: &[PyObjectRef]) -> bool {
-    items
-        .iter()
-        .all(|&item| unsafe { int_or_float_encode_item(item).is_some() })
 }
 
 fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
@@ -774,7 +756,7 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
-/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy
+/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy.
 ///
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
@@ -814,17 +796,12 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
 
 /// The strategy `w_list_new` picks for a given item set.
 ///
-/// listobject.py:1092 EmptyListStrategy: a freshly created list with no
-/// items uses Empty until first append picks a typed strategy.
+/// listobject.py:1092 EmptyListStrategy plus Python 3.14 identity: a freshly
+/// created list with no items uses Empty, while every non-empty public list
+/// uses Object storage so indexing returns the exact inserted references.
 pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
     if items.is_empty() {
         ListStrategy::Empty
-    } else if all_ints(items) {
-        ListStrategy::Integer
-    } else if all_floats(items) {
-        ListStrategy::Float
-    } else if all_int_or_float(items) {
-        ListStrategy::IntOrFloat
     } else {
         ListStrategy::Object
     }
@@ -1040,7 +1017,12 @@ impl ListStorage {
     }
 }
 
-fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
+/// Construct a list with an explicitly selected PyPy storage strategy.
+///
+/// This is an interpreter-internal seam: Python-visible constructors call
+/// [`w_list_new`], while JIT strategy tests use it to exercise the unboxed
+/// representations without changing CPython 3.14's list identity semantics.
+pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
     // below (`alloc_list_items_block_gc`, the collecting header allocation) so the
@@ -2993,6 +2975,18 @@ mod tests {
     use super::*;
     use crate::intobject::w_int_new;
 
+    fn integer_strategy(items: Vec<PyObjectRef>) -> PyObjectRef {
+        w_list_new_with_strategy(items, ListStrategy::Integer)
+    }
+
+    fn float_strategy(items: Vec<PyObjectRef>) -> PyObjectRef {
+        w_list_new_with_strategy(items, ListStrategy::Float)
+    }
+
+    fn int_or_float_strategy(items: Vec<PyObjectRef>) -> PyObjectRef {
+        w_list_new_with_strategy(items, ListStrategy::IntOrFloat)
+    }
+
     #[test]
     fn test_list_create_and_access() {
         let items = vec![w_int_new(10), w_int_new(20), w_int_new(30)];
@@ -3009,10 +3003,8 @@ mod tests {
 
     #[test]
     fn unused_typed_storage_holds_no_block() {
-        // An Object-strategy list reads neither typed array, and an
-        // Integer-strategy list reads only `int_items`: the other side must
-        // carry the empty form, not an allocated single-slot block. This is the
-        // shape `emit_typed_list_inline` already leaves for traced code.
+        // Public Python 3.14 lists retain numeric wrapper identity and thus
+        // read neither typed array.
         let object_list = w_list_new(vec![crate::w_str_new("x")]);
         let int_list = w_list_new(vec![w_int_new(1)]);
         let float_list = w_list_new(vec![crate::floatobject::w_float_new(1.5)]);
@@ -3025,14 +3017,14 @@ mod tests {
             assert!(l.float_items.as_slice().is_empty());
 
             let l = &*(int_list as *const W_ListObject);
-            assert_eq!(l.strategy, ListStrategy::Integer);
-            assert!(!l.int_items.block.is_null());
+            assert_eq!(l.strategy, ListStrategy::Object);
+            assert!(l.int_items.block.is_null());
             assert!(l.float_items.block.is_null());
 
             let l = &*(float_list as *const W_ListObject);
-            assert_eq!(l.strategy, ListStrategy::Float);
+            assert_eq!(l.strategy, ListStrategy::Object);
             assert!(l.int_items.block.is_null());
-            assert!(!l.float_items.block.is_null());
+            assert!(l.float_items.block.is_null());
         }
     }
 
@@ -3063,10 +3055,10 @@ mod tests {
             assert_eq!(l.strategy, ListStrategy::Empty);
             assert!(l.int_items.block.is_null());
             assert!(l.float_items.block.is_null());
-            // The next append reinstalls the matching typed storage.
+            // Python 3.14 requires the next append to retain its wrapper.
             w_list_append(list, w_int_new(9));
             let l = &*(list as *const W_ListObject);
-            assert_eq!(l.strategy, ListStrategy::Integer);
+            assert_eq!(l.strategy, ListStrategy::Object);
             assert_eq!(w_list_len(list), 1);
         }
     }
@@ -3084,7 +3076,7 @@ mod tests {
     #[test]
     fn integer_strategy_oopspec_leaves_roundtrip() {
         let items = vec![w_int_new(10), w_int_new(20), w_int_new(30)];
-        let list = w_list_new(items);
+        let list = w_list_new_with_strategy(items, ListStrategy::Integer);
         unsafe {
             let l = &mut *(list as *mut W_ListObject);
             assert_eq!(l.strategy, ListStrategy::Integer);
@@ -3208,8 +3200,8 @@ mod tests {
     #[test]
     fn test_w_list_pop_end_returns_none_for_empty_every_strategy() {
         let empty = w_list_new(Vec::new());
-        let integer = w_list_new(vec![w_int_new(1)]);
-        let float = w_list_new(vec![crate::floatobject::w_float_new(1.0)]);
+        let integer = integer_strategy(vec![w_int_new(1)]);
+        let float = float_strategy(vec![crate::floatobject::w_float_new(1.0)]);
         let object = w_list_new_object(vec![w_int_new(1)]);
 
         unsafe {
@@ -3230,18 +3222,19 @@ mod tests {
     }
 
     #[test]
-    fn test_list_uses_integer_strategy_for_homogeneous_ints() {
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+    fn test_public_list_preserves_homogeneous_int_identity() {
+        let first = w_int_new(257);
+        let list = w_list_new(vec![first, w_int_new(258), w_int_new(259)]);
         unsafe {
-            assert!(w_list_uses_int_storage(list));
-            assert!(!w_list_uses_object_storage(list));
+            assert!(w_list_uses_object_storage(list));
             assert_eq!(w_list_len(list), 3);
+            assert!(std::ptr::eq(w_list_getitem(list, 0).unwrap(), first));
         }
     }
 
     #[test]
     fn test_list_setitem_mixed_value_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2)]);
         let float = crate::floatobject::w_float_new(3.5);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3254,7 +3247,7 @@ mod tests {
 
     #[test]
     fn test_list_append_mixed_value_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2)]);
         let float = crate::floatobject::w_float_new(3.5);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3268,7 +3261,7 @@ mod tests {
 
     #[test]
     fn test_int_or_float_strategy_preserves_types_and_numeric_equality() {
-        let list = w_list_new(vec![
+        let list = int_or_float_strategy(vec![
             w_int_new(42),
             crate::floatobject::w_float_new(42.0),
             crate::floatobject::w_float_new(-0.0),
@@ -3297,7 +3290,7 @@ mod tests {
 
     #[test]
     fn test_int_or_float_rejects_out_of_int32_range() {
-        let list = w_list_new(vec![w_int_new(i32::MAX as i64 + 1), w_int_new(1)]);
+        let list = integer_strategy(vec![w_int_new(i32::MAX as i64 + 1), w_int_new(1)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_append(list, crate::floatobject::w_float_new(2.5));
@@ -3307,9 +3300,9 @@ mod tests {
 
     #[test]
     fn test_int_or_float_setslice_accepts_integer_and_float_strategies() {
-        let list = w_list_new(vec![w_int_new(1), crate::floatobject::w_float_new(4.0)]);
-        let integers = w_list_new(vec![w_int_new(2), w_int_new(3)]);
-        let floats = w_list_new(vec![crate::floatobject::w_float_new(2.5)]);
+        let list = int_or_float_strategy(vec![w_int_new(1), crate::floatobject::w_float_new(4.0)]);
+        let integers = integer_strategy(vec![w_int_new(2), w_int_new(3)]);
+        let floats = float_strategy(vec![crate::floatobject::w_float_new(2.5)]);
         unsafe {
             w_list_setslice(list, 1, 1, integers).unwrap();
             assert!(w_list_uses_int_or_float_storage(list));
@@ -3328,16 +3321,17 @@ mod tests {
     }
 
     #[test]
-    fn test_list_uses_float_strategy_for_homogeneous_floats() {
+    fn test_public_list_preserves_homogeneous_float_identity() {
+        let first = crate::floatobject::w_float_new(1.25);
         let list = w_list_new(vec![
-            crate::floatobject::w_float_new(1.25),
+            first,
             crate::floatobject::w_float_new(2.5),
             crate::floatobject::w_float_new(3.75),
         ]);
         unsafe {
-            assert!(w_list_uses_float_storage(list));
-            assert!(!w_list_uses_object_storage(list));
+            assert!(w_list_uses_object_storage(list));
             assert_eq!(w_list_len(list), 3);
+            assert!(std::ptr::eq(w_list_getitem(list, 0).unwrap(), first));
             let value = w_list_getitem(list, 1).unwrap();
             assert!(crate::pyobject::is_float(value));
             assert_eq!(crate::floatobject::w_float_get_value(value), 2.5);
@@ -3346,7 +3340,7 @@ mod tests {
 
     #[test]
     fn test_list_setitem_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![
+        let list = float_strategy(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
         ]);
@@ -3361,7 +3355,7 @@ mod tests {
 
     #[test]
     fn test_list_append_mixed_on_float_strategy_switches_to_int_or_float_strategy() {
-        let list = w_list_new(vec![
+        let list = float_strategy(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
         ]);
@@ -3382,7 +3376,7 @@ mod tests {
     #[test]
     fn test_int_list_pop_stays_integer_strategy() {
         // AbstractUnwrappedStrategy.pop (listobject.py:1855)
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             let popped = w_list_pop(list, 1).unwrap();
@@ -3406,7 +3400,7 @@ mod tests {
     #[test]
     fn test_int_list_pop_end_stays_integer_strategy() {
         // AbstractUnwrappedStrategy.pop_end (listobject.py:1848)
-        let list = w_list_new(vec![w_int_new(10), w_int_new(20)]);
+        let list = integer_strategy(vec![w_int_new(10), w_int_new(20)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             let popped = w_list_pop_end(list).unwrap();
@@ -3422,7 +3416,7 @@ mod tests {
     #[test]
     fn test_int_list_insert_stays_integer_strategy() {
         // AbstractUnwrappedStrategy.insert (listobject.py:1714)
-        let list = w_list_new(vec![w_int_new(1), w_int_new(3)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_insert(list, 1, w_int_new(2));
@@ -3441,7 +3435,7 @@ mod tests {
     #[test]
     fn test_int_list_insert_float_switches_to_int_or_float() {
         // AbstractUnwrappedStrategy.switch_to_next_strategy (listobject.py:1720)
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2)]);
         let fv = crate::floatobject::w_float_new(9.0);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3454,7 +3448,7 @@ mod tests {
     #[test]
     fn test_int_list_reverse_stays_integer_strategy() {
         // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_reverse(list);
@@ -3488,7 +3482,7 @@ mod tests {
         // listobject.py:391 W_ListObject.clear → EmptyListStrategy.
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         unsafe {
-            assert!(w_list_uses_int_storage(list));
+            assert!(w_list_uses_object_storage(list));
             w_list_clear(list);
             assert!(
                 w_list_uses_empty_storage(list),
@@ -3499,37 +3493,36 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_first_int_append_switches_to_int_strategy() {
-        // listobject.py:1170 EmptyListStrategy.append picks the typed strategy
-        // matching the first item.
+    fn test_empty_first_int_append_preserves_identity() {
+        // Python 3.14 delta: the public list retains the exact first wrapper.
         let list = w_list_new(Vec::new());
+        let item = w_int_new(257);
         unsafe {
             assert!(w_list_uses_empty_storage(list));
-            w_list_append(list, w_int_new(7));
-            assert!(w_list_uses_int_storage(list));
+            w_list_append(list, item);
+            assert!(w_list_uses_object_storage(list));
             assert_eq!(w_list_len(list), 1);
-            assert_eq!(
-                crate::intobject::w_int_get_value(w_list_getitem(list, 0).unwrap()),
-                7
-            );
+            assert!(std::ptr::eq(w_list_getitem(list, 0).unwrap(), item));
         }
     }
 
     #[test]
-    fn test_empty_first_float_append_switches_to_float_strategy() {
+    fn test_empty_first_float_append_preserves_identity() {
         let list = w_list_new(Vec::new());
+        let item = crate::floatobject::w_float_new(2.5);
         unsafe {
             assert!(w_list_uses_empty_storage(list));
-            w_list_append(list, crate::floatobject::w_float_new(2.5));
-            assert!(w_list_uses_float_storage(list));
+            w_list_append(list, item);
+            assert!(w_list_uses_object_storage(list));
             assert_eq!(w_list_len(list), 1);
+            assert!(std::ptr::eq(w_list_getitem(list, 0).unwrap(), item));
         }
     }
 
     #[test]
     fn test_int_list_delslice_stays_integer_strategy() {
         // AbstractUnwrappedStrategy.deleteslice (listobject.py:1815)
-        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
+        let list = integer_strategy(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
             w_list_delslice(list, 1, 3);
@@ -3552,7 +3545,7 @@ mod tests {
     #[test]
     fn test_float_list_pop_stays_float_strategy() {
         // AbstractUnwrappedStrategy.pop (listobject.py:1855)
-        let list = w_list_new(vec![
+        let list = float_strategy(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
             crate::floatobject::w_float_new(3.0),
@@ -3572,7 +3565,7 @@ mod tests {
     #[test]
     fn test_float_list_reverse_stays_float_strategy() {
         // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
-        let list = w_list_new(vec![
+        let list = float_strategy(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
         ]);

@@ -11769,16 +11769,16 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
 /// helper residual_call (oopspec `StoreSubscr`, void result).  Ports
 /// `generated_store_subscr_value` → `generated_list_setitem_by_strategy`
-/// for the int- and float-storage list strategies with a non-negative
-/// concrete index and a type-matching value: `guard_class LIST` +
+/// for the object-, int-, and float-storage list strategies with a non-negative
+/// concrete index (and a type-matching value for the unboxed strategies): `guard_class LIST` +
 /// `guard_value(strategy)` + unbox index + `IntLt` bounds guard + unbox
-/// value + `setarrayitem_raw`.
+/// value + the strategy's `setarrayitem_gc`.
 ///
-/// No concrete execution: the recorded `setarrayitem_raw` performs the
+/// No residual execution: the recorded `setarrayitem_gc` performs the
 /// mutation at runtime (the void residual was likewise not walk-executed —
 /// `try_execute_residual_call_via_executor` skips Void results), so the walk's
-/// concrete state is unchanged relative to the generic leg.  Object-storage
-/// lists, long values, strategy mismatches, negative indices, and
+/// concrete state is unchanged relative to the generic leg. Long values,
+/// strategy mismatches, negative indices, and
 /// non-`list[int]` operands fall through to the generic `CALL_MAY_FORCE`
 /// record (`Ok(None)`), preserving Python `__setitem__` semantics.
 pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
@@ -11800,8 +11800,11 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // Gate: list[int] = value, non-negative index in bounds, storage matching
-    // the value type (int storage ← W_IntObject, float storage ← W_FloatObject).
+    // Gate: list[int] = value, non-negative index in bounds. Object storage
+    // accepts every reference; the unboxed strategies additionally require a
+    // matching value type (int storage ← W_IntObject, float storage ←
+    // W_FloatObject). This is jtransform.py `do_resizable_list_setitem`'s
+    // kind=`r` arm, not a separate object-list shortcut.
     let (sid, index, concrete_len) = unsafe {
         // A bool index is fine: bool shares int's `intval`, unboxed below via
         // its own &BOOL_TYPE guard.  A bool *value* into int storage must still
@@ -11823,7 +11826,9 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         if index as usize >= concrete_len {
             return Ok(None);
         }
-        let sid = if pyre_object::w_list_uses_int_storage(list_obj)
+        let sid = if pyre_object::w_list_uses_object_storage(list_obj) {
+            0i64
+        } else if pyre_object::w_list_uses_int_storage(list_obj)
             && pyre_object::is_int(value_obj)
             && !pyre_object::is_bool(value_obj)
         {
@@ -11885,10 +11890,11 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
     // Bounds guard (non-negative index path): IntLt(raw_index, len).
-    let len_descr = if sid == 1 {
-        crate::descr::list_int_items_len_descr()
-    } else {
-        crate::descr::list_float_items_len_descr()
+    let len_descr = match sid {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => unreachable!(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw_index, lenbox]);
@@ -11898,8 +11904,18 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     );
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
 
-    // Unbox the value + setarrayitem.
-    if sid == 1 {
+    // Store the reference directly for ObjectListStrategy; only the typed
+    // strategies unwrap their payload.  The object arm is what keeps Python
+    // 3.14's `lst[i] is value` guarantee while removing the opaque
+    // STORE_SUBSCR helper from hot loops.
+    if sid == 0 {
+        let block = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::list_items_descr(),
+        );
+        crate::state::trace_items_block_setitem_value(ctx.trace_ctx, block, raw_index, value_op);
+    } else if sid == 1 {
         let block = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             list_op,
@@ -11940,8 +11956,9 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
              (strategy/bounds gates above admitted it)"
         );
     };
-    // `w_list_getitem` boxes the displaced int/float; that allocation can
-    // run a minor collection and move the operands, so re-read the
+    // For typed storage `w_list_getitem` boxes the displaced int/float; that
+    // allocation can run a minor collection and move the operands. Object
+    // storage returns its exact existing reference without allocation. Re-read the
     // forwarded refs from the shadow before touching the heap.  (The
     // freshly boxed `displaced` itself cannot move before the journal
     // push roots it — nothing below allocates.)
