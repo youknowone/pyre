@@ -2530,7 +2530,6 @@ pub unsafe fn fdel_func_doc(obj: PyObjectRef) -> Result<(), crate::PyError> {
 const IDTAG_SHIFT: i64 = 4;
 const IDTAG_INT: i64 = 1;
 const IDTAG_FLOAT: i64 = 5;
-const IDTAG_COMPLEX: i64 = 7;
 const IDTAG_SPECIAL: i64 = 11;
 
 #[inline]
@@ -2556,25 +2555,18 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
         if is_exact_type(obj, &FLOAT_TYPE) {
             // `float2longlong(float_w(self))` reinterprets the f64 bits as
             // a signed i64; the same `| IDTAG_FLOAT` == `+ IDTAG_FLOAT`.
-            let bits = pyre_object::floatobject::w_float_get_value(obj).to_bits() as i64;
+            // NaNs use the address uid, matching `is_w`'s pointer identity.
+            let value = pyre_object::floatobject::w_float_get_value(obj);
+            if value.is_nan() {
+                return None;
+            }
+            let bits = value.to_bits() as i64;
             let b = (majit_rlib::rbigint::RBigInt::from(bits) << IDTAG_SHIFT as usize)
                 + majit_rlib::rbigint::RBigInt::from(IDTAG_FLOAT);
             return Some(pyre_object::functional::range_bigint_to_obj(b));
         }
-        if is_exact_type(obj, &COMPLEX_TYPE) {
-            // `(real_b << 64 | imag_b) << IDTAG_SHIFT | IDTAG_COMPLEX`
-            // (complexobject.py:303-314): the real bits are signed
-            // (`float2longlong`), the imag bits unsigned (`r_ulonglong`);
-            // the high/low 64-bit halves don't overlap, so each `|` is a
-            // `+`.
-            let real_bits = pyre_object::complexobject::w_complex_get_real(obj).to_bits() as i64;
-            let imag_bits = pyre_object::complexobject::w_complex_get_imag(obj).to_bits();
-            let combined = (majit_rlib::rbigint::RBigInt::from(real_bits) << 64usize)
-                + majit_rlib::rbigint::RBigInt::from(imag_bits);
-            let b = (combined << IDTAG_SHIFT as usize)
-                + majit_rlib::rbigint::RBigInt::from(IDTAG_COMPLEX);
-            return Some(pyre_object::functional::range_bigint_to_obj(b));
-        }
+        // Unlike PyPy's `complexobject.py:303-314`, CPython 3.14 complex
+        // identity is address-based, so there is no IDTAG_COMPLEX branch.
         if is_exact_type(obj, &TUPLE_TYPE) {
             // `W_AbstractTupleObject.immutable_unique_id`
             // (tupleobject.py:57-62): only the empty tuple is unique-ified

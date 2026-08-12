@@ -8038,6 +8038,16 @@ fn walker_float_cmp_guard<Sym: WalkSym>(
     walker_emit_guard_with_snapshot(ctx, op_pc, guard, &[c])
 }
 
+/// Guard the non-NaN precondition of raw-f64 storage. A class guard alone
+/// admits NaNs; `raw != raw` sends them back to the boxed interpreter path.
+fn walker_guard_float_not_nan<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+) -> Result<(), DispatchError> {
+    walker_float_cmp_guard(ctx, op_pc, OpCode::FloatNe, &[raw, raw], false)
+}
+
 /// Inline trace of `_pow` (floatobject.py, ported as
 /// `float_pow_inner`) for its fast paths: `y == 2.0` (`float_mul`),
 /// `y == 0.0` / `bx == 1.0` (constant result), and the mainstream
@@ -8603,7 +8613,7 @@ enum WalkerStoreAttrSpecialization {
 ///
 /// # Safety
 /// `obj` must be a non-null, untagged heap object.
-unsafe fn walker_exact_builtin_class(
+pub(crate) unsafe fn walker_exact_builtin_class(
     obj: pyre_object::PyObjectRef,
 ) -> Option<pyre_object::PyObjectRef> {
     unsafe {

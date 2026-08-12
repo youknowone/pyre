@@ -3248,8 +3248,17 @@ unsafe fn is_unboxable_int(w_value: PyObjectRef) -> bool {
 /// Float half of `_pick_unbox_type`: PyPy uses
 /// `type(w_value) is space.FloatObjectCls`, so a float subclass must retain
 /// its boxed object and `w_class` too.
-unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
-    if !unsafe { pyre_object::is_float(w_value) } {
+///
+/// NaNs also stay boxed: raw-f64 storage reboxes on read and would lose their
+/// CPython 3.14 pointer identity. Shared with the JIT STORE_ATTR fold and used
+/// for both new and existing unboxed slots.
+///
+/// # Safety
+/// `w_value` must point to a live object.
+pub unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
+    if !unsafe { pyre_object::is_float(w_value) }
+        || unsafe { pyre_object::w_float_get_value(w_value) }.is_nan()
+    {
         return false;
     }
     let exact = crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE);

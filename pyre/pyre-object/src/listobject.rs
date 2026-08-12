@@ -588,8 +588,13 @@ fn all_ints(items: &[PyObjectRef]) -> bool {
 /// containers must retain the original NaN object so `[nan] == [nan]` is true
 /// for one shared object while two freshly-created NaNs still compare false.
 /// Keep NaNs in Object storage; ordinary exact floats retain PyPy's strategy.
+///
+/// Shared with JIT list stores so traced and concrete strategies agree.
+///
+/// # Safety
+/// `item` must be null or point to a live object.
 #[inline]
-unsafe fn is_float_strategy_item(item: PyObjectRef) -> bool {
+pub unsafe fn is_float_strategy_item(item: PyObjectRef) -> bool {
     !item.is_null() && is_plain_float_strict(item) && !w_float_get_value(item).is_nan()
 }
 
@@ -2588,16 +2593,7 @@ pub unsafe fn w_list_find_or_count_fast(
             let mut result: i64 = 0;
             let mut i = start.max(0);
             while i < stop {
-                // `FloatListStrategy._safe_find_or_count`: ordinary floats
-                // compare by value, while NaNs compare by their unwrapped
-                // bit pattern.  The latter preserves the identity shortcut
-                // that `space.eq_w` would observe before the strategy erased
-                // the original W_FloatObject.
-                let matches = if target.is_nan() {
-                    items[i as usize].to_bits() == target.to_bits()
-                } else {
-                    items[i as usize] == target
-                };
+                let matches = items[i as usize] == target;
                 if matches {
                     if count {
                         result += 1;
