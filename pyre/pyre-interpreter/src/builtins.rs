@@ -7603,9 +7603,46 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// which reports the args alone.  It is what `BaseException.__str__(exc)`
 /// runs even when `exc`'s own class registers a `descr_str` override.
 fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
-    let obj = args[0];
-    let text = unsafe { crate::display::base_exception_str_wtf8(obj)? };
-    Ok(pyre_object::w_str_from_wtf8(text))
+    // `W_BaseException.descr_str` reads the internal `args_w` list directly:
+    // no args returns the empty text singleton, one arg returns
+    // `space.str(args_w[0])` unchanged, and several args stringify a fresh
+    // tuple.  In particular, flattening the one-arg result through WTF-8
+    // loses both its identity and its managed lifetime.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[args[0]]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(obj) };
+    let len = if stored.is_null() {
+        0
+    } else if unsafe { pyre_object::is_list(stored) } {
+        unsafe { pyre_object::w_list_len(stored) }
+    } else if unsafe { pyre_object::is_tuple(stored) } {
+        unsafe { pyre_object::w_tuple_len(stored) }
+    } else {
+        0
+    };
+    if len == 0 {
+        return Ok(w_str_new(""));
+    }
+    if len == 1 {
+        let first = if unsafe { pyre_object::is_list(stored) } {
+            unsafe { pyre_object::w_list_getitem(stored, 0) }
+        } else {
+            unsafe { pyre_object::w_tuple_getitem(stored, 0) }
+        }
+        .unwrap_or(pyre_object::PY_NULL);
+        pyre_object::gc_roots::pin_root(first);
+        let first_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        return builtin_str(&[pyre_object::gc_roots::shadow_stack_get(first_slot)]);
+    }
+    let tuple = unsafe {
+        pyre_object::interp_exceptions::w_exception_get_args(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        )
+    };
+    pyre_object::gc_roots::pin_root(tuple);
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    builtin_str(&[pyre_object::gc_roots::shadow_stack_get(tuple_slot)])
 }
 
 /// The `descr_str` of the class that registers one, falling back to
@@ -7613,13 +7650,18 @@ fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
 /// (`KeyError('a', 'b')`, an `OSError` with neither errno nor strerror).
 fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
-    let text = unsafe {
-        match crate::display::exception_kind_str_wtf8(obj)? {
-            Some(s) => s,
-            None => crate::display::base_exception_str_wtf8(obj)?,
-        }
+    let Some(text) = (unsafe { crate::display::exception_kind_str_wtf8(obj)? }) else {
+        // The subclass has no `descr_str` override for this argument shape,
+        // so inherit `W_BaseException.descr_str` as PyPy does.  Calling the
+        // object-returning path matters for one argument: `space.str(arg)`
+        // preserves an exact str's identity instead of flattening it through
+        // WTF-8 and allocating a replacement.
+        return base_exception_str_method(args);
     };
-    Ok(pyre_object::w_str_from_wtf8(text))
+    // A builtin override (KeyError / OSError / UnicodeError / SyntaxError)
+    // constructs a fresh text result.  It is an ordinary GC object, not a
+    // prebuilt constant tied to the descriptor.
+    Ok(pyre_object::w_str_from_wtf8_managed(text))
 }
 
 /// `interp_exceptions.py:135-151 W_BaseException.descr_repr` — every builtin
@@ -9389,11 +9431,16 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // a str subclass is valid and retains its Python class. The WTF-8
         // conversion below is for builtin formatting, where a fresh base str
         // is the appropriate result object.
-        if !obj.is_null()
-            && pyre_object::is_exception(obj)
-            && let Some(r) = crate::display::exc_user_dunder_obj(obj, "__str__")?
-        {
-            return Ok(r);
+        if !obj.is_null() && pyre_object::is_exception(obj) {
+            if let Some(r) = crate::display::exc_user_dunder_obj(obj, "__str__")? {
+                return Ok(r);
+            }
+            // `space.str(w_exc)` invokes the resolved exception descriptor
+            // and returns its object result.  The diagnostic WTF-8 path below
+            // is intentionally value-only; routing builtin `str()` through it
+            // would copy `BaseException.args_w[0]` and break the upstream
+            // `str(ValueError(s)) is s` identity rule.
+            return exception_str_method(&[obj]);
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
