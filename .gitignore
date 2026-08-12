@@ -61,6 +61,7 @@ rpython/rlib/rvmprof/src/shared/libbacktrace/config.h
 rpython/rlib/test/_hacked_rbigint.py
 include/pypy*
 lib/pypy*
+lib/pyre*
 pybuilddir.txt
 pypy/doc/config/*.rst
 pypy/doc/config/*.txt
@@ -69,6 +70,10 @@ site-packages/pip*
 site-packages/setuptools*
 site-packages/pkg_resources*
 site-packages/easy_install.py
+lib-python/3/site-packages/pip*
+lib-python/3/site-packages/setuptools*
+lib-python/3/site-packages/pkg_resources*
+lib-python/3/site-packages/easy_install.py
 bin/pip*
 bin/easy_install*
 lib-python/3/test/data/*.txt
@@ -85,6 +90,7 @@ pyre-dynasm
 # `tools/ubuntu24-*-repro` bind-mounts the worktree, so the container's builds
 # need their own CARGO_TARGET_DIR or they overwrite the host binaries.
 /target-linux
+/dist-assets/
 
 # Build artefacts: Charon binary fetched via scripts/install-charon.py
 /build/
