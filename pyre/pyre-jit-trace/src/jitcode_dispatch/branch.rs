@@ -332,6 +332,79 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
     }
 }
 
+/// Whether some kept operand-stack slot at `target` is held by the walk mirror
+/// as the NULL `ConstPtr` and is recovered by none of the not-taken edge's
+/// decoded `ref_copy` moves.
+///
+/// `collect_outer_active_boxes` accepts a mirror box only when it is neither
+/// `OpRef::NONE` nor the NULL `ConstPtr`, so a slot carrying that encoding is
+/// dropped by the snapshot's own mirror arm and has to be sourced from the
+/// merge-color paths beneath it instead.  Provenance does not change that: the
+/// live-NULL marker (`virtualizable_slot_stored_live_null`) records that
+/// `reseed_vstack_from_shadow` admitted a deliberate `PUSH_NULL` sentinel
+/// rather than a slot the portal never wrote, but the snapshot reader rejects
+/// both alike.  What is left is the edge recovery, and it is per slot: `moves`
+/// is keyed by resume-merge COLOR (`collect_outer_active_boxes` reads
+/// `kept_recovered[color]`), so the question for slot `sem` is whether the
+/// moves name the colors `pcdep_color_slots` maps to `sem`.  A move that
+/// renames some other slot answers nothing about this one, and a slot with no
+/// color at all cannot be named by any move.  Where a slot owns more than one
+/// color the snapshot emits one entry per color, and an unnamed one still falls
+/// through to the merge-color register file, so every color must be named — by
+/// a move carrying a real box.  `resolved_recovered` drops only `OpRef::NONE`,
+/// so a move can hand back the NULL `ConstPtr` itself, which recovers nothing.
+///
+/// This is a strictly narrower state than an uncovered slot in general — a
+/// mirror shorter than the resume depth, and a `NONE` hole, both still resume
+/// through the shadow.
+pub(crate) fn kept_stack_has_unrecovered_null_const_slot(
+    frame: &ActiveResumeFrame,
+    target: usize,
+    vstack_boxes: &[OpRef],
+    moves: &[(u16, OpRef)],
+) -> bool {
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: the depth and pcdep twins are read-only payload tables kept alive
+    // by the frame's `Arc<PyJitCode>`.  Both key on the trivia-folded twin at
+    // `target`, so they cannot land on different resume coordinates.
+    let (depth, pcdep) = unsafe {
+        (
+            pjc.depth_trivia_for_jitcode_pc(target),
+            pjc.pcdep_trivia_for_jitcode_pc(target),
+        )
+    };
+    let Some(depth) = depth.map(|d| d as usize) else {
+        return false;
+    };
+    let stack_base = pjc.metadata.stack_base;
+    (0..depth).any(|s| {
+        let is_null_const = vstack_boxes
+            .get(s)
+            .copied()
+            .is_some_and(opref_is_null_const_ptr);
+        if !is_null_const {
+            return false;
+        }
+        let sem = (stack_base + s) as u16;
+        let mut colors = pcdep
+            .unwrap_or(&[])
+            .iter()
+            .filter(|&&(bank, _, slot)| bank == 1 && slot == sem)
+            .map(|&(_, color, _)| color)
+            .peekable();
+        let recovered = colors.peek().is_some()
+            && colors.all(|color| {
+                moves
+                    .iter()
+                    .any(|&(dst, v)| dst == color && !opref_is_null_const_ptr(v))
+            });
+        !recovered
+    })
+}
+
 /// The resume snapshot's live Ref register colors at a kept-stack branch
 /// guard's not-taken arm, plus the jitcode `num_regs_r` (the const-window
 /// boundary `n()`).  These are exactly the registers the blackhole restores

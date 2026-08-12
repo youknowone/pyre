@@ -2358,13 +2358,7 @@ pub enum DispatchError {
     /// (`pyjitpl.rs` opimpl_recursive_call_assembler).  Surface a typed
     /// abort so the key interprets without JIT (`FBW_DECLINED_KEYS`) until
     /// the walker itself covers loop-callee inlining.
-    LoopBearingCalleeInlineUnsupported {
-        pc: usize,
-        /// The decline stopped before the next residual executed with a
-        /// complete MIFrame image.  RPython converts that whole frame stack
-        /// and runs forward; rewinding an outer CALL would repeat effects.
-        blackhole_required: bool,
-    },
+    LoopBearingCalleeInlineUnsupported { pc: usize },
     /// An in-flight FOR_ITER body executed a non-journalable
     /// in-place builtin-container mutation (`acc += delta` for an object-/float-
     /// strategy list, `bytearray`, `set`, `dict`, …).  The abort rollback cannot
@@ -2553,10 +2547,6 @@ impl DispatchError {
                 | Self::InlineCallArityMismatch { .. }
                 | Self::InlineCallIntArityMismatch { .. }
                 | Self::InlineCallFloatArityMismatch { .. }
-                | Self::LoopBearingCalleeInlineUnsupported {
-                    blackhole_required: true,
-                    ..
-                }
                 // The direct counterpart of `pyjitpl.py:1116`
                 // `raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)`:
                 // taken with the registers bound, after `do_force_quasi_immutable`
@@ -2579,21 +2569,7 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::LoopBearingCalleeInlineUnsupported {
-            pc,
-            blackhole_required: false,
-        }
-    }
-
-    /// The nested residual-decline arm has proved that the current operation
-    /// has not run and that the MIFrame banks are complete.  Preserve each
-    /// inlined frame and continue through the blackhole, as
-    /// `convert_and_run_from_pyjitpl` does in RPython.
-    pub(crate) fn callee_inline_blackhole_required(pc: usize) -> Self {
-        Self::LoopBearingCalleeInlineUnsupported {
-            pc,
-            blackhole_required: true,
-        }
+        Self::LoopBearingCalleeInlineUnsupported { pc }
     }
 }
 
@@ -2972,10 +2948,7 @@ pub fn walk<Sym: WalkSym>(
                 let carrier_owned = matches!(
                     error,
                     DispatchError::AbortPermanentMarkerReached { .. }
-                        | DispatchError::LoopBearingCalleeInlineUnsupported {
-                            blackhole_required: false,
-                            ..
-                        }
+                        | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
                 );
                 // Kept in lockstep with the epilogue's own gate: an abort that
                 // reports a MISSING value cannot be converted, because the
@@ -5279,13 +5252,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             ) {
                 if sem >= nlocals {
                     let m = mirror.get(sem - nlocals).copied().unwrap_or(OpRef::NONE);
-                    // The walk-level mirror is a sparse, per-opcode value
-                    // source.  A present CONST_NULL is therefore an actual
-                    // PUSH_NULL/self_or_null operand, not the dense vable
-                    // shadow's "slot was never written" encoding.  PyPy's
-                    // MIFrame registers preserve CONST_NULL in snapshots;
-                    // keep it here as well.  Only OpRef::NONE is a hole.
-                    if m != OpRef::NONE {
+                    if m != OpRef::NONE && !opref_is_null_const_ptr(m) {
                         active.push(m);
                         continue;
                     }
@@ -9407,7 +9374,7 @@ fn guarded_branch_core<Sym: WalkSym>(
         // Mirror-sourced kept-stack compile: a kept-stack guard
         // COMPILES whenever the walk-level operand-stack mirror
         // (`ctx.vstack_boxes`) covers EVERY kept resume slot
-        // `0..resume_depth` with a non-NONE box — i.e. the
+        // `0..resume_depth` with a non-NONE, non-NULL box — i.e. the
         // snapshot is 100% mirror-sourced with no legacy fallback.  This
         // bypasses the kept-stack declines below (whose purpose is
         // precisely the unreliable legacy resume the mirror replaces).
@@ -9429,7 +9396,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                     ctx.vstack_boxes
                         .get(s as usize)
                         .copied()
-                        .is_some_and(|b| b != OpRef::NONE)
+                        .is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b))
                 })
             });
         // `branch_resume_target_stack_depth` reads
@@ -9598,6 +9565,45 @@ fn guarded_branch_core<Sym: WalkSym>(
                 && gate_frame.as_ref().is_some_and(|f| {
                     kept_stack_has_boxed_int_hazard(f, other_target, ctx.concrete_registers_r)
                 });
+            // Hazard (4): a VALID mirror holds a kept operand-stack slot as
+            // the NULL `ConstPtr` and the not-taken edge recovers no value
+            // for that slot.  Hazards (1)-(3) admit an uncovered slot on the
+            // premise that it is an edge-materialized merge temp whose value
+            // `resolved_recovered` supplies; a NULL `ConstPtr` is the one
+            // uncovered state the snapshot's own mirror arm drops outright
+            // (`collect_outer_active_boxes` takes a mirror box only when it
+            // is neither `NONE` nor the NULL `ConstPtr`), so with no move
+            // naming that slot it has no source at all and the resume rebuilds
+            // the whole not-taken arm from the merge-color file.  What arrives
+            // wrong there is not the sentinel: `re/_parser.py` `_parse_sub`
+            // evaluates `not nested and not items` inside `_parse`'s argument
+            // list, so both calls' `PUSH_NULL` slots are kept across the
+            // short-circuit guard and `nested + 1` — an ordinary argument on
+            // the same kept stack — resumes NULL, which `match_signature`
+            // then reports as a missing positional parameter.  The NULL slots
+            // are the shape's signature, and declining on them is what keeps
+            // the decline narrow: a mirror shorter than the resume depth, and
+            // a `NONE` hole, both still resume through the shadow and must
+            // keep compiling — declining for those instead loses every bridge
+            // in `bench/synth/attr_cache_invalidation` and turns its 1002
+            // guard failures into 4 million.  `bhimpl_goto_if_not` has no
+            // analogue: `consume_boxes` (resume.py) restores every register
+            // bank by color, which is why suppressing bridge recording
+            // (`MAJIT_NO_BRIDGE`) makes the same guard correct.
+            //
+            // The recovery test is per slot: a trampoline that renames some
+            // other slot says nothing about this one.  An edge whose moves
+            // could not be decoded at all (`resolved_recovered` is `None`)
+            // recovers nothing by definition, so it declines.
+            let kept_null_const_slot = ctx.vstack_valid
+                && gate_frame.as_ref().is_some_and(|f| {
+                    kept_stack_has_unrecovered_null_const_slot(
+                        f,
+                        other_target,
+                        &ctx.vstack_boxes,
+                        resolved_recovered.as_deref().unwrap_or(&[]),
+                    )
+                });
             // A not-taken arm resuming at an exception-handler-protected
             // PC carries the kept exception operand (`PUSH_EXC_INFO`'s
             // Ref) on its operand stack; the handler-entry mirror reseed
@@ -9605,7 +9611,7 @@ fn guarded_branch_core<Sym: WalkSym>(
             // whole block out), and where the mirror still does not cover,
             // that kept Ref always also trips Hazard (1)/(2)/(3) — so the
             // exc-region case needs no decline of its own.
-            if reads_null_ref || uses_edge_recovery || kept_boxed_int {
+            if reads_null_ref || uses_edge_recovery || kept_boxed_int || kept_null_const_slot {
                 // Attribute the kept-stack decline to the hazard that
                 // fired and the mirror state behind it, so a corpus run
                 // (`PYRE_FBW_DEBUG_ABORT`) can separate the distinct
@@ -9619,7 +9625,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                         "[decline-why] PERMANENT pc={} other_target={} vstack_valid={} \
                          subwalk={} mirror_covers_kept={} depth_gt_1={} kept_stack={} \
                          kept_stack_any_leg={} reads_null_ref={} uses_edge_recovery={} \
-                         kept_boxed_int={} \
+                         kept_boxed_int={} kept_null_const_slot={} \
                          kept_recovered_nonempty={}",
                         op.pc,
                         other_target,
@@ -9632,6 +9638,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                         reads_null_ref,
                         uses_edge_recovery,
                         kept_boxed_int,
+                        kept_null_const_slot,
                         kept_recovered.as_deref().is_some_and(|m| !m.is_empty()),
                     );
                 }
