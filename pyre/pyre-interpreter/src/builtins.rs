@@ -7627,7 +7627,9 @@ fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
 /// alone and reads the receiver's own class name.
 fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
-    Ok(pyre_object::w_str_from_wtf8(unsafe {
+    // W_BaseException.descr_repr returns `space.newtext(clsname + args_repr)`
+    // for the zero-, one-, and multi-argument forms.
+    Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
         crate::display::py_repr_wtf8(obj)?
     }))
 }
