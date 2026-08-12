@@ -295,6 +295,58 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
     })
 }
 
+/// Rebuild frame 0's post-CALL operand stack from the exact caller image
+/// captured when the first inline level was pushed.
+///
+/// RPython keeps this stack in the root `MIFrame.registers_r` while its callee
+/// frames are paused above it.  Pyre's live `PyFrame` is still parked at the
+/// outer loop header, so the multi-frame blackhole adopter must publish the
+/// paused caller image before it drives those frames.  Every pre-existing
+/// stack slot comes from `call_stack_overrides`; the top result slot is left
+/// null because `drive_multi_frame_blackhole` writes it when the callee returns.
+fn capture_root_parent_resume_stack<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<MirrorStackImage> {
+    let session = ctx.session.borrow();
+    let parent = session.framestack.first()?.parent.as_ref()?;
+    let call_jit_pc = parent.call_jitcode_pc?;
+    let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)?;
+    if pjc.code_ptr.is_null() {
+        return None;
+    }
+    let resume_py_pc = resolve_parent_resume_py_pc(parent)? as usize;
+    let depth = crate::liveness::liveness_for(pjc.code_ptr)
+        .depth_at_py_pc()
+        .get(resume_py_pc)
+        .copied()? as usize;
+    // `MIFrame`'s operand stack starts after locals *and* cell/freevar
+    // entries (`pyframe.py:111`).  `call_stack_overrides` uses that same
+    // semantic slot space through `caller_sym.nlocals()`; using only
+    // `varnames` here would shift every closure caller's paused stack into
+    // its cells when the multi-frame blackhole image is adopted.
+    let code = unsafe { &*pjc.code_ptr };
+    let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
+    let result_bank = call.argcodes.chars().last()?;
+    let result_slot = (result_bank != 'v' && depth != 0).then_some(nlocals + depth - 1);
+    let mut slots = Vec::with_capacity(depth);
+    for slot in nlocals..nlocals + depth {
+        if result_slot == Some(slot) {
+            slots.push(pyre_object::PY_NULL);
+            continue;
+        }
+        let value = parent
+            .call_stack_overrides
+            .iter()
+            .find_map(|&(candidate, value)| (candidate == slot).then_some(value))?;
+        slots.push(value);
+    }
+    Some(MirrorStackImage {
+        py_pc: resume_py_pc,
+        slots,
+    })
+}
+
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -411,15 +463,11 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 last_exc_value,
                 raising_exception: false,
                 publish_root_stack: true,
-                // `ctx` is the INNERMOST callee here, so its mirror describes
-                // that callee, not frame 0 whose stack the adopter publishes.
-                // Frame 0's own stack is recorded per level in
-                // `InlineParentFrame::call_stack_overrides`, but sparsely (only
-                // the slots the caller CALL touched), so it cannot stand in for
-                // a complete image.  Left `None`: the `WalkAbort` adopt then
-                // declines and the abort keeps the legacy entry replay, which
-                // is exactly the pre-leg behaviour.
-                mirror_stack: None,
+                // `ctx` is the innermost callee, so its ordinary vstack mirror
+                // names the wrong frame.  Reconstruct frame 0 from the paused
+                // caller image captured at the outermost inline push, exactly
+                // where RPython keeps that root MIFrame's register bank.
+                mirror_stack: capture_root_parent_resume_stack(ctx),
             });
         });
         true
