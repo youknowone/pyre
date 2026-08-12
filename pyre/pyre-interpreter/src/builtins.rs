@@ -5274,8 +5274,7 @@ fn min_max_multiple_args(
     Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
-/// typeobject.py:886 `descr__new__` — `type.__new__(metatype, name, bases, dict)`
-/// and its one-argument form `type(obj)`.
+/// CPython 3.14 `type_new` — `type.__new__(metatype, name, bases, dict)`.
 ///
 /// `descr__new__(space, w_typetype, __args__)` takes the metatype as its own
 /// gateway parameter and everything behind it as `__args__`, so `pos[0]` is the
@@ -5293,85 +5292,48 @@ pub(crate) fn type_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // dict (the builtin kwargs ABI); strip it before the arity check and
     // hand it to __init_subclass__ via `type_descr_new_with_metaclass`.
     let (pos, kwargs) = split_builtin_kwargs(args);
-    // The gateway supplies `w_typetype` from a declared parameter, so this
-    // shape is refused by the argument parser and never reaches
-    // `descr__new__`.  pyre reads the metatype out of the same flat slice and
-    // has to word that refusal itself — in the parser's words, which is the
-    // one message here that is not `descr__new__`'s own.
+    // `type_new` receives the metatype separately from the tuple parsed by
+    // `PyArg_ParseTuple`.  Pyre's flat builtin ABI has to reproduce the
+    // descriptor gateway's missing-metatype refusal before splitting it out.
     if pos.is_empty() {
         return Err(crate::PyError::type_error(
-            "type.__new__() missing 1 required positional argument: 'typetype'",
+            "type.__new__(): not enough arguments",
         ));
     }
 
     let w_typetype = pos[0];
     let arguments_w = &pos[1..];
-    // The count decides the form before any argument is read; `w_typetype` is
-    // touched only to word the refusal, which is why `_precheck_for_new` runs
-    // after it and not before.
-    if arguments_w.len() != 1 && arguments_w.len() != 3 {
-        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
-    }
-
+    // `type_new` is entered only after `tp_new_wrapper` has established that
+    // the first argument is a type.  This check therefore precedes parsing
+    // `(name, bases, dict)`, regardless of that tuple's arity.
     precheck_for_new(w_typetype)?;
-    if arguments_w.len() == 1 {
-        // typeobject.py:901-908 — the one-argument form belongs to `type`
-        // alone: `type(x)` reports the type of `x`, while `Metaclass(x)` is a
-        // class statement missing its bases and its namespace.
-        if unsafe { std::ptr::eq(w_typetype, crate::typedef::w_type()) } {
-            return type_descr_new_without_metaclass(arguments_w, kwargs);
-        }
-        return Err(crate::PyError::type_error(new_arity_message(w_typetype)));
+    if arguments_w.len() != 3 {
+        return Err(crate::PyError::type_error(new_arity_message(
+            arguments_w.len(),
+        )));
     }
 
     type_descr_new_with_metaclass(arguments_w, w_typetype, kwargs)
 }
-/// typeobject.py:888-895 `descr__new__` — the wording for a `type.__new__`
-/// call whose argument count is neither one nor three.  `type` itself names
-/// both accepted counts; any other metatype names only the three-argument
-/// form, under the count upstream writes as a literal.
-fn new_arity_message(w_metatype: PyObjectRef) -> String {
-    if unsafe { std::ptr::eq(w_metatype, crate::typedef::w_type()) } {
-        return "type.__new__() takes 1 or 3 arguments".to_string();
-    }
-    let name = type_new_getname(w_metatype);
-    format!("{name}.__new__() takes exactly 3 arguments (1 given)")
+/// Python 3.14 `type_new`: the inherited slot keeps the defining type's name
+/// in its error, even when invoked through a metaclass subclass.  PyPy 3.11's
+/// `descr__new__` instead interpolates that subclass (`M.__new__`), but the
+/// project's version target is 3.14.
+fn new_arity_message(given: usize) -> String {
+    format!("type.__new__() takes exactly 3 arguments ({given} given)")
 }
 
-/// typeobject.py:1001-1003 `_precheck_for_new` — the metatype must be a type
-/// before anything reads it as one.  It runs after the arity decision and
-/// before the one-argument form is resolved.
+/// CPython 3.14 `tp_new_wrapper` — the metatype must be a type before
+/// `type_new` parses its three construction arguments.
 fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_type(w_type) } {
         Ok(())
     } else {
         let type_name = crate::baseobjspace::object_functionstr_type_name(w_type);
         Err(crate::PyError::type_error(format!(
-            "X is not a type object ({type_name})"
+            "type.__new__(X): X is not a type object ({type_name})"
         )))
     }
-}
-
-/// `W_Root.getname` (baseobjspace.py:90-94), the `%N` operand spelling: a type
-/// reports its own name, any other object reports its `__name__` attribute,
-/// and a failed lookup reports `?`.  The arity message reaches this with an
-/// unvalidated metatype, so it must not read one through the type layout.
-fn type_new_getname(w_obj: PyObjectRef) -> String {
-    if unsafe { pyre_object::is_type(w_obj) } {
-        return unsafe { pyre_object::w_type_get_name(w_obj) }.to_string();
-    }
-    match crate::baseobjspace::getattr_str(w_obj, "__name__").and_then(crate::baseobjspace::utf8_w)
-    {
-        Ok(name) => name.to_string(),
-        Err(_) => "?".to_string(),
-    }
-}
-
-fn type_descr_new_without_metaclass(
-    args: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    type_descr_new_with_metaclass(args, pyre_object::PY_NULL, kwargs)
 }
 
 /// typeobject.py:141 `_check_surrogate` — a type name may not contain a
@@ -5495,9 +5457,6 @@ fn type_descr_new_with_metaclass(
     w_metaclass: PyObjectRef,
     kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 1 && args.len() != 3 {
-        return Err(crate::PyError::type_error("type() takes 1 or 3 arguments"));
-    }
     // type(name, bases, dict) — 3-arg form creates a new type
     // PyPy: typeobject.py type.__new__(metatype, name, bases, dict)
     if args.len() == 3 {
@@ -5892,20 +5851,22 @@ fn type_descr_new_with_metaclass(
         return Ok(w_type);
     }
 
-    // type(obj) — 1-arg form returns the type
-    // PyPy objspace.py:400: space.type(w_obj) → w_obj.getclass(space)
-    // typedef::type() respects __class__ override for all object kinds.
-    let obj = args[0];
+    unreachable!("type.__new__ argument count was checked by type_descr_new")
+}
+
+/// CPython 3.14 `type_call` / `type_vectorcall` one-argument fast path.
+/// This deliberately does not belong to `type_descr_new`: a direct
+/// `type.__new__(type, obj)` must still require `(name, bases, dict)`.
+pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
+    // `typedef::type()` respects __class__ overrides for all object kinds.
     if let Some(tp) = crate::typedef::r#type(obj) {
-        return Ok(tp.as_ptr());
+        return tp.as_ptr();
     }
     if obj.is_null() {
-        return Ok(crate::typedef::gettypeobject(
-            &pyre_object::pyobject::NONE_TYPE,
-        ));
+        return crate::typedef::gettypeobject(&pyre_object::pyobject::NONE_TYPE);
     }
     let name = unsafe { (*(*obj).ob_type).name };
-    Ok(box_str_constant(rustpython_wtf8::Wtf8::new(name)))
+    box_str_constant(rustpython_wtf8::Wtf8::new(name))
 }
 
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py

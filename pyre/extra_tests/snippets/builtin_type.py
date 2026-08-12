@@ -86,6 +86,31 @@ class A(type):
     pass
 
 
+class MetaOfMeta(type, metaclass=A):
+    pass
+
+
+for metaclass in (A, MetaOfMeta):
+    with assert_raises(TypeError) as raised:
+        metaclass(5)
+    assert str(raised.exception) == "type.__new__() takes exactly 3 arguments (1 given)"
+
+
+for args, message in (
+    ((), "type.__new__(): not enough arguments"),
+    ((type,), "type.__new__() takes exactly 3 arguments (0 given)"),
+    ((type, 5), "type.__new__() takes exactly 3 arguments (1 given)"),
+    ((type, 1, 2), "type.__new__() takes exactly 3 arguments (2 given)"),
+):
+    with assert_raises(TypeError) as raised:
+        type.__new__(*args)
+    assert str(raised.exception) == message
+
+with assert_raises(TypeError) as raised:
+    type.__new__(5)
+assert str(raised.exception) == "type.__new__(X): X is not a type object (int)"
+
+
 class B(type):
     __module__ = "b"
     __qualname__ = "BB"
