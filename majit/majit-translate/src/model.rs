@@ -2972,6 +2972,60 @@ pub fn fuse_boxing_alloc(
                 _ => None,
             })
     }
+    /// The op-result variables `var` can be, following the links when `var` is
+    /// a `Block.inputargs` phi rather than an op result.
+    ///
+    /// A field store is recorded against the variable the producing operation
+    /// wrote, so a header value that crosses a block boundary — each preceding
+    /// call ends a block — leaves its `ob_type` / `w_class` stores behind on
+    /// the predecessor's variable, and a bare `base == var` lookup on the phi
+    /// finds nothing. Collecting the roots first puts the lookup back on the
+    /// variable the stores actually name. Every root is then required to agree,
+    /// exactly as `resolve_addr` requires of a merged pointer. `depth` bounds
+    /// the walk so a loop-carried phi whose own link arg is itself terminates.
+    fn store_roots(
+        graph: &FunctionGraph,
+        var: &Variable,
+        depth: u32,
+        out: &mut Vec<Variable>,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        if graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .any(|o| o.result.as_ref() == Some(var))
+        {
+            out.push(var.clone());
+            return true;
+        }
+        let Some((target_id, slot)) = graph.blocks.iter().find_map(|b| {
+            b.inputargs
+                .iter()
+                .position(|arg| arg == var)
+                .map(|slot| (b.id, slot))
+        }) else {
+            return false;
+        };
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != target_id {
+                    continue;
+                }
+                // A link whose arity does not cover the slot is a malformed
+                // edge; refuse rather than read past it.
+                let Some(arg) = link.args.get(slot).and_then(LinkArg::as_variable) else {
+                    return false;
+                };
+                if !store_roots(graph, arg, depth - 1, out) {
+                    return false;
+                }
+            }
+        }
+        !out.is_empty()
+    }
     /// Resolve `var` to the constant address `terminal` reads off its producer.
     ///
     /// The walk itself is shared by every header spelling: it steps through
@@ -3086,19 +3140,31 @@ pub fn fuse_boxing_alloc(
         let Some(header) = store_value(graph, agg, "ob_header") else {
             return 0;
         };
-        let Some(vtable) = store_value(graph, &header, "ob_type")
-            .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
-        else {
-            return 0;
-        };
-        let w_class_value = store_value(graph, &header, "w_class");
-        let w_class = w_class_value
-            .as_ref()
-            .and_then(|value| get_instantiate_arg_addr(graph, value, 8));
-        if w_class != Some(vtable) {
+        let mut roots = Vec::new();
+        if !store_roots(graph, &header, 8, &mut roots) {
             return 0;
         }
-        vtable
+        let mut resolved: Option<i64> = None;
+        for root in &roots {
+            let Some(vtable) = store_value(graph, root, "ob_type")
+                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
+            else {
+                return 0;
+            };
+            let w_class = store_value(graph, root, "w_class")
+                .and_then(|value| get_instantiate_arg_addr(graph, &value, 8));
+            if w_class != Some(vtable) {
+                return 0;
+            }
+            match resolved {
+                None => resolved = Some(vtable),
+                Some(seen) if seen == vtable => {}
+                // Predecessors building headers for different types merge into
+                // one malloc: no single vtable stands for the whole cluster.
+                Some(_) => return 0,
+            }
+        }
+        resolved.unwrap_or(0)
     };
 
     struct Payload {
@@ -7276,6 +7342,205 @@ mod tests {
                 residual,
                 expected == 0,
                 "{feed}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_resolves_a_header_that_crosses_a_link() {
+        // Here the *header itself* crosses the boundary, not just the two
+        // values it stores.  That is the shape every constructor with a
+        // preceding call leaves behind — the `PyObject` ctor and its
+        // `ob_type` / `w_class` stores stay in the predecessor while the
+        // header arrives at the `malloc_typed` as a `Block.inputargs` phi.  A
+        // field store is recorded against the variable the producing
+        // operation wrote, so asking the phi for `ob_type` finds nothing and
+        // the cluster declines however constant its type pointer is; the
+        // lookup has to resolve the phi back to its roots first.  Roots
+        // reached through a merge must agree, for the reason `resolve_addr`
+        // requires it of a merged pointer: no single vtable stands for a
+        // header that is one of two types.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        fn ctor(graph: &mut FunctionGraph, blk: BlockId, name: &str) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(name),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some(name.into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        /// The nested `PyObject` header, built entirely in `blk`.
+        fn header_in(graph: &mut FunctionGraph, blk: BlockId, addr: i64) -> Var {
+            let cast = |graph: &mut FunctionGraph| {
+                let ty = graph
+                    .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
+                    .unwrap();
+                call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![ty])
+            };
+            let ob_type = cast(graph);
+            let w_class_cast = cast(graph);
+            let w_class = call(
+                graph,
+                blk,
+                &["pyre_object", "pyobject", "get_instantiate"],
+                vec![w_class_cast],
+            );
+            let header = ctor(graph, blk, "PyObject");
+            graph.push_op_var(blk, field(&header, "ob_type", "PyObject", &ob_type), false);
+            graph.push_op_var(blk, field(&header, "w_class", "PyObject", &w_class), false);
+            header
+        }
+        /// The outer object and its `malloc_typed`, taking `header` from
+        /// wherever it was built.
+        fn outer_in(graph: &mut FunctionGraph, blk: BlockId, header: &Var) {
+            let payload = graph
+                .push_op_var(blk, OpKind::ConstFloat(0.0f64.to_bits()), true)
+                .unwrap();
+            let agg = ctor(graph, blk, "W_FloatObject");
+            graph.push_op_var(
+                blk,
+                field(&agg, "ob_header", "W_FloatObject", header),
+                false,
+            );
+            graph.push_op_var(
+                blk,
+                field(&agg, "floatval", "W_FloatObject", &payload),
+                false,
+            );
+            let ret = call(
+                graph,
+                blk,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![agg],
+            );
+            graph.set_return(blk, Some(ret));
+        }
+
+        /// The header built once, then relayed across `crossings` blocks
+        /// before the object that stores it — a run of calls before the
+        /// allocation leaves exactly this.
+        fn chain(crossings: usize) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let mut carried = vec![header_in(&mut graph, entry, FLOAT_TYPE_ADDR)];
+            let mut from = entry;
+            for _ in 0..crossings {
+                let (next, args) = graph.create_block_with_arg_vars(1);
+                graph.set_goto(from, next, carried);
+                carried = args;
+                from = next;
+            }
+            outer_in(&mut graph, from, &carried[0]);
+            graph
+        }
+        /// Two predecessors each building their own header, and the object
+        /// storing whichever one the merge carried.
+        fn merge(left_addr: i64, right_addr: i64) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let cond = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+            let (join, carried) = graph.create_block_with_arg_vars(1);
+            let arms: Vec<Link> = [(true, left_addr), (false, right_addr)]
+                .into_iter()
+                .map(|(case, addr)| {
+                    let arm = graph.create_block();
+                    let header = header_in(&mut graph, arm, addr);
+                    graph.set_goto(arm, join, vec![header]);
+                    Link::from_variables(&graph, vec![], arm, Some(ExitCase::Bool(case)))
+                })
+                .collect();
+            graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+            graph.closeblock(entry, arms);
+            outer_in(&mut graph, join, &carried[0]);
+            graph
+        }
+
+        let rows: [(&str, &dyn Fn() -> FunctionGraph, usize); 4] = [
+            ("header crosses one link", &|| chain(1), 1),
+            ("header crosses two links", &|| chain(2), 1),
+            (
+                "merged headers naming one type",
+                &|| merge(FLOAT_TYPE_ADDR, FLOAT_TYPE_ADDR),
+                1,
+            ),
+            (
+                "merged headers naming two types",
+                &|| merge(FLOAT_TYPE_ADDR, OTHER_TYPE_ADDR),
+                0,
+            ),
+        ];
+        for (shape, build, expected) in rows {
+            let mut graph = build();
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+                expected,
+                "{shape}: wrong number of fused clusters"
+            );
+            let vtables: Vec<i64> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                    _ => None,
+                })
+                .collect();
+            // Naming the address separates a walk that reached the header's
+            // own roots from one that read some other constant in the graph.
+            let expected_vtables = if expected == 0 {
+                Vec::new()
+            } else {
+                vec![FLOAT_TYPE_ADDR]
+            };
+            assert_eq!(vtables, expected_vtables, "{shape}: wrong vtable stamped");
+            let residual = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{shape}: malloc_typed residual must survive exactly when the cluster declines"
             );
         }
     }
