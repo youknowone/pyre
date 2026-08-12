@@ -7177,15 +7177,29 @@ impl PyreJitState {
         concrete_nlocals(self.frame).unwrap_or(0)
     }
 
-    pub fn set_local_at(&mut self, idx: usize, value: PyObjectRef) -> bool {
+    /// Store one absolute slot of `locals_cells_stack_w` and re-arm the write
+    /// barrier, as `store_live_frame_array_slot` and `write_back_outer_locals`
+    /// do for the same array: the callers box Int/Float slots in a loop, so the
+    /// next iteration can allocate, and each minor consumes the array's
+    /// remembered-set entry.
+    fn set_array_slot_at(&mut self, abs: usize, value: PyObjectRef) -> bool {
+        let Some(frame) = self.frame_ptr() else {
+            return false;
+        };
         let Some(arr) = self.locals_cells_stack_array_mut() else {
             return false;
         };
-        let Some(slot) = arr.as_mut_slice().get_mut(idx) else {
+        let arr_ptr = arr as *mut pyre_object::FixedObjectArray;
+        let Some(slot) = arr.as_mut_slice().get_mut(abs) else {
             return false;
         };
         *slot = value;
+        frame_array_write_barrier(frame, arr_ptr);
         true
+    }
+
+    pub fn set_local_at(&mut self, idx: usize, value: PyObjectRef) -> bool {
+        self.set_array_slot_at(idx, value)
     }
 
     /// Read a stack value at stack-relative index `idx` (0-based from stack bottom).
@@ -7205,14 +7219,7 @@ impl PyreJitState {
     /// Set a stack value at stack-relative index `idx`.
     pub fn set_stack_at(&mut self, idx: usize, value: PyObjectRef) -> bool {
         let nlocals = self.local_count();
-        let Some(arr) = self.locals_cells_stack_array_mut() else {
-            return false;
-        };
-        let Some(slot) = arr.as_mut_slice().get_mut(nlocals + idx) else {
-            return false;
-        };
-        *slot = value;
-        true
+        self.set_array_slot_at(nlocals + idx, value)
     }
 
     // ── Heap accessors: single source of truth (RPython parity) ──
