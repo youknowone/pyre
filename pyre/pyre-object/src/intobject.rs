@@ -109,6 +109,22 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
 /// returns the pre-allocated entry; outside the range we allocate
 /// (`instantiate(W_IntObject)` upstream).
 ///
+/// Upstream's two arms then join on a shared `w_res.intval = x`
+/// (`intobject.py:917-921`) which rewrites the payload of a *prebuilt* entry
+/// too. `PREBUILT[x - lower]` already holds `x`, so that store changes no
+/// value; its own comment calls it "an obscure hack to help the CPU cache",
+/// there to pull the field into cache before the caller reads it. The
+/// prebuilt arm here returns without it, and cannot currently spell it: the
+/// pointer is derived from `&SMALL_INTS.0[idx]`, so writing through it is
+/// undefined rather than merely racy; the `unsafe impl Sync for PrebuiltInts`
+/// above rests on those entries staying immutable for process lifetime, which
+/// a store would break for concurrent callers; and `intval` is published to
+/// the JIT as an immutable field descr, which licenses the optimizer to drop
+/// the store in the traced arm anyway. Spelling it faithfully needs the
+/// payload behind an `UnsafeCell` and `intval` no longer described as
+/// immutable — until then the omission costs a cache hint and no semantics,
+/// and the arm is unreachable while `WITHPREBUILTINT` is false.
+///
 /// Traced, not residualised, and `#[inline]` — `wrapint` carries no
 /// `@dont_look_inside` and its own comment reads "this whole function is
 /// getting inlined into every caller so keeping the branching to a minimum
