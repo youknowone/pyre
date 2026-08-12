@@ -1171,15 +1171,14 @@ impl Bookkeeper {
             let mut classdef_mut = classdef.borrow_mut();
             let trace_class_name =
                 crate::determinism_trace_enabled().then(|| classdef_mut.name.clone());
-            if let Some(attrdef) = classdef_mut.attrs.get_mut(attrname) {
-                if attrdef.read_locations.insert(pk) {
-                    if let Some(class_name) = trace_class_name {
-                        eprintln!(
-                            "[DTRACE-ATTR] record_getattr class={class_name} attr={attrname} nloc={}",
-                            attrdef.read_locations.len()
-                        );
-                    }
-                }
+            if let Some(attrdef) = classdef_mut.attrs.get_mut(attrname)
+                && attrdef.read_locations.insert(pk)
+                && let Some(class_name) = trace_class_name
+            {
+                eprintln!(
+                    "[DTRACE-ATTR] record_getattr class={class_name} attr={attrname} nloc={}",
+                    attrdef.read_locations.len()
+                );
             }
         }
         Ok(())
