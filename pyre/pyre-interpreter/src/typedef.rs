@@ -15014,7 +15014,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                     let name = crate::function::function_get_name(function);
                     let owner = crate::function::fget_func_objclass(function)?;
                     let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new(&format!(
+                    Ok(pyre_object::w_str_new_managed(&format!(
                         "<method '{name}' of '{owner_name}' objects>"
                     )))
                 },
