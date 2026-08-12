@@ -3366,24 +3366,52 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
         return err;
     }
     unsafe {
-        let mut tb = w_exception_get_traceback(exc);
-        while !tb.is_null() && !is_none(tb) {
+        use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len,
+                                    shadow_stack_set};
+
+        // `code_get_field` realises `co_filename`, which allocates and can
+        // therefore collect.  A traceback node emitted by compiled code is
+        // nursery-resident, so a collection moves it and a raw cursor carried
+        // across the call would name reclaimed memory — both when the walk
+        // steps to `w_next` and when the survivor is republished below.  Keep
+        // the cursor in a root slot and re-read it after every call that can
+        // allocate, the discipline `write_traceback_chain` already follows for
+        // its own walk.
+        let _roots = push_roots();
+        let exc_slot = shadow_stack_len();
+        pin_root(exc);
+        let tb_slot = shadow_stack_len();
+        pin_root(w_exception_get_traceback(exc));
+        let code_slot = shadow_stack_len();
+        pin_root(pyre_object::PY_NULL);
+        loop {
+            let tb = shadow_stack_get(tb_slot);
+            if tb.is_null() || is_none(tb) {
+                break;
+            }
             let w_code = crate::pytraceback::w_pytraceback_get_w_code(tb);
-            let is_bootstrap = !w_code.is_null()
-                && crate::pycode::code_get_field(w_code, "co_filename")
-                    .ok()
-                    .filter(|f| pyre_object::is_str(*f))
-                    // A module imported from a path with no UTF-8 spelling
-                    // carries a surrogate escape in `co_filename`; it is not
-                    // one of the bootstrap names either way.
-                    .and_then(|f| pyre_object::w_str_get_value_opt(f))
-                    .is_some_and(is_bootstrap_filename);
+            if w_code.is_null() {
+                break;
+            }
+            shadow_stack_set(code_slot, w_code);
+            let is_bootstrap = crate::pycode::code_get_field(
+                shadow_stack_get(code_slot),
+                "co_filename",
+            )
+            .ok()
+            .filter(|f| pyre_object::is_str(*f))
+            // A module imported from a path with no UTF-8 spelling carries a
+            // surrogate escape in `co_filename`; it is not one of the
+            // bootstrap names either way.
+            .and_then(|f| pyre_object::w_str_get_value_opt(f))
+            .is_some_and(is_bootstrap_filename);
             if !is_bootstrap {
                 break;
             }
-            tb = crate::pytraceback::w_pytraceback_get_w_next(tb);
+            let tb = shadow_stack_get(tb_slot);
+            shadow_stack_set(tb_slot, crate::pytraceback::w_pytraceback_get_w_next(tb));
         }
-        w_exception_set_traceback(exc, tb);
+        w_exception_set_traceback(shadow_stack_get(exc_slot), shadow_stack_get(tb_slot));
     }
     err
 }
