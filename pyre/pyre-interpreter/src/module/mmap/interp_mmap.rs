@@ -673,11 +673,17 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             } else {
                 len
             };
-            if start >= end || needle.is_empty() {
+            if start > end {
+                return Ok(pyre_object::w_int_new(-1));
+            }
+            if needle.is_empty() {
+                return Ok(pyre_object::w_int_new(start as i64));
+            }
+            if needle.len() > end - start {
                 return Ok(pyre_object::w_int_new(-1));
             }
             let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
-            let pos = (0..=hay.len().saturating_sub(needle.len()))
+            let pos = (0..=hay.len() - needle.len())
                 .find(|&i| &hay[i..i + needle.len()] == needle)
                 .map(|i| (start + i) as i64)
                 .unwrap_or(-1);
@@ -727,11 +733,17 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             } else {
                 len
             };
-            if start >= end || needle.is_empty() {
+            if start > end {
+                return Ok(pyre_object::w_int_new(-1));
+            }
+            if needle.is_empty() {
+                return Ok(pyre_object::w_int_new(end as i64));
+            }
+            if needle.len() > end - start {
                 return Ok(pyre_object::w_int_new(-1));
             }
             let hay = unsafe { std::slice::from_raw_parts(p.add(start), end - start) };
-            let pos = (0..=hay.len().saturating_sub(needle.len()))
+            let pos = (0..=hay.len() - needle.len())
                 .rev()
                 .find(|&i| &hay[i..i + needle.len()] == needle)
                 .map(|i| (start + i) as i64)
