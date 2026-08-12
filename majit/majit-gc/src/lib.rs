@@ -28,6 +28,20 @@ pub mod shadow_stack;
 pub mod trace;
 pub mod weakref;
 
+static AFTER_MINOR_COLLECTION_FN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the callback installed as `finished_minor_collection` by
+/// framework.py:135-138. Called once when the JIT counter is initialized.
+pub fn register_after_minor_collection_hook(f: fn()) {
+    let _ = AFTER_MINOR_COLLECTION_FN.set(f);
+}
+
+pub(crate) fn invoke_after_minor_collection_hook() {
+    if let Some(f) = AFTER_MINOR_COLLECTION_FN.get() {
+        f();
+    }
+}
+
 /// GC flags stored in object headers.
 ///
 /// From incminimark.py GCFLAG_* constants.

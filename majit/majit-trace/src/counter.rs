@@ -1,4 +1,5 @@
 use majit_ir::IndexMapExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// counter.py: JitCounter — float-based 5-way associative timetable.
 ///
@@ -16,6 +17,21 @@ const ASSOCIATIVITY: usize = 5;
 
 /// counter.py:8 UINT32MAX = 2 ** 32 - 1
 const UINT32MAX: u64 = 0xFFFF_FFFF;
+
+static MINOR_COLLECTION_STEP: AtomicUsize = AtomicUsize::new(0);
+static DECAY_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// counter.py:104-121 invoke_after_minor_collection
+///
+/// This runs inside a minor collection, so it must remain allocation-free and
+/// must not touch the counter table or acquire a lock.
+fn invoke_after_minor_collection() {
+    let step = MINOR_COLLECTION_STEP.fetch_add(1, Ordering::Relaxed) + 1;
+    if step == 32 {
+        MINOR_COLLECTION_STEP.store(0, Ordering::Relaxed);
+        DECAY_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// One timetable entry: 5-way associative (time, subhash) pairs.
 /// counter.py:11-13 ENTRY struct.
@@ -49,11 +65,15 @@ pub struct JitCounter {
     _nexthash: u64,
     /// counter.py:264 decay_by_mult — f64 (Python float).
     decay_by_mult: f64,
+    /// Last `DECAY_GENERATION` this counter applied. Each counter tracks its
+    /// own, so one thread's tick cannot consume another counter's decay.
+    last_decay_generation: usize,
 }
 
 impl JitCounter {
     /// counter.py:84-100 __init__(self, size=DEFAULT_SIZE, translator=None)
     pub fn new(size: usize) -> Self {
+        majit_gc::register_after_minor_collection_hook(invoke_after_minor_collection);
         let mut shift = 16u32;
         while (UINT32MAX >> shift) != (size as u64 - 1) {
             shift += 1;
@@ -65,6 +85,7 @@ impl JitCounter {
             timetable: vec![Entry::default(); size],
             _nexthash: 0,
             decay_by_mult: 1.0,
+            last_decay_generation: DECAY_GENERATION.load(Ordering::Relaxed),
         }
     }
 
@@ -147,6 +168,26 @@ impl JitCounter {
     /// counter.py:185-202 tick(self, hash, increment)
     #[inline(always)]
     pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
+        // counter.py:104-121 applies the decay synchronously inside the minor
+        // collection. pyre defers it to the next tick because the metainterp
+        // owns the counter table, and reaching it from inside the collector
+        // would re-enter a borrow the GC does not hold. Counters are only read
+        // at tick time.
+        //
+        // Each JitCounter keeps its own last-seen generation because JIT_DRIVER
+        // in eval.rs is thread-local, giving each mutator thread its own counter.
+        // This still saturates: if two or more 32-collection intervals elapse
+        // between ticks, counter.py has applied that many decays while this
+        // applies one. Carrying the elapsed count would match it, but would move
+        // inline_chain_depth_typeflip's recorded jit-stats (bridges_compiled
+        // 19 -> 18, guard_failures 3820 -> 3681); left for a change that can
+        // re-record them on every platform.
+        let generation = DECAY_GENERATION.load(Ordering::Relaxed);
+        if generation != self.last_decay_generation {
+            self.last_decay_generation = generation;
+            self.decay_all_counters();
+        }
+
         let index = self._get_index(hash);
         let subhash = Self::_get_subhash(hash);
         let entry = &mut self.timetable[index];

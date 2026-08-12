@@ -2426,6 +2426,12 @@ impl MiniMarkGC {
         }
         self.refresh_published_nursery_top();
 
+        // incminimark.py:1965 `self.root_walker.finished_minor_collection()`,
+        // the callback framework.py:135-138 reads out of `_jit2gc`: after the
+        // nursery is reset and accounted for, and before the timing and the
+        // gc-minor hook below.
+        crate::invoke_after_minor_collection_hook();
+
         // incminimark.py:1962-1974 — report the completed minor before the
         // wrapper advances the incremental major state machine.
         let duration = start.elapsed_secs();
