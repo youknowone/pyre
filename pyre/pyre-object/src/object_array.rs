@@ -446,24 +446,31 @@ pub unsafe fn grow_list_items_block_gc(
         return unsafe { grow_list_items_block(old, new_cap, live_len) };
     }
     let _roots = crate::gc_roots::push_roots();
-    let save = crate::gc_roots::shadow_stack_len();
-    // Only a GC-owned block needs rooting: `alloc_items_block_gc` falls back to
-    // `std::alloc` when the nursery declines, and such a block never moves, so
-    // the incoming pointer stays valid on its own. A null `old` carries no items.
-    let root_old = !old.is_null() && crate::gc_hook::try_gc_owns_object(old as *mut u8);
-    if root_old {
+    let old_slot = if old.is_null() {
+        None
+    } else {
+        // Publish the old block before *any* GC hook.  In particular,
+        // `try_gc_owns_object` is not a harmless predicate: its cross-thread
+        // path can wait behind a collection.  Asking whether `old` was
+        // managed before rooting it therefore let that collection relocate
+        // the block, after which the copy below read its reclaimed nursery
+        // slots and installed stale item pointers in the new block.
+        //
+        // The shadow-stack walker ignores non-GC addresses, so rooting the
+        // std::alloc fallback unconditionally is both safe and removes the
+        // ownership-query safepoint entirely.
+        let slot = crate::gc_roots::shadow_stack_len();
         crate::gc_roots::pin_root(old as crate::pyobject::PyObjectRef);
-    }
+        Some(slot)
+    };
     let new_block_slot = crate::gc_roots::shadow_stack_len();
     let new_block = unsafe { alloc_items_block_gc(new_cap) };
     crate::gc_roots::pin_root(new_block as PyObjectRef);
     let new_block = crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
     let new_base = unsafe { items_block_items_base(new_block) };
-    let old = if root_old {
-        crate::gc_roots::shadow_stack_get(save) as *mut ItemsBlock
-    } else {
-        old
-    };
+    let old = old_slot
+        .map(|slot| crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock)
+        .unwrap_or(old);
     if live_len > 0 {
         let old_base = unsafe { items_block_items_base(old) };
         unsafe { std::ptr::copy_nonoverlapping(old_base, new_base, live_len) };
