@@ -41,6 +41,12 @@ try:
     raise AssertionError("expected TypeError")
 except TypeError as e:
     assert "__init_subclass__" in str(e), str(e)
+    # `parse_obj` collapses an unknown keyword to one message when the callee
+    # takes neither `**kwargs` nor a keyword-only argument (argument.py:377-380),
+    # so this does not name `flag`.  The qualname ahead of the `()` is not
+    # asserted: it is the one part pyre and CPython spell differently.
+    assert "takes no keyword arguments" in str(e), str(e)
+    assert "flag" not in str(e), str(e)
 
 # A user __init_subclass__ still receives the keywords.
 seen = {}

@@ -20113,11 +20113,16 @@ fn init_object_type(ns: PyObjectRef) {
                     },
                     None => Vec::new(),
                 };
-                if let Some(first) = unknown.first() {
-                    return refuse(crate::argument::ArgErr::UnknownKwds {
-                        num_kwds: unknown.len(),
-                        kwd_name: first.clone(),
-                    });
+                if !unknown.is_empty() {
+                    // argument.py:377-380 — `parse_obj` does not report an
+                    // unknown keyword when the signature has neither `**kwargs`
+                    // nor a keyword-only argument; it collapses every such
+                    // refusal to one message.  This signature is `cls` alone,
+                    // so that branch always applies and naming the keyword
+                    // would be the shape a `**kwargs`-bearing callee gets.
+                    return Err(crate::PyError::type_error(
+                        "object.__init_subclass__() takes no keyword arguments".to_string(),
+                    ));
                 }
                 // `pos[0]` is the class the classmethod bound, so an argument
                 // of its own puts the count at two.
