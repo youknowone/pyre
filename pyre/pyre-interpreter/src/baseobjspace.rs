@@ -371,8 +371,10 @@ pub fn allocate_lock() -> *mut Lock {
 }
 
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
-/// `w_type.mro_w`. Uses the cached MRO when present, otherwise
-/// recomputes via `compute_default_mro`.
+/// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py:1640-1644
+/// _issubtype`: `w_type in w_sub.mro_w`); a type whose MRO is not yet
+/// installed (`mro_ptr` null / `not hasmro`) takes the
+/// [`issubtype_slow_and_wrong`] base-chain walk.
 pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() {
         return false;
@@ -387,9 +389,30 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     if !mro_ptr.is_null() {
         return (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls));
     }
-    compute_default_mro(w_type)
-        .iter()
-        .any(|&t| std::ptr::eq(t, cls))
+    issubtype_slow_and_wrong(w_type, cls)
+}
+
+/// `typeobject.py:1646-1656 _issubtype_slow_and_wrong` — the subtype test
+/// for a partially-initialised `w_type` whose MRO is not yet installed
+/// (reached only from a custom `MetaCls.mro()`).  Walks the best-base chain
+/// rather than the MRO; deliberately broken wrt. multiple inheritance,
+/// matching CPython.
+///
+/// `dont_look_inside`: the cold walk bottoms out in `find_best_base`'s
+/// `w_tuple_items_copy_as_vec` `Vec` iteration, opaque to the annotator, and
+/// returns a single-word `bool`, so it residualises behind one boundary —
+/// keeping the hot cached-MRO branch of [`issubtype_w`] a pure typed-slice
+/// iteration instead of a `<slice> ∪ <opaque Vec>` phi merge.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn issubtype_slow_and_wrong(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    let mut w_cls = w_type;
+    while !w_cls.is_null() {
+        if std::ptr::eq(w_cls, cls) {
+            return true;
+        }
+        w_cls = pyre_object::typeobject::w_type_get_best_base(w_cls);
+    }
+    false
 }
 
 /// pypy/interpreter/baseobjspace.py:1359 `exception_is_valid_obj_as_class_w`.

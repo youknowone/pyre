@@ -1014,6 +1014,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::memoryview_gather_bytes",
         memoryview_gather_bytes as *const (),
     );
+    // #346: the `not hasmro` subtype fallback for a partially-initialised type
+    // (`_issubtype_slow_and_wrong`, typeobject.py:1646).  Its cold best-base
+    // walk bottoms out in an opaque `Vec` iteration and returns a single-word
+    // `bool`, so it is `#[dont_look_inside]` — keeping the hot cached-MRO
+    // branch of `issubtype_w` a pure typed-slice iteration.  Bind its `fn` by
+    // qualified path.
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::issubtype_slow_and_wrong",
+        "pyre_interpreter::issubtype_slow_and_wrong",
+        crate::baseobjspace::issubtype_slow_and_wrong as *const (),
+    );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
     // `dictmultiobject::dict_view_iterator_gc_type_id` read the
