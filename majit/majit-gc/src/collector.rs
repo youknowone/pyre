@@ -3404,6 +3404,20 @@ impl MiniMarkGC {
     /// referents without changing collection state.
     fn visit_referents(&self, obj_addr: usize, visitor: &mut dyn FnMut(GcRef)) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.visit_referents_with_type_id(obj_addr, type_id, visitor);
+    }
+
+    /// `visit_referents` for a caller that already resolved the type id,
+    /// because a prebuilt object carries no header to read it back out of.
+    /// The bounds check sits here rather than beside the header read so that
+    /// both callers get its diagnostic instead of `TypeTable::get`'s bare
+    /// index panic.
+    fn visit_referents_with_type_id(
+        &self,
+        obj_addr: usize,
+        type_id: u32,
+        visitor: &mut dyn FnMut(GcRef),
+    ) {
         self.validate_type_id(type_id, obj_addr, "visit_referents");
         let type_info = self.types.get(type_id);
         if let Some(trace_fn) = type_info.custom_trace {
@@ -3515,11 +3529,22 @@ impl MiniMarkGC {
     /// `inspector.py:51-72 get_rpy_referents`: trace only the direct raw
     /// fields of `obj`.  In contrast, `do_get_referents` below recursively
     /// looks through non-object implementation nodes.
+    ///
+    /// `inspector.py:56-61 _do_append_rpy_referents` traces every gcref
+    /// unconditionally, so heap membership cannot reject registered prebuilt
+    /// objects. `get_actual_typeid` instead rejects null, tagged immediates,
+    /// and unknown foreign pointers; the managed-only nursery check below is
+    /// the only remaining `header_of` on this path.
     pub fn do_get_rpy_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
-        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null() {
             return true;
         }
-        if self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() } {
+        let Some(type_id) = self.get_actual_typeid(obj) else {
+            return true;
+        };
+        let is_managed = self.is_managed_heap_object(obj.0);
+        if is_managed && self.is_in_nursery(obj.0) && unsafe { (*header_of(obj.0)).is_forwarded() }
+        {
             return true;
         }
         let _stw = if crate::gc_sync::stw_required() {
@@ -3527,7 +3552,7 @@ impl MiniMarkGC {
         } else {
             None
         };
-        self.visit_referents(obj.0, visitor);
+        self.visit_referents_with_type_id(obj.0, type_id, visitor);
         true
     }
 

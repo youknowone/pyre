@@ -96,6 +96,16 @@ assert raw_roots
 # is its type, which is app-level and passes through unwrapped.
 raw_list_referents = gc.get_rpy_referents([object()])
 assert any(type(referent) is gc.GcRef for referent in raw_list_referents)
+
+# Bootstrap modules are immortal prebuilt objects outside the managed heap,
+# but their registered type still describes the GC fields they own.  The raw
+# inspector must trace those fields just as it traces a managed object's.
+assert not gc.is_tracked(gc)
+assert not any(obj is gc for obj in gc.get_objects())
+prebuilt_module_referents = gc.get_rpy_referents(gc)
+assert prebuilt_module_referents
+assert any(referent is gc.__dict__ for referent in prebuilt_module_referents)
+
 raw = raw_roots[0]
 memory_usage = gc.get_rpy_memory_usage(raw)
 type_index = gc.get_rpy_type_index(raw)
