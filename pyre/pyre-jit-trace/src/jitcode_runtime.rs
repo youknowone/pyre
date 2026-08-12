@@ -365,8 +365,12 @@ pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-/// The guard-free charon `w_list_pop_end_inner` body in `ALL_JITCODES`,
-/// resolved by name and cached per thread.
+/// The lock-guard-free charon `w_list_pop_end_inner` body in `ALL_JITCODES`,
+/// resolved by name and cached per thread. "Lock" is the whole of it: the body
+/// holds no `w_list_lock` pair, which is what would decline the fold's
+/// sub-walk (`listobject.rs` `w_list_pop_end`). It says nothing about trace
+/// guards — for those see `try_walker_orthodox_list_pop`, whose soundness
+/// turns on where they land relative to the body's first store.
 pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
     let idx = LIST_POP_END_JITCODE_INDEX
         .with(|cell| *cell.get_or_init(|| compute_named_jitcode_index("w_list_pop_end_inner")))?;

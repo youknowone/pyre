@@ -10355,9 +10355,29 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     Ok(())
 }
 
-/// Descend the guard-free Integer-strategy `w_list_pop_end_inner` body for a
-/// bound `list.pop()` call, recording its length/item array operations instead
-/// of an opaque residual call.
+/// Descend the Integer-strategy `w_list_pop_end_inner` body for a bound
+/// `list.pop()` call, recording its length/item array operations instead of an
+/// opaque residual call.
+///
+/// "Guard-free" elsewhere about this body (`listobject.rs` `w_list_pop_end`,
+/// `jitcode_runtime.rs` `list_pop_end_jitcode`) names the *lock* guard: a
+/// `w_list_lock` pair inside the body would decline the sub-walk. It is not a
+/// claim about trace guards, and the two must not be conflated here, because
+/// what the fold's soundness rests on is a trace-guard ordering property:
+///
+/// The sub-walk gets no callee frame — `outer_*` and `snapshot_sym` below stay
+/// the caller's — so a guard recorded inside it resumes at this CALL boundary
+/// and re-executes the whole `pop()`. That is only sound while every guard
+/// lands *before* the body's first committed store. It does today: the Integer
+/// arm's `ll_list_int_set_len` is a native `setfield_gc_i`, and the sole op
+/// after it is the `w_int_new` call, which `dispatch_inline_call_dir_kind`
+/// short-circuits into `walker_box_int` (`NewWithVtable` + `SetfieldGc`,
+/// recording no guard) and returns before `run_sub_jitcode_walk`. Take that
+/// short-circuit away and the walk records the boxing body's own null and
+/// exception guards after the length is already shrunk, and a failure there
+/// pops twice. Nothing asserts this ordering; the pre-fold `GuardClass` /
+/// `GuardValue` and the strategy switch's guard are all ahead of the store by
+/// construction, not by check.
 pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
