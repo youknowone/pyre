@@ -125,6 +125,12 @@ fn check_storage(storage: *mut usize, words: usize) {
 
 /// Initialize an object-owned opaque state buffer. Returns false for an
 /// unsupported canonical digest name.
+///
+/// # Safety
+///
+/// `storage` must point to an aligned, writable, uninitialized buffer of at
+/// least `words * size_of::<usize>()` bytes. The buffer must remain valid until
+/// its successfully initialized state is passed to [`state_drop`].
 pub unsafe fn state_init(storage: *mut usize, words: usize, name: &str) -> bool {
     check_storage(storage, words);
     let Some(state) = HashState::new(name) else {
@@ -138,6 +144,12 @@ pub unsafe fn state_init(storage: *mut usize, words: usize, name: &str) -> bool 
 /// The Python layer validates the exact PyPy/CPython ranges before calling;
 /// the backend APIs then encode the fields in the algorithm-defined little-
 /// endian parameter layout.
+///
+/// # Safety
+///
+/// `storage` must point to an aligned, writable, uninitialized buffer of at
+/// least `words * size_of::<usize>()` bytes. The buffer must remain valid until
+/// its successfully initialized state is passed to [`state_drop`].
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn state_init_blake2(
     storage: *mut usize,
@@ -195,6 +207,11 @@ pub unsafe fn state_init_blake2(
     true
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`state_init`] or
+/// [`state_init_blake2`] with the same `words` value, and it must not be
+/// dropped while this operation runs.
 pub unsafe fn state_update(storage: *mut usize, words: usize, data: &[u8]) {
     check_storage(storage, words);
     let state = unsafe { &*storage.cast::<LockedHashState>() };
@@ -204,6 +221,11 @@ pub unsafe fn state_update(storage: *mut usize, words: usize, data: &[u8]) {
         .update(data);
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`state_init`] or
+/// [`state_init_blake2`] with the same `words` value, and it must not be
+/// dropped while this operation runs.
 pub unsafe fn state_digest(storage: *const usize, words: usize, length: usize) -> Vec<u8> {
     check_storage(storage.cast_mut(), words);
     let state = unsafe { &*storage.cast::<LockedHashState>() };
@@ -213,6 +235,11 @@ pub unsafe fn state_digest(storage: *const usize, words: usize, length: usize) -
         .digest(length)
 }
 
+/// # Safety
+///
+/// `src` must contain a live initialized state, while `dst` must point to a
+/// distinct aligned, writable, uninitialized buffer. Both buffers must hold at
+/// least `words * size_of::<usize>()` bytes and remain valid for this call.
 pub unsafe fn state_copy(src: *const usize, dst: *mut usize, words: usize) {
     check_storage(src.cast_mut(), words);
     check_storage(dst, words);
@@ -224,6 +251,11 @@ pub unsafe fn state_copy(src: *const usize, dst: *mut usize, words: usize) {
     unsafe { dst.cast::<LockedHashState>().write(Mutex::new(cloned)) };
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`state_init`],
+/// [`state_init_blake2`], or [`state_copy`] with the same `words` value. The
+/// state must not be used again after this call.
 pub unsafe fn state_drop(storage: *mut usize, words: usize) {
     check_storage(storage, words);
     unsafe { std::ptr::drop_in_place(storage.cast::<LockedHashState>()) };
@@ -377,6 +409,11 @@ fn check_hmac_storage(storage: *mut usize, words: usize) {
     assert_eq!((storage as usize) % HMAC_STATE_STORAGE_ALIGN, 0);
 }
 
+/// # Safety
+///
+/// `storage` must point to an aligned, writable, uninitialized buffer of at
+/// least `words * size_of::<usize>()` bytes. The buffer must remain valid until
+/// its successfully initialized state is passed to [`hmac_state_drop`].
 pub unsafe fn hmac_state_init(storage: *mut usize, words: usize, name: &str, key: &[u8]) -> bool {
     check_hmac_storage(storage, words);
     let Some(state) = HmacState::new(name, key) else {
@@ -386,6 +423,11 @@ pub unsafe fn hmac_state_init(storage: *mut usize, words: usize, name: &str, key
     true
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`hmac_state_init`] with
+/// the same `words` value, and it must not be dropped while this operation
+/// runs.
 pub unsafe fn hmac_state_update(storage: *mut usize, words: usize, data: &[u8]) {
     check_hmac_storage(storage, words);
     unsafe { &*storage.cast::<LockedHmacState>() }
@@ -394,6 +436,11 @@ pub unsafe fn hmac_state_update(storage: *mut usize, words: usize, data: &[u8]) 
         .update(data);
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`hmac_state_init`] with
+/// the same `words` value, and it must not be dropped while this operation
+/// runs.
 pub unsafe fn hmac_state_digest(storage: *const usize, words: usize) -> Vec<u8> {
     check_hmac_storage(storage.cast_mut(), words);
     unsafe { &*storage.cast::<LockedHmacState>() }
@@ -402,6 +449,11 @@ pub unsafe fn hmac_state_digest(storage: *const usize, words: usize) -> Vec<u8> 
         .digest()
 }
 
+/// # Safety
+///
+/// `src` must contain a live initialized HMAC state, while `dst` must point to
+/// a distinct aligned, writable, uninitialized buffer. Both buffers must hold
+/// at least `words * size_of::<usize>()` bytes and remain valid for this call.
 pub unsafe fn hmac_state_copy(src: *const usize, dst: *mut usize, words: usize) {
     check_hmac_storage(src.cast_mut(), words);
     check_hmac_storage(dst, words);
@@ -412,6 +464,11 @@ pub unsafe fn hmac_state_copy(src: *const usize, dst: *mut usize, words: usize) 
     unsafe { dst.cast::<LockedHmacState>().write(Mutex::new(cloned)) };
 }
 
+/// # Safety
+///
+/// `storage` must contain a live state initialized by [`hmac_state_init`] or
+/// [`hmac_state_copy`] with the same `words` value. The state must not be used
+/// again after this call.
 pub unsafe fn hmac_state_drop(storage: *mut usize, words: usize) {
     check_hmac_storage(storage, words);
     unsafe { std::ptr::drop_in_place(storage.cast::<LockedHmacState>()) };
