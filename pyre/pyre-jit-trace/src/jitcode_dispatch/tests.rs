@@ -582,7 +582,7 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             null,
             true,
         ),
-        VableArrayStore::Stored(_)
+        VableArrayStore::Stored(Some(_))
     ));
     assert!(tc.virtualizable_slot_stored_live_null(flat_base));
     assert!(
@@ -613,7 +613,7 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             null,
             false,
         ),
-        VableArrayStore::Stored(_)
+        VableArrayStore::Stored(Some(_))
     ));
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
 
@@ -631,13 +631,13 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             Value::Ref(majit_ir::GcRef(2)),
             true,
         ),
-        VableArrayStore::Stored(_)
+        VableArrayStore::Stored(Some(_))
     ));
     assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
 
     assert!(matches!(
         tc.vable_setarrayitem_indexed(0, vable, index0, 0, fdescr, adescr, const_null, null, true,),
-        VableArrayStore::Stored(_)
+        VableArrayStore::Stored(Some(_))
     ));
     assert!(tc.virtualizable_slot_stored_live_null(flat_base));
     tc.set_virtualizable_entry_at(flat_base, const_null, null);

@@ -4797,10 +4797,21 @@ impl TraceCtx {
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
     ///
-    /// Returns `false` when the promoted index does not resolve to a standard
-    /// virtualizable slot (e.g. a transient out-of-bounds index during state-
-    /// field tracing). The caller aborts the trace in that case, mirroring the
-    /// read path's graceful handling in `vable_getarrayitem_int_indexed`.
+    /// `VableArrayStore::OutOfVable` means the promoted index did not resolve
+    /// to a standard virtualizable slot: it was negative, or `fdescr` is not
+    /// one of the virtualizable's array fields. Nothing was stored.
+    /// `VableArrayStore::Stored(Some(write))` is a standard-leg store; `write`
+    /// identifies the overwritten shadow slot and its prior box and value so a
+    /// caller capturing a promote guard can roll it back during the capture.
+    /// `VableArrayStore::Stored(None)` means the non-standard leg recorded a
+    /// plain `SETARRAYITEM_GC`, with no virtualizable shadow slot to roll back.
+    ///
+    /// The three `MetaInterp::opimpl_setarrayitem_vable_*` wrappers deliberately
+    /// assert `Stored`: `_get_arrayitem_vable_index` in
+    /// `rpython/jit/metainterp/pyjitpl.py:1215` asserts that the index is within
+    /// the virtualizable array, making `OutOfVable` an invariant violation on
+    /// that path. Graceful handling belongs to dispatcher/walker callers that
+    /// have a trace to abort.
     pub fn vable_setarrayitem_indexed(
         &mut self,
         pc: usize,
