@@ -16293,9 +16293,10 @@ fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// builtins.open(file, mode='r', ...) — PyPy: io.open → FileIO + TextIOWrapper.
 /// Minimal implementation that loads the entire file into memory and
 /// returns a file wrapper instance.
-/// POSIX `open(2)` flags for a text/binary mode string, used when an
-/// `opener` is supplied (the opener receives `(file, flags)`).
-#[cfg(unix)]
+/// OS descriptor flags for a text/binary mode string, used when an `opener`
+/// is supplied (the opener receives `(file, flags)`). Windows forces binary
+/// descriptor I/O and requests a non-inheritable descriptor at open time.
+#[cfg(any(unix, windows))]
 fn open_flags_for_mode(mode: &str) -> i32 {
     let write = mode.contains('w');
     let append = mode.contains('a');
@@ -16317,13 +16318,21 @@ fn open_flags_for_mode(mode: &str) -> i32 {
     if exclusive {
         flags |= libc::O_CREAT | libc::O_EXCL;
     }
-    // PyPy `W_FileIO.descr_init`: every pathname/opener call receives
-    // `O_CLOEXEC` when the platform provides it.  The explicit fcntl below
-    // remains necessary for an opener that ignores the supplied flag.
-    flags |= libc::O_CLOEXEC;
+    // PyPy `W_FileIO.descr_init`: every pathname/opener call requests a
+    // non-inheritable descriptor. The explicit fcntl below remains necessary
+    // on Unix for an opener that ignores the supplied flag. Windows also uses
+    // binary descriptor I/O because the buffered/text layers own translation.
+    #[cfg(unix)]
+    {
+        flags |= libc::O_CLOEXEC;
+    }
+    #[cfg(windows)]
+    {
+        flags |= libc::O_BINARY | libc::O_NOINHERIT;
+    }
     flags
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_flags_for_mode(_mode: &str) -> i32 {
     0
 }
@@ -16819,7 +16828,49 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
         Ok(wrapper)
     }
-    #[cfg(all(not(feature = "sandbox"), not(unix)))]
+    #[cfg(all(not(feature = "sandbox"), windows, feature = "host_env"))]
+    {
+        let _ = (reading, writing);
+        let flags = open_flags_for_mode(&mode);
+
+        // Match posix.open's Windows path boundary: `_wopen` receives the
+        // filesystem-decoded UTF-16 spelling, including unpaired surrogates.
+        let os_path = crate::gateway::os_string_from_fs_bytes(path_bytes);
+        let wide = widestring::WideCString::from_os_str(&os_path)
+            .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+        let (opened, _errno) = crate::module::thread::call_external_function(|| {
+            rustpython_host_env::crt_fd::wopen(&wide, flags, 0o666)
+        });
+        let fd = opened
+            .map_err(|e| {
+                crate::PyError::os_error_syscall(
+                    io_error_posix_errno(&e, libc::EACCES),
+                    resolved_path.w_path(),
+                )
+            })?
+            .into_raw();
+
+        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        // Carry binary-ness so descriptor reads/readlines wrap their chunks as
+        // `bytes` for `rb`; tokenize.detect_encoding relies on that result.
+        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
+        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
+        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
+        Ok(wrapper)
+    }
+    // Preserve the existing non-Windows fallback (notably wasm) unchanged;
+    // the Windows host build above owns a real CRT descriptor instead.
+    #[cfg(all(
+        not(feature = "sandbox"),
+        not(unix),
+        any(not(windows), not(feature = "host_env"))
+    ))]
     {
         let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
             #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]

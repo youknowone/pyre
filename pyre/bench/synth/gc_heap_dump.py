@@ -49,50 +49,37 @@ with tempfile.TemporaryDirectory(prefix="pyre-gc-dump-") as dump_dir:
 
     # The remaining two arms both take their descriptor from the builtin
     # `open`: `app_referents.py:23` for the filename arm and `:48` for the file
-    # object. The Windows builtin `open` hands back an in-memory wrapper that
-    # carries no descriptor, so `fileno()` raises there and neither arm can
-    # run. Ask the platform rather than name it, so a target that grows a
-    # descriptor picks the arms up without editing this file.
-    with open(os.path.join(dump_dir, "probe.bin"), "wb") as probe:
-        try:
-            probe.fileno()
-            open_is_descriptor_backed = True
-        except OSError:
-            open_is_descriptor_backed = False
-
+    # object.
     dump_path = os.path.join(dump_dir, "heap.bin")
-    if open_is_descriptor_backed:
-        with open(dump_path, "wb") as dump_file:
-            assert gc.dump_rpy_heap(dump_file) is None
-        with open(dump_path, "rb") as dump_file:
-            check_dump(dump_file.read())
+    with open(dump_path, "wb") as dump_file:
+        assert gc.dump_rpy_heap(dump_file) is None
+    with open(dump_path, "rb") as dump_file:
+        check_dump(dump_file.read())
 
     # app_referents.py:22-42 — the filename arm opens and truncates the dump
     # itself, then materializes typeids.txt/typeids.lst beside it when they are
     # absent. Neither sidecar is written for a file object or a descriptor, so
     # this is the only call shape that reaches them.
-    if open_is_descriptor_backed:
-        named_dir = os.path.join(dump_dir, "named")
-        os.mkdir(named_dir)
-        named_path = os.path.join(named_dir, "heap.bin")
-        assert gc.dump_rpy_heap(named_path) is None
-        with open(named_path, "rb") as dump_file:
-            check_dump(dump_file.read())
-        typeids_txt = os.path.join(named_dir, "typeids.txt")
-        typeids_lst = os.path.join(named_dir, "typeids.lst")
-        with open(typeids_txt, "rb") as sidecar:
-            assert len(sidecar.read()) > 2
-        with open(typeids_lst, "r") as sidecar:
-            lines = sidecar.read().splitlines()
-        assert len(lines) == len(typeids_list)
-        assert [int(line) for line in lines] == typeids_list
+    named_dir = os.path.join(dump_dir, "named")
+    os.mkdir(named_dir)
+    named_path = os.path.join(named_dir, "heap.bin")
+    assert gc.dump_rpy_heap(named_path) is None
+    with open(named_path, "rb") as dump_file:
+        check_dump(dump_file.read())
+    typeids_txt = os.path.join(named_dir, "typeids.txt")
+    typeids_lst = os.path.join(named_dir, "typeids.lst")
+    with open(typeids_txt, "rb") as sidecar:
+        assert len(sidecar.read()) > 2
+    with open(typeids_lst, "r") as sidecar:
+        lines = sidecar.read().splitlines()
+    assert len(lines) == len(typeids_list)
+    assert [int(line) for line in lines] == typeids_list
 
-        # The second call finds both sidecars in place and leaves them
-        # untouched.
-        with open(typeids_txt, "ab") as sidecar:
-            sidecar.write(b"sentinel\n")
-        assert gc.dump_rpy_heap(named_path) is None
-        with open(typeids_txt, "rb") as sidecar:
-            assert sidecar.read().endswith(b"sentinel\n")
+    # The second call finds both sidecars in place and leaves them untouched.
+    with open(typeids_txt, "ab") as sidecar:
+        sidecar.write(b"sentinel\n")
+    assert gc.dump_rpy_heap(named_path) is None
+    with open(typeids_txt, "rb") as sidecar:
+        assert sidecar.read().endswith(b"sentinel\n")
 
 print("OK")
