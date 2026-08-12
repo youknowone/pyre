@@ -10695,6 +10695,77 @@ fn make_getset_property_full(
     )
 }
 
+/// `_PyObject_IS_GC`: `Py_TPFLAGS_HAVE_GC` on the instance's type, refined by
+/// `tp_is_gc` where the type installs one.
+///
+/// This is a property of the type, not of the object's current collector
+/// state: `()` is untracked yet `sys.getsizeof` still charges it a
+/// `PyGC_Head`, because `tuple` carries the flag. Reading pyre's own GC
+/// ownership instead answers a different question — pyre's nursery owns
+/// `object()` and `b""`, which `object` and `bytes` never declare.
+pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
+    let Some(tp) = r#type(w_obj) else {
+        return false;
+    };
+    if !cpython_type_has_gc_flag(tp.as_ptr()) {
+        return false;
+    }
+    // `type_is_gc` is the only `tp_is_gc` in the builtin types, and it answers
+    // with `Py_TPFLAGS_HEAPTYPE`: a statically allocated type object is never
+    // collected, while one built by `type_new` is.
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return unsafe { pyre_object::w_type_is_heaptype(w_obj) };
+    }
+    true
+}
+
+/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`.
+///
+/// A type carries the flag when its instances can hold a reference that joins
+/// a cycle, which is nearly all of them, so what is enumerated here is the
+/// complement: the scalars, the buffers and the singletons. `type_new` sets
+/// the flag on every heap type.
+///
+/// Two matches are needed because a builtin only gets its own Layout when it
+/// has a payload of its own. `int` and `bytes` do, so their layout identifies
+/// them; `NoneType` and `code` do not, and share the base instance layout with
+/// `function`, `generator`, the iterators and the dict views — all of which do
+/// declare the flag. Those are matched on the type object instead.
+fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        return false;
+    }
+    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+        return true;
+    }
+    let same_type = |tp: &PyType| std::ptr::eq(w_type, gettypeobject(tp));
+    // `object` holds nothing; the singletons are one instance each; a code
+    // object's references are all reachable from the function that owns it;
+    // and both range iterators count, one in machine words and one in ints
+    // that cannot themselves reference anything.
+    if std::ptr::eq(w_type, w_object())
+        || same_type(&pyre_object::NONE_TYPE)
+        || same_type(&pyre_object::NOTIMPLEMENTED_TYPE)
+        || same_type(&pyre_object::ELLIPSIS_TYPE)
+        || same_type(&crate::pycode::CODE_TYPE)
+        || same_type(&pyre_object::functional::RANGE_ITER_TYPE)
+        || same_type(&pyre_object::functional::LONG_RANGE_ITER_TYPE)
+    {
+        return false;
+    }
+    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
+    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
+    !(is(&pyre_object::INT_TYPE)
+        || is(&pyre_object::LONG_TYPE)
+        || is(&pyre_object::BOOL_TYPE)
+        || is(&pyre_object::FLOAT_TYPE)
+        || is(&pyre_object::COMPLEX_TYPE)
+        || is(&pyre_object::STR_TYPE)
+        || is(&pyre_object::bytesobject::BYTES_TYPE)
+        || is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
+        || is(&pyre_object::functional::RANGE_TYPE))
+}
+
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.

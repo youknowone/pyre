@@ -83,22 +83,22 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
     // ranges and one built at run time does not, so the same value reported two
     // different sizes.
     let word = std::mem::size_of::<usize>() as u64;
-    let pre_header = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
-        let tp = tp.as_ptr();
-        let gc_header = if pyre_object::typeobject::w_type_get_have_gc(tp) {
-            2 * word
-        } else {
-            0
-        };
-        let managed_prefix = if pyre_object::w_type_is_heaptype(tp)
-            && (pyre_object::w_type_get_hasdict(tp) || pyre_object::w_type_get_weakrefable(tp))
+    let gc_header = if crate::typedef::cpython_object_is_gc(current()) {
+        2 * word
+    } else {
+        0
+    };
+    let managed_prefix = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
+        if pyre_object::w_type_is_heaptype(tp.as_ptr())
+            && (pyre_object::w_type_get_hasdict(tp.as_ptr())
+                || pyre_object::w_type_get_weakrefable(tp.as_ptr()))
         {
             2 * word
         } else {
             0
-        };
-        gc_header + managed_prefix
+        }
     });
+    let pre_header = gc_header + managed_prefix;
     let total = (size as u64)
         .checked_add(pre_header)
         .expect("Py_ssize_t plus the fixed pre-header fits in size_t");
