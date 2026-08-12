@@ -6225,12 +6225,14 @@ impl<M: Clone> MetaInterp<M> {
         let trace_ops_snapshot = trace_ops.clone();
         let constants_snapshot = constants.clone();
 
-        // PyPy: pyjitpl.py:3016-3017 `can_use_unroll = cpu.supports_guard_gc_type
-        // and 'unroll' in warmstate.enable_opts`. PYRE_NO_UNROLL forces the
-        // simple-loop compilation path (compile.py:251 compile_simple_loop)
-        // without preamble peeling, useful for diagnostics and to isolate
-        // unroller-related regressions.
-        let no_unroll = crate::no_unroll_enabled();
+        // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
+        // warmstate.enable_opts. PYRE_NO_UNROLL remains a diagnostic override.
+        let no_unroll = crate::no_unroll_enabled()
+            || !self
+                .warm_state
+                .get_enable_opts()
+                .iter()
+                .any(|opt| opt == "unroll");
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
