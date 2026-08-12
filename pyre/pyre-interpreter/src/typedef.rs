@@ -13893,7 +13893,7 @@ fn init_builtin_function_type(ns: PyObjectRef) {
                     } else {
                         unsafe { crate::function::function_get_self_or_none(carrier) }
                     };
-                    Ok(pyre_object::w_str_new(&unsafe {
+                    Ok(pyre_object::w_str_new_managed(&unsafe {
                         crate::function::builtin_function_repr_text(name, w_self)
                     }))
                 },
