@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.
 use dynasmrt::aarch64::Assembler;
-use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
+use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
-use majit_backend::{BackendError, JitCellToken};
+use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
@@ -264,6 +264,8 @@ fn invert_cc(cc: u8) -> u8 {
 pub struct AssemblerARM64<'a> {
     /// The dynasm assembler (rx86.py + codebuf.py combined).
     pub(crate) mc: Assembler,
+    /// `BaseAssembler.asmmemmgr`: destination arena for materialization.
+    asm_memory_manager: Arc<AsmMemoryManager>,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
     /// GC bitmap to push before the current collecting call (e.g.,
@@ -471,11 +473,7 @@ struct GuardToken {
 /// Compiled output from assemble_loop/assemble_bridge.
 pub struct CompiledCode {
     /// Executable memory buffer (keeps code alive).
-    pub buffer: ExecutableBuffer,
-    /// `llmodel.py:252 asmmemmgr_blocks` lifetime accounting token for this
-    /// executable allocation. It is stored on the same object that owns the
-    /// buffer, matching AsmMemoryManager's block ownership upstream.
-    pub(crate) _asmmemmgr_block: Option<majit_backend::AsmMemoryBlock>,
+    pub buffer: codebuf::ArenaExecutableBuffer,
     /// Entry point offset within the buffer.
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
@@ -530,6 +528,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:54 __init__
     pub(crate) fn new(
+        asm_memory_manager: Arc<AsmMemoryManager>,
         trace_id: u64,
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
@@ -546,6 +545,7 @@ impl<'a> AssemblerARM64<'a> {
         let op_pos = OpTypeIndex::build_op_pos(operations);
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
+            asm_memory_manager,
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
@@ -1935,10 +1935,7 @@ impl<'a> AssemblerARM64<'a> {
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
-        let buffer = self
-            .mc
-            .finalize()
-            .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         // assembler.py:849 patch_pending_failure_recoveries
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
@@ -1954,6 +1951,7 @@ impl<'a> AssemblerARM64<'a> {
         unsafe { *self.self_entry_addr_ptr = rawstart + entry.0 };
 
         Self::fixup_target_tokens(tokens, frame_depth, rawstart);
+        buffer.make_executable()?;
 
         // Position is the canonical fail_index identity (matching
         // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
@@ -1966,7 +1964,6 @@ impl<'a> AssemblerARM64<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
-            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,
@@ -2077,10 +2074,7 @@ impl<'a> AssemblerARM64<'a> {
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
-        let buffer = self
-            .mc
-            .finalize()
-            .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
@@ -2090,6 +2084,7 @@ impl<'a> AssemblerARM64<'a> {
         // frame depth (max of loop/bridge), now known post-finalize.
         Self::patch_stack_checks(self.frame_depth, rawstart, &self.frame_depth_to_patch);
         Self::fixup_target_tokens(tokens, frame_depth, rawstart);
+        buffer.make_executable()?;
 
         if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
@@ -2125,7 +2120,6 @@ impl<'a> AssemblerARM64<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
-            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,

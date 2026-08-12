@@ -4,6 +4,10 @@
 /// The Backend trait is the contract between the JIT frontend (tracing + optimization)
 /// and the code generation backend (Cranelift, etc.).
 use std::cell::Cell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -1710,32 +1714,9 @@ pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 /// code bytes and is released with each compiled block, exactly like
 /// `AsmMemoryManager.free(start, stop)` (`asmmemmgr.py:47-50`).
 ///
-/// The counters are upstream's, but the allocator under them is not.
-/// `total_memory_allocated` is monotonic there because the arena it counts is
-/// *retained*: `free` puts the range back on a reuse list and the mapping
-/// stays, so the figure is the capacity the process still holds. Pyre has no
-/// such arena, and what `allocated` means differs per backend:
-///
-/// - dynasm gives every compiled block its own `ExecutableBuffer`, whose
-///   `memmap2` mapping really is unmapped on drop, so the monotonic figure
-///   *over*-reports once code is freed and grows across compile/invalidate
-///   cycles.
-/// - cranelift records the finalized machine-code length, while the provider
-///   inside `JITModule` page-rounds its mappings and never frees them, so the
-///   figure *under*-reports.
-/// - wasm has no pyre-owned executable mapping at all — the host compiler owns
-///   the code — so what it records is encoded module bytes, a different
-///   quantity from retained capacity.
-///
-/// The fix is the missing allocator — a real reusable `AsmMemoryManager` with
-/// the free list of `asmmemmgr.py:53-90` — not a subtraction here, which would
-/// make one number honest while leaving the semantics further from upstream.
-/// It is blocked on the emission APIs: `dynasmrt`'s `ExecutableBuffer` has no
-/// constructor over caller-owned memory (only `VecAssembler::new(baseaddr)`
-/// can target a chosen address, and copying a finalized buffer is unsound
-/// because `AbsToRel`/`RelToAbs` relocations bake the old base), and
-/// `cranelift-jit` exports `JITMemoryProvider` but not the `JITMemoryKind` its
-/// `allocate` takes, so the trait cannot be implemented outside that crate.
+/// Native backends allocate from [`AsmMemoryManager`], the retained free-list
+/// arena ported below. The wasm backend has no pyre-owned executable mapping;
+/// its existing accounting token measures encoded module bytes instead.
 #[derive(Default)]
 pub struct AsmMemoryManagerStats {
     total_memory_allocated: AtomicUsize,
@@ -1776,6 +1757,7 @@ impl AsmMemoryManagerStats {
         AsmMemoryBlock {
             owner: Arc::clone(self),
             used,
+            storage: AsmMemoryBlockStorage::AccountingOnly,
         }
     }
 
@@ -1787,24 +1769,385 @@ impl AsmMemoryManagerStats {
     }
 }
 
-/// Lifetime token stored beside the executable buffer it accounts for.
+#[cfg(not(target_arch = "wasm32"))]
+const ASM_LARGE_ALLOC_SIZE: usize = 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const ASM_MIN_FRAGMENT: usize = 64;
+#[cfg(not(target_arch = "wasm32"))]
+const ASM_NUM_INDICES: usize = 32;
+
+/// `rpython/jit/backend/llsupport/asmmemmgr.py:10-145`.
+///
+/// The two keyed maps and the size-bucket vectors deliberately preserve the
+/// upstream storage shape. `BTreeMap` is used only for exact-key lookups; the
+/// oldest-first policy lives in `blocks_by_size`, just as it does in RPython.
+/// Pyre creates one backend per mutator, so all manager handles share a
+/// process-owned inner arena: retained capacity remains mapped and reusable
+/// when a worker thread and its backend exit.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct AsmMemoryManager {
+    stats: Arc<AsmMemoryManagerStats>,
+    inner: Arc<parking_lot::Mutex<AsmMemoryManagerInner>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct AsmMemoryManagerInner {
+    allocations: Vec<region::Allocation>,
+    allocation_ranges: Vec<(usize, usize)>,
+    free_blocks: BTreeMap<usize, usize>,
+    free_blocks_end: BTreeMap<usize, usize>,
+    blocks_by_size: Vec<Vec<usize>>,
+}
+
+// `region::Allocation` is an owning handle to an OS mapping. Moving that
+// handle does not move the mapping or change its thread affinity; Cranelift's
+// upstream `ArenaMemoryProvider` makes the same `unsafe impl Send` assertion.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for AsmMemoryManagerInner {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AsmMemoryManagerInner {
+    fn new() -> Self {
+        Self {
+            allocations: Vec::new(),
+            allocation_ranges: Vec::new(),
+            free_blocks: BTreeMap::new(),
+            free_blocks_end: BTreeMap::new(),
+            blocks_by_size: (0..ASM_NUM_INDICES).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn get_index(mut length: usize) -> usize {
+        let mut index = 0;
+        while length > ASM_MIN_FRAGMENT {
+            length = (length * 3) >> 2;
+            index += 1;
+            if index == ASM_NUM_INDICES - 1 {
+                break;
+            }
+        }
+        index
+    }
+
+    fn same_allocation(&self, left: usize, right: usize) -> bool {
+        self.allocation_ranges
+            .iter()
+            .any(|&(start, stop)| start <= left && right < stop)
+    }
+
+    fn del_free_block(&mut self, start: usize, stop: usize) {
+        assert_eq!(self.free_blocks.remove(&start), Some(stop));
+        assert_eq!(self.free_blocks_end.remove(&stop), Some(start));
+        let bucket = &mut self.blocks_by_size[Self::get_index(stop - start)];
+        let position = bucket
+            .iter()
+            .position(|candidate| *candidate == start)
+            .expect("free block missing from size bucket");
+        bucket.remove(position);
+    }
+
+    fn add_free_block(&mut self, mut start: usize, mut stop: usize) -> usize {
+        if let Some(&left_start) = self.free_blocks_end.get(&start)
+            && self.same_allocation(left_start, start)
+        {
+            self.del_free_block(left_start, start);
+            start = left_start;
+        }
+        if let Some(&right_stop) = self.free_blocks.get(&stop)
+            && self.same_allocation(stop, right_stop - 1)
+        {
+            self.del_free_block(stop, right_stop);
+            stop = right_stop;
+        }
+        assert!(self.free_blocks.insert(start, stop).is_none());
+        assert!(self.free_blocks_end.insert(stop, start).is_none());
+        self.blocks_by_size[Self::get_index(stop - start)].push(start);
+        start
+    }
+
+    fn allocate_large_block(
+        &mut self,
+        min_size: usize,
+        total_memory_allocated: usize,
+    ) -> io::Result<usize> {
+        let min_size = min_size.max(total_memory_allocated >> 4);
+        let size = min_size
+            .checked_add(ASM_LARGE_ALLOC_SIZE - 1)
+            .and_then(|value| value.checked_div(ASM_LARGE_ALLOC_SIZE))
+            .and_then(|value| value.checked_mul(ASM_LARGE_ALLOC_SIZE))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "JIT arena size overflow")
+            })?;
+        let mut allocation =
+            region::alloc(size, region::Protection::READ_WRITE).map_err(io::Error::other)?;
+        let start = allocation.as_mut_ptr::<u8>() as usize;
+        let stop = start + size;
+        self.allocations.push(allocation);
+        self.allocation_ranges.push((start, stop));
+        Ok(self.add_free_block(start, stop))
+    }
+
+    fn allocate_block(
+        &mut self,
+        length: usize,
+        total_memory_allocated: usize,
+    ) -> io::Result<(usize, usize, Option<usize>)> {
+        let initial_index = Self::get_index(length);
+        let mut found = None;
+        for (position, &start) in self.blocks_by_size[initial_index].iter().enumerate() {
+            let stop = self.free_blocks[&start];
+            if start + length <= stop {
+                found = Some((initial_index, position, start, stop));
+                break;
+            }
+        }
+        if found.is_none() {
+            for index in initial_index + 1..ASM_NUM_INDICES {
+                if let Some(&start) = self.blocks_by_size[index].first() {
+                    found = Some((index, 0, start, self.free_blocks[&start]));
+                    break;
+                }
+            }
+        }
+        let newly_mapped = if found.is_none() {
+            let start = self.allocate_large_block(length, total_memory_allocated)?;
+            let stop = self.free_blocks[&start];
+            let index = Self::get_index(stop - start);
+            Some((index, self.blocks_by_size[index].len() - 1, start, stop))
+        } else {
+            None
+        };
+        let (index, position, start, stop) = found.or(newly_mapped).unwrap();
+        self.blocks_by_size[index].remove(position);
+        self.free_blocks.remove(&start);
+        self.free_blocks_end.remove(&stop);
+
+        let allocated_stop = start + length;
+        if stop - allocated_stop >= ASM_MIN_FRAGMENT {
+            self.add_free_block(allocated_stop, stop);
+        }
+        let mapped = (newly_mapped.is_some()).then_some(stop - start);
+        Ok((start, allocated_stop, mapped))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl AsmMemoryManager {
+    pub fn new(stats: Arc<AsmMemoryManagerStats>) -> Arc<Self> {
+        static PROCESS_ARENA: OnceLock<Arc<parking_lot::Mutex<AsmMemoryManagerInner>>> =
+            OnceLock::new();
+        let inner = Arc::clone(
+            PROCESS_ARENA
+                .get_or_init(|| Arc::new(parking_lot::Mutex::new(AsmMemoryManagerInner::new()))),
+        );
+        Arc::new(Self { stats, inner })
+    }
+
+    #[cfg(test)]
+    fn new_isolated(stats: Arc<AsmMemoryManagerStats>) -> Arc<Self> {
+        Arc::new(Self {
+            stats,
+            inner: Arc::new(parking_lot::Mutex::new(AsmMemoryManagerInner::new())),
+        })
+    }
+
+    pub fn stats(&self) -> &Arc<AsmMemoryManagerStats> {
+        &self.stats
+    }
+
+    /// Allocate one page-isolated range. Page isolation is the W^X adaptation
+    /// needed when compiled blocks with different lifetimes share an arena.
+    pub fn allocate(self: &Arc<Self>, size: usize, used: usize) -> io::Result<AsmMemoryBlock> {
+        if used > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JIT used size exceeds requested allocation",
+            ));
+        }
+        let page_size = region::page::size();
+        let capacity = size
+            .max(1)
+            .checked_add(page_size - 1)
+            .map(|value| value / page_size * page_size)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "JIT block size overflow")
+            })?;
+        let total = PROCESS_ASM_MEMORY_STATS
+            .total_memory_allocated
+            .load(Ordering::Relaxed);
+        let (start, stop, mapped) = self.inner.lock().allocate_block(capacity, total)?;
+        if let Some(mapped) = mapped {
+            self.stats
+                .total_memory_allocated
+                .fetch_add(mapped, Ordering::Relaxed);
+            PROCESS_ASM_MEMORY_STATS
+                .total_memory_allocated
+                .fetch_add(mapped, Ordering::Relaxed);
+        }
+        let protection_result = unsafe {
+            region::protect(
+                start as *const u8,
+                stop - start,
+                region::Protection::READ_WRITE,
+            )
+            .map_err(io::Error::other)
+        };
+        if let Err(error) = protection_result {
+            self.inner.lock().add_free_block(start, stop);
+            return Err(error);
+        }
+        self.stats.total_mallocs.fetch_add(used, Ordering::Relaxed);
+        PROCESS_ASM_MEMORY_STATS
+            .total_mallocs
+            .fetch_add(used, Ordering::Relaxed);
+        Ok(AsmMemoryBlock {
+            owner: Arc::clone(&self.stats),
+            used,
+            storage: AsmMemoryBlockStorage::Arena {
+                manager: Arc::clone(self),
+                start,
+                stop,
+            },
+        })
+    }
+
+    fn free(&self, start: usize, stop: usize) {
+        self.inner.lock().add_free_block(start, stop);
+    }
+}
+
+enum AsmMemoryBlockStorage {
+    AccountingOnly,
+    #[cfg(not(target_arch = "wasm32"))]
+    Arena {
+        manager: Arc<AsmMemoryManager>,
+        start: usize,
+        stop: usize,
+    },
+}
+
+/// Lifetime token stored beside executable code. Arena-backed tokens return
+/// their range to the upstream-style free list on drop.
 pub struct AsmMemoryBlock {
     owner: Arc<AsmMemoryManagerStats>,
     used: usize,
+    storage: AsmMemoryBlockStorage,
+}
+
+impl AsmMemoryBlock {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn ptr(&self) -> *const u8 {
+        match self.storage {
+            AsmMemoryBlockStorage::AccountingOnly => std::ptr::null(),
+            AsmMemoryBlockStorage::Arena { start, .. } => start as *const u8,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.used
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        match self.storage {
+            AsmMemoryBlockStorage::AccountingOnly => self.used,
+            #[cfg(not(target_arch = "wasm32"))]
+            AsmMemoryBlockStorage::Arena { start, stop, .. } => stop - start,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn contains(&self, ptr: *const u8) -> bool {
+        let address = ptr as usize;
+        match self.storage {
+            AsmMemoryBlockStorage::AccountingOnly => false,
+            AsmMemoryBlockStorage::Arena { start, stop, .. } => start <= address && address < stop,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let AsmMemoryBlockStorage::Arena { start, stop, .. } = self.storage else {
+            panic!("accounting-only assembler block has no storage")
+        };
+        unsafe { std::slice::from_raw_parts_mut(start as *mut u8, stop - start) }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn make_read_only(&mut self) -> io::Result<()> {
+        self.protect(region::Protection::READ)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn make_writable(&mut self) -> io::Result<()> {
+        self.protect(region::Protection::READ_WRITE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn make_executable(&mut self) -> io::Result<()> {
+        flush_instruction_cache(self.ptr(), self.capacity());
+        self.protect(region::Protection::READ_EXECUTE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn protect(&mut self, protection: region::Protection) -> io::Result<()> {
+        let AsmMemoryBlockStorage::Arena { start, stop, .. } = self.storage else {
+            return Ok(());
+        };
+        unsafe { region::protect(start as *const u8, stop - start, protection) }
+            .map_err(io::Error::other)
+    }
 }
 
 impl Drop for AsmMemoryBlock {
     fn drop(&mut self) {
-        // `used` only, as `free` does at `asmmemmgr.py:47-50`. The capacity
-        // stays charged; see [`AsmMemoryManagerStats`] for what that costs
-        // without the arena upstream keeps it in.
         self.owner
             .total_mallocs
             .fetch_sub(self.used, Ordering::Relaxed);
         PROCESS_ASM_MEMORY_STATS
             .total_mallocs
             .fetch_sub(self.used, Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let AsmMemoryBlockStorage::Arena {
+            ref manager,
+            start,
+            stop,
+        } = self.storage
+        {
+            manager.free(start, stop);
+        }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn flush_instruction_cache(ptr: *const u8, len: usize) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    unsafe {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *mut u8, size: usize);
+        }
+        sys_icache_invalidate(ptr as *mut u8, len);
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    unsafe {
+        unsafe extern "C" {
+            fn __clear_cache(start: *mut u8, end: *mut u8);
+        }
+        __clear_cache(ptr as *mut u8, ptr.add(len) as *mut u8);
+    }
+    #[cfg(windows)]
+    unsafe {
+        unsafe extern "system" {
+            fn FlushInstructionCache(process: isize, addr: *const u8, size: usize) -> i32;
+            fn GetCurrentProcess() -> isize;
+        }
+        FlushInstructionCache(GetCurrentProcess(), ptr, len);
+    }
+    #[cfg(not(any(target_arch = "aarch64", windows)))]
+    let _ = (ptr, len);
 }
 
 /// The backend trait — implemented by Cranelift (or other code generators).
@@ -3482,5 +3825,40 @@ mod tests {
         assert_eq!(manager.get_stats(), (12_288, 300));
         drop(second);
         assert_eq!(manager.get_stats(), (12_288, 0));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn asm_memory_manager_reuses_freed_arena_range() {
+        let stats = Arc::new(AsmMemoryManagerStats::default());
+        let manager = AsmMemoryManager::new_isolated(Arc::clone(&stats));
+
+        let first = manager.allocate(120, 120).unwrap();
+        let first_address = first.ptr();
+        assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 120));
+        drop(first);
+        assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 0));
+
+        let second = manager.allocate(300, 300).unwrap();
+        assert_eq!(second.ptr(), first_address);
+        assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 300));
+        drop(second);
+        assert_eq!(stats.get_stats(), (ASM_LARGE_ALLOC_SIZE, 0));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn process_arena_reuses_range_after_backend_manager_drop() {
+        let first_stats = Arc::new(AsmMemoryManagerStats::default());
+        let first_manager = AsmMemoryManager::new(first_stats);
+        let first = first_manager.allocate(128, 128).unwrap();
+        let first_address = first.ptr();
+        drop(first);
+        drop(first_manager);
+
+        let second_stats = Arc::new(AsmMemoryManagerStats::default());
+        let second_manager = AsmMemoryManager::new(second_stats);
+        let second = second_manager.allocate(128, 128).unwrap();
+        assert_eq!(second.ptr(), first_address);
     }
 }

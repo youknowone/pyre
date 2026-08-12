@@ -14,10 +14,11 @@ use std::sync::Arc;
 
 // x86/assembler.py parity: x86_64-only backend.
 use dynasmrt::x64::Assembler;
-use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
+use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{
-    BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
+    AsmMemoryManager, BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout,
+    JitCellToken,
 };
 use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
@@ -323,13 +324,13 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
 /// fail at `handle_fail` dispatch time); pyre prefers a build-time
 /// fail-fast for the same invariant.
 ///
-/// Returns `(buffer, entry_addr)`.  The caller (`X86CpuExt`) owns the
-/// `ExecutableBuffer` for the lifetime of the per-CPU stash so the RX
-/// page is unmapped when the CPU drops — matches PyPy's `asmmemmgr`,
-/// which roots helper buffers on the CPU.
+/// Returns `(buffer, entry_addr)`. The caller (`X86CpuExt`) owns the arena
+/// block for the lifetime of the per-CPU stash, matching the helper blocks
+/// rooted by PyPy's `asmmemmgr`.
 pub(crate) fn build_propagate_exception_path(
     cpu_handle: &crate::guard::CpuDescrHandle,
-) -> (ExecutableBuffer, usize) {
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
     let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
     let propagate_descr = cpu_handle
         .read()
@@ -365,7 +366,8 @@ pub(crate) fn build_propagate_exception_path(
     // assembler.py:342 `self._call_footer()` — restore callee-save,
     // set rax = rbp, ADD rsp, prologue_size, RET.
     emit_call_footer_raw(&mut asm);
-    let buffer = asm.finalize().expect("propagate_exception_path: finalize");
+    let buffer =
+        codebuf::finalize_executable(asm, arena).expect("propagate_exception_path: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -405,11 +407,12 @@ pub(crate) fn build_propagate_exception_path(
 ///
 /// Returns `(buffer, entry_addr)`.  Same ownership rule as
 /// `build_propagate_exception_path` — the caller (`X86CpuExt`) holds
-/// the `ExecutableBuffer` so the RX page lives as long as the CPU.
+/// the arena buffer so the RX page lives as long as the CPU.
 pub(crate) fn build_malloc_slowpath_fixed(
     cpu_handle: &crate::guard::CpuDescrHandle,
     propagate_path: usize,
-) -> (ExecutableBuffer, usize) {
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
     // `cpu_handle` is still threaded through for symmetry with PyPy
     // (where `_build_malloc_slowpath` reads several `self.cpu`-rooted
     // attrs).  The propagate descr itself is now baked once into the
@@ -428,7 +431,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
     let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
     build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
 
-    let buffer = asm.finalize().expect("malloc_slowpath: finalize");
+    let buffer = codebuf::finalize_executable(asm, arena).expect("malloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -436,7 +439,8 @@ pub(crate) fn build_malloc_slowpath_fixed(
 pub(crate) fn build_malloc_slowpath_headerless(
     cpu_handle: &crate::guard::CpuDescrHandle,
     propagate_path: usize,
-) -> (ExecutableBuffer, usize) {
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
     let _ = cpu_handle;
     let mut asm = Assembler::new().expect("malloc_slowpath_headerless: new Assembler");
 
@@ -445,9 +449,8 @@ pub(crate) fn build_malloc_slowpath_headerless(
     let slowpath_fn = crate::runner::dynasm_nursery_slowpath_headerless as *const () as i64;
     build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path);
 
-    let buffer = asm
-        .finalize()
-        .expect("malloc_slowpath_headerless: finalize");
+    let buffer =
+        codebuf::finalize_executable(asm, arena).expect("malloc_slowpath_headerless: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -597,9 +600,9 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // (line 322).  Stage `propagate_path` into a scratch register and
     // jump indirectly so the transfer is range-independent: dynasm-rs's
     // `jmp extern` would lower to `E9 + rel32`, but the malloc slowpath
-    // and propagate trampoline live in separately-finalized
-    // `ExecutableBuffer`s that aren't guaranteed to land within ±2GB
-    // under ASLR, so `finalize()` would otherwise fail with
+    // and propagate trampoline are separate arena blocks that may belong to
+    // different retained mappings and are not guaranteed to land within ±2GB,
+    // so a relative external jump could otherwise fail with
     // `ImpossibleRelocation` and trip the caller's `expect("malloc_slowpath:
     // finalize")` on affected layouts.
     let propagate_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -755,6 +758,8 @@ fn invert_cc(cc: u8) -> u8 {
 pub struct Assembler386<'a> {
     /// The dynasm assembler (rx86.py + codebuf.py combined).
     pub(crate) mc: Assembler,
+    /// `BaseAssembler.asmmemmgr`: destination arena for materialization.
+    asm_memory_manager: Arc<AsmMemoryManager>,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
     /// GC bitmap to push before the current collecting call (e.g.,
@@ -945,11 +950,7 @@ struct GuardToken {
 /// Compiled output from assemble_loop/assemble_bridge.
 pub struct CompiledCode {
     /// Executable memory buffer (keeps code alive).
-    pub buffer: ExecutableBuffer,
-    /// `llmodel.py:252 asmmemmgr_blocks` lifetime accounting token for this
-    /// executable allocation. It is stored on the same object that owns the
-    /// buffer, matching AsmMemoryManager's block ownership upstream.
-    pub(crate) _asmmemmgr_block: Option<majit_backend::AsmMemoryBlock>,
+    pub buffer: codebuf::ArenaExecutableBuffer,
     /// Entry point offset within the buffer.
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
@@ -1002,6 +1003,7 @@ impl<'a> Assembler386<'a> {
     }
     /// assembler.py:54 __init__
     pub(crate) fn new(
+        asm_memory_manager: Arc<AsmMemoryManager>,
         trace_id: u64,
         header_pc: u64,
         constants: majit_ir::ConstMap<majit_ir::Const>,
@@ -1020,6 +1022,7 @@ impl<'a> Assembler386<'a> {
         let op_pos = OpTypeIndex::build_op_pos(operations);
         Assembler386 {
             mc: Assembler::new().unwrap(),
+            asm_memory_manager,
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
@@ -2586,10 +2589,7 @@ impl<'a> Assembler386<'a> {
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
-        let buffer = self
-            .mc
-            .finalize()
-            .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         // assembler.py:849 patch_pending_failure_recoveries
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
@@ -2607,6 +2607,7 @@ impl<'a> Assembler386<'a> {
         unsafe { *self.self_entry_addr_ptr = rawstart + entry.0 };
 
         Self::fixup_target_tokens(tokens, frame_depth, rawstart);
+        buffer.make_executable()?;
 
         // Position is the canonical fail_index identity (matching
         // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
@@ -2619,7 +2620,6 @@ impl<'a> Assembler386<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
-            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,
@@ -2722,10 +2722,7 @@ impl<'a> Assembler386<'a> {
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
-        let buffer = self
-            .mc
-            .finalize()
-            .map_err(|_| BackendError::CompilationFailed("dynasm finalize failed".to_string()))?;
+        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
@@ -2737,6 +2734,7 @@ impl<'a> Assembler386<'a> {
         // CMP at bridge entry reflects the bridge's true requirement.
         Self::patch_stack_checks(self.frame_depth, rawstart, &self.frame_depth_to_patch);
         Self::fixup_target_tokens(tokens, frame_depth, rawstart);
+        buffer.make_executable()?;
 
         if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
@@ -2772,7 +2770,6 @@ impl<'a> Assembler386<'a> {
         // for `fail_index_per_trace()` regardless of their Vec position.
         Ok(CompiledCode {
             buffer,
-            _asmmemmgr_block: None,
             entry_offset: entry,
             fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,

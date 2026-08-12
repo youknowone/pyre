@@ -1,3 +1,5 @@
+mod asm_memory;
+
 /// Cranelift-based JIT code generation backend for majit.
 ///
 /// This crate implements the `majit_backend::Backend` trait using Cranelift

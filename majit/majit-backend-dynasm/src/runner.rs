@@ -1360,10 +1360,10 @@ pub struct DynasmBackend {
     /// store.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     /// `llsupport/asmmemmgr.py:38-40` `cpu.asmmemmgr` parity.  The
-    /// manager is owned by this CPU/backend and shared with every compiled
-    /// code block and per-CPU helper buffer so `get_stats()` observes the
-    /// same allocation/lifetime boundary as upstream.
-    asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
+    /// handle is owned by this CPU/backend and shared with every compiled code
+    /// block and per-CPU helper buffer; its retained inner arena is
+    /// process-owned so worker-backend teardown cannot discard reusable pages.
+    asm_memory_manager: Arc<majit_backend::AsmMemoryManager>,
     /// Next unique trace ID.
     next_trace_id: u64,
     /// Next header PC (green key).
@@ -1474,9 +1474,11 @@ impl DynasmBackend {
         // `compile.make_and_attach_done_descrs([self, cpu])` during
         // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
         let asm_memory_stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
+        let asm_memory_manager =
+            majit_backend::AsmMemoryManager::new(Arc::clone(&asm_memory_stats));
         DynasmBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
-            asm_memory_stats: Arc::clone(&asm_memory_stats),
+            asm_memory_manager: Arc::clone(&asm_memory_manager),
             next_trace_id: 1,
             next_header_pc: 0,
             constants: majit_ir::ConstMap::new(),
@@ -1484,7 +1486,7 @@ impl DynasmBackend {
             descr_attachments: Arc::new(std::sync::RwLock::new(
                 crate::guard::CpuDescrAttachments::default(),
             )),
-            arch_cpu_ext: ArchCpuExt::new(asm_memory_stats),
+            arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
         }
     }
 
@@ -2344,7 +2346,7 @@ impl Backend for DynasmBackend {
     }
 
     fn assembler_memory_stats(&self) -> (usize, usize) {
-        self.asm_memory_stats.get_stats()
+        majit_backend::process_assembler_memory_stats()
     }
 
     fn compile_loop(
@@ -2416,6 +2418,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
         let mut asm = Asm::new(
+            Arc::clone(&self.asm_memory_manager),
             trace_id,
             header_pc,
             const_pool,
@@ -2441,11 +2444,7 @@ impl Backend for DynasmBackend {
             asm.set_gc_table_base(table.base_addr());
         }
         asm.set_invalidated_flag_addr(std::sync::Arc::as_ptr(&token.invalidated) as usize);
-        let mut compiled = asm.assemble_loop()?;
-        compiled._asmmemmgr_block = Some(
-            self.asm_memory_stats
-                .record_block(compiled.buffer.size(), compiled.buffer.len()),
-        );
+        let compiled = asm.assemble_loop()?;
 
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -2672,6 +2671,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_headerless(&self.descr_attachments);
         let mut asm = Asm::new(
+            Arc::clone(&self.asm_memory_manager),
             trace_id,
             0,
             const_pool,
@@ -2711,11 +2711,7 @@ impl Backend for DynasmBackend {
                 .expect("guard_descr is FailDescr"),
             inputargs,
         );
-        let mut compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
-        compiled._asmmemmgr_block = Some(
-            self.asm_memory_stats
-                .record_block(compiled.buffer.size(), compiled.buffer.len()),
-        );
+        let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
@@ -2778,7 +2774,7 @@ impl Backend for DynasmBackend {
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
-        // both the ExecutableBuffer (mapped code) AND the fail_descrs
+        // both the arena-backed mapped code AND the fail_descrs
         // (DescrRef) alive. Recovery stubs embed raw pointers to
         // these Arcs — dropping them would create dangling pointers
         // when a bridge-internal guard fires.  RPython's asmmemmgr

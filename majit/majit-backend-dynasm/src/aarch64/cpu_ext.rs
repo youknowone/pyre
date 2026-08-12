@@ -17,7 +17,7 @@ pub(crate) struct Aarch64CpuExt;
 
 impl Aarch64CpuExt {
     pub(crate) fn new(
-        _asm_memory_stats: std::sync::Arc<majit_backend::AsmMemoryManagerStats>,
+        _asm_memory_manager: std::sync::Arc<majit_backend::AsmMemoryManager>,
     ) -> Self {
         Self
     }

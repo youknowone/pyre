@@ -18,6 +18,8 @@ cranelift-jit = { workspace = true }
 cranelift-module = { workspace = true }
 cranelift-native = { workspace = true }
 target-lexicon = { workspace = true }
+parking_lot = { workspace = true }
+region = { workspace = true }
 
 [dev-dependencies]
 majit-gc = { workspace = true, features = ["gc_box"] }

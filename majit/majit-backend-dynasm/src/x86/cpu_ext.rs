@@ -13,20 +13,20 @@
 //! currently a no-op placeholder — aarch64 inlines the slowpath
 //! sequences today and has no per-CPU trampoline to memoise.
 
+use crate::codebuf::ArenaExecutableBuffer;
 use crate::guard::CpuDescrHandle;
-use dynasmrt::ExecutableBuffer;
-use majit_backend::{AsmMemoryBlock, AsmMemoryManagerStats};
+use majit_backend::AsmMemoryManager;
 use std::sync::Arc;
 
 /// Lazily-materialised per-CPU x86 trampolines.
 ///
 /// Both addresses are set once on first use and reused for every
 /// subsequent `compile_loop` / `compile_bridge` on this CPU.  The
-/// owning `ExecutableBuffer`s are kept alongside so the RX pages are
-/// unmapped exactly when the CPU is dropped — matching PyPy's
-/// `asmmemmgr`, which roots helper buffers on the CPU.
+/// owning arena buffers are kept alongside so their ranges stay live for the
+/// CPU and return to its reusable free list on drop, matching PyPy's
+/// `asmmemmgr` ownership.
 pub(crate) struct X86CpuExt {
-    asm_memory_stats: Arc<AsmMemoryManagerStats>,
+    asm_memory_manager: Arc<AsmMemoryManager>,
     /// `assembler.py:63 self.malloc_slowpath` parity.  Entry address
     /// of the shared malloc slowpath trampoline built by
     /// `build_malloc_slowpath_fixed`.  PyPy's `malloc_cond` (line
@@ -37,32 +37,26 @@ pub(crate) struct X86CpuExt {
     /// `_buffer` is the matching RX mapping kept for the lifetime of
     /// this struct.
     malloc_slowpath_fixed: Option<usize>,
-    _malloc_slowpath_fixed_buffer: Option<ExecutableBuffer>,
-    _malloc_slowpath_fixed_block: Option<AsmMemoryBlock>,
+    _malloc_slowpath_fixed_buffer: Option<ArenaExecutableBuffer>,
     malloc_slowpath_headerless: Option<usize>,
-    _malloc_slowpath_headerless_buffer: Option<ExecutableBuffer>,
-    _malloc_slowpath_headerless_block: Option<AsmMemoryBlock>,
+    _malloc_slowpath_headerless_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath (and, in PyPy,
     /// the stack check slowpath) JMPs to on OOM / propagate.
     propagate_exception_path: Option<usize>,
-    _propagate_exception_path_buffer: Option<ExecutableBuffer>,
-    _propagate_exception_path_block: Option<AsmMemoryBlock>,
+    _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
 }
 
 impl X86CpuExt {
-    pub(crate) fn new(asm_memory_stats: Arc<AsmMemoryManagerStats>) -> Self {
+    pub(crate) fn new(asm_memory_manager: Arc<AsmMemoryManager>) -> Self {
         Self {
-            asm_memory_stats,
+            asm_memory_manager,
             malloc_slowpath_fixed: None,
             _malloc_slowpath_fixed_buffer: None,
-            _malloc_slowpath_fixed_block: None,
             malloc_slowpath_headerless: None,
             _malloc_slowpath_headerless_buffer: None,
-            _malloc_slowpath_headerless_block: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
-            _propagate_exception_path_block: None,
         }
     }
 
@@ -78,15 +72,12 @@ impl X86CpuExt {
         if let Some(addr) = self.propagate_exception_path {
             return addr;
         }
-        let (buffer, addr) = super::assembler::build_propagate_exception_path(cpu_handle);
+        let (buffer, addr) =
+            super::assembler::build_propagate_exception_path(cpu_handle, &self.asm_memory_manager);
         debug_assert!(
             addr != 0,
             "build_propagate_exception_path returned NULL entry address — \
              dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._propagate_exception_path_block = Some(
-            self.asm_memory_stats
-                .record_block(buffer.size(), buffer.len()),
         );
         self._propagate_exception_path_buffer = Some(buffer);
         self.propagate_exception_path = Some(addr);
@@ -108,16 +99,15 @@ impl X86CpuExt {
             return addr;
         }
         let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let (buffer, addr) =
-            super::assembler::build_malloc_slowpath_fixed(cpu_handle, propagate_path);
+        let (buffer, addr) = super::assembler::build_malloc_slowpath_fixed(
+            cpu_handle,
+            propagate_path,
+            &self.asm_memory_manager,
+        );
         debug_assert!(
             addr != 0,
             "build_malloc_slowpath_fixed returned NULL entry address — \
              dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._malloc_slowpath_fixed_block = Some(
-            self.asm_memory_stats
-                .record_block(buffer.size(), buffer.len()),
         );
         self._malloc_slowpath_fixed_buffer = Some(buffer);
         self.malloc_slowpath_fixed = Some(addr);
@@ -132,16 +122,15 @@ impl X86CpuExt {
             return addr;
         }
         let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-        let (buffer, addr) =
-            super::assembler::build_malloc_slowpath_headerless(cpu_handle, propagate_path);
+        let (buffer, addr) = super::assembler::build_malloc_slowpath_headerless(
+            cpu_handle,
+            propagate_path,
+            &self.asm_memory_manager,
+        );
         debug_assert!(
             addr != 0,
             "build_malloc_slowpath_headerless returned NULL entry address — \
              dynasm finalize is expected to yield a non-zero buffer_ptr"
-        );
-        self._malloc_slowpath_headerless_block = Some(
-            self.asm_memory_stats
-                .record_block(buffer.size(), buffer.len()),
         );
         self._malloc_slowpath_headerless_buffer = Some(buffer);
         self.malloc_slowpath_headerless = Some(addr);

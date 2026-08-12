@@ -11,3 +11,6 @@ majit-ir = { workspace = true }
 majit-translate = { workspace = true }
 majit-gc = { workspace = true }
 parking_lot = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+region = { workspace = true }

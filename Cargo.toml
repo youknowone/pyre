@@ -119,12 +119,13 @@ smallvec = "1"
 linkme = "0.3"
 
 # cranelift backend
-cranelift-codegen = "0.132"
-cranelift-frontend = "0.132"
-cranelift-jit = "0.132"
-cranelift-module = "0.132"
-cranelift-native = "0.132"
+cranelift-codegen = "0.134"
+cranelift-frontend = "0.134"
+cranelift-jit = "0.134"
+cranelift-module = "0.134"
+cranelift-native = "0.134"
 target-lexicon = "0.13"
+region = "3"
 
 # dynasm backend
 dynasm = "5"
@@ -141,10 +142,10 @@ wasmparser = "0.225"
 # the `web` build's `getrandom/wasm_js` feature reaches that shared instance.
 getrandom = "0.4.2"
 # Native host runtime for the wasm runner. Pinned to the wasmtime release whose
-# `wasmtime-internal-*` support crates already ride along with cranelift 0.132
+# `wasmtime-internal-*` support crates already ride along with cranelift 0.134
 # (the version the dynasm/cranelift backends use), so it reuses the existing
 # cranelift rather than duplicating it.
-wasmtime = "45"
+wasmtime = "47"
 
 # system
 libc = "0.2"

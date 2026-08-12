@@ -13,7 +13,8 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types as cl_types;
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -89,6 +90,7 @@ fn majit_verify_enabled() -> bool {
     *ENABLED
 }
 
+use crate::asm_memory::{CraneliftArenaHandle, CraneliftArenaMemoryProvider};
 use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
 
 // `compile.py:665-674` `done_with_this_frame` singletons
@@ -1237,7 +1239,7 @@ fn coerce_ty(
     if builder.func.dfg.value_type(val) == want {
         val
     } else {
-        builder.ins().bitcast(want, MemFlags::new(), val)
+        builder.ins().bitcast(want, MemFlagsData::new(), val)
     }
 }
 
@@ -1377,7 +1379,9 @@ fn resolve_opref_vec_int(
         let v = builder.use_var(var(opref.raw()));
         if vec_float_oprefs.contains(&opref.raw()) {
             // Variable is F64X2, bitcast to I64X2
-            return builder.ins().bitcast(cl_types::I64X2, MemFlags::new(), v);
+            return builder
+                .ins()
+                .bitcast(cl_types::I64X2, MemFlagsData::new(), v);
         }
         return v;
     }
@@ -1400,7 +1404,7 @@ fn resolve_opref_vec_float(
         let scalar_i = builder.ins().iconst(cl_types::I64, c);
         let scalar_f = builder
             .ins()
-            .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+            .bitcast(cl_types::F64, MemFlagsData::new(), scalar_i);
         return builder.ins().splat(cl_types::F64X2, scalar_f);
     }
     if vec_oprefs.contains(&opref.raw()) {
@@ -1410,7 +1414,9 @@ fn resolve_opref_vec_float(
             return v;
         }
         // I64X2 -> F64X2 bitcast
-        return builder.ins().bitcast(cl_types::F64X2, MemFlags::new(), v);
+        return builder
+            .ins()
+            .bitcast(cl_types::F64X2, MemFlagsData::new(), v);
     }
     // Scalar variable: reinterpret as f64 (a float var is already F64) then splat
     let scalar = builder.use_var(var(opref.raw()));
@@ -3319,10 +3325,10 @@ fn emit_call_header_shadowstack(
     // MOV ebx, [root_stack_top_addr]
     let rst = builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), rst_addr_val, 0);
+        .load(ptr_type, MemFlagsData::trusted(), rst_addr_val, 0);
     // MOV [ebx], 1   — is_minor marker
     let one = builder.ins().iconst(ptr_type, 1);
-    builder.ins().store(MemFlags::trusted(), one, rst, 0);
+    builder.ins().store(MemFlagsData::trusted(), one, rst, 0);
     // MOV [ebx + WORD], ebp
     let jf_as_ptr = if builder.func.dfg.value_type(jf_ptr) != ptr_type {
         builder.ins().ireduce(ptr_type, jf_ptr)
@@ -3331,13 +3337,13 @@ fn emit_call_header_shadowstack(
     };
     builder
         .ins()
-        .store(MemFlags::trusted(), jf_as_ptr, rst, word as i32);
+        .store(MemFlagsData::trusted(), jf_as_ptr, rst, word as i32);
     // ADD ebx, 2*WORD
     let new_rst = builder.ins().iadd_imm(rst, 2 * word);
     // MOV [root_stack_top_addr], ebx
     builder
         .ins()
-        .store(MemFlags::trusted(), new_rst, rst_addr_val, 0);
+        .store(MemFlagsData::trusted(), new_rst, rst_addr_val, 0);
 }
 
 /// assembler.py:1130-1136 _call_footer_shadowstack — inline Cranelift IR.
@@ -3357,11 +3363,11 @@ fn emit_call_footer_shadowstack(
     );
     let rst = builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), rst_addr_val, 0);
+        .load(ptr_type, MemFlagsData::trusted(), rst_addr_val, 0);
     let new_rst = builder.ins().iadd_imm(rst, -(2 * word));
     builder
         .ins()
-        .store(MemFlags::trusted(), new_rst, rst_addr_val, 0);
+        .store(MemFlagsData::trusted(), new_rst, rst_addr_val, 0);
 }
 
 /// x86/assembler.py:1630-1641 `genop_discard_check_memory_error` /
@@ -3404,25 +3410,25 @@ fn emit_memory_error_check(
         let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
         let exc_val = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), exc_val_addr, 0);
         builder
             .ins()
-            .store(MemFlags::trusted(), zero, exc_val_addr, 0);
+            .store(MemFlagsData::trusted(), zero, exc_val_addr, 0);
         let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
         builder
             .ins()
-            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+            .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
         // assembler.py:336-340 — MOV [jf_guard_exc], tmp; MOV [jf_descr], descr.
         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
         builder
             .ins()
-            .store(MemFlags::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
+            .store(MemFlagsData::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
         let descr_val = builder
             .ins()
             .iconst(ptr_type, propagate_exception_descr_ptr as i64);
         builder
             .ins()
-            .store(MemFlags::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
+            .store(MemFlagsData::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
         emit_call_footer_shadowstack(builder, ptr_type);
         builder.ins().return_(&[cur_jf]);
     }
@@ -5500,7 +5506,7 @@ fn resolve_failarg_opref(
     if let Some(offset) = demoted_failarg_offset(demoted_failarg_slots, opref.raw()) {
         return builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
+            .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, offset);
     }
     if let Some((_, root_slot)) = ref_root_slots
         .iter()
@@ -5509,7 +5515,7 @@ fn resolve_failarg_opref(
         let root_offset = ref_root_base_ofs + (*root_slot as i32) * 8;
         return builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, root_offset);
+            .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, root_offset);
     }
     resolve_opref(builder, constants, opref)
 }
@@ -5539,7 +5545,7 @@ fn resolve_local_jump_arg(
         let jf_ptr = cached_pinned_reg(builder, ptr_type, cached_jf_ptr);
         return builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
+            .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, offset);
     }
     resolve_opref(builder, constants, opref)
 }
@@ -5659,12 +5665,12 @@ fn emit_load_from_addr(
     signed: bool,
     opcode: OpCode,
 ) -> Result<CValue, BackendError> {
-    // Use non-trusted MemFlags so Cranelift does NOT speculate loads
+    // Use non-trusted MemFlagsData so Cranelift does NOT speculate loads
     // past guards. With trusted(), Cranelift can hoist a load before
     // a GuardNonnull branch, causing SEGFAULT on null pointers.
     // RPython's x86 backend emits in IR order (no scheduling), so
     // loads after guards are safe. Cranelift needs this annotation.
-    let heap_flags = MemFlags::new();
+    let heap_flags = MemFlagsData::new();
     match value_type {
         Type::Float => {
             if size != 8 {
@@ -5723,7 +5729,7 @@ fn emit_store_to_addr(
                 ));
             }
             let fval = coerce_ty(builder, value, cl_types::F64);
-            builder.ins().store(MemFlags::trusted(), fval, addr, 0);
+            builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
         }
         Type::Int | Type::Ref => {
             if value_type == Type::Ref && size != 8 {
@@ -5742,7 +5748,9 @@ fn emit_store_to_addr(
             } else {
                 builder.ins().ireduce(mem_ty, value)
             };
-            builder.ins().store(MemFlags::trusted(), store_val, addr, 0);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), store_val, addr, 0);
         }
         Type::Void => {
             return Err(unsupported_semantics(
@@ -5846,7 +5854,9 @@ fn spill_ref_roots(
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder.use_var(var(var_idx));
-        builder.ins().store(MemFlags::new(), val, jf_ptr, offset);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), val, jf_ptr, offset);
     }
 }
 
@@ -5877,7 +5887,7 @@ fn reload_ref_roots(
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), jf_ptr, offset);
+            .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, offset);
         builder.def_var(var(var_idx), val);
     }
 }
@@ -5895,7 +5905,9 @@ fn sync_ref_root_var(
     if let Some((_, slot)) = ref_root_slots.iter().find(|(idx, _)| *idx == var_idx) {
         let offset = ref_root_base_ofs + (*slot as i32) * 8;
         let jf_ptr = cached_pinned_reg(builder, ptr_type, cached_jf_ptr);
-        builder.ins().store(MemFlags::new(), value, jf_ptr, offset);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), value, jf_ptr, offset);
         synced_ref_vars.insert(var_idx);
     }
 }
@@ -6086,11 +6098,11 @@ fn emit_reload_frame_if_necessary(
     );
     let rst = builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), rst_addr, 0);
+        .load(ptr_type, MemFlagsData::trusted(), rst_addr, 0);
     // MOV ebp, [ecx - WORD]  — jf_ptr is at top - WORD
     builder
         .ins()
-        .load(ptr_type, MemFlags::trusted(), rst, -word)
+        .load(ptr_type, MemFlagsData::trusted(), rst, -word)
 }
 
 /// llsupport/llmodel.py:229-234 `insert_stack_check` plus
@@ -6115,11 +6127,11 @@ fn emit_stack_check_result(
         let end_addr = builder.ins().iconst(ptr_type, addrs.end_adr as i64);
         let end = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), end_addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), end_addr, 0);
         let length_addr = builder.ins().iconst(ptr_type, addrs.length_adr as i64);
         let length = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), length_addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), length_addr, 0);
         let ofs = builder.ins().isub(end, current);
         let overflow_candidate = builder.ins().icmp(IntCC::UnsignedGreaterThan, ofs, length);
 
@@ -6181,7 +6193,7 @@ fn emit_push_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, per_call_gcmap
     let gcmap_val = builder.ins().iconst(cl_types::I64, per_call_gcmap);
     builder
         .ins()
-        .store(MemFlags::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
 }
 
 /// RPython pop_gcmap (assembler.py:2024-2027):
@@ -6192,7 +6204,7 @@ fn emit_pop_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, _per_call_gcmap
     let zero = builder.ins().iconst(cl_types::I64, 0);
     builder
         .ins()
-        .store(MemFlags::new(), zero, jf_ptr, JF_GCMAP_OFS);
+        .store(MemFlagsData::new(), zero, jf_ptr, JF_GCMAP_OFS);
 }
 
 fn emit_jitframe_write_barrier(
@@ -6426,7 +6438,7 @@ fn emit_cmp_guard_class(
         // x86/assembler.py:1884-1885 vtable_offset path: full classptr CMP.
         let actual_class = builder
             .ins()
-            .load(ptr_type, MemFlags::trusted(), obj, off as i32);
+            .load(ptr_type, MemFlagsData::trusted(), obj, off as i32);
         builder
             .ins()
             .icmp(IntCC::NotEqual, actual_class, expected_class)
@@ -6461,7 +6473,7 @@ fn emit_cmp_guard_class(
         // typeid is a 32-bit half-word at offset 0 of the object.
         let actual_typeid = builder
             .ins()
-            .load(cl_types::I32, MemFlags::trusted(), obj, 0);
+            .load(cl_types::I32, MemFlagsData::trusted(), obj, 0);
         let expected_typeid_val = builder.ins().iconst(cl_types::I32, expected_typeid as i64);
         builder
             .ins()
@@ -6514,7 +6526,7 @@ fn emit_attached_bridge_dispatch(
     let bridge_body =
         builder
             .ins()
-            .atomic_load(ptr_type, MemFlags::trusted(), bridge_body_cache_ptr);
+            .atomic_load(ptr_type, MemFlagsData::trusted(), bridge_body_cache_ptr);
     let null_ptr = builder.ins().iconst(ptr_type, 0);
     let has_bridge = builder.ins().icmp(IntCC::NotEqual, bridge_body, null_ptr);
     let bridge_block = builder.create_block();
@@ -6595,7 +6607,7 @@ fn emit_attached_loop_dispatch(
     let cell_ptr = builder.ins().iconst(ptr_type, ll_loop_code_addr as i64);
     let entry = builder
         .ins()
-        .atomic_load(ptr_type, MemFlags::trusted(), cell_ptr);
+        .atomic_load(ptr_type, MemFlagsData::trusted(), cell_ptr);
     let null = builder.ins().iconst(ptr_type, 0);
     let has_entry = builder.ins().icmp(IntCC::NotEqual, entry, null);
     let check_block_id = builder.create_block();
@@ -6625,7 +6637,7 @@ fn emit_attached_loop_dispatch(
     let lbid_ptr = builder.ins().iconst(ptr_type, label_block_id_addr as i64);
     let lbid = builder
         .ins()
-        .load(cl_types::I32, MemFlags::trusted(), lbid_ptr, 0);
+        .load(cl_types::I32, MemFlagsData::trusted(), lbid_ptr, 0);
     let check_depth_block = builder.create_block();
     builder.append_block_param(check_depth_block, ptr_type);
     builder
@@ -6652,12 +6664,13 @@ fn emit_attached_loop_dispatch(
     let depth_cell_ptr = builder
         .ins()
         .iconst(ptr_type, target_frame_depth_addr as i64);
-    let target_depth = builder
-        .ins()
-        .load(cl_types::I64, MemFlags::trusted(), depth_cell_ptr, 0);
+    let target_depth =
+        builder
+            .ins()
+            .load(cl_types::I64, MemFlagsData::trusted(), depth_cell_ptr, 0);
     let frame_len = builder.ins().load(
         cl_types::I64,
-        MemFlags::trusted(),
+        MemFlagsData::trusted(),
         jf_ptr,
         JF_FRAME_LENGTH_OFS,
     );
@@ -6806,7 +6819,7 @@ fn emit_guard_exit(
                 };
                 builder
                     .ins()
-                    .bitcast(cl_types::I64, MemFlags::new(), scalar_f)
+                    .bitcast(cl_types::I64, MemFlagsData::new(), scalar_f)
             } else {
                 // _accum_reduce_sum INT (vector_ext.py:174-179):
                 // PEXTRQ lane0, PEXTRQ lane1, ADD
@@ -6820,7 +6833,7 @@ fn emit_guard_exit(
             };
             builder
                 .ins()
-                .store(MemFlags::trusted(), reduced, jf_ptr, offset);
+                .store(MemFlagsData::trusted(), reduced, jf_ptr, offset);
         } else {
             let val = resolve_failarg_opref(
                 builder,
@@ -6834,7 +6847,7 @@ fn emit_guard_exit(
             );
             builder
                 .ins()
-                .store(MemFlags::trusted(), val, jf_ptr, offset);
+                .store(MemFlagsData::trusted(), val, jf_ptr, offset);
         }
     }
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
@@ -6919,7 +6932,7 @@ fn emit_guard_exit(
             .iconst(cl_types::I64, gcmap_arr.as_ptr() as i64);
         builder
             .ins()
-            .store(MemFlags::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
+            .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     }
     // _build_failure_recovery (assembler.py:2089-2096) parity:
     // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
@@ -6933,18 +6946,20 @@ fn emit_guard_exit(
             .iconst(cl_types::I64, jit_exc_value_addr() as i64);
         let exc_val = builder
             .ins()
-            .load(cl_types::I64, MemFlags::trusted(), exc_addr, 0);
+            .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
         builder
             .ins()
-            .store(MemFlags::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+            .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
         let zero = builder.ins().iconst(cl_types::I64, 0);
-        builder.ins().store(MemFlags::trusted(), zero, exc_addr, 0);
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, exc_addr, 0);
         let exc_type_addr = builder
             .ins()
             .iconst(cl_types::I64, jit_exc_type_addr() as i64);
         builder
             .ins()
-            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+            .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
     }
     if info.gcmap != 0 || info.must_save_exception {
         // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`:
@@ -6959,7 +6974,7 @@ fn emit_guard_exit(
     }
     builder
         .ins()
-        .store(MemFlags::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
+        .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
     // assembler.py:1101 _call_footer → _call_footer_shadowstack:
     // SUB [rootstacktop], 2*WORD — inline, no function call.
     emit_call_footer_shadowstack(builder, ptr_type);
@@ -6983,6 +6998,8 @@ struct CompiledLoop {
     /// bridge dispatched from a parent guard.
     body_ptr: *const u8,
     code_size: usize,
+    /// Finalized native ranges awaiting transfer to the owning CLT.
+    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
     fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `RegisteredLoopTarget::fail_descr_cells`).
@@ -8012,27 +8029,8 @@ pub struct CraneliftBackend {
     /// counterpart for the shared-Arc pairing rationale with the
     /// metainterp `JitProfiler`.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
-    /// `asmmemmgr.py:28` `AsmMemoryManager` parity — the CPU owns the
-    /// accounting `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. Cranelift
-    /// has no `AsmMemoryManager` of its own: the memory lives inside
-    /// `JITModule`'s provider, which does not publish what it mapped, so
-    /// `record_block` is given the finalized code size for both figures.
-    ///
-    /// That makes `allocated` an *under*count, not a page-rounded one: the
-    /// default `SystemMemoryProvider` page-rounds its anonymous mappings, so
-    /// the pages it holds exceed the machine-code length recorded here.
-    asm_memory_stats: Arc<majit_backend::AsmMemoryManagerStats>,
-    /// Lifetime tokens for the blocks recorded above. They are held for the
-    /// backend's whole life because nothing shorter is correct: the default
-    /// provider does not free on drop. `Memory`'s `Drop` `mem::forget`s every
-    /// allocation ("leak memory to guarantee validity of function pointers"),
-    /// and the only release is `unsafe JITModule::free_memory(self)`, which
-    /// consumes the module and which this backend never calls. So the code
-    /// outlives the process's use of it, and `used` is given back at backend
-    /// teardown rather than when the code stops existing. `allocated` is never
-    /// given back, which is `asmmemmgr.py:90`'s shape: an arena counts once
-    /// and is never un-counted.
-    asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
+    /// `cpu.asmmemmgr` view into the provider moved into `JITModule`.
+    asm_memory_handle: CraneliftArenaHandle,
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     /// Constant pool keyed by OpRef raw index. Each `Const` carries its
@@ -8286,14 +8284,18 @@ impl CraneliftBackend {
             .finish(settings::Flags::new(flag_builder))
             .unwrap();
 
-        let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let asm_memory_stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
+        let asm_memory_manager =
+            majit_backend::AsmMemoryManager::new(Arc::clone(&asm_memory_stats));
+        let (provider, asm_memory_handle) = CraneliftArenaMemoryProvider::new(asm_memory_manager);
+        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        jit_builder.memory_provider(Box::new(provider));
         let module = JITModule::new(jit_builder);
         let func_ctx = FunctionBuilderContext::new();
 
         CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
-            asm_memory_stats: Arc::new(majit_backend::AsmMemoryManagerStats::default()),
-            asm_memory_blocks: Vec::new(),
+            asm_memory_handle,
             module,
             func_ctx,
             constants: majit_ir::ConstMap::new(),
@@ -8458,7 +8460,7 @@ impl CraneliftBackend {
                 .get()
                 .and_then(|info| info.jitframe_descrs.clone()),
             // llmodel.py:39 default. Cranelift lowers GcStoreIndexed via
-            // ir::MemFlags and explicit offset arithmetic rather than an
+            // ir::MemFlagsData and explicit offset arithmetic rather than an
             // ISA scaled addressing mode, so we keep the rewriter in the
             // "pre-scale everything" contract that the lowering expects.
             load_supported_factors: &[1],
@@ -8835,7 +8837,8 @@ impl CraneliftBackend {
         // build-time store, which decodes the same `-live-` marker to a
         // different — and silently plausible — count.
         let frame_value_count_fn = self.next_frame_value_count_fn.take();
-        let ptr_type = self.module.target_config().pointer_type();
+        let frontend_config = self.module.target_config();
+        let ptr_type = frontend_config.pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
         // The body uses CallConv::Tail so it can `return_call_indirect` to
         // another body's entry — `assembler.py:2456-2462 closing_jump` raw
@@ -9160,7 +9163,7 @@ impl CraneliftBackend {
             // `LDR_ri(r.ip0.value, r.fp.value, ofs)` parity.
             let frame_len = builder.ins().load(
                 cl_types::I64,
-                MemFlags::trusted(),
+                MemFlagsData::trusted(),
                 initial_jf_ptr,
                 JF_FRAME_LENGTH_OFS,
             );
@@ -9519,7 +9522,7 @@ impl CraneliftBackend {
                 let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                 builder
                     .ins()
-                    .load(cl_types::I64, MemFlags::trusted(), inputs_ptr, offset)
+                    .load(cl_types::I64, MemFlagsData::trusted(), inputs_ptr, offset)
             })
             .collect();
 
@@ -9718,7 +9721,7 @@ impl CraneliftBackend {
                     for &(i, raw, root_ofs) in positions {
                         let v = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             cur_jf,
                             JF_FRAME_ITEM0_OFS + (i as i32) * 8,
                         );
@@ -9737,7 +9740,7 @@ impl CraneliftBackend {
                     for &(i, _raw, home_ofs) in positions {
                         let v = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             cur_jf,
                             JF_FRAME_ITEM0_OFS + (i as i32) * 8,
                         );
@@ -9750,7 +9753,7 @@ impl CraneliftBackend {
                         let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), cur_jf, offset)
+                            .load(cl_types::I64, MemFlagsData::trusted(), cur_jf, offset)
                     })
                     .collect();
                 // Ref-root re-syncs go after every dense carried-slot load:
@@ -9760,7 +9763,9 @@ impl CraneliftBackend {
                 // read (same hazard `deferred_entry_root_syncs` defers past
                 // the dispatch above).
                 for &(v, root_ofs) in &demoted_root_syncs {
-                    builder.ins().store(MemFlags::new(), v, cur_jf, root_ofs);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::new(), v, cur_jf, root_ofs);
                 }
                 let args = block_args_to(&mut builder, label_block, &vals);
                 builder.ins().jump(label_block, &args);
@@ -9852,7 +9857,7 @@ impl CraneliftBackend {
                                 let opref = label_args[i].to_opref();
                                 let v = resolve_opref(&mut builder, &constants, opref);
                                 let v = coerce_ty(&mut builder, v, cl_types::I64);
-                                builder.ins().store(MemFlags::new(), v, cur_jf, ofs);
+                                builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
                                 synced_ref_vars.insert(raw);
                                 demoted_failarg_slots.insert(raw, ofs);
                             }
@@ -9868,7 +9873,9 @@ impl CraneliftBackend {
                                 let opref = label_args[i].to_opref();
                                 let v = resolve_opref(&mut builder, &constants, opref);
                                 let v = coerce_ty(&mut builder, v, cl_types::I64);
-                                builder.ins().store(MemFlags::new(), v, cur_jf, home_ofs);
+                                builder
+                                    .ins()
+                                    .store(MemFlagsData::new(), v, cur_jf, home_ofs);
                                 demoted_failarg_slots.insert(raw, home_ofs);
                             }
                         }
@@ -9890,10 +9897,12 @@ impl CraneliftBackend {
                     if let Some(positions) = demoted_ref_positions_by_label.get(&op_idx) {
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         for &(_, raw, ofs) in positions {
-                            let value =
-                                builder
-                                    .ins()
-                                    .load(cl_types::I64, MemFlags::trusted(), cur_jf, ofs);
+                            let value = builder.ins().load(
+                                cl_types::I64,
+                                MemFlagsData::trusted(),
+                                cur_jf,
+                                ofs,
+                            );
                             builder.def_var(var(raw), value);
                         }
                     }
@@ -10425,7 +10434,7 @@ impl CraneliftBackend {
                     let exc_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
                     let exc_val = builder.ins().load(
                         cl_types::I64,
-                        cranelift_codegen::ir::MemFlags::trusted(),
+                        cranelift_codegen::ir::MemFlagsData::trusted(),
                         exc_addr,
                         0,
                     );
@@ -10476,10 +10485,12 @@ impl CraneliftBackend {
                         resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // Inline: load pos_exception (exc type)
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
-                    let exc_type =
-                        builder
-                            .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
+                    let exc_type = builder.ins().load(
+                        cl_types::I64,
+                        MemFlagsData::trusted(),
+                        exc_type_addr,
+                        0,
+                    );
                     // CMP exc_type, expected
                     let mismatch = builder.ins().icmp(IntCC::NotEqual, exc_type, expected_type);
                     let exit_block = builder.create_block();
@@ -10519,14 +10530,14 @@ impl CraneliftBackend {
                     let exc_val =
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+                            .load(cl_types::I64, MemFlagsData::trusted(), exc_val_addr, 0);
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+                        .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, exc_val_addr, 0);
+                        .store(MemFlagsData::trusted(), zero, exc_val_addr, 0);
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_val);
                 }
@@ -10625,7 +10636,7 @@ impl CraneliftBackend {
 
                     let jf_descr = builder.ins().load(
                         cl_types::I64,
-                        MemFlags::trusted(),
+                        MemFlagsData::trusted(),
                         jf_ptr,
                         JF_DESCR_OFS,
                     );
@@ -10679,9 +10690,12 @@ impl CraneliftBackend {
                     // _store_force_index(op): store descr to jf_force_descr
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
+                    builder.ins().store(
+                        MemFlagsData::trusted(),
+                        descr_val,
+                        cur_jf,
+                        JF_FORCE_DESCR_OFS,
+                    );
 
                     // implement_guard_recovery / _update_at_exit parity:
                     // Write fail_arg values to jf_frame[0..n] in fail_args order.
@@ -10697,7 +10711,7 @@ impl CraneliftBackend {
                             arg_ref,
                         );
                         builder.ins().store(
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             raw,
                             cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
@@ -10719,7 +10733,7 @@ impl CraneliftBackend {
                         let flag_val =
                             builder
                                 .ins()
-                                .load(cl_types::I8, MemFlags::trusted(), addr_val, 0);
+                                .load(cl_types::I8, MemFlagsData::trusted(), addr_val, 0);
                         let zero = builder.ins().iconst(cl_types::I8, 0);
                         let is_invalidated = builder.ins().icmp(IntCC::NotEqual, flag_val, zero);
 
@@ -10835,7 +10849,7 @@ impl CraneliftBackend {
                     let hdr_word =
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                            .load(cl_types::I64, MemFlagsData::trusted(), hdr_addr, 0);
                     // Extract type_id (lower 32 bits)
                     let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
                     let actual_tid = builder.ins().band(hdr_word, tid_mask);
@@ -10915,7 +10929,7 @@ impl CraneliftBackend {
                     let hdr_word =
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                            .load(cl_types::I64, MemFlagsData::trusted(), hdr_addr, 0);
                     let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
                     let loc_typeid = builder.ins().band(hdr_word, tid_mask);
 
@@ -10943,7 +10957,7 @@ impl CraneliftBackend {
                     let byte =
                         builder
                             .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), loc_infobits, 0);
+                            .load(cl_types::I8, MemFlagsData::trusted(), loc_infobits, 0);
                     let mask = builder.ins().iconst(cl_types::I8, is_object_flag as i64);
                     let masked = builder.ins().band(byte, mask);
                     let zero_i8 = builder.ins().iconst(cl_types::I8, 0);
@@ -11049,13 +11063,13 @@ impl CraneliftBackend {
                         //     self.mc.MOV_rm(loc_tmp, (loc_tmp, offset2))
                         let vtable_ptr_val = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             loc_object,
                             vtable_off as i32,
                         );
                         builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             vtable_ptr_val,
                             offset2 as i32,
                         )
@@ -11070,7 +11084,7 @@ impl CraneliftBackend {
                         let hdr_word =
                             builder
                                 .ins()
-                                .load(cl_types::I64, MemFlags::trusted(), hdr_addr, 0);
+                                .load(cl_types::I64, MemFlagsData::trusted(), hdr_addr, 0);
                         let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
                         let typeid = builder.ins().band(hdr_word, tid_mask);
                         let (base_type_info, shift_by, sizeof_ti) =
@@ -11087,7 +11101,7 @@ impl CraneliftBackend {
                             .iadd_imm(addr_base, (sizeof_ti + offset2) as i64);
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), addr, 0)
+                            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0)
                     };
 
                     // assembler.py:1971-1974 read the bounds from the
@@ -11152,15 +11166,15 @@ impl CraneliftBackend {
                     let exc_val =
                         builder
                             .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+                            .load(cl_types::I64, MemFlagsData::trusted(), exc_val_addr, 0);
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+                        .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero, exc_val_addr, 0);
+                        .store(MemFlagsData::trusted(), zero, exc_val_addr, 0);
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_val);
                 }
@@ -11168,10 +11182,12 @@ impl CraneliftBackend {
                     // x86/assembler.py:1817-1818 genop_save_exc_class:
                     //   MOV resloc, [pos_exception]
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
-                    let exc_type =
-                        builder
-                            .ins()
-                            .load(cl_types::I64, MemFlags::trusted(), exc_type_addr, 0);
+                    let exc_type = builder.ins().load(
+                        cl_types::I64,
+                        MemFlagsData::trusted(),
+                        exc_type_addr,
+                        0,
+                    );
                     let vi = op_var_index(op, op_idx, inputargs.len());
                     builder.def_var(var(vi as u32), exc_type);
                 }
@@ -11185,10 +11201,10 @@ impl CraneliftBackend {
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), value, exc_val_addr, 0);
+                        .store(MemFlagsData::trusted(), value, exc_val_addr, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), exc_type, exc_type_addr, 0);
+                        .store(MemFlagsData::trusted(), exc_type, exc_type_addr, 0);
                 }
                 OpCode::CheckMemoryError => {
                     // x86/assembler.py:1630-1641 `genop_discard_check_memory_error`
@@ -11313,7 +11329,7 @@ impl CraneliftBackend {
                         let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         builder.ins().store(
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             descr_val,
                             cur_jf,
                             JF_FORCE_DESCR_OFS,
@@ -11324,7 +11340,7 @@ impl CraneliftBackend {
                         let zero = builder.ins().iconst(cl_types::I64, 0);
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), zero, cur_jf, JF_DESCR_OFS);
+                            .store(MemFlagsData::trusted(), zero, cur_jf, JF_DESCR_OFS);
                     }
 
                     // rewrite.py:613-653 gen_malloc_frame parity:
@@ -11391,7 +11407,7 @@ impl CraneliftBackend {
                             let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
                             builder
                                 .ins()
-                                .load(ptr_type, MemFlags::trusted(), entry_ptr, 0)
+                                .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
                         };
                         let expected_finish_descr_ptr = self
                             .attached_descr_ptrs()
@@ -11483,7 +11499,7 @@ impl CraneliftBackend {
                         //   CMP [eax + jf_descr_ofs], done_with_this_frame_descr
                         let fail_idx_raw = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             result_jf,
                             JF_DESCR_OFS,
                         );
@@ -11517,7 +11533,7 @@ impl CraneliftBackend {
                         builder.seal_block(direct_finish_block);
                         let direct_result = builder.ins().load(
                             cl_types::I64,
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             result_jf,
                             JF_FRAME_ITEM0_OFS,
                         );
@@ -11659,7 +11675,10 @@ impl CraneliftBackend {
                     );
                     mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
 
-                    let outcome_kind = builder.ins().stack_load(cl_types::I64, outcome_slot, 0);
+                    let outcome_kind =
+                        builder
+                            .ins()
+                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 0);
                     let finish_kind = builder
                         .ins()
                         .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
@@ -11676,9 +11695,12 @@ impl CraneliftBackend {
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    let deadframe_handle = builder.ins().stack_load(cl_types::I64, outcome_slot, 8);
+                    let deadframe_handle =
+                        builder
+                            .ins()
+                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 8);
                     builder.ins().store(
-                        MemFlags::trusted(),
+                        MemFlagsData::trusted(),
                         deadframe_handle,
                         jf_ptr,
                         JF_FRAME_ITEM0_OFS,
@@ -11688,7 +11710,7 @@ impl CraneliftBackend {
                         .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
+                        .store(MemFlagsData::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
                     // assembler.py:1130-1136 _call_footer_shadowstack — inline SUB
                     emit_call_footer_shadowstack(&mut builder, ptr_type);
                     builder.ins().return_(&[jf_ptr]);
@@ -11731,9 +11753,12 @@ impl CraneliftBackend {
                     // forces the frame, force() reads this to set jf_descr.
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
+                    builder.ins().store(
+                        MemFlagsData::trusted(),
+                        descr_val,
+                        cur_jf,
+                        JF_FORCE_DESCR_OFS,
+                    );
 
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
@@ -11762,7 +11787,7 @@ impl CraneliftBackend {
                             )
                         };
                         builder.ins().store(
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             raw,
                             cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
@@ -11812,9 +11837,12 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), descr_val, cur_jf, JF_FORCE_DESCR_OFS);
+                    builder.ins().store(
+                        MemFlagsData::trusted(),
+                        descr_val,
+                        cur_jf,
+                        JF_FORCE_DESCR_OFS,
+                    );
 
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
@@ -11842,7 +11870,7 @@ impl CraneliftBackend {
                             )
                         };
                         builder.ins().store(
-                            MemFlags::trusted(),
+                            MemFlagsData::trusted(),
                             raw,
                             cur_jf,
                             JF_FRAME_ITEM0_OFS + (index as i32) * 8,
@@ -12119,7 +12147,7 @@ impl CraneliftBackend {
                     // `nursery_top` reported as 0) the op stays on the helper.
                     let inline_bump = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
                     if let Some((nf_addr, nt_addr)) = inline_bump {
-                        let flags = MemFlags::trusted();
+                        let flags = MemFlagsData::trusted();
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
                         let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
@@ -12294,7 +12322,7 @@ impl CraneliftBackend {
                         // Slow path passes GC-updated values from jitframe.
                         let (nf_addr, nt_addr) =
                             gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                        let flags = MemFlags::trusted();
+                        let flags = MemFlagsData::trusted();
                         // history.py:227 ConstInt.value inline — read directly
                         // from `OpRef::ConstInt(v)`, fall through to the
                         // legacy pool for `OpRef::ConstInt(idx)` arms.
@@ -12340,7 +12368,9 @@ impl CraneliftBackend {
                         builder.seal_block(fast_block);
                         builder.ins().store(flags, new_free, nf_ptr, 0);
                         let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
-                        builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
+                        builder
+                            .ins()
+                            .store(MemFlagsData::trusted(), zero_hdr, free, 0);
                         let hdr_sz = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                         let obj = builder.ins().iadd(free, hdr_sz);
                         // Pass original values through block params
@@ -12485,7 +12515,7 @@ impl CraneliftBackend {
                     // slow path installs the gcmap and spills/reloads roots.
                     let (nf_addr, nt_addr) =
                         gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let flags = MemFlags::trusted();
+                    let flags = MemFlagsData::trusted();
                     let size_total = resolve_opref_or_imm(
                         &mut builder,
                         &constants,
@@ -12525,7 +12555,9 @@ impl CraneliftBackend {
                     builder.seal_block(fast_block);
                     builder.ins().store(flags, new_free, nf_ptr, 0);
                     let zero_hdr = builder.ins().iconst(cl_types::I64, 0);
-                    builder.ins().store(MemFlags::trusted(), zero_hdr, free, 0);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), zero_hdr, free, 0);
                     let header_size = builder.ins().iconst(ptr_type, GcHeader::SIZE as i64);
                     let obj_ptr = builder.ins().iadd(free, header_size);
                     let mut fast_args: Vec<BlockArg> =
@@ -12610,7 +12642,7 @@ impl CraneliftBackend {
                     let zero_gcmap = builder.ins().iconst(cl_types::I64, 0);
                     builder
                         .ins()
-                        .store(MemFlags::trusted(), zero_gcmap, result, JF_GCMAP_OFS);
+                        .store(MemFlagsData::trusted(), zero_gcmap, result, JF_GCMAP_OFS);
                     builder.def_var(var(vi), result);
                 }
 
@@ -12646,7 +12678,7 @@ impl CraneliftBackend {
                     let flag_byte =
                         builder
                             .ins()
-                            .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
+                            .load(cl_types::I8, MemFlagsData::trusted(), obj, wb_byteofs);
                     let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
                     let mask_val = builder.ins().iconst(cl_types::I64, wb_mask & 0xFF);
                     let test = builder.ins().band(flag_ext, mask_val);
@@ -12690,10 +12722,12 @@ impl CraneliftBackend {
                         );
 
                         // opassembler.py:982-987: post-helper re-load + re-test CARDS_SET.
-                        let flag_byte2 =
-                            builder
-                                .ins()
-                                .load(cl_types::I8, MemFlags::trusted(), obj, wb_byteofs);
+                        let flag_byte2 = builder.ins().load(
+                            cl_types::I8,
+                            MemFlagsData::trusted(),
+                            obj,
+                            wb_byteofs,
+                        );
                         let flag_ext2 = builder.ins().uextend(cl_types::I64, flag_byte2);
                         let cards_test2 = builder.ins().band(flag_ext2, cards_mask);
                         let has_cards2 = builder.ins().icmp(IntCC::NotEqual, cards_test2, zero);
@@ -12720,13 +12754,13 @@ impl CraneliftBackend {
                         let card_byte =
                             builder
                                 .ins()
-                                .load(cl_types::I8, MemFlags::trusted(), card_addr, 0);
+                                .load(cl_types::I8, MemFlagsData::trusted(), card_addr, 0);
                         let card_ext = builder.ins().uextend(cl_types::I64, card_byte);
                         let card_new = builder.ins().bor(card_ext, bit_mask);
                         let card_trunc = builder.ins().ireduce(cl_types::I8, card_new);
                         builder
                             .ins()
-                            .store(MemFlags::trusted(), card_trunc, card_addr, 0);
+                            .store(MemFlagsData::trusted(), card_trunc, card_addr, 0);
                         builder.ins().jump(cont_block, &[]);
                     } else {
                         // Simple write barrier (no card marking).
@@ -13859,8 +13893,8 @@ impl CraneliftBackend {
                     } else {
                         let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
-                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                        let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
+                        let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                         let fresult = match op.opcode {
                             OpCode::VecFloatAdd => builder.ins().fadd(fa, fb),
                             OpCode::VecFloatSub => builder.ins().fsub(fa, fb),
@@ -13868,9 +13902,10 @@ impl CraneliftBackend {
                             OpCode::VecFloatTrueDiv => builder.ins().fdiv(fa, fb),
                             _ => unreachable!(),
                         };
-                        let result = builder
-                            .ins()
-                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        let result =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::I64, MemFlagsData::new(), fresult);
                         builder.def_var(var(vi), result);
                     }
                 }
@@ -13888,11 +13923,12 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                     } else {
                         let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                         let fresult = builder.ins().fneg(fa);
-                        let result = builder
-                            .ins()
-                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        let result =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::I64, MemFlagsData::new(), fresult);
                         builder.def_var(var(vi), result);
                     }
                 }
@@ -13910,11 +13946,12 @@ impl CraneliftBackend {
                         builder.def_var(var(vi), result);
                     } else {
                         let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                        let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                        let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                         let fresult = builder.ins().fabs(fa);
-                        let result = builder
-                            .ins()
-                            .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        let result =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::I64, MemFlagsData::new(), fresult);
                         builder.def_var(var(vi), result);
                     }
                 }
@@ -13938,9 +13975,10 @@ impl CraneliftBackend {
                         );
                         let xored = builder.ins().bxor(a, b);
                         // Result is declared as F64X2, bitcast from I64X2
-                        let result = builder
-                            .ins()
-                            .bitcast(cl_types::F64X2, MemFlags::new(), xored);
+                        let result =
+                            builder
+                                .ins()
+                                .bitcast(cl_types::F64X2, MemFlagsData::new(), xored);
                         builder.def_var(var(vi), result);
                     } else {
                         let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -13955,8 +13993,8 @@ impl CraneliftBackend {
                 OpCode::VecFloatEq => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
+                    let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::Equal, fa, fb);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
@@ -13965,8 +14003,8 @@ impl CraneliftBackend {
                 OpCode::VecFloatNe => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let b = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
-                    let fb = builder.ins().bitcast(cl_types::F64, MemFlags::new(), b);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
+                    let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::NotEqual, fa, fb);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(vi), result);
@@ -14006,7 +14044,7 @@ impl CraneliftBackend {
                 // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let result = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(vi), result);
                 }
@@ -14016,17 +14054,17 @@ impl CraneliftBackend {
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let result = builder
                         .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), fresult);
+                        .bitcast(cl_types::I64, MemFlagsData::new(), fresult);
                     builder.def_var(var(vi), result);
                 }
 
                 OpCode::VecCastFloatToSinglefloat => {
                     let a = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let fa = builder.ins().bitcast(cl_types::F64, MemFlags::new(), a);
+                    let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
                     let result = builder
                         .ins()
-                        .bitcast(cl_types::I32, MemFlags::new(), f32val);
+                        .bitcast(cl_types::I32, MemFlagsData::new(), f32val);
                     let result_ext = builder.ins().uextend(cl_types::I64, result);
                     builder.def_var(var(vi), result_ext);
                 }
@@ -14036,11 +14074,11 @@ impl CraneliftBackend {
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
                     let f32val = builder
                         .ins()
-                        .bitcast(cl_types::F32, MemFlags::new(), a_trunc);
+                        .bitcast(cl_types::F32, MemFlagsData::new(), a_trunc);
                     let f64val = builder.ins().fpromote(cl_types::F64, f32val);
                     let result = builder
                         .ins()
-                        .bitcast(cl_types::I64, MemFlags::new(), f64val);
+                        .bitcast(cl_types::I64, MemFlagsData::new(), f64val);
                     builder.def_var(var(vi), result);
                 }
 
@@ -14053,7 +14091,7 @@ impl CraneliftBackend {
                             let zero_f =
                                 builder
                                     .ins()
-                                    .bitcast(cl_types::F64, MemFlags::new(), zero_i);
+                                    .bitcast(cl_types::F64, MemFlagsData::new(), zero_i);
                             let result = builder.ins().splat(cl_types::F64X2, zero_f);
                             builder.def_var(var(vi), result);
                         } else {
@@ -14105,7 +14143,7 @@ impl CraneliftBackend {
                         let scalar_f =
                             builder
                                 .ins()
-                                .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                                .bitcast(cl_types::F64, MemFlagsData::new(), scalar_i);
                         let lane =
                             lookup_const_i64(&constants, op.arg(2).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
@@ -14152,7 +14190,7 @@ impl CraneliftBackend {
                         let result =
                             builder
                                 .ins()
-                                .bitcast(cl_types::I64, MemFlags::new(), scalar_f);
+                                .bitcast(cl_types::I64, MemFlagsData::new(), scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
                         let vec_val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -14180,7 +14218,7 @@ impl CraneliftBackend {
                         let scalar_f =
                             builder
                                 .ins()
-                                .bitcast(cl_types::F64, MemFlags::new(), scalar_i);
+                                .bitcast(cl_types::F64, MemFlagsData::new(), scalar_i);
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(vi), result);
                     } else {
@@ -14205,7 +14243,10 @@ impl CraneliftBackend {
                         } else {
                             cl_types::I64X2
                         };
-                        let result = builder.ins().load(load_type, MemFlags::trusted(), addr, 0);
+                        let result =
+                            builder
+                                .ins()
+                                .load(load_type, MemFlagsData::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     } else {
                         let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
@@ -14218,7 +14259,7 @@ impl CraneliftBackend {
                         let result =
                             builder
                                 .ins()
-                                .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+                                .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
                         builder.def_var(var(vi), result);
                     }
                 }
@@ -14239,7 +14280,7 @@ impl CraneliftBackend {
                             resolve_opref(&mut builder, &constants, value_ref.to_opref())
                         };
                         let addr = builder.ins().iadd(base, offset_val);
-                        builder.ins().store(MemFlags::trusted(), value, addr, 0);
+                        builder.ins().store(MemFlagsData::trusted(), value, addr, 0);
                     } else {
                         let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 2 {
@@ -14253,7 +14294,7 @@ impl CraneliftBackend {
                             op.arg(op.num_args() - 1).to_opref(),
                         );
                         let addr = builder.ins().iadd(base, offset_val);
-                        builder.ins().store(MemFlags::trusted(), value, addr, 0);
+                        builder.ins().store(MemFlagsData::trusted(), value, addr, 0);
                     }
                 }
 
@@ -14308,7 +14349,7 @@ impl CraneliftBackend {
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 vtable_val,
                                 result,
                                 vtable_off_i32,
@@ -14343,7 +14384,7 @@ impl CraneliftBackend {
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
-                                cranelift_codegen::ir::MemFlags::trusted(),
+                                cranelift_codegen::ir::MemFlagsData::trusted(),
                                 vtable_val,
                                 result,
                                 vtable_off_i32,
@@ -14444,9 +14485,10 @@ impl CraneliftBackend {
                     // f64 → f32 → zero-extend to i64 (singlefloat is Int-typed)
                     let f64_val = coerce_ty(&mut builder, val, cl_types::F64);
                     let f32_val = builder.ins().fdemote(cl_types::F32, f64_val);
-                    let i32_val = builder
-                        .ins()
-                        .bitcast(cl_types::I32, MemFlags::new(), f32_val);
+                    let i32_val =
+                        builder
+                            .ins()
+                            .bitcast(cl_types::I32, MemFlagsData::new(), f32_val);
                     let result = builder.ins().uextend(cl_types::I64, i32_val);
                     builder.def_var(var(vi), result);
                 }
@@ -14455,9 +14497,10 @@ impl CraneliftBackend {
                     let val = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     // i64 (lower 32 bits = f32) → f32 → f64 → i64
                     let i32_val = builder.ins().ireduce(cl_types::I32, val);
-                    let f32_val = builder
-                        .ins()
-                        .bitcast(cl_types::F32, MemFlags::new(), i32_val);
+                    let f32_val =
+                        builder
+                            .ins()
+                            .bitcast(cl_types::F32, MemFlagsData::new(), i32_val);
                     let f64_val = builder.ins().fpromote(cl_types::F64, f32_val);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let result = coerce_ty(&mut builder, f64_val, want);
@@ -14471,9 +14514,10 @@ impl CraneliftBackend {
                     let scale = builder.ins().iconst(cl_types::I64, 8);
                     let offset = builder.ins().imul(index, scale);
                     let addr = builder.ins().iadd(base, offset);
-                    let result = builder
-                        .ins()
-                        .load(cl_types::I64, MemFlags::trusted(), addr, 0);
+                    let result =
+                        builder
+                            .ins()
+                            .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
                     builder.def_var(var(vi), result);
                     sync_ref_root_var(
                         &mut builder,
@@ -14532,7 +14576,7 @@ impl CraneliftBackend {
                     let slot_addr = builder.ins().iadd(base, byte_ofs);
                     let value = builder
                         .ins()
-                        .load(ptr_type, MemFlags::trusted(), slot_addr, 0);
+                        .load(ptr_type, MemFlagsData::trusted(), slot_addr, 0);
                     builder.def_var(var(vi), value);
                 }
 
@@ -14624,7 +14668,7 @@ impl CraneliftBackend {
         if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
-        builder.finalize();
+        builder.finalize(frontend_config);
         self.func_ctx = func_ctx;
 
         // Compile
@@ -14699,7 +14743,7 @@ impl CraneliftBackend {
             let ret = wb.inst_results(call_inst)[0];
             wb.ins().set_pinned_reg(host_pinned);
             wb.ins().return_(&[ret]);
-            wb.finalize();
+            wb.finalize(frontend_config);
             self.func_ctx = wrapper_ctx;
         }
         let mut wrapper_compile_ctx = Context::for_function(wrapper_func);
@@ -14725,18 +14769,24 @@ impl CraneliftBackend {
         self.module.clear_context(&mut wrapper_compile_ctx);
 
         self.module.finalize_definitions().unwrap();
-        // `JITModule` owns the executable mapping and publishes no arena size,
-        // so `allocated` and `used` are both the finalized code size. The token
-        // is kept for this backend's lifetime because that is exactly how long
-        // the mapping lives.
         let code_bytes = body_code_bytes + wrapper_code_bytes;
-        if code_bytes != 0 {
-            let block = self.asm_memory_stats.record_block(code_bytes, code_bytes);
-            self.asm_memory_blocks.push(block);
-        }
-
         let body_ptr = self.module.get_finalized_function(func_id);
         let code_ptr = self.module.get_finalized_function(entry_id);
+        let mut asm_memory_blocks = Vec::with_capacity(2);
+        for ptr in [body_ptr, code_ptr] {
+            if asm_memory_blocks
+                .iter()
+                .any(|block: &majit_backend::AsmMemoryBlock| block.contains(ptr))
+            {
+                continue;
+            }
+            let block = self.asm_memory_handle.take_executable(ptr).ok_or_else(|| {
+                BackendError::CompilationFailed(format!(
+                    "Cranelift arena did not retain finalized function {ptr:p}"
+                ))
+            })?;
+            asm_memory_blocks.push(block);
+        }
         if std::env::var_os("MAJIT_LOG").is_some() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
@@ -14857,7 +14907,8 @@ impl CraneliftBackend {
             _func_id: func_id,
             code_ptr,
             body_ptr,
-            code_size: 0,
+            code_size: code_bytes,
+            asm_memory_blocks,
             fail_descrs,
             fail_descr_cells,
             terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
@@ -15879,7 +15930,7 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn assembler_memory_stats(&self) -> (usize, usize) {
-        self.asm_memory_stats.get_stats()
+        majit_backend::process_assembler_memory_stats()
     }
 
     fn compile_loop(
@@ -15948,6 +15999,12 @@ impl majit_backend::Backend for CraneliftBackend {
                     std::sync::Arc::clone(&clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
                 );
             }
+            clt.asmmemmgr_blocks.lock().extend(
+                compiled
+                    .asm_memory_blocks
+                    .drain(..)
+                    .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
+            );
         }
 
         token.set_compiled(Box::new(compiled));
@@ -16089,7 +16146,15 @@ impl majit_backend::Backend for CraneliftBackend {
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
         );
-        let compiled = compiled?;
+        let mut compiled = compiled?;
+        if let Some(clt) = original_token.compiled_loop_token() {
+            clt.asmmemmgr_blocks.lock().extend(
+                compiled
+                    .asm_memory_blocks
+                    .drain(..)
+                    .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
+            );
+        }
         // x86/assembler.py:691-693 assemble_bridge parity:
         // bridge compilation can increase the frame depth required by
         // CALL_ASSEMBLER callee frames.  The GC rewriter reads the
