@@ -914,18 +914,27 @@ impl FrameBox {
     /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
     /// calls pass the function's current writable metadata so each newly
     /// created generator freezes it independently of the code object.
-    /// `__name__` / `__qualname__` are the function's own strings, which may
-    /// carry a lone surrogate, and they are read back as values -- so they
-    /// arrive as WTF-8 rather than through a lossy `&str`.
+    /// `__name__` / `__qualname__` are the function's own immutable string
+    /// objects, retained by reference exactly as `generator.py:22-23` does.
     pub fn into_generator_named(
         mut self,
-        name: Option<&rustpython_wtf8::Wtf8>,
-        qualname: Option<&rustpython_wtf8::Wtf8>,
+        name: Option<PyObjectRef>,
+        qualname: Option<PyObjectRef>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
         let register_final = code_yields_inside_try(self.code());
         let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
         let _origin_roots = pyre_object::gc_roots::push_roots();
+        let name_slot = name.map(|name| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(name);
+            slot
+        });
+        let qualname_slot = qualname.map(|qualname| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(qualname);
+            slot
+        });
         let coroutine_origin_slot = if is_coroutine {
             let origin = capture_coroutine_origin(self.execution_context);
             pyre_object::gc_roots::pin_root(origin);
@@ -970,6 +979,8 @@ impl FrameBox {
         } else {
             pyre_object::generator::w_generator_new(frame_ptr as *mut u8, pycode)
         };
+        let _generator_roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(generator);
         if let Some(slot) = coroutine_origin_slot {
             unsafe {
                 pyre_object::generator::w_coroutine_set_origin(
@@ -978,18 +989,23 @@ impl FrameBox {
                 );
             }
         }
-        // GeneratorOrCoroutine.__init__ stores `_name` / `_qualname` on the
-        // generator.  Root the new owner while allocating the two wrapped
-        // strings, then publish them through the normal GC write barrier.
-        let _roots = pyre_object::gc_roots::push_roots();
-        pyre_object::gc_roots::pin_root(generator);
-        if let Some(name) = name {
-            let w_name = pyre_object::w_str_from_wtf8(name.to_wtf8_buf());
-            unsafe { pyre_object::generator::w_generator_set_name(generator, w_name) };
+        // generator.py:22-23 stores the function's existing `_name` /
+        // `_qualname` objects directly on the generator.
+        if let Some(slot) = name_slot {
+            unsafe {
+                pyre_object::generator::w_generator_set_name(
+                    generator,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                )
+            };
         }
-        if let Some(qualname) = qualname {
-            let w_qualname = pyre_object::w_str_from_wtf8(qualname.to_wtf8_buf());
-            unsafe { pyre_object::generator::w_generator_set_qualname(generator, w_qualname) };
+        if let Some(slot) = qualname_slot {
+            unsafe {
+                pyre_object::generator::w_generator_set_qualname(
+                    generator,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                )
+            };
         }
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;

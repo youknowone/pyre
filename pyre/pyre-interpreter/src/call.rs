@@ -11,7 +11,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use crate::runtime_ops::{CallableKind, classify_callable};
 use crate::{
     PyError, PyResult, builtin_code_get, function_get_closure, function_get_globals_obj,
-    function_get_name, function_get_qualname,
+    function_get_name, function_get_name_obj, function_get_qualname, function_get_qualname_obj,
 };
 
 /// `function.py:131/214/231 new_frame.run(self.name, self.qualname)`.
@@ -21,12 +21,18 @@ pub(crate) fn frame_into_generator_for_function(
     frame: crate::pyframe::FrameBox,
     function: PyObjectRef,
 ) -> PyResult {
-    // `__name__` lives in the `Function`'s Rust `str` field, so it is UTF-8 by
-    // construction; `__qualname__` is a Python object and may carry a lone
-    // surrogate, which the generator's own `__qualname__` has to read back.
-    let name = unsafe { function_get_name(function) };
-    let qualname = unsafe { function_get_qualname(function) };
-    frame.into_generator_named(Some(Wtf8::new(name)), Some(&qualname))
+    let _roots = pyre_object::gc_roots::push_roots();
+    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(function);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(unsafe { function_get_name_obj(function) });
+    let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(unsafe { function_get_qualname_obj(function) });
+    frame.into_generator_named(
+        Some(pyre_object::gc_roots::shadow_stack_get(name_slot)),
+        Some(pyre_object::gc_roots::shadow_stack_get(qualname_slot)),
+    )
 }
 
 struct FrameLocalsRoot {
