@@ -610,28 +610,62 @@ def refuse_nested_repos(entries: list[str]) -> None:
     nested = nested_repo_entries(entries)
     if not nested:
         return
+    # Each parenthesised pair is ONE message line: without the parentheses a
+    # dropped comma reads exactly like the wrapping, and would silently join two
+    # lines of the refusal into one.
     lines = [
-        "extract-llbc.py: a nested git repository sits under a fingerprinted"
-        " pathspec:",
+        (
+            "extract-llbc.py: a nested git repository sits under a fingerprinted"
+            " pathspec:"
+        ),
         *(f"    {entry}" for entry in nested),
         "",
-        "`git ls-files --others` does not descend into one, so every file"
-        " inside is",
-        "absent from `source=` while the directory itself hashes to a single"
-        " constant",
-        "token — the digest does not move when those contents change, grow, or"
-        " are",
+        (
+            "`git ls-files --others` does not descend into one, so every file"
+            " inside is"
+        ),
+        (
+            "absent from `source=` while the directory itself hashes to a single"
+            " constant"
+        ),
+        (
+            "token — the digest does not move when those contents change, grow, or"
+            " are"
+        ),
         "deleted outright. The stamp would claim a coverage it does not have.",
         "",
-        "Move it outside the fingerprinted pathspecs, or add it to"
-        " `.gitignore`",
+        (
+            "Move it outside the fingerprinted pathspecs, or add it to"
+            " `.gitignore`"
+        ),
         "(an ignored nested repo is excluded here and is not compiled either).",
-        "Registering it as a SUBMODULE does not fix this: a gitlink arrives on"
-        " the",
-        "tracked leg, carries no trailing slash, and hashes through the same"
-        " branch.",
+        (
+            "Registering it as a SUBMODULE does not fix this: a gitlink arrives on"
+            " the"
+        ),
+        (
+            "tracked leg, carries no trailing slash, and hashes through the same"
+            " branch."
+        ),
     ]
     raise SystemExit("\n".join(lines))
+
+
+_inputs_cache: dict[tuple, tuple[list[str], list[Path]]] = {}
+
+
+def forget_collected_inputs() -> None:
+    """Drop the memoised input sets, because the tree they describe has moved.
+
+    The memo below answers "what does this crate compile" for a tree as it was
+    when the walk ran, so anything in this process that CHANGES the tree has to
+    call this before the next walk reads it. Two do, and each would otherwise
+    get a stale answer at exactly the moment it needs a fresh one: `extract`,
+    whose whole post-build re-hash exists to catch a tree that moved while
+    Charon ran, and `self_test`, whose probe file exists precisely to move the
+    input set.
+    """
+    _inputs_cache.clear()
 
 
 def _collect_inputs(
@@ -664,7 +698,30 @@ def _collect_inputs(
     below, which admitted neither `proc-macro` nor `cdylib` until it was
     inverted into a deny-list. Both are fixed; do not read that as the class
     being closed, since each was found only after the previous one was.
+
+    Memoised, because none of this is cheap: two `git ls-files` subprocesses per
+    call plus `include_closure`, which reads the text of every `.rs` input. One
+    `extract` of one crate reaches here five times — twice through `stamp_for`,
+    then the provenance closure, `window_writes` and the post-build digest — and
+    `--fingerprint` twice, under a caller-imposed budget (120s in
+    `pyre-jit-trace/build.rs`) past which freshness degrades to UNKNOWN for
+    every crate. The key spells out the engine fields this walk reads, except
+    the SPEC TABLE, which the crate names stand for: `run_cli` builds one
+    Engine from a driver's specs and nothing edits them afterwards.
+    `forget_collected_inputs` is how a caller that moved the tree says so.
     """
+    key = (
+        str(eng.root),
+        eng.metadata_feature_crates,
+        tuple(eng.base_pathspecs),
+        eng.external_inputs,
+        eng.layout_targets,
+        tuple(crates),
+        cargo_features,
+    )
+    if key in _inputs_cache:
+        return _inputs_cache[key]
+
     root = eng.root
     target_names: list[str] = []
     pathspecs = list(eng.base_pathspecs)
@@ -792,7 +849,9 @@ def _collect_inputs(
     refuse_nested_repos(others)
     files = ls_files() | {Path(entry) for entry in others}
     files |= include_closure(root, files)
-    return sorted(files, key=lambda path: path.as_posix()), external
+    result = (sorted(files, key=lambda path: path.as_posix()), external)
+    _inputs_cache[key] = result
+    return result
 
 
 def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
@@ -1142,6 +1201,8 @@ STAMP_KEYS = (
     "crate",
     "platform",
     "charon",
+    "fingerprint_schema",
+    "extraction_abi",
     "features",
     "flags",
     "charon_flags",
@@ -1852,6 +1913,15 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             write_layout_sidecar(full, sidecar)
             full.unlink()
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+        # Every walk from here on reports on the tree AFTER the builds above,
+        # so the memoised pre-build input sets are dropped first. The three
+        # readers below — the provenance closure, `window_writes` and the
+        # post-build digest — exist to see a tree that moved while Charon ran,
+        # and an input set carried over from before it would hide exactly the
+        # movement they are looking for. They still share one walk with each
+        # other, which is the intent.
+        forget_collected_inputs()
+
         # Closing half of the provenance pair, and the sidecar write.
         #
         # This precedes the two guards below, both of which can end the run,
@@ -2531,10 +2601,16 @@ def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     before = source_fingerprint(eng, crates, cargo_features)
     try:
         probe.write_text("// transient probe written by --self-test; safe to delete\n")
+        # Both legs of this test are a deliberate change to the input SET, which
+        # is the one thing `_collect_inputs` memoises. Reading a carried-over set
+        # here would report the guard blind and the removal residual — a failure
+        # printed by the cache rather than by the code under test.
+        forget_collected_inputs()
         moved = source_fingerprint(eng, crates, cargo_features)
         listed = probe.relative_to(eng.root) in set(fingerprint_inputs(eng, crates, cargo_features))
     finally:
         probe.unlink(missing_ok=True)
+        forget_collected_inputs()
     after = source_fingerprint(eng, crates, cargo_features)
     print(f"    probe          {probe.relative_to(eng.root).as_posix()}")
     print(f"    before         {before}")
@@ -2573,15 +2649,21 @@ def run_cli(
         description="Extract Charon ULLBC artefacts with source-fingerprint skip logic."
     )
     parser.add_argument("crates", nargs="*", help=f"known: {all_crates}")
-    parser.add_argument("--fingerprint", action="store_true")
-    parser.add_argument("--list-inputs", action="store_true")
-    parser.add_argument(
+    # The dispatch below takes the FIRST of these that is set and returns, so
+    # accepting two would perform one and drop the other with no output saying
+    # so — `--check --self-test` would run the self-test and report success for
+    # a freshness check that never ran. That is the shape this file refuses
+    # everywhere else, and argparse can refuse it here.
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--fingerprint", action="store_true")
+    modes.add_argument("--list-inputs", action="store_true")
+    modes.add_argument(
         "--check",
         action="store_true",
         help="compare the existing artefacts against the tree and exit nonzero "
         "if any is stale; never extracts",
     )
-    parser.add_argument(
+    modes.add_argument(
         "--self-test",
         action="store_true",
         help="prove the source fingerprint still sees a new untracked .rs; "
