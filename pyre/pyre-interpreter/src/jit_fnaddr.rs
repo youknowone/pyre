@@ -1082,6 +1082,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::lookup_in_type_wtf8_uncached",
         lookup_in_type_wtf8_uncached as *const (),
     );
+    // #346: the getattribute attribute-miss / special-attribute path.  Its cold
+    // `[Option; 2].iter().flatten()` metaclass walks and array indexing are
+    // opaque to the annotator, so it is `#[dont_look_inside]` and residualises
+    // over the blessed `PyResult` carrier; bind its `fn` by qualified path.
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::object_getattr_miss",
+        "pyre_interpreter::object_getattr_miss",
+        crate::baseobjspace::object_getattr_miss as *const (),
+    );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
     // `dictmultiobject::dict_view_iterator_gc_type_id` read the

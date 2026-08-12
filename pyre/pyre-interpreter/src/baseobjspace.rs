@@ -7335,7 +7335,14 @@ pub(crate) fn exception_attr_get(obj: PyObjectRef, name: &str) -> PyResult {
     Ok(pyre_object::PY_NULL)
 }
 
-fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
+/// The attribute-miss / special-attribute path of `getattribute`, reached only
+/// after the fast descriptor and instance-dict lookups return nothing (a hot
+/// attribute that resolves never enters here). Its `[Option<PyObjectRef>; 2]`
+/// metaclass walks (`.iter().flatten()`), array indexing, and `__getattr__`
+/// callback are opaque to the annotator; it returns the blessed `PyResult`
+/// carrier, so the whole cold path is residualised behind one boundary.
+#[majit_macros::dont_look_inside]
+pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bool) -> PyResult {
     if name == "__dict__" && unsafe { is_module(obj) } {
         let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
         if !dict.is_null() {
