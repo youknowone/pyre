@@ -43,6 +43,24 @@ fn is_done_states(oldstate: u8, newstate: u8) -> bool {
 /// `interp_gc.py:91-130 StepCollector.finalizing`. `space.fromcache` owns one
 /// instance per object space upstream; pyre has one process-wide object space,
 /// so the corresponding state is shared rather than thread-local.
+///
+/// The atomic carries storage and visibility, not the state transition. The
+/// rgil is what serializes load -> collector step -> store: a mutator holds it
+/// across the whole builtin body (`rgil.rs:214` takes it with a single-owner
+/// CAS, and only an explicit release such as `call_external_function` gives it
+/// up), and nothing on this path releases it. So a second mutator cannot also
+/// observe `false` and start a major step.
+///
+/// The USERDEL drain is the deliberate exception, and matches
+/// `StepCollector.do`: the flag stays set until `run_finalizers_now` returns,
+/// so app-level `__del__` code can yield the GIL or re-enter `collect_step`.
+/// Both are safe because a queue entry is popped before its callback runs
+/// (`_run_finalizers` takes `next_dead()` first, and the collector's
+/// `finalizer_next_dead` is a `pop_front`), so an interleaved or nested drain
+/// cannot invoke the same entry twice. A lock held across the drain would not
+/// help and would invert against the GIL: its holder yields inside `__del__`,
+/// a second thread takes the GIL and blocks on the lock, and the holder can
+/// never reacquire the GIL.
 static STEP_FINALIZING: AtomicBool = AtomicBool::new(false);
 
 /// `referents.py:11-15 W_GcRef(W_Root)`: an app-level handle for a raw GC
