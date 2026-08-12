@@ -4,6 +4,13 @@ import gc
 import mmap
 
 
+# pyre's mmap implementation is currently Unix-only.  The module still
+# imports on Windows so callers can feature-detect it, but it does not expose
+# mmap.mmap there.
+if not hasattr(mmap, "mmap"):
+    print("mmap repr results are collectable (mmap unavailable)")
+    raise SystemExit
+
 mapping = mmap.mmap(-1, 1)
 live_direct = mmap.mmap.__repr__(mapping)
 live_ordinary = repr(mapping)
