@@ -219,6 +219,47 @@ def runtime_function():
 managed("function repr", type(runtime_function).__repr__(runtime_function))
 managed("builtin function repr", type(len).__repr__(len))
 managed("builtin method repr", type([].append).__repr__([].append))
+wrapper = (1).__add__
+managed("method-wrapper repr", type(wrapper).__repr__(wrapper))
+
+
+class RuntimeType:
+    pass
+
+
+managed("type repr", type.__repr__(RuntimeType))
+
+
+def make_cell(value):
+    def inner():
+        return value
+
+    return inner.__closure__[0]
+
+
+filled_cell = make_cell(42)
+empty_cell = make_cell(42)
+del empty_cell.cell_contents
+managed("filled cell repr", type(filled_cell).__repr__(filled_cell))
+managed("empty cell repr", type(empty_cell).__repr__(empty_cell))
+
+
+def generate():
+    yield 1
+
+
+generator = generate()
+managed("generator repr", type(generator).__repr__(generator))
+generator.close()
+
+
+async def run():
+    return 1
+
+
+coroutine = run()
+managed("coroutine repr", type(coroutine).__repr__(coroutine))
+coroutine.close()
 
 
 class SlotOwner:

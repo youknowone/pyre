@@ -26674,7 +26674,7 @@ fn generator_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn coroutine_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
     let name = generator_name_value(args[0], true)?;
-    Ok(w_str_new(&format!(
+    Ok(w_str_new_managed(&format!(
         "<coroutine object {} at {}>",
         unsafe { pyre_object::w_str_get_value(name) },
         crate::display::repr_addr(args[0] as usize)
