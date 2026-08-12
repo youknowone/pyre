@@ -1144,13 +1144,173 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
     }
 }
 
-/// PyPy `ObjSpace.finish()` (`baseobjspace.py:481-504`): join non-daemon
-/// threads, run atexit callbacks, mark the runtime finalizing, flush standard
-/// streams, and run started modules' shutdown hooks. PyPy does not force a full
-/// collection or clear `__main__` globals here; doing either makes shutdown
-/// traverse (and temporarily expand) an arbitrarily large heap and gives
-/// module-global `__del__` methods CPython behavior that the PyPy oracle does
-/// not have.
+fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
+    pyre_object::gc_hook::try_gc_collect();
+    if !ec_ptr.is_null() {
+        unsafe { (&mut *(ec_ptr as *mut PyExecutionContext))._run_finalizers_now() };
+    }
+}
+
+/// Whether releasing this binding can remove anything from the reachable set,
+/// and so whether the collection that follows it could find garbage an earlier
+/// one did not. Answering `false` skips a full mark-and-sweep of the whole
+/// heap, which is what the release loop below otherwise costs per name.
+///
+/// Two values answer `false` outright:
+///
+/// * An exact `int`, `float`, `bool`, `str`, `bytes` or `None`. It holds no
+///   reference to another object, so nothing but the value itself can lose its
+///   last referrer, and no builtin scalar type defines `__del__`, so nothing
+///   observes it going. `is_exact_type` is what makes this safe rather than
+///   `is_str`/`is_int`, which key off the layout `ob_type` a subclass keeps: a
+///   `class MyStr(str)` instance retags `w_class` and is rejected here, so its
+///   `__del__` and its own attributes stay on the collecting path.
+/// * A module still registered in `sys.modules` under its own `__name__`. It
+///   stays reachable from there no matter what `__main__` does, so the release
+///   removes no object at all from the reachable set. This is every `import`
+///   name. Reading the live `sys.modules` rather than assuming is what keeps a
+///   program that replaced or deleted the entry on the collecting path.
+///
+/// The point is not that these values are cheap to collect — it is that the
+/// collection cannot reach a different answer, so every `__del__` still runs at
+/// exactly the same place in the loop.
+fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    unsafe {
+        if pyre_object::is_none(value)
+            || pyre_object::is_exact_type(value, &pyre_object::INT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BOOL_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::FLOAT_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::STR_TYPE)
+            || pyre_object::is_exact_type(value, &pyre_object::BYTES_TYPE)
+        {
+            return true;
+        }
+        if pyre_object::is_module(value) {
+            // `Module.name` is the interpreter's own field, not the
+            // program-writable `__name__` attribute, so it is always a string —
+            // but `types.ModuleType.__new__` leaves it empty until `__init__`
+            // seeds it. An anonymous module proves nothing about reachability,
+            // so it takes the collecting path rather than a `sys.modules[""]`
+            // lookup that only an adversarial program could satisfy.
+            let name = pyre_object::w_module_get_name(value);
+            return !name.is_empty() && importing::get_sys_module(name).is_some_and(|m| m == value);
+        }
+    }
+    false
+}
+
+fn shutdown_module_private_name(name: &rustpython_wtf8::Wtf8) -> bool {
+    let bytes = name.as_bytes();
+    bytes.first() == Some(&b'_') && bytes.get(1) != Some(&b'_')
+}
+
+fn clear_shutdown_module_name(dict: pyre_object::PyObjectRef, name: &rustpython_wtf8::Wtf8) {
+    let should_clear = unsafe { pyre_object::w_dict_getitem_wtf8(dict, name) }
+        .is_some_and(|value| unsafe { !pyre_object::is_none(value) });
+    if should_clear {
+        unsafe {
+            pyre_object::w_dict_setitem_wtf8(dict, name, pyre_object::w_none());
+        }
+    }
+}
+
+/// `_PyModule_ClearDict`: clear string-keyed module globals in two name passes.
+fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef) {
+    if dict.is_null() {
+        return;
+    }
+    let keys: Vec<rustpython_wtf8::Wtf8Buf> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for name in &keys {
+        if shutdown_module_private_name(name) {
+            clear_shutdown_module_name(dict, name);
+        }
+    }
+    for name in &keys {
+        if name.as_bytes() != b"__builtins__" {
+            clear_shutdown_module_name(dict, name);
+        }
+    }
+}
+
+/// `finalize_modules`: clear detached modules newest-first while their peers
+/// remain available to finalizers that run between module dictionaries.
+fn clear_shutdown_modules(
+    modules: Vec<(rustpython_wtf8::Wtf8Buf, pyre_object::PyObjectRef)>,
+    ec_ptr: *const PyExecutionContext,
+) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let roots_start = pyre_object::gc_roots::shadow_stack_len();
+    let mut names = Vec::with_capacity(modules.len());
+    let mut sys_module_slot = None;
+    let mut builtins_module_slot = None;
+    for (name, module) in modules {
+        let index = names.len();
+        let bytes = name.as_bytes();
+        if bytes == b"sys" {
+            sys_module_slot = Some(index);
+        } else if bytes == b"builtins" {
+            builtins_module_slot = Some(index);
+        }
+        names.push(name);
+        pyre_object::gc_roots::pin_root(module);
+    }
+    collect_and_run_finalizers(ec_ptr);
+    for index in (0..names.len()).rev() {
+        let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
+        let is_core_module = sys_module_slot.is_some_and(|slot| {
+            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
+        }) || builtins_module_slot.is_some_and(|slot| {
+            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
+        });
+        if is_core_module {
+            continue;
+        }
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        clear_shutdown_module_dict(dict);
+    }
+    // One collection for the whole walk, not one per module. `finalize_modules`
+    // clears the module dictionaries and lets refcounting release what they
+    // held; a sweep per module buys no ordering here, because a finalizer that
+    // reads a global reaches its own already-cleared namespace either way, and
+    // it costs a full mark-and-sweep for each of the ~100 modules a bare
+    // `import unittest` loads.
+    collect_and_run_finalizers(ec_ptr);
+}
+
+/// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
+/// threads, collect already-unreachable cycles, then release `__main__`
+/// globals from newest to oldest while the older globals their `__del__`
+/// methods may reference are still present.
+///
+/// Newest-to-oldest is what keeps those references working, and it is not
+/// interchangeable with the insertion order `_PyModule_ClearDict` uses. A name
+/// is bound before every name that could be finalized while reading it — most
+/// of all `import sys`, which is usually the very first — so releasing in
+/// insertion order strands `sys` at `None` and every finalizer that writes to
+/// `sys.stderr` dies with an `AttributeError` instead of running. Refcounting
+/// makes the question moot upstream: a finalizer there runs from the decref of
+/// the name being released, while every other slot still holds its original
+/// value, which is not reproducible without leaving dangling pointers in the
+/// dict.
+///
+/// The value is rebound to `None` rather than deleted, as `_PyModule_ClearDict`
+/// does: a `__del__` that reads an already-released name then sees `None`, the
+/// way it would upstream, instead of raising `NameError` at a name the program
+/// can see is still defined.
+///
+/// `__main__` is not the whole reachable set: an object stored in another
+/// module's namespace stays alive through that module's dict. The
+/// `finalize_modules` phase that follows detaches `sys.modules` and clears the
+/// remaining module dictionaries newest-first.
 fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionContext) {
     run_threading_shutdown();
     run_atexit_callbacks(canonical, ec_ptr);
@@ -1160,14 +1320,48 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     pyre_interpreter::module::thread::set_finalizing();
     // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
     // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
-    // alive.
+    // alive.  The per-global teardown below reaches only the ones `__main__`
+    // itself holds, so without this a stream owned by any other module loses
+    // its buffered writes.
     pyre_interpreter::module::_io::flush_all_streams();
+    collect_and_run_finalizers(ec_ptr);
+    let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
+    entries.reverse();
+    for (name, _) in entries {
+        if name == "__builtins__" {
+            continue;
+        }
+        // Re-read rather than trusting the snapshot: a `__del__` already run by
+        // this loop may have rebound the name, and the decision below is only
+        // sound about the value actually being released.
+        let value = unsafe { pyre_object::w_dict_getitem_str(canonical, &name) };
+        let frees_nothing = value.is_none_or(release_frees_nothing);
+        unsafe {
+            pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
+        }
+        if !frees_nothing {
+            collect_and_run_finalizers(ec_ptr);
+        }
+    }
+    // The loop ends on a collection whenever it releases anything collectable;
+    // this is the one for the case where the last releases were all skipped, so
+    // teardown still finishes with the heap swept and the queue drained.
+    collect_and_run_finalizers(ec_ptr);
+    let shutdown_modules = pyre_interpreter::importing::release_sys_modules_for_shutdown();
+    clear_shutdown_modules(shutdown_modules, ec_ptr);
 }
 
 /// Resolve a pending `SystemExit`'s status, then finalize and exit with it.
 ///
-/// `app_main.py:114-129 handle_sys_exit` resolves `e.code` at application
-/// level, before `targetpypystandalone.py:88 finally: space.finish()`.
+/// The order matters: `app_main.py:114-129 handle_sys_exit` runs at
+/// application level, i.e. *before* `targetpypystandalone.py:88
+/// finally: space.finish()`. Resolving `e.code` is an ordinary attribute
+/// lookup that walks the exception's type and that type's dict, and
+/// `finalize_runtime` collects — pinning the three raw `PyObjectRef` fields
+/// of the Rust `PyError` (which, unlike PyPy's GC-visible `OperationError`,
+/// the collector cannot see) does not keep that type's dict alive. Reading
+/// the code after the collection spun forever inside the type dict's
+/// `IndexMap` probe for a user-defined `SystemExit` subclass.
 fn finalize_system_exit(
     error: pyre_interpreter::PyError,
     canonical: pyre_object::PyObjectRef,
@@ -1443,8 +1637,9 @@ fn run_source_with_context(
             }
             let is_keyboard_interrupt = is_keyboard_interrupt(&e);
             // targetpypystandalone.py:88 `finally: space.finish()` — finalize
-            // on every exit path, not only on SystemExit. Print the exception
-            // before shutdown, matching app_main.py's ordering.
+            // on every exit path, not only on SystemExit.  Print first: the raw
+            // `PyObjectRef` fields of `e` are not GC-visible and
+            // `finalize_runtime` collects.
             pyre_interpreter::eprint_exception(&e, true);
             finalize_runtime(canonical, ec_ptr);
             maybe_print_jit_stats();

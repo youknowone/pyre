@@ -1697,6 +1697,39 @@ pub fn remove_sys_module(name: &str) {
     }
 }
 
+/// `finalize_remove_modules`: snapshot real modules, then detach import-cache
+/// entries so module/dict cycles can become unreachable during shutdown.
+pub fn release_sys_modules_for_shutdown() -> Vec<(Wtf8Buf, PyObjectRef)> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Vec::new();
+    }
+    let entries = unsafe { pyre_object::w_dict_items(dict) };
+    let mut modules = Vec::new();
+    for (key, module) in entries {
+        let name = if unsafe { pyre_object::is_str(key) } {
+            Some(unsafe { pyre_object::w_str_get_wtf8(key) }.to_owned())
+        } else {
+            None
+        };
+        if !module.is_null() && unsafe { pyre_object::is_module(module) } {
+            if let Some(name) = &name {
+                modules.push((name.clone(), module));
+            }
+        }
+        let keep_entry = name.as_deref().is_some_and(|name| {
+            let bytes = name.as_bytes();
+            bytes == b"sys" || bytes == b"builtins"
+        });
+        if !keep_entry {
+            unsafe {
+                pyre_object::w_dict_delitem(dict, key);
+            }
+        }
+    }
+    modules
+}
+
 /// GC root walk over every bound module's dict storage.
 ///
 /// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
