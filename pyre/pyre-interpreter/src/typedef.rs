@@ -13475,7 +13475,7 @@ fn init_function_type(ns: PyObjectRef) {
                         " at {}>",
                         crate::display::repr_addr(function as usize)
                     ));
-                    Ok(pyre_object::w_str_from_wtf8(repr))
+                    Ok(pyre_object::w_str_from_wtf8_managed(repr))
                 },
                 1,
             ),
