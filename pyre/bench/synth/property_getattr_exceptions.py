@@ -1,9 +1,13 @@
-# pyre-check: max-pypy-ratio=86
+# pyre-check: max-pypy-ratio=30
 # Property getter/setter exceptions and __getattr__ hook exceptions
 # propagate out of attribute access instead of being swallowed. Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.
+# The raising getter must stay inside the compiled loop: leaving its fget as an
+# opaque residual measured at least 31-37x PyPy in CI.  Keep the hot loop long
+# enough that PyPy clears check.py's timing floor and the ratio ceiling is
+# enforced rather than displayed as an informational lower bound.
 
-N = 50000
+N = 20000000
 
 
 def show(label, fn):

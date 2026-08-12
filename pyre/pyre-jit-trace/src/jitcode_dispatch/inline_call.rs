@@ -5463,9 +5463,13 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
 /// receiver as `self` so the getter body (commonly `return self._value`) folds
 /// to a guarded slot read inside the trace.
 ///
-/// Restricted to a straight-line, nested-call-free getter: the inline then
-/// stays on the leaf sub-walk path and never reaches the loop/`CALL_ASSEMBLER`
-/// route (the only consumer of this LOAD_ATTR residual's non-call `r_args`).
+/// Restricted to a straight-line getter whose body owns no loop: the inline
+/// then stays off the `CALL_ASSEMBLER` route (the only consumer of this
+/// LOAD_ATTR residual's non-call `r_args`).  Nested calls are walked normally;
+/// in particular, `raise ValueError(...)` constructs the exception in the
+/// callee sub-walk and returns `SubRaise` to this LOAD_ATTR's enclosing
+/// `catch_exception`, matching `descroperation.py:96-101` tracing through the
+/// property's `__get__` and Python fget.
 /// Top full-body frame only, for the resume-doubling reason
 /// [`try_walker_specialize_load_bound_method_attr`] documents.  Every other
 /// shape declines to the residual (SAFE — no acceleration, unchanged
@@ -5503,12 +5507,9 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     if nparams != 1 {
         return Ok(None);
     }
-    // Leaf-only getter body: a branch or a nested Python call would drive the
-    // sub-walk into plumbing that consumes the non-call `r_args`; decline those
-    // to the residual instead.
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return Ok(None);
-    };
+    // A branch still needs the bounded property-entry control-flow port.  A
+    // nested call does not: the ordinary sub-walk handles it, including the
+    // exception-constructor call in a raising getter.
     // Decided once per callee on its jitcode payload; `None` means no body or
     // descr pool, which this route declines on either way.
     let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
@@ -5517,14 +5518,6 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     if !body_facts.exc_override_straight_line {
         return Ok(None);
     }
-    let Some((getter_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
-    else {
-        return Ok(None);
-    };
-    if body_facts.exc_override_has_nested_call {
-        return Ok(None);
-    }
-
     // `[fget, <self-placeholder>, obj]`: the method-form call header the inline
     // plumbing expects (`callable`, unused self slot, then the receiver).
     let arg_concretes = vec![
