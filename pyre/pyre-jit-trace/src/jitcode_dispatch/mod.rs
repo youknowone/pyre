@@ -9031,7 +9031,7 @@ fn mark_trace_reads_module_global_from_frame_name(
 /// const-fold a module-global name read to a `QuasiimmutField` version guard
 /// + elidable `jit_namespace_cell_lookup`, reading an `ObjectMutableCell`'s
 /// `w_value` live.  Returns `false` (fall through to the residual) for a
-/// missing / `IntMutableCell` / still-movable slot.
+/// missing / `IntMutableCell` slot.
 fn emit_module_dict_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9046,27 +9046,19 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
             if !stored.is_null() {
-                // The fast path const-folds `stored` (the slot's raw value, or
-                // the `ObjectMutableCell` / `IntMutableCell`) as the elidable
-                // `jit_namespace_cell_lookup` result.  That bakes its address
-                // into the trace / guard resume data.  The collector is
-                // moving, so a `stored` still in the nursery at trace time
-                // relocates nursery->oldgen afterwards and the baked address
-                // dangles (a `memo` dict grown in the loop is the canonical
-                // case).  Fall through to the residual live lookup, which
-                // re-reads the slot each call and follows the relocation, when
-                // `stored` can still move.  Mutable cells are `malloc_typed`
-                // (never nursery), so `can_move` is false and a hot int/object
-                // global folds; a raw movable value does not.
-                if !majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
-                    return emit_namespace_cell_fold(
-                        ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true,
-                    );
-                }
+                // RPython's `ConstPtr.value` is a GC-visible field. Pyre keeps
+                // the same value in the active trace, resume pools and backend
+                // GC table, whose registered walkers forward it in place.
+                // Movability therefore does not change whether this elidable
+                // cell lookup can fold; the namespace version guard below
+                // still revokes the constant when the slot is rebound.
+                return emit_namespace_cell_fold(
+                    ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true,
+                );
             }
         }
         // The name is present in the module dict but unfoldable
-        // (null / movable raw value / strategy-switched); keep the residual
+        // (null / strategy-switched); keep the residual
         // rather than misreaching into the builtins fallback (the residual
         // reads the live globals slot, which is correct).
         return Ok(false);
@@ -9079,7 +9071,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
 /// + (for a mutable cell) live field read that the LOAD_GLOBAL cell fold lowers
 /// to, seeding the dst's concrete with the unwrapped value.  `stored` is the
 /// raw value-or-cell at `slot` of `ns` (a module dict in strategy mode); the
-/// caller has already proven it foldable (non-null, immovable).  An
+/// caller has already proven it foldable and non-null.  An
 /// `ObjectMutableCell` reads `cell.w_value` (`getfield_gc_r`); an
 /// `IntMutableCell` reads `cell.intvalue` (`getfield_gc_i`) and re-boxes it
 /// (the box is elided by the optimizer when the sole consumer unboxes).
@@ -9103,15 +9095,15 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     if !walker_pin_namespace_version(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    // Bake the immovable cell as a `ConstPtr` (pypy `ConstPtr(cell)`).  The
+    // Bake the stored value/cell as a `ConstPtr` (pypy `ConstPtr(cell)`). The
     // `QuasiimmutField(strategy, version)` guard above invalidates the loop on a
     // rebind / strategy-version bump (`_setitem_str_cell_known` calls
     // `mutated()` before every write that replaces the stored pointer), and the
-    // caller's `can_move` check
-    // guarantees the address is stable — the optimizer already folds the
-    // equivalent elidable `jit_namespace_cell_lookup` down to this same const
-    // ptr.  A genuine constant (not the elidable call's `RefOp` result, which
-    // is not `is_constant()`) is what lets the trace-time heapcache's
+    // registered `ConstPtr` walkers keep the address current across a moving
+    // collection — the optimizer already folds the equivalent elidable
+    // `jit_namespace_cell_lookup` down to this same const ptr.  A genuine
+    // constant (not the elidable call's `RefOp` result, which is not
+    // `is_constant()`) is what lets the trace-time heapcache's
     // `_unique_const_heuristic` canonicalise the LOAD's `getfield_gc_i` and
     // the STORE fold's `setfield_gc_i` onto one cache slot; without it a hot
     // int global's cached field goes stale.

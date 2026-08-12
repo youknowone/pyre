@@ -13092,24 +13092,31 @@ fn _unpackiterable_unknown_length(
 /// jitcode. `#[dont_look_inside]` keeps the host plumbing opaque should a
 /// caller ever be traced.
 ///
-/// Pins `items` and every element read back. This is a liveness bracket, not
-/// a relocation read-back: the `W_ListObject` header is old-gen and non-moving.
-/// The caller's `RootScope` is already gone, so the drained list lives only on
-/// the Rust stack, and an Integer/Float-strategy `getitem` boxes through
+/// Pins `items` and every element read back. The caller's `RootScope` is already
+/// gone, so the drained list lives only on the Rust stack. Reload the movable
+/// `W_ListObject` from its shadow-stack slot before every `getitem`; an
+/// Integer/Float-strategy `getitem` boxes through
 /// `w_int_new` / `w_float_new`, whose allocator slow path parks this mutator at
 /// a `gc_op` — a foreign thread's stop-the-world collection can mark and sweep
-/// while it is parked. The boxes read back so far are reachable from no root at
-/// that moment, so they get the same per-element pins
+/// (and relocate the list) while it is parked. The boxes read back so far are
+/// reachable from no root at that moment, so they get the same per-element pins
 /// `alloc_list_items_block_gc` uses.
 #[majit_macros::dont_look_inside]
 pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
+    let items_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(items);
-    let n = unsafe { pyre_object::listobject::w_list_len(items) };
+    let n = unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(items_slot))
+    };
     let save = pyre_object::gc_roots::shadow_stack_len();
     for i in 0..n as i64 {
         pyre_object::gc_roots::pin_root(unsafe {
-            pyre_object::listobject::w_list_getitem(items, i).unwrap()
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(items_slot),
+                i,
+            )
+            .unwrap()
         });
     }
     (0..n)

@@ -325,6 +325,8 @@ pub fn is_list_write_barrier(addr: usize) -> bool {
                     || *path == "pyre_object::list_write_barrier"
                     || path.ends_with("::listobject::prepare_list_ref_store")
                     || *path == "pyre_object::prepare_list_ref_store"
+                    || path.ends_with("::listobject::current_gc_ref")
+                    || *path == "pyre_object::current_gc_ref"
             })
             .map(|(_, fnaddr)| fnaddr)
             .collect()
@@ -1810,6 +1812,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::listobject::prepare_list_ref_store",
         "pyre_object::prepare_list_ref_store",
         prepare_list_ref_store as *const (),
+    );
+    // `prepare_list_ref_store` returns the relocated value. The following
+    // owner reload is the other half of RPython's post-safepoint pop_roots;
+    // keep it residual while leaving the append's set_len/setitem leaves in
+    // the descended body.
+    let current_gc_ref: extern "C" fn(i64) -> i64 =
+        pyre_object::listobject::__majit_call_target_current_gc_ref;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::listobject::current_gc_ref",
+        "pyre_object::current_gc_ref",
+        current_gc_ref as *const (),
     );
     // The #171 fold descends `w_list_append` as a sub-jitcode walk, so a guard
     // exit inside it is numbered against `w_list_append`'s own jitcode and is

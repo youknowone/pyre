@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+use majit_ir::{EffectInfo, ExtraEffect, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
 
@@ -109,6 +109,58 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
             "{bench} fell back to the allocating interpreter loop:\n{stderr}"
         );
     }
+}
+
+#[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
+fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
+    let root = workspace_root();
+    let dynasm = root.join("target/release/pyre-dynasm");
+    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
+    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
+    let wasm_module = if host_module.exists() {
+        host_module
+    } else {
+        plain_module
+    };
+    let script = root.join("pyre/bench/raise_catch_loop.py");
+
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime raise/catch regression needs {}; build the requested dynasm and wasm-host artifacts first",
+            artifact.display()
+        );
+    }
+
+    let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+    assert!(
+        dynasm_run.status.success(),
+        "dynasm failed:\n{}",
+        String::from_utf8_lossy(&dynasm_run.stderr)
+    );
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    let wasm_run = run_runtime_program(
+        &wasm_runner,
+        &script,
+        &[
+            ("PYRE_WASM_MODULE", module),
+            ("PYRE_WASM_ENGINE", "wasmtime"),
+            ("PYRE_WASM_JIT_STATS", "1"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+    assert!(wasm_run.status.success(), "wasm failed:\n{stderr}");
+    assert_eq!(
+        wasm_run.stdout, dynasm_run.stdout,
+        "wasm raise/catch output diverged from dynasm:\n{stderr}"
+    );
+    assert!(
+        stat_value(&stderr, "jit_calls") < 100_000,
+        "caught-exception root clearing crossed the host trampoline per iteration:\n{stderr}"
+    );
 }
 
 #[test]
@@ -580,6 +632,151 @@ fn test_call_generates_import() {
         }
     }
     assert!(has_jit_call, "module should import jit_call_compact");
+}
+
+fn true_void_call(helper: PyreHelperKind) -> Op {
+    let mut effect = EffectInfo::default();
+    effect.extraeffect = ExtraEffect::CannotRaise;
+    effect.can_collect = false;
+    effect.pyre_helper = helper;
+    let op = Op::new(OpCode::CallN, &[rb(OpRef::const_int(42))]);
+    op.setdescr(majit_ir::make_call_descr(vec![], Type::Void, effect));
+    op
+}
+
+fn import_func_type(bytes: &[u8], name: &str) -> Option<u32> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::ImportSection(imports) = payload.unwrap() {
+            for import in imports {
+                let import = import.unwrap();
+                if import.name == name {
+                    return match import.ty {
+                        wasmparser::TypeRef::Func(type_idx) => Some(type_idx),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+    None
+}
+
+fn has_table_import(bytes: &[u8]) -> bool {
+    wasmparser::Parser::new(0).parse_all(bytes).any(|payload| {
+        let Ok(wasmparser::Payload::ImportSection(imports)) = payload else {
+            return false;
+        };
+        imports
+            .into_iter()
+            .any(|import| import.is_ok_and(|import| import.name == "__indirect_function_table"))
+    })
+}
+
+fn indirect_call_types_and_drop_count(bytes: &[u8]) -> (Vec<(u32, u32)>, usize) {
+    let mut indirect_calls = Vec::new();
+    let mut drops = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::CallIndirect {
+                        type_index,
+                        table_index,
+                        ..
+                    } => indirect_calls.push((type_index, table_index)),
+                    wasmparser::Operator::Drop => drops += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    (indirect_calls, drops)
+}
+
+#[test]
+fn test_clear_in_flight_exception_uses_true_void_indirect_call() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        true_void_call(PyreHelperKind::ClearInFlightException),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(1, 0)]);
+    assert_eq!(drops, 0, "a genuine () -> () helper needs no result drop");
+}
+
+#[test]
+fn test_untagged_size_zero_void_call_keeps_trampoline() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        true_void_call(PyreHelperKind::None),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+    assert!(indirect_calls.is_empty());
+}
+
+#[test]
+fn test_malformed_tagged_void_call_keeps_trampoline() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let mut effect = EffectInfo::default();
+    effect.extraeffect = ExtraEffect::CannotRaise;
+    effect.can_collect = false;
+    effect.pyre_helper = PyreHelperKind::ClearInFlightException;
+    let call = Op::new(
+        OpCode::CallN,
+        &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
+    );
+    call.setdescr(majit_ir::make_call_descr(
+        vec![Type::Int],
+        Type::Void,
+        effect,
+    ));
+    let ops = vec![
+        call,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+    assert!(indirect_calls.is_empty());
+}
+
+#[test]
+fn test_true_void_type_index_accounts_for_trampoline_type() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::CallI,
+            &[OpRef::const_int(43), OpRef::input_arg_int(0)],
+            OpRef::int_op(1),
+        ),
+        true_void_call(PyreHelperKind::ClearInFlightException),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(2, 0)]);
+    assert_eq!(drops, 0);
 }
 
 #[test]
