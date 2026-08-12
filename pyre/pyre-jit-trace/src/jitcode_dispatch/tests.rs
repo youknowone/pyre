@@ -12676,3 +12676,66 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
         other => panic!("expected the callee's Jit coordinate, got {other:?}"),
     }
 }
+
+#[test]
+fn a_guard_after_the_subwalks_store_is_what_declines_the_pop_fold() {
+    use super::specialize::subwalk_guard_follows_store;
+
+    let obj = OpRef::input_arg_ref(0);
+    let value = OpRef::ConstInt(7);
+
+    // The shape `w_list_pop_end_inner`'s Integer arm records today: every guard
+    // is ahead of `ll_list_int_set_len`, so a CALL-boundary resume re-executes
+    // a pop that has not happened.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let start = tc.get_trace_position();
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
+    assert!(
+        !subwalk_guard_follows_store(&tc, start),
+        "guard-then-store is the sound order and must not decline"
+    );
+
+    // What removing the `w_int_new` short-circuit would produce: the boxing
+    // body's own guards land after the length is already shrunk, so the same
+    // resume pops a second time.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let start = tc.get_trace_position();
+    tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    assert!(
+        subwalk_guard_follows_store(&tc, start),
+        "a guard past the body's first store is the double-apply shape"
+    );
+
+    // The window starts at the recorded position: the caller's own pre-descent
+    // stores are not the body's, and a guard after them is not a finding.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    tc.record_op(majit_ir::OpCode::SetfieldGc, &[obj, value]);
+    let start = tc.get_trace_position();
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    assert!(
+        !subwalk_guard_follows_store(&tc, start),
+        "ops recorded before the sub-walk are outside the window"
+    );
+
+    // Array stores commit just as much as field stores.
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let start = tc.get_trace_position();
+    tc.record_op(majit_ir::OpCode::SetarrayitemGc, &[obj, value, value]);
+    tc.record_guard(majit_ir::OpCode::GuardNonnull, &[obj], 0);
+    assert!(
+        subwalk_guard_follows_store(&tc, start),
+        "SetarrayitemGc is a committed store too"
+    );
+
+    // A start past the end is a window that no longer exists — an empty read
+    // there must not pass for "no guard after a store".
+    let tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let mut past_end = tc.get_trace_position();
+    past_end._pos = tc.ops().len() + 1;
+    assert!(
+        subwalk_guard_follows_store(&tc, past_end),
+        "an unreadable window declines"
+    );
+}

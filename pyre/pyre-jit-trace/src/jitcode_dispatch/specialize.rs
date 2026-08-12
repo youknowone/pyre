@@ -10375,9 +10375,11 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
 /// recording no guard) and returns before `run_sub_jitcode_walk`. Take that
 /// short-circuit away and the walk records the boxing body's own null and
 /// exception guards after the length is already shrunk, and a failure there
-/// pops twice. Nothing asserts this ordering; the pre-fold `GuardClass` /
-/// `GuardValue` and the strategy switch's guard are all ahead of the store by
-/// construction, not by check.
+/// pops twice. The pre-fold `GuardClass` / `GuardValue` and the strategy
+/// switch's guard are ahead of the store by construction; the body's own ops
+/// are checked instead of assumed —
+/// [`subwalk_guard_follows_store`] reads the window the sub-walk recorded and
+/// declines the fold if a guard landed past the first store.
 pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -10502,6 +10504,42 @@ pub(crate) fn orthodox_list_pop_body_and_sym<Sym: WalkSym>(
     Some((sub_body, sym_ptr))
 }
 
+/// Whether the ops recorded since `start` put a guard after a store.
+///
+/// A sub-walk that gets no callee frame resumes its guards at the caller's CALL
+/// boundary, so a failure re-executes the whole call. That is sound only while
+/// every guard precedes the body's first store: past one, the resumed call
+/// re-applies an effect the body already recorded.
+///
+/// This reads the recorded IR only. A `setfield` here says the walk *recorded*
+/// a store, not that one reached the heap — `setfield_gc_via_heapcache` writes
+/// through only for boxes the walk itself allocated — so a caller that wants to
+/// decline on the answer still owes its own proof that nothing observable has
+/// been applied yet.
+///
+/// A `start` past the end means the trace was cut below the capture point, so
+/// the window this answers about is gone; report the guard rather than read an
+/// empty one as "sound".
+pub(crate) fn subwalk_guard_follows_store(
+    trace_ctx: &TraceCtx,
+    start: majit_metainterp::recorder::TracePosition,
+) -> bool {
+    let ops = trace_ctx.ops();
+    let Some(recorded) = ops.get(start._pos..) else {
+        return true;
+    };
+    let mut stored = false;
+    for op in recorded {
+        if op.opcode.is_guard() && stored {
+            return true;
+        }
+        stored |= op.opcode.is_setfield()
+            || op.opcode.is_setarrayitem()
+            || op.opcode.is_setinteriorfield();
+    }
+    false
+}
+
 /// Publish the pop call-site resume coordinate, descend the real helper body,
 /// write its Ref result, and journal/apply the concrete shrink exactly once.
 #[allow(clippy::too_many_arguments)]
@@ -10609,6 +10647,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
 
+    let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
     let walk_result = run_sub_jitcode_walk(
@@ -10639,6 +10678,25 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
         }
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
     };
+    // The Integer arm commits `ll_list_int_set_len` before it boxes, so a guard
+    // recorded after that store would resume at this CALL boundary and pop a
+    // second time. Today none is: the boxing call is short-circuited into
+    // `NewWithVtable` + `SetfieldGc`. Decline rather than inherit that as an
+    // assumption — the caller cuts back to the generic residual, which pops
+    // exactly once.
+    //
+    // Declining is only safe while the receiver is untouched, so it takes the
+    // same length re-read the commit below does: on a target whose
+    // `ll_list_int_set_len` keeps a runtime binding, the sub-walk executed it
+    // for real rather than recording it, and cutting back to a residual that
+    // pops again is the very double-pop this fold already had to fix on the
+    // append side. In that case the store is a `call`, not a `setfield`, so
+    // the ordering read has nothing to say about it either.
+    if unsafe { pyre_object::w_list_len(inner_self) } == len_before
+        && subwalk_guard_follows_store(ctx.trace_ctx, walk_start)
+    {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
+    }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
 
     let w_item = pyre_object::w_int_new(raw_item);
