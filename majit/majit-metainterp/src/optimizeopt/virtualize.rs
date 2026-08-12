@@ -94,10 +94,10 @@ pub(crate) struct VirtualizableConfig {
     /// returns true there and no vable array access is ever resolved for
     /// mirroring.
     ///
-    /// The decline is not total. `identity_input_ref` returns
-    /// `Some(input_arg_ref(base))` whenever `ctx.inputarg_base != 0` — a bridge —
-    /// before it consults this field at all, so a tracker is still installed on
-    /// that path with this set to `None`.
+    /// The decline is not total. On the bridge path (`ctx.building_bridge`)
+    /// `identity_input_ref` returns `Some(input_arg_ref(ctx.inputarg_base))`
+    /// before it consults this field at all, so a tracker is still installed
+    /// there with this set to `None`.
     pub identity_input_index: Option<usize>,
     /// Whether the tracker seeds array-element state from the trace-entry
     /// input args (`init`'s array loop).
@@ -164,18 +164,31 @@ impl VirtualizableTracker {
     /// The input-arg slot the virtualizable identity occupies, or `None` when
     /// no sound slot is known and the tracker must decline.
     ///
-    /// A bridge keeps the identity at its own base: its input args are rebuilt
-    /// from the deadframe frame-first, which is also what `init`'s `base == 0`
-    /// gate and `is_standard_ref` assume, so the resolved offset applies to the
-    /// loop entry only — and so does the decline, since the bridge's base is
-    /// established by the deadframe rather than by the host's layout.
+    /// The answer is always expressed in this run's own OpRef namespace:
+    /// inputarg `#i` is raw OpRef `inputarg_base + i`. Phase 1 runs at base 0;
+    /// Phase 2 and bridges are shifted above the parent trace's high water
+    /// mark.
+    ///
+    /// A bridge keeps the identity at slot 0: its input args are rebuilt from
+    /// the deadframe frame-first, which is also what `init`'s seeding gate and
+    /// `is_standard_ref` assume, so the front end's resolved offset does not
+    /// describe them — the bridge's layout is established by the deadframe.
+    /// Every other run — loop, preamble, unrolled Phase 2 body — carries the
+    /// front end's own layout, so it consults `identity_input_index` and
+    /// declines with it.
+    ///
+    /// ⛔ The discriminator is `ctx.building_bridge`, never
+    /// `inputarg_base != 0`. Phase 2 shifts the base as well, so keying on the
+    /// base sends an unrolled loop body down the bridge path and installs
+    /// `PtrInfo::Virtualizable` on whatever inputarg 0 happens to be. On the
+    /// banked layout that is an Int scalar, and the loop-close Jump then fails
+    /// to match the Ref-typed preview (`VirtualStatesCantMatch`).
     fn identity_input_ref(&self, ctx: &OptContext) -> Option<OpRef> {
-        let base = ctx.inputarg_base;
-        if base != 0 {
-            return Some(OpRef::input_arg_ref(base));
+        if ctx.building_bridge {
+            return Some(OpRef::input_arg_ref(ctx.inputarg_base));
         }
         Some(OpRef::input_arg_ref(
-            self.config.identity_input_index? as u32,
+            ctx.inputarg_base + self.config.identity_input_index? as u32,
         ))
     }
 
@@ -345,14 +358,12 @@ impl VirtualizableTracker {
 
     fn is_standard_ref(&self, b: &Operand, ctx: &OptContext) -> bool {
         // pyjitpl.py:1131 `standard_box is box` — box identity against the
-        // standard virtualizable frame, then virtualizable check. The frame
-        // is the trace's first inputarg, at `inputarg_base`: `0` for
-        // loops/preambles, `bridge_inputarg_base` for bridges (whose parent
-        // loop owns the low OpRef range, so the bridge's own inputargs — frame
-        // first — start at the shifted base). A loop whose front end does not
-        // lead with the identity declares where it does sit
-        // (`identity_input_index`), and a loop with no known identity slot
-        // declines: nothing is the standard ref.
+        // standard virtualizable frame, then virtualizable check. The slot is
+        // resolved by `identity_input_ref`, so this reads the same answer
+        // `ensure_setup` installed on: a bridge's frame-first slot 0, or the
+        // front end's declared `identity_input_index`, both in this run's own
+        // OpRef namespace. A run with no known identity slot declines:
+        // nothing is the standard ref.
         match self
             .identity_input_ref(ctx)
             .and_then(|r| ctx.get_box_replacement_operand_opt(r))
