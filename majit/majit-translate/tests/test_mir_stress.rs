@@ -822,8 +822,21 @@ fn mir_on_unwind_target_taxonomy() {
             // catch. So exempt on the SOURCE terminator plus the eventual,
             // never on `drop_in_chain`: that flag is written only while
             // walking and is unreachable at the arms that return at once.
-            let destructor_cleanup =
-                term_kind_label == "Drop" && !matches!(eventual, "Call" | "Return");
+            //
+            // `Switch` is the third case and it splits. `classify_unwind_chain`
+            // calls it "cleanup that inspects state", and inside drop glue that
+            // is what it is: dropping an array branches over its elements, and
+            // this corpus holds exactly one such chain
+            // (`<array>::<Impl>::drop_in_place`, measured). Outside drop glue a
+            // branch on the unwind path is the catch-like control flow the
+            // assertion below exists to catch, so the exemption is withheld
+            // there. Keying on the drop-glue symbol is a proxy; it is the one
+            // the corpus actually distinguishes, and a `Switch` appearing under
+            // any other name is reported rather than absorbed.
+            let in_drop_glue = fd.item_meta.name_path().contains("drop_in_place");
+            let destructor_cleanup = term_kind_label == "Drop"
+                && !matches!(eventual, "Call" | "Return")
+                && (eventual != "Switch" || in_drop_glue);
             if did_work {
                 tally.real_work += 1;
                 if destructor_cleanup {
@@ -889,8 +902,8 @@ fn mir_on_unwind_target_taxonomy() {
         tally.total_call_terms > 0,
         "expected at least one Call/Assert/Drop terminator in the snapshot"
     );
-    // The decisive invariant — no on_unwind path does
-    // catch-like work (a Call/Switch/Return or a non-trivial statement)
+    // The decisive invariant — no on_unwind path does catch-like work (a
+    // Call/Return, a Switch outside drop glue, or a non-trivial statement)
     // other than pure destructor drop-glue. If this ever trips, the
     // corpus grew a Rust catch/cleanup that the front-graph driver would
     // silently drop, and the "drop on_unwind" adaptation must be revisited.
