@@ -2248,13 +2248,10 @@ impl Bookkeeper {
         // qualname spelling, unchanged.  Without this, a residual-return
         // `Option<*mut PyObject>` narrowed to `SomeInstance(Some)` re-blocks
         // its `__pos_0` payload read on an `Impossible` attr.
-        // Gated with the residual-Option narrow (mir.rs
-        // `option_residual_narrow_enabled`): the narrowed
-        // `Option<*mut PyObject>` residual result is the only consumer of the
-        // per-instantiation raw-pointer payload row today, so the two land
-        // and lift as one slice (`PYRE_OPTION_RESIDUAL_NARROW=0` restores the
-        // template-only projection).
-        if crate::front::mir::option_residual_narrow_enabled() {
+        // The narrowed `Option<*mut PyObject>` residual result is the consumer
+        // of the per-instantiation raw-pointer payload row, so project the two
+        // as one slice.
+        {
             let guard = self.pyre_struct_fields.borrow();
             if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
                 for (fname, fty) in &mut fields {

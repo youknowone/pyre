@@ -2502,8 +2502,7 @@ pub fn translate_op(
                     ])
                 }
                 // A `dyn Trait` virtual call. `front::mir` routes the
-                // inline-Field vtable-slot dispatch here (gated behind
-                // `PYRE_DYN_INDIRECT`) with the receiver already in
+                // inline-Field vtable-slot dispatch here with the receiver already in
                 // `args[0]`.  The production codewriter lowers it through
                 // `rpbc::lower_indirect_calls` (`VtableMethodPtr` +
                 // `IndirectCall`), but pyre has no IR vtable struct, so the

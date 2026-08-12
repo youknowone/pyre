@@ -6,7 +6,9 @@ read-expression at every source site (four census passes). Polarity rule:
 `is_some()`/`=="1"`/`.unwrap_or(false)` → default **OFF**; `is_none()` /
 `!= Ok("0")` / `.unwrap_or(true)` → default **ON**; a parse of
 number/path/list/mode → **VALUE** (config, not a boolean gate).
-Re-audited 2026-07-18 on branch `nbody`: §1c added; 10 rows retired.
+Re-audited 2026-07-18 on branch `nbody`: §1c added; 10 rows retired. The
+2026-08-12 pass retired six more default-ON gates whose tracked epics and
+successor work had closed.
 
 The charter (§3.6, A7) says a gate is a staging area, not a home: each live
 default-ON experiment gate is kept only until its epic closes, then its OFF
@@ -20,9 +22,9 @@ matches are not env gates at all** (Rust consts, macro-generated identifiers,
 runtime symbols, or comment-only dead references). The 2026-07-05 audit found
 that the **wasm trio** and the **#171 pair** were cleanly settled (epic closed
 / merged) and retired in that pass. The 2026-07-18 re-audit found no new live
-default-ON gate that is safely retirable right now; §1c is book-keeping for
-rows whose source readers were already deleted by closed epics after the
-original audit.
+default-ON gate that was safely retirable then; §1c records readers deleted by
+closed epics after the original audit, including the six gates retired on
+2026-08-12.
 
 ## §1 — Retired this pass (5)
 
@@ -237,7 +239,7 @@ program point is not a safepoint, and the same bench is clean under the real
 allocation-driven stress.  Force collections through the GC's own stress hook,
 never at a hand-picked instruction.
 
-## §1c — Retired since the 2026-07-05 audit (11): reader already deleted by a closed epic
+## §1c — Retired since the 2026-07-05 audit (17): reader already deleted by a closed epic
 
 Book-keeping only: these OFF-paths were deleted in source by the cited epics
 after the 2026-07-05 audit; this pass removes their stale registry rows. The
@@ -256,6 +258,12 @@ after the 2026-07-05 audit; this pass removes their stale registry rows. The
 | PYRE_P2_AUTHORITATIVE | reader gone; attribution #374 per re-audit | stale §5 deferred entry removed |
 | PYRE_SAME_GREENKEY | PR#390 (`802b79ff8db`); follow-up `111bdb4eeb8` dropped the gate | stale §1b deferred mention and §5 list entry removed |
 | PYRE_FBW_REC_UNROLL | PR#374 (`9a97c47f6e9`) deleted `fbw_unroll_bound()` | stale §5 config-switch entry removed 2026-08-08. The successor knob `PYRE_FBW_REC_UNROLL_DEPTH` was never listed here and its reader `fbw_max_rec_unroll_depth()` is gone too (PR#887, `e5546b2ed36`) — both names read from nothing |
+| PYRE_TWO_PHASE_RTYPE | #346 closed; the annotate-all → rtype-all prepass is the production pipeline | OFF return deleted and `run_two_phase_prepass_if_enabled` made unconditional 2026-08-12 |
+| PYRE_TUPLE_PER_SHAPE_CLASSDEF | #346 closed; per-shape tuple classdefs are the settled fix for cross-shape attribute unions | single-global-`Tuple` OFF path and reader deleted 2026-08-12 |
+| PYRE_ORIGINAL_BOXES | #202 and successor resume issues #366/#368/#369 closed; `greens ++ reds` is the RPython frame shape | collapsed-index OFF path and reader deleted 2026-08-12 |
+| PYRE_DYN_INDIRECT | PR#873 made faithful indirect-call lowering the default; OFF restored the inert `__dyn_call` placeholder | placeholder-routing OFF path and reader deleted 2026-08-12 |
+| PYRE_OPTION_RESIDUAL_NARROW | #346 / PR#446 / PR#574 settled per-instantiation Option classdefs | classdef-less GCREF OFF path and reader deleted 2026-08-12 |
+| PYRE_FBW_CALLEE_VSTACK | PR#1057 flipped the callee-local mirror after full-corpus validation on dynasm, cranelift and wasm | fallback register-scan OFF path, recursive-closure exception and reader deleted 2026-08-12 |
 
 ## §1d — Parity verdicts for the default-OFF `PYRE_FBW_*` seams (2026-07-25)
 
@@ -270,9 +278,9 @@ upstream lines:
 |---|---|---|
 | PYRE_FBW_VABLE_SCALAR_CA | **OFF** | **RETIRED** — the ON design contradicts upstream |
 | `_MULTIFRAME` (retired) | **ON** | **RETIRED** — reader and OFF path deleted after the default-ON verification; the adopt is now unconditional when the multi-frame latch conditions hold. §1d's one remaining wrong answer (a `sys._getframe` that is itself the escaping residual reading the caller frame) was closed by `walker_ec_enter` / `walker_ec_leave` publishing the callee frame at the inlined-call push |
-| PYRE_FBW_CALLEE_VSTACK | NEITHER | keep OFF; see §5 |
 
-The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757.
+The walker's default-ON `PYRE_FBW_*` cluster was retired separately in #757;
+the callee-vstack mirror followed after its default-ON validation in #1057.
 
 **`_VABLE_SCALAR_CA` — retired, ON path deleted.**  The gate proposed passing
 the callee's loop-carried locals as *extra scalar* CALL_ASSEMBLER args plus a
@@ -817,8 +825,6 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 
 | var | subsystem | retire when |
 |---|---|---|
-| PYRE_TWO_PHASE_RTYPE, PYRE_TUPLE_PER_SHAPE_CLASSDEF | rtyper prepass / per-shape tuple classdef | WS2 / #346 rtyper epic |
-| PYRE_ORIGINAL_BOXES | greens++reds original_boxes index shape | box-identity #202 / resume F1 |
 | PYRE_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
 | PYRE_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
 | PYRE_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
@@ -842,44 +848,16 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
-- **Default-OFF experiments (1 remaining)** — triaged in §1b/§1c (4 retired
-  in the 2026-07-05 pass, 9 retired since then; `PYRE_P2_DRAIN` retired with
+- **Default-OFF experiments (none remaining)** — triaged in §1b/§1c (4 retired
+  in the 2026-07-05 pass; `PYRE_P2_DRAIN` retired with
   the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
   §1d; `PYRE_CARRIER_EXC_RESUME` retired 2026-08-06 with its ON path deleted,
-  see §1b).  Kept: `_CALLEE_VSTACK` (callee-local operand-stack mirror).  Its
-  *ON* path is the unattested one, so it is an adoption target rather than a
-  retirement target.
+  see §1b; `_CALLEE_VSTACK` flipped default-ON in #1057 and retired 2026-08-12).
   The single-frame resume-past-escape switch graduated out of this bucket on
   2026-07-25 when it flipped default-ON. It is now retired alongside the
   multi-frame switch, with both readers and OFF paths deleted after
   `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe`
   identity answer.
-
-  `_CALLEE_VSTACK` was evaluated for a flip on 2026-07-25 and **declined —
-  the ON path is a half-finished port with no consumer**.  Parity first:
-  upstream has *no* per-frame operand-stack model to port, because the
-  codewriter has already flattened the Python stack into jitcode registers —
-  `MIFrame` carries only `registers_i/r/f` (`pyjitpl.py:65-95`), a callee's
-  resume section is its own registers under the per-pc liveness window
-  (`get_list_of_active_boxes`, `pyjitpl.py:177-234`), and `virtualizable_boxes`
-  is established once for the ONE standard vable
-  (`initialize_virtualizable`, `pyjitpl.py:3314-3331`; `_nonstandard_virtualizable`,
-  `1120-1146`).  So NEITHER side of this gate is an upstream port, and the
-  mirror's own module doc concedes it has no `rpython/jit/metainterp/`
-  counterpart.  What decides it is a defect on the ON side: with the gate on,
-  `seed_callee_vstack_mirror` fills the mirror with CALLEE content
-  (`vstack_mirror.rs:727-742`), but the two maintenance sites still classify
-  `index_value` against the OUTER portal sym's `nlocals()`
-  (`vable_ops.rs:558-570`, `610-645`), and `collect_call_stack_overrides`
-  indexes the mirror with `caller_sym.nlocals()`
-  (`resume_snapshot.rs:1138-1151`) — callee content read through caller frame
-  geometry.  Meanwhile the guard-time consumer is unreachable in a sub-walk
-  (`resume_snapshot.rs:325` gates it behind `!inline_subwalk`), which is why a
-  306-bench corpus A/B on both backends changes the `[vstack-reconcile]` count
-  in 60 benches with byte-identical output and no measurable timing difference:
-  the mirror is seeded and then read by nobody.  Definition of done before
-  re-evaluating: make the maintenance sites read the ACTIVE callee jitcode
-  metadata (what the gate doc already asks for), then land a consumer.
 - **Config / value / master switches (~17)** — tuning, paths, modes; keep:
   `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
@@ -901,12 +879,13 @@ with no entry here fails `cargo test`. The counts to quote, distinguished:
 | distinct names read from the environment | **111** |
 | — of those, read from Rust | 105 |
 | — read only from the harness Python | 6 |
-| (file, name) read pairs | 137 |
+| (file, name) read pairs | 141 |
 | **live gates that were absent from this file** | **66** |
 | names still listed live with no read site left (retire) | 0 |
 
 ```sh
-{ git ls-files '*.rs'; git ls-files 'pyre/**/*.py' 'scripts/*.py'; } \
+{ git ls-files '*.rs' ':!pyre/pyrex/tests/gate_triage_complete.rs'; \
+  git ls-files 'pyre/*.py' 'pyre/**/*.py' 'scripts/*.py'; } \
   | xargs rg --no-filename -o \
       '(env::var[_a-z]*|host_os::var|getenv|environ\.get)\(b?"(PYRE_[A-Z0-9_]+)"' \
       -r '$2' | sort -u
@@ -962,10 +941,10 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6b — VALUE knobs (13): config, not gates
+### §6b — VALUE knobs (11): config, not gates
 
-`PYRE_DYN_INDIRECT`, `PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_JD1_THRESHOLD`,
-`PYRE_OPTION_RESIDUAL_NARROW`, `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
+`PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_JD1_THRESHOLD`,
+`PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_DTRACE_CONST_FROM`, `PYRE_DTRACE_CONST_TO`,
 `PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
@@ -1003,11 +982,11 @@ already-ON criterion. They are listed so they cannot be missed again.
 
 | bucket | count |
 |---|---|
-| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 11 + 1 |
+| retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 17 + 1 |
 | not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
-| live default-ON, kept until epic closes | 9 |
+| live default-ON, kept until epic closes | 6 |
 | diagnostics (OFF) | ~34 |
-| default-OFF experiments (all keep — adoption targets) | 3 |
+| default-OFF experiments | 0 |
 | config / value / master | ~17 |
 | test harness | 1 |

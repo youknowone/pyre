@@ -3399,13 +3399,9 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `live_values` is reds-only (greens fold to consts in the `green_key`
     /// side channel, matching the compiled loop's reds-only entry contract).
-    /// By default the local `original_boxes = greens ++ reds` shape is restored
+    /// The local `original_boxes = greens ++ reds` shape is restored
     /// (greens prepended as positional placeholders), matching RPython's
     /// `original_boxes[num_green_args + index_of_virtualizable]` read.
-    /// `PYRE_ORIGINAL_BOXES=0` opts out, collapsing the absolute index back to
-    /// `index_of_virtualizable`; the resolved virtualizable pointer and its
-    /// ref-bank index are unchanged either way (the gate is a structural-parity
-    /// no-op).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3315: vinfo = self.jitdriver_sd.virtualizable_info
         // Prefer the trace-bound `active_jitdriver_sd` (RPython
@@ -3439,24 +3435,13 @@ impl<M: Clone> MetaInterp<M> {
         // below as positional placeholders (their const values live in the
         // `green_key`, so they only offset `index` to the virtualizable red) and
         // `num_green_args` comes from the active driver descriptor.
-        // `PYRE_ORIGINAL_BOXES=0` opts out — greens then contribute 0 and `index`
-        // collapses to `index_of_virtualizable`. Either way the trace inputargs /
-        // entry stay reds-only, so the virtualizable's ref-bank index
-        // (`box_ref_index`) decouples from the flat `index`.
+        // The trace inputargs / entry stay reds-only, so the virtualizable's
+        // ref-bank index (`box_ref_index`) decouples from the flat `index`.
         let descriptor_num_greens = ctx
             .driver_descriptor()
             .map(|driver| driver.num_greens())
             .unwrap_or(0);
-        let use_original_boxes = descriptor_num_greens > 0 && crate::original_boxes_enabled();
-        let num_green_args = if use_original_boxes {
-            descriptor_num_greens
-        } else {
-            jd_sd.num_greens()
-        };
-        debug_assert!(
-            use_original_boxes || num_green_args == 0,
-            "pyre green args live in green_key, not in live_values (pyjitpl.py:3317)"
-        );
+        let num_green_args = descriptor_num_greens;
         assert!(
             jd_sd.index_of_virtualizable >= 0,
             "pyjitpl.py:3317: jitdriver with virtualizable_info must have \
@@ -3466,8 +3451,8 @@ impl<M: Clone> MetaInterp<M> {
         let index_of_virtualizable = jd_sd.index_of_virtualizable as usize;
         let index = num_green_args + index_of_virtualizable;
         // original_boxes = [green placeholders ++ live_values]; identical to
-        // `live_values` when the gate is off (num_green_args == 0). Read by `index`
-        // for the virtualizable pointer; the reds-only `live_values` still drives the
+        // `live_values` when there are no green args. Read by `index` for the
+        // virtualizable pointer; the reds-only `live_values` still drives the
         // expanded-tail and inputarg-minting paths below.
         let original_boxes: std::borrow::Cow<[Value]> = if num_green_args > 0 {
             let mut boxes = Vec::with_capacity(num_green_args + live_values.len());

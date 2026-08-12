@@ -305,18 +305,6 @@ pub fn no_unroll_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("PYRE_NO_UNROLL").is_some())
 }
 
-/// `PYRE_ORIGINAL_BOXES`: default true, only disabled by `0` or `false`.
-pub fn original_boxes_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| match std::env::var_os("PYRE_ORIGINAL_BOXES") {
-        Some(v) => {
-            let v = v.to_string_lossy();
-            v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        None => true,
-    })
-}
-
 pub fn stall_window() -> u64 {
     static VAL: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
         std::env::var("MAJIT_STALL_WINDOW")

@@ -1573,17 +1573,13 @@ fn analyze_pipeline_from_module_paths(
     // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
     // to the family base ClassDef.  Union with the config list (dedup by
     // base_root), never replacing it, to stay forward-safe with the aheui
-    // census.  Shares [`dyn_indirect_enabled`] with the lowering arm because
-    // the two are one decision: minting base/impl subclass classdefs perturbs
-    // `pyre_struct_root_names` → `ensure_session` inheritance-id numbering
-    // even off-path, so `PYRE_DYN_INDIRECT=0` must restore BOTH the
-    // `__dyn_call` emit and the config-only (empty in prod) set together for
-    // the kill switch to be byte-identical.  Applies the same within-family
+    // census. Minting base/impl subclass classdefs and lowering the indirect
+    // call are one decision. Applies the same within-family
     // `dup_leaf` guard as the config path plus the cross-registry
     // `struct_leaf_counts` bail: an impl leaf that also names a DIFFERENT
     // registered struct would mis-seed the family, so skip it (fail-safe
     // classdef-less).
-    if front::mir::dyn_indirect_enabled() {
+    {
         let already: std::collections::HashSet<&str> = trait_family_registrations
             .iter()
             .map(|r| r.base_root.as_str())
@@ -2037,11 +2033,10 @@ fn make_jitcodes(
     // RPython call.py:145-148.
     call_control.grab_initial_jitcodes();
     prof.mark("  grab_initial_jitcodes");
-    // Two-phase rtyper prepass (production default; `PYRE_TWO_PHASE_RTYPE=0`
-    // opts out): annotate-all → rtype-all over the portal closure before the
-    // drain publishes any covered graph, so a shared callee (e.g. `type_error`)
-    // is unioned across all its callers before being rtyped.
-    codewriter.run_two_phase_prepass_if_enabled(call_control);
+    // Two-phase rtyper prepass: annotate-all → rtype-all over the portal closure
+    // before the drain publishes any covered graph, so a shared callee (e.g.
+    // `type_error`) is unioned across all its callers before being rtyped.
+    codewriter.run_two_phase_prepass(call_control);
     prof.mark("  run_two_phase_prepass");
     codewriter.drain_pending_graphs(call_control, &pipeline_config.transform);
     prof.mark("  drain_pending_graphs");

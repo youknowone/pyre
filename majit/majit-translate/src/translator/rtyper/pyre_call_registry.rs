@@ -191,7 +191,7 @@ impl PyreFunctionEntry {
     }
 }
 
-/// Per-subject result of the two-phase rtyper drive (`PYRE_TWO_PHASE_RTYPE`).
+/// Per-subject result of the two-phase rtyper drive.
 ///
 /// Phase A (annotate-all over the portal closure) populates `value_to_var` /
 /// `constant_concretetypes` via the adapter + annotate-half and records the
@@ -256,7 +256,7 @@ pub struct PyreCallRegistry {
     bookkeeper: Rc<Bookkeeper>,
     entries: RefCell<HashMap<FunctionPathKey, Rc<PyreFunctionEntry>>>,
     aliases: RefCell<HashMap<FunctionPathKey, FunctionPathKey>>,
-    /// Whole-program two-phase type cache (`PYRE_TWO_PHASE_RTYPE`). Empty and
+    /// Whole-program two-phase type cache. Empty and
     /// `prepass_done = false` unless the two-phase prepass populated it.
     two_phase: RefCell<TwoPhaseTypeCache>,
     /// Lazily-constructed `(RPythonAnnotator, RPythonTyper)` pair
@@ -290,7 +290,7 @@ impl PyreCallRegistry {
         }
     }
 
-    /// Mutable access to the two-phase type cache (`PYRE_TWO_PHASE_RTYPE`).
+    /// Mutable access to the two-phase type cache.
     pub fn two_phase(&self) -> std::cell::RefMut<'_, TwoPhaseTypeCache> {
         self.two_phase.borrow_mut()
     }

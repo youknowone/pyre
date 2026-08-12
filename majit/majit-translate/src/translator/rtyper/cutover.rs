@@ -3055,7 +3055,7 @@ fn drive_subject(
     ))
 }
 
-/// Whole-program two-phase rtyper prepass (`PYRE_TWO_PHASE_RTYPE`).
+/// Whole-program two-phase rtyper prepass.
 ///
 /// Mirrors upstream `translator.annotate()` → `rtyper.specialize()`
 /// (`driver.py:325/345`): Phase A annotates EVERY graph in the portal closure

@@ -1017,13 +1017,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // witness (`getcalldescr`'s indirect arm reads its `return_type` as
         // `FUNC.RESULT`).  Left `None` it maps to `Void` and mismatches the
         // caller's `Ref`/`Int` `result_ty`; stamp the same token an opaque
-        // callee gets so the witness reports its real return kind.  Gated on
-        // `PYRE_DYN_INDIRECT` so the direct `[Trait, method]` registration
-        // (`lib.rs`) keeps its `None`→`Void` default when the routing is off
-        // — off-path byte-identity holds.
+        // callee gets so the witness reports its real return kind.
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
-            || (dyn_indirect_enabled() && trait_root.is_some() && self_ty_root.is_none());
+            || (trait_root.is_some() && self_ty_root.is_none());
         let return_type = if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc)
         } else {
@@ -6740,13 +6737,8 @@ impl<'a> Lowering<'a> {
                 // `Some(..)`/`None` of the same instantiation mints, so the caller's
                 // `if let Some(x) = ..` (`Discriminant` → `__discriminant` read, then
                 // the Some-arm `__pos_0` payload) resolves against the Option classdef
-                // instead of blocking on a classdef-less GCREF.  Gated so the
-                // bare-GCREF residual result can be restored.
-                .or_else(|| {
-                    option_residual_narrow_enabled()
-                        .then(|| self.option_residual_narrow_root(&call.dest.ty))
-                        .flatten()
-                })
+                // instead of blocking on a classdef-less GCREF.
+                .or_else(|| self.option_residual_narrow_root(&call.dest.ty))
         } else {
             None
         };
@@ -8196,9 +8188,7 @@ impl<'a> Lowering<'a> {
                 // synthetic `__dyn_call` path (the fat-pointer receiver
                 // threaded into `args[0]`).
                 let is_fn_ptr = operand_is_fn_ptr(&dyn_operand, self.llbc);
-                let indirect = dyn_indirect_enabled()
-                    .then(|| self.dyn_indirect_target(&dyn_operand))
-                    .flatten();
+                let indirect = self.dyn_indirect_target(&dyn_operand);
                 if let Some((trait_root, method_name)) = indirect {
                     OpKind::Call {
                         target: CallTarget::indirect(trait_root, method_name),
@@ -16777,14 +16767,7 @@ fn render_adt_type_args(
 /// get distinct classdefs instead of colliding on the shared `__pos_N`
 /// attributes of one global `Tuple` class — the `generalize_attr` UnionError
 /// that walls every graph mixing tuple element categories (`bigint_truediv`,
-/// …) off the two-phase rtyper.  On by default; `PYRE_TUPLE_PER_SHAPE_CLASSDEF=0`
-/// is the kill switch that restores the single global `Tuple` classdef.
-fn tuple_per_shape_enabled() -> bool {
-    !matches!(
-        std::env::var("PYRE_TUPLE_PER_SHAPE_CLASSDEF").as_deref(),
-        Ok("0") | Ok("false")
-    )
-}
+/// …) off the two-phase rtyper.
 
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
 /// `CallTarget::Indirect` vtable pipeline instead of the synthetic
@@ -16802,42 +16785,22 @@ fn tuple_per_shape_enabled() -> bool {
 /// | off | 243 | `__dyn_call` 48 |
 /// | on  | **224** | `Wtf8::as_str` 37 |
 ///
-/// On by default; `PYRE_DYN_INDIRECT=0` is the kill switch that restores the
-/// inert `__dyn_call` emit.
-pub(crate) fn dyn_indirect_enabled() -> bool {
-    !matches!(
-        std::env::var("PYRE_DYN_INDIRECT").as_deref(),
-        Ok("0") | Ok("false")
-    )
-}
-
 /// Narrow a `dont_look_inside` residual call whose destination is
 /// `Option<*mut PyObject>` from the classdef-less `ref` GCREF token to the
 /// per-instantiation `Option` enum root, so the caller's `if let Some(x) =
 /// ..` (`__discriminant` read + Some-arm `__pos_0` payload) resolves against
 /// the Option classdef instead of panicking with `Ptr{Opaque(GCREF)}
-/// instance has no field "__discriminant"`.  On by default;
-/// `PYRE_OPTION_RESIDUAL_NARROW=0` is the kill switch that restores the
-/// bare-GCREF residual result.
-pub(crate) fn option_residual_narrow_enabled() -> bool {
-    !matches!(
-        std::env::var("PYRE_OPTION_RESIDUAL_NARROW").as_deref(),
-        Ok("0") | Ok("false")
-    )
-}
+/// instance has no field "__discriminant"`.
 
 /// The per-shape `<…>` suffix for a synthetic tuple whose Charon ADT
 /// descriptor is `adt` (`{"id":"Tuple","generics":{"types":[…]}}`), or `""`
-/// when the gate is off, `adt` is not a `"Tuple"`, or the tuple is the unit
+/// when `adt` is not a `"Tuple"`, or the tuple is the unit
 /// `()` (empty type list — kept bare `"Tuple"` so the unit-value special-cases
 /// in `jtransform` / `unit_variant_fold` still match).  Rendered via the same
 /// [`render_adt_type_args`] both the construction and the projection derive
 /// from the tuple's `place.ty` node (NOT the element-type-less `AggregateKind`
 /// head), so the `__pos_N` read and write owners agree.
 fn tuple_shape_suffix(adt: &serde_json::Map<String, serde_json::Value>, llbc: &Llbc) -> String {
-    if !tuple_per_shape_enabled() {
-        return String::new();
-    }
     if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
         return String::new();
     }

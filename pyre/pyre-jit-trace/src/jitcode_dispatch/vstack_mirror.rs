@@ -12,29 +12,6 @@
 
 use super::*;
 
-/// Whether `frame` is a recursive call to the live root portal closure.
-/// Compare against the live `PyFrame.pycode`, not `snapshot_sym.jitcode`:
-/// the latter is rebound while a callee sub-walk is active and therefore
-/// aliases every ordinary inlined closure to itself.
-fn is_recursive_root_closure<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    frame: &ActiveResumeFrame,
-) -> bool {
-    if !frame.is_handler_free_closure() || ctx.fbw_mode.snapshot_sym.is_null() {
-        return false;
-    }
-    let live_frame = unsafe { (*ctx.fbw_mode.snapshot_sym).live_vable_frame_addr() }
-        as *const pyre_interpreter::PyFrame;
-    if live_frame.is_null() {
-        return false;
-    }
-    let root_code = unsafe {
-        pyre_interpreter::w_code_get_ptr((*live_frame).pycode as pyre_object::PyObjectRef)
-            as *const pyre_interpreter::CodeObject
-    };
-    !root_code.is_null() && root_code == frame.0.code_ptr
-}
-
 /// #73: classify `instr` for the [`VstackOpClass`] taxonomy.  Mirrors the
 /// stack-effect grouping in [`crate::liveness`]'s `stack_effects`, but
 /// collapsed to the three categories the operand-stack box maintenance
@@ -704,10 +681,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // with the NONE slot left in place; `stack_sync` (USE) omits any NONE
     // mirror slot, which resume re-materializes.
     if ctx.vstack_valid {
-        // Admission, not the env gate, decides the shadow owner: a recursive
-        // closure is admitted with `PYRE_FBW_CALLEE_VSTACK` off, and filling
-        // its hole from the outer portal virtualizable would record a caller
-        // operand as the callee's kept-stack value.  A sub-walk mirror only
+        // Admission decides the shadow owner: filling a callee hole from the
+        // outer portal virtualizable would record a caller operand as the
+        // callee's kept-stack value. A sub-walk mirror only
         // exists once `seed_callee_vstack_mirror` / `step_vstack_mirror` have
         // admitted it, so `inline_subwalk` alone is that predicate here.
         let callee_local_shadow = ctx.fbw_mode.inline_subwalk;
@@ -932,18 +908,10 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             ctx.vstack_valid = false;
             return;
         };
-        let recursive_closure = is_recursive_root_closure(ctx, &frame);
         // A carrier-resume walk is the rebuilt MIFrame of
         // `resume.py rebuild_from_resumedata` being driven forward after guard
-        // failure.  Its per-frame operand stack is not an optional
-        // optimization: residual calls must read the exact boxes the
-        // reconstructed frame owns, so it is admitted alongside the recursive
-        // root closure even while the experimental fresh-inline mirror stays
-        // disabled for ordinary tracing.
-        if !fbw_callee_vstack_enabled() && !recursive_closure && !ctx.fbw_mode.carrier_resume {
-            ctx.vstack_valid = false;
-            return;
-        }
+        // failure. Its per-frame operand stack must read the exact boxes the
+        // reconstructed frame owns, just like an ordinary inline sub-walk.
         let Some(coord) = frame.vstack_step_coordinate_for_jitcode_pc(jit_pc, ctx.vstack_cur_pypc)
         else {
             ctx.vstack_valid = false;
@@ -1037,10 +1005,6 @@ pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
         return;
     };
-    let recursive_closure = is_recursive_root_closure(ctx, frame);
-    if !fbw_callee_vstack_enabled() && !recursive_closure {
-        return;
-    }
     ctx.vstack_boxes.clear();
     ctx.vstack_depth = 0;
     ctx.vstack_cur_pypc = first_pypc;
@@ -1344,7 +1308,7 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     handler_jit_pc: usize,
     exc: OpRef,
 ) {
-    if !fbw_callee_vstack_enabled() || !ctx.vstack_valid {
+    if !ctx.vstack_valid {
         ctx.vstack_valid = false;
         return;
     }
