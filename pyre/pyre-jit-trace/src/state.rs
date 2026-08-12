@@ -1919,8 +1919,7 @@ pub(crate) struct BridgeSemanticMaps {
 /// leg that fires first is ever named, so a run in which one leg never executed
 /// is indistinguishable from one in which it executed second.
 ///
-/// Pure telemetry — with the variable unset every counter path is skipped and
-/// the fallback's value is unchanged.
+/// Pure telemetry — with the variable unset every counter path is skipped.
 struct EmptyTwinSite {
     name: &'static str,
     hits: std::sync::atomic::AtomicU64,
@@ -1954,17 +1953,14 @@ static EMPTY_TWIN_MISS: EmptyTwinSite = EmptyTwinSite::new("twin_miss");
 /// the carried offset does not decode as a `-live-` anchored startpoint.
 static EMPTY_TWIN_NON_DECODABLE: EmptyTwinSite = EmptyTwinSite::new("non_decodable");
 
-/// `jit_pc` / `twin` report the coordinate this leg declined on and what the
-/// jitcode-keyed containing-depth twin would have answered there — the
-/// measurement the "route the fallback through the twins instead of answering
-/// 0" question needs. On the 399-file synth corpus all 20 executions answer
-/// `jit_pc >= 0` with `twin = Some(3..=5)`, so that change is not inert.
+/// `jit_pc` / `twin` report the coordinate that reached the fallback and the
+/// jitcode-keyed containing depth used there. Before that twin became the
+/// production fallback, the 399-file synth corpus showed all 20 executions at
+/// `jit_pc >= 0` with `twin = Some(3..=5)` while the function returned 0.
 ///
-/// What this does NOT resolve: the counters are per leg, not per call site, so
-/// a fire cannot be attributed to one of the callers. That matters, because
-/// `setup_bridge_sym` is the only one whose `stack_depth_at_pc` read is
-/// unconditional; at the others an empty `pcdep_entries` makes the depth inert
-/// regardless of its value.
+/// The counters remain per leg, not per call site, so a fire cannot be
+/// attributed to one of the callers. `setup_bridge_sym` is the consumer whose
+/// `stack_depth_at_pc` read is unconditional.
 fn empty_twin_census(
     site: &EmptyTwinSite,
     rp: Option<usize>,
@@ -2063,8 +2059,12 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // computed kept operand-stack temps are live; at the merge-target PC
         // they've been consumed and carry no pcdep entry.
         //
-        // A caller holding no Python coordinate answers 0. That is a decline,
-        // and a lossy one — not the best available answer.
+        // A caller holding no Python coordinate reads the floor-only static
+        // depth twin.  This is independent of whether `jitcode_pc` itself is
+        // a `-live-`-anchored startpoint: the frame width and the per-slot
+        // color map are codewriter sidecars keyed by the containing operation,
+        // while `can_decode_live_vars` only decides whether the register-value
+        // stream can be enumerated directly at that byte.
         //
         // Jitcode-keyed spellings of this same static table exist:
         // `depth_containing_for_jitcode_pc` is built (`finalize_jitcode`, the
@@ -2072,26 +2072,29 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `depth_at_py_pc[containing_py]` for every offset, and
         // `depth_trivia_for_jitcode_pc` reads it at the trivia-skipped py.
         // `collect_outer_active_boxes`, the encode half this mirrors, already
-        // sources its own `stack_depth_at_pc` from those twins with no Python
-        // PC in hand. The census below measured what they would answer here:
+        // sources its own `stack_depth_at_pc` and pcdep from JitCode-keyed
+        // twins with no Python PC in hand. The census below measured what the
+        // containing-depth twin answers here:
         // over the 399-file synth corpus every one of the 20 executions of this
         // leg carried a non-negative offset at which the containing twin
-        // answers 3, 4 or 5 — so routing through it is a real change in the
-        // reconstructed frame's width, not a no-op, and it is left to its own
-        // measurement rather than folded into a coordinate repair.
+        // answers 3, 4 or 5. Returning 0 truncated the reconstructed frame's
+        // semantic prefix and dropped exactly those operand-stack slots.
         //
         // What this leg must not do, and did before the `Option`, is index the
         // Python-keyed table with the JitCode word.
         let via_py_pc = |rp: Option<i32>, site: &'static EmptyTwinSite| -> usize {
-            // Census-only: what the jitcode-keyed twin would answer at the
-            // coordinate this leg is declining on. Behind the census gate, so a
-            // production run does no extra work for it.
-            let twin = (crate::py_coord::emptytwin_census_enabled() && jitcode_pc >= 0)
+            // The JitCode-keyed static twin is the production fallback when no
+            // sanctioned Python coordinate is carried.  It is built from the
+            // same `depth_at_py_pc` table as the raw read below and therefore
+            // preserves frame width without projecting a JitCode byte offset
+            // through a Python-keyed map.
+            let twin = (jitcode_pc >= 0)
                 .then(|| payload.depth_containing_for_jitcode_pc(jitcode_pc as usize))
                 .flatten();
             let Some(rp) = rp.and_then(|p| usize::try_from(p).ok()) else {
-                empty_twin_census(site, None, None, 0, jitcode_pc, twin);
-                return 0;
+                let depth = twin.unwrap_or(0);
+                empty_twin_census(site, None, None, depth, jitcode_pc, twin);
+                return depth as usize;
             };
             if payload.code_ptr.is_null() {
                 empty_twin_census(site, Some(rp), None, 0, jitcode_pc, twin);
@@ -2102,29 +2105,30 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             empty_twin_census(site, Some(rp), Some(table.len()), depth, jitcode_pc, twin);
             depth as usize
         };
-        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0
-            && payload
-                .jitcode
-                .can_decode_live_vars(jitcode_pc as usize, sd.op_live)
-        {
+        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0 {
             let jp = jitcode_pc as usize;
             // Decode-identity: source depth/pcdep from the carried genuine
-            // `jitcode_pc` via the predecessor-keyed twins. Every real carried
-            // coordinate is an op-start or block-head offset of a colored
-            // jitcode, for which the codewriter seeds these twins; a twin miss
-            // degrades to the caller's own merge-target Python PC, keeping
-            // liveness and pcdep on one coordinate, and to 0 when the caller
-            // has none.
-            match (
-                payload.depth_for_jitcode_pc_pred(jp),
-                payload.pcdep_for_jitcode_pc(jp),
-            ) {
-                (Some(depth), Some(pcdep)) => (depth as usize, pcdep),
-                _ => (via_py_pc(py_pc, &EMPTY_TWIN_MISS), Vec::new()),
+            // `jitcode_pc` via the predecessor-keyed twins.  A `-live-`
+            // startpoint uses the walk-time depth twin, exactly as the encoder
+            // does.  A non-decodable operation byte still owns semantic
+            // sidecars: retain its pcdep and obtain frame width from the static
+            // containing-depth twin instead of collapsing both to empty/zero.
+            // RPython's resume reader keeps these concerns separate too:
+            // `setup_resume_at_op(pc)` selects the frame position and
+            // `consume_boxes(get_current_position_info(), ...)` enumerates
+            // whatever register stream that position carries.
+            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
+            if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                let depth = payload
+                    .depth_for_jitcode_pc_pred(jp)
+                    .map(usize::from)
+                    .unwrap_or_else(|| via_py_pc(py_pc, &EMPTY_TWIN_MISS));
+                (depth, pcdep)
+            } else {
+                (via_py_pc(py_pc, &EMPTY_TWIN_NON_DECODABLE), pcdep)
             }
         } else {
-            // A non-decodable carried coordinate falls back to the merge-target
-            // PC so liveness and pcdep key the same point.
+            // A genuinely absent coordinate can only use a carried Python PC.
             (via_py_pc(py_pc, &EMPTY_TWIN_NON_DECODABLE), Vec::new())
         };
         BridgeSemanticMaps {
@@ -2145,12 +2149,9 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
 /// `recipe.jitcode_pc`, `residual_call.rs` `op_pc`, `resume_snapshot.rs`
 /// `callee_jitcode_pc`). The two `RebuiltFrame` callers (`state.rs`
 /// `reconstruct_inline_recipe` and `setup_bridge_sym`) do hold one — the
-/// forward-carried `RebuiltFrame::py_pc`, which `py_coord.rs` names as a
-/// sanctioned Python-coordinate source — and decline it anyway: they carried
-/// `.pc` here before, and supplying `.py_pc` instead would widen
-/// `semantic_prefix_len` off a coordinate the old code never read. Declining is
-/// what keeps this a coordinate repair; what the declined leg leaves on the
-/// table is recorded at `via_py_pc`.
+/// forward-carried `RebuiltFrame::py_pc`, but the JitCode-keyed containing
+/// depth and pcdep twins now carry the same semantic information without
+/// routing the JitCode word through a Python-keyed map.
 pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     jitcode_index: i32,
     jitcode_pc: i32,
@@ -13749,6 +13750,42 @@ mod tests {
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
         assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(7)]));
+    }
+
+    #[test]
+    fn bridge_semantic_maps_keep_sidecars_at_non_live_jitcode_offset() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+
+        let raw_code = compile_exec("x = 1").expect("test code should compile");
+        let frame = PyFrame::new(raw_code);
+        let code_ref = frame.pycode as *const ();
+
+        // A CALL/residual operation start can be a valid JitCode coordinate
+        // without being a `-live-`-anchored decode point.  The codewriter still
+        // publishes containing-depth and pcdep sidecars for that coordinate;
+        // bridge reconstruction must not collapse them to 0/empty merely
+        // because the runtime JitCode body below has no live marker at pc=9.
+        let mut metadata = crate::PyJitCodeMetadata::degenerate();
+        metadata.depth_containing_by_jit_pc = vec![(0, 4)];
+        metadata.pcdep_by_jit_pc = vec![(0, vec![(1, 7, 3)])];
+        metadata.has_color_map = true;
+        metadata.is_drained = true;
+        let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
+            std::sync::Arc::new(majit_metainterp::jitcode::JitCode::default()),
+            metadata,
+            std::ptr::null(),
+            false,
+        ));
+        let jitcode_index = METAINTERP_SD.with(|r| unsafe {
+            let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
+            (*ptr).index
+        });
+
+        let maps = bridge_semantic_maps_from_jitcode_pc(jitcode_index, 9);
+        assert_eq!(maps.stack_depth_at_pc, 4);
+        assert_eq!(maps.pcdep_entries, vec![(1, 7, 3)]);
     }
 
     #[test]
