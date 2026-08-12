@@ -116,6 +116,22 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
 /// after the first access. An array access can still emit a second promote
 /// guard for its index, so every guard minted by one opcode is captured in
 /// emission order.
+///
+/// `write` rolls the virtualizable shadow entry back to its pre-store value
+/// for the capture window: a setter stores before this runs, so without the
+/// swap the promote guard's resume data would carry the very write its resume
+/// pc re-executes.
+///
+/// Both that rollback and the per-guard loop only have a subject when a vable
+/// op's frame operand is an `OpRef` that is not `standard_virtualizable_box()`
+/// yet points at the same frame, so the PTR_EQ reads equal. Nothing mints one
+/// today: `lower_vable_field_read` and its siblings lower a field access to a
+/// vable op only when the base is literally the declared virtualizable
+/// variable, and `run_perfn_walk`, `fbw_force_virtualizable_before_return` and
+/// `fbw_publish_exit_last_instr` all seed that variable from
+/// `standard_virtualizable_box()` itself, so an aliasing box returns early on
+/// the identity check. A new seeding site, or a base other than the declared
+/// variable reaching a vable op, makes both live at once.
 pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
