@@ -91,29 +91,43 @@ def _typing_type_repr(value):
     return f"{module}.{qualname}"
 
 
-def _index(value):
+def _index(value) -> int:
     # `operator.index`, written out because this module loads before the
     # pure-Python `operator` is importable.  An evaluator's format argument is
     # a `Format` member, so it reaches here through the integer index
     # protocol: a float or a string is a TypeError rather than a format that
     # silently compares unequal to every member.
     if isinstance(value, int):
-        return value
+        return int(value)
     try:
         index = type(value).__index__
     except AttributeError:
         raise TypeError(
             f"{type(value).__name__!r} object cannot be interpreted as an integer"
         ) from None
-    return index(value)
+    result = index(value)
+    if not isinstance(result, int):
+        raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
+    return int(result)
+
+
+def _immutable_const_evaluator_error(name):
+    return TypeError(
+        f"cannot set '{name}' attribute of immutable type "
+        "'_typing._ConstEvaluator'"
+    )
 
 
 class _ConstEvaluatorMeta(type):
     def __setattr__(cls, name, value):
-        raise TypeError(
-            f"cannot set '{name}' attribute of immutable type "
-            "'_typing._ConstEvaluator'"
-        )
+        raise _immutable_const_evaluator_error(name)
+
+    def __delattr__(cls, name):
+        # `type_setattro` handles both writes, so an immutable type refuses a
+        # deletion with the wording it uses for an assignment. Without this,
+        # `del type(evaluator).__call__` removes call support from every
+        # constant evaluator in the process.
+        raise _immutable_const_evaluator_error(name)
 
 
 class _ConstEvaluator(metaclass=_ConstEvaluatorMeta):
