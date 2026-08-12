@@ -1219,6 +1219,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         w_code: crate::state::recover_inline_callee_code(callee_code_key as *const ()) as usize,
         jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
+    if consts.w_code == 0 {
+        return None;
+    }
+    let callee_w_code = consts.w_code;
 
     // Install the ROOT sym as the snapshot sym (NOT the callee's) so in-callee
     // guards snapshot the paused root.
@@ -1227,10 +1231,20 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut parent_guards = Vec::new();
     let mut parent_for_current = root_frame.clone();
     for parent_recipe in paused_parent_recipes {
+        // `InlineFrame.w_code` is the portal green (`W_Code`) used by
+        // `fbw_inline_recursion_count`, not the raw `CodeObject*` carried by
+        // a reconstruction recipe.  Forward inlining pushes the wrapper too;
+        // preserving the same identity here makes reconstructed and newly
+        // entered frames one recursion chain, as in `MIFrame.greenkey`.
+        let parent_w_code =
+            crate::state::recover_inline_callee_code(parent_recipe.code_ptr) as usize;
+        if parent_w_code == 0 {
+            return None;
+        }
         let guard_parent = parent_for_current.clone();
         parent_guards.push(InlineFrameGuard::enter(
             session,
-            parent_recipe.code_ptr as usize,
+            parent_w_code,
             Some(guard_parent),
         ));
         parent_for_current = recipe_parent_frame_from_recipe(
@@ -1302,7 +1316,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             outer_active_boxes,
         };
         let _inline_frame =
-            InlineFrameGuard::enter(session, callee_code_key, Some(parent_for_current));
+            InlineFrameGuard::enter(session, callee_w_code, Some(parent_for_current));
         // No `InlineConcreteFrameGuard` here.  A forward-inline sub-walk owns
         // the callee frame it publishes, so retargeting `last_instr` /
         // `valuestackdepth` onto it is the whole point.  A bridge-resume

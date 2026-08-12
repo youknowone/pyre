@@ -672,12 +672,10 @@ pub(crate) fn collect_callee_active_boxes(
 /// Parity note: upstream `_opimpl_recursive_call` (`pyjitpl.py`)
 /// counts same-greenkey portal frames on the framestack and flips to
 /// `assembler_call` only at `count >= memmgr.max_unroll_recursion`,
-/// inlining (`perform_call`) below the bound.  This function fires for
-/// the FIRST self-recursive occurrence the inline path declines — there
-/// is no unroll count.  Value-correct (the callee runs as its own
-/// compiled loop either way), but recursion shallower than
-/// `max_unroll_recursion` that upstream would have unrolled in-trace is
-/// cut over to `CALL_ASSEMBLER` immediately here.
+/// inlining (`perform_call`) below the bound.  The inline attempt immediately
+/// preceding this function applies the same count, including reconstructed
+/// carrier frames, so reaching this fold at the recursion boundary has the
+/// same transition.
 pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -2774,13 +2772,29 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         }
         pyre_object::PY_NULL
     };
-    // Bound recursive inlining at `max_unroll_recursion`: a callee already
-    // this deep on the FBW inline stack falls back to a residual call rather
-    // than unrolling its (exponentially branching) call tree at trace time.
-    // Mirror of `pyjitpl.py` `recursion_exceeded` →
-    // `assembler_call` instead of trace-through.
+    // `pyjitpl.py:1382-1416`: consult `can_inline_callable` first, then bound
+    // recursive inlining at `max_unroll_recursion`.  Reaching the bound marks
+    // this callee's entry greenkey `dont_trace_here`; that state transition is
+    // essential for branching recursion.  Once one arm reaches the bound,
+    // later sibling calls in the same trace go straight to CALL_ASSEMBLER
+    // instead of starting a fresh unroll from their now-shallower framestack.
     let callee_code_key = w_code as pyre_object::PyObjectRef as usize;
+    let callee_green_key = crate::driver::make_green_key(w_code, 0);
+    if let Some((driver, _)) = crate::driver::try_driver_pair()
+        && !driver
+            .meta_interp_mut()
+            .warm_state_mut()
+            .can_inline_callable(callee_green_key)
+    {
+        return Ok(None);
+    }
     if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
+        if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .disable_noninlinable_function(callee_green_key);
+        }
         return Ok(None);
     }
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
@@ -3158,21 +3172,9 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     // `fbw_inline_recursion_count` already applied above, matching
     // `opimpl_recursive_call` (`pyjitpl.py:1390-1416`), which counts the portal
     // frames already on the framestack and inlines while the count is below
-    // `max_unroll_recursion`.  A carrier-resume sub-walk is the exception: it
-    // reconstructs its frames rather than entering them, so the count is not
-    // the walk's own recursion depth.
-    if !strict_inlinable && nparams >= 1 && ctx.fbw_mode.carrier_resume {
-        let sym_ptr = ctx.fbw_mode.snapshot_sym;
-        let self_recursive = !sym_ptr.is_null()
-            && unsafe {
-                pyre_interpreter::live_code_wrapper((*(*sym_ptr).jitcode()).raw_code() as *const ())
-                    as *const ()
-            } as usize
-                == w_code as usize;
-        if self_recursive {
-            return Ok(None);
-        }
-    }
+    // `max_unroll_recursion`.  Carrier-resume frames participate in that same
+    // count: `drive_bridge_frame_subwalk` reconstructs their `W_Code` green
+    // identities before entering this path.
     // #68: a forward-branch-bearing callee is inlinable with a multi-frame
     // guard snapshot (its in-callee branch
     // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
