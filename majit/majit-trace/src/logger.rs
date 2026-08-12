@@ -37,7 +37,7 @@ pub struct TraceRecord {
     pub ops_before_opt: usize,
     /// Number of operations after optimization.
     pub ops_after_opt: usize,
-    /// Time spent recording + optimization.
+    /// Time spent in the unroll and optimization pipeline, excluding trace recording.
     pub opt_time: Duration,
     /// Time spent in backend compilation.
     pub compile_time: Duration,
