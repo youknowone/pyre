@@ -264,6 +264,10 @@ pub enum VirtualStateInfo {
 #[derive(Debug)]
 pub struct VirtualStateInfoNode {
     pub info: VirtualStateInfo,
+    /// virtualstate.py:508-518 `NotVirtualStateInfoPtr.lenbound`.
+    /// Only non-virtual pointer leaves populate this; all other nodes keep
+    /// the default `None`.
+    pub lenbound: Option<IntBound>,
     /// virtualstate.py:70 `AbstractVirtualStateInfo.position`. Default -1.
     /// Set by [`VirtualState::enum_top_level`] during construction.
     pub position: Cell<i32>,
@@ -276,8 +280,13 @@ pub struct VirtualStateInfoNode {
 
 impl VirtualStateInfoNode {
     pub fn new(info: VirtualStateInfo) -> Self {
+        Self::new_with_lenbound(info, None)
+    }
+
+    pub fn new_with_lenbound(info: VirtualStateInfo, lenbound: Option<IntBound>) -> Self {
         VirtualStateInfoNode {
             info,
+            lenbound,
             position: Cell::new(-1),
             position_in_notvirtuals: Cell::new(-1),
         }
@@ -285,6 +294,10 @@ impl VirtualStateInfoNode {
 
     pub fn new_rc(info: VirtualStateInfo) -> Rc<Self> {
         Rc::new(Self::new(info))
+    }
+
+    pub fn new_rc_with_lenbound(info: VirtualStateInfo, lenbound: Option<IntBound>) -> Rc<Self> {
+        Rc::new(Self::new_with_lenbound(info, lenbound))
     }
 
     /// virtualstate.py:111-116 `AbstractVirtualStateInfo.enum`.
@@ -367,6 +380,7 @@ impl Clone for VirtualStateInfoNode {
     fn clone(&self) -> Self {
         VirtualStateInfoNode {
             info: self.info.clone(),
+            lenbound: self.lenbound.clone(),
             position: Cell::new(-1),
             position_in_notvirtuals: Cell::new(-1),
         }
@@ -1496,6 +1510,34 @@ impl VirtualState {
             return Err(VirtualStatesCantMatch::default());
         }
 
+        // virtualstate.py:529-537 NotVirtualStateInfoPtr._generate_guards:
+        // compare the incoming pointer length bound before dispatching on
+        // LEVEL_NONNULL / LEVEL_KNOWNCLASS / the base NotVirtual level.
+        // An incoming pointer without length information has the default
+        // nonnegative length range.
+        if let Some(expected_bound) = expected.lenbound.as_ref() {
+            let default_incoming_bound;
+            let incoming_bound = match incoming.lenbound.as_ref() {
+                Some(bound) => bound,
+                None => {
+                    default_incoming_bound = IntBound::nonnegative();
+                    &default_incoming_bound
+                }
+            };
+            assert!(expected_bound.are_knownbits_implied());
+            if !incoming_bound.is_within_range(expected_bound.lower, expected_bound.upper) {
+                state.bad.insert(expected as *const _);
+                state.bad.insert(incoming as *const _);
+                if crate::log_jtet_enabled() {
+                    eprintln!(
+                        "[jit][jte] virtualstate length-bound mismatch arg_idx={arg_idx} \
+                         expected={expected_bound:?} incoming={incoming_bound:?}"
+                    );
+                }
+                return Err(VirtualStatesCantMatch::new("length bound does not match"));
+            }
+        }
+
         // virtualstate.py:96-101 try/except VirtualStatesCantMatch wrapper.
         // If `_generate_guards` raises, RPython marks `self` and `other`
         // in `state.bad` so debug_print can flag the failing nodes:
@@ -2352,7 +2394,7 @@ fn deep_clone_node(
                 .collect(),
         },
     };
-    let new_rc = VirtualStateInfoNode::new_rc(cloned_info);
+    let new_rc = VirtualStateInfoNode::new_rc_with_lenbound(cloned_info, src.lenbound.clone());
     cache.insert(key, Rc::clone(&new_rc));
     new_rc
 }
@@ -2688,7 +2730,24 @@ fn export_single_value(
     cache.in_progress.insert(key.clone());
 
     let info = export_single_value_inner(box_.to_opref(), ctx, cache);
-    let rc = VirtualStateInfoNode::new_rc(info);
+    // virtualstate.py:508-518 NotVirtualStateInfoPtr.__init__: retain the
+    // widened ArrayPtrInfo / StrPtrInfo length bound on the per-instance
+    // pointer leaf. Virtual pointer infos have their own state variants and
+    // do not populate NotVirtualStateInfoPtr.lenbound.
+    let lenbound = if matches!(
+        &info,
+        VirtualStateInfo::Constant(Value::Ref(_))
+            | VirtualStateInfo::KnownClass { .. }
+            | VirtualStateInfo::NonNull
+            | VirtualStateInfo::Unknown(Type::Ref)
+    ) {
+        ctx.peek_ptr_info(&box_)
+            .and_then(|mut ptr_info| ptr_info.getlenbound(None))
+            .map(|bound| bound.widen())
+    } else {
+        None
+    };
+    let rc = VirtualStateInfoNode::new_rc_with_lenbound(info, lenbound);
     cache.in_progress.swap_remove(&key);
     cache.finished.insert(key, Rc::clone(&rc));
     rc
@@ -2943,6 +3002,12 @@ mod tests {
         VirtualState::new(vec![info])
     }
 
+    fn vs1_with_lenbound(info: VirtualStateInfo, lenbound: Option<IntBound>) -> VirtualState {
+        VirtualState::from_shared_rcs(vec![VirtualStateInfoNode::new_rc_with_lenbound(
+            info, lenbound,
+        )])
+    }
+
     #[test]
     fn test_unknown_type_discrimination() {
         // virtualstate.py:383-410 NotVirtualStateInfoInt._generate_guards:
@@ -2992,6 +3057,49 @@ mod tests {
             &mut ctx
         ));
         assert!(!nn.generalization_of(&vs1(VirtualStateInfo::Unknown(Type::Int)), &mut ctx));
+    }
+
+    #[test]
+    fn test_pointer_lenbound_is_checked_by_generalization_and_guard_generation() {
+        // virtualstate.py:529-537 NotVirtualStateInfoPtr._generate_guards:
+        // a narrower incoming length range is accepted, while a range that
+        // escapes the expected bound is rejected before LEVEL_NONNULL dispatch.
+        let expected = vs1_with_lenbound(
+            VirtualStateInfo::NonNull,
+            Some(IntBound::bounded(0, 10).widen()),
+        );
+        let within = vs1_with_lenbound(
+            VirtualStateInfo::NonNull,
+            Some(IntBound::bounded(2, 8).widen()),
+        );
+        let too_wide = vs1_with_lenbound(
+            VirtualStateInfo::NonNull,
+            Some(IntBound::bounded(0, 20).widen()),
+        );
+        let no_bound = vs1(VirtualStateInfo::NonNull);
+        let nonnegative =
+            vs1_with_lenbound(VirtualStateInfo::NonNull, Some(IntBound::nonnegative()));
+
+        let mut ctx = OptContext::new(128);
+        assert!(expected.generalization_of(&within, &mut ctx));
+        assert!(!expected.generalization_of(&too_wide, &mut ctx));
+        assert!(!expected.generalization_of(&no_bound, &mut ctx));
+        assert!(nonnegative.generalization_of(&no_bound, &mut ctx));
+
+        let runtime = ctx.make_constant_ref(GcRef(0x100));
+        assert!(
+            expected
+                .generate_guards(&within, &[OpRef::ref_op(10)], &[runtime], &mut ctx, false,)
+                .is_ok()
+        );
+        assert!(
+            expected
+                .generate_guards(&too_wide, &[OpRef::ref_op(10)], &[runtime], &mut ctx, false,)
+                .is_err()
+        );
+
+        let cloned = expected.clone();
+        assert_eq!(cloned.state[0].lenbound.as_ref().unwrap().upper, 10);
     }
 
     #[test]
@@ -3250,6 +3358,28 @@ mod tests {
     }
 
     // ── Export/Import tests ──
+
+    #[test]
+    fn test_export_nonvirtual_array_preserves_widened_lenbound() {
+        // virtualstate.py:508-518 NotVirtualStateInfoPtr.__init__: the
+        // non-virtual ArrayPtrInfo leaf retains getlenbound(None).widen().
+        let mut ctx = OptContext::new(32);
+        let array_ref = OpRef::ref_op(10);
+        let array_box = ctx.materialize_operand_at(array_ref);
+        ctx.set_ptr_info(
+            &array_box,
+            PtrInfo::array(test_descr(20), IntBound::bounded(0, 10)),
+        );
+
+        let state = export_state(&[array_ref], &ctx);
+        assert!(matches!(state.state[0].info, VirtualStateInfo::NonNull));
+        let lenbound = state.state[0]
+            .lenbound
+            .as_ref()
+            .expect("non-virtual array length bound");
+        assert_eq!((lenbound.lower, lenbound.upper), (0, 10));
+        assert!(lenbound.are_knownbits_implied());
+    }
 
     #[test]
     fn test_make_inputargs_skips_virtual_entries() {
