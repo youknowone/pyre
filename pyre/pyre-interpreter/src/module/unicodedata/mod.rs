@@ -107,14 +107,14 @@ fn char_and_default(
 // `LEGACY` for the `ucd_3_2_0` instance.
 
 fn category_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(db.category(one_char("category", args)?)))
+    Ok(w_str_new_managed(db.category(one_char("category", args)?)))
 }
 fn category(args: &[PyObjectRef]) -> PyResult {
     category_impl(&MODERN, args)
 }
 
 fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(
+    Ok(w_str_new_managed(
         db.bidirectional(one_char("bidirectional", args)?),
     ))
 }
@@ -123,7 +123,7 @@ fn bidirectional(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn east_asian_width_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(
+    Ok(w_str_new_managed(
         db.east_asian_width(one_char("east_asian_width", args)?),
     ))
 }
@@ -146,7 +146,7 @@ fn mirrored(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
-    Ok(w_str_new(
+    Ok(w_str_new_managed(
         &db.decomposition(one_char("decomposition", args)?),
     ))
 }
@@ -198,7 +198,7 @@ fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if db.category(cp) != UNASSIGNED_CATEGORY
         && let Some(name) = cp.to_char().and_then(ucd_core::character_name)
     {
-        return Ok(w_str_new(&name));
+        return Ok(w_str_new_managed(&name));
     }
     default.ok_or_else(|| PyError::value_error("no such name"))
 }
@@ -230,7 +230,7 @@ fn lookup(args: &[PyObjectRef]) -> PyResult {
     {
         let mut buf = String::with_capacity(ch.len_utf8());
         buf.push(ch);
-        return Ok(w_str_new(&buf));
+        return Ok(w_str_new_managed(&buf));
     }
     let mut msg = Wtf8Buf::from_string("undefined character name '".to_string());
     msg.push_wtf8(name);
