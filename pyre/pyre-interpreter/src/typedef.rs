@@ -4006,7 +4006,7 @@ fn super_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             pyre_object::w_type_get_name(bound_type)
         })
     };
-    Ok(w_str_new(&format!(
+    Ok(pyre_object::w_str_new_managed(&format!(
         "<super: <class '{}'>, {}>",
         start_name, bound_name
     )))
