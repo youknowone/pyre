@@ -1877,6 +1877,17 @@ impl<S: JitState> JitDriver<S> {
         self.set_max_unroll_recursion(value);
     }
 
+    /// warmspot.py:73 `jd.warmstate.set_param_enable_opts(enable_opts)`.
+    ///
+    /// Takes the `':'`-separated pass names of `ALL_OPTS`; `"all"` restores the
+    /// full set. Dropping `"unroll"` selects the simple-loop compilation path
+    /// for this driver alone, which is why this is per-driver rather than a
+    /// process-wide switch. `set_param` cannot carry it — that surface is
+    /// `i64`-valued, and this parameter is a string upstream too.
+    pub fn set_param_enable_opts(&mut self, value: &str) {
+        self.meta.warm_state_mut().set_param_enable_opts(value);
+    }
+
     /// Whether this driver was declared recursive.
     pub fn is_recursive(&self) -> bool {
         self.is_recursive
