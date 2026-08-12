@@ -2046,12 +2046,16 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                         }
                     }
-                    // Fail-closed on an UNFUSED `lltype::malloc_typed`.  Only the
-                    // numeric boxing structs recognised by `fuse_boxing_alloc`
-                    // (`model.rs payload_fields` — `W_FloatObject` / `W_IntObject`
-                    // / `W_ComplexObject` / `W_LongObject`) get a `NewWithVtable`
-                    // lowering before the rtyper runs; every other mallocable GC
-                    // struct's `malloc_typed` survives to here with no ported
+                    // Fail-closed on an UNFUSED `lltype::malloc_typed`.  A boxing
+                    // struct gets its `NewWithVtable` lowering before the rtyper
+                    // runs only where `fuse_boxing_alloc` (`model.rs`) could
+                    // resolve the cluster's header: a constant `ob_type`
+                    // type-pointer whose `w_class` is `get_instantiate` of that
+                    // same type.  A cluster it declined — no `ob_header` field at
+                    // all, a type-pointer that is not a constant, or a `w_class`
+                    // naming a different type, which is a subclass construction
+                    // (`w_long_from_raw` pairs `&LONG_TYPE` with `&INT_TYPE`) —
+                    // survives to here as a call, with no ported
                     // `jtransform.rewrite_op_malloc` general path
                     // (`jtransform.py:1012`).  Layer-1 misses it (cutover skips
                     // registering `malloc_typed`), so it would resolve to the
@@ -2071,9 +2075,9 @@ pub fn translate_op(
                     {
                         return Err(TyperError::message(
                             "`lltype::malloc_typed[_managed]` survived fuse_boxing_alloc unfused; \
-                             only the numeric boxing structs fuse_boxing_alloc rewrites \
-                             (W_Float/W_Int/W_Complex/W_Long) have a NewWithVtable \
-                             lowering; no general malloc->new lowering ported"
+                             the cluster's header did not resolve to a constant type \
+                             pointer standing for its own `w_class`, and no general \
+                             malloc->new lowering is ported"
                                 .to_string(),
                         ));
                     }
