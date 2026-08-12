@@ -1220,6 +1220,35 @@ fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
     Some(nargs)
 }
 
+/// Whether `op` is the exact `() -> ()` helper that clears the caught-
+/// exception propagation root after `PUSH_EXC_INFO` publishes the exception
+/// on the execution context.
+///
+/// A plain void call descr (`result_size == 0`) is not enough to select this
+/// ABI: pyre also records word-returning helpers as void when their result is
+/// ignored, and only the reflective host trampoline can absorb that mismatch.
+/// `ClearInFlightException` is codewriter-stamped onto the one genuinely
+/// nullary, genuinely void target (`bh_clear_in_flight_exception`), so this
+/// exact tag + descr + operand shape is safe to call through a `() -> ()`
+/// table type. Keeping the allow-list singular also prevents an unrelated
+/// void helper from silently bypassing the signature audit.
+fn residual_call_true_void(op: &Op) -> bool {
+    if op.opcode != OpCode::CallN {
+        return false;
+    }
+    let Some(descr) = op.getdescr() else {
+        return false;
+    };
+    let Some(cd) = descr.as_call_descr() else {
+        return false;
+    };
+    cd.result_type() == Type::Void
+        && cd.result_size() == 0
+        && cd.arg_types().is_empty()
+        && op.getarglist().len() == 1
+        && cd.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ClearInFlightException
+}
+
 /// Arity of `op`'s in-module `(i64×n) -> i64` lowering, if it has one: an
 /// eligible residual CALL (word-result or word-ABI void), a `New*`
 /// allocation (the `wasm_jit_alloc*` helper targets are plain
@@ -1289,6 +1318,7 @@ fn has_trampoline_calls(inputargs: &[InputArg], ops: &[Op], emit_ca: bool) -> bo
         _ if op.opcode.is_call() => {
             direct_helper_i64_arity(op, &ref_values).is_none()
                 && residual_call_float_sig(op).is_none()
+                && !residual_call_true_void(op)
         }
         // `New*` and ref-store write barriers are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
@@ -1716,12 +1746,18 @@ pub fn build_wasm_module(
             }
         }
     }
+    // `PUSH_EXC_INFO`'s propagation-root clear is the one signature-audited
+    // true-void residual helper. It gets a dedicated `() -> ()` type instead
+    // of being mixed into the `(i64×n) -> i64` family.
+    let has_true_void_residual =
+        WASM_DIRECT_RESIDUAL_CALL && ops.iter().any(residual_call_true_void);
     // The shared indirect-function table backs direct residual helpers as well
     // as host-trampoline dispatch, chained bridges, and CA recursion.
     let needs_table = needs_call
         || bridge_dispatch
         || residual_max_arity.is_some()
         || !float_residual_sigs.is_empty()
+        || has_true_void_residual
         || ca.emit_ca;
     // `ca.emit_ca` forces the direct helper family to include arities 0..=2,
     // so all CA frame-helper trampoline `else` arms below are baseline-only.
@@ -1773,6 +1809,11 @@ pub fn build_wasm_module(
         .collect::<indexmap::IndexMap<_, _>>();
     for sig in float_residual_type_indices.keys() {
         types.ty().function(sig.clone(), vec![ValType::F64]);
+    }
+    let true_void_residual_type_idx =
+        float_residual_type_base + float_residual_type_indices.len() as u32;
+    if has_true_void_residual {
+        types.ty().function(vec![], vec![]);
     }
     module.section(&types);
 
@@ -1854,6 +1895,7 @@ pub fn build_wasm_module(
         frame,
         residual_max_arity.map(|_| residual_type_base),
         &float_residual_type_indices,
+        has_true_void_residual.then_some(true_void_residual_type_idx),
         ca,
         bridge_finish_fi,
         ca_helper_type_idx,
@@ -1908,6 +1950,9 @@ fn build_function(
     // descr-derived parameter sequence. These types return `f64`; Float SSA
     // values are converted to/from their i64 bit carrier around the call.
     float_residual_type_indices: &indexmap::IndexMap<Vec<ValType>, u32>,
+    // Dedicated `() -> ()` type for the signature-audited
+    // ClearInFlightException residual, or `None` when absent.
+    true_void_residual_type_idx: Option<u32>,
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
     ca: CaParams,
@@ -3969,6 +4014,16 @@ fn build_function(
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
                     );
+                } else if let Some(type_idx) =
+                    true_void_residual_type_idx.filter(|_| residual_call_true_void(op))
+                {
+                    // Exact `() -> ()` in-module helper. Unlike the generic
+                    // trampoline path, this cannot allocate, collect, force,
+                    // or replace the frame, so no frame/ref-home reload is
+                    // needed after the call.
+                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
+                    sink.i32_wrap_i64();
+                    sink.call_indirect(0, type_idx);
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
