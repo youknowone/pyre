@@ -2822,7 +2822,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "len",
-            builtin_len,
+            __pyre_wrap_builtin_len,
             1,
             crate::gateway::Signature::new(vec!["obj"], None, None, 0, 1),
         )
@@ -4321,7 +4321,7 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 }
 
 /// True iff `callable` is the builtin `len` function object — a
-/// builtin-code function whose code wraps [`builtin_len`].  The JIT
+/// builtin-code function whose code wraps [`__pyre_wrap_builtin_len`].  The JIT
 /// walker uses this to recognize a `len(x)` residual it can lower to the
 /// container's inline length read.
 pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
@@ -4335,7 +4335,7 @@ pub fn is_builtin_len_function(callable: PyObjectRef) -> bool {
         }
         crate::gateway::builtin_code_fn_eq(
             crate::gateway::builtin_code_get(code),
-            builtin_len as crate::gateway::BuiltinCodeFn,
+            __pyre_wrap_builtin_len as crate::gateway::BuiltinCodeFn,
         )
     }
 }
@@ -4473,6 +4473,32 @@ fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = parse_single_required(args, "obj", "len")?;
     Ok(w_int_new(crate::baseobjspace::len_w(obj)?))
 }
+
+/// Manual interp2app gateway for `len`.
+///
+/// `#[pyre_methods]` emits this same wrapper/descriptor pair automatically:
+/// the wrapper reads the arity and each positional slot out of the slice before
+/// entering the typed body. The gateway descent walker keys its heap-cache
+/// entries for the args array off that element read, so this hand-written
+/// wrapper must keep the same shape.
+/// Builtins installed by hand must publish the equivalent `BuiltinCode.func`
+/// PBC member so source translation can discover and codewrite its graph.
+pub fn __pyre_wrap_builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 1 {
+        return builtin_len(args);
+    }
+    let obj = args[0];
+    Ok(w_int_new(crate::baseobjspace::len_w(obj)?))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_len_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_len"),
+        func: __pyre_wrap_builtin_len,
+    };
 
 /// `abs(x)` — return the absolute value of a number.
 pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5898,11 +5924,20 @@ fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// Manual interp2app gateway for `isinstance`.
 ///
-/// `#[pyre_methods]` emits this same wrapper/descriptor pair automatically.
+/// `#[pyre_methods]` emits this same wrapper/descriptor pair automatically:
+/// the wrapper reads the arity and each positional slot out of the slice before
+/// entering the typed body. The gateway descent walker keys its heap-cache
+/// entries for the args array off that element read, so this hand-written
+/// wrapper must keep the same shape.
 /// Builtins installed by hand must publish the equivalent `BuiltinCode.func`
 /// PBC member so source translation can discover and codewrite its graph.
 pub fn __pyre_wrap_builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    builtin_isinstance(args)
+    if args.len() != 2 {
+        return builtin_isinstance(args);
+    }
+    let obj = args[0];
+    let cls = args[1];
+    Ok(w_bool_from(crate::baseobjspace::isinstance(obj, cls)?))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
