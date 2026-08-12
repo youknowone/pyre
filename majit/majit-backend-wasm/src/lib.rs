@@ -105,16 +105,17 @@ fn diag_bump(i: usize) {
 // A source token is compiled before a later guard may become a CA bridge.
 // Freeze modest room for that bridge at first compilation; a later trace that
 // exceeds either bound is declined rather than changing the live frame's
-// offsets. The fib CA path measured raw maxima of 9 positional slots and 15
-// Ref homes, but that is not a bridge fail-arg census for the full suite; keep
-// both existing floors until such a census establishes smaller safe bounds.
+// offsets. The recursive-unroll fib CA bridge needs more than 64 Ref homes:
+// declining it leaves the recursive return guard permanently blackholed and
+// turns every later invocation into a host round-trip. Keep enough bounded
+// per-token reserve for that bridge and the existing full-suite shapes.
 // A CALL_ASSEMBLER target must retain enough frozen spill/home geometry for a
 // later exit bridge.  nbody's callee bridge needs more Ref homes than the old
 // 16-slot floor; declining it turns every CA invocation into a blackhole.  The
 // larger fixed reserve keeps the bridge in compiled wasm and is still bounded
 // per compiled token.
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
-const FROZEN_CHAIN_REF_HOMES: usize = 64;
+const FROZEN_CHAIN_REF_HOMES: usize = 128;
 
 /// An op whose result advances loop-carried state. A value produced inside the
 /// re-running region by arithmetic or by a heap load is fresh on each pass, so
