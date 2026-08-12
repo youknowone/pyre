@@ -1191,7 +1191,8 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 ///     translated `f_generator_wref` (pyframe.py:75-76/276-279), hence a
 ///     non-owning back-reference rather than a GC edge.
 ///   - `debugdata` / `lastblock` — managed field slots are forwarded.
-///   - `debugdata->{w_locals, w_f_trace, hidden_operationerr}` — null-guarded.
+///   - `debugdata->{w_locals, w_extra_locals, w_f_trace,
+///     hidden_operationerr}` — null-guarded.
 ///
 /// Excluded (matches the walker): `execution_context` (persistent, not
 /// GC), the module-dict / method-cache / prebuilt-family global walks (those are not frame-owned; the
@@ -1286,6 +1287,7 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         if walk_fields {
             let d = unsafe { &mut *frame.debugdata };
             f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+            f(&mut d.w_extra_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.hidden_operationerr as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
         }
@@ -3054,6 +3056,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         std::mem::size_of::<pyre_interpreter::pyframe::FrameDebugData>(),
         vec![
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_locals),
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_extra_locals),
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_f_trace),
             std::mem::offset_of!(
                 pyre_interpreter::pyframe::FrameDebugData,
@@ -4585,9 +4588,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // Register the real portal `JitDriverStaticData` so `get_assembler_token` /
     // `compile_tmp_callback` (warmstate.py:714-723, compile.py:1101-1150) have
     // a slot with `portal_runner_adr` + `portal_calldescr` populated.
-    // The empty `ensure_default_driver_sd` placeholder remains at
-    // jitdrivers_sd[0]; this pushes the greens/reds portal schema at index 1+
-    // per the documented `register_jitdriver_sd` contract.
+    // `register_jitdriver_sd` replaces the translation-time empty placeholder
+    // at slot 0, preserving the jdindex emitted by the shared codewriter.
     // warmspot.py:1010-1012 `jd.portal_runner_adr = adr_of(ll_portal_runner)`.
     let mut jd = PyreJitState::pypyjit_driver_descriptor();
     jd.result_type = majit_ir::Type::Ref;
@@ -4597,7 +4599,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // baseobjspace.py:29 `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
     // unknown-length unpack loop `_unpackiterable_unknown_length`. Registered
-    // here, right after jd0, so it lands at `jitdrivers_sd[2]` and inherits the
+    // here, right after jd0, so it lands at `jitdrivers_sd[1]` and inherits the
     // same `portal_finishtoken` / `propagate_exc_descr` via the
     // `finish_setup_descrs_for_jitdrivers` tail. jd1 is novable
     // (`virtualizable_info` stays `None`), so `elect_active_jitdriver_sd`'s

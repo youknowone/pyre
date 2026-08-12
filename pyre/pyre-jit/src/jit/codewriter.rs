@@ -194,15 +194,10 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
 /// registered portal name jitdriver 1, the third jitdriver 2, and so on —
 /// indices no resume-side table has.
 ///
-/// The value is 0 because the table a Python portal frame is resumed against
-/// (`call_jit.rs` `blackhole_resume_via_rd_numb`) holds exactly that one
-/// driver.  `metainterp_sd.jitdrivers_sd` numbers differently: the
-/// `ensure_default_driver_sd` placeholder occupies slot 0 there and the Python
-/// portal registers at 1 (`eval.rs`), so a blackhole fed by `bh_jitdrivers_sd`
-/// reads the placeholder.  That slot shares the portal's `result_type`
-/// (`set_result_type` broadcasts to every registered driver) but has no
-/// `portal_runner_adr`, which `portal_runner_call_args` reports instead of
-/// calling through address 0.
+/// The value is 0 because every Python portal uses that single Python driver.
+/// `MetaInterpStaticData::register_jitdriver_sd` replaces its translation-time
+/// metadata shell in slot 0 with the real portal record, matching RPython's
+/// single CallControl list and keeping blackhole lookup on the same index.
 const PYTHON_PORTAL_JD_INDEX: usize = 0;
 
 fn portal_jit_merge_point_graph_args(

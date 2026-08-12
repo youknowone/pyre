@@ -2552,9 +2552,16 @@ impl PyFrame {
         if !existing.is_null() {
             return existing;
         }
-        let extra = unsafe { pyre_object::w_dict_new() };
-        self.getorcreate_debug_data(-1).w_extra_locals = extra;
-        extra
+        // `w_dict_new` returns a movable nursery object, while allocating the
+        // debug payload below may collect.  CPython's frame owns both through
+        // traced references; mirror that lifetime by pinning the dict until
+        // the payload has been installed and then reload its forwarded value.
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        roots.pin_root(unsafe { pyre_object::w_dict_new() });
+        let debug = self.getorcreate_debug_data(-1);
+        debug.w_extra_locals = roots.get(slot);
+        roots.get(slot)
     }
 
     #[inline]
