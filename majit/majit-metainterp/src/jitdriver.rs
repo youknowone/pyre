@@ -5940,7 +5940,7 @@ impl<S: JitState> JitDriver<S> {
             should_bridge,
             owning_key,
             raw_values,
-            exit_layout: Box::new(exit_layout),
+            exit_layout,
             guard_exc,
         }
     }
