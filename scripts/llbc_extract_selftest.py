@@ -150,6 +150,10 @@ def run_fingerprint(engine) -> int:
 
         untracked = root / "src" / "new.rs"
         untracked.write_text("pub fn new_item() {}\n")
+        # The input walk is memoised for one stable extraction snapshot. This
+        # test deliberately changes the input set, so begin a new snapshot
+        # before asking whether the added path moves the fingerprint.
+        engine.forget_collected_inputs()
         before_stage = fingerprint(eng)
         expect("untracked source moves the source key", before_stage != base)
         subprocess.run(["git", "add", "src/new.rs"], cwd=root, check=True)

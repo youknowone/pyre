@@ -411,19 +411,29 @@ use llbc_fingerprint::{
 /// Wait for the fingerprint oracle with a deadline.
 ///
 /// A build script that blocks forever is strictly worse than a missing
-/// warning, and `std` has no `wait_timeout`, so the wait runs on a helper
-/// thread and a timeout abandons the child.  Every non-answer — spawn failure,
-/// non-zero exit, unparseable stdout — collapses to `None`, i.e. silence: an
-/// unavailable oracle must not break offline, hermetic or vendored builds.
-fn llbc_fingerprint_output(child: std::process::Child) -> Option<FingerprintFields> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let output = rx
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .ok()?
-        .ok()?;
+/// warning, and `std` has no `wait_timeout`, so the child is polled until the
+/// deadline. A timed-out or otherwise unobservable child is killed and reaped;
+/// it must not retain Cargo locks after the build proceeds. Every non-answer —
+/// spawn failure, non-zero exit, unparseable stdout — collapses to `None`. The
+/// caller reports freshness as unknown without breaking offline, hermetic or
+/// vendored builds.
+fn llbc_fingerprint_output(mut child: std::process::Child) -> Option<FingerprintFields> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }

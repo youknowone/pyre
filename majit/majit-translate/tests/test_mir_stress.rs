@@ -177,7 +177,7 @@ fn parse_read_bb_and_local(msg: &str) -> Option<(usize, u64)> {
 
 /// The census's finder predicate, and the one duplicated literal here.
 ///
-/// ⛔ This spelling is a COPY. `resolve_place` in `majit_translate`'s
+/// This spelling is a copy. `resolve_place` in `majit_translate`'s
 /// `front::mir` builds the failure message, and `is_known_lowering_gap`
 /// tests for this same substring to decide whether to re-lower the body in
 /// reverse-postorder. Neither is reachable from an integration test, so
@@ -400,7 +400,7 @@ fn arm_classifier(llbc: &Llbc) -> String {
     );
 
     // (2) The finder predicate, both directions, against the same pair.
-    // ⛔ See FINDER: this arms the predicate against a literal of the
+    // See FINDER: this arms the predicate against a literal of the
     // producer's shape, NOT against the producer.
     assert!(
         probe.contains(FINDER),
@@ -503,8 +503,8 @@ fn arm_classifier(llbc: &Llbc) -> String {
 /// only `Assign` to the local reaches the reading block exclusively via a
 /// back-edge (genuine loop-carried value, needs a phi / block-inputarg).
 ///
-/// ⛔ THE SUBJECT SET IS POST-RETRY, AND THAT CHANGES WHAT THE BUCKETS
-/// MEAN. `lower_fun_decl` lowers linearly, and on a `LowerError::Unsupported`
+/// The subject set is post-retry, which changes what the buckets mean.
+/// `lower_fun_decl` lowers linearly, and on a `LowerError::Unsupported`
 /// whose message satisfies `is_known_lowering_gap` — which is satisfied by
 /// exactly this census's [`FINDER`] substring — it re-lowers the whole body
 /// in `BlockOrder::ReversePostorder`. The retry's `?` propagates whatever

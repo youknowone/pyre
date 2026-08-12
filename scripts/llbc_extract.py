@@ -1646,8 +1646,8 @@ def touch_and_note(target: Path, own_writes: dict[tuple[int, int], int]) -> None
     Every touch of a closure input must go through this rather than
     `Path.touch()`. `window_writes` tells the extractor's own writes from a
     peer's by comparing against the exact mtime recorded here, so a touch that
-    is not recorded is reported as a candidate on every clean run — and a
-    reviewer who sees four false alarms per run stops reading the output.
+    is not recorded is reported as a candidate on every clean run. Repeated
+    false positives would make the report unactionable.
 
     Pairing the write with its record in ONE call is what keeps them from
     drifting. There are already two touch sites (the crate root before the
@@ -1709,7 +1709,7 @@ def window_writes(
         if not lo_ns <= st.st_mtime_ns <= hi_ns:
             continue
         if own_writes.get((st.st_dev, st.st_ino)) == st.st_mtime_ns:
-            continue  # our own touch, to the nanosecond
+            continue  # the extractor's own touch, to the nanosecond
         candidates.append((st.st_mtime_ns, rel))
     candidates.sort()
     return candidates, len(inputs) - len(unresolved), unresolved
@@ -1815,6 +1815,12 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             # re-stamping it with the current HEAD would claim this checkout produced
             # bytes it did not.
             continue
+
+        # The stamp certifies the exact artefact bytes from the previous
+        # successful extraction. This run may replace those bytes before any
+        # of the validation below fails, so the old certificate must stop
+        # being publishable before Charon can write to `dest`.
+        stamp_path.unlink(missing_ok=True)
 
         # Opening half of the provenance pair, taken before the Charon build
         # that is about to run for minutes. See `provenance_for`.
@@ -2331,8 +2337,8 @@ def self_test_exclusion_diamond() -> None:
     package reaches, and must NOT drop what something else also reaches — and a
     fingerprint that gets this wrong still hashes to something, still compares
     equal to itself, and still passes `--check`. The pre-fix engine filtered at
-    emission and carried four unreferenced files for 30 days without a single
-    red run. So the property is checked here on a graph built for it.
+    emission and carried four unreferenced files without making any check fail.
+    So the property is checked here on a graph built for it.
 
     The graph, with `excluded` excluded:
 
