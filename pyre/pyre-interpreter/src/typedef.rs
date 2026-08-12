@@ -10990,7 +10990,7 @@ fn init_type_type(ns: PyObjectRef) {
                         "<class '{}'>",
                         crate::baseobjspace::type_repr_qualified_name(obj)
                     );
-                    Ok(pyre_object::w_str_new(&rendered))
+                    Ok(pyre_object::w_str_new_managed(&rendered))
                 },
                 1,
             ),
