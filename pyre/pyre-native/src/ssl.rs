@@ -1253,6 +1253,111 @@ struct PolicyServerVerifier {
     has_crl: bool,
 }
 
+/// Preserve OpenSSL's explicit end-entity trust semantics on top of WebPKI.
+///
+/// RustPython's `PartialChainVerifier` performs the same fallback: a
+/// self-issued leaf explicitly loaded into the trust store is trusted without
+/// `VERIFY_X509_PARTIAL_CHAIN`; a non-self-issued leaf additionally requires
+/// that flag.  The exact DER match is the trust decision, but certificate
+/// time, purpose, and server-name policy still apply.
+#[derive(Debug)]
+struct ExplicitEndEntityVerifier {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    trusted_der: Vec<Vec<u8>>,
+    verify_flags: i32,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ExplicitEndEntityVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let original_error = match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => return Ok(verified),
+            Err(error) => error,
+        };
+
+        let exact_match = self
+            .trusted_der
+            .iter()
+            .any(|trusted| trusted.as_slice() == end_entity.as_ref());
+        if !exact_match {
+            return Err(original_error);
+        }
+
+        let (_, certificate) =
+            x509_parser::parse_x509_certificate(end_entity.as_ref()).map_err(|_| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+            })?;
+        let self_issued = certificate.subject() == certificate.issuer();
+        const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
+        if !self_issued && self.verify_flags & VERIFY_X509_PARTIAL_CHAIN == 0 {
+            return Err(original_error);
+        }
+
+        let now = i64::try_from(now.as_secs()).map_err(|_| {
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )
+        })?;
+        if now < certificate.validity().not_before.timestamp() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidYet,
+            ));
+        }
+        if now > certificate.validity().not_after.timestamp() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Expired,
+            ));
+        }
+        if certificate
+            .extended_key_usage()
+            .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?
+            .is_some_and(|usage| !usage.value.any && !usage.value.server_auth)
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::InvalidPurpose,
+            ));
+        }
+
+        let certificate = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_name(&certificate, server_name)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 impl rustls::client::danger::ServerCertVerifier for PolicyServerVerifier {
     fn verify_server_cert(
         &self,
@@ -1276,10 +1381,25 @@ impl rustls::client::danger::ServerCertVerifier for PolicyServerVerifier {
                 .extensions()
                 .iter()
                 .any(|extension| extension.oid.to_id_string() == "2.5.29.35");
-            if !has_aki {
+            if certificate.subject() != certificate.issuer() && !has_aki {
                 return Err(rustls::Error::InvalidCertificate(
                     rustls::CertificateError::ApplicationVerificationFailure,
                 ));
+            }
+            for intermediate in intermediates {
+                let (_, certificate) = x509_parser::parse_x509_certificate(intermediate.as_ref())
+                    .map_err(|_| {
+                    rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+                })?;
+                let has_aki = certificate
+                    .extensions()
+                    .iter()
+                    .any(|extension| extension.oid.to_id_string() == "2.5.29.35");
+                if !has_aki {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::ApplicationVerificationFailure,
+                    ));
+                }
             }
         }
         self.inner
@@ -1720,6 +1840,14 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
                 format!("[SSL] cannot build certificate verifier: {error}"),
             )
         })?;
+        let mut trusted_der = context.root_der.clone();
+        trusted_der.extend(deferred_roots.iter().cloned());
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            Arc::new(ExplicitEndEntityVerifier {
+                inner: verifier,
+                trusted_der,
+                verify_flags: context.verify_flags,
+            });
         let mut verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PolicyServerVerifier {
                 inner: verifier,
