@@ -990,6 +990,10 @@ impl UnionBuilder {
                 if present {
                     return Ok(());
                 }
+                // The contains probe may execute user equality and collect;
+                // use both forwarded operands for the following set store.
+                let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+                let set = pyre_object::gc_roots::shadow_stack_get(self.hashable_set_slot);
                 unsafe { pyre_object::w_set_add_hashed_checked(set, arg, hash) }
                     .map_err(crate::baseobjspace::map_set_update_error)?;
                 false

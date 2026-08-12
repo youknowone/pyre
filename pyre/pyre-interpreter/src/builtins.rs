@@ -10809,6 +10809,10 @@ fn syntax_error_character_offset(source: &str, lineno: usize, byte_offset: usize
 
 fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
     let byte_index = byte_index.min(source.len());
+    let byte_index = (0..=byte_index)
+        .rev()
+        .find(|&index| source.is_char_boundary(index))
+        .unwrap_or(0);
     let line_start = source[..byte_index]
         .rfind('\n')
         .map_or(0, |index| index + 1);
@@ -17939,6 +17943,12 @@ mod tests {
         assert_eq!(syntax_error_character_offset("α = 0xI", 1, 7), 6);
         assert_eq!(syntax_error_character_offset("first\nα = 0xI", 2, 7), 6);
         assert_eq!(syntax_error_character_offset("α", 1, 0), 0);
+    }
+
+    #[test]
+    fn source_byte_location_accepts_an_offset_inside_utf8() {
+        assert_eq!(source_byte_location("αx", 1), (1, 1));
+        assert_eq!(source_byte_location("first\nαx", 7), (2, 1));
     }
 
     #[test]
