@@ -1221,13 +1221,51 @@ impl W_Struct {
         Ok(format!("Struct('{fmt}')"))
     }
 
-    /// CPython `Struct.__sizeof__` first applies
-    /// `ENSURE_STRUCT_IS_READY`; the exact allocator accounting is a
-    /// CPython-only assertion, while the half-initialized error is observable
-    /// cross-interpreter behavior.
+    /// CPython 3.14 `_struct.c:s_sizeof` — the dynamic instance prefix plus
+    /// one `formatcode` for every compiled unit and the terminal sentinel.
+    ///
+    /// PyPy's `W_Struct` keeps only `format` and `size`, rather than CPython's
+    /// separate `s_codes` allocation.  Reparse the immutable format here to
+    /// project the 3.14 public size without adding a parallel cache field to
+    /// the PyPy-shaped object.  `x` and a zero-repeat scalar produce no code;
+    /// `s` and `p` produce one even when their byte count is zero, exactly as
+    /// `prepare_s()`'s `ncodes` pass does.
     fn __sizeof__(&self) -> Result<i64, crate::PyError> {
         self.ensure_ready()?;
-        Ok(std::mem::size_of::<W_Struct>() as i64)
+        let fmt = unsafe { w_str_get_value(self.format) };
+        let parsed = parse_format(fmt)?;
+        let ncodes = parsed
+            .units
+            .iter()
+            .filter(|(fmt, repeat)| match fmt.code {
+                Code::Pad => false,
+                Code::Str | Code::Pascal => true,
+                _ => *repeat != 0,
+            })
+            .count();
+
+        let word = std::mem::size_of::<usize>();
+        // CPython 3.14 `PyStructObject`: PyObject_HEAD, s_size, s_len,
+        // s_codes, s_format, weakreflist. Heap-subclass slots extend that
+        // fixed prefix one pointer apiece; managed dict/weakref preheaders do
+        // not contribute to tp_basicsize.
+        let obj = self as *const Self as PyObjectRef;
+        let w_type = crate::typedef::r#type(obj)
+            .map(|ty| ty.as_ptr())
+            .unwrap_or_else(type_object);
+        let basicsize = 7usize
+            .checked_mul(word)
+            .and_then(|base| {
+                base.checked_add(unsafe { pyre_object::w_type_get_nslots(w_type) } as usize * word)
+            })
+            .ok_or_else(crate::builtins::reservation_failed)?;
+        // CPython `formatcode` is one pointer and three Py_ssize_t fields.
+        let codes_size = (ncodes + 1)
+            .checked_mul(4 * word)
+            .ok_or_else(crate::builtins::reservation_failed)?;
+        Ok(basicsize
+            .checked_add(codes_size)
+            .ok_or_else(crate::builtins::reservation_failed)? as i64)
     }
 }
 
