@@ -805,9 +805,14 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
 /// registry.
 ///
 /// PyCode wrappers use stable GC allocation, so the visitor marks each
-/// wrapper but never needs to rewrite `LIVE_CODE_WRAPPERS`.  Keeping this walk
-/// on the same per-mutator area as the jitcode constants preserves the owner:
-/// RPython reaches both through `MetaInterpStaticData.jitcodes`.
+/// wrapper but never needs to rewrite `LIVE_CODE_WRAPPERS`.  The registered
+/// pyre-jit area invokes this walk for major marking and, when tagged ints are
+/// disabled, skips it for minor collections: stable wrappers and constants
+/// cannot be nursery objects.  Tagged-int normalization can materialize a
+/// moving constant, so that configuration conservatively walks the combined
+/// area during minor collections too.  Keeping this walk on the same
+/// per-mutator area as the jitcode constants preserves the owner: RPython
+/// reaches both through `MetaInterpStaticData.jitcodes`.
 pub fn walk_jitcode_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_code_roots_in(&state.borrow(), visitor);
@@ -1058,12 +1063,15 @@ pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
 ///
 /// `blackhole_from_resumedata` seeds the blackhole register file directly
 /// from `jitcode.constants_r` (`init_register_files_from_runtime_jitcode`),
-/// so a constant boxed object reachable only from a jitcode and swept
-/// between trace executions leaves the next guard-failure resume reading a
-/// freed pointer.  The constant pool is immutable after build and its
-/// objects are non-moving — interpreter-routed int/float consts live in
-/// the non-moving old-gen, build-time consts are `malloc_typed`-immortal —
-/// so the slots are marked in place without forwarding.
+/// so a constant boxed object reachable only from a jitcode and swept by a
+/// major collection between trace executions leaves the next guard-failure
+/// resume reading a freed pointer.  The constant pool is immutable after
+/// build.  With tagged ints disabled, its objects are non-moving —
+/// interpreter-routed int/float consts live in the non-moving old-gen and
+/// build-time consts are `malloc_typed`-immortal — so the pyre-jit root-area
+/// wrapper skips this walk for minor collections and marks the slots in place
+/// during major marking.  The tagged-int configuration retains the minor walk
+/// because normalization can materialize a moving `W_IntObject`.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_constants_refs_in(&state.borrow(), visitor);
