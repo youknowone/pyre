@@ -1,10 +1,12 @@
-//! _blake2 module — hashlib blocks OpenSSL's blake2 and uses this builtin
-//! instead.  The constructors defer to the `_hashlib` HASH object, which
-//! computes blake2b-512 / blake2s-256 through RustCrypto.
+//! `_blake2` module constants and PyPy-shaped app-level object types.
+//!
+//! The wrappers mirror `lib_pypy/_blake2/__init__.py`; their object-owned
+//! native RFC 7693 contexts are created by `_hashlib._blake2_new`.
 
 crate::py_module! {
     "_blake2",
     int_constants: {
+        "_GIL_MINSIZE" => 2048,
         "BLAKE2B_SALT_SIZE" => 16,
         "BLAKE2B_PERSON_SIZE" => 16,
         "BLAKE2B_MAX_KEY_SIZE" => 64,

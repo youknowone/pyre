@@ -3128,6 +3128,10 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
         args.iter().find(|&&a| !a.is_null() && unsafe { is_str(a) }).copied()
     }
+    // POSIX EIO is 5 on every host ABI pyre targets. Keep the fallback value
+    // target-neutral: wasm's `libc` intentionally exposes no `EIO` symbol,
+    // while a real descriptor error still supplies its actual raw errno.
+    const EIO_FALLBACK: i32 = 5;
     // Encode through `encode_object` with the stream's error handler so a lone
     // surrogate is routed there (stdout `strict` → UnicodeEncodeError; stderr
     // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
@@ -3146,7 +3150,12 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                     #[cfg(not(feature = "sandbox"))]
                     {
                         use std::io::Write;
-                        let _ = std::io::stderr().write_all(&bytes);
+                        std::io::stderr().write_all(&bytes).map_err(|error| {
+                            crate::PyError::os_error_with_errno(
+                                error.raw_os_error().unwrap_or(EIO_FALLBACK),
+                                error.to_string(),
+                            )
+                        })?;
                     }
                     #[cfg(feature = "sandbox")]
                     crate::host_seam::ops::write(2, &bytes)
@@ -3168,7 +3177,12 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                     #[cfg(not(feature = "sandbox"))]
                     {
                         use std::io::Write;
-                        let _ = std::io::stdout().write_all(&bytes);
+                        std::io::stdout().write_all(&bytes).map_err(|error| {
+                            crate::PyError::os_error_with_errno(
+                                error.raw_os_error().unwrap_or(EIO_FALLBACK),
+                                error.to_string(),
+                            )
+                        })?;
                     }
                     #[cfg(feature = "sandbox")]
                     crate::host_seam::ops::write(1, &bytes)

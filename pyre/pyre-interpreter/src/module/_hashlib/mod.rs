@@ -1,12 +1,11 @@
 //! _hashlib module — the OpenSSL-backed digest surface `hashlib.py` probes.
 //!
-//! The actual digests are computed by `pyre-native` through
-//! [`oneshot_digest`]; the `HASH` object lives in the app-level
-//! `_hashlib_app.py`, while the non-binding `openssl_<name>` and `new`
-//! constructors are interp-level here and build a `HASH`, which calls back
-//! into `_oneshot_digest` at digest time.  Accumulating the data and
-//! re-hashing on `digest()` keeps the object model trivial at the cost of
-//! recomputation.
+//! Digest state is object-owned, matching PyPy/CPython's per-HASH context.
+//! The algorithm implementations live in `pyre-native` (outside LLBC
+//! extraction); `_HashState` embeds their fixed-size opaque state buffer in
+//! the GC payload, so there is no TLS, global registry, or semantic side
+//! table. `HASH` and its `HASHXOF` subclass are native immutable types whose
+//! methods operate directly on that incremental state.
 
 use pyre_object::*;
 
@@ -58,31 +57,290 @@ fn lookup_digest_name(name: &[u8]) -> Option<&'static str> {
         .map(|(python_name, _)| *python_name)
 }
 
-/// `_oneshot_digest(name, data, length=0)` — bytes of the digest.
-fn oneshot_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name_obj = args.first().copied().unwrap_or_else(w_none);
-    if !unsafe { is_str(name_obj) } {
-        return Err(crate::PyError::type_error("digest name must be a string"));
+const HASH_STATE_WORDS: usize = 64;
+
+#[repr(C)]
+struct HashStateStorage {
+    words: [usize; HASH_STATE_WORDS + 1],
+}
+
+impl HashStateStorage {
+    fn as_ptr(&self) -> *const usize {
+        let address = self.words.as_ptr() as usize;
+        ((address + 15) & !15) as *const usize
     }
-    let name = crate::baseobjspace::str_utf8_w(name_obj)?.to_string();
-    let data = match args.get(1).copied() {
-        Some(obj) if unsafe { bytesobject::is_bytes_like(obj) } => {
-            unsafe { bytesobject::bytes_like_data(obj) }.to_vec()
+
+    fn as_mut_ptr(&mut self) -> *mut usize {
+        self.as_ptr() as *mut usize
+    }
+}
+
+/// The fixed-size native digest context embedded directly in its Python
+/// owner. CPython stores an `EVP_MD_CTX *` on `EVPobject`; this inline opaque
+/// buffer is pyre-native's allocation-free equivalent.
+#[crate::pyre_class("_hashlib.HASH")]
+pub struct W_HashState {
+    name: PyObjectRef,
+    digest_size: i64,
+    storage: HashStateStorage,
+}
+
+impl W_HashState {
+    fn new(name: &'static str, data: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+        assert_eq!(
+            HASH_STATE_WORDS,
+            pyre_native::hash::HASH_STATE_STORAGE_WORDS
+        );
+        assert_eq!(16, pyre_native::hash::HASH_STATE_STORAGE_ALIGN);
+        let _roots = gc_roots::push_roots();
+        let name_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(w_str_new(name));
+        let state = W_HashState::allocate_stable(W_HashState {
+            ob: PyObject::default(),
+            name: gc_roots::shadow_stack_get(name_slot),
+            digest_size: pyre_native::hash::digest_output_size(name).unwrap_or(0) as i64,
+            storage: HashStateStorage {
+                words: [0; HASH_STATE_WORDS + 1],
+            },
+        });
+        let this = W_HashState::from_obj(state).expect("fresh _HashState");
+        assert!(unsafe {
+            pyre_native::hash::state_init(this.storage.as_mut_ptr(), HASH_STATE_WORDS, name)
+        });
+        if !data.is_empty() {
+            unsafe {
+                pyre_native::hash::state_update(this.storage.as_mut_ptr(), HASH_STATE_WORDS, data);
+            }
         }
-        Some(obj) if unsafe { is_none(obj) } => Vec::new(),
-        None => Vec::new(),
-        _ => return Err(crate::PyError::type_error("data must be bytes-like")),
-    };
-    let length = args
-        .get(2)
-        .map(|&o| unsafe { w_int_get_value(o) } as usize)
-        .unwrap_or(0);
-    match pyre_native::hash::compute_digest(&name, &data, length) {
-        Some(out) => Ok(w_bytes_from_bytes(&out)),
-        None => Err(crate::PyError::value_error(format!(
-            "unsupported hash type {name}"
-        ))),
+        if matches!(name, "shake_128" | "shake_256") {
+            unsafe { (*state).w_class = hash_xof_type() };
+        }
+        Ok(state)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_blake2(
+        name: &'static str,
+        data: &[u8],
+        digest_size: usize,
+        key: &[u8],
+        salt: &[u8],
+        person: &[u8],
+        fanout: u8,
+        depth: u8,
+        leaf_size: u32,
+        node_offset: u64,
+        node_depth: u8,
+        inner_size: usize,
+        last_node: bool,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let _roots = gc_roots::push_roots();
+        let name_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(w_str_new(name));
+        let state = W_HashState::allocate_stable(W_HashState {
+            ob: PyObject::default(),
+            name: gc_roots::shadow_stack_get(name_slot),
+            digest_size: digest_size as i64,
+            storage: HashStateStorage {
+                words: [0; HASH_STATE_WORDS + 1],
+            },
+        });
+        let this = W_HashState::from_obj(state).expect("fresh BLAKE2 state");
+        assert!(unsafe {
+            pyre_native::hash::state_init_blake2(
+                this.storage.as_mut_ptr(),
+                HASH_STATE_WORDS,
+                name,
+                digest_size,
+                key,
+                salt,
+                person,
+                fanout,
+                depth,
+                leaf_size,
+                node_offset,
+                node_depth,
+                inner_size,
+                last_node,
+            )
+        });
+        if !data.is_empty() {
+            unsafe {
+                pyre_native::hash::state_update(this.storage.as_mut_ptr(), HASH_STATE_WORDS, data);
+            }
+        }
+        Ok(state)
+    }
+
+    fn canonical_name(&self) -> &str {
+        unsafe { w_str_get_value(self.name) }
+    }
+
+    fn digest_bytes(&self, method: &str, args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
+        let name = self.canonical_name();
+        let length = if matches!(name, "shake_128" | "shake_256") {
+            if args.len() != 1 {
+                return Err(crate::PyError::type_error(format!(
+                    "{method}() missing required argument 'length' (pos 1)"
+                )));
+            }
+            let length = crate::baseobjspace::int_w(crate::baseobjspace::space_index(args[0])?)?;
+            usize::try_from(length)
+                .map_err(|_| crate::PyError::value_error("length must be non-negative"))?
+        } else {
+            if !args.is_empty() {
+                return Err(crate::PyError::type_error(format!(
+                    "{method}() takes no arguments ({} given)",
+                    args.len()
+                )));
+            }
+            0
+        };
+        Ok(unsafe {
+            pyre_native::hash::state_digest(self.storage.as_ptr(), HASH_STATE_WORDS, length)
+        })
+    }
+}
+
+/// Sweep-time cleanup for the placement-initialized native digest context.
+/// The Python name is a traced raw reference and has no Rust drop glue.
+pub unsafe fn w_hash_state_dealloc(obj: PyObjectRef) {
+    let this = unsafe { &mut *(obj as *mut W_HashState) };
+    unsafe {
+        pyre_native::hash::state_drop(this.storage.as_mut_ptr(), HASH_STATE_WORDS);
+    }
+}
+
+mod hash_state_class {
+    use super::*;
+
+    #[crate::pyre_methods]
+    impl W_HashState {
+        #[staticmethod]
+        fn __new__(
+            _cls: PyObjectRef,
+            _args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            Err(crate::PyError::type_error(
+                "cannot create '_hashlib.HASH' instances",
+            ))
+        }
+
+        #[getter]
+        fn name(&self) -> PyObjectRef {
+            self.name
+        }
+
+        #[getter]
+        fn digest_size(&self) -> i64 {
+            self.digest_size
+        }
+
+        #[getter]
+        fn block_size(&self) -> i64 {
+            match self.canonical_name() {
+                "md5" | "sha1" | "sha224" | "sha256" | "blake2s" => 64,
+                "sha384" | "sha512" | "blake2b" => 128,
+                "sha3_224" => 144,
+                "sha3_256" | "shake_256" => 136,
+                "sha3_384" => 104,
+                "sha3_512" => 72,
+                "shake_128" => 168,
+                _ => 0,
+            }
+        }
+
+        fn update(&mut self, data: PyObjectRef) -> Result<(), crate::PyError> {
+            let data = read_hash_buffer(data)?;
+            unsafe {
+                pyre_native::hash::state_update(self.storage.as_mut_ptr(), HASH_STATE_WORDS, &data);
+            }
+            Ok(())
+        }
+
+        fn digest(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            Ok(w_bytes_from_bytes(
+                &self.digest_bytes("digest", &args[1..])?,
+            ))
+        }
+
+        fn hexdigest(&self, args: &[PyObjectRef]) -> Result<String, crate::PyError> {
+            let digest = self.digest_bytes("hexdigest", &args[1..])?;
+            let mut out = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                use std::fmt::Write;
+                let _ = write!(out, "{byte:02x}");
+            }
+            Ok(out)
+        }
+
+        fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
+            let _roots = gc_roots::push_roots();
+            let name_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(self.name);
+            let clone = W_HashState::allocate_stable(W_HashState {
+                ob: PyObject::default(),
+                name: gc_roots::shadow_stack_get(name_slot),
+                digest_size: self.digest_size,
+                storage: HashStateStorage {
+                    words: [0; HASH_STATE_WORDS + 1],
+                },
+            });
+            let clone = W_HashState::from_obj(clone).expect("fresh _HashState");
+            unsafe {
+                pyre_native::hash::state_copy(
+                    self.storage.as_ptr(),
+                    clone.storage.as_mut_ptr(),
+                    HASH_STATE_WORDS,
+                );
+                // PyPy `_hashlib.HASHXOF(HASH)` and CPython EVP_copy preserve
+                // the concrete HASH/HASHXOF class. Both share the same native
+                // payload layout, so carry the live instance's class tag.
+                clone.ob.w_class = self.ob.w_class;
+            }
+            Ok(clone as *mut W_HashState as PyObjectRef)
+        }
+
+        fn __repr__(&self) -> String {
+            let class_name = if matches!(self.canonical_name(), "shake_128" | "shake_256") {
+                "HASHXOF"
+            } else {
+                "HASH"
+            };
+            format!(
+                "<{} _hashlib.{class_name} object @ {:#x}>",
+                self.canonical_name(),
+                self as *const Self as usize
+            )
+        }
+    }
+}
+
+/// PyPy `lib_pypy/_hashlib/__init__.py`: `class HASHXOF(HASH): pass`.
+///
+/// The subclass introduces no fields, hence it deliberately reuses HASH's
+/// `W_HashState` layout instead of inventing a parallel payload or side table.
+#[majit_macros::dont_look_inside]
+fn hash_xof_type() -> PyObjectRef {
+    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TYPE.get_or_init(|| {
+        crate::typedef::make_builtin_type_with_layout(
+            "_hashlib.HASHXOF",
+            |ns| unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__new__",
+                    crate::typedef::make_new_descr(|_| {
+                        Err(crate::PyError::type_error(
+                            "cannot create '_hashlib.HASHXOF' instances",
+                        ))
+                    }),
+                )
+            },
+            hash_state_class::type_object(),
+            <W_HashState as crate::PyreClassPyTypeOf>::PYTYPE,
+        ) as usize
+    }) as PyObjectRef
 }
 
 /// The `name: str` clinic conversion: `name` must be a str (or subclass, per
@@ -119,25 +377,9 @@ fn check_digest_name(name_obj: PyObjectRef) -> Result<(), crate::PyError> {
     Ok(())
 }
 
-/// `HASH(name)` name resolution — the Python name of the digest `name`
-/// selects.  OpenSSL resolves the digest when the context is created, so an
-/// unknown name is reported there rather than when the digest is finally
-/// taken.
-fn resolve_digest_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let name_obj = args.first().copied().unwrap_or_else(w_none);
-    check_digest_name(name_obj)?;
-    let name = unsafe { w_str_get_wtf8(name_obj) };
-    match lookup_digest_name(name.as_bytes()) {
-        Some(python_name) => Ok(w_str_new(python_name)),
-        None => Err(unsupported_digestmod(&format!(
-            "unsupported hash type {name}"
-        ))),
-    }
-}
-
 /// Build a `PyError` raising `_hashlib.UnsupportedDigestmodError` with `msg`.
-/// `hmac.py` catches this to fall back to its pure-Python HMAC, so the OpenSSL
-/// HMAC entry points always raise it: we have no streaming HMAC primitive.
+/// `hmac.py` catches this to fall back to its pure-Python HMAC when the
+/// requested digest is not one of the native streaming implementations.
 fn unsupported_digestmod(msg: &str) -> crate::PyError {
     let mut err = crate::PyError::value_error(msg.to_string());
     if let Some(cls) = crate::builtins::lookup_exc_class("_hashlib.UnsupportedDigestmodError") {
@@ -149,20 +391,494 @@ fn unsupported_digestmod(msg: &str) -> crate::PyError {
     err
 }
 
-/// `hmac_new(key, msg=b'', *, digestmod)` — always declines so `hmac.py`
-/// takes its pure-Python `_init_old` path.
-fn hmac_new(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(unsupported_digestmod("unsupported hash type"))
+const HMAC_STATE_WORDS: usize = 128;
+
+#[repr(C)]
+struct HmacStateStorage {
+    words: [usize; HMAC_STATE_WORDS + 1],
 }
 
-/// `hmac_digest(key, msg, digest)` — always declines so `hmac.digest()` takes
-/// its `_compute_digest_fallback` path.
-fn hmac_digest(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(unsupported_digestmod("unsupported hash type"))
+impl HmacStateStorage {
+    fn as_ptr(&self) -> *const usize {
+        let address = self.words.as_ptr() as usize;
+        ((address + 15) & !15) as *const usize
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut usize {
+        self.as_ptr() as *mut usize
+    }
+}
+
+#[crate::pyre_class("_hashlib.HMAC")]
+pub struct W_Hmac {
+    name: PyObjectRef,
+    digest_size: i64,
+    block_size: i64,
+    storage: HmacStateStorage,
+}
+
+impl W_Hmac {
+    fn new(name: &'static str, key: &[u8], msg: &[u8]) -> Result<PyObjectRef, crate::PyError> {
+        assert_eq!(
+            HMAC_STATE_WORDS,
+            pyre_native::hash::HMAC_STATE_STORAGE_WORDS
+        );
+        assert_eq!(16, pyre_native::hash::HMAC_STATE_STORAGE_ALIGN);
+        let digest_size = pyre_native::hash::digest_output_size(name)
+            .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
+        let block_size = pyre_native::hash::digest_block_size(name)
+            .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
+        let _roots = gc_roots::push_roots();
+        let name_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(w_str_new(&format!("hmac-{name}")));
+        let obj = W_Hmac::allocate_stable(W_Hmac {
+            ob: PyObject::default(),
+            name: gc_roots::shadow_stack_get(name_slot),
+            digest_size: digest_size as i64,
+            block_size: block_size as i64,
+            storage: HmacStateStorage {
+                words: [0; HMAC_STATE_WORDS + 1],
+            },
+        });
+        let this = W_Hmac::from_obj(obj).expect("fresh HMAC");
+        assert!(unsafe {
+            pyre_native::hash::hmac_state_init(
+                this.storage.as_mut_ptr(),
+                HMAC_STATE_WORDS,
+                name,
+                key,
+            )
+        });
+        if !msg.is_empty() {
+            unsafe {
+                pyre_native::hash::hmac_state_update(
+                    this.storage.as_mut_ptr(),
+                    HMAC_STATE_WORDS,
+                    msg,
+                );
+            }
+        }
+        Ok(obj)
+    }
+}
+
+/// Sweep-time cleanup for the placement-initialized native HMAC context.
+pub unsafe fn w_hmac_dealloc(obj: PyObjectRef) {
+    let this = unsafe { &mut *(obj as *mut W_Hmac) };
+    unsafe {
+        pyre_native::hash::hmac_state_drop(this.storage.as_mut_ptr(), HMAC_STATE_WORDS);
+    }
+}
+
+mod hmac_class {
+    use super::*;
+
+    #[crate::pyre_methods]
+    impl W_Hmac {
+        #[staticmethod]
+        fn __new__(
+            _cls: PyObjectRef,
+            _args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
+            Err(crate::PyError::type_error(
+                "cannot create '_hashlib.HMAC' instances",
+            ))
+        }
+
+        #[getter]
+        fn name(&self) -> PyObjectRef {
+            self.name
+        }
+
+        #[getter]
+        fn digest_size(&self) -> i64 {
+            self.digest_size
+        }
+
+        #[getter]
+        fn block_size(&self) -> i64 {
+            self.block_size
+        }
+
+        fn update(&mut self, msg: PyObjectRef) -> Result<(), crate::PyError> {
+            let msg = read_hash_buffer(msg)?;
+            unsafe {
+                pyre_native::hash::hmac_state_update(
+                    self.storage.as_mut_ptr(),
+                    HMAC_STATE_WORDS,
+                    &msg,
+                );
+            }
+            Ok(())
+        }
+
+        fn digest(&self) -> PyObjectRef {
+            let digest = unsafe {
+                pyre_native::hash::hmac_state_digest(self.storage.as_ptr(), HMAC_STATE_WORDS)
+            };
+            w_bytes_from_bytes(&digest)
+        }
+
+        fn hexdigest(&self) -> String {
+            let digest = unsafe {
+                pyre_native::hash::hmac_state_digest(self.storage.as_ptr(), HMAC_STATE_WORDS)
+            };
+            let mut out = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                use std::fmt::Write;
+                let _ = write!(out, "{byte:02x}");
+            }
+            out
+        }
+
+        fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
+            let _roots = gc_roots::push_roots();
+            let name_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(self.name);
+            let obj = W_Hmac::allocate_stable(W_Hmac {
+                ob: PyObject::default(),
+                name: gc_roots::shadow_stack_get(name_slot),
+                digest_size: self.digest_size,
+                block_size: self.block_size,
+                storage: HmacStateStorage {
+                    words: [0; HMAC_STATE_WORDS + 1],
+                },
+            });
+            let clone = W_Hmac::from_obj(obj).expect("fresh HMAC");
+            unsafe {
+                pyre_native::hash::hmac_state_copy(
+                    self.storage.as_ptr(),
+                    clone.storage.as_mut_ptr(),
+                    HMAC_STATE_WORDS,
+                );
+            }
+            Ok(obj)
+        }
+
+        fn __repr__(&self) -> String {
+            let name = unsafe { w_str_get_value(self.name) };
+            let name = name.strip_prefix("hmac-").unwrap_or(name);
+            format!("<{name} HMAC object @ {:#x}>", self as *const Self as usize)
+        }
+    }
+}
+
+fn resolve_hmac_digestmod(digestmod: PyObjectRef) -> Result<&'static str, crate::PyError> {
+    let name_obj = if unsafe { is_str(digestmod) } {
+        digestmod
+    } else if unsafe {
+        pyre_object::py_type_check(digestmod, &crate::function::BUILTIN_FUNCTION_TYPE)
+    } {
+        crate::baseobjspace::getattr_str(digestmod, "__name__")?
+    } else {
+        return Err(unsupported_digestmod("unsupported hash type"));
+    };
+    let name = unsafe { w_str_get_wtf8(name_obj) };
+    let bytes = name.as_bytes();
+    let bytes = bytes.strip_prefix(b"openssl_").unwrap_or(bytes);
+    lookup_digest_name(bytes).ok_or_else(|| unsupported_digestmod("unsupported hash type"))
+}
+
+fn hmac_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "hmac_new",
+        positional.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        1,
+        3,
+        0,
+    )?;
+    let key = crate::builtins::bind_pos_or_kw(positional, kwargs, 0, "key", "hmac_new", 1)?
+        .ok_or_else(|| crate::PyError::type_error("hmac_new() missing required argument 'key'"))?;
+    let msg = crate::builtins::bind_pos_or_kw(positional, kwargs, 1, "msg", "hmac_new", 2)?;
+    let digestmod =
+        crate::builtins::bind_pos_or_kw(positional, kwargs, 2, "digestmod", "hmac_new", 3)?
+            .ok_or_else(|| {
+                crate::PyError::type_error(
+                    "hmac_new() missing required argument 'digestmod' (pos 3)",
+                )
+            })?;
+    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "msg", "digestmod"], "hmac_new")?;
+    let key = read_hash_buffer(key)?;
+    let msg = match msg {
+        Some(msg) if unsafe { !is_none(msg) } => read_hash_buffer(msg)?,
+        _ => Vec::new(),
+    };
+    W_Hmac::new(resolve_hmac_digestmod(digestmod)?, &key, &msg)
+}
+
+fn hmac_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "hmac_digest",
+        positional.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        3,
+        3,
+        0,
+    )?;
+    let key = crate::builtins::bind_pos_or_kw(positional, kwargs, 0, "key", "hmac_digest", 1)?
+        .ok_or_else(|| {
+            crate::PyError::type_error("hmac_digest() missing required argument 'key'")
+        })?;
+    let msg = crate::builtins::bind_pos_or_kw(positional, kwargs, 1, "msg", "hmac_digest", 2)?
+        .ok_or_else(|| {
+            crate::PyError::type_error("hmac_digest() missing required argument 'msg'")
+        })?;
+    let digestmod =
+        crate::builtins::bind_pos_or_kw(positional, kwargs, 2, "digest", "hmac_digest", 3)?
+            .ok_or_else(|| {
+                crate::PyError::type_error(
+                    "hmac_digest() missing required argument 'digest' (pos 3)",
+                )
+            })?;
+    crate::builtins::kwarg_reject_unknown(kwargs, &["key", "msg", "digest"], "hmac_digest")?;
+    let key = read_hash_buffer(key)?;
+    let msg = read_hash_buffer(msg)?;
+    let state = W_Hmac::new(resolve_hmac_digestmod(digestmod)?, &key, &msg)?;
+    let state = W_Hmac::from_obj(state).expect("fresh HMAC");
+    let digest =
+        unsafe { pyre_native::hash::hmac_state_digest(state.storage.as_ptr(), HMAC_STATE_WORDS) };
+    Ok(w_bytes_from_bytes(&digest))
+}
+
+fn pbkdf2_hmac(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    const KEYWORDS: &[&str] = &["hash_name", "password", "salt", "iterations", "dklen"];
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "pbkdf2_hmac",
+        positional.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        4,
+        5,
+        0,
+    )?;
+    let required = |index, name, position| {
+        crate::builtins::bind_pos_or_kw(positional, kwargs, index, name, "pbkdf2_hmac", position)?
+            .ok_or_else(|| {
+                crate::PyError::type_error(format!(
+                    "pbkdf2_hmac() missing required argument '{name}' (pos {position})"
+                ))
+            })
+    };
+    let hash_name = required(0, "hash_name", 1)?;
+    let password = required(1, "password", 2)?;
+    let salt = required(2, "salt", 3)?;
+    let iterations = required(3, "iterations", 4)?;
+    let dklen = crate::builtins::bind_pos_or_kw(positional, kwargs, 4, "dklen", "pbkdf2_hmac", 5)?;
+    crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "pbkdf2_hmac")?;
+
+    check_digest_name(hash_name)?;
+    let requested = unsafe { w_str_get_wtf8(hash_name) };
+    let name = lookup_digest_name(requested.as_bytes()).ok_or_else(|| {
+        crate::PyError::value_error(format!(
+            "[digital envelope routines] unsupported: {requested}"
+        ))
+    })?;
+    let password = read_hash_buffer(password)?;
+    let salt = read_hash_buffer(salt)?;
+    let iterations = crate::baseobjspace::int_w(crate::baseobjspace::space_index(iterations)?)?;
+    let iterations = usize::try_from(iterations)
+        .ok()
+        .filter(|&value| value > 0)
+        .ok_or_else(|| crate::PyError::value_error("iteration value must be greater than 0"))?;
+    let dklen = match dklen {
+        Some(obj) if unsafe { !is_none(obj) } => {
+            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(obj)?)?;
+            usize::try_from(value)
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or_else(|| crate::PyError::value_error("key length must be greater than 0"))?
+        }
+        _ => pyre_native::hash::digest_output_size(name).unwrap_or(0),
+    };
+    let result = pyre_native::hash::compute_pbkdf2_hmac(name, &password, &salt, iterations, dklen)
+        .ok_or_else(|| crate::PyError::value_error("unsupported hash type"))?;
+    Ok(w_bytes_from_bytes(&result))
+}
+
+/// `scrypt(password, *, salt, n, r, p, maxmem=0, dklen=64)`.
+///
+/// CPython `_hashopenssl.c` takes only `password` positionally and sends the
+/// work to `EVP_PBE_scrypt`.  The pure-Rust backend implements the same RFC
+/// 7914 primitive; validation stays here so Python-visible errors and integer
+/// bounds do not depend on the backend crate's narrower parameter types.
+fn scrypt_kdf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    const KEYWORDS: &[&str] = &["salt", "n", "r", "p", "maxmem", "dklen"];
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::clinic_arity(
+        "scrypt",
+        positional.len(),
+        crate::builtins::real_kwarg_count(kwargs),
+        1,
+        1,
+        6,
+    )?;
+    let password = positional.first().copied().ok_or_else(|| {
+        crate::PyError::type_error("scrypt() missing required argument 'password' (pos 1)")
+    })?;
+    crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "scrypt")?;
+    let required = |name: &str| {
+        crate::builtins::kwarg_get(kwargs, name).ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "scrypt() missing required keyword-only argument '{name}'"
+            ))
+        })
+    };
+    let salt = required("salt")?;
+    let n_obj = required("n")?;
+    let r_obj = required("r")?;
+    let p_obj = required("p")?;
+
+    let password = read_hash_buffer(password)?;
+    let salt = read_hash_buffer(salt)?;
+    let index = |obj| crate::baseobjspace::int_w(crate::baseobjspace::space_index(obj)?);
+    let n = index(n_obj)?;
+    let r = index(r_obj)?;
+    let p = index(p_obj)?;
+    let maxmem = match crate::builtins::kwarg_get(kwargs, "maxmem") {
+        Some(obj) => index(obj)?,
+        None => 0,
+    };
+    let dklen = match crate::builtins::kwarg_get(kwargs, "dklen") {
+        Some(obj) => index(obj)?,
+        None => 64,
+    };
+
+    let n = u64::try_from(n).unwrap_or(0);
+    if n < 2 || !n.is_power_of_two() {
+        return Err(crate::PyError::value_error(
+            "n must be a power of 2 greater than 1",
+        ));
+    }
+    let log_n = u8::try_from(n.trailing_zeros()).map_err(|_| {
+        crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
+    })?;
+    let r = u32::try_from(r)
+        .ok()
+        .filter(|&value| value > 0)
+        .ok_or_else(|| {
+            crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
+        })?;
+    let p = u32::try_from(p)
+        .ok()
+        .filter(|&value| value > 0)
+        .ok_or_else(|| {
+            crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
+        })?;
+    let maxmem = usize::try_from(maxmem).map_err(|_| {
+        crate::PyError::value_error("maxmem must be positive and smaller than 2147483647")
+    })?;
+    let dklen = usize::try_from(dklen)
+        .ok()
+        .filter(|&value| value > 0)
+        .ok_or_else(|| {
+            crate::PyError::value_error("dklen must be greater than 0 and smaller than 2147483647")
+        })?;
+    if maxmem > i32::MAX as usize {
+        return Err(crate::PyError::value_error(
+            "maxmem must be positive and smaller than 2147483647",
+        ));
+    }
+    if dklen > i32::MAX as usize {
+        return Err(crate::PyError::value_error(
+            "dklen must be greater than 0 and smaller than 2147483647",
+        ));
+    }
+
+    // RFC 7914's dominant allocation is V[N] with 128*r-byte entries. OpenSSL
+    // also needs B[p] and a working block. Honor an explicit caller limit;
+    // maxmem=0 retains OpenSSL's implementation-defined default behavior.
+    let memory = usize::try_from(n)
+        .ok()
+        .and_then(|n| n.checked_mul(r as usize))
+        .and_then(|v| v.checked_mul(128))
+        .and_then(|v| v.checked_add((p as usize).checked_mul(r as usize)?.checked_mul(128)?))
+        .and_then(|v| v.checked_add((r as usize).checked_mul(256)?))
+        .ok_or_else(|| {
+            crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
+        })?;
+    if maxmem != 0 && memory > maxmem {
+        return Err(crate::PyError::value_error(
+            "Invalid parameter combination for n, r, p, maxmem",
+        ));
+    }
+    let output = pyre_native::hash::compute_scrypt(&password, &salt, log_n, r, p, dklen)
+        .ok_or_else(|| {
+            crate::PyError::value_error("Invalid parameter combination for n, r, p, maxmem")
+        })?;
+    Ok(w_bytes_from_bytes(&output))
+}
+
+/// Private constructor used by PyPy-shaped `_blake2` app-level objects after
+/// they validate the public clinic contract. The returned HASH is the native,
+/// object-owned context held by the wrapper's `_state` attribute.
+fn blake2_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::builtins::clinic_arity("_blake2_new", args.len(), 0, 13, 13, 0)?;
+    let _roots = gc_roots::push_roots();
+    let base = gc_roots::shadow_stack_len();
+    for &arg in args {
+        gc_roots::pin_root(arg);
+    }
+    let arg = |index| gc_roots::shadow_stack_get(base + index);
+    let name_obj = arg(0);
+    check_digest_name(name_obj)?;
+    let requested = unsafe { w_str_get_wtf8(name_obj) };
+    let name = match requested.as_bytes() {
+        b"blake2b" => "blake2b",
+        b"blake2s" => "blake2s",
+        _ => return Err(crate::PyError::value_error("unsupported BLAKE2 type")),
+    };
+    let data = read_hash_buffer(arg(1))?;
+    let key = read_hash_buffer(arg(3))?;
+    let salt = read_hash_buffer(arg(4))?;
+    let person = read_hash_buffer(arg(5))?;
+    let index =
+        |position| crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg(position))?);
+    let digest_size = usize::try_from(index(2)?)
+        .map_err(|_| crate::PyError::value_error("invalid digest size"))?;
+    let fanout =
+        u8::try_from(index(6)?).map_err(|_| crate::PyError::value_error("invalid fanout"))?;
+    let depth =
+        u8::try_from(index(7)?).map_err(|_| crate::PyError::value_error("invalid depth"))?;
+    let leaf_size =
+        u32::try_from(index(8)?).map_err(|_| crate::PyError::value_error("invalid leaf size"))?;
+    // BLAKE2b accepts the full unsigned 64-bit range; `int_w` would reject
+    // values above i64::MAX even though the app-level range check accepted
+    // them. operator.index has already normalized the public argument.
+    let node_offset = crate::baseobjspace::uint_w(arg(9))?;
+    let node_depth =
+        u8::try_from(index(10)?).map_err(|_| crate::PyError::value_error("invalid node depth"))?;
+    let inner_size = usize::try_from(index(11)?)
+        .map_err(|_| crate::PyError::value_error("invalid inner size"))?;
+    let last_node = crate::baseobjspace::is_true(arg(12))?;
+    W_HashState::new_blake2(
+        name,
+        &data,
+        digest_size,
+        &key,
+        &salt,
+        &person,
+        fanout,
+        depth,
+        leaf_size,
+        node_offset,
+        node_depth,
+        inner_size,
+        last_node,
+    )
 }
 
 /// Constant-time equality of two ASCII strings or two bytes-like objects.
 fn compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let a_obj = args.first().copied().unwrap_or_else(w_none);
+    let b_obj = args.get(1).copied().unwrap_or_else(w_none);
+    if unsafe { is_str(a_obj) } != unsafe { is_str(b_obj) } {
+        return Err(crate::PyError::type_error(
+            "unsupported operand types(s) or combination of types",
+        ));
+    }
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
@@ -185,8 +901,8 @@ fn compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
     };
-    let a = read(args.first().copied().unwrap_or_else(w_none))?;
-    let b = read(args.get(1).copied().unwrap_or_else(w_none))?;
+    let a = read(a_obj)?;
+    let b = read(b_obj)?;
     let mut result = (a.len() ^ b.len()) as u8;
     for i in 0..a.len() {
         result |= a[i] ^ b.get(i).copied().unwrap_or(0);
@@ -266,18 +982,11 @@ fn make_hash(
         Some(slot) => read_hash_buffer(pyre_object::gc_roots::shadow_stack_get(slot))?,
         None => Vec::new(),
     };
-    let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data_bytes));
-    let module = crate::importing::check_sys_modules("_hashlib")
-        .ok_or_else(|| crate::PyError::runtime_error("_hashlib module not loaded"))?;
-    let hash_cls = crate::baseobjspace::getattr_str(module, "HASH")?;
-    crate::call::call_function_impl_result(
-        hash_cls,
-        &[
-            pyre_object::gc_roots::shadow_stack_get(name_slot),
-            pyre_object::gc_roots::shadow_stack_get(bytes_slot),
-        ],
-    )
+    let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    let name = unsafe { w_str_get_wtf8(name_obj) };
+    let name = lookup_digest_name(name.as_bytes())
+        .ok_or_else(|| unsupported_digestmod(&format!("unsupported hash type {name}")))?;
+    W_HashState::new(name, &data_bytes)
 }
 
 /// `new(name, data=b'', *, usedforsecurity=True, string=None)` — build a
@@ -329,6 +1038,10 @@ fn make_openssl_hash(digest: &str, args: &[PyObjectRef]) -> Result<PyObjectRef, 
 crate::py_module! {
     "_hashlib",
     interpleveldefs: {
+        "HASH" => hash_state_class::type_object(),
+        "HASHXOF" => hash_xof_type(),
+        "HMAC" => hmac_class::type_object(),
+        "_GIL_MINSIZE" => w_int_new(2048),
         "openssl_md_meth_names" => {
             let names: Vec<PyObjectRef> =
                 DIGEST_NAMES.iter().map(|(n, _)| w_str_new(n)).collect();
@@ -339,9 +1052,6 @@ crate::py_module! {
         // _hashopenssl.c — UnsupportedDigestmodError subclasses ValueError.
         "UnsupportedDigestmodError" => crate::builtins::lookup_exc_class("ValueError")
             .expect("ValueError installed"),
-    },
-    appleveldefs: {
-        "_hashlib_app.py" => ["HASH"],
     },
     functions: {
         "new" / * = new_hash,
@@ -357,11 +1067,49 @@ crate::py_module! {
         "openssl_sha3_512" / * = |args| make_openssl_hash("sha3_512", args),
         "openssl_shake_128" / * = |args| make_openssl_hash("shake_128", args),
         "openssl_shake_256" / * = |args| make_openssl_hash("shake_256", args),
-        "_oneshot_digest" / * = oneshot_digest,
-        "_resolve_digest_name" / 1 = resolve_digest_name,
         "compare_digest" / 2 = compare_digest,
         "hmac_new" / * = hmac_new,
         "hmac_digest" / * = hmac_digest,
-        "get_fips_mode" / * = |_| Ok(w_int_new(0)),
+        "pbkdf2_hmac" / * = pbkdf2_hmac,
+        "scrypt" / * = scrypt_kdf,
+        "_blake2_new" / * = blake2_new,
+        "get_fips_mode" / 0 = |_| Ok(w_int_new(0)),
+    },
+    extra_init: |ns| {
+        let _roots = gc_roots::push_roots();
+        let mapping_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(w_dict_new());
+        for (constructor, name) in [
+            ("openssl_md5", "md5"),
+            ("openssl_sha1", "sha1"),
+            ("openssl_sha224", "sha224"),
+            ("openssl_sha256", "sha256"),
+            ("openssl_sha384", "sha384"),
+            ("openssl_sha512", "sha512"),
+            ("openssl_sha3_224", "sha3_224"),
+            ("openssl_sha3_256", "sha3_256"),
+            ("openssl_sha3_384", "sha3_384"),
+            ("openssl_sha3_512", "sha3_512"),
+            ("openssl_shake_128", "shake_128"),
+            ("openssl_shake_256", "shake_256"),
+        ] {
+            let function = crate::module_ns_get(ns, constructor)
+                .expect("_hashlib constructor installed before extra_init");
+            let function_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(function);
+            let name_slot = gc_roots::shadow_stack_len();
+            gc_roots::pin_root(w_str_new(name));
+            crate::baseobjspace::setitem(
+                gc_roots::shadow_stack_get(mapping_slot),
+                gc_roots::shadow_stack_get(function_slot),
+                gc_roots::shadow_stack_get(name_slot),
+            )
+            .expect("populate _hashlib._constructors");
+        }
+        crate::module_ns_store(
+            ns,
+            "_constructors",
+            pyre_object::w_dict_proxy_new(gc_roots::shadow_stack_get(mapping_slot)),
+        );
     },
 }

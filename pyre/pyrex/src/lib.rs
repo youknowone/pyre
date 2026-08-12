@@ -1128,6 +1128,53 @@ fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) {
     }
 }
 
+/// Release module globals whose objects carry a Python `__del__` after the
+/// modules have been detached from `sys.modules`.
+///
+/// Pyre still has native-owned immortal Module holders, so clearing the import
+/// cache alone cannot release a user finalizer stored in one of their dicts.
+/// CPython's full `finalize_modules` also coordinates weakref callbacks and a
+/// two-pass namespace clear; until that complete ordering is ported, erasing
+/// every helper module here would invalidate callback globals during the same
+/// shutdown. The finalizer queue already records precisely the observable
+/// user-deallocator case, so release those values newest-first and leave the
+/// supporting module namespaces alive for their callbacks.
+fn clear_shutdown_modules(
+    modules: Vec<pyre_object::PyObjectRef>,
+    ec_ptr: *const PyExecutionContext,
+) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let roots_start = pyre_object::gc_roots::shadow_stack_len();
+    for module in modules {
+        pyre_object::gc_roots::pin_root(module);
+    }
+    let roots_end = pyre_object::gc_roots::shadow_stack_len();
+    for slot in roots_start..roots_end {
+        let module = pyre_object::gc_roots::shadow_stack_get(slot);
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        if dict.is_null() {
+            continue;
+        }
+        let mut entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+        entries.reverse();
+        for (name, value) in entries {
+            let Some(value_type) = pyre_interpreter::typedef::r#type(value) else {
+                continue;
+            };
+            if !unsafe { pyre_object::w_type_get_hasuserdel(value_type.as_ptr()) } {
+                continue;
+            }
+            unsafe {
+                pyre_object::w_dict_setitem_str(dict, &name, pyre_object::w_none());
+            }
+            collect_and_run_finalizers(ec_ptr);
+        }
+    }
+}
+
 /// Whether releasing this binding can remove anything from the reachable set,
 /// and so whether the collection that follows it could find garbage an earlier
 /// one did not. Answering `false` skips a full mark-and-sweep of the whole
@@ -1212,6 +1259,11 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // itself holds, so without this a stream owned by any other module loses
     // its buffered writes.
     pyre_interpreter::module::_io::flush_all_streams();
+    // CPython `finalize_modules` releases the import cache before globals;
+    // otherwise module-owned cycles never become candidates for the
+    // collections below and their deallocators do not run at shutdown.
+    let shutdown_modules = pyre_interpreter::importing::release_sys_modules_for_shutdown();
+    clear_shutdown_modules(shutdown_modules, ec_ptr);
     collect_and_run_finalizers(ec_ptr);
     let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
     entries.reverse();

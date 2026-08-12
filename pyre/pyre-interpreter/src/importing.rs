@@ -436,6 +436,12 @@ thread_local! {
 pub(crate) struct BuiltinModuleDef {
     init: fn(PyObjectRef),
     startup: Option<fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>>,
+    /// The module follows ordinary `sys.modules` ownership and may be
+    /// collected after a fresh import is removed from that cache. Most of
+    /// pyre's legacy MixedModules still have JIT/native owners that require
+    /// their historical immortal holder; opt in only after that module's
+    /// state and cached references have been audited.
+    collectible: bool,
 }
 
 struct ImportRootArea {
@@ -469,6 +475,20 @@ pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
         BuiltinModuleDef {
             init,
             startup: None,
+            collectible: false,
+        },
+    );
+}
+
+/// Register a builtin module whose holder has no native/JIT owner beyond the
+/// ordinary Python object graph.
+pub fn register_collectible_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
+    BUILTIN_MODULES.lock().unwrap().insert(
+        name,
+        BuiltinModuleDef {
+            init,
+            startup: None,
+            collectible: true,
         },
     );
 }
@@ -486,6 +506,7 @@ pub fn register_builtin_module_with_startup(
         BuiltinModuleDef {
             init,
             startup: Some(startup),
+            collectible: false,
         },
     );
 }
@@ -671,7 +692,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_random);
     pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(_pickle);
-    pyre_install_module!("_struct"(r#struct));
+    register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(binascii);
     pyre_install_module!(marshal);
     pyre_install_module!(zlib);
@@ -1025,7 +1046,16 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
             crate::gateway::with_module(static_name, value);
         }
     }
-    let module = pyre_object::w_module_new_aliasing_dict(name, w_dict);
+    // Before `sys.modules` exists the native bootstrap registry is the only
+    // owner and retains the legacy immortal module shape. Afterwards an
+    // audited collectible module follows the PyPy `space.sys.modules` object
+    // graph; legacy MixedModules retain the immortal holder until their
+    // native/JIT caches have been migrated to traced owners.
+    let module = if sys_modules_dict().is_null() || !module_def.collectible {
+        pyre_object::w_module_new_aliasing_dict(name, w_dict)
+    } else {
+        pyre_object::w_module_new_aliasing_dict_managed(name, w_dict)
+    };
     // function.py:797-815 BuiltinFunction.w_moduleobj — MixedModule binds
     // every interp-level function to the live defining module object.
     for key in &keys {
@@ -1607,10 +1637,16 @@ pub fn sys_modules_dict() -> PyObjectRef {
 }
 
 pub fn set_sys_module(name: &str, module: PyObjectRef) {
-    // A new module joins the `walk_module_dicts_gc` root set; its dict
-    // may hold young values — rescan on the next minor collection.
+    // Native-owned immortal modules need their managed dicts in
+    // `walk_module_dicts_gc`; managed modules are instead reached through the
+    // ordinary object graph rooted at `sys.modules`.  Test actual ownership,
+    // not whether that dict currently exists: the immortal bootstrap `sys`
+    // module installs `sys.modules` from inside its initializer, before this
+    // function receives the finished module.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    MODULE_DICT_ROOTS.lock().unwrap().insert(module as usize);
+    if !majit_gc::gc_owns_object(module as usize) {
+        MODULE_DICT_ROOTS.lock().unwrap().insert(module as usize);
+    }
     SYS_MODULES
         .lock()
         .unwrap()
@@ -1639,6 +1675,37 @@ pub fn remove_sys_module(name: &str) {
             pyre_object::w_dict_delitem_str(dict, name);
         }
     }
+}
+
+/// Drop the Python-visible import cache during process shutdown.
+///
+/// CPython's `finalize_modules()` clears `sys.modules` before module-global
+/// teardown; PyPy's object space likewise owns modules through
+/// `space.sys.modules`, rather than a permanent side table.  Keeping every
+/// imported module in the cache until `process::exit` prevents its managed
+/// module/dict cycles and their `__del__` objects from ever becoming
+/// unreachable.  Retain `sys` and `builtins` themselves because pyre's
+/// unraisable-error path still consults their live dictionaries while the
+/// released modules are finalized.
+pub fn release_sys_modules_for_shutdown() -> Vec<PyObjectRef> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Vec::new();
+    }
+    let entries = unsafe { pyre_object::w_dict_str_entries(dict) };
+    let mut modules = Vec::new();
+    for (name, module) in entries {
+        if matches!(name.as_str(), "sys" | "builtins") {
+            continue;
+        }
+        if !module.is_null() && unsafe { pyre_object::is_module(module) } {
+            modules.push(module);
+        }
+        unsafe {
+            pyre_object::w_dict_delitem_str(dict, &name);
+        }
+    }
+    modules
 }
 
 /// GC root walk over every bound module's dict storage.

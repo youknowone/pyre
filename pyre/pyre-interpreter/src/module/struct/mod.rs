@@ -1220,6 +1220,15 @@ impl W_Struct {
         let fmt = unsafe { w_str_get_value(self.format) };
         Ok(format!("Struct('{fmt}')"))
     }
+
+    /// CPython `Struct.__sizeof__` first applies
+    /// `ENSURE_STRUCT_IS_READY`; the exact allocator accounting is a
+    /// CPython-only assertion, while the half-initialized error is observable
+    /// cross-interpreter behavior.
+    fn __sizeof__(&self) -> Result<i64, crate::PyError> {
+        self.ensure_ready()?;
+        Ok(std::mem::size_of::<W_Struct>() as i64)
+    }
 }
 
 /// gateway `Signature` for a builtin whose named parameters are all

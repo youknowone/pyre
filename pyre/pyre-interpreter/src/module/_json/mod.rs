@@ -115,7 +115,7 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
         json_decode_error("Unterminated string starting at".to_owned(), doc, start)
     })?;
     match machinery::scan_string(rest, start, strict) {
-        Ok((decoded, next)) => Ok(pyre_object::w_tuple_new(vec![
+        Ok((decoded, next, _)) => Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_str_from_wtf8(decoded),
             pyre_object::w_int_new(next as i64),
         ])),
@@ -132,142 +132,105 @@ fn stop_iteration(index: i64) -> PyError {
     }
 }
 
-fn scanner_call_inner(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyResult {
-    let value = require_string(doc)?;
-    if index < 0 {
-        return Err(stop_iteration(index));
+#[inline]
+fn skip_json_whitespace(
+    doc: PyObjectRef,
+    mut char_index: usize,
+    mut byte_index: usize,
+) -> (usize, usize) {
+    let bytes = unsafe { pyre_object::w_str_get_wtf8(doc) }.as_bytes();
+    while matches!(bytes.get(byte_index), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        char_index += 1;
+        byte_index += 1;
     }
-    let index = index as usize;
-    let Some(first) = value.code_points().nth(index) else {
-        return Err(stop_iteration(index as i64));
+    (char_index, byte_index)
+}
+
+fn scanner_decode_error(msg: &str, doc: PyObjectRef, pos: usize) -> PyError {
+    json_decode_error(msg.to_owned(), doc, pos)
+}
+
+/// CPython `scan_once_unicode`: scanner state owns only the six callbacks and
+/// strict flag; the memo dict is born per public call and threaded through the
+/// recursive object/array descent.
+fn scanner_scan_once(
+    self_obj: PyObjectRef,
+    memo: PyObjectRef,
+    doc: PyObjectRef,
+    char_index: usize,
+    byte_index: usize,
+) -> Result<(PyObjectRef, usize, usize), PyError> {
+    let _roots = gc_roots::push_roots();
+    let slot = gc_roots::shadow_stack_len();
+    for value in [self_obj, memo, doc] {
+        gc_roots::pin_root(value);
+    }
+    let doc = gc_roots::shadow_stack_get(slot + 2);
+    let bytes = unsafe { pyre_object::w_str_get_wtf8(doc) }.as_bytes();
+    let Some(&first) = bytes.get(byte_index) else {
+        return Err(stop_iteration(char_index as i64));
     };
 
-    match first.to_char_lossy() {
-        '"' => {
-            let parse_string = crate::baseobjspace::getattr_str(self_obj, "parse_string")?;
-            let strict = crate::baseobjspace::getattr_str(self_obj, "strict")?;
-            let _roots = gc_roots::push_roots();
-            let slot = gc_roots::shadow_stack_len();
-            for value in [parse_string, strict, doc, self_obj] {
-                gc_roots::pin_root(value);
-            }
-            let end = pyre_object::w_int_new(index as i64 + 1);
-            gc_roots::pin_root(end);
-            crate::call::call_function_impl_result(
-                gc_roots::shadow_stack_get(slot),
-                &[
-                    gc_roots::shadow_stack_get(slot + 2),
-                    gc_roots::shadow_stack_get(slot + 4),
-                    gc_roots::shadow_stack_get(slot + 1),
-                ],
-            )
+    match first {
+        b'"' => {
+            let strict = W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
+                .expect("Scanner payload")
+                .strict;
+            let value = unsafe { pyre_object::w_str_get_wtf8(doc) };
+            let (decoded, next_char, bytes_used) =
+                machinery::scan_string(&value[byte_index + 1..], char_index + 1, strict)
+                    .map_err(|err| json_decode_error(err.msg, doc, err.pos))?;
+            Ok((
+                pyre_object::w_str_from_wtf8(decoded),
+                next_char,
+                byte_index + 1 + bytes_used,
+            ))
         }
-        '{' => {
-            let parse_object = crate::baseobjspace::getattr_str(self_obj, "parse_object")?;
-            let strict = crate::baseobjspace::getattr_str(self_obj, "strict")?;
-            let object_hook = crate::baseobjspace::getattr_str(self_obj, "object_hook")?;
-            let pairs_hook = crate::baseobjspace::getattr_str(self_obj, "object_pairs_hook")?;
-            let memo = crate::baseobjspace::getattr_str(self_obj, "memo")?;
-            let _roots = gc_roots::push_roots();
-            let slot = gc_roots::shadow_stack_len();
-            for value in [
-                parse_object,
-                strict,
-                self_obj,
-                object_hook,
-                pairs_hook,
-                memo,
+        b'{' => {
+            crate::stack_check::stack_check().map_err(|_| {
+                PyError::recursion_error(
+                    "maximum recursion depth exceeded while decoding a JSON object from a string",
+                )
+            })?;
+            scanner_parse_object(
+                gc_roots::shadow_stack_get(slot),
+                gc_roots::shadow_stack_get(slot + 1),
                 doc,
-            ] {
-                gc_roots::pin_root(value);
-            }
-            let end = pyre_object::w_int_new(index as i64 + 1);
-            gc_roots::pin_root(end);
-            let state = pyre_object::w_tuple_new(vec![
-                gc_roots::shadow_stack_get(slot + 6),
-                gc_roots::shadow_stack_get(slot + 7),
-            ]);
-            gc_roots::pin_root(state);
-            crate::call::call_function_impl_result(
-                gc_roots::shadow_stack_get(slot),
-                &[
-                    gc_roots::shadow_stack_get(slot + 8),
-                    gc_roots::shadow_stack_get(slot + 1),
-                    gc_roots::shadow_stack_get(slot + 2),
-                    gc_roots::shadow_stack_get(slot + 3),
-                    gc_roots::shadow_stack_get(slot + 4),
-                    gc_roots::shadow_stack_get(slot + 5),
-                ],
+                char_index + 1,
+                byte_index + 1,
             )
         }
-        '[' => {
-            let parse_array = crate::baseobjspace::getattr_str(self_obj, "parse_array")?;
-            let _roots = gc_roots::push_roots();
-            let slot = gc_roots::shadow_stack_len();
-            for value in [parse_array, self_obj, doc] {
-                gc_roots::pin_root(value);
-            }
-            let end = pyre_object::w_int_new(index as i64 + 1);
-            gc_roots::pin_root(end);
-            let state = pyre_object::w_tuple_new(vec![
-                gc_roots::shadow_stack_get(slot + 2),
-                gc_roots::shadow_stack_get(slot + 3),
-            ]);
-            gc_roots::pin_root(state);
-            crate::call::call_function_impl_result(
+        b'[' => {
+            crate::stack_check::stack_check().map_err(|_| {
+                PyError::recursion_error(
+                    "maximum recursion depth exceeded while decoding a JSON array from a string",
+                )
+            })?;
+            scanner_parse_array(
                 gc_roots::shadow_stack_get(slot),
-                &[
-                    gc_roots::shadow_stack_get(slot + 4),
-                    gc_roots::shadow_stack_get(slot + 1),
-                ],
+                gc_roots::shadow_stack_get(slot + 1),
+                doc,
+                char_index + 1,
+                byte_index + 1,
             )
         }
-        _ => scan_scalar(self_obj, doc, value, index),
+        _ => scan_scalar(
+            gc_roots::shadow_stack_get(slot),
+            doc,
+            char_index,
+            byte_index,
+        ),
     }
 }
 
-fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyResult {
-    // Recursive object/array callbacks invoke this same Scanner.  The memo is
-    // context-owned and is cleared only after the outermost token finishes.
-    let scanner = W_Scanner::from_obj(self_obj).expect("Scanner payload");
-    let depth = scanner.depth;
-    // `scan_once_unicode` brackets recursive container decoding with
-    // `Py_EnterRecursiveCall`.  The meta-tracing JIT can flatten this
-    // recursion, so the scanner-owned counter, not the native stack address,
-    // must remain the guard.
-    if depth >= crate::stack_check::get_recursion_limit() as i64 {
-        return Err(PyError::recursion_error(
-            "maximum recursion depth exceeded while decoding a JSON object",
-        ));
-    }
-    scanner.depth = depth + 1;
-    let result = scanner_call_inner(self_obj, doc, index);
-    W_Scanner::from_obj(self_obj)
-        .expect("Scanner payload")
-        .depth = depth;
-    if depth != 0 {
-        return result;
-    }
-    // `json.scanner.py:scan_once` clears the context-owned memo in a finally.
-    let _result_roots = gc_roots::push_roots();
-    let result_slots = pin_pyresult_payload(&result);
-    let memo = crate::baseobjspace::getattr_str(self_obj, "memo")?;
-    let clear_result = crate::call::call_function_impl_result(
-        crate::baseobjspace::getattr_str(memo, "clear")?,
-        &[],
-    );
-    let result = reload_pyresult_payload(result, result_slots);
-    match (result, clear_result) {
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-        (Ok(value), Ok(_)) => Ok(value),
-    }
-}
-
-fn scan_scalar(self_obj: PyObjectRef, doc: PyObjectRef, value: &Wtf8, index: usize) -> PyResult {
-    let byte_index = unsafe { pyre_object::w_str_index_to_byte(doc, index) };
-    let bytes = value.as_bytes();
-    let rest = &bytes[byte_index..];
+fn scan_scalar(
+    self_obj: PyObjectRef,
+    doc: PyObjectRef,
+    index: usize,
+    byte_index: usize,
+) -> Result<(PyObjectRef, usize, usize), PyError> {
+    let value = unsafe { pyre_object::w_str_get_wtf8(doc) };
+    let rest = &value.as_bytes()[byte_index..];
     let simple = if rest.starts_with(b"null") {
         Some((pyre_object::w_none(), 4))
     } else if rest.starts_with(b"true") {
@@ -278,10 +241,7 @@ fn scan_scalar(self_obj: PyObjectRef, doc: PyObjectRef, value: &Wtf8, index: usi
         None
     };
     if let Some((obj, len)) = simple {
-        return Ok(pyre_object::w_tuple_new(vec![
-            obj,
-            pyre_object::w_int_new((index + len) as i64),
-        ]));
+        return Ok((obj, index + len, byte_index + len));
     }
 
     let mut end = 0usize;
@@ -328,10 +288,7 @@ fn scan_scalar(self_obj: PyObjectRef, doc: PyObjectRef, value: &Wtf8, index: usi
         let number = unsafe { core::str::from_utf8_unchecked(&rest[..end]) };
         let parsed =
             crate::call::call_function_impl_result(parser, &[pyre_object::w_str_new(number)])?;
-        return Ok(pyre_object::w_tuple_new(vec![
-            parsed,
-            pyre_object::w_int_new((index + end) as i64),
-        ]));
+        return Ok((parsed, index + end, byte_index + end));
     }
 
     for (token, len) in [("NaN", 3usize), ("Infinity", 8), ("-Infinity", 9)] {
@@ -339,28 +296,348 @@ fn scan_scalar(self_obj: PyObjectRef, doc: PyObjectRef, value: &Wtf8, index: usi
             let parser = crate::baseobjspace::getattr_str(self_obj, "parse_constant")?;
             let parsed =
                 crate::call::call_function_impl_result(parser, &[pyre_object::w_str_new(token)])?;
-            return Ok(pyre_object::w_tuple_new(vec![
-                parsed,
-                pyre_object::w_int_new((index + len) as i64),
-            ]));
+            return Ok((parsed, index + len, byte_index + len));
         }
     }
     Err(stop_iteration(index as i64))
 }
 
+fn scanner_parse_object(
+    self_obj: PyObjectRef,
+    memo: PyObjectRef,
+    doc: PyObjectRef,
+    mut char_index: usize,
+    mut byte_index: usize,
+) -> Result<(PyObjectRef, usize, usize), PyError> {
+    let _roots = gc_roots::push_roots();
+    let slot = gc_roots::shadow_stack_len();
+    for value in [self_obj, memo, doc] {
+        gc_roots::pin_root(value);
+    }
+    let pairs_hook = W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
+        .expect("Scanner payload")
+        .object_pairs_hook;
+    let has_pairs_hook = !unsafe { pyre_object::is_none(pairs_hook) };
+    let result = if has_pairs_hook {
+        pyre_object::w_list_new_empty()
+    } else {
+        pyre_object::w_dict_new()
+    };
+    gc_roots::pin_root(result);
+
+    (char_index, byte_index) =
+        skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
+    let doc = gc_roots::shadow_stack_get(slot + 2);
+    if unsafe { pyre_object::w_str_get_wtf8(doc) }
+        .as_bytes()
+        .get(byte_index)
+        == Some(&b'}')
+    {
+        char_index += 1;
+        byte_index += 1;
+    } else {
+        loop {
+            let doc = gc_roots::shadow_stack_get(slot + 2);
+            if unsafe { pyre_object::w_str_get_wtf8(doc) }
+                .as_bytes()
+                .get(byte_index)
+                != Some(&b'"')
+            {
+                return Err(scanner_decode_error(
+                    "Expecting property name enclosed in double quotes",
+                    doc,
+                    char_index,
+                ));
+            }
+            let strict = W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
+                .expect("Scanner payload")
+                .strict;
+            let value = unsafe { pyre_object::w_str_get_wtf8(doc) };
+            let (decoded, next_char, bytes_used) =
+                machinery::scan_string(&value[byte_index + 1..], char_index + 1, strict)
+                    .map_err(|err| json_decode_error(err.msg, doc, err.pos))?;
+            char_index = next_char;
+            byte_index += 1 + bytes_used;
+
+            let iteration_roots = gc_roots::push_roots();
+            let item_slot = gc_roots::shadow_stack_len();
+            let candidate = pyre_object::w_str_from_wtf8(decoded);
+            gc_roots::pin_root(candidate);
+            let memo = gc_roots::shadow_stack_get(slot + 1);
+            let key =
+                match crate::baseobjspace::finditem(memo, gc_roots::shadow_stack_get(item_slot))? {
+                    Some(key) => key,
+                    None => {
+                        crate::baseobjspace::setitem(
+                            memo,
+                            gc_roots::shadow_stack_get(item_slot),
+                            gc_roots::shadow_stack_get(item_slot),
+                        )?;
+                        gc_roots::shadow_stack_get(item_slot)
+                    }
+                };
+            gc_roots::pin_root(key);
+
+            (char_index, byte_index) =
+                skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
+            let doc = gc_roots::shadow_stack_get(slot + 2);
+            if unsafe { pyre_object::w_str_get_wtf8(doc) }
+                .as_bytes()
+                .get(byte_index)
+                != Some(&b':')
+            {
+                return Err(scanner_decode_error(
+                    "Expecting ':' delimiter",
+                    doc,
+                    char_index,
+                ));
+            }
+            char_index += 1;
+            byte_index += 1;
+            (char_index, byte_index) = skip_json_whitespace(doc, char_index, byte_index);
+
+            let (value, next_char, next_byte) = scanner_scan_once(
+                gc_roots::shadow_stack_get(slot),
+                gc_roots::shadow_stack_get(slot + 1),
+                gc_roots::shadow_stack_get(slot + 2),
+                char_index,
+                byte_index,
+            )
+            .map_err(|err| {
+                if err.kind == crate::PyErrorKind::StopIteration {
+                    scanner_decode_error(
+                        "Expecting value",
+                        gc_roots::shadow_stack_get(slot + 2),
+                        char_index,
+                    )
+                } else {
+                    err
+                }
+            })?;
+            gc_roots::pin_root(value);
+            char_index = next_char;
+            byte_index = next_byte;
+
+            if has_pairs_hook {
+                let pair = pyre_object::w_tuple_new(vec![
+                    gc_roots::shadow_stack_get(item_slot + 1),
+                    gc_roots::shadow_stack_get(item_slot + 2),
+                ]);
+                gc_roots::pin_root(pair);
+                unsafe {
+                    pyre_object::w_list_append(
+                        gc_roots::shadow_stack_get(slot + 3),
+                        gc_roots::shadow_stack_get(item_slot + 3),
+                    );
+                }
+            } else {
+                crate::baseobjspace::setitem(
+                    gc_roots::shadow_stack_get(slot + 3),
+                    gc_roots::shadow_stack_get(item_slot + 1),
+                    gc_roots::shadow_stack_get(item_slot + 2),
+                )?;
+            }
+            drop(iteration_roots);
+
+            (char_index, byte_index) =
+                skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
+            let doc = gc_roots::shadow_stack_get(slot + 2);
+            match unsafe { pyre_object::w_str_get_wtf8(doc) }
+                .as_bytes()
+                .get(byte_index)
+            {
+                Some(b'}') => {
+                    char_index += 1;
+                    byte_index += 1;
+                    break;
+                }
+                Some(b',') => {
+                    let comma = char_index;
+                    char_index += 1;
+                    byte_index += 1;
+                    (char_index, byte_index) = skip_json_whitespace(doc, char_index, byte_index);
+                    if unsafe { pyre_object::w_str_get_wtf8(doc) }
+                        .as_bytes()
+                        .get(byte_index)
+                        == Some(&b'}')
+                    {
+                        return Err(scanner_decode_error(
+                            "Illegal trailing comma before end of object",
+                            doc,
+                            comma,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(scanner_decode_error(
+                        "Expecting ',' delimiter",
+                        doc,
+                        char_index,
+                    ));
+                }
+            }
+        }
+    }
+
+    let result = gc_roots::shadow_stack_get(slot + 3);
+    let hook = if has_pairs_hook {
+        W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
+            .expect("Scanner payload")
+            .object_pairs_hook
+    } else {
+        W_Scanner::from_obj(gc_roots::shadow_stack_get(slot))
+            .expect("Scanner payload")
+            .object_hook
+    };
+    if unsafe { pyre_object::is_none(hook) } {
+        Ok((result, char_index, byte_index))
+    } else {
+        let hooked = crate::call::call_function_impl_result(hook, &[result])?;
+        Ok((hooked, char_index, byte_index))
+    }
+}
+
+fn scanner_parse_array(
+    self_obj: PyObjectRef,
+    memo: PyObjectRef,
+    doc: PyObjectRef,
+    mut char_index: usize,
+    mut byte_index: usize,
+) -> Result<(PyObjectRef, usize, usize), PyError> {
+    let _roots = gc_roots::push_roots();
+    let slot = gc_roots::shadow_stack_len();
+    for value in [self_obj, memo, doc] {
+        gc_roots::pin_root(value);
+    }
+    let result = pyre_object::w_list_new_empty();
+    gc_roots::pin_root(result);
+    (char_index, byte_index) =
+        skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
+    let doc = gc_roots::shadow_stack_get(slot + 2);
+    if unsafe { pyre_object::w_str_get_wtf8(doc) }
+        .as_bytes()
+        .get(byte_index)
+        == Some(&b']')
+    {
+        return Ok((
+            gc_roots::shadow_stack_get(slot + 3),
+            char_index + 1,
+            byte_index + 1,
+        ));
+    }
+
+    loop {
+        let item_roots = gc_roots::push_roots();
+        let (value, next_char, next_byte) = scanner_scan_once(
+            gc_roots::shadow_stack_get(slot),
+            gc_roots::shadow_stack_get(slot + 1),
+            gc_roots::shadow_stack_get(slot + 2),
+            char_index,
+            byte_index,
+        )
+        .map_err(|err| {
+            if err.kind == crate::PyErrorKind::StopIteration {
+                scanner_decode_error(
+                    "Expecting value",
+                    gc_roots::shadow_stack_get(slot + 2),
+                    char_index,
+                )
+            } else {
+                err
+            }
+        })?;
+        gc_roots::pin_root(value);
+        unsafe {
+            pyre_object::w_list_append(
+                gc_roots::shadow_stack_get(slot + 3),
+                gc_roots::shadow_stack_get(gc_roots::shadow_stack_len() - 1),
+            );
+        }
+        drop(item_roots);
+        char_index = next_char;
+        byte_index = next_byte;
+        (char_index, byte_index) =
+            skip_json_whitespace(gc_roots::shadow_stack_get(slot + 2), char_index, byte_index);
+        let doc = gc_roots::shadow_stack_get(slot + 2);
+        match unsafe { pyre_object::w_str_get_wtf8(doc) }
+            .as_bytes()
+            .get(byte_index)
+        {
+            Some(b']') => {
+                char_index += 1;
+                byte_index += 1;
+                break;
+            }
+            Some(b',') => {
+                let comma = char_index;
+                char_index += 1;
+                byte_index += 1;
+                (char_index, byte_index) = skip_json_whitespace(doc, char_index, byte_index);
+                if unsafe { pyre_object::w_str_get_wtf8(doc) }
+                    .as_bytes()
+                    .get(byte_index)
+                    == Some(&b']')
+                {
+                    return Err(scanner_decode_error(
+                        "Illegal trailing comma before end of array",
+                        doc,
+                        comma,
+                    ));
+                }
+            }
+            _ => {
+                return Err(scanner_decode_error(
+                    "Expecting ',' delimiter",
+                    doc,
+                    char_index,
+                ));
+            }
+        }
+    }
+    Ok((gc_roots::shadow_stack_get(slot + 3), char_index, byte_index))
+}
+
+fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyResult {
+    require_string(doc)?;
+    if index < 0 {
+        return Err(PyError::value_error("idx cannot be negative"));
+    }
+    let char_index = index as usize;
+    let byte_index = unsafe { pyre_object::w_str_index_to_byte(doc, char_index) };
+    if byte_index >= unsafe { pyre_object::w_str_get_wtf8(doc) }.len() {
+        return Err(stop_iteration(index));
+    }
+    let _roots = gc_roots::push_roots();
+    let slot = gc_roots::shadow_stack_len();
+    for value in [self_obj, doc] {
+        gc_roots::pin_root(value);
+    }
+    // CPython `scanner_call`: one exact dict per public invocation, shared by
+    // the whole recursive descent and discarded with the call.
+    let memo = pyre_object::w_dict_new();
+    gc_roots::pin_root(memo);
+    let (value, next, _) = scanner_scan_once(
+        gc_roots::shadow_stack_get(slot),
+        gc_roots::shadow_stack_get(slot + 2),
+        gc_roots::shadow_stack_get(slot + 1),
+        char_index,
+        byte_index,
+    )?;
+    gc_roots::pin_root(value);
+    Ok(pyre_object::w_tuple_new(vec![
+        gc_roots::shadow_stack_get(slot + 3),
+        pyre_object::w_int_new(next as i64),
+    ]))
+}
+
 #[crate::pyre_class("_json.Scanner")]
 pub struct W_Scanner {
-    parse_object: PyObjectRef,
-    parse_array: PyObjectRef,
-    parse_string: PyObjectRef,
-    strict: PyObjectRef,
+    strict: bool,
     parse_float: PyObjectRef,
     parse_int: PyObjectRef,
     parse_constant: PyObjectRef,
     object_hook: PyObjectRef,
     object_pairs_hook: PyObjectRef,
-    memo: PyObjectRef,
-    depth: i64,
 }
 
 mod scanner_class {
@@ -373,20 +650,8 @@ mod scanner_class {
         }
 
         #[getter]
-        fn parse_object(&self) -> PyObjectRef {
-            self.parse_object
-        }
-        #[getter]
-        fn parse_array(&self) -> PyObjectRef {
-            self.parse_array
-        }
-        #[getter]
-        fn parse_string(&self) -> PyObjectRef {
-            self.parse_string
-        }
-        #[getter]
         fn strict(&self) -> PyObjectRef {
-            self.strict
+            pyre_object::w_bool_from(self.strict)
         }
         #[getter]
         fn parse_float(&self) -> PyObjectRef {
@@ -407,10 +672,6 @@ mod scanner_class {
         #[getter]
         fn object_pairs_hook(&self) -> PyObjectRef {
             self.object_pairs_hook
-        }
-        #[getter]
-        fn memo(&self) -> PyObjectRef {
-            self.memo
         }
     }
 }
@@ -991,37 +1252,28 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
     let slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(context);
     for name in [
-        "parse_object",
-        "parse_array",
-        "parse_string",
         "strict",
         "parse_float",
         "parse_int",
         "parse_constant",
         "object_hook",
         "object_pairs_hook",
-        "memo",
     ] {
         let value = crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
         gc_roots::pin_root(value);
     }
     // Match the C accelerator: strict is converted during construction, so
     // an overriding `__bool__` raises before the first token is scanned.
-    let strict = crate::baseobjspace::is_true(gc_roots::shadow_stack_get(slot + 4))?;
+    let strict = crate::baseobjspace::is_true(gc_roots::shadow_stack_get(slot + 1))?;
     let _ = scanner_class::type_object();
     Ok(W_Scanner::allocate_stable(W_Scanner {
         ob: pyre_object::PyObject::default(),
-        parse_object: gc_roots::shadow_stack_get(slot + 1),
-        parse_array: gc_roots::shadow_stack_get(slot + 2),
-        parse_string: gc_roots::shadow_stack_get(slot + 3),
-        strict: pyre_object::w_bool_from(strict),
-        parse_float: gc_roots::shadow_stack_get(slot + 5),
-        parse_int: gc_roots::shadow_stack_get(slot + 6),
-        parse_constant: gc_roots::shadow_stack_get(slot + 7),
-        object_hook: gc_roots::shadow_stack_get(slot + 8),
-        object_pairs_hook: gc_roots::shadow_stack_get(slot + 9),
-        memo: gc_roots::shadow_stack_get(slot + 10),
-        depth: 0,
+        strict,
+        parse_float: gc_roots::shadow_stack_get(slot + 2),
+        parse_int: gc_roots::shadow_stack_get(slot + 3),
+        parse_constant: gc_roots::shadow_stack_get(slot + 4),
+        object_hook: gc_roots::shadow_stack_get(slot + 5),
+        object_pairs_hook: gc_roots::shadow_stack_get(slot + 6),
     }))
 }
 

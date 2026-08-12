@@ -146,6 +146,26 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 /// discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
+    let value = module_aliasing_dict_value(name, w_dict_object);
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+/// GC-managed counterpart of [`w_module_new_aliasing_dict`].
+///
+/// Once `sys.modules` exists it is the ordinary object-graph owner of imported
+/// modules, exactly as `space.sys.modules` is in PyPy.  A builtin module made
+/// after that point must therefore be collectible when its cache entry and
+/// every application reference disappear; in particular its
+/// module -> dict -> builtin function -> module cycle is not a process root.
+/// Stable allocation preserves the address assumptions of promoted module
+/// constants while still letting a major collection reclaim the cycle.
+#[majit_macros::dont_look_inside]
+pub fn w_module_new_aliasing_dict_managed(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
+    let value = module_aliasing_dict_value(name, w_dict_object);
+    crate::lltype::malloc_typed_stable(value) as PyObjectRef
+}
+
+fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module {
     if !name.is_empty() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
         unsafe {
             crate::dictmultiobject::w_dict_setitem_str(
@@ -156,14 +176,14 @@ pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyO
         }
     }
     let name = crate::lltype::malloc_raw(name.to_string());
-    crate::lltype::malloc_typed(Module {
+    Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
         },
         name,
         w_dict: w_dict_object,
-    }) as PyObjectRef
+    }
 }
 
 /// Get the module name.

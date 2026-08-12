@@ -676,6 +676,20 @@ unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
     unsafe { pyre_interpreter::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
 }
 
+unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_hashlib::w_hash_state_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        );
+    }
+}
+
+unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
+    }
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`,
@@ -3481,6 +3495,25 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_json::W_Encoder
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // CPython's EVPobject and HMACobject own their native contexts.  Pyre's
+    // fixed-size opaque contexts live inline on the equivalent managed owner;
+    // attach drop glue so sweeping the owner releases the RustCrypto state.
+    let hashlib_hash_state_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_hashlib::W_HashState
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    gc.types
+        .set_destructor(hashlib_hash_state_tid, hashlib_hash_state_destructor);
+    let hashlib_hmac_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_hashlib::W_Hmac
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    gc.types
+        .set_destructor(hashlib_hmac_tid, hashlib_hmac_destructor);
     // `pypy/module/gc/referents.py:11-15 W_GcRef`: the wrapper's raw gcref
     // field is a normal traced edge so an internal object stays live and is
     // forwarded in place.  Register it before the target-gated DirEntry slot;

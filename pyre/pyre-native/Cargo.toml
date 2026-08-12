@@ -11,5 +11,7 @@ md-5 = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
-blake2 = { workspace = true }
+blake2b_simd = { workspace = true }
+blake2s_simd = { workspace = true }
+scrypt = { workspace = true }
 flate2 = { workspace = true, features = ["zlib-rs"] }

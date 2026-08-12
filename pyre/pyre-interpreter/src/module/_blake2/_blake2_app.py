@@ -1,19 +1,177 @@
-"""App-level _blake2 constructors backed by the _hashlib HASH object.
+"""PyPy-shaped BLAKE2 objects with object-owned native digest state.
 
-Only the default digest sizes (blake2b-512 / blake2s-256) are computed;
-the keyed/salted/personalised parameters are accepted and ignored.
+The validation and object shape follow ``lib_pypy/_blake2/__init__.py``.
+Only the RFC 7693 state machine lives in ``_hashlib._blake2_new`` so copying,
+incremental updates, and GC ownership remain on the Python hash object rather
+than in a TLS cache or global side table.
 """
 
+import operator as _operator
 
-def blake2b(data=b"", *, digest_size=64, key=b"", salt=b"", person=b"",
-            fanout=1, depth=1, leaf_size=0, node_offset=0, node_depth=0,
-            inner_size=0, last_node=False, usedforsecurity=True):
-    from _hashlib import HASH
-    return HASH("blake2b", data)
+from _hashlib import _blake2_new as _new_state
 
 
-def blake2s(data=b"", *, digest_size=32, key=b"", salt=b"", person=b"",
-            fanout=1, depth=1, leaf_size=0, node_offset=0, node_depth=0,
-            inner_size=0, last_node=False, usedforsecurity=True):
-    from _hashlib import HASH
-    return HASH("blake2s", data)
+class _Immutable(type):
+    def __init__(cls, name, bases, namespace):
+        type.__setattr__(cls, "_immutable_names", frozenset(namespace))
+        type.__init__(cls, name, bases, namespace)
+
+    def __setattr__(cls, name, value):
+        qualname = ".".join((cls.__module__, cls.__name__))
+        raise TypeError(
+            "cannot set %r attribute of immutable type %r" % (name, qualname)
+        )
+
+
+_MISSING = object()
+
+
+def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
+                     _digest_size, max_offset, _block_size):
+    class _Blake(metaclass=_Immutable):
+        SALT_SIZE = _salt_size
+        PERSON_SIZE = _person_size
+        MAX_KEY_SIZE = _key_size
+        MAX_DIGEST_SIZE = _digest_size
+
+        def __new__(cls, *args, **kwargs):
+            # Argument Clinic diagnoses a duplicate positional/keyword `data`
+            # before unknown keywords, then diagnoses unknown keywords before
+            # the data/string conflict. Python-function binding uses different
+            # wording, so preserve CPython's public ordering explicitly.
+            if len(args) > 1:
+                raise TypeError(
+                    "%s() takes at most 1 positional argument (%d given)" %
+                    (class_name, len(args))
+                )
+            if args and "data" in kwargs:
+                raise TypeError(
+                    "argument for %s() given by name ('data') and position (1)" %
+                    class_name
+                )
+            allowed = {
+                "data", "digest_size", "key", "salt", "person", "fanout",
+                "depth", "leaf_size", "node_offset", "node_depth",
+                "inner_size", "last_node", "usedforsecurity", "string",
+            }
+            for keyword in kwargs:
+                if keyword not in allowed:
+                    raise TypeError(
+                        "%s() got an unexpected keyword argument %r" %
+                        (class_name, keyword)
+                    )
+            data = args[0] if args else kwargs.get("data", _MISSING)
+            string = kwargs.get("string", _MISSING)
+            if data is not _MISSING and string is not _MISSING:
+                raise TypeError(
+                    "'data' and 'string' are mutually exclusive and support "
+                    "for 'string' keyword parameter is slated for removal in "
+                    "a future version."
+                )
+            if data is _MISSING:
+                data = b"" if string is _MISSING else string
+
+            digest_size = kwargs.get("digest_size", _digest_size)
+            key = kwargs.get("key", b"")
+            salt = kwargs.get("salt", b"")
+            person = kwargs.get("person", b"")
+            fanout = kwargs.get("fanout", 1)
+            depth = kwargs.get("depth", 1)
+            leaf_size = kwargs.get("leaf_size", 0)
+            node_offset = kwargs.get("node_offset", 0)
+            node_depth = kwargs.get("node_depth", 0)
+            inner_size = kwargs.get("inner_size", 0)
+            last_node = kwargs.get("last_node", False)
+            usedforsecurity = kwargs.get("usedforsecurity", True)
+
+            # PyPy sets every integer parameter into the native parameter
+            # block after range checking. operator.index matches the clinic
+            # integer converters while accepting integer subclasses.
+            digest_size = _operator.index(digest_size)
+            fanout = _operator.index(fanout)
+            depth = _operator.index(depth)
+            leaf_size = _operator.index(leaf_size)
+            node_offset = _operator.index(node_offset)
+            node_depth = _operator.index(node_depth)
+            inner_size = _operator.index(inner_size)
+            if not 1 <= digest_size <= cls.MAX_DIGEST_SIZE:
+                raise ValueError(
+                    "digest_size must be between 1 and %d bytes" %
+                    cls.MAX_DIGEST_SIZE
+                )
+            if len(key) > cls.MAX_KEY_SIZE:
+                raise ValueError("maximum key length is %d bytes" % cls.MAX_KEY_SIZE)
+            if len(salt) > cls.SALT_SIZE:
+                raise ValueError("maximum salt length is %d bytes" % cls.SALT_SIZE)
+            if len(person) > cls.PERSON_SIZE:
+                raise ValueError("maximum person length is %d bytes" % cls.PERSON_SIZE)
+            if not 0 <= fanout <= 255:
+                raise ValueError("fanout must be between 0 and 255")
+            if not 1 <= depth <= 255:
+                raise ValueError("depth must be between 1 and 255")
+            if leaf_size < 0:
+                raise ValueError("value must be positive")
+            if leaf_size > 0xFFFFFFFF:
+                raise OverflowError("leaf_size is too large")
+            if node_offset < 0:
+                raise ValueError("value must be positive")
+            if node_offset > max_offset:
+                raise OverflowError("node_offset is too large")
+            if not 0 <= node_depth <= 255:
+                raise ValueError("node_depth must be between 0 and 255")
+            if not 0 <= inner_size <= cls.MAX_DIGEST_SIZE:
+                raise ValueError(
+                    "inner_size must be between 0 and %d" %
+                    cls.MAX_DIGEST_SIZE
+                )
+
+            # Both clinic bool converters are observable through __bool__.
+            bool(usedforsecurity)
+            last_node = bool(last_node)
+            self = object.__new__(cls)
+            self._state = _new_state(
+                class_name, data, digest_size, key, salt, person, fanout,
+                depth, leaf_size, node_offset, node_depth, inner_size,
+                last_node,
+            )
+            return self
+
+        @property
+        def name(self):
+            return class_name
+
+        @property
+        def block_size(self):
+            return _block_size
+
+        @property
+        def digest_size(self):
+            return self._state.digest_size
+
+        def update(self, data):
+            self._state.update(data)
+
+        def digest(self):
+            return self._state.digest()
+
+        def hexdigest(self):
+            return self._state.hexdigest()
+
+        def copy(self):
+            other = object.__new__(type(self))
+            other._state = self._state.copy()
+            return other
+
+        def __repr__(self):
+            return "<%s.%s object at 0x%x>" % (
+                type(self).__module__, type(self).__name__, id(self)
+            )
+
+    type.__setattr__(_Blake, "__name__", class_name)
+    type.__setattr__(_Blake, "__qualname__", class_name)
+    type.__setattr__(_Blake, "__module__", "_blake2")
+    return _Blake
+
+
+blake2b = _make_blake_type("blake2b", 16, 16, 64, 64, (1 << 64) - 1, 128)
+blake2s = _make_blake_type("blake2s", 8, 8, 32, 32, (1 << 48) - 1, 64)

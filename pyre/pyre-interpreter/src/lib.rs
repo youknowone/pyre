@@ -1104,22 +1104,26 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // payload tail without renumbering an established class.
         subclass_range_alias(162, typed::<crate::module::_json::W_Scanner>()),
         subclass_range_alias(163, typed::<crate::module::_json::W_Encoder>()),
+        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
+        // owners and have sweep-time native-state destructors in build_gc.
+        subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
+        subclass_range_alias(165, typed::<crate::module::_hashlib::W_Hmac>()),
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.
-        subclass_range_alias(164, typed::<crate::module::gc::gcref::W_GcRef>()),
+        subclass_range_alias(166, typed::<crate::module::gc::gcref::W_GcRef>()),
         // `gc.hooks` owns its three callback references directly, matching
         // W_AppLevelHooks in pypy/module/gc/hook.py.
-        subclass_range_alias(165, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
+        subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
-        subclass_range_alias(166, typed::<crate::module::gc::stats::W_GcStats>()),
+        subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
         // `posix.DirEntry` — `allocate_stable` type registered last among the
         // native rclass registrations in `build_gc`, before the bare twister
         // id.
         // `posix` is compiled out on wasm32 (`module/mod.rs`), so this alias is
         // too; nothing unconditional follows it, so no id differs per target.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(167, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(169, typed::<crate::module::posix::W_DirEntry>()),
     ]
 }
 

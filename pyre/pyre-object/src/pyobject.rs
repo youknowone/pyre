@@ -640,19 +640,22 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // `_json.Scanner` and `_json.Encoder` follow with typed managed payloads.
     (162, Some(0)),
     (163, Some(0)),
+    // `_hashlib`'s per-object digest and HMAC native-state owners.
+    (164, Some(0)),
+    (165, Some(0)),
     // `gc.GcRef` stores its raw referent as a traced wrapper edge.
     // gcref payload is a traced edge on the wrapper itself.
-    (164, Some(0)),
-    // `gc.hooks` keeps its three callback fields on W_AppLevelHooks.
-    (165, Some(0)),
-    // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
     (166, Some(0)),
+    // `gc.hooks` keeps its three callback fields on W_AppLevelHooks.
+    (167, Some(0)),
+    // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
+    (168, Some(0)),
     // W_GcStats is the final unconditional rclass registration.
     // `posix.DirEntry` follows it on native builds, last of the rclass
     // registrations and before the bare twister id. `posix` is compiled out
     // on wasm32, so its object-hierarchy slot is too.
     #[cfg(not(target_arch = "wasm32"))]
-    (167, Some(0)),
+    (169, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

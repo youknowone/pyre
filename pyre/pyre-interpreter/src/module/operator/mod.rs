@@ -47,6 +47,13 @@ fn op_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `_compare_digest(a, b)` — constant-time equality of two ASCII strings or
 /// two bytes-like objects, used by `hmac` / `secrets`.
 fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let a_obj = args.first().copied().unwrap_or_else(w_none);
+    let b_obj = args.get(1).copied().unwrap_or_else(w_none);
+    if unsafe { is_str(a_obj) } != unsafe { is_str(b_obj) } {
+        return Err(crate::PyError::type_error(
+            "unsupported operand types(s) or combination of types",
+        ));
+    }
     let read = |obj: PyObjectRef| -> Result<Vec<u8>, crate::PyError> {
         unsafe {
             if is_str(obj) {
@@ -69,8 +76,8 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
         }
     };
-    let a = read(args.first().copied().unwrap_or_else(w_none))?;
-    let b = read(args.get(1).copied().unwrap_or_else(w_none))?;
+    let a = read(a_obj)?;
+    let b = read(b_obj)?;
     let mut result = (a.len() ^ b.len()) as u8;
     for i in 0..a.len() {
         result |= a[i] ^ b.get(i).copied().unwrap_or(0);

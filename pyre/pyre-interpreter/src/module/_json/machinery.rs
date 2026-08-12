@@ -73,16 +73,16 @@ pub(super) fn scan_string(
     value: &Wtf8,
     char_offset: usize,
     strict: bool,
-) -> Result<(Wtf8Buf, usize), DecodeError> {
+) -> Result<(Wtf8Buf, usize, usize), DecodeError> {
     let unterminated = || DecodeError {
         msg: "Unterminated string starting at".to_owned(),
         pos: char_offset.saturating_sub(1),
     };
     let mut out = Wtf8Buf::new();
     let mut chars = value.code_point_indices().enumerate().peekable();
-    while let Some((char_i, (_, cp))) = chars.next() {
+    while let Some((char_i, (byte_i, cp))) = chars.next() {
         match cp.to_char_lossy() {
-            '"' => return Ok((out, char_offset + char_i + 1)),
+            '"' => return Ok((out, char_offset + char_i + 1, byte_i + 1)),
             '\\' => {
                 let (escape_i, (_, escaped)) = chars.next().ok_or_else(unterminated)?;
                 match escaped.to_char_lossy() {

@@ -562,13 +562,13 @@
       "dynasm": "PASS"
     },
     "test.test_hashlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_heapq": {
       "dynasm": "PASS"
     },
     "test.test_hmac": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_html": {
       "cranelift": "PASS",
@@ -644,7 +644,7 @@
       "dynasm": "PASS"
     },
     "test.test_json": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_keyword": {
       "cranelift": "PASS",
@@ -1069,7 +1069,7 @@
       "dynasm": "PASS"
     },
     "test.test_struct": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_structseq": {
       "dynasm": "PASS"
