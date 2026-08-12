@@ -15817,7 +15817,7 @@ fn cell_descr_repr(args: &[PyObjectRef]) -> crate::PyResult {
             crate::display::repr_addr(value as usize)
         )
     };
-    Ok(w_str_new(&text))
+    Ok(w_str_new_managed(&text))
 }
 
 /// `nestedscope.py:934-952 Cell.typedef`, in source order. CPython 3.14 is
