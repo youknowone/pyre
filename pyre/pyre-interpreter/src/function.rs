@@ -2873,13 +2873,9 @@ pub unsafe fn descr_method_repr(obj: PyObjectRef) -> Result<PyObjectRef, crate::
         .map(|value| unsafe { pyre_object::w_str_get_wtf8(value) }.to_wtf8_buf())
         .unwrap_or_else(|| Wtf8Buf::from_string("?".to_owned()));
     let instance_repr = unsafe { crate::display::py_repr_wtf8(instance)? };
-    Ok(pyre_object::w_str_from_wtf8(crate::display::wtf8_format!(
-        "<bound method ",
-        name,
-        " of ",
-        instance_repr,
-        ">"
-    )))
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        crate::display::wtf8_format!("<bound method ", name, " of ", instance_repr, ">"),
+    ))
 }
 
 #[inline]
