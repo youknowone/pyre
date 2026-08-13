@@ -59,6 +59,19 @@
 /// rather than relying on the InteriorFieldDescr backreference for
 /// identity).
 ///
+/// Leaking is not the only thing a cycle costs: any *walk* over the
+/// descr graph must refuse the back-reference too.  `Debug` is such a
+/// walk, and with both ends derived it recursed until the stack ran
+/// out — `SimpleArrayDescr::fmt` → `OnceLock` → `Vec<DescrRef>` →
+/// `SimpleInteriorFieldDescr::fmt` → `SimpleArrayDescr::fmt` → … — for
+/// every `{:?}` that reached a struct-array descr, including
+/// `format_assembler`'s `EffectInfo` render.  `SimpleInteriorFieldDescr`
+/// therefore has a hand-written `Debug` that prints `array_descr` as an
+/// identity summary, matching `descr.py:420-421
+/// InteriorFieldDescr.repr_of_descr`, which never follows
+/// `self.arraydescr`.  A future reader added to this graph has to make
+/// the same choice at the same edge.
+///
 /// **C (landed 2026-05-19).**  Trait-dispatch + structural keying
 /// migration for the virtualizable / virtualref field paths:
 ///
@@ -6311,7 +6324,6 @@ impl ArrayDescr for SimpleArrayDescr {
 }
 
 /// Simple concrete InteriorFieldDescr.
-#[derive(Debug)]
 pub struct SimpleInteriorFieldDescr {
     /// per-trace analyzer slot id. Stored atomic so the analyzer's
     /// `cc.interiorfielddescrof` cache-or-mint can stamp on a
@@ -6339,6 +6351,39 @@ pub struct SimpleInteriorFieldDescr {
     /// `arraydescr`).  Kept for pyre's
     /// `ensure_ptr_info_arg0`-style dispatch paths.
     owner_size_descr: Option<std::sync::Arc<dyn SizeDescr>>,
+}
+
+/// Hand-written rather than derived: `array_descr` is the back half of
+/// the `SimpleArrayDescr.all_interiorfielddescrs` ↔
+/// `SimpleInteriorFieldDescr.array_descr` strong cycle recorded in the
+/// Arc cycle audit at the top of this module, so a derived `Debug`
+/// makes every `{:?}` of a struct-array descr non-terminating
+/// (`SimpleArrayDescr::fmt` → `OnceLock` → `Vec<DescrRef>` →
+/// `SimpleInteriorFieldDescr::fmt` → `SimpleArrayDescr::fmt` → …).
+/// `descr.py:420-421 InteriorFieldDescr.repr_of_descr` renders only
+/// `self.fielddescr.repr_of_descr()` and never follows
+/// `self.arraydescr`, so the back-reference prints as an identity
+/// summary here instead of being traversed.  The forward half stays
+/// derived — one broken edge makes every walk finite, and
+/// `all_interiorfielddescrs` is the half a reader actually wants.
+impl std::fmt::Debug for SimpleInteriorFieldDescr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimpleInteriorFieldDescr")
+            .field("index", &self.index)
+            .field("descr_index", &self.descr_index)
+            .field("ei_index", &self.ei_index)
+            .field(
+                "array_descr",
+                &format_args!(
+                    "<ArrayDescr cache_key={}, type_id={}>",
+                    self.array_descr.cache_key(),
+                    self.array_descr.type_id()
+                ),
+            )
+            .field("field_descr", &self.field_descr)
+            .field("owner_size_descr", &self.owner_size_descr)
+            .finish()
+    }
 }
 
 impl Clone for SimpleInteriorFieldDescr {
@@ -7338,6 +7383,54 @@ mod register_keyed_size_authority_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A struct-array descr and its interior field descrs point at each
+    /// other (the "CYCLE, accepted" row of the Arc cycle audit at the top
+    /// of this module), so a `Debug` that follows both edges never
+    /// terminates.  Formatting either end must finish; a regression here
+    /// aborts the process with a stack overflow rather than failing an
+    /// assertion, which is precisely why the walk has to refuse the
+    /// back-reference.
+    #[test]
+    fn debug_of_a_struct_array_descr_terminates() {
+        let array = Arc::new(SimpleArrayDescr::with_flag(
+            0,
+            16,
+            8,
+            7,
+            Type::Int,
+            ArrayFlag::Struct,
+        ));
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "Item.x".to_string(),
+            "x".to_string(),
+        ));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(
+            0,
+            array.clone() as Arc<dyn ArrayDescr>,
+            field,
+        ));
+        array.set_all_interiorfielddescrs(vec![interior.clone()]);
+
+        // Both entry points, because either can be the one a caller holds.
+        let from_array = format!("{array:?}");
+        let from_interior = format!("{interior:?}");
+
+        // The forward edge still renders the interior descr; only the
+        // back-reference is summarised.
+        assert!(from_array.contains("SimpleInteriorFieldDescr"));
+        assert!(from_interior.contains("<ArrayDescr cache_key=0, type_id=7>"));
+        // One level each way, not many: a walk that re-entered the cycle
+        // even a few times would repeat the array descr's own name.
+        assert_eq!(from_array.matches("SimpleArrayDescr").count(), 1);
+        assert_eq!(from_interior.matches("SimpleInteriorFieldDescr").count(), 1);
+    }
 
     #[test]
     fn strip_instantiation_suffix_drops_generic_args() {
