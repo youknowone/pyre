@@ -107,6 +107,11 @@ pub struct PyreFieldDescr {
     quasi_immutable: bool,
     /// RPython descr.py:227 — field name for heaptracker.py:66 filtering.
     name: &'static str,
+    /// Whether this field is the owning struct's class word — the declared
+    /// answer behind `FieldDescr::is_w_class()`.  Stated per construction
+    /// site rather than recovered from `name`, so a consumer never has to
+    /// know how this host spells its header.
+    is_class_word: bool,
     index_in_parent: usize,
     parent_descr: Option<Weak<dyn Descr>>,
     /// `effectinfo.py:465 compute_bitstrings` ei_index. `u32::MAX` until
@@ -330,6 +335,9 @@ impl Descr for PyreFieldDescr {
 }
 
 impl FieldDescr for PyreFieldDescr {
+    fn is_w_class(&self) -> bool {
+        self.is_class_word
+    }
     fn offset(&self) -> usize {
         self.offset
     }
@@ -370,6 +378,7 @@ pub fn make_field_descr(
         immutable: false,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -405,6 +414,7 @@ pub fn make_field_descr_full(
         immutable,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -427,6 +437,7 @@ pub fn make_immutable_field_descr(
         immutable: true,
         quasi_immutable: false,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -449,6 +460,7 @@ pub fn make_quasi_immutable_field_descr(
         immutable: false,
         quasi_immutable: true,
         name: "",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -2008,6 +2020,7 @@ static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock
         immutable: false,
         quasi_immutable: false,
         name: "vable_token",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -2277,6 +2290,7 @@ fn array_lendescr_at_offset(offset: usize) -> DescrRef {
         immutable: false,
         quasi_immutable: false,
         name: "len",
+        is_class_word: false,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),
@@ -2416,11 +2430,12 @@ use pyre_object::{FLOAT_TYPE, INT_TYPE};
 ///
 /// Mutable because __class__ assignment can change it.
 fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
-    // Named "w_class" so `FieldDescr::is_w_class()` recognises the
-    // header field; OptVirtualize must resolve it from the object's
-    // class identity rather than indexing it against a virtual's value
-    // fields (its `index_in_parent` of 0 would otherwise collide with
-    // the first value field, e.g. `W_IntObject.intval`).
+    // Declares itself the class word (`is_class_word`), which is what
+    // `FieldDescr::is_w_class()` reports; the name is for diagnostics only
+    // and no consumer reads it. OptVirtualize must resolve this field from
+    // the object's class identity rather than indexing it against a
+    // virtual's value fields (its `index_in_parent` of 0 would otherwise
+    // collide with the first value field, e.g. `W_IntObject.intval`).
     Arc::new(PyreFieldDescr {
         offset: pyre_object::pyobject::W_CLASS_OFFSET,
         // `WORD` on paper — the field is a `*mut PyObject`, so 4 bytes on
@@ -2438,6 +2453,7 @@ fn new_w_class_field_descr() -> Arc<dyn FieldDescr> {
         immutable: false,
         quasi_immutable: false,
         name: "w_class",
+        is_class_word: true,
         index_in_parent: 0,
         parent_descr: None,
         ei_index: AtomicU32::new(u32::MAX),

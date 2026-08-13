@@ -4405,8 +4405,10 @@ pub trait SizeDescr: Descr {
     /// that must establish the two describe the same bytes compare
     /// `offset()`/`field_size()` and cannot compare identity.
     ///
-    /// The default body is the *only* place the class word is recovered by
-    /// name, and it is what a declaring producer replaces.
+    /// The default body finds the entry that *declares* itself the class
+    /// word (`FieldDescr::is_w_class`), so nothing here reads a field name.
+    /// A producer that already knows its header slot overrides this and skips
+    /// the scan.
     ///
     /// It searches `gc_fielddescrs()` before `all_fielddescrs()`.  The class
     /// word is a GC pointer, so a real layout lists the *same* `Arc` in both
@@ -4415,8 +4417,6 @@ pub trait SizeDescr: Descr {
     /// descr that populates the two lists with different objects, and for
     /// that case the GC list is the answer every byte-offset consumer here
     /// was already using.
-    // TODO(declared-class-word): drop this body once the field-list builder
-    // declares the slot; a producer that overrides it already opts out.
     fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
         self.gc_fielddescrs()
             .iter()
@@ -4560,20 +4560,42 @@ pub trait FieldDescr: Descr {
             || name.ends_with(".ob_type")
     }
 
-    /// Pyre object-model: `PyObject.w_class` (offset 8) carries the
-    /// Python-level class identity, distinct from the `typeptr`/vtable
-    /// (offset 0). Like `typeptr`, it is a header field — not a value
-    /// field that may be indexed by `index_in_parent` against a
-    /// virtual's stored fields. Recognised by name so OptVirtualize can
-    /// resolve it from the object's class identity instead of colliding
-    /// with the first value field.
+    /// Whether this descr names the class word: the header slot carrying
+    /// Python-level class identity, distinct from the `typeptr`/vtable at
+    /// offset 0.  Like `typeptr` it is a *header* field, not a value field
+    /// that may be indexed by `index_in_parent` against a virtual's stored
+    /// fields, so consumers resolve it from the object's class identity
+    /// rather than colliding it with the first value field.
     ///
-    /// Handles both formats:
-    /// - `"w_class"` (pyre tracer w_class_descr)
-    /// - `"STRUCT.w_class"` (e.g. "PyObject.w_class")
+    /// **Declared, not inferred.**  A producer that mints a class-word descr
+    /// says so; nothing here reads the field's name.  `false` is the
+    /// upstream-orthodox default rather than a convenience: RPython's field
+    /// lists contain no header field at all (`heaptracker.py:66` drops
+    /// `typeptr` before any descr is built), so "this is an ordinary value
+    /// field" is what a list entry means unless its producer states
+    /// otherwise.
     fn is_w_class(&self) -> bool {
-        let name = self.field_name();
-        name == "w_class" || name.ends_with(".w_class")
+        false
+    }
+
+    /// Whether this descr names *any* header slot — the class word or the
+    /// `typeptr`/vtable.  Both are resolved from class identity and neither
+    /// resolves through the owner's value-field list, so the sites that must
+    /// skip header fields ask this rather than spelling the union.
+    ///
+    /// ⛔ This is the right question **only** where the two header fields are
+    /// genuinely interchangeable.  It must not be substituted for
+    /// `is_w_class()` at a site that has already handled `typeptr`
+    /// separately: `virtualize.rs`'s GETFIELD fold resolves a `typeptr` from
+    /// `known_class` in an earlier arm and only *falls through* to the
+    /// class-word arm when that arm found no known class, so widening the
+    /// class-word test to the union there would route a typeptr read into the
+    /// `w_class` fold. `optimizeopt/mod.rs`'s `ensure_ptr_info_arg0` and
+    /// `info.rs`'s allocation-cover check are likewise about the class word
+    /// specifically. Widening any of the three by symmetry with the sites
+    /// below would be a behaviour change, not a de-duplication.
+    fn is_header_field(&self) -> bool {
+        self.is_typeptr() || self.is_w_class()
     }
 
     /// descr.py: sort_key() — for ordering field descriptors.
@@ -5266,6 +5288,16 @@ pub struct SimpleFieldDescr {
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
     virtualizable: bool,
+    /// Whether this field is the owning struct's class word — the declared
+    /// answer behind `FieldDescr::is_w_class()`.
+    ///
+    /// `new_with_name` seeds it from the `"STRUCT.fieldname"` the codewriter
+    /// supplies, which for this descr *is* the producer's declaration:
+    /// `descr.py:227` builds that name from the struct and field being
+    /// described, so a caller cannot pass a class-word name for a field that
+    /// is not one.  `with_class_word` overrides it for a producer that knows
+    /// its layout without going through the name.
+    is_class_word: bool,
     /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
@@ -5287,6 +5319,19 @@ pub struct SimpleFieldDescr {
     pub vinfo: Option<Weak<dyn VinfoMarker>>,
 }
 
+/// Whether a `"STRUCT.fieldname"` (or bare `"fieldname"`) descr name names a
+/// class word.
+///
+/// The single place in the tree that reads this spelling.  It exists because
+/// `SimpleFieldDescr` is minted by the codewriter from the name
+/// `descr.py:227` builds out of the struct and field being described, so for
+/// that producer the name *is* the declaration.  Every consumer asks the
+/// declared `FieldDescr::is_w_class()` instead, and a producer that knows its
+/// layout without a name uses `SimpleFieldDescr::with_class_word`.
+fn name_is_class_word(name: &str) -> bool {
+    name == "w_class" || name.ends_with(".w_class")
+}
+
 impl Clone for SimpleFieldDescr {
     fn clone(&self) -> Self {
         SimpleFieldDescr {
@@ -5302,6 +5347,7 @@ impl Clone for SimpleFieldDescr {
             is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
+            is_class_word: self.is_class_word,
             index_in_parent: self.index_in_parent,
             parent_descr: RwLock::new(self.parent_descr.read().unwrap().clone()),
             vinfo: self.vinfo.clone(),
@@ -5373,6 +5419,9 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            // Unnamed: this constructor describes a field by geometry alone,
+            // and a producer with a header slot uses `with_class_word`.
+            is_class_word: false,
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5397,6 +5446,7 @@ impl SimpleFieldDescr {
         field_key: String,
     ) -> Self {
         let field_key_start = field_key_start(&name, &field_key);
+        let is_class_word = name_is_class_word(&name);
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
@@ -5410,6 +5460,7 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
+            is_class_word,
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5422,6 +5473,15 @@ impl SimpleFieldDescr {
     /// `FieldDescr::is_quasi_immutable()` below.
     pub fn with_quasi_immutable(mut self, is_quasi_immutable: bool) -> Self {
         self.is_quasi_immutable = is_quasi_immutable;
+        self
+    }
+
+    /// Declare (or retract) that this field is the owning struct's class
+    /// word.  For a producer that knows its own layout and does not spell
+    /// the field's name in the `"STRUCT.fieldname"` form `new_with_name`
+    /// reads.
+    pub fn with_class_word(mut self, is_class_word: bool) -> Self {
+        self.is_class_word = is_class_word;
         self
     }
 
@@ -5520,6 +5580,10 @@ impl Descr for SimpleFieldDescr {
 }
 
 impl FieldDescr for SimpleFieldDescr {
+    fn is_w_class(&self) -> bool {
+        self.is_class_word
+    }
+
     fn offset(&self) -> usize {
         self.offset
     }
@@ -5997,6 +6061,7 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
+                    is_class_word: name_is_class_word(&spec.name),
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
@@ -6771,6 +6836,9 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     is_quasi_immutable: false,
                     flag: ArrayFlag::Signed,
                     virtualizable: false,
+                    // `typeptr` is the other header field, not the class
+                    // word; `is_typeptr()` answers for it.
+                    is_class_word: false,
                     index_in_parent: 0,
                     parent_descr: RwLock::new(Some(parent_descr)),
                     vinfo: None,
@@ -7479,6 +7547,47 @@ mod tests {
     /// The list precedence is pinned because it is observable: a descr whose
     /// two field lists hold different objects gets the GC-list one, which is
     /// what every byte-offset consumer searched before this accessor existed.
+    /// The class-word answer is the descr's own, and `is_header_field()` is
+    /// strictly wider than it — `typeptr` is a header field that is *not* the
+    /// class word, which is why the three sites that resolve a typeptr
+    /// separately cannot use the union.
+    #[test]
+    fn a_field_descr_declares_whether_it_is_the_class_word() {
+        let named = |offset: usize, ty: Type, flag: ArrayFlag, name: &str| {
+            SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                ty,
+                false,
+                flag,
+                name.to_string(),
+                name.to_string(),
+            )
+        };
+
+        let w = named(8, Type::Ref, ArrayFlag::Pointer, "PyObject.w_class");
+        assert!(w.is_w_class());
+        assert!(w.is_header_field());
+
+        let value = named(16, Type::Int, ArrayFlag::Signed, "W_IntObject.intval");
+        assert!(!value.is_w_class());
+        assert!(!value.is_header_field());
+
+        // Geometry-only construction describes a value field; a producer
+        // that has no name declares the slot explicitly instead.
+        let bare = SimpleFieldDescr::new(0, 8, 8, Type::Ref, false);
+        assert!(!bare.is_w_class());
+        assert!(bare.with_class_word(true).is_w_class());
+
+        // `typeptr` is the other header field: header, but not the class word.
+        let vtable_descr = make_vtable_field_descr();
+        let typeptr = vtable_descr.as_field_descr().expect("a FieldDescr");
+        assert!(typeptr.is_typeptr());
+        assert!(!typeptr.is_w_class());
+        assert!(typeptr.is_header_field());
+    }
+
     #[test]
     fn class_word_field_is_absent_for_a_layout_without_one() {
         #[derive(Debug)]

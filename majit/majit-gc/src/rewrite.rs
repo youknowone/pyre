@@ -3505,6 +3505,11 @@ mod tests {
     }
 
     impl FieldDescr for TestWClassFieldDescr {
+        // This fixture exists to be the class word; it says so rather than
+        // relying on a consumer to recognise its name.
+        fn is_w_class(&self) -> bool {
+            true
+        }
         fn offset(&self) -> usize {
             self.offset
         }

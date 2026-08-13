@@ -948,8 +948,7 @@ impl OptVirtualize {
         // excluded for the reason the arms below give -- they do not resolve
         // through the field list at all.
         if !is_raw_op
-            && !is_typeptr
-            && !field_descr.is_w_class()
+            && !field_descr.is_header_field()
             && let (Some(b), Some(parent_descr)) =
                 (struct_box.as_ref(), field_descr.get_parent_descr())
         {
@@ -1076,7 +1075,7 @@ impl OptVirtualize {
                 _ => true,
             };
             let slot_resolvable =
-                slot_identifies_field || is_raw_op || is_typeptr || field_descr.is_w_class();
+                slot_identifies_field || is_raw_op || field_descr.is_header_field();
             if !slot_resolvable && crate::majit_log_enabled() {
                 // What the skip is worth: a populated slot is the value
                 // `get_field` would have forwarded for a field not in it.
@@ -1163,8 +1162,7 @@ impl OptVirtualize {
             // because upstream defines this handler for GETFIELD_GC_{I,R,F}
             // only.
             let folds_to_zero = !is_raw_op
-                && !is_typeptr
-                && !field_descr.is_w_class()
+                && !field_descr.is_header_field()
                 && matches!(info, PtrInfo::Virtual(_) | PtrInfo::VirtualStruct(_));
             if folds_to_zero {
                 // optimizer.py:528-534 new_const: CONST_NULL for a pointer

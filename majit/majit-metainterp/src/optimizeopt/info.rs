@@ -1792,6 +1792,12 @@ mod tests {
         fn field_name(&self) -> &str {
             self.name
         }
+        // The fixture builds an op-side and a layout-side descr separately and
+        // tells them apart by name, so the mock declares from the name it was
+        // constructed with. Production producers store the flag instead.
+        fn is_w_class(&self) -> bool {
+            self.name == "w_class" || self.name.ends_with(".w_class")
+        }
     }
 
     #[derive(Debug)]
