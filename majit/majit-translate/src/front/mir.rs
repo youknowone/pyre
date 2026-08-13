@@ -9961,7 +9961,8 @@ impl<'a> Lowering<'a> {
     ///
     /// Five conditions, cheapest first (so the body scans run only on
     /// genuine candidates): the callee is `<ptr>::add`; two arguments;
-    /// the receiver is `*mut PyObjectRef`; the index is a runtime local
+    /// the receiver points at a managed reference
+    /// ([`is_object_ref_items_ptr`]); the index is a runtime local
     /// (not the constant offset brick 1 collapses); the base traces to
     /// an items-base accessor ([`base_traces_to_items_block_accessor`])
     /// — so the header `base_size` re-add lands on `items[0]`; and the
@@ -13847,19 +13848,20 @@ fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
 /// `items_block_items_ptr`).  brick 3's `*base.add(idx)` lowering only
 /// fires when the base traces to one of these (their header return is
 /// what the `base_size = ITEMS_BLOCK_ITEMS_OFFSET` array descr re-adds);
-/// a `*mut PyObjectRef` from any other producer already points at
+/// an items pointer from any other producer already points at
 /// `items[0]` and must keep its residual `add`.
+///
+/// Recognised through [`is_object_items_block_base_accessor`], the same
+/// module-qualified suffix brick 1 keys on. An earlier revision matched two
+/// whole `pyre_object::` paths here while brick 1 already matched by suffix,
+/// which made brick 3 strictly narrower than the rewrite it is paired with —
+/// see that function for why the two must not disagree.
 fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return false;
     };
-    llbc.fn_by_id(*id).is_some_and(|fd| {
-        matches!(
-            fd.item_meta.name_path().as_str(),
-            "pyre_object::object_array::items_block_items_base"
-                | "pyre_object::object_array::items_block_items_ptr"
-        )
-    })
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -13892,7 +13894,7 @@ fn is_list_items_elem_ptr_add_parts(
 ) -> bool {
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
-        && base_ty.is_some_and(|ty| is_pyobjectref_items_ptr(ty, llbc))
+        && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
         && index_local.is_some()
         && base_local.is_some_and(|base| base_traces_to_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(body, dest_local)
@@ -16197,15 +16199,31 @@ fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     })
 }
 
-/// Whether `ty` is a `*mut PyObjectRef` / `*const PyObjectRef`
-/// (`RawPtr` onto a `RawPtr` onto `PyObject`) — the pointer-to-pointer
-/// signature of the object-element store an `ItemsBlock` lays out after
-/// its length header, and the receiver type of brick 3's
-/// `*base.add(idx)` ([`Lowering::is_list_items_elem_ptr_add`]).  A typed
-/// primitive array carries a scalar pointee (`*mut u8` / `*mut i64`),
-/// excluded by the inner-`RawPtr` test; the `PyObject` pointee root pins
-/// it to the object family rather than any `*mut *mut T`.
-fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+/// Whether `ty` is a pointer to a MANAGED REFERENCE — `RawPtr` onto a `RawPtr`
+/// onto a named class root — the pointer-to-pointer signature of the object
+/// element an items block lays out after its length header, and the receiver
+/// type of brick 3's `*base.add(idx)`
+/// ([`Lowering::is_list_items_elem_ptr_add`]).
+///
+/// Two tests, and what each one excludes is different. The inner `RawPtr`
+/// rejects a typed primitive array, whose pointee is a scalar (`*mut u8` /
+/// `*mut i64`) — that is what keeps a `TypedItemsBlock` out of the `Ref`-typed
+/// array ops. [`raw_ptr_pointee_class_root`] answering `Some` rejects a
+/// pointer-to-pointer whose pointee is not a class at all.
+///
+/// The root is DERIVED, not fixed. An earlier revision compared it against the
+/// literal `"PyObject"`, which made the whole route unreachable from any host
+/// but pyre — `adt_node_class_root` answers with the pointee's own leaf name,
+/// so a host class family rooted at some other header answered its own name
+/// and was declined for having one. That is the same correction
+/// `Lowering::resolve_place`'s class-singleton narrow already carries: a
+/// prebuilt is annotated with the class of the object itself
+/// (`rpython/annotator/bookkeeper.py:339-345`), so the root comes off the type
+/// rather than out of the front end. Naming one host's root here bought no
+/// safety the accessor gate does not already provide — what makes the base an
+/// items pointer is [`base_traces_to_items_block_accessor`], not the spelling
+/// of its element.
+fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(outer) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
@@ -16218,7 +16236,7 @@ fn is_pyobjectref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    raw_ptr_pointee_class_root(inner, llbc).as_deref() == Some("PyObject")
+    raw_ptr_pointee_class_root(inner, llbc).is_some()
 }
 
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
@@ -17734,16 +17752,45 @@ fn strip_crate_prefix(path: &str) -> String {
     }
 }
 
-/// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
-/// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
-/// receiver (see [`Lowering::is_items_block_base_ptr_add`]).  Matched on
-/// the module-qualified path so a leaf collision in another module
-/// cannot widen the gate, and crate-prefix-independent so the same
-/// accessor matches whether reached from `majit_rlib`, `pyre_object`,
-/// `pyre_interpreter`, or `pyre_jit`'s monomorphized copy.
-fn graph_is_items_block_base_accessor(name: &str) -> bool {
+/// True for the two REFERENCE items-base accessors — the ones whose block
+/// lays `Ptr` items after its length header.
+///
+/// Split out of [`graph_is_items_block_base_accessor`] rather than spelled
+/// twice, because brick 1 (the accessor-body collapse) and brick 3 (the
+/// element `*base.add(i)`) must recognise the same accessor or the pointer
+/// means different things at the two ends: brick 1 rewrites the accessor to
+/// return the block HEADER, and only brick 3's `base_size`-bearing array descr
+/// adds the item offset back. An accessor collapsed by the first and declined
+/// by the second leaves a residual `.add` striding from the LENGTH WORD — a
+/// silent one-element mis-index, not a missed optimisation. One list, two
+/// call sites.
+///
+/// Matched on the module-qualified path so a leaf collision in another module
+/// cannot widen the gate, and crate-prefix-independent so the same accessor
+/// matches whether reached from `pyre_object`, `pyre_interpreter`, `pyre_jit`'s
+/// monomorphized copy — or a non-pyre host crate that lays its block out this
+/// way. The prefix carries no information the suffix does not: what makes the
+/// collapse sound is the accessor's CONTRACT (return the interior pointer for
+/// descr-based consumption), which the module-qualified name states and the
+/// crate name does not.
+fn is_object_items_block_base_accessor(name: &str) -> bool {
     name.ends_with("object_array::items_block_items_base")
         || name.ends_with("object_array::items_block_items_ptr")
+}
+
+/// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
+/// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
+/// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
+///
+/// The typed (scalar) accessor is here and NOT in
+/// [`is_object_items_block_base_accessor`]: its block holds `u64` words, so a
+/// `*base.add(i)` through it is not a reference element store and brick 3 must
+/// not lower it as one. That separation is what keeps the shared-list
+/// invariant above from pulling a scalar block into the `Ref`-typed array ops
+/// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
+/// two gates agree by construction rather than by coincidence.
+fn graph_is_items_block_base_accessor(name: &str) -> bool {
+    is_object_items_block_base_accessor(name)
         || name.ends_with("rlist::typed_items_block_items_base")
 }
 
@@ -21316,6 +21363,48 @@ mod tests {
         assert!(!graph_is_items_block_base_accessor(
             "pyre_object::other_mod::items_block_items_base_helper"
         ));
+    }
+
+    /// brick 1 collapses an accessor to its receiver — the block header — and
+    /// only brick 3's `base_size`-bearing array descr adds the item offset
+    /// back. So every REFERENCE accessor brick 1 rewrites must also be one
+    /// brick 3 recognises, or the residual `.add` strides from the length
+    /// word. The typed accessor is the deliberate exception: brick 1 collapses
+    /// it, and its scalar element is refused on the element side instead
+    /// (`is_object_ref_items_ptr`), so no `Ref`-typed array op is minted for a
+    /// `u64` block.
+    #[test]
+    fn the_two_bricks_agree_on_every_reference_items_base_accessor() {
+        use super::{graph_is_items_block_base_accessor, is_object_items_block_base_accessor};
+
+        for name in [
+            "pyre_object::object_array::items_block_items_base",
+            "pyre_object::object_array::items_block_items_ptr",
+            "pyre_jit::object_array::items_block_items_base",
+        ] {
+            assert!(
+                is_object_items_block_base_accessor(name),
+                "brick 3 declines {name}, which brick 1 rewrites"
+            );
+            assert!(graph_is_items_block_base_accessor(name));
+        }
+
+        // The typed block: brick 1 only.
+        let typed = "majit_rlib::lltypesystem::rlist::typed_items_block_items_base";
+        assert!(graph_is_items_block_base_accessor(typed));
+        assert!(!is_object_items_block_base_accessor(typed));
+
+        // Neither gate is keyed on a crate: a host crate laying its block out
+        // the same way is recognised by the same module-qualified suffix. The
+        // name below is a shape, not a crate this workspace contains.
+        let host = "some_host::runtime::object_array::items_block_items_base";
+        assert!(is_object_items_block_base_accessor(host));
+        assert!(graph_is_items_block_base_accessor(host));
+
+        // A leaf collision still cannot widen either gate.
+        let collision = "some_host::other_mod::items_block_items_base_helper";
+        assert!(!is_object_items_block_base_accessor(collision));
+        assert!(!graph_is_items_block_base_accessor(collision));
     }
 
     #[test]
