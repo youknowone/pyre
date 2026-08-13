@@ -3703,10 +3703,24 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
 
 #[inline(never)]
 unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    // `STORE_SUBSCR` pops all three operands off the value stack before
+    // dispatching here, so the frame no longer roots any of them and each is a
+    // bare address. Every step below can collect — `slice_unpack` honors
+    // `__index__`, `collect_iterable` runs the iterable's own Python code, and
+    // both list constructors allocate — so publish the operands on the shadow
+    // stack first and read each one back after any step that can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value);
+    let index_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(index);
     // CPython 3.14 `list_ass_subscript_lock_held`: unpack the slice first,
     // materialize the replacement next, and only then adjust the bounds
     // against the list's live length. Materializing an arbitrary iterable may
     // mutate `obj` (gh-120384), so using its earlier length is incorrect.
+    let index = pyre_object::gc_roots::shadow_stack_get(index_slot);
     let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
         w_slice_get_start(index),
         w_slice_get_stop(index),
@@ -3715,6 +3729,8 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     // PyPy listobject.py:709-714 wraps non-list iterables into a temporary
     // W_ListObject so the strategy-aware setslice path sees a list operand.
     // CPython additionally protects `a[::-1] = a` with a shallow copy.
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let w_other = if obj == value {
         pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec(
             value,
@@ -3725,6 +3741,9 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let items = crate::builtins::collect_iterable(value)?;
         pyre_object::listobject::w_list_new(items)
     };
+    let other_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_other);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let len = w_list_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
@@ -3736,6 +3755,8 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         // has zero length and inserts/deletes at 5, rather than forming the
         // invalid Rust range `5..2`.
         let s_hi = stop.max(start).max(0) as usize;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_other = pyre_object::gc_roots::shadow_stack_get(other_slot);
         pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
             .expect("w_other is always a valid list");
         return Ok(w_none());
@@ -3754,6 +3775,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
             i += step;
         }
     }
+    let w_other = pyre_object::gc_roots::shadow_stack_get(other_slot);
     let other_len = pyre_object::w_list_len(w_other);
     if other_len != indices.len() {
         return Err(PyError::new(
@@ -3772,8 +3794,19 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     let mut k = 0usize;
     while k < indices.len() {
         let idx = indices[k];
+        // A store can switch the receiver's strategy, and that allocates, so
+        // both lists are re-read from their slots on every iteration and the
+        // item is published before the store that may collect. The item's slot
+        // is bracketed per iteration, or a long extended slice would push one
+        // root per element and never pop them.
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let w_other = pyre_object::gc_roots::shadow_stack_get(other_slot);
         let item =
             pyre_object::w_list_getitem(w_other, k as i64).expect("k < other_len by construction");
+        let item_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(item);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         if !pyre_object::w_list_setitem(obj, idx, item) {
             return Err(PyError::new(
                 PyErrorKind::IndexError,
