@@ -13,7 +13,9 @@
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types as cl_types;
-use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName};
+use cranelift_codegen::ir::{
+    AbiParam, Function, InstBuilder, MemFlagsData, Signature, UserFuncName,
+};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -52,6 +54,7 @@ fn tail_call_sp_drift_repro() {
 
     let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
+    let frontend_config = module.target_config();
     let ptr_type = cl_types::I64;
 
     // body signature: (i64) -> i64 (Tail conv)
@@ -87,7 +90,9 @@ fn tail_call_sp_drift_repro() {
         let arg = bx.block_params(entry)[0];
 
         let cap_addr = bx.ins().iconst(ptr_type, &CHAIN_CAP as *const _ as i64);
-        let cap = bx.ins().load(ptr_type, MemFlags::trusted(), cap_addr, 0);
+        let cap = bx
+            .ins()
+            .load(ptr_type, MemFlagsData::trusted(), cap_addr, 0);
         let cont = bx.ins().icmp(IntCC::SignedLessThan, arg, cap);
         let tail = bx.create_block();
         let exit = bx.create_block();
@@ -119,7 +124,7 @@ fn tail_call_sp_drift_repro() {
         bx.switch_to_block(exit);
         bx.seal_block(exit);
         bx.ins().return_(&[arg]);
-        bx.finalize();
+        bx.finalize(frontend_config);
     }
     let mut ctx = Context::for_function(body_func);
     module.define_function(body_id, &mut ctx).unwrap();
@@ -142,7 +147,7 @@ fn tail_call_sp_drift_repro() {
         let big_slot =
             bx.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 128, 3));
         let big_addr = bx.ins().stack_addr(ptr_type, big_slot, 0);
-        bx.ins().store(MemFlags::trusted(), arg, big_addr, 0);
+        bx.ins().store(MemFlagsData::trusted(), arg, big_addr, 0);
 
         // Always tail-call back to body with arg+1.
         let one = bx.ins().iconst(ptr_type, 1);
@@ -155,7 +160,7 @@ fn tail_call_sp_drift_repro() {
         let tail_sig_ref = bx.import_signature(tail_sig);
         bx.ins()
             .return_call_indirect(tail_sig_ref, body_addr, &[next]);
-        bx.finalize();
+        bx.finalize(frontend_config);
     }
     let mut ctx = Context::for_function(body2_func);
     module.define_function(body2_id, &mut ctx).unwrap();
@@ -177,7 +182,7 @@ fn tail_call_sp_drift_repro() {
         let call = bx.ins().call(body_ref, &[arg]);
         let r = bx.inst_results(call)[0];
         bx.ins().return_(&[r]);
-        bx.finalize();
+        bx.finalize(frontend_config);
     }
     let mut ctx = Context::for_function(wrapper_func);
     module.define_function(wrapper_id, &mut ctx).unwrap();
