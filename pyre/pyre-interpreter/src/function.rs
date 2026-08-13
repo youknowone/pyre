@@ -2563,9 +2563,13 @@ pub unsafe fn descr_builtinfunction__new__(
 /// `FunctionType(code, g)` and `FunctionType(code, g, closure=c,
 /// kwdefaults=k)` reach the same slot resolution.
 pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(
-        kwargs,
+    // `args[0]` is `cls`; the constructor parameters start at index 1. All six
+    // are positional-or-keyword, so the shared binder owns the arity count,
+    // the by-name-and-position duplicate, and the missing-required report —
+    // resolving each slot by hand let the positional value win a duplicate and
+    // let a seventh argument through.
+    let scope = crate::builtins::bind_builtin_kwargs(
+        args.get(1..).unwrap_or(&[]),
         &[
             "code",
             "globals",
@@ -2574,27 +2578,15 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "closure",
             "kwdefaults",
         ],
+        &[true, true, false, false, false, false],
         "function",
     )?;
-    // `positional[0]` is `cls`; the constructor parameters start at index 1.
-    let pos = |i: usize| positional.get(i).copied().unwrap_or(PY_NULL);
-    let resolve = |i: usize, name: &str| {
-        let p = pos(i);
-        if p.is_null() {
-            crate::builtins::kwarg_get(kwargs, name).unwrap_or(PY_NULL)
-        } else {
-            p
-        }
-    };
-    let w_code = resolve(1, "code");
-    let w_globals = resolve(2, "globals");
-    let w_name = resolve(3, "name");
-    let w_argdefs = resolve(4, "argdefs");
-    let w_closure = resolve(5, "closure");
-    // Python 3.14's sixth constructor parameter is positional-or-keyword.
-    // Keep it in the same slot resolver as `code` through `closure`; reading
-    // only the kwargs dict silently discarded the positional value.
-    let w_kwdefaults = resolve(6, "kwdefaults");
+    let w_code = scope[0];
+    let w_globals = scope[1];
+    let w_name = scope[2];
+    let w_argdefs = scope[3];
+    let w_closure = scope[4];
+    let w_kwdefaults = scope[5];
 
     if w_code.is_null() || !unsafe { crate::pycode::is_code(w_code) } {
         return Err(crate::PyError::type_error(

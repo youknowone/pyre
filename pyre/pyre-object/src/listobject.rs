@@ -1047,6 +1047,21 @@ impl ListStorage {
 /// JIT's strategy tests use this to pin one representation instead of
 /// depending on that inference.
 pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy) -> PyObjectRef {
+    // `build_list_storage` unboxes each item the way `strategy` names, so a
+    // strategy narrower than the items support reaches `plain_int_w` /
+    // `w_float_get_value` on the wrong payload. A wider one is always sound —
+    // `Object` keeps the pointers — so this admits every widening the seam
+    // exists to express and only rejects the unboxing that has no payload.
+    debug_assert!(
+        match strategy {
+            ListStrategy::Empty => items.is_empty(),
+            ListStrategy::Integer => all_ints(&items),
+            ListStrategy::Float => all_floats(&items),
+            ListStrategy::IntOrFloat => all_int_or_float(&items),
+            ListStrategy::Object => true,
+        },
+        "list items do not support the requested storage strategy",
+    );
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
     // pin every PyObjectRef in `items` before the GC malloc paths
     // below (`alloc_list_items_block_gc`, the collecting header allocation) so the

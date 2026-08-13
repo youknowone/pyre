@@ -98,17 +98,21 @@ def _index(value) -> int:
     # protocol: a float or a string is a TypeError rather than a format that
     # silently compares unequal to every member.
     if isinstance(value, int):
-        return int(value)
-    try:
-        index = type(value).__index__
-    except AttributeError:
-        raise TypeError(
-            f"{type(value).__name__!r} object cannot be interpreted as an integer"
-        ) from None
-    result = index(value)
-    if not isinstance(result, int):
-        raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
-    return int(result)
+        result = value
+    else:
+        try:
+            index = type(value).__index__
+        except AttributeError:
+            raise TypeError(
+                f"{type(value).__name__!r} object cannot be interpreted as an integer"
+            ) from None
+        result = index(value)
+        if not isinstance(result, int):
+            raise TypeError(f"__index__ returned non-int (type {type(result).__name__})")
+    # `int(result)` would route a subclass through its own `__int__`, which may
+    # answer something other than the value the subclass stores. Narrowing to
+    # an exact `int` is what `PyNumber_Index` does with `_PyLong_Copy`.
+    return int.__index__(result)
 
 
 def _immutable_const_evaluator_error(name):

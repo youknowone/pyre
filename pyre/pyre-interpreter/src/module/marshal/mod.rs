@@ -78,11 +78,17 @@ fn marshal_buffer_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, PyError> {
     Ok(None)
 }
 
-/// Transient equivalent of PyPy's `Marshaller.all_refs` dict.  A VecMap is
-/// sufficient because marshal streams normally contain few shared objects;
-/// each entry is a shadow-stack slot so a collection updates object identity.
+/// Transient equivalent of PyPy's `Marshaller.all_refs` dict.  One entry is
+/// reserved for every non-singleton object written, not only for the shared
+/// ones, so the table reaches thousands of entries on a module-sized code
+/// tree.  `entries` holds a shadow-stack slot per object, which a collection
+/// forwards; `by_identity` reproduces the O(1) lookup of the RPython dict.
 struct WriterRefs {
     entries: Vec<WriterRefEntry>,
+    /// `gc_identity_hash` survives a move while a raw address does not, so it
+    /// keys the buckets; the entry inside a bucket is confirmed against the
+    /// forwarded shadow-stack address.
+    by_identity: std::collections::HashMap<usize, Vec<u32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,22 +101,26 @@ impl WriterRefs {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            by_identity: std::collections::HashMap::new(),
         }
     }
 
     fn find(&self, obj: PyObjectRef) -> Option<(u32, bool)> {
         let obj =
             pyre_object::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef;
-        self.entries
+        let bucket = self
+            .by_identity
+            .get(&pyre_object::gc_hook::gc_identity_hash(obj as usize))?;
+        bucket
             .iter()
-            .position(|entry| {
-                std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(entry.slot), obj)
+            .copied()
+            .find(|&index| {
+                std::ptr::eq(
+                    pyre_object::gc_roots::shadow_stack_get(self.entries[index as usize].slot),
+                    obj,
+                )
             })
-            .and_then(|index| {
-                u32::try_from(index)
-                    .ok()
-                    .map(|index| (index, self.entries[index as usize].incomplete))
-            })
+            .map(|index| (index, self.entries[index as usize].incomplete))
     }
 
     fn reserve(&mut self, obj: PyObjectRef, incomplete: bool) -> Result<u32, PyError> {
@@ -118,9 +128,11 @@ impl WriterRefs {
             return Err(PyError::value_error("too many objects to marshal"));
         }
         let index = self.entries.len() as u32;
+        let identity = pyre_object::gc_hook::gc_identity_hash(obj as usize);
         let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(obj);
         self.entries.push(WriterRefEntry { slot, incomplete });
+        self.by_identity.entry(identity).or_default().push(index);
         Ok(index)
     }
 
@@ -531,7 +543,10 @@ impl FileReader {
             // `new` before any reads began.
             Err(error) => return self.python_error(error),
         };
-        let count = match crate::baseobjspace::int_w(count) {
+        // The file protocol reads a byte count through the index protocol, so
+        // an object carrying only `__int__` is a TypeError rather than a
+        // silently accepted length.
+        let count = match crate::baseobjspace::getindex_w(count) {
             Ok(count) => count,
             Err(error) => return self.python_error(error),
         };
