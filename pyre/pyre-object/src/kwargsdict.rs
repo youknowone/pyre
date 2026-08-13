@@ -7,11 +7,10 @@
 //! constant-folds when the dict size and lookup key are both
 //! constant.
 //!
-//! `EmptyKwargsDictStrategy` (`kwargsdict.py:13-22`) — the subclass
-//! of `EmptyDictStrategy` that promotes to `KwargsDictStrategy` on
-//! unicode setitem — is not yet wired into pyre's argument
-//! processing path; once it lands, function-call sites can
-//! allocate dicts via the subclassed empty strategy.
+//! `EmptyKwargsDictStrategy` (`kwargsdict.py:13-22`) is selected by
+//! `w_dict_new_kwargs`; function-call `**kwargs` collectors allocate through
+//! that entry point and the first unicode store promotes directly to this
+//! parallel-array strategy.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -203,6 +202,28 @@ impl DictStrategy for KwargsDictStrategy {
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
     }
 
+    /// `kwargsdict.py:68-79 setdefault` — keep an exact unicode key on the
+    /// parallel-array strategy, otherwise switch first and re-dispatch on the
+    /// new strategy.  The latter detail matters structurally: after the swap
+    /// PyPy calls `w_dict.setdefault`, it does not keep invoking methods on
+    /// the stale `KwargsDictStrategy` instance.
+    unsafe fn setdefault(
+        &self,
+        w_dict: PyObjectRef,
+        w_key: PyObjectRef,
+        w_default: PyObjectRef,
+    ) -> PyObjectRef {
+        if Self::is_correct_type(w_key) {
+            if let Some(w_result) = self.getitem(w_dict, w_key) {
+                return w_result;
+            }
+            self.setitem(w_dict, w_key, w_default);
+            return w_default;
+        }
+        self.switch_to_object_strategy(w_dict);
+        crate::dictmultiobject::w_dict_get_strategy(w_dict).setdefault(w_dict, w_key, w_default)
+    }
+
     /// `kwargsdict.py:41-67 setitem` + `_setitem_correct_indirection`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
@@ -262,6 +283,25 @@ impl DictStrategy for KwargsDictStrategy {
             .collect()
     }
 
+    /// `create_iterator_classes(KwargsDictStrategy)` reads the two backing
+    /// lists at the same cursor position.  Supplying the cursor operation
+    /// directly avoids the trait fallback's `items().into_iter().nth(index)`,
+    /// which rebuilt the complete kwargs list at every iterator step.
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        let (keys_w, values_w) = kwargs_storage(w_dict);
+        keys_w.get(index).copied().zip(values_w.get(index).copied())
+    }
+
+    /// Value-iterator twin of [`Self::nth_item`], matching
+    /// `kwargsdict.py:114-115 itervalues`' direct values-list cursor.
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        kwargs_storage(w_dict).1.get(index).copied()
+    }
+
     /// `kwargsdict.py:123-129 popitem` — pop from both arrays in lock-step.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
         let storage = kwargs_storage_mut(w_dict);
@@ -269,6 +309,19 @@ impl DictStrategy for KwargsDictStrategy {
         let w_value = storage.1.pop()?;
         crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
         Some((w_key, w_value))
+    }
+
+    /// `kwargsdict.py:178-181 getiterreversed` — copy/reverse the key list in
+    /// PyPy.  Pyre's iterator carrier consumes key/value pairs, so walk both
+    /// parallel lists from the tail without first materialising `items()`.
+    unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
+        let (keys_w, values_w) = kwargs_storage(w_dict);
+        keys_w
+            .iter()
+            .copied()
+            .zip(values_w.iter().copied())
+            .rev()
+            .collect()
     }
 
     /// `kwargsdict.py:131-132 clear` — `w_dict.dstorage =
@@ -315,5 +368,99 @@ impl DictStrategy for KwargsDictStrategy {
             kwargs_dict_storage_gc_type_id(),
         );
         crate::dictmultiobject::w_dict_new_with(&KWARGS_DICT_STRATEGY_REF, new_storage as *mut u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install_test_hash_hooks() {
+        unsafe fn hash_object(obj: PyObjectRef) -> i64 {
+            if crate::is_int(obj) {
+                crate::w_int_get_value(obj)
+            } else {
+                0
+            }
+        }
+
+        unsafe fn hash_str(_ptr: *const u8, _len: usize) -> i64 {
+            0
+        }
+
+        crate::dict_eq_hook::register_hash_w_hook(hash_object);
+        crate::dict_eq_hook::register_hash_str_hook(hash_str);
+    }
+
+    unsafe fn kwargs_with(entries: &[(&str, i64)]) -> PyObjectRef {
+        let w_dict = crate::dictmultiobject::w_dict_new_kwargs();
+        for &(key, value) in entries {
+            crate::dictmultiobject::w_dict_setitem_str(w_dict, key, crate::w_int_new(value));
+        }
+        assert_eq!(
+            crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+            crate::dictmultiobject::StrategyKind::Kwargs
+        );
+        w_dict
+    }
+
+    #[test]
+    fn kwargs_cursor_reads_parallel_arrays_without_materialising_items() {
+        unsafe {
+            let w_dict = kwargs_with(&[("a", 10), ("b", 20), ("c", 30)]);
+            let strategy = crate::dictmultiobject::w_dict_get_strategy(w_dict);
+
+            for (index, (key, value)) in [("a", 10), ("b", 20), ("c", 30)].into_iter().enumerate() {
+                let (w_key, w_value) = strategy.nth_item(w_dict, index).unwrap();
+                assert_eq!(crate::w_str_get_value(w_key), key);
+                assert_eq!(crate::w_int_get_value(w_value), value);
+                assert_eq!(
+                    crate::w_int_get_value(strategy.nth_value(w_dict, index).unwrap()),
+                    value
+                );
+            }
+            assert!(strategy.nth_item(w_dict, 3).is_none());
+            assert!(strategy.nth_value(w_dict, 3).is_none());
+
+            let reversed = strategy.getiterreversed(w_dict);
+            let keys: Vec<_> = reversed
+                .iter()
+                .map(|&(key, _)| crate::w_str_get_value(key).to_owned())
+                .collect();
+            assert_eq!(keys, ["c", "b", "a"]);
+        }
+    }
+
+    #[test]
+    fn kwargs_setdefault_keeps_string_strategy_and_redispatches_other_keys() {
+        unsafe {
+            install_test_hash_hooks();
+            let w_dict = kwargs_with(&[("a", 10)]);
+            let strategy = crate::dictmultiobject::w_dict_get_strategy(w_dict);
+            let w_a = crate::w_str_new("a");
+            let existing = strategy.setdefault(w_dict, w_a, crate::w_int_new(99));
+            assert_eq!(crate::w_int_get_value(existing), 10);
+
+            let w_b = crate::w_str_new("b");
+            let inserted = strategy.setdefault(w_dict, w_b, crate::w_int_new(20));
+            assert_eq!(crate::w_int_get_value(inserted), 20);
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+
+            let w_int_key = crate::w_int_new(1);
+            let inserted = crate::dictmultiobject::w_dict_setdefault_checked(
+                w_dict,
+                w_int_key,
+                crate::w_int_new(30),
+            )
+            .unwrap();
+            assert_eq!(crate::w_int_get_value(inserted), 30);
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Object
+            );
+        }
     }
 }

@@ -3072,6 +3072,20 @@ pub unsafe fn w_dict_setdefault_checked(
         dict_write_barrier(obj);
         return Ok(value);
     }
+    if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
+        // `kwargsdict.py:68-79 KwargsDictStrategy.setdefault`: exact text
+        // keys stay in the parallel arrays; every other key first switches
+        // to ObjectDictStrategy and then calls `w_dict.setdefault` again.
+        // Preserve that re-dispatch through this checked entry point.  Calling
+        // the trait method here would reach ObjectDictStrategy's infallible
+        // `object_key_for` path after the switch and consume a failing
+        // `__hash__` instead of propagating it.
+        if crate::is_exact_type(key, &crate::STR_TYPE) {
+            return Ok(strategy.setdefault(obj, key, value));
+        }
+        strategy.switch_to_object_strategy(obj);
+        return w_dict_setdefault_checked(obj, key, value);
+    }
     let result = strategy.setdefault(obj, key, value);
     if take_dict_key_error() {
         return Err(DictKeyError);
