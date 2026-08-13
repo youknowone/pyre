@@ -16,7 +16,7 @@ use pyre_object::interp_sre::{
 use pyre_object::*;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use sre_engine::engine::{Request, SearchIter, State};
-use sre_engine::string::StrDrive;
+use sre_engine::string::{StrDrive, StringCursor};
 
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
@@ -660,15 +660,7 @@ enum Subject {
     AsciiStr(&'static [u8]),
     /// `Utf8MatchContext` carrying `ctx.w_unicode_obj` (interp_sre.py:248-250)
     /// — the object is kept rather than just its payload because the length
-    /// and the character-to-byte conversion are read off it.
-    ///
-    /// Positions here are code point indices, which the `Wtf8` driver still
-    /// resolves by walking from the start (`sre_engine` `string.rs:155-196`,
-    /// once for `count` and again for `create_cursor`).  Upstream avoids that
-    /// by driving the utf8 bytes for this context too — "'start' and 'end' are
-    /// byte positions" (interp_sre.py:58) — and converting the spans it
-    /// reports back with `_byte_to_index`.  Converting every reported span is
-    /// the step that would finish the port.
+    /// and the character-to-byte conversion are read off it, by [`Utf8Drive`].
     Str(PyObjectRef),
     Bytes(&'static [u8]),
 }
@@ -699,6 +691,100 @@ unsafe fn str_subject(string: PyObjectRef) -> Subject {
         Subject::AsciiStr(unsafe { w_str_get_wtf8(string) }.as_bytes())
     } else {
         Subject::Str(string)
+    }
+}
+
+/// The drive behind [`Subject::Str`]: a non-ASCII `str` whose positions are
+/// code point indices, resolved through the object's stored length and index
+/// storage — `_len()` and `_index_to_byte` (unicodeobject.py:1245-1251) —
+/// rather than by walking the payload.
+///
+/// This is the point of carrying `w_unicode_obj` on the context at all.
+/// `impl StrDrive for &Wtf8` (`sre_engine` `string.rs:153`) has only the
+/// payload, so it answers `count` by counting every code point and
+/// `create_cursor(n)` by stepping over the first `n` of them; both run once
+/// per match, which makes a scan that restarts at successive positions
+/// quadratic in the subject. The index storage answers the same two questions
+/// without touching the payload.
+///
+/// Stepping is left to that impl: it is pure cursor arithmetic, identical for
+/// either way of arriving at the cursor.
+#[derive(Clone, Copy)]
+struct Utf8Drive {
+    obj: PyObjectRef,
+    wtf8: &'static Wtf8,
+}
+
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+unsafe fn utf8_drive(obj: PyObjectRef) -> Utf8Drive {
+    Utf8Drive {
+        obj,
+        wtf8: unsafe { w_str_get_wtf8(obj) },
+    }
+}
+
+impl StrDrive for Utf8Drive {
+    #[inline]
+    fn count(&self) -> usize {
+        unsafe { w_str_len(self.obj) }
+    }
+
+    #[inline]
+    fn create_cursor(&self, n: usize) -> StringCursor {
+        // `n == count()` is the end-of-subject cursor, which has no character
+        // to index; every other caller keeps `n` inside the subject.
+        let byte = if n >= unsafe { w_str_len(self.obj) } {
+            self.wtf8.as_bytes().len()
+        } else {
+            unsafe { w_str_index_to_byte(self.obj, n) }
+        };
+        // `StringCursor.ptr` is crate-private, so the cursor is minted at the
+        // head of the suffix — an O(1) reslice — and carries the code point
+        // index that the engine actually compares against.
+        let suffix: &Wtf8 = &self.wtf8[byte..];
+        let mut cursor = suffix.create_cursor(0);
+        cursor.position = n;
+        cursor
+    }
+
+    #[inline]
+    fn adjust_cursor(&self, cursor: &mut StringCursor, n: usize) {
+        // The `&Wtf8` impl only rebuilds when it has to move backwards,
+        // because seeking forward costs it a step per code point. Seeking is
+        // a lookup here, so a rebuild is never the slower branch, and it also
+        // avoids reading the crate-private `ptr` to test it for null.
+        *cursor = self.create_cursor(n);
+    }
+
+    #[inline]
+    fn advance(cursor: &mut StringCursor) -> u32 {
+        <&Wtf8 as StrDrive>::advance(cursor)
+    }
+
+    #[inline]
+    fn peek(cursor: &StringCursor) -> u32 {
+        <&Wtf8 as StrDrive>::peek(cursor)
+    }
+
+    #[inline]
+    fn skip(cursor: &mut StringCursor, n: usize) {
+        <&Wtf8 as StrDrive>::skip(cursor, n)
+    }
+
+    #[inline]
+    fn back_advance(cursor: &mut StringCursor) -> u32 {
+        <&Wtf8 as StrDrive>::back_advance(cursor)
+    }
+
+    #[inline]
+    fn back_peek(cursor: &StringCursor) -> u32 {
+        <&Wtf8 as StrDrive>::back_peek(cursor)
+    }
+
+    #[inline]
+    fn back_skip(cursor: &mut StringCursor, n: usize) {
+        <&Wtf8 as StrDrive>::back_skip(cursor, n)
     }
 }
 
@@ -1067,7 +1153,7 @@ fn do_match(
             drive_match(b, pos, endpos, code, search, match_all)
         }
         Subject::Str(obj) => {
-            let s = unsafe { w_str_get_wtf8(obj) };
+            let s = unsafe { utf8_drive(obj) };
             drive_match(s, pos, endpos, code, search, match_all)
         }
     };
@@ -1221,7 +1307,7 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let matches = match subj {
         Subject::AsciiStr(b) | Subject::Bytes(b) => collect_matches(b, pos, endpos, code, pat),
         Subject::Str(obj) => {
-            let s = unsafe { w_str_get_wtf8(obj) };
+            let s = unsafe { utf8_drive(obj) };
             collect_matches(s, pos, endpos, code, pat)
         }
     };
@@ -1400,7 +1486,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             stream_matches(b, 0, endpos, code, pat, count, on_match)?
         }
         Subject::Str(obj) => {
-            let s = unsafe { w_str_get_wtf8(obj) };
+            let s = unsafe { utf8_drive(obj) };
             stream_matches(s, 0, endpos, code, pat, count, on_match)?
         }
     };
@@ -1488,7 +1574,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             stream_matches(b, 0, endpos, code, pat, maxsplit, on_match)?
         }
         Subject::Str(obj) => {
-            let s = unsafe { w_str_get_wtf8(obj) };
+            let s = unsafe { utf8_drive(obj) };
             stream_matches(s, 0, endpos, code, pat, maxsplit, on_match)?
         }
     };
@@ -2012,7 +2098,7 @@ fn sre_scanner_step(
             drive_scanner_step(b, pos as usize, endpos, code, must_advance, anchored)
         }
         Subject::Str(obj) => {
-            let s = unsafe { w_str_get_wtf8(obj) };
+            let s = unsafe { utf8_drive(obj) };
             drive_scanner_step(s, pos as usize, endpos, code, must_advance, anchored)
         }
     };
