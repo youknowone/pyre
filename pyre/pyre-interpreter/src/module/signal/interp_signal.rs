@@ -4,7 +4,8 @@
 
 use super::signalstate;
 use crate::executioncontext::{
-    AsyncAction, AsyncActionOps, ExecutionContext, PeriodicAsyncAction, PeriodicAsyncActionOps,
+    AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext, PeriodicAsyncAction,
+    PeriodicAsyncActionOps,
 };
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
@@ -423,8 +424,9 @@ impl AsyncActionOps for CheckSignalAction {
         &mut self,
         ec: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        self.poll_for_signals(ec)
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        self.poll_for_signals(ec)?;
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {

@@ -1374,7 +1374,7 @@ impl ExecutionContext {
         if let Some(action) = self.check_signal_action {
             let self_ptr = self as *mut ExecutionContext;
             unsafe {
-                (*action).perform(&mut *self_ptr, std::ptr::null_mut())?;
+                perform_async_action(action, self_ptr, std::ptr::null_mut())?;
             }
         }
         Ok(())
@@ -1535,6 +1535,28 @@ pub extern "C" fn perform_pending_actions(ec_ptr: i64, frame_ptr: i64) -> i64 {
             1
         }
     }
+}
+
+/// Invoke one action, ending the action object's exclusive borrow before a
+/// requested GIL hand-off.  `GILReleaseAction` is process-owned, so the next
+/// thread can dispatch this same object as soon as it acquires the GIL.  A
+/// direct `perform()` implementation that yields would leave the first
+/// thread's `&mut dyn AsyncActionOps` live across that second mutable borrow.
+///
+/// # Safety
+///
+/// `action` and `ec` must point to live objects for the duration of the
+/// action call.  The caller must hold the GIL on entry.
+unsafe fn perform_async_action(
+    action: *mut dyn AsyncActionOps,
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> Result<(), crate::PyError> {
+    let control = unsafe { (*action).perform(&mut *ec, frame)? };
+    if control == AsyncActionControl::YieldGil {
+        majit_gc::rgil::yield_thread();
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1773,7 +1795,7 @@ pub trait ActionFlagOps {
                 continue;
             }
             unsafe {
-                (*action_ptr).perform(&mut *ec, frame)?;
+                perform_async_action(action_ptr, ec, frame)?;
             }
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
@@ -1788,7 +1810,7 @@ pub trait ActionFlagOps {
                     self.abstract_flag_mut()._fired_bitmask &= !mask;
                     if !action_ptr.is_null() && !ec.is_null() {
                         unsafe {
-                            (*action_ptr).perform(&mut *ec, frame)?;
+                            perform_async_action(action_ptr, ec, frame)?;
                         }
                     }
                 }
@@ -2144,18 +2166,27 @@ impl AsyncAction {
 /// `*mut dyn AsyncActionOps` so the dispatcher reaches the override
 /// through the embedded vtable, and `fire` / `action_dispatcher` can
 /// reach the base bitmask through the accessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncActionControl {
+    Continue,
+    /// Complete the action call first, then hand the GIL to a waiter.
+    YieldGil,
+}
+
 pub trait AsyncActionOps {
     /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`:
     /// `def perform(self, executioncontext, frame): "To be overridden."`
     ///
     /// Returns `Result` so an overriding action (e.g. `CheckSignalAction`)
     /// can raise — PyPy's `perform` propagates an `OperationError` up
-    /// through `action_dispatcher` to the eval loop.
+    /// through `action_dispatcher` to the eval loop.  The control value lets
+    /// the process-owned GIL action defer its hand-off until this method's
+    /// exclusive receiver has ended.
     fn perform(
         &mut self,
         executioncontext: &mut ExecutionContext,
         frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError>;
+    ) -> Result<AsyncActionControl, crate::PyError>;
 
     /// Composition accessor: shared `AsyncAction` state.
     fn async_action(&self) -> &AsyncAction;
@@ -2245,8 +2276,8 @@ impl AsyncActionOps for AsyncAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        Ok(())
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -2335,8 +2366,8 @@ impl AsyncActionOps for PeriodicAsyncAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        Ok(())
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -2557,13 +2588,13 @@ impl AsyncActionOps for UserDelAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<AsyncActionControl, crate::PyError> {
         if self.collect_oldgen_before_run {
             self.collect_oldgen_before_run = false;
             pyre_object::gc_hook::try_gc_collect_oldgen();
         }
         self._run_finalizers();
-        Ok(())
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
