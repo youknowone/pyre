@@ -11,9 +11,10 @@
 // `mmap.mmap(fileno, length, ...)` maps through `host_env::mmap`
 // (memmap2-based, cross-platform), not raw libc.  Per-instance state
 // lives in the instance dict: `_ptr` (mapping pointer as i64), `_len`
-// (i64), `_pos` (i64 cursor), `_access` (int), `_id` (registry key),
-// plus the descriptor the object owns — `_fd` on POSIX, `_handle` on
-// Windows, where the constructor duplicates the file's handle
+// (i64), `_pos` (i64 cursor), `_access` (int), `_mode` (resolved mapping
+// protection), `_id` (registry key), plus the descriptor the object owns —
+// `_fd` on POSIX, `_handle` and `_tagname` on Windows, where the constructor
+// duplicates the file's handle
 // (`rmmap.py:953-970`).  The mapping is invalidated on close()/`__exit__`
 // by dropping the registry entry (→ unmap); leaking it (e.g. GC drops the
 // instance before close) is acceptable, matching CPython behaviour.
@@ -65,6 +66,14 @@ impl MappedObj {
             Self::Named(m) => m.flush_range(offset, size),
         }
     }
+
+    #[cfg(windows)]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Mapped(m) => m.as_mut_slice(),
+            Self::Named(m) => m.as_mut_slice(),
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -98,19 +107,6 @@ fn mmap_registry_replace(id: u64, m: MappedObj) -> (*const u8, usize) {
     (ptr, len)
 }
 
-/// True when the mapping is a tagged one.  `CreateFileMappingW` fixed such an
-/// object's size when it was created and reopening it under the same name is
-/// what shares it, so there is nothing to resize in place: `resize` rejects
-/// them, where a real resize would only get as far as ERROR_USER_MAPPED_FILE
-/// once a second mapping holds the name.
-#[cfg(windows)]
-fn mmap_registry_is_named(id: u64) -> bool {
-    matches!(
-        MMAP_REGISTRY.lock().unwrap().get(&id),
-        Some(MappedObj::Named(_))
-    )
-}
-
 #[cfg(any(unix, windows))]
 fn mmap_registry_flush(id: u64, offset: usize, size: usize) -> std::io::Result<()> {
     match MMAP_REGISTRY.lock().unwrap().get(&id) {
@@ -142,12 +138,15 @@ fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
 /// `.errno` and the OSError subclass derived from it (`rmmap.py:1010`
 /// `lastSavedWindowsError`).
 #[cfg(windows)]
-fn mmap_io_err(e: std::io::Error, _ctx: &str) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(
-        e.raw_os_error().unwrap_or(0),
-        pyre_object::PY_NULL,
-        pyre_object::PY_NULL,
-    )
+fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
+    match e.raw_os_error() {
+        Some(code) => crate::PyError::os_error_win32_syscall2(
+            code,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ),
+        None => crate::PyError::os_error(format!("{ctx}: {e}")),
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -181,6 +180,18 @@ fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
             return unsafe { pyre_object::w_int_get_value(v) };
         }
     0
+}
+
+#[cfg(windows)]
+fn mmap_get_attr_str(obj: pyre_object::PyObjectRef, key: &str) -> String {
+    let d = crate::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return String::new();
+    }
+    unsafe { pyre_object::w_dict_getitem_str(d, key) }
+        .and_then(|v| unsafe { pyre_object::w_str_get_value_opt(v) })
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[cfg(any(unix, windows))]
@@ -1318,9 +1329,12 @@ fn mmap_resize_mapping(
             ));
         }
         let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-        let (dup_fd, mapped) =
-            host_mmap::map_file(borrowed, offset, newsize, host_mmap::AccessMode::Write)
-                .map_err(|e| mmap_io_err(e, "mmap"))?;
+        // `rmmap.py:729-745` resolves `access` plus the caller's `prot` to the
+        // protection used by the original mapping.  Reuse that resolved mode;
+        // `_access == _ACCESS_DEFAULT` alone does not preserve a PROT_READ map.
+        let mode = mmap_access_mode(mmap_get_attr_i64(obj, "_mode"));
+        let (dup_fd, mapped) = host_mmap::map_file(borrowed, offset, newsize, mode)
+            .map_err(|e| mmap_io_err(e, "mmap"))?;
         drop(dup_fd);
         mapped
     } else {
@@ -1349,23 +1363,35 @@ fn mmap_resize_mapping(
     newsize: usize,
 ) -> Result<(), crate::PyError> {
     let id = mmap_get_attr_i64(obj, "_id") as u64;
-    if mmap_registry_is_named(id) {
-        return Err(crate::PyError::os_error(
-            "mmap: cannot resize a named memory mapping",
-        ));
-    }
-    let mapped = if let Some(handle) = mmap_handle(obj) {
+    let tagname = mmap_get_attr_str(obj, "_tagname");
+    let named = !tagname.is_empty();
+    let handle = mmap_handle(obj);
+    let old_bytes = (named && handle.is_none())
+        .then(|| unsafe { std::slice::from_raw_parts(p, old_len) }.to_vec());
+
+    let mapped = if let Some(handle) = handle {
         let offset = mmap_get_attr_i64(obj, "_offset");
         mmap_registry_remove(id);
         let mapped = host_mmap::extend_file(handle, offset + newsize as i64)
-            .and_then(|()| mmap_remap_handle(obj, handle, newsize));
+            .and_then(|()| {
+                if named {
+                    mmap_remap_named(obj, handle, newsize, &tagname, true)
+                } else {
+                    mmap_remap_handle(obj, handle, newsize)
+                }
+            });
         match mapped {
             Ok(mapped) => mapped,
             Err(e) => {
                 // The view is already gone, so `_ptr` would dangle; put the
                 // mapping back at its old size, and mark the object closed if
                 // even that fails.
-                match mmap_remap_handle(obj, handle, old_len) {
+                let restored = if named {
+                    mmap_remap_named(obj, handle, old_len, &tagname, false)
+                } else {
+                    mmap_remap_handle(obj, handle, old_len)
+                };
+                match restored {
                     Ok(old) => {
                         mmap_store_mapping(obj, id, old);
                     }
@@ -1377,6 +1403,50 @@ fn mmap_resize_mapping(
                     }
                 }
                 return Err(mmap_io_err(e, "mmap"));
+            }
+        }
+    } else if named {
+        // `rmmap.py:602-646` has no tag-name precheck: it closes the old map
+        // handle and recreates the mapping with `self.tagname`.  For a
+        // pagefile-backed mapping there is no file EOF to move, but the same
+        // close/recreate sequence applies.  ERROR_ALREADY_EXISTS comes from
+        // CreateFileMapping when another live view still owns the name.
+        mmap_registry_remove(id);
+        let mapped = mmap_remap_named(
+            obj,
+            host_mmap::INVALID_HANDLE,
+            newsize,
+            &tagname,
+            true,
+        );
+        match mapped {
+            Ok(mut mapped) => {
+                let old = old_bytes.as_deref().unwrap_or_default();
+                let keep = old.len().min(newsize);
+                mapped.as_mut_slice()[..keep].copy_from_slice(&old[..keep]);
+                mapped
+            }
+            Err(e) => {
+                match mmap_remap_named(
+                    obj,
+                    host_mmap::INVALID_HANDLE,
+                    old_len,
+                    &tagname,
+                    false,
+                ) {
+                    Ok(mut old_mapping) => {
+                        if let Some(old) = old_bytes.as_deref() {
+                            old_mapping.as_mut_slice().copy_from_slice(old);
+                        }
+                        mmap_store_mapping(obj, id, old_mapping);
+                    }
+                    Err(_) => {
+                        mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(0));
+                        mmap_set_attr(obj, "_len", pyre_object::w_int_new(0));
+                        mmap_set_attr(obj, "_id", pyre_object::w_int_new(0));
+                    }
+                }
+                return Err(mmap_io_err(e, "CreateFileMapping"));
             }
         }
     } else {
@@ -1397,6 +1467,29 @@ fn mmap_remap_handle(
     let offset = mmap_get_attr_i64(obj, "_offset");
     let access = mmap_access_mode(mmap_get_attr_i64(obj, "_access"));
     host_mmap::map_handle(handle, offset, size, access).map(MappedObj::Mapped)
+}
+
+/// Recreate the Windows mapping object with its original tag name, matching
+/// `rmmap.py:634-645`.  `CreateFileMappingW` reports ERROR_ALREADY_EXISTS when
+/// another mapping still owns the name; resize surfaces that OS error while
+/// the recovery remap is allowed to reopen the existing object.
+#[cfg(windows)]
+fn mmap_remap_named(
+    obj: pyre_object::PyObjectRef,
+    handle: host_mmap::Handle,
+    size: usize,
+    tagname: &str,
+    reject_existing: bool,
+) -> std::io::Result<MappedObj> {
+    let offset = mmap_get_attr_i64(obj, "_offset");
+    let access = mmap_access_mode(mmap_get_attr_i64(obj, "_mode"));
+    let named = host_mmap::create_named_mapping(handle, tagname, access, offset, size)?;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+    if reject_existing && host_mmap::last_error() as i32 == ERROR_ALREADY_EXISTS {
+        drop(named);
+        return Err(std::io::Error::from_raw_os_error(ERROR_ALREADY_EXISTS));
+    }
+    Ok(MappedObj::Named(named))
 }
 
 /// Publish a freshly created mapping as the object's live one.
@@ -1439,7 +1532,7 @@ fn mmap_resize_mapping(
 /// The mapping mode an `ACCESS_*` argument asks for.  host_env expresses a
 /// mapping as an `AccessMode` rather than the raw `flProtect` /
 /// `dwDesiredAccess` pair `rmmap.py:904-914` derives.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn mmap_access_mode(access: i64) -> host_mmap::AccessMode {
     match access {
         x if x == MMAP_ACCESS_READ => host_mmap::AccessMode::Read,
@@ -1480,16 +1573,37 @@ fn mmap_check_int_args(
 /// per-instance state every method reads back out of the instance dict.  The
 /// caller adds the descriptor it owns (`_fd` on POSIX, `_handle` on Windows).
 #[cfg(any(unix, windows))]
-fn mmap_new_object(mapped: MappedObj, access: i64, offset: i64) -> pyre_object::PyObjectRef {
+fn mmap_new_object(
+    mapped: MappedObj,
+    access: i64,
+    mode: host_mmap::AccessMode,
+    offset: i64,
+) -> pyre_object::PyObjectRef {
     let (id, ptr, len) = mmap_registry_insert(mapped);
     let obj = pyre_object::w_instance_new(mmap_type());
-    mmap_set_attr(obj, "_ptr", pyre_object::w_int_new(ptr as usize as i64));
-    mmap_set_attr(obj, "_len", pyre_object::w_int_new(len as i64));
-    mmap_set_attr(obj, "_id", pyre_object::w_int_new(id as i64));
-    mmap_set_attr(obj, "_pos", pyre_object::w_int_new(0));
-    mmap_set_attr(obj, "_access", pyre_object::w_int_new(access));
-    mmap_set_attr(obj, "_offset", pyre_object::w_int_new(offset));
-    obj
+    // `w_instance_new` returns a movable GC object.  Every integer allocation
+    // below can collect, so keep the instance in a shadow-stack slot and reload
+    // it only after each value has been allocated.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(obj);
+    for (key, value) in [
+        ("_ptr", ptr as usize as i64),
+        ("_len", len as i64),
+        ("_id", id as i64),
+        ("_pos", 0),
+        ("_access", access),
+        ("_mode", mode as i64),
+        ("_offset", offset),
+    ] {
+        let w_value = pyre_object::w_int_new(value);
+        mmap_set_attr(
+            unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+            key,
+            w_value,
+        );
+    }
+    unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) }
 }
 
 // `interp_mmap.py:333-350 mmap(fileno, length, flags, prot, access, offset)`
@@ -1517,7 +1631,7 @@ fn mmap_construct(
         ],
     )?;
     let fd = (unsafe { pyre_object::w_int_get_value(w_fileno) }) as libc::c_int;
-    let length = (unsafe { pyre_object::w_int_get_value(w_length) }) as libc::size_t;
+    let length_value = unsafe { pyre_object::w_int_get_value(w_length) };
     let flags_arg = mmap_arg(args, 2).map_or(host_mmap::MAP_SHARED, |a| {
         (unsafe { pyre_object::w_int_get_value(a) }) as libc::c_int
     });
@@ -1527,9 +1641,31 @@ fn mmap_construct(
     let access = mmap_arg(args, 4).map_or(MMAP_ACCESS_DEFAULT, |a| unsafe {
         pyre_object::w_int_get_value(a)
     });
-    let offset = mmap_arg(args, 5).map_or(0, |a| {
-        (unsafe { pyre_object::w_int_get_value(a) }) as libc::off_t
+    let offset_value = mmap_arg(args, 5).map_or(0, |a| unsafe {
+        pyre_object::w_int_get_value(a)
     });
+
+    // `rmmap.py:718-727` performs these guards in this order and before the
+    // size_t/off_t casts.
+    if access != MMAP_ACCESS_DEFAULT
+        && (flags_arg != host_mmap::MAP_SHARED
+            || prot_arg != (host_mmap::PROT_READ | host_mmap::PROT_WRITE))
+    {
+        return Err(crate::PyError::value_error(
+            "mmap can't specify both access and flags, prot.",
+        ));
+    }
+    if length_value < 0 {
+        return Err(crate::PyError::type_error(
+            "memory mapped size must be positive",
+        ));
+    }
+    if offset_value < 0 {
+        return Err(crate::PyError::value_error("negative offset"));
+    }
+
+    let length = length_value as libc::size_t;
+    let offset = offset_value as libc::off_t;
     let (flags, prot) = match access {
         x if x == MMAP_ACCESS_READ => (host_mmap::MAP_SHARED, host_mmap::PROT_READ),
         x if x == MMAP_ACCESS_WRITE => {
@@ -1549,18 +1685,18 @@ fn mmap_construct(
     // still records the caller's original access argument, so repr() and the
     // write-guard are unchanged.
     let real_fd = fd;
+    let mode = if prot & host_mmap::PROT_WRITE != 0 {
+        if flags & host_mmap::MAP_PRIVATE != 0 {
+            host_mmap::AccessMode::Copy
+        } else {
+            host_mmap::AccessMode::Write
+        }
+    } else {
+        host_mmap::AccessMode::Read
+    };
     let mapped = if real_fd == -1 {
         host_mmap::map_anon(length).map_err(|e| mmap_io_err(e, "mmap"))?
     } else {
-        let mode = if prot & host_mmap::PROT_WRITE != 0 {
-            if flags & host_mmap::MAP_PRIVATE != 0 {
-                host_mmap::AccessMode::Copy
-            } else {
-                host_mmap::AccessMode::Write
-            }
-        } else {
-            host_mmap::AccessMode::Read
-        };
         let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(real_fd) };
         let (dup_fd, mapped) = host_mmap::map_file(borrowed, offset, length, mode)
             .map_err(|e| mmap_io_err(e, "mmap"))?;
@@ -1570,9 +1706,17 @@ fn mmap_construct(
         drop(dup_fd);
         mapped
     };
-    let obj = mmap_new_object(MappedObj::Mapped(mapped), access, offset as i64);
-    mmap_set_attr(obj, "_fd", pyre_object::w_int_new(real_fd as i64));
-    Ok(obj)
+    let obj = mmap_new_object(MappedObj::Mapped(mapped), access, mode, offset as i64);
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(obj);
+    let w_fd = pyre_object::w_int_new(real_fd as i64);
+    mmap_set_attr(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+        "_fd",
+        w_fd,
+    );
+    Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) })
 }
 
 // `interp_mmap.py:354-370 mmap(fileno, length, tagname, access, offset)` —
@@ -1655,21 +1799,30 @@ fn mmap_construct(
                 if file_len == 0 {
                     return Err(crate::PyError::value_error("cannot mmap an empty file"));
                 }
-                if offset >= file_len {
+                // PyPy rejects only offset > size (`rmmap.py:943-945`), unlike
+                // CPython's offset >= size check (`mmapmodule.c:2087-2091`).
+                if offset > file_len {
                     return Err(crate::PyError::value_error(
                         "mmap offset is greater than file size",
                     ));
                 }
-                map_size = (file_len - offset) as usize;
+                let remaining = file_len - offset;
+                map_size = remaining as usize;
+                if map_size as i64 != remaining {
+                    return Err(crate::PyError::value_error("mmap length is too large"));
+                }
             } else {
-                // A view longer than the file grows the file, which is what
-                // `CreateFileMapping` itself does for a size beyond EOF.
+                // PyPy rejects a mapping past EOF (`rmmap.py:949-950`).
+                // CPython instead passes offset + map_size on to
+                // CreateFileMapping (`mmapmodule.c:2100-2107`), so this is a
+                // deliberate PyPy-over-CPython parity choice.
                 let required = offset
                     .checked_add(map_size as i64)
                     .ok_or_else(|| crate::PyError::value_error("mmap length is too large"))?;
                 if required > file_len {
-                    host_mmap::extend_file(guard.0, required)
-                        .map_err(|e| mmap_io_err(e, "SetEndOfFile"))?;
+                    return Err(crate::PyError::value_error(
+                        "mmap length is greater than file size",
+                    ));
                 }
             }
         }
@@ -1709,13 +1862,24 @@ fn mmap_construct(
         let mapped = host_mmap::map_anon(map_size).map_err(|e| mmap_io_err(e, "mmap"))?;
         (MappedObj::Mapped(mapped), host_mmap::INVALID_HANDLE)
     };
-    let obj = mmap_new_object(mapped, access, offset);
+    let mode = mmap_access_mode(access);
+    let obj = mmap_new_object(mapped, access, mode, offset);
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(obj);
+    let w_tagname = pyre_object::w_str_new_managed(&tagname);
     mmap_set_attr(
-        obj,
-        "_handle",
-        pyre_object::w_int_new(owned_handle as isize as i64),
+        unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+        "_tagname",
+        w_tagname,
     );
-    Ok(obj)
+    let w_handle = pyre_object::w_int_new(owned_handle as isize as i64);
+    mmap_set_attr(
+        unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
+        "_handle",
+        w_handle,
+    );
+    Ok(unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) })
 }
 
 /// Closes the duplicated file handle unless it is released into the finished
