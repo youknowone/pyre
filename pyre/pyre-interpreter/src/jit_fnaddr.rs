@@ -623,6 +623,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::shadow_stack_cell",
         pyre_object::gc_roots::shadow_stack_cell as *const (),
     );
+    // The other two thirds of the `push_roots` bracket.  Both take the cell
+    // pointer `shadow_stack_cell` returns, so a descent that gets past the
+    // resolution lands on these next; all three are one-word scalars in and
+    // out, with no fat pointer, `Option`, or sret.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::shadow_stack_cell_len",
+        "pyre_object::shadow_stack_cell_len",
+        pyre_object::gc_roots::shadow_stack_cell_len as *const (),
+    );
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::gc_roots::shadow_stack_cell_truncate",
+        "pyre_object::shadow_stack_cell_truncate",
+        pyre_object::gc_roots::shadow_stack_cell_truncate as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::typeobject::w_type_set_uses_object_setattr",

@@ -601,14 +601,14 @@ pub fn shadow_stack_cell() -> *const RootStack {
 }
 
 #[majit_macros::dont_look_inside]
-fn shadow_stack_cell_len(cell: *const RootStack) -> usize {
+pub fn shadow_stack_cell_len(cell: *const RootStack) -> usize {
     // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
     // the bracket on the thread that resolved it.
     unsafe { (*cell).len() }
 }
 
 #[majit_macros::dont_look_inside]
-fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
+pub fn shadow_stack_cell_truncate(cell: *const RootStack, len: usize) {
     // SAFETY: `cell` is this thread's root-stack cell, and `_not_send` keeps
     // the bracket on the thread that resolved it.
     unsafe { (*cell).truncate(len) };
