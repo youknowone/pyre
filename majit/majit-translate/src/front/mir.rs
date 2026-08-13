@@ -2567,6 +2567,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 ///   raise block between a discriminant switch's `else
 ///   unreachable!()` exit and `exceptblock`, exposing the
 ///   `[Constant(AssertionError), …]` link to the next pass.
+/// - `retarget_assert_raise_blocks` points an edge into a bare
+///   implicit-raise block at `exceptblock` instead, which is where
+///   upstream's flow space puts it and what the next pass matches.
 /// - `remove_assertion_errors` (simplify.py:321-346) prunes the
 ///   shouldn't-occur branch and promotes the surviving exit to an
 ///   unconditional link.
@@ -2643,6 +2646,10 @@ fn simplify_lowered_graph(
     // keeps them because a `FieldWrite` is side-effecting, so its `base`
     // pins the aggregate (`remove_simple_mallocs`, malloc.py).
     dirty |= crate::model::remove_dead_aggregates(graph) > 0;
+    // Bring the raise into the shape `remove_assertion_errors` matches: the
+    // MIR front builds the exception in a block of its own, where upstream's
+    // flow space links straight to `exceptblock`.
+    dirty |= crate::model::retarget_assert_raise_blocks(graph) > 0;
     dirty |= crate::model::remove_assertion_errors(graph) > 0;
     // Constant-condition arms (`if WITHPREBUILTINT { … }` with the
     // config const folded by `const_eval_global`) collapse to the
