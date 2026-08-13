@@ -78,7 +78,7 @@ pub struct WasmFrameData {
     /// exited through a GuardNoException / GuardException (0 = none), surfaced
     /// via `grab_exc_value`.
     pub exc_value: i64,
-    /// Slots handed to [`crate::wasm_gc_add_root`] by [`WasmFrameData::boxed`],
+    /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
 }
@@ -108,28 +108,160 @@ impl WasmFrameData {
             exc_value,
             roots: Vec::new(),
         });
-        let mut roots: Vec<usize> = Vec::new();
-        for i in 0..data.raw_values.len() {
-            if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
-                roots.push(&mut data.raw_values[i] as *mut i64 as usize);
+        let ref_count = data
+            .fail_descr
+            .fail_arg_types
+            .iter()
+            .take(data.raw_values.len())
+            .filter(|ty| **ty == Type::Ref)
+            .count();
+        if ref_count != 0 || data.exc_value != 0 {
+            let mut roots = Vec::with_capacity(ref_count + usize::from(data.exc_value != 0));
+            for i in 0..data.raw_values.len() {
+                if data.fail_descr.fail_arg_types.get(i) == Some(&Type::Ref) {
+                    roots.push(&mut data.raw_values[i] as *mut i64 as usize);
+                }
             }
+            // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
+            // reads it after it has already allocated. A null `GcRef` needs no root.
+            if data.exc_value != 0 {
+                roots.push(&mut data.exc_value as *mut i64 as usize);
+            }
+            unsafe { crate::wasm_gc_add_roots(&roots) };
+            data.roots = roots;
         }
-        // `grab_exc_value` hands this out as a `GcRef` too, and the resume path
-        // reads it after it has already allocated.
-        roots.push(&mut data.exc_value as *mut i64 as usize);
-        for slot in &roots {
-            unsafe { crate::wasm_gc_add_root(*slot as *mut majit_ir::GcRef) };
-        }
-        data.roots = roots;
         data
     }
 }
 
 impl Drop for WasmFrameData {
     fn drop(&mut self) {
-        for slot in self.roots.drain(..) {
-            crate::wasm_gc_remove_root(slot as *mut majit_ir::GcRef);
+        if self.roots.is_empty() {
+            return;
         }
+        // Remove in reverse push order so RootSet::remove stays on its
+        // O(1) stack-pop path.
+        crate::wasm_gc_remove_roots(self.roots.drain(..).rev());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use majit_gc::GcAllocator;
+    use majit_ir::GcRef;
+
+    use super::{Type, WasmFailDescr, WasmFrameData};
+
+    struct RootCountingGc(Arc<AtomicUsize>);
+
+    impl GcAllocator for RootCountingGc {
+        fn alloc_nursery(&mut self, _size: usize) -> GcRef {
+            GcRef(0)
+        }
+
+        fn alloc_nursery_no_collect(&mut self, _size: usize) -> GcRef {
+            GcRef(0)
+        }
+
+        fn alloc_varsize(&mut self, _base_size: usize, _item_size: usize, _length: usize) -> GcRef {
+            GcRef(0)
+        }
+
+        fn alloc_varsize_no_collect(
+            &mut self,
+            _base_size: usize,
+            _item_size: usize,
+            _length: usize,
+        ) -> GcRef {
+            GcRef(0)
+        }
+
+        fn write_barrier(&mut self, _obj: GcRef) {}
+
+        fn jit_remember_young_pointer_from_array(&mut self, _obj: GcRef) {}
+
+        fn remember_young_pointer_from_array2(
+            &mut self,
+            _obj: GcRef,
+            _index: usize,
+            _card_page_shift: u32,
+        ) {
+        }
+
+        fn collect_nursery(&mut self) {}
+
+        fn collect_full(&mut self) {}
+
+        fn nursery_free(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+
+        fn nursery_free_addr(&self) -> usize {
+            0
+        }
+
+        fn nursery_top(&self) -> *const u8 {
+            std::ptr::null()
+        }
+
+        fn nursery_top_addr(&self) -> usize {
+            0
+        }
+
+        fn max_nursery_object_size(&self) -> usize {
+            0
+        }
+
+        unsafe fn add_root(&mut self, _root: *mut GcRef) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn remove_root(&mut self, _root: *mut GcRef) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn install_root_counting_gc() -> Arc<AtomicUsize> {
+        let roots = Arc::new(AtomicUsize::new(0));
+        crate::install_gc_box(Box::new(RootCountingGc(Arc::clone(&roots))));
+        roots
+    }
+
+    fn fail_descr(fail_arg_types: Vec<Type>) -> Arc<WasmFailDescr> {
+        Arc::new(WasmFailDescr {
+            fail_index: 0,
+            trace_id: 0,
+            fail_arg_types,
+            is_finish: false,
+            meta_descr: None,
+        })
+    }
+
+    #[test]
+    fn boxed_roots_ref_slots_and_nonzero_exception_until_drop() {
+        let roots = install_root_counting_gc();
+        let before = roots.load(Ordering::SeqCst);
+        let frame = WasmFrameData::boxed(
+            vec![0x10, 42, 0, 0x20],
+            fail_descr(vec![Type::Ref, Type::Int, Type::Float, Type::Ref]),
+            0x30,
+        );
+        assert_eq!(roots.load(Ordering::SeqCst), before + 3);
+        drop(frame);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn boxed_without_refs_or_exception_does_not_bracket_roots() {
+        let roots = install_root_counting_gc();
+        let before = roots.load(Ordering::SeqCst);
+        let frame = WasmFrameData::boxed(vec![1, 2], fail_descr(vec![Type::Int, Type::Float]), 0);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+        drop(frame);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
     }
 }
 

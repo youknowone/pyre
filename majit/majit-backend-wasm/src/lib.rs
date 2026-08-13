@@ -1106,9 +1106,33 @@ pub(crate) unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| unsafe { gc.add_root(slot) });
 }
 
+/// Batched [`wasm_gc_add_root`] for one stack-shaped root bracket.
+///
+/// # Safety
+/// Every slot must remain valid until removed with [`wasm_gc_remove_roots`].
+pub(crate) unsafe fn wasm_gc_add_roots(slots: &[usize]) {
+    if slots.is_empty() {
+        return;
+    }
+    with_wasm_active_gc_mut(|gc| {
+        for &slot in slots {
+            unsafe { gc.add_root(slot as *mut GcRef) };
+        }
+    });
+}
+
 /// Companion to [`wasm_gc_add_root`].
 pub(crate) fn wasm_gc_remove_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| gc.remove_root(slot));
+}
+
+/// Batched [`wasm_gc_remove_root`] for one stack-shaped root bracket.
+pub(crate) fn wasm_gc_remove_roots(slots: impl Iterator<Item = usize>) {
+    with_wasm_active_gc_mut(|gc| {
+        for slot in slots {
+            gc.remove_root(slot as *mut GcRef);
+        }
+    });
 }
 
 /// Host-side write-barrier trampoline for the interpreter (mapdict / list /
