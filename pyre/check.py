@@ -8,7 +8,6 @@ import argparse
 import difflib
 import math
 import os
-import platform
 import re
 import shutil
 import statistics
@@ -146,11 +145,6 @@ WIN_NATIVE_TIMEOUT_SCALE = 2.0
 BENCH_DIR = "pyre/bench"
 SYNTHETIC_BENCH_DIR = "pyre/bench/synth"
 CPYTHON_SUITE_BASELINE = "pyre/cpython_tests/baseline.json"
-# The baseline holds one verdict per module per backend, and dynasm emits
-# arch-specific code, so a verdict only compares against the host it was
-# observed on. `.github/workflows/pyre-ci.yml` pins its CPython suite job to
-# `macos-latest` for the same reason.
-CPYTHON_SUITE_BASELINE_HOST = ("darwin", "arm64")
 # Per module, matching the CI job. `test.test_asyncio` alone needs ~2m47s of
 # wall time, so a smaller per-module limit turns a slow module into a fake
 # regression.
@@ -2430,10 +2424,11 @@ class Check:
         specialised-pair subscript fold while the whole synthetic corpus and
         every parity fixture stayed green.
 
-        The baseline records one verdict per module per backend, observed on
-        darwin-arm64, and dynasm's codegen is arch-specific -- so the
-        comparison only means anything there.  On any other host the stage
-        reports that it did not run instead of counting as a pass.
+        The baseline records one verdict per module per backend and follows
+        the host: `run.py` reads a `baseline.<platform>-<machine>.json`
+        overlay before the shared file, so a verdict a host disagrees with
+        (dynasm's codegen is arch-specific) is recorded there rather than
+        making the stage unusable off one machine.
 
         Off by default and reached only through `--cpython-suite`: the suite
         costs more wall time than every other stage here put together, and the
@@ -2447,15 +2442,6 @@ class Check:
         if not self.enabled(backend):
             sys.stdout.write(f"    {backend:<10s}")
             print(dim("skip (backend not enabled)"))
-            self._append_comparison(backend, name, "-", "-", "skip")
-            return
-        host = (sys.platform, platform.machine())
-        if host != CPYTHON_SUITE_BASELINE_HOST:
-            sys.stdout.write(f"    {backend:<10s}")
-            print(dim(
-                f"skip (baseline observed on {'-'.join(CPYTHON_SUITE_BASELINE_HOST)}, "
-                f"host is {'-'.join(host)})"
-            ))
             self._append_comparison(backend, name, "-", "-", "skip")
             return
         sys.stdout.write(f"    {backend:<10s}")

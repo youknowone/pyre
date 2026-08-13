@@ -37,9 +37,13 @@ modules surface only when the non-PASS modules are actually run, so use
 `--strict-baseline` (gates on unrecorded improvements), `--full`, or
 `--update-baseline` to detect them. `SKIP` baseline entries are not run.
 
-Baseline entries carry no platform. `PLATFORM_GATED` excludes modules CPython
-skips wholesale on this host, preventing another host's PASS from becoming a
-false `PASS -> SKIP` regression; it does not make the baseline portable.
+The baseline is a shared file plus a per-host overlay,
+`baseline.<sys.platform>-<machine>.json`, consulted first. Whichever host
+records a (module, backend) first sets the shared verdict; every other host
+writes an entry only where it disagrees, and drops it again once the two
+agree. Two separate mechanisms sit next to this: `PLATFORM_GATED` excludes
+modules CPython skips wholesale on a host, and `KNOWN_SKIPS` is a decision
+about the module rather than the host, so it stays shared.
 
 Usage:
     python3 pyre/cpython_tests/run.py [--backend dynasm|cranelift]
@@ -54,6 +58,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -66,6 +71,7 @@ TARGET_RELEASE = ROOT / "target" / "release"
 TESTDIR = ROOT / "lib-python" / "3" / "test"
 STDLIB_VERSION_FILE = ROOT / "lib-python" / "stdlib-version.txt"
 DEFAULT_BASELINE = HERE / "baseline.json"
+HOST_TAG = f"{sys.platform}-{platform.machine()}"
 
 EXE = ".exe" if sys.platform == "win32" else ""
 BIN_NAME = {"dynasm": "pyre-dynasm", "cranelift": "pyre-cranelift"}
@@ -453,11 +459,30 @@ def load_baseline(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def expected_status(baseline: dict, module: str, backend: str) -> str | None:
-    entry = baseline.get("modules", {}).get(module)
-    if entry is None:
-        return None
-    return entry.get(backend) or entry.get("dynasm")
+def host_baseline_path(path: Path) -> Path:
+    """Per-host overlay beside the shared baseline, `baseline.<host>.json`.
+
+    Same shape as the shared file and consulted first, so a host records only
+    the modules it genuinely disagrees with.  The jit-stats baselines overlay
+    on `sys.platform` alone; a verdict also has to separate the architectures
+    within a platform, because the dynasm backend emits different machine code
+    on each and a miscompile is not portable.
+    """
+    return path.with_name(f"{path.stem}.{HOST_TAG}{path.suffix}")
+
+
+def expected_status(baseline: dict, overlay: dict, module: str,
+                    backend: str) -> str | None:
+    """Recorded verdict for `module`, the host overlay winning over the shared
+    file.  Within one file `dynasm` stands in for a backend with no entry."""
+    for source in (overlay, baseline):
+        entry = source.get("modules", {}).get(module)
+        if entry is None:
+            continue
+        status = entry.get(backend) or entry.get("dynasm")
+        if status is not None:
+            return status
+    return None
 
 
 # ── main ─────────────────────────────────────────────────────────────
@@ -518,6 +543,8 @@ def main() -> int:
         return 2
 
     baseline = load_baseline(args.baseline)
+    overlay_path = host_baseline_path(args.baseline)
+    overlay = load_baseline(overlay_path) if overlay_path.exists() else {"modules": {}}
     modules = discover_modules(args.filter)
 
     if args.list:
@@ -558,7 +585,7 @@ def main() -> int:
             off_platform.append((m, gate_reason))
             skipped.append(m)
             continue
-        exp = expected_status(baseline, m, args.backend)
+        exp = expected_status(baseline, overlay, m, args.backend)
         is_skip = (exp == "SKIP") or (m in KNOWN_SKIPS)
         if is_skip and not args.full and not args.update_baseline:
             skipped.append(m)
@@ -571,6 +598,10 @@ def main() -> int:
     print(f"pyre CPython suite — backend={args.backend} mode={args.mode} "
           f"jit={'off' if args.no_jit else 'on'} jobs={args.jobs}")
     print(f"binary: {binary}")
+    overlay_count = len(overlay.get("modules", {}))
+    print(f"baseline: {args.baseline.name} + "
+          + (f"{overlay_path.name} ({overlay_count} host entries)"
+             if overlay_count else f"no {HOST_TAG} overlay"))
     for m, reason in off_platform:
         print(f"  off-platform on {sys.platform}: {m} ({reason})")
     extra = f", {deselected} not gated (non-PASS)" if deselected else ""
@@ -632,7 +663,7 @@ def main() -> int:
     regressions: list[str] = []
     improvements: list[str] = []
     for m, (status, detail) in sorted(results.items()):
-        exp = expected_status(baseline, m, args.backend)
+        exp = expected_status(baseline, overlay, m, args.backend)
         if exp == "PASS" and status != "PASS":
             regressions.append(f"{m}: PASS -> {status}  {detail}")
         elif exp != "PASS" and status == "PASS":
@@ -659,9 +690,11 @@ def main() -> int:
         print(f"\nreport written: {args.report}")
 
     if args.update_baseline:
-        write_baseline(args.baseline, baseline, results, args.backend)
-        print(f"\nbaseline written: {args.baseline} "
-              f"({sum(1 for s, _ in results.values() if s == 'PASS')} PASS recorded)")
+        written = write_baseline(args.baseline, baseline, overlay, results,
+                                 args.backend)
+        recorded = sum(1 for s, _ in results.values() if s == "PASS")
+        for target in written:
+            print(f"\nbaseline written: {target} ({recorded} PASS recorded)")
         return 0
 
     if regressions:
@@ -682,25 +715,68 @@ def main() -> int:
     return 0
 
 
-def write_baseline(path: Path, baseline: dict, results: dict, backend: str) -> None:
+def write_baseline(path: Path, baseline: dict, overlay: dict, results: dict,
+                   backend: str) -> list[Path]:
+    """Record `results`, splitting them between the shared baseline and this
+    host's overlay.  Returns the files actually written.
+
+    A verdict the shared file has never seen establishes the shared answer, so
+    whichever host records first sets it and no host is privileged.  After
+    that a host writes to its own overlay only where it disagrees, and a run
+    that comes back into agreement drops the overlay entry again -- so an
+    overlay never outlives the divergence that created it.
+    """
     modules = baseline.setdefault("modules", {})
+    overlay_modules = overlay.setdefault("modules", {})
     baseline["stdlib_version"] = stdlib_version()
+    overlay_dirty = False
     for m, (status, _detail) in results.items():
         # Defensive: never overwrite another platform's recorded result.
         if platform_gate(m) is not None:
             continue
-        entry = modules.setdefault(m, {})
         # A curated KNOWN_SKIP stays SKIP regardless of what the run observed
         # (it is a "do not run" decision, not a result). Modules absent from
         # `results` (phantom skips that no longer exist) are simply not added.
+        # It is a decision about the module rather than about this host, so it
+        # is shared and never overlaid.
         if m in KNOWN_SKIPS:
+            entry = modules.setdefault(m, {})
             entry[backend] = "SKIP"
             entry.setdefault("reason", KNOWN_SKIPS[m])
-        else:
-            entry[backend] = status
+            overlay_dirty |= overlay_modules.pop(m, None) is not None
+            continue
+        shared = modules.get(m, {}).get(backend)
+        if shared is None:
+            modules.setdefault(m, {})[backend] = status
+            continue
+        if status == shared:
+            host_entry = overlay_modules.get(m)
+            if host_entry is not None and host_entry.pop(backend, None) is not None:
+                overlay_dirty = True
+                if not host_entry:
+                    del overlay_modules[m]
+            continue
+        if overlay_modules.setdefault(m, {}).get(backend) != status:
+            overlay_modules[m][backend] = status
+            overlay_dirty = True
+
+    written = [path]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8")
+    overlay_path = host_baseline_path(path)
+    if overlay_dirty or overlay_path.exists():
+        if overlay_modules:
+            overlay["host"] = HOST_TAG
+            overlay["stdlib_version"] = stdlib_version()
+            overlay_path.write_text(
+                json.dumps(overlay, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8")
+            written.append(overlay_path)
+        elif overlay_path.exists():
+            overlay_path.unlink()
+            written.append(overlay_path)
+    return written
 
 
 if __name__ == "__main__":
