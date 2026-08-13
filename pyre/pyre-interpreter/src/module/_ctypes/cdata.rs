@@ -419,15 +419,7 @@ pub(super) fn ctype_size_of(cls: PyObjectRef) -> Option<usize> {
     super::stginfo::stginfo_of(cls)
         .map(super::stginfo::stginfo_size)
         .or_else(|| type_code_of(cls).and_then(|tc| host_ctypes::simple_type_size(&tc)))
-        .or_else(|| {
-            // `_CFuncPtr` itself is abstract, while every concrete type made
-            // by CFUNCTYPE/WINFUNCTYPE carries `_flags_`.  Use that ctypes
-            // invariant here; the generic issubclass path is not reliable for
-            // these metaclass-created raw types.
-            (!std::ptr::eq(cls, super::funcptr::cfuncptr_type())
-                && unsafe { crate::baseobjspace::lookup_in_type(cls, "_flags_") }.is_some())
-            .then(host_ctypes::pointer_size)
-        })
+        .or_else(|| super::funcptr::is_funcptr_type(cls).then(host_ctypes::pointer_size))
 }
 
 /// `_SimpleCData.value` getter — `(descr, instance)`.

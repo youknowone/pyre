@@ -22,13 +22,13 @@ use rustpython_host_env::ctypes as host_ctypes;
 use std::sync::OnceLock;
 
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
-const FUNCFLAG_USE_ERRNO: i64 = 0x8;
+pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
 
 /// Reserved instance-dict keys.
 const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
 const ARGTYPES_KEY: &str = "_argtypes";
-const CALLABLE_KEY: &str = "_callable";
+pub(super) const CALLABLE_KEY: &str = "_callable";
 const INTERNAL_CAST_ADDR: usize = 1;
 const INTERNAL_STRING_AT_ADDR: usize = 2;
 const INTERNAL_WSTRING_AT_ADDR: usize = 3;
@@ -127,6 +127,17 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe { pyre_object::w_dict_setitem_str(d, PTR_KEY, pyre_object::w_int_new(addr as i64)) };
     if !callback.is_null() {
         unsafe { pyre_object::w_dict_setitem_str(d, CALLABLE_KEY, callback) };
+        if let Some(code) = super::callbacks::build_thunk(obj)? {
+            let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+                "P",
+                host_ctypes::SimpleStorageValue::Pointer(code),
+                false,
+            );
+            unsafe {
+                pyre_object::w_dict_setitem_str(d, PTR_KEY, pyre_object::w_int_new(code as i64))
+            };
+            cdata::cdata_write(obj, 0, &bytes);
+        }
     }
     Ok(obj)
 }
@@ -160,8 +171,8 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
         _ => {}
     }
     super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
-        use host_ctypes::LookupSymbolError as L;
-        if matches!(e, L::LibraryNotFound) {
+        use rustpython_host_env::ctypes::LookupSymbolError as E;
+        if matches!(e, E::LibraryNotFound) {
             return crate::PyError::value_error("library not found");
         }
         // A symbol name arrives as bytes, so it is decoded the way a name the
@@ -176,7 +187,7 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
 
 // ── restype / argtypes descriptors ────────────────────────────────────
 
-fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+pub(super) fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
     let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return None;
@@ -254,7 +265,7 @@ fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), crate::PyError> {
 // ── call ──────────────────────────────────────────────────────────────
 
 /// Resolved return-type selector.
-enum Ret {
+pub(super) enum Ret {
     Void,
     Code(String),
     /// A pointer metaclass type (`POINTER(T)`): the result address is wrapped
@@ -265,7 +276,7 @@ enum Ret {
     Aggregate(PyObjectRef),
 }
 
-fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
+pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let rt = instance_get(obj, RESTYPE_KEY)
         .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") });
@@ -314,7 +325,7 @@ fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::
 
 /// The `_argtypes_` sequence as a Vec, or `None` when unset (ConvParam
 /// defaults apply).
-fn resolve_argtypes(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+pub(super) fn resolve_argtypes(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let at = instance_get(obj, ARGTYPES_KEY)
         .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_argtypes_") })?;
@@ -344,7 +355,7 @@ fn seq_to_vec(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     }
 }
 
-fn funcptr_flags(obj: PyObjectRef) -> i64 {
+pub(super) fn funcptr_flags(obj: PyObjectRef) -> i64 {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     match unsafe { crate::baseobjspace::lookup_in_type(cls, "_flags_") } {
         Some(o) if unsafe { pyre_object::is_int(o) } => unsafe { pyre_object::w_int_get_value(o) },
@@ -352,7 +363,7 @@ fn funcptr_flags(obj: PyObjectRef) -> i64 {
     }
 }
 
-fn funcptr_addr(obj: PyObjectRef) -> usize {
+pub(super) fn funcptr_addr(obj: PyObjectRef) -> usize {
     instance_get(obj, PTR_KEY)
         .filter(|o| unsafe { pyre_object::is_int(*o) })
         .map(|o| unsafe { pyre_object::w_int_get_value(o) } as usize)
@@ -370,19 +381,22 @@ enum OwnedArg {
     Aggregate(host_ctypes::CTypeLayout, Vec<u8>),
 }
 
-fn callback_argument(ty: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub(super) fn is_simple_subclass(ty: PyObjectRef) -> bool {
     let bases = unsafe { pyre_object::typeobject::w_type_get_bases(ty) };
-    let is_simple_subclass = !bases.is_null()
+    !bases.is_null()
         && unsafe { pyre_object::w_tuple_getitem(bases, 0) }
-            .is_some_and(|base| cdata::type_code_of(base).is_some());
-    if is_simple_subclass {
+            .is_some_and(|base| cdata::type_code_of(base).is_some())
+}
+
+fn callback_argument(ty: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if is_simple_subclass(ty) {
         crate::call::type_call_instantiate(ty, &[value])
     } else {
         Ok(value)
     }
 }
 
-fn callback_result(
+pub(super) fn callback_result(
     obj: PyObjectRef,
     result: Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -452,7 +466,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_obj = args[0];
     let (call_args, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     reject_kwargs(kwargs)?;
-    if instance_get(self_obj, CALLABLE_KEY).is_some() {
+    if funcptr_addr(self_obj) == 0 && instance_get(self_obj, CALLABLE_KEY).is_some() {
         return call_python_callback(self_obj, call_args);
     }
     match funcptr_addr(self_obj) {
@@ -600,6 +614,9 @@ fn argument_address(obj: PyObjectRef) -> Result<usize, crate::PyError> {
     }
     if unsafe { pyre_object::is_bytes(obj) } {
         return Ok(unsafe { pyre_object::bytesobject::w_bytes_data(obj) }.as_ptr() as usize);
+    }
+    if is_funcptr_instance(obj) {
+        return Ok(funcptr_addr(obj));
     }
     if cdata::is_cdata_instance(obj) {
         let cls = unsafe { pyre_object::w_instance_get_type(obj) };
@@ -806,7 +823,7 @@ fn cdata_paramfunc(obj: PyObjectRef) -> String {
 
 /// Whether argument type `at` lowers to a pointer (a pointer metaclass type,
 /// an array type — which decays — or a simple pointer code like `P`/`z`/`Z`).
-fn argtype_is_pointer_kind(at: PyObjectRef) -> bool {
+pub(super) fn argtype_is_pointer_kind(at: PyObjectRef) -> bool {
     if let Some(info) = stginfo::stginfo_of(at) {
         if stginfo::stginfo_flags(info) & stginfo::TYPEFLAG_ISPOINTER != 0 {
             return true;
@@ -816,6 +833,19 @@ fn argtype_is_pointer_kind(at: PyObjectRef) -> bool {
         }
     }
     matches!(cdata::type_code_of(at).as_deref(), Some(c) if cdata::is_pointer_code(c))
+        || is_funcptr_type(at)
+}
+
+/// Whether `t` is a concrete foreign-function type (`CFUNCTYPE`/`WINFUNCTYPE`).
+pub(super) fn is_funcptr_type(t: PyObjectRef) -> bool {
+    !t.is_null()
+        && unsafe { pyre_object::is_type(t) }
+        && !std::ptr::eq(t, cfuncptr_type())
+        && unsafe { crate::baseobjspace::lookup_in_type(t, "_flags_") }.is_some()
+}
+
+fn is_funcptr_instance(obj: PyObjectRef) -> bool {
+    !obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, cfuncptr_type()) }
 }
 
 /// Whether type `t` is a by-value aggregate (struct or union).
@@ -983,6 +1013,9 @@ fn marshal_default_arg(
     if super::interp_ctypes::is_carg(arg) {
         return Ok(OwnedArg::Pointer(super::interp_ctypes::carg_ptr(arg)));
     }
+    if is_funcptr_instance(arg) {
+        return Ok(OwnedArg::Pointer(funcptr_addr(arg)));
+    }
     // A scalar cdata is passed by value.
     if cdata::is_simplecdata_instance(arg) {
         let cls = unsafe { pyre_object::w_instance_get_type(arg) };
@@ -1030,12 +1063,15 @@ fn marshal_default_arg(
 /// Resolve the address a pointer-kind argument lowers to: `byref()` carriers,
 /// `_Pointer`/`Array`/`Structure` instances, pointer-typed scalars, bytes, an
 /// integer address, or `None`.
-fn resolve_pointer_addr(
+pub(super) fn resolve_pointer_addr(
     arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<usize, crate::PyError> {
     if super::interp_ctypes::is_carg(arg) {
         return Ok(super::interp_ctypes::carg_ptr(arg));
+    }
+    if is_funcptr_instance(arg) {
+        return Ok(funcptr_addr(arg));
     }
     if cdata::is_simplecdata_instance(arg) {
         // A pointer-typed scalar stores the target address in its buffer.

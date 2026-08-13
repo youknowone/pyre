@@ -319,6 +319,18 @@ pub struct BlockingGuard {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
+/// Re-enter pyre from a foreign frame this thread released the GIL to reach,
+/// matching `rffi`'s callback path, which acquires before the first RPython
+/// instruction (`entrypoint.c:78 _RPyGilAcquire`). Takes the GIL back and
+/// rejoins the RUNNING census for as long as the guard lives, then gives both
+/// back so the outward call's `BlockingGuard` finds the state it left.
+#[must_use = "pyre may only run for as long as the guard is alive"]
+pub struct CallbackGuard {
+    rejoined: bool,
+    took_gil: bool,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
 impl Drop for BlockingGuard {
     fn drop(&mut self) {
         // `rffi.aroundstate.after()` retakes the GIL on return from a
@@ -369,6 +381,52 @@ pub fn before_external_block() -> BlockingGuard {
     BlockingGuard {
         registered,
         held_gil,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        if self.rejoined {
+            let mut state = GC_SYNC.quiesce.lock().unwrap();
+            assert!(
+                GC_THREAD.with(|t| t.running.replace(false)),
+                "GC mutator left an external callback twice"
+            );
+            state.running = state
+                .running
+                .checked_sub(1)
+                .expect("RUNNING underflow leaving external callback");
+            GC_SYNC.quiesced.notify_all();
+        }
+        if self.took_gil {
+            crate::rgil::release();
+        }
+    }
+}
+
+#[inline]
+pub fn enter_external_callback() -> CallbackGuard {
+    let took_gil = !crate::rgil::am_i_holding_the_gil();
+    if took_gil {
+        crate::rgil::acquire();
+    }
+    let registered = GC_THREAD.with(|t| t.registered.get());
+    let running = GC_THREAD.with(|t| t.running.get());
+    let mut rejoined = false;
+    if registered && !running {
+        let mut state = GC_SYNC.quiesce.lock().unwrap();
+        state = GC_SYNC
+            .resumed
+            .wait_while(state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire))
+            .unwrap();
+        state.running += 1;
+        GC_THREAD.with(|t| t.running.set(true));
+        rejoined = true;
+    }
+    CallbackGuard {
+        rejoined,
+        took_gil,
         _not_send: std::marker::PhantomData,
     }
 }

@@ -464,7 +464,14 @@ pub(super) fn lookup_symbol(
         )
     };
     match address {
-        Some(address) => Ok(address as usize),
+        // `GetProcAddress` can hand back a NULL address without reporting an
+        // error. A NULL address is not callable, so the lookup failed — the
+        // rejection the posix arm applies to a NULL `dlsym`.
+        Some(address) if address as usize != 0 => Ok(address as usize),
+        Some(_) => Err(Error::Load(format!(
+            "symbol '{}' not found",
+            String::from_utf8_lossy(symbol)
+        ))),
         None => Err(Error::Load(
             rustpython_host_env::ctypes::format_error_message(None)
                 .unwrap_or_else(|| "symbol not found".to_string()),

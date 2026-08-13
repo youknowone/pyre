@@ -54,6 +54,12 @@ pub fn before_external_block() -> majit_gc::gc_sync::BlockingGuard {
     majit_gc::gc_sync::before_external_block()
 }
 
+/// `entrypoint.c:78 _RPyGilAcquire`: retake the GIL and rejoin the collector's
+/// RUNNING census while a foreign callback runs pyre code.
+pub fn enter_external_callback() -> majit_gc::gc_sync::CallbackGuard {
+    majit_gc::gc_sync::enter_external_callback()
+}
+
 thread_local! {
     /// Set once this thread owns a mutator registration, so the entry below
     /// stays a single thread-local read on every later entry.

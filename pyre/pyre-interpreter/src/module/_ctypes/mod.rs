@@ -18,6 +18,8 @@ fn type_ns_store(ns: pyre_object::PyObjectRef, name: &str, value: pyre_object::P
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
+pub mod callbacks;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod cdata;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod funcptr;
