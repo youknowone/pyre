@@ -3148,9 +3148,22 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
     ) && fbw_foriter_inflight_top_body_pc()
         .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize);
+    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
+    // alone counts it.  The slot it writes exists only to keep a propagating
+    // exception rooted for the collector — nothing reads it back as a value —
+    // and `push_exc_info` performs the same clear at the same point, so a
+    // re-run of the body reaches the same state rather than doubling anything.
+    // That is the `is_idempotent_gc_barrier` category, and BOTH accountings of
+    // it read this one binding: the gh#467 heap-write odometer below stated the
+    // exemption while the R1 discriminator on the next line did not, so a `for`
+    // body whose only committed residual was `except`'s clear had its delivery
+    // refused and the whole iteration dropped — the outcome the refusal exists
+    // to be safer than.
+    let writes_gc_liveness_root_only = helper == majit_ir::PyreHelperKind::ClearInFlightException;
     let body_effect_candidate = !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !is_loop_var_binding_store
+        && !writes_gc_liveness_root_only
         && writes_live_heap
         && fbw_foriter_inflight_active();
     // #57 Option C (Finding #1, user-frame signal): the Void/helper-tag write
@@ -3643,14 +3656,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // The inline abort-forward-flush gate snapshots this at the CALL and refuses
     // the forward flush if a callee sub-walk moved it — re-executing the CALL
     // would double the effect.
-    // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
-    // alone would count it.  The slot it writes exists only to keep a
-    // propagating exception rooted for the collector — nothing reads it back as
-    // a value — and `push_exc_info` performs the same clear at the same point.
-    // An uncommitted walk therefore has nothing to undo and the region it
-    // hands back is not irreversible, which is the `is_idempotent_gc_barrier`
-    // category one line up.
-    let writes_gc_liveness_root_only = helper == majit_ir::PyreHelperKind::ClearInFlightException;
+    // `writes_gc_liveness_root_only` (defined with the R1 discriminator above,
+    // which reads the same binding): an uncommitted walk has nothing to undo
+    // for the exception carrier's clear, so the region it hands back is not
+    // irreversible.
     if !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !writes_gc_liveness_root_only
