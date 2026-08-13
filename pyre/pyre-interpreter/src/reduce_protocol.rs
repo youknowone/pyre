@@ -109,9 +109,20 @@ pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
 /// has no `variable_sized` layout notion to gate it on — the structure
 /// is ported without that dead arm.
 pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
-    let w_objdict = crate::baseobjspace::findattr(w_obj, "__dict__");
-    let mut w_ret = match w_objdict {
-        Some(d) if crate::baseobjspace::len_w(d)? > 0 => {
+    // Allocating the copy, storing into it and `get_slotvalues` all collect,
+    // so the receiver, its `__dict__`, the items being copied and the copy
+    // itself are read back from the shadow stack rather than kept in Rust
+    // locals across those points.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_objdict = crate::baseobjspace::findattr(current_obj(), "__dict__");
+    let mut state_slot = None;
+    if let Some(d) = w_objdict {
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(d);
+        if crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(dict_slot))? > 0 {
             // Copy `__dict__`. For a dict subclass, drop the internal
             // `__dict_data__` key it keeps its mapping payload under: that
             // payload is reconstructed through `dictitems`, not the instance
@@ -120,47 +131,72 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
             // A non-dict instance keeps a user attribute of that name.
             let is_dict_inst = {
                 let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-                unsafe { crate::baseobjspace::isinstance_w(w_obj, w_dict_type) }
+                unsafe { crate::baseobjspace::isinstance_w(current_obj(), w_dict_type) }
             };
-            let w_copy = pyre_object::w_dict_new();
+            let copy_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+            let items = unsafe {
+                pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+            };
+            let items_slot = pyre_object::gc_roots::shadow_stack_len();
+            for (k, v) in &items {
+                pyre_object::gc_roots::pin_root(*k);
+                pyre_object::gc_roots::pin_root(*v);
+            }
             let mut count = 0usize;
-            for (k, v) in unsafe { pyre_object::w_dict_items(d) } {
+            for index in 0..items.len() {
+                let k = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index);
+                let v = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index + 1);
                 if is_dict_inst
                     && unsafe { pyre_object::is_str(k) }
                     && unsafe { pyre_object::w_str_get_value(k) } == "__dict_data__"
                 {
                     continue;
                 }
-                unsafe { pyre_object::w_dict_store(w_copy, k, v) };
+                unsafe {
+                    pyre_object::w_dict_store(
+                        pyre_object::gc_roots::shadow_stack_get(copy_slot),
+                        k,
+                        v,
+                    )
+                };
                 count += 1;
             }
             if count > 0 {
-                w_copy
-            } else {
-                pyre_object::w_none()
+                state_slot = Some(copy_slot);
             }
         }
-        _ => pyre_object::w_none(),
-    };
-    let w_slots = get_slotvalues(w_obj)?;
-    if !unsafe { pyre_object::is_none(w_slots) } {
-        w_ret = pyre_object::w_tuple_new(vec![w_ret, w_slots]);
     }
-    Ok(w_ret)
+    let w_slots = get_slotvalues(current_obj())?;
+    let w_ret = match state_slot {
+        Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+        None => pyre_object::w_none(),
+    };
+    if unsafe { pyre_object::is_none(w_slots) } {
+        return Ok(w_ret);
+    }
+    Ok(pyre_object::w_tuple_new(vec![w_ret, w_slots]))
 }
 
 /// objectobject.py:201 `_getnewargs(space, w_obj)` — returns
 /// `(hasargs, w_args, w_kwargs)`.
 pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
-    let w_type = crate::typedef::r#type(w_obj)
+    // `__getnewargs_ex__`/`__getnewargs__` run arbitrary Python and the
+    // no-args branch allocates the empty tuple, so `w_obj` moves underneath
+    // this frame.  Read it back from the shadow stack for every later use.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_type = crate::typedef::r#type(current_obj())
         .ok_or_else(|| PyError::type_error("cannot determine type for __getnewargs__"))?;
-    let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs_ex__") };
+    let w_descr = unsafe { crate::baseobjspace::lookup(current_obj(), "__getnewargs_ex__") };
     let hasargs;
     let w_args;
     let w_kwargs;
     if let Some(w_descr) = w_descr {
         let w_result = unsafe {
-            crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type.as_ptr(), &[])
+            crate::baseobjspace::get_and_call_function(w_descr, current_obj(), w_type.as_ptr(), &[])
         }?;
         if !unsafe { pyre_object::is_tuple(w_result) } {
             return Err(PyError::type_error(format!(
@@ -193,10 +229,15 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
         w_args = wa;
         w_kwargs = wk;
     } else {
-        let w_descr = unsafe { crate::baseobjspace::lookup(w_obj, "__getnewargs__") };
+        let w_descr = unsafe { crate::baseobjspace::lookup(current_obj(), "__getnewargs__") };
         if let Some(w_descr) = w_descr {
             let wa = unsafe {
-                crate::baseobjspace::get_and_call_function(w_descr, w_obj, w_type.as_ptr(), &[])
+                crate::baseobjspace::get_and_call_function(
+                    w_descr,
+                    current_obj(),
+                    w_type.as_ptr(),
+                    &[],
+                )
             }?;
             if !unsafe { pyre_object::is_tuple(wa) } {
                 return Err(PyError::type_error(format!(
@@ -256,9 +297,15 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
 
 /// objectobject.py:23 `reduce_1(obj, proto)` — app-level handle.
 fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
+    // Boxing `proto` allocates, so the receiver cannot be copied into the
+    // argument array before it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let w_proto = pyre_object::w_int_new(proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_1),
-        &[w_obj, pyre_object::w_int_new(proto)],
+        &[pyre_object::gc_roots::shadow_stack_get(obj_slot), w_proto],
     )
 }
 
@@ -269,23 +316,52 @@ fn reduce_2(
     w_args: PyObjectRef,
     w_kwargs: PyObjectRef,
 ) -> PyResult {
+    // Same as `reduce_1`: boxing `proto` allocates, and here it would move
+    // three already-copied references.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    pyre_object::gc_roots::pin_root(w_args);
+    pyre_object::gc_roots::pin_root(w_kwargs);
+    let w_proto = pyre_object::w_int_new(proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_2),
-        &[w_obj, pyre_object::w_int_new(proto), w_args, w_kwargs],
+        &[
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            w_proto,
+            pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
+            pyre_object::gc_roots::shadow_stack_get(obj_slot + 2),
+        ],
     )
 }
 
 /// objectobject.py:260 `descr__reduce_ex__(space, w_obj, proto)`.
 pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
+    // Every attribute lookup below can run Python, and `getnewargs` allocates
+    // even when the type defines neither hook, so the receiver and the
+    // arguments it produced have to come back off the shadow stack rather than
+    // out of a Rust local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     // Honour a user `__reduce__` override:
     // `type(obj).__reduce__ is not object.__reduce__`.
-    let w_reduce = crate::baseobjspace::findattr(w_obj, "__reduce__");
+    let w_reduce = crate::baseobjspace::findattr(current_obj(), "__reduce__");
     if let Some(w_reduce) = w_reduce {
-        let w_type = crate::typedef::r#type(w_obj)
+        let reduce_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_reduce);
+        let w_type = crate::typedef::r#type(current_obj())
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         let w_cls_reduce = crate::baseobjspace::getattr_str(w_type.as_ptr(), "__reduce__")?;
+        // Both sides of the identity test have to survive the second lookup,
+        // or a collection between them reports a spurious override.
+        let cls_reduce_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_cls_reduce);
         let w_obj_reduce =
             crate::baseobjspace::getattr_str(crate::typedef::w_object(), "__reduce__")?;
+        let w_cls_reduce = pyre_object::gc_roots::shadow_stack_get(cls_reduce_slot);
+        let w_reduce = pyre_object::gc_roots::shadow_stack_get(reduce_slot);
         let mut override_ = !crate::baseobjspace::is_w(w_cls_reduce, w_obj_reduce);
         // Built-in types (range, the iterators) expose `__reduce__`
         // through instance dispatch rather than the type MRO, so the
@@ -302,7 +378,10 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
             override_ = !crate::baseobjspace::is_w(w_inst_func, w_obj_reduce);
         }
         if override_ {
-            return crate::call::call_function_impl_result(w_reduce, &[]);
+            return crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(reduce_slot),
+                &[],
+            );
         }
     }
     if proto >= 2 {
@@ -312,15 +391,18 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION`; check it before collecting new
         // arguments, exactly as `reduce_newobj` does.  Coroutine objects and
         // their `__await__` wrappers both have this shape.
-        let w_type = crate::typedef::r#type(w_obj)
+        let w_type = crate::typedef::r#type(current_obj())
             .ok_or_else(|| PyError::type_error("cannot determine type for __reduce_ex__"))?;
         if unsafe { pyre_object::w_type_disallows_instantiation(w_type.as_ptr()) } {
             return Err(PyError::type_error(format!(
                 "cannot pickle '{}' object",
-                typename(w_obj)
+                typename(current_obj())
             )));
         }
-        let (hasargs, w_args, w_kwargs) = getnewargs(w_obj)?;
+        let (hasargs, w_args, w_kwargs) = getnewargs(current_obj())?;
+        let args_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_args);
+        pyre_object::gc_roots::pin_root(w_kwargs);
         // objectobject.py:276 / `_PyObject_GetState(required)`: a type whose
         // instances carry C-level state that `__dict__`/`__slots__` cannot
         // reconstruct, and that supplies no `__getnewargs__`, cannot be
@@ -336,18 +418,23 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // CPython 3.14 for every pickle protocol.
         if !hasargs
             && unsafe {
-                pyre_object::is_module(w_obj)
-                    || pyre_object::memoryview::is_w_memoryview(w_obj)
-                    || pyre_object::function::is_staticmethod(w_obj)
-                    || pyre_object::function::is_classmethod(w_obj)
+                pyre_object::is_module(current_obj())
+                    || pyre_object::memoryview::is_w_memoryview(current_obj())
+                    || pyre_object::function::is_staticmethod(current_obj())
+                    || pyre_object::function::is_classmethod(current_obj())
             }
         {
             return Err(PyError::type_error(format!(
                 "cannot pickle '{}' object",
-                typename(w_obj)
+                typename(current_obj())
             )));
         }
-        return reduce_2(w_obj, proto, w_args, w_kwargs);
+        return reduce_2(
+            current_obj(),
+            proto,
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            pyre_object::gc_roots::shadow_stack_get(args_slot + 1),
+        );
     }
-    reduce_1(w_obj, proto)
+    reduce_1(current_obj(), proto)
 }
