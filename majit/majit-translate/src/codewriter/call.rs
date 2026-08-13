@@ -4700,6 +4700,30 @@ impl CallControl {
     /// `CallPath`; otherwise it falls back to the stable symbolic address
     /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
+        // A `__pyre_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
+        // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
+        // one-register-per-slot residual-call ABI can carry. The codewriter
+        // gives every wrapper its own jitcode and inlines it, so refusing the
+        // address here costs nothing and prevents a wrong-ABI call if inlining
+        // is ever declined. This guard precedes every resolution arm because a
+        // wrapper otherwise resolves through `target_to_path` and never reaches
+        // the symbolic tail. Both resolution arms below return
+        // `symbolic_fnaddr_for_path(&path)` when `function_fnaddrs` misses, so
+        // deriving the refusal from the same path makes a fire on a path that
+        // would have missed byte-identical to the unguarded result. Only a fire
+        // that refuses a resolved address changes the constant, keeping that
+        // change attributable to a real refusal.
+        let wrapper_path = crate::model::fn_const_segments(target)
+            .map(|segments| CallPath::from_segments(segments.iter().map(String::as_str)))
+            .or_else(|| self.target_to_path(target));
+        if let Some(path) = &wrapper_path
+            && path
+                .last_segment()
+                .is_some_and(|leaf| leaf.starts_with("__pyre_wrap_"))
+        {
+            return symbolic_fnaddr_for_path(path);
+        }
+
         if let Some(segments) = crate::model::fn_const_segments(target) {
             let path = CallPath::from_segments(segments.iter().map(String::as_str));
             return self
