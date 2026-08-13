@@ -1,8 +1,8 @@
 use std::ops::{Index, IndexMut};
 
 use crate::object_array::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock,
-    alloc_typed_items_block, dealloc_typed_items_block, grow_typed_items_block,
+    TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TypedItemsBlock, alloc_typed_items_block,
+    dealloc_typed_items_block, gc_float_array_gc_type_id, grow_typed_items_block,
     typed_items_block_capacity,
 };
 
@@ -52,7 +52,7 @@ impl FloatArray {
     pub fn from_vec(values: Vec<f64>) -> Self {
         let len = values.len();
         let arr = Self {
-            block: unsafe { alloc_typed_items_block(len, GC_FLOAT_ARRAY_GC_TYPE_ID) },
+            block: unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) },
             len,
         };
         unsafe {
@@ -137,7 +137,12 @@ impl FloatArray {
             .max(self.capacity().saturating_mul(2))
             .max(FLOAT_ARRAY_INLINE_CAP);
         self.block = unsafe {
-            grow_typed_items_block(self.block, target_cap, self.len, GC_FLOAT_ARRAY_GC_TYPE_ID)
+            grow_typed_items_block(
+                self.block,
+                target_cap,
+                self.len,
+                gc_float_array_gc_type_id(),
+            )
         };
     }
 

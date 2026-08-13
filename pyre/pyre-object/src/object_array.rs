@@ -7,12 +7,17 @@ use crate::{PY_NULL, PyObjectRef};
 // live with `rbigint`, whose `_digits` is lowered to one
 // (`majit_rlib::lltypesystem::rlist`). The stable-tier constructors below are
 // this crate's, because they root through this crate's shadow stack.
+// The two `GcArray` tids are read through accessors rather than re-exported as
+// constants: they are slots in *this* host's type registry, so pyre declares
+// them from its own `gc.register_type` results (`pyre-jit/src/eval.rs`) instead
+// of majit-rlib carrying pyre's numbering.
 pub use majit_rlib::lltypesystem::rlist::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
-    TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock, alloc_typed_items_block_immortal,
-    alloc_typed_items_block_nursery, itemsblock_gc_enabled, try_alloc_typed_items_block_nursery,
-    try_typed_items_block_layout, typed_items_block_capacity, typed_items_block_clear,
-    typed_items_block_items_base, typed_items_block_layout,
+    TYPED_ITEMS_BLOCK_ITEMS_OFFSET, TYPED_ITEMS_BLOCK_LEN_OFFSET, TypedItemsBlock,
+    alloc_typed_items_block_immortal, alloc_typed_items_block_nursery, gc_float_array_gc_type_id,
+    gc_int_array_gc_type_id, itemsblock_gc_enabled, set_gc_float_array_gc_type_id,
+    set_gc_int_array_gc_type_id, try_alloc_typed_items_block_nursery, try_typed_items_block_layout,
+    typed_items_block_capacity, typed_items_block_clear, typed_items_block_items_base,
+    typed_items_block_layout,
 };
 
 /// GC type id for the variable-length backing block of
@@ -660,14 +665,14 @@ unsafe fn grow_items_block(
 // in, which roots through this crate's shadow stack, plus the array tokens the
 // descr registry reads.
 
-/// `get_array_token(GcArray(Signed))` — [`GC_INT_ARRAY_GC_TYPE_ID`].
+/// `get_array_token(GcArray(Signed))` — [`gc_int_array_gc_type_id`].
 pub const TYPED_ITEMS_BLOCK_INT_TOKEN: ArrayToken = ArrayToken {
     base_size: TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
     item_size: std::mem::size_of::<i64>(),
     len_offset: TYPED_ITEMS_BLOCK_LEN_OFFSET,
 };
 
-/// `get_array_token(GcArray(Float))` — [`GC_FLOAT_ARRAY_GC_TYPE_ID`]. A distinct
+/// `get_array_token(GcArray(Float))` — [`gc_float_array_gc_type_id`]. A distinct
 /// ARRAY identity from the signed one, sharing this block's layout.
 pub const TYPED_ITEMS_BLOCK_FLOAT_TOKEN: ArrayToken = ArrayToken {
     base_size: TYPED_ITEMS_BLOCK_ITEMS_OFFSET,

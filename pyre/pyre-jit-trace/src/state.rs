@@ -3446,7 +3446,7 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
     crate::descr::make_array_descr_with_type(
         token.base_size,
         token.item_size,
-        pyre_object::GC_INT_ARRAY_GC_TYPE_ID,
+        pyre_object::gc_int_array_gc_type_id(),
         Some(token.len_offset),
         Type::Int,
         true,
@@ -3493,7 +3493,7 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
     crate::descr::make_array_descr_with_type(
         token.base_size,
         token.item_size,
-        pyre_object::GC_FLOAT_ARRAY_GC_TYPE_ID,
+        pyre_object::gc_float_array_gc_type_id(),
         Some(token.len_offset),
         Type::Float,
         false,

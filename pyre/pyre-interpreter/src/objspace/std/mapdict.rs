@@ -3179,7 +3179,7 @@ impl MapdictObject for Object {
 /// rerased `erase_unboxed` / `unerase_unboxed` (mapdict.py:38-41) — the
 /// unboxed longlong list lives in an otherwise-`PyObjectRef` storage slot.
 ///
-/// The list is a varsize leaf GcArray (`GC_INT_ARRAY_GC_TYPE_ID`), so the slot
+/// The list is a varsize leaf GcArray (`gc_int_array_gc_type_id()`), so the slot
 /// holds an ordinary GC reference like every other storage slot: the collector
 /// marks it through the instance and reclaims it when the instance dies, and no
 /// walker has to be told to skip the slot. Every mutation allocates a fresh
@@ -3195,7 +3195,7 @@ fn erase_unboxed(values: &[i64]) -> PyObjectRef {
     unsafe {
         let block = pyre_object::object_array::alloc_typed_items_block(
             values.len(),
-            pyre_object::object_array::GC_INT_ARRAY_GC_TYPE_ID,
+            pyre_object::object_array::gc_int_array_gc_type_id(),
         );
         std::ptr::copy_nonoverlapping(
             values.as_ptr(),

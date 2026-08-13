@@ -558,8 +558,10 @@ pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
 // Array GC type ids live in `pyre-object` alongside the backing storage
 // structs/constants they describe (matching W_INT/W_FLOAT/W_LIST/W_TUPLE
 // pattern). Re-exported here for existing call sites.
+// The two `GcArray` tids are accessors, not constants: pyre declares them from
+// its own `gc.register_type` results at GC build time (`pyre-jit/src/eval.rs`).
 pub use pyre_object::object_array::{
-    GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+    PY_OBJECT_ARRAY_GC_TYPE_ID, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
 };
 pub use pyre_object::tupleobject::W_TUPLE_GC_TYPE_ID;
 // GC type ids for `W_SpecialisedTupleObject_{ii,ff,oo}` live in

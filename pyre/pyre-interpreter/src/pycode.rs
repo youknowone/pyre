@@ -474,7 +474,7 @@ pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::Gc
 /// a `debug_assert_eq!` in the pyre-jit type-registration sequence: the
 /// `PyCode` `TypeInfo` is registered explicitly just before the
 /// foreign-pytype loop, taking the slot directly after
-/// `GC_FLOAT_ARRAY_GC_TYPE_ID = 42`.  Pre-registering it there (and
+/// the two `GcArray` tids (41 and 42 in that order).  Pre-registering it there (and
 /// inserting `CODE_TYPE` into `pytype_to_tid`) makes the foreign loop
 /// skip `CODE_TYPE`, so the net register-call count up to
 /// `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged and no downstream tid

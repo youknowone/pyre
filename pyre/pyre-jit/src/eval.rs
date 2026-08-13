@@ -1436,17 +1436,17 @@ enum JitAction {
 
 use crate::jit::descr::{
     BUILTIN_CODE_GC_TYPE_ID, FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID,
-    FUNCTION_GC_TYPE_ID, GC_FLOAT_ARRAY_GC_TYPE_ID, GC_INT_ARRAY_GC_TYPE_ID, JITFRAME_GC_TYPE_ID,
-    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
-    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
-    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BASE_EXCEPTION_GC_TYPE_ID,
-    W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
-    W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID, W_DICT_PROXY_GC_TYPE_ID,
-    W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID,
-    W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID, W_MODULE_DICT_GC_TYPE_ID,
-    W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID, W_SEQ_ITER_GC_TYPE_ID,
-    W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID, W_SUPER_GC_TYPE_ID,
-    W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID, W_UNION_GC_TYPE_ID,
+    FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID,
+    PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID, SPECIALISED_TUPLE_FF_GC_TYPE_ID,
+    SPECIALISED_TUPLE_II_GC_TYPE_ID, SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID,
+    W_BASE_EXCEPTION_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID,
+    W_CELL_GC_TYPE_ID, W_CLASSMETHOD_GC_TYPE_ID, W_COUNT_GC_TYPE_ID, W_DICT_GC_TYPE_ID,
+    W_DICT_PROXY_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_GENERATOR_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    W_LIST_GC_TYPE_ID, W_LONG_GC_TYPE_ID, W_MEMBER_GC_TYPE_ID, W_METHOD_GC_TYPE_ID,
+    W_MODULE_DICT_GC_TYPE_ID, W_MODULE_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID,
+    W_SEQ_ITER_GC_TYPE_ID, W_SET_GC_TYPE_ID, W_SLICE_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
+    W_SUPER_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID, W_TYPE_GC_TYPE_ID, W_UNICODE_GC_TYPE_ID,
+    W_UNION_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -2497,7 +2497,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         false,
         Vec::new(),
     ));
-    debug_assert_eq!(gc_int_array_tid, GC_INT_ARRAY_GC_TYPE_ID);
+    // Declare the slot to `majit-rlib`, which owns the block but has no
+    // registry of its own: `Digits::new` and the list-strategy allocators
+    // stamp this word into every items-block header, and the collector indexes
+    // *this* registry with it. Announcing the value the line above just
+    // returned is what keeps the two ends the same host's.
+    pyre_object::object_array::set_gc_int_array_gc_type_id(gc_int_array_tid);
     let float_token = &pyre_object::TYPED_ITEMS_BLOCK_FLOAT_TOKEN;
     let gc_float_array_tid = gc.register_type(TypeInfo::varsize(
         float_token.base_size,
@@ -2506,7 +2511,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         false,
         Vec::new(),
     ));
-    debug_assert_eq!(gc_float_array_tid, GC_FLOAT_ARRAY_GC_TYPE_ID);
+    pyre_object::object_array::set_gc_float_array_gc_type_id(gc_float_array_tid);
     // `pypy/interpreter/pycode.py:52 class PyCode(W_Root)` — code
     // objects are normal GC heap objects in PyPy.  Pre-register
     // `PyCode` here, immediately after the GcArray tids and
