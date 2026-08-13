@@ -2090,6 +2090,20 @@ impl<S: JitState> JitDriver<S> {
         self.meta.backend_mut().set_gc_allocator(gc);
     }
 
+    /// Route compiled `New` / `NewWithVtable` through the installed GC
+    /// allocator instead of the backend's `malloc` stub.
+    ///
+    /// The backends have carried this setting since it was added for aheui's
+    /// nursery-backed nodes, and until now none of them had a caller: it is an
+    /// inherent method on each backend struct, and `backend_mut` is private, so
+    /// no consumer of `JitDriver` could reach it. Only the dynasm backend acts
+    /// on it — cranelift already routes `New` through an installed GC, and the
+    /// wasm backend takes it as a no-op — so on those two the setting is
+    /// already the behaviour and this call is a statement of intent.
+    pub fn set_new_via_gc(&mut self, enabled: bool) {
+        self.meta.backend_mut().set_new_via_gc(enabled);
+    }
+
     /// llmodel.py:64-69 self.vtable_offset configuration.
     /// Frontend supplies the byte offset of the type pointer field, mirroring
     /// RPython's `symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...)`.
