@@ -477,6 +477,125 @@ fn build_module_default(
     )
 }
 
+/// Count the direct `wasm_jit_write_barrier` table calls by their unique table
+/// target immediate.  The direct lowering places that `i32.const` immediately
+/// before its `call_indirect`.
+fn direct_write_barrier_call_count(bytes: &[u8], target: i32) -> usize {
+    let mut count = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            let mut target_on_stack = false;
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I32Const { value } if value == target => {
+                        target_on_stack = true;
+                    }
+                    wasmparser::Operator::CallIndirect { .. } if target_on_stack => {
+                        count += 1;
+                        target_on_stack = false;
+                    }
+                    _ => target_on_stack = false,
+                }
+            }
+        }
+    }
+    count
+}
+
+fn build_module_with_write_barrier_target(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    write_barrier_target: i64,
+) -> Vec<u8> {
+    let (bytes, _, _, _, _) = codegen::build_wasm_module(
+        inputargs,
+        ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        codegen::AllocHelpers::default(),
+        write_barrier_target,
+        None,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // The allocated trace keeps both Ref inputs live across New; reserve
+        // their homes in the shared helper geometry.
+        codegen::FrameGeometry::compact(4, 2, 0),
+        codegen::CaParams::default(),
+    )
+    .expect("wasm codegen should succeed");
+    bytes
+}
+
+#[test]
+fn write_barrier_elision_keeps_one_barrier_per_base() {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+
+    const WB_TARGET: i64 = 0x4a11;
+    let pointer_field = Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+    let finish = Op::new(OpCode::Finish, &[]);
+
+    let new_obj = make_op(OpCode::New, &[], OpRef::ref_op(2));
+    new_obj.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 1)));
+    let new_store_a = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(0))],
+    );
+    new_store_a.setdescr(pointer_field.clone());
+    let new_store_b = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(1))],
+    );
+    new_store_b.setdescr(pointer_field.clone());
+    let allocated = build_module_with_write_barrier_target(
+        &[
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ],
+        &[new_obj, new_store_a, new_store_b, finish.clone()],
+        WB_TARGET,
+    );
+    validate_wasm(&allocated);
+    assert_eq!(
+        direct_write_barrier_call_count(&allocated, WB_TARGET as i32),
+        1,
+        "an allocation result is not seeded into the applied set — its generation \
+         is a runtime choice — so the first store barriers and the second is elided"
+    );
+
+    let live_store_a = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+    );
+    live_store_a.setdescr(pointer_field.clone());
+    let live_store_b = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(2))],
+    );
+    live_store_b.setdescr(pointer_field);
+    let repeated_livein = build_module_with_write_barrier_target(
+        &[
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type(Type::Ref, 2),
+        ],
+        &[live_store_a, live_store_b, finish],
+        WB_TARGET,
+    );
+    validate_wasm(&repeated_livein);
+    assert_eq!(
+        direct_write_barrier_call_count(&repeated_livein, WB_TARGET as i32),
+        1,
+        "repeated stores into one live-in base must emit one write-barrier call"
+    );
+}
+
 fn execute_ovf_trace_with_guard(
     opcode: OpCode,
     guard_opcode: OpCode,

@@ -727,6 +727,26 @@ fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
 
+/// wasm emission's complete SETFIELD_GC write-barrier gate.  The import census
+/// deliberately keeps using [`write_barrier_base`]: it must remain an
+/// un-elided over-approximation so an arm that emits a barrier always has the
+/// `jit_call` import available.  Unlike SETARRAYITEM_GC, a SETFIELD_GC can
+/// carry a non-pointer field descriptor even when its value has a Ref home
+/// (the ForceToken layout is one such case).  rewrite.rs:1917-1923 rejects
+/// that store because the collector does not trace the field.
+fn emitted_write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
+    let base = write_barrier_base(op, ref_values)?;
+    if op.opcode == OpCode::SetfieldGc
+        && !op
+            .getdescr()
+            .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(base)
+}
+
 /// Whether any op in the trace needs a write-barrier trampoline call, which
 /// requires the `jit_call` import to be present.
 fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
@@ -2168,8 +2188,17 @@ fn build_function(
     let mut labels_passed = 0usize;
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
+    // rewrite.py:41-45 `_write_barrier_applied`, represented by
+    // RewriteState::wb_applied in rewrite.rs.  A base enters this set after
+    // its barrier is emitted or when a nursery allocation produces it; clear
+    // at every potentially-collecting op and LABEL so this describes every
+    // path reaching the next op, including entry through a LABEL loader.
+    let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
+        if op.opcode == OpCode::Label || op.opcode.can_malloc() {
+            wb_applied.clear();
+        }
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
             // Branch over the resume loader, then close C_j, emit the loader
@@ -2919,7 +2948,9 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
+                if let Some(base) = emitted_write_barrier_base(op, ref_values)
+                    && !wb_applied.contains(&base)
+                {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -2929,6 +2960,9 @@ fn build_function(
                         wb_fn_ptr,
                         base,
                     );
+                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
+                    // only after the barrier has been emitted.
+                    wb_applied.insert(base);
                 }
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
@@ -3013,7 +3047,9 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                if let Some(base) = write_barrier_base(op, ref_values) {
+                if let Some(base) = emitted_write_barrier_base(op, ref_values)
+                    && !wb_applied.contains(&base)
+                {
                     emit_write_barrier(
                         &mut sink,
                         constants,
@@ -3023,6 +3059,9 @@ fn build_function(
                         wb_fn_ptr,
                         base,
                     );
+                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
+                    // only after the barrier has been emitted.
+                    wb_applied.insert(base);
                 }
                 emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
@@ -4324,6 +4363,22 @@ fn build_function(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
                     );
                 }
+                // No `remember_wb` for the result. rewrite.rs:1130 and :2731
+                // seed it only on the branches that reached
+                // `can_use_nursery`; the `gen_malloc_fixedsize` decline does
+                // not, and :2720 spells out why — "the first result can come
+                // from an old-gen slow path whose TRACK_YOUNG_PTRS flag
+                // gen_initialize_tid intentionally preserves". Here the
+                // generation is not a codegen-time fact at all: a
+                // `non_moving` descr routes to `new_oldgen_fn_ptr`, whose
+                // `alloc_in_oldgen` stamps TRACK_YOUNG_PTRS, and the plain
+                // helper picks nursery or old-gen at runtime (the GC spells
+                // that out through `alloc_nursery_collecting_typed_rooted`'s
+                // `needs_write_barrier` out-parameter). Eliding here would
+                // drop the barrier on a fresh old object, losing an
+                // old-to-young edge. The inline flag test already makes the
+                // young case a load and a not-taken branch, so the elision
+                // this forgoes is the cheap one.
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos.get().raw();
@@ -4685,6 +4740,9 @@ fn build_function(
                         &mut sink, ref_homes, &liveness, op_idx, skip, frame,
                     );
                 }
+                // No `remember_wb` for the result, for the reason the
+                // New/NewWithVtable arm above gives: a `non_moving` array
+                // descr routes to `new_array_oldgen_fn_ptr`.
             }
 
             // ── Misc ──
