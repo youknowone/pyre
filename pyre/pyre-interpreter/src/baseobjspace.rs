@@ -16261,18 +16261,44 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         //         self.w_prev = w_next
         //         return space.newtuple2(w_prev, w_next)
         if pyre_object::interp_itertools::is_pairwise(obj) {
-            let it = &mut *(obj as *mut pyre_object::interp_itertools::W_Pairwise);
-            let mut w_prev = it.w_prev;
-            if w_prev.is_null() {
-                w_prev = next(it.w_iterator)?;
+            use pyre_object::interp_itertools as pairwise;
+
+            // `space.next` may allocate and move either yielded item. RPython's
+            // shadow-stack transform keeps `self` and `w_prev` live across the
+            // second call and reloads both before the final stores/newtuple2.
+            // Keep the same livevar set explicitly; in particular, the
+            // barriered `self.w_prev` field is forwarded by a minor collection
+            // but a raw Rust local copied before that collection is not.
+            // The bracket claims its whole livevar set up front, so a slot's
+            // index does not depend on which arm ran. `w_prev` is PY_NULL until
+            // the first result and `w_next` has no value yet, and reserving a
+            // slot for each is what lets the reloads below be plain `get`s; a
+            // null slot is what the root walkers already read as "no root".
+            const SELF: usize = 0;
+            const ITERATOR: usize = 1;
+            const PREV: usize = 2;
+            const NEXT: usize = 3;
+
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.base();
+            roots.pin_root(obj);
+            roots.pin_root(pairwise::w_pairwise_get_iterator(roots.get(base + SELF)));
+            roots.pin_root(pairwise::w_pairwise_get_prev(roots.get(base + SELF)));
+            roots.pin_root(std::ptr::null_mut());
+
+            if roots.get(base + PREV).is_null() {
+                let w_prev = next(roots.get(base + ITERATOR))?;
+                roots.set(base + PREV, w_prev);
                 // set before fetching w_next to handle reentrancy
-                it.w_prev = w_prev;
-                pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+                pairwise::w_pairwise_set_prev(roots.get(base + SELF), roots.get(base + PREV));
             }
-            let w_next = next(it.w_iterator)?;
-            it.w_prev = w_next;
-            pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-            return Ok(pyre_object::w_tuple_new(vec![w_prev, w_next]));
+            let w_next = next(roots.get(base + ITERATOR))?;
+            roots.set(base + NEXT, w_next);
+            pairwise::w_pairwise_set_prev(roots.get(base + SELF), roots.get(base + NEXT));
+            return Ok(pyre_object::w_tuple_new(vec![
+                roots.get(base + PREV),
+                roots.get(base + NEXT),
+            ]));
         }
         // itertools.cycle — interp_itertools.py W_Cycle.next_w
         //
