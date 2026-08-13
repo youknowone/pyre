@@ -3092,6 +3092,18 @@ impl<S: JitState> JitDriver<S> {
                                         // `close_bridge` directly and have no such path.
                                         crate::mc_diag_bump(67); // bridge_unattempted_close
                                     }
+                                    // pyjitpl.py:1574 `self.pc = saved_pc` resumes at the
+                                    // merge point that was CONSULTED — the one whose greens
+                                    // `get_procedure_token` read (pyjitpl.py:3005), which is
+                                    // this one. The `continue` below re-runs the walk with
+                                    // the native interpreter's `pc` untouched, i.e. at the
+                                    // position the walk STARTED from, while the symbolic
+                                    // state stands here. Publish the position half before
+                                    // dropping the only record of it, or the re-entered walk
+                                    // replays the instructions between the two against state
+                                    // that belongs to neither.
+                                    ctx.walk_resume_pc =
+                                        ctx.close_green_pc.and_then(|p| usize::try_from(p).ok());
                                     ctx.close_greens = None;
                                     ctx.close_green_pc = None;
                                     ctx.merge_point_resumed = true;
@@ -8967,6 +8979,108 @@ mod cross_loop_cut_close_tests {
         assert!(
             driver.is_tracing(),
             "the walk keeps recording, as on the declined-attempt path",
+        );
+    }
+
+    /// `close_jumping_into` with the walk-entry bookkeeping the
+    /// `jit_merge_point!` expansion performs, and with a `close_green_pc` the
+    /// caller chooses.  Returns the `walk_resume_pc` observed at the top of
+    /// each walk — one entry per invocation of the closure, which is what the
+    /// macro reads to decide where to seed the walk.
+    fn close_jumping_into_observing_resume(
+        driver: &mut JitDriver<CutCloseState>,
+        target: u64,
+        close_pc: Option<i64>,
+    ) -> Vec<Option<usize>> {
+        let mut observed = Vec::new();
+        driver.merge_point(|meta, _sym| {
+            let Some(ctx) = meta.trace_ctx() else {
+                return TraceAction::Continue;
+            };
+            observed.push(ctx.walk_resume_pc.take());
+            if std::mem::take(&mut ctx.merge_point_resumed) {
+                return TraceAction::Continue;
+            }
+            ctx.close_greens = Some(inner_greens());
+            ctx.close_green_pc = close_pc;
+            ctx.close_jump_into_key = Some(target);
+            TraceAction::CloseLoop
+        });
+        observed
+    }
+
+    /// Where a declined close re-enters the walk.
+    ///
+    /// pyjitpl.py:1571/1574 `saved_pc`: upstream consults one merge point per
+    /// `opimpl_jit_merge_point` call, so the position that entered the call and
+    /// the position that declined cannot differ.  A pyre walk covers a whole
+    /// segment, so they can — and only the second one names the state the walk
+    /// is carrying.  The driver hands that pc over; the walk is re-seeded from
+    /// it rather than from wherever the segment began.
+    ///
+    /// `close_jumping_into`, which the rest of this module drives, publishes no
+    /// `close_green_pc` at all, so none of those tests can tell the two pcs
+    /// apart.
+    #[test]
+    fn a_declined_close_hands_over_the_pc_that_declined() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7081u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        // Deliberately unrelated to the trace's own header, which is what a
+        // close reached deeper in the walk than its entry looks like.
+        let declining_pc = 385i64;
+        start_outer_trace(&mut driver, 7082);
+        let seen = close_jumping_into_observing_resume(&mut driver, inner_key, Some(declining_pc));
+
+        assert!(
+            driver.is_tracing(),
+            "premise: the decline keeps tracing, so there is a re-entry to check",
+        );
+        assert_eq!(
+            seen.len(),
+            2,
+            "the declined close re-runs the walk exactly once",
+        );
+        assert_eq!(
+            seen[0], None,
+            "the first walk is seeded by its caller; nothing has declined yet",
+        );
+        assert_eq!(
+            seen[1],
+            Some(declining_pc as usize),
+            "the re-entered walk must be seeded at the merge point that \
+             declined. Seeded at the pc that entered the walk instead, it \
+             re-executes everything between the two against the state it \
+             already advanced past, and closes a loop whose registered green \
+             key contradicts the state its own JUMP carries",
+        );
+    }
+
+    /// …and a close that names no pc leaves the seed alone, rather than
+    /// pointing the walk at 0.  The pc is the merge point's green
+    /// (pyjitpl.py:3005), so a driver whose merge point yields none has
+    /// nothing to correct and keeps the pc it was called with.
+    #[test]
+    fn a_declined_close_without_a_pc_hands_over_nothing() {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let inner_key = 7091u64;
+        compile_inner_loop(&mut driver, inner_key, /* cut */ true);
+
+        start_outer_trace(&mut driver, 7092);
+        let seen = close_jumping_into_observing_resume(&mut driver, inner_key, None);
+
+        assert_eq!(
+            seen.len(),
+            2,
+            "the declined close re-runs the walk exactly once"
+        );
+        assert!(
+            seen.iter().all(Option::is_none),
+            "with no pc published there is nothing to re-seed from, and the \
+             walk keeps the pc its caller passed",
         );
     }
 

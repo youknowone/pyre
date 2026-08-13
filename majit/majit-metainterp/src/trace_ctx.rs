@@ -450,16 +450,38 @@ pub struct TraceCtx {
     /// merge point asserts the flag equals its own `jdindex`. Consumed
     /// (`take`) by the first merge point, which then stamps that `jdindex`.
     pub bridge_resume_at_position: bool,
-    /// pyjitpl.py:1570/1577 `saved_pc = self.pc` / `self.pc = saved_pc`.
+    /// pyjitpl.py:1571/1574 `saved_pc = self.pc` / `self.pc = saved_pc`, the
+    /// "do not re-consult the merge point" half. [`Self::walk_resume_pc`] is
+    /// the position half.
     ///
     /// Upstream consults a merge point once per visit and then resumes the
     /// frame just after it, so the loop body runs before the next consult.
     /// Pyre fuses the merge point onto the guest instruction hosting it, so a
-    /// walk re-entered at the same guest pc — the `current_merge_points.append`
-    /// path, which keeps tracing instead of ending the trace — would re-consult
-    /// it with nothing recorded in between. Set on that re-entry and consumed
-    /// by the next `BC_JIT_MERGE_POINT`, which then falls straight through.
+    /// walk re-entered at the merge point's own guest pc — the
+    /// `current_merge_points.append` path, which keeps tracing instead of
+    /// ending the trace — would re-consult it with nothing recorded in
+    /// between. Set on that re-entry and consumed by the next
+    /// `BC_JIT_MERGE_POINT`, which then falls straight through.
     pub merge_point_resumed: bool,
+    /// The guest pc a re-entered walk must be seeded at — the position half of
+    /// `self.pc = saved_pc`.
+    ///
+    /// Upstream consults exactly one merge point per `opimpl_jit_merge_point`
+    /// call, so `saved_pc` is a function of that visit's own `orgpc` and the
+    /// position that entered the call cannot differ from the position that
+    /// declined. Pyre runs a whole walk segment — many merge-point visits —
+    /// per `JitDriver::merge_point` call, and a walk re-entered from inside
+    /// that call is re-seeded from the closure-captured `__pc`, which is where
+    /// the walk STARTED and which the native loop has not advanced. Left
+    /// unset that rewinds the position while the symbolic state stays at the
+    /// merge point the walk reached, and the instructions between the two are
+    /// re-executed against state they do not belong to.
+    ///
+    /// Set to the declining merge point's own guest pc; consumed (`take`) by
+    /// the `jit_merge_point!` expansion before it hands the pc to the walk.
+    /// `None` for a re-entry that publishes no resume pc, which keeps the
+    /// closure-captured `__pc`.
+    pub walk_resume_pc: Option<usize>,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
     /// / `slice_unicode` (resume.py:1143-1188) which look up the
@@ -1619,6 +1641,7 @@ impl TraceCtx {
             seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,
             merge_point_resumed: false,
+            walk_resume_pc: None,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
@@ -1706,6 +1729,7 @@ impl TraceCtx {
             seen_loop_header_jit_pc: None,
             bridge_resume_at_position: false,
             merge_point_resumed: false,
+            walk_resume_pc: None,
             callinfocollection: None,
             call_pure_results: indexmap::IndexMap::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
