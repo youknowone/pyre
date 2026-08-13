@@ -228,6 +228,63 @@ stood for weeks was overturned, and an unbounded "epic" turned into a named
 port, by one command. Note also `pypy3` is 3.11 — a fixture using newer syntax
 needs trimming to the subset that runs.
 
+## Spec follows CPython 3.14; implementation follows PyPy
+
+Standing ruling: **pyre's *implementation* is a port of PyPy; pyre's *spec* —
+what a Python program can observe — is CPython 3.14.** A behavioural difference
+from PyPy is a parity regression **unless** a CPython 3.14 artefact shows PyPy is
+wrong about what the caller observes. Then it is a spec fix, and PyPy's shape
+still governs every other line on the way there.
+
+**This is not a 3.11-vs-3.14 question, and reading it as one is why the same
+findings get re-filed every review cycle.** Of seven adjudicated cases, six have
+no version delta at all: `sched_setscheduler` has returned None since 3.3,
+`PyUnicode_FSConverter` has accepted bytes since 3.3, PEP 529 surrogatepass is
+3.6, `DirEntry` has cached its `stat_result` since PEP 471. These are standing
+PyPy-vs-CPython divergences, not PyPy lagging a release. "3.14" pins *which*
+CPython you read (`lib-python/stdlib-version.txt`); it does not narrow the rule
+to version lag, and the absence of a delta is not grounds to refuse the
+exception. Conversely a real delta earns nothing on its own.
+
+**What the spec governs** is only what a caller can observe: a return value, an
+exception's type / message / attributes, object identity, an
+encoding-and-errors contract, and which argument shapes are accepted or
+rejected. Everything else follows PyPy **unconditionally** — names, module
+paths, control-flow order, data structures, storage owner, JIT hints. A
+structural divergence does not become a spec fix by sitting next to one.
+
+**Six tests, in order; stop at the first leaf.** The full procedure, with the
+evidence rules and worked examples, is in the `/parity` skill under
+"SPEC-DEVIATION"; do not invoke this ruling without reading it.
+
+1. **Can a Python snippet print a difference?** No → ordinary parity finding.
+2. **Do you hold an admissible artefact for the 3.14 side?** An in-tree
+   `lib-python/3/…:line` assertion, a measured run at the pinned version, or C
+   source read at that tag in a named checkout. Prose (docs, PEPs) is not
+   admissible, and a comment in pyre's own source is never the artefact. No
+   artefact → you may not invoke this section.
+3. **Do the two upstreams actually disagree?** If they agree and pyre differs
+   from both, that is a plain regression and no spec reasoning rescues it.
+4. **Is PyPy's shape load-bearing for a mechanism pyre also has?** Search the
+   whole definition — decorators included — plus the class/module bindings it
+   reads, in `rpython/` as well as `pypy/`, for `@jit.*`, `_immutable_*`,
+   `_attrs_`, `unrolling_iterable`, `make_sure_not_resized`, `rgc.*`. A hint
+   that governs the value you are changing → **STOP, follow PyPy**; that is
+   implementation, which this ruling assigns to PyPy. Record the negative
+   search too.
+5. **Per-site artefact plus a blast-radius census.** Every departing
+   `file:line` needs the artefact that forces *that site*; "consistency with a
+   sibling" is not one. Then `rg` pyre's own readers of the shape you are
+   deleting, `pyre-jit*` and `majit*` included.
+6. **Does pyre land on 3.14 across the whole decision?** Adjacency is what
+   reads the state you changed, not "the same function". Landing where
+   **neither** upstream sits is a defect regardless of which axis matched.
+
+Reaching the end: file it under the review's `## 4. Structural adaptations` as
+`[3.14-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence:
+<route + cite>`, and comment at the site citing both sides. That records the
+decision; it does not close it.
+
 ## RPython Parity Rules
 - When porting from RPython/PyPy, do STRICT line-by-line structural parity. Do NOT take shortcuts, reimplement from scratch, or declare phases 'complete' without the literal refactor.
 - If a parity fix causes regressions, investigate root cause before reverting. Do not declare success if structural alignment was skipped, even if benchmarks pass.

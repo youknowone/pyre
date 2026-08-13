@@ -10,11 +10,33 @@ collecting all differences, organize the report into separate sections:
 3. Mismatches that already existed before this patch
 4. Structural adaptations
 
-Exceptions: some differences cannot be ported 1:1 because of Python 3.11 vs
-3.14 differences, opcode mismatches caused by using a CPython-compatible
-compiler, GIL/free-threading differences, and fundamental implementation-
-language differences between RPython and Rust. Mark those separately under
-"Structural adaptations".
+Exceptions — mark these under "Structural adaptations", not under 1 or 2:
+opcode mismatches caused by using a CPython-compatible compiler,
+GIL/free-threading differences, and fundamental implementation-language
+differences between RPython and Rust.
+
+Also section 4: a deviation from PyPy that makes pyre match the observable
+behaviour of the CPython in `lib-python/3` (version pinned in
+`lib-python/stdlib-version.txt`), where PyPy and that CPython genuinely differ.
+This is usually NOT a 3.11-vs-3.14 delta but a standing PyPy-vs-CPython
+divergence; "CPython did not change in 3.14" is not grounds to refile it under
+1 or 2. It qualifies only when the finding carries all four of:
+(a) an observable difference — return value, exception type/message/attributes,
+    identity, encoding-and-errors contract, or accepted argument shapes;
+(b) a cited CPython artefact — a `lib-python/3/...:line` assertion, a measured
+    run at the pinned version, or C read at that tag in a named checkout. Not
+    docs, not a PEP, not a comment in pyre's own source;
+(c) the PyPy `file:line` that decides, showing the two upstreams actually
+    differ (if PyPy contradicts itself, pyre following PyPy's own declaration
+    is section 4 as ordinary parity);
+(d) no PyPy-side JIT/GC/annotator hint governing the value being changed —
+    `@jit.*`, `_immutable_*`, `_attrs_`, `make_sure_not_resized`,
+    `unrolling_iterable`, `rgc.*`, on the function, its helpers, or the class-
+    and module-level bindings they read.
+Missing any of (a)-(d), or leaving pyre matching NEITHER upstream on an
+adjacent observable of the same decision, keep it in section 1 or 2 and say
+which test it failed. Full rule: AGENTS.md "Spec follows CPython 3.14;
+implementation follows PyPy".
 
 Scope discipline: before writing the report, run
 `git diff upstream/main --name-only -- . ':(exclude)*.jitstats'` and treat that
