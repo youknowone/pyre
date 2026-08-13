@@ -218,3 +218,306 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
         }
     }
 }
+
+/// Every hand-written trace-time specialization, its call-site file, and — for
+/// a fold reached only from another fold — the outer fold whose `fired` count
+/// already contains it.
+///
+/// Declared beside the counters so a fold cannot be added to the tree and go
+/// unnamed here.  `site` is `"none"` for a fold with no call site at all.
+///
+/// `store_attr` occupies two rows because its single call site has two firing
+/// outcomes that must not be summed: `Direct` folds the store away, while
+/// `Residual` only replaces the generic setattr residual's descr, arguments and
+/// effect and lets the rewritten call continue through the ordinary record
+/// path.  Both are `Ok(Some(_))`, so a single row would read as fully foldable
+/// when part of it is a descr swap.  The two rows share one call, so they carry
+/// identical `consulted` and `suppressed` counts and only `fired` is split;
+/// `parent` marks the second row as a split of the first so the reader does not
+/// sum them.
+#[rustfmt::skip]
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 56] = [
+    // (label, site, parent)
+    ("truth_int",                 "residual_call", "-"),
+    ("truth_bool",                "residual_call", "-"),
+    ("unary_positive_int",        "residual_call", "-"),
+    ("unary_negative_int",        "residual_call", "-"),
+    ("unary_invert_int",          "residual_call", "-"),
+    ("store_subscr",              "residual_call", "-"),
+    ("setslice",                  "residual_call", "-"),
+    ("get_iter",                  "residual_call", "-"),
+    ("for_iter_next",             "residual_call", "-"),
+    ("make_function",             "residual_call", "-"),
+    ("newtuple",                  "residual_call", "-"),
+    ("newtuple_object",           "residual_call", "-"),
+    ("newlist",                   "residual_call", "-"),
+    ("builtin_len",               "residual_call", "-"),
+    ("builtin_type",              "residual_call", "-"),
+    ("builtin_dict_get",          "residual_call", "-"),
+    ("builtin_type_getattr",      "residual_call", "-"),
+    ("builtin_range",             "residual_call", "-"),
+    ("builtin_zip",               "residual_call", "-"),
+    ("builtin_locals",            "residual_call", "-"),
+    ("sys_getframe",              "residual_call", "-"),
+    ("math_sqrt",                 "residual_call", "-"),
+    ("math_log_trig",             "residual_call", "-"),
+    ("math_frexp",                "residual_call", "-"),
+    ("math_ldexp",                "residual_call", "-"),
+    ("math_isqrt",                "residual_call", "-"),
+    ("int_call",                  "residual_call", "-"),
+    ("float_call",                "residual_call", "-"),
+    ("builtin_divmod",            "residual_call", "-"),
+    ("store_attr_direct",         "residual_call", "-"),
+    ("store_attr_residual",       "residual_call", "store_attr_direct"),
+    ("load_attr",                 "residual_call", "-"),
+    ("load_type_name_attr",       "residual_call", "-"),
+    ("load_type_attr",            "residual_call", "-"),
+    ("load_method_attr",          "residual_call", "-"),
+    ("load_classmethod_attr",     "residual_call", "-"),
+    ("load_bound_method_attr",    "residual_call", "-"),
+    ("subscr",                    "residual_call", "-"),
+    ("binary_op_int",             "residual_call", "-"),
+    ("binary_op_long_int",        "residual_call", "-"),
+    ("binary_op_long_int_shift",  "residual_call", "-"),
+    ("binary_op_long_int_div",    "residual_call", "-"),
+    ("binary_op_long_int_pow",    "residual_call", "-"),
+    ("binary_op_long",            "residual_call", "-"),
+    ("truediv_op_long",           "residual_call", "-"),
+    ("binary_op_float",           "residual_call", "-"),
+    ("compare_op_int",            "residual_call", "-"),
+    ("compare_op_long_int",       "residual_call", "-"),
+    ("compare_op_long",           "residual_call", "-"),
+    ("compare_op_float",          "residual_call", "-"),
+    ("unpack",                    "residual_call", "-"),
+    ("subscr_tuple",              "specialize",    "subscr"),
+    ("subscr_specialised_pair",   "specialize",    "subscr"),
+    ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
+    ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
+    ("seqiter_getitem_next",      "none",          "-"),
+];
+
+const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
+
+static SPEC_CONSULTED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; SPEC_FOLD_COUNT]
+};
+static SPEC_FIRED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; SPEC_FOLD_COUNT]
+};
+/// How many times the kill switch skipped the call.  Reported per fold so a
+/// suppression run states what it actually suppressed rather than what it was
+/// asked to suppress.
+static SPEC_SUPPRESSED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; SPEC_FOLD_COUNT]
+};
+/// A label passed to a gate that `SPEC_FOLD_ROWS` does not carry.  A nonzero
+/// value means a typo at a call site; the summary reports it rather than
+/// silently dropping the row.
+static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `PYRE_FBW_SPEC_CENSUS`: per-fold consulted/fired tallies for the
+/// hand-written trace-time specializations.  Off by default; the gated branch
+/// is the only added work on the dispatch path.
+pub(crate) fn fbw_spec_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some())
+}
+
+/// Parse `PYRE_FBW_NO_SPECIALIZE` once into table-index bits and unknown
+/// selector tokens.  The reserved `all` token turns off these 56 rows and
+/// nothing else: the `try_walker_fold_*` trio, the 11 `try_walker_inline_*`
+/// descent entry points, and `try_walker_store_subscr_specialization` all stay
+/// live.
+fn spec_suppression() -> &'static (u64, Vec<String>) {
+    static SUPPRESSION: std::sync::OnceLock<(u64, Vec<String>)> = std::sync::OnceLock::new();
+    SUPPRESSION.get_or_init(|| {
+        let mut mask = 0u64;
+        let mut unknown = Vec::new();
+        if let Some(selectors) = std::env::var_os("PYRE_FBW_NO_SPECIALIZE") {
+            for selector in selectors.to_string_lossy().split(',') {
+                let selector = selector.trim();
+                if selector.is_empty() {
+                    continue;
+                }
+                if selector == "all" {
+                    mask = (1u64 << SPEC_FOLD_COUNT) - 1;
+                } else if let Some(idx) = spec_row_index(selector) {
+                    mask |= 1u64 << idx;
+                } else {
+                    unknown.push(selector.to_owned());
+                }
+            }
+        }
+        (mask, unknown)
+    })
+}
+
+fn spec_suppressed_mask() -> u64 {
+    spec_suppression().0
+}
+
+fn spec_suppress_unknown() -> &'static [String] {
+    &spec_suppression().1
+}
+
+/// Either axis armed.  A gate's fast path reads only this, so a default run
+/// pays one cached load and one predictable branch per consult.
+fn spec_instrumented() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fbw_spec_census_enabled() || spec_suppressed_mask() != 0)
+}
+
+fn spec_row_index(name: &str) -> Option<usize> {
+    SPEC_FOLD_ROWS
+        .iter()
+        .position(|(label, _, _)| *label == name)
+}
+
+/// Gate and observe one hand-written specialization.
+///
+/// When `name` is suppressed the fold is NOT CALLED and the site sees
+/// `Ok(None)` — the decline every one of these folds already produces for a
+/// shape it cannot handle, and the decline path is uniformly the generic
+/// residual.  Otherwise the call runs and its outcome is passed back unchanged,
+/// including `Err`, so `?` at the call site behaves exactly as it did before
+/// the wrap.
+///
+/// `consulted` counts calls that were made — in an `&&` chain that means every
+/// preceding guard held, so `consulted == 0` says the site's guards never held.
+/// `fired` counts `Ok(Some(_))`.  `consulted - fired` covers both `Ok(None)`
+/// declines and `Err` propagations; an `Err` aborts the walk, so it is rare, and
+/// it is counted as consulted and never as fired.
+#[inline]
+pub(crate) fn spec_gate<T, E>(
+    name: &'static str,
+    call: impl FnOnce() -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    // Neither axis armed: one cached load, one predictable branch, then the
+    // original call.  This is what every default run executes.
+    if !spec_instrumented() {
+        return call();
+    }
+    let Some(idx) = spec_row_index(name) else {
+        SPEC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return call();
+    };
+    if spec_suppressed_mask() & (1u64 << idx) != 0 {
+        SPEC_SUPPRESSED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    let outcome = call();
+    if fbw_spec_census_enabled() {
+        SPEC_CONSULTED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if matches!(&outcome, Ok(Some(_))) {
+            SPEC_FIRED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    outcome
+}
+
+/// The STORE_ATTR gate.  One call, two firing outcomes: `Direct` folded the
+/// store away, `Residual` only rewrote the generic setattr residual's descr,
+/// arguments and effect.  Both are `Ok(Some(_))`, so they are recorded on
+/// separate rows; the shared call means `consulted` and `suppressed` land on
+/// both.
+///
+/// The two rows cannot be suppressed independently — naming either one, or
+/// `all`, suppresses the single call.
+#[inline]
+pub(super) fn spec_gate_store_attr<E>(
+    call: impl FnOnce() -> Result<Option<WalkerStoreAttrSpecialization>, E>,
+) -> Result<Option<WalkerStoreAttrSpecialization>, E> {
+    // Neither axis armed: one cached load, one predictable branch, then the
+    // original call.  This is what every default run executes.
+    if !spec_instrumented() {
+        return call();
+    }
+    let (Some(direct_idx), Some(residual_idx)) = (
+        spec_row_index("store_attr_direct"),
+        spec_row_index("store_attr_residual"),
+    ) else {
+        SPEC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return call();
+    };
+    let mask = spec_suppressed_mask();
+    if mask & ((1u64 << direct_idx) | (1u64 << residual_idx)) != 0 {
+        SPEC_SUPPRESSED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPEC_SUPPRESSED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(None);
+    }
+    let outcome = call();
+    if fbw_spec_census_enabled() {
+        SPEC_CONSULTED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPEC_CONSULTED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match &outcome {
+            Ok(Some(WalkerStoreAttrSpecialization::Direct)) => {
+                SPEC_FIRED[direct_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(Some(WalkerStoreAttrSpecialization::Residual(..))) => {
+                SPEC_FIRED[residual_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
+    outcome
+}
+
+/// One line per fold, sorted heaviest first, INCLUDING every fold with zero
+/// firings — a zero is the answer this census exists to produce, so it is
+/// printed, never omitted.
+///
+/// Deliberately not under the `[jit-stats]` prefix: `check.py`'s
+/// `_jit_stats_snapshot` merges every such line, so this census uses its own
+/// prefix.
+pub fn spec_census_summary() -> String {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    let mask = spec_suppressed_mask();
+    let mut rows: Vec<_> = SPEC_FOLD_ROWS
+        .iter()
+        .enumerate()
+        .map(|(idx, &(label, site, parent))| {
+            (
+                label,
+                site,
+                parent,
+                SPEC_CONSULTED[idx].load(ordering),
+                SPEC_FIRED[idx].load(ordering),
+                SPEC_SUPPRESSED[idx].load(ordering),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.4.cmp(&a.4).then(b.3.cmp(&a.3)).then(a.0.cmp(b.0)));
+
+    let consulted_total: u64 = rows.iter().map(|row| row.3).sum();
+    let fired_total: u64 = rows.iter().map(|row| row.4).sum();
+    let suppressed_total: u64 = rows.iter().map(|row| row.5).sum();
+    let suppressed_names = if mask == 0 {
+        "-".to_owned()
+    } else {
+        SPEC_FOLD_ROWS
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, (label, _, _))| (mask & (1u64 << idx) != 0).then_some(*label))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let suppress_unknown = if spec_suppress_unknown().is_empty() {
+        "-".to_owned()
+    } else {
+        spec_suppress_unknown().join(",")
+    };
+    let mut summary = format!(
+        "[spec-census] folds={} consulted_total={consulted_total} fired_total={fired_total} unknown_labels={} suppressed_total={suppressed_total} suppressed_names={suppressed_names} suppress_unknown={suppress_unknown}\n",
+        rows.len(),
+        SPEC_UNKNOWN.load(ordering),
+    );
+    for (label, site, parent, consulted, fired, suppressed) in rows {
+        summary.push_str(&format!(
+            "[spec-census] fold={label} consulted={consulted} fired={fired} suppressed={suppressed} site={site} parent={parent}\n"
+        ));
+    }
+    summary
+}

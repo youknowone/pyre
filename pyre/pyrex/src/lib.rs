@@ -769,6 +769,7 @@ fn maybe_print_jit_stats() {
     }
     maybe_print_mc_diag();
     maybe_print_gc_diag();
+    maybe_print_spec_census();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -904,6 +905,17 @@ fn maybe_print_gc_diag() {
         "[jit-gc-diag] minor={minor} major={major} heap_bytes={heap_bytes} \
          nursery_bytes={nursery_bytes}"
     );
+}
+
+/// Deliberately not under the `[jit-stats]` prefix, following
+/// [`maybe_print_mc_diag`] and [`maybe_print_gc_diag`]: `check.py`'s
+/// `_jit_stats_snapshot` merges every such line, so the specialization census
+/// uses its own prefix.
+fn maybe_print_spec_census() {
+    if std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_none() {
+        return;
+    }
+    eprint!("{}", pyre_jit::spec_census_summary());
 }
 
 fn maybe_print_mc_diag() {

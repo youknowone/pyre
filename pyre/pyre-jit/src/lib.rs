@@ -98,6 +98,10 @@ pub fn fbw_diag_counter(i: usize) -> u64 {
     pyre_jit_trace::trace::fbw_diag::get(i)
 }
 
+pub fn spec_census_summary() -> String {
+    pyre_jit_trace::jitcode_dispatch::spec_census_summary()
+}
+
 /// The `PYPY_GC_*` variables the collector sizes itself from, and the setter
 /// for an embedder whose platform hands the process no environment to read them
 /// out of. Re-exported so such a host reaches them through the crate it already
