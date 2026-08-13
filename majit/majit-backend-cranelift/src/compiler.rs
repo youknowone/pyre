@@ -6078,17 +6078,22 @@ fn ref_root_slots_with_future_regular_uses(
         .collect()
 }
 
-/// assembler.py:1369-1377 _reload_frame_if_necessary:
+/// assembler.py:1369-1383 _reload_frame_if_necessary:
 ///   MOV ecx, [rootstacktop]      // load shadow stack top pointer
 ///   MOV ebp, [ecx - WORD]        // load jf_ptr from topmost entry
+///   _write_barrier_fastpath(mc, wbdescr, [ebp], array=False, is_frame=True)
 ///
 /// After a collecting call, the GC may have copied the jitframe from
 /// nursery to old gen. The shadow stack entry was updated by the GC.
-/// Reload jf_ptr from the shadow stack top.
+/// Reload jf_ptr from the shadow stack top, then re-apply the non-array
+/// write barrier to the reloaded pointer. The `and wbdescr` guard is
+/// load-bearing: a collector that needs no write barrier reports none
+/// (`gc.py:156 GcLLDescr_boehm.write_barrier_descr = None`) and there is
+/// nothing to re-apply for it.
 fn emit_reload_frame_if_necessary(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
-    _call_conv: cranelift_codegen::isa::CallConv,
+    call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
     let word = std::mem::size_of::<usize>() as i32;
     // MOV ecx, [rootstacktop]
@@ -6100,9 +6105,16 @@ fn emit_reload_frame_if_necessary(
         .ins()
         .load(ptr_type, MemFlagsData::trusted(), rst_addr, 0);
     // MOV ebp, [ecx - WORD]  — jf_ptr is at top - WORD
-    builder
+    let jf_ptr = builder
         .ins()
-        .load(ptr_type, MemFlagsData::trusted(), rst, -word)
+        .load(ptr_type, MemFlagsData::trusted(), rst, -word);
+    if with_cranelift_gc(|gc| gc.get_write_barrier_descr())
+        .flatten()
+        .is_some()
+    {
+        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
+    }
+    jf_ptr
 }
 
 /// llsupport/llmodel.py:229-234 `insert_stack_check` plus
