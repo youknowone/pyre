@@ -341,7 +341,7 @@
       "dynasm": "PASS"
     },
     "test.test_dictcomps": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_dictviews": {
       "dynasm": "PASS"
@@ -416,7 +416,7 @@
       "dynasm": "PASS"
     },
     "test.test_exceptions": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_extcall": {
       "dynasm": "IMPORTERROR"
@@ -531,7 +531,7 @@
       "dynasm": "PASS"
     },
     "test.test_getpass": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_getpath": {
       "dynasm": "IMPORTERROR"
@@ -594,7 +594,7 @@
       "reason": "needs display"
     },
     "test.test_imaplib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_import": {
       "dynasm": "PASS"
@@ -671,7 +671,7 @@
       "dynasm": "PASS"
     },
     "test.test_listcomps": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_lltrace": {
       "cranelift": "PASS",
@@ -975,7 +975,7 @@
       "dynasm": "PASS"
     },
     "test.test_secrets": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_select": {
       "dynasm": "FAIL"
@@ -984,7 +984,7 @@
       "dynasm": "PASS"
     },
     "test.test_set": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_setcomps": {
       "dynasm": "PASS"
@@ -1012,7 +1012,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_smtpnet": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_socket": {
       "dynasm": "IMPORTERROR"
