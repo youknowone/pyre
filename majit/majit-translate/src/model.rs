@@ -2463,8 +2463,58 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 /// Returns the number of removed exits so the caller can gate the
 /// follow-up dead-condition sweep (`removeassert.py:35-37` — "now melt
 /// away the (hopefully) dead operation that compute the condition").
+/// The front model does not run `join_blocks` over this graph type, so
+/// the assertion raise can remain behind a single-entry, single-exit block
+/// that upstream `simplify.py:271-319` would have collapsed.
 pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
-    use crate::flowspace::model::HOST_ENV;
+    use crate::flowspace::model::{HOST_ENV, HostObject};
+
+    fn targets_assertion_error(
+        graph: &FunctionGraph,
+        exit: &Link,
+        exceptblock: BlockId,
+        assert_err_class: &HostObject,
+    ) -> bool {
+        let indirect = exit.target != exceptblock;
+        let assertion_exit = if indirect {
+            let target = graph.block(exit.target);
+            if target.exits.len() != 1 {
+                return false;
+            }
+            &target.exits[0]
+        } else {
+            exit
+        };
+
+        let raises_assertion_error = assertion_exit.target == exceptblock
+            && matches!(
+                assertion_exit.args.first(),
+                Some(LinkArg::Const(c))
+                    if matches!(
+                        &c.value,
+                        ConstValue::HostObject(h) if h == assert_err_class
+                    )
+            );
+        if !raises_assertion_error {
+            return false;
+        }
+        if !indirect {
+            return true;
+        }
+        // Only `join_blocks` would collapse the intermediate block into this
+        // one, and only when this exit is its sole entry — otherwise removing
+        // the exit strands the other predecessors.  Counted last: it is the
+        // one whole-graph scan here, and the cheap shape tests above already
+        // reject every exit that is not a raise-block edge.
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .filter(|candidate| candidate.target == exit.target)
+            .count()
+            == 1
+    }
+
     let assert_err_class = HOST_ENV
         .lookup_builtin("AssertionError")
         .expect("HOST_ENV missing AssertionError");
@@ -2481,16 +2531,7 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
             };
             // upstream: `if not (exit.target is graph.exceptblock and
             // exit.args[0] == Constant(AssertionError)): continue`.
-            let targets_except = exit.target == exceptblock;
-            let args_is_assert_err = matches!(
-                exit.args.first(),
-                Some(LinkArg::Const(c))
-                    if matches!(
-                        &c.value,
-                        ConstValue::HostObject(h) if *h == assert_err_class
-                    )
-            );
-            if !(targets_except && args_is_assert_err) {
+            if !targets_assertion_error(graph, exit, exceptblock, &assert_err_class) {
                 continue;
             }
             // upstream: `if len(block.exits) < 2: break`.
@@ -6370,6 +6411,126 @@ mod tests {
         assert_eq!(entry_block.exits[0].prevblock, Some(entry));
         assert_eq!(entry_block.exits[0].target, graph.returnblock);
         assert_eq!(entry_block.exits[0].args, vec![LinkArg::Value(value_var)]);
+    }
+
+    fn assertion_error_except_link(graph: &FunctionGraph, exitcase: Option<ExitCase>) -> Link {
+        Link::new_mixed(
+            vec![
+                LinkArg::from(ConstValue::builtin("AssertionError")),
+                LinkArg::from(ConstValue::None),
+            ],
+            graph.exceptblock,
+            exitcase,
+        )
+        .with_llexitcase_from_exitcase()
+    }
+
+    #[test]
+    fn remove_assertion_errors_prunes_direct_exceptblock_exit() {
+        let mut graph = FunctionGraph::new("direct_assertion_error");
+        let entry = graph.startblock;
+        let live = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let survivor = Link::from_variables(&graph, vec![], live, Some(ExitCase::Bool(false)))
+            .with_llexitcase_from_exitcase();
+        let assertion = assertion_error_except_link(&graph, Some(ExitCase::Bool(true)));
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::Value(cond)),
+            vec![survivor, assertion],
+        );
+
+        assert_eq!(remove_assertion_errors(&mut graph), 1);
+        let entry_block = graph.block(entry);
+        assert_eq!(entry_block.exits.len(), 1);
+        assert_eq!(entry_block.exits[0].target, live);
+        assert!(entry_block.exitswitch.is_none());
+        assert!(entry_block.exits[0].exitcase.is_none());
+        assert!(entry_block.exits[0].llexitcase.is_none());
+    }
+
+    #[test]
+    fn remove_assertion_errors_prunes_through_single_entry_raise_block() {
+        let mut graph = FunctionGraph::new("indirect_assertion_error");
+        let entry = graph.startblock;
+        let live = graph.create_block();
+        let raise = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, raise, vec![], live, vec![]);
+        graph.set_raise_implicit(raise, "ValueError");
+
+        assert_eq!(remove_assertion_errors(&mut graph), 1);
+        let entry_block = graph.block(entry);
+        assert_eq!(entry_block.exits.len(), 1);
+        assert_eq!(entry_block.exits[0].target, live);
+        assert!(entry_block.exitswitch.is_none());
+        assert!(entry_block.exits[0].exitcase.is_none());
+        assert!(entry_block.exits[0].llexitcase.is_none());
+    }
+
+    #[test]
+    fn remove_assertion_errors_keeps_raise_block_with_multiple_entries() {
+        let mut graph = FunctionGraph::new("shared_assertion_error");
+        let entry = graph.startblock;
+        let other_predecessor = graph.create_block();
+        let live = graph.create_block();
+        let raise = graph.create_block();
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cond".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(entry, cond, raise, vec![], live, vec![]);
+        graph.set_goto(other_predecessor, raise, vec![]);
+        graph.set_raise_implicit(raise, "ValueError");
+
+        assert_eq!(remove_assertion_errors(&mut graph), 0);
+        assert_eq!(graph.block(entry).exits.len(), 2);
+        assert!(
+            graph
+                .block(entry)
+                .exits
+                .iter()
+                .any(|exit| exit.target == raise)
+        );
+        assert_eq!(graph.block(other_predecessor).exits[0].target, raise);
+    }
+
+    #[test]
+    fn remove_assertion_errors_keeps_whole_graph_single_exit_raise() {
+        let mut graph = FunctionGraph::new("whole_graph_assertion_error");
+        let entry = graph.startblock;
+        graph.set_raise_implicit(entry, "ValueError");
+
+        assert_eq!(remove_assertion_errors(&mut graph), 0);
+        assert_eq!(graph.block(entry).exits.len(), 1);
+        assert_eq!(graph.block(entry).exits[0].target, graph.exceptblock);
     }
 
     #[test]
