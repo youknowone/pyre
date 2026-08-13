@@ -2833,7 +2833,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // keyword is rejected with "takes no keyword arguments".
         crate::gateway::make_module_builtin_function_with_arity_and_sig(
             "abs",
-            builtin_abs,
+            __pyre_wrap_builtin_abs,
             1,
             crate::gateway::Signature::new(vec!["val"], None, None, 0, 1),
         )
@@ -4510,6 +4510,10 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         [val] => *val,
         _ => parse_single_required(args, "val", "abs")?,
     };
+    builtin_abs_obj(obj)
+}
+
+fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -4556,6 +4560,23 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
+
+pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 1 {
+        return builtin_abs(args);
+    }
+    let obj = args[0];
+    builtin_abs_obj(obj)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_abs"),
+        func: __pyre_wrap_builtin_abs,
+    };
 
 /// Strip the trailing `__pyre_kw__` dict that `call_with_kwargs`
 /// (`call.rs`) appends for builtin callees and return the positional
