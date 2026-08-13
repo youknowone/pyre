@@ -11,6 +11,87 @@
 
 use crate::gc_hook::try_gc_alloc;
 use crate::pyobject::*;
+use pyre_macros::pyre_class;
+
+/// `interp__weakref.py:19-28 WeakrefLifeline(W_Root)` — the interpreter-owned
+/// bookkeeping object attached to every weak-referenceable referent.
+///
+/// PyPy stores these four values directly on the translated instance.  Keep
+/// the same ownership here: none of them are Python attributes and no
+/// instance dictionary participates in weakref bookkeeping.  The first three
+/// slots currently contain pyre's managed `GcWeakrefBox` / list carriers;
+/// they are ordinary GC references and are therefore discovered by the
+/// `#[pyre_class]` offset census.
+#[pyre_class("_weakref.WeakrefLifeline", static_name = "WEAKREF_LIFELINE")]
+pub struct W_WeakrefLifeline {
+    /// `interp__weakref.py:22 cached_weakref = None`.
+    pub cached_weakref: PyObjectRef,
+    /// `interp__weakref.py:23 cached_proxy = None`.
+    pub cached_proxy: PyObjectRef,
+    /// `interp__weakref.py:24 other_refs_weak = None`.
+    pub other_refs_weak: PyObjectRef,
+    /// `interp__weakref.py:25 has_callbacks = False`.
+    pub has_callbacks: bool,
+}
+
+/// Allocate the hidden typed lifeline with PyPy's four class defaults.
+/// `allocate_stable` stamps its static translated-layout `ob_type`; like
+/// PyPy's `typedef = None` owner, it has no Python-visible heap type.
+pub fn w_weakref_lifeline_new() -> PyObjectRef {
+    W_WeakrefLifeline::allocate_stable(W_WeakrefLifeline {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        cached_weakref: PY_NULL,
+        cached_proxy: PY_NULL,
+        other_refs_weak: PY_NULL,
+        has_callbacks: false,
+    })
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_cached_weakref(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_WeakrefLifeline)).cached_weakref }
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_set_cached_weakref(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut W_WeakrefLifeline)).cached_weakref = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_cached_proxy(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_WeakrefLifeline)).cached_proxy }
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_set_cached_proxy(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut W_WeakrefLifeline)).cached_proxy = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_other_refs(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_WeakrefLifeline)).other_refs_weak }
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_set_other_refs(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut W_WeakrefLifeline)).other_refs_weak = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_has_callbacks(obj: PyObjectRef) -> bool {
+    unsafe { (*(obj as *const W_WeakrefLifeline)).has_callbacks }
+}
+
+#[inline]
+pub unsafe fn w_weakref_lifeline_set_has_callbacks(obj: PyObjectRef) {
+    unsafe { (*(obj as *mut W_WeakrefLifeline)).has_callbacks = true };
+}
 
 /// Interpreter-level layout tag shared by PyPy's `W_Weakref` and
 /// `W_AbstractProxy` families.  The current host representation still uses
@@ -119,17 +200,17 @@ pub unsafe fn w_weakref_deref(wref: *const Weakref) -> PyObjectRef {
 
 // ── GcWeakrefBox wrapper ──────────────────────────────────────────────
 //
-// pyre's `interp__weakref.rs` simulates PyPy's W_WeakrefBase /
-// WeakrefLifeline subclasses on top of `W_ObjectObject` + ATTR_*
-// instance-dict slots (TODO: bring to parity). Instance-dict slots
-// can only hold `PyObjectRef`, not a raw `*mut Weakref`, so this
-// tiny internal PyObject wraps the rweakref pointer for storage in those slots.
+// pyre's `interp__weakref.rs` still simulates PyPy's W_WeakrefBase on top of
+// `W_ObjectObject` + ATTR_* instance-dict slots. Instance-dict slots can only
+// hold `PyObjectRef`, not a raw `*mut Weakref`, so this tiny internal PyObject
+// wraps the rweakref pointer for storage in those slots. `WeakrefLifeline`
+// itself now has its orthodox typed, inline layout above.
 //
-// A faithful port would replace the W_ObjectObject simulation with typed
-// W_Root subclasses carrying inline `*mut Weakref` fields (the shape PyPy's
-// W_Weakref / WeakrefLifeline use). Until that refactor, this wrapper is
-// itself GC-managed and carries the inline field: the owning instance dict
-// traces the box, and the box traces the Weakref GcStruct.
+// Completing W_Weakref / W_AbstractProxy as typed W_Root subclasses will let
+// their inline fields own raw `*mut Weakref` values directly. Until that
+// follow-up, this wrapper is itself GC-managed and carries the inline field:
+// the owning typed lifeline or instance dict traces the box, and the box traces
+// the Weakref GcStruct.
 
 /// Internal type tag — used by `py_type_check` to recognise a
 /// `GcWeakrefBox` PyObject when it surfaces through a generic slot.
@@ -350,6 +431,51 @@ pub unsafe fn w_gc_weakref_box_or_strong_deref(slot: PyObjectRef) -> PyObjectRef
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lltype::PyreClassPyTypeOf;
+
+    #[test]
+    fn weakref_lifeline_uses_inline_pypy_fields() {
+        let lifeline = w_weakref_lifeline_new();
+        assert!(unsafe { py_type_check(lifeline, &WEAKREF_LIFELINE_TYPE) });
+        assert!(unsafe { w_weakref_lifeline_cached_weakref(lifeline) }.is_null());
+        assert!(unsafe { w_weakref_lifeline_cached_proxy(lifeline) }.is_null());
+        assert!(unsafe { w_weakref_lifeline_other_refs(lifeline) }.is_null());
+        assert!(!unsafe { w_weakref_lifeline_has_callbacks(lifeline) });
+
+        let cached_ref = 0x1000_usize as PyObjectRef;
+        let cached_proxy = 0x2000_usize as PyObjectRef;
+        let other_refs = 0x3000_usize as PyObjectRef;
+        unsafe {
+            w_weakref_lifeline_set_cached_weakref(lifeline, cached_ref);
+            w_weakref_lifeline_set_cached_proxy(lifeline, cached_proxy);
+            w_weakref_lifeline_set_other_refs(lifeline, other_refs);
+            w_weakref_lifeline_set_has_callbacks(lifeline);
+        }
+        assert_eq!(
+            unsafe { w_weakref_lifeline_cached_weakref(lifeline) },
+            cached_ref
+        );
+        assert_eq!(
+            unsafe { w_weakref_lifeline_cached_proxy(lifeline) },
+            cached_proxy
+        );
+        assert_eq!(
+            unsafe { w_weakref_lifeline_other_refs(lifeline) },
+            other_refs
+        );
+        assert!(unsafe { w_weakref_lifeline_has_callbacks(lifeline) });
+
+        assert_eq!(
+            W_WeakrefLifeline::DESCRIPTOR.ptr_offsets,
+            &[
+                std::mem::offset_of!(W_WeakrefLifeline, ob)
+                    + std::mem::offset_of!(PyObject, w_class),
+                std::mem::offset_of!(W_WeakrefLifeline, cached_weakref),
+                std::mem::offset_of!(W_WeakrefLifeline, cached_proxy),
+                std::mem::offset_of!(W_WeakrefLifeline, other_refs_weak),
+            ]
+        );
+    }
 
     #[test]
     fn w_weakref_new_pre_gc_returns_strong_immortal_ref() {
