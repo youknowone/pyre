@@ -286,13 +286,13 @@
       "dynasm": "PASS"
     },
     "test.test_ctypes": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_curses": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_datetime": {
       "dynasm": "PASS"
@@ -444,7 +444,7 @@
       "dynasm": "PASS"
     },
     "test.test_fileio": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_fileutils": {
       "dynasm": "IMPORTERROR"
@@ -1253,7 +1253,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_unittest": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_univnewlines": {
       "dynasm": "PASS"

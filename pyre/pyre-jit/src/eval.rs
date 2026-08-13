@@ -2223,11 +2223,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_long_tid,
     );
     pytype_to_tid.insert(&pyre_object::LONG_TYPE as *const _ as usize, w_long_tid);
-    // Module carries `name: *mut String` (raw heap),
-    // `dict: *mut u8` (DictStorage*, non-PyObject), and
-    // `w_dict: PyObjectRef` (aliased `W_DictObject`,
-    // `pypy/interpreter/module.py:22 self.w_dict = w_dict`).  Only
-    // the last is GC-traceable.
+    // Module carries the two wrapped fields from module.py:22-23:
+    // `w_name` and the aliased `w_dict`. Both are GC-traceable, alongside
+    // the inherited `w_class` slot.
     let w_module_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::module::Module>(),
         object_tid,

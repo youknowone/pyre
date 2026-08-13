@@ -95,9 +95,8 @@ impl OldGen {
                 let alloc_size = Self::allocation_size(total_size)
                     .checked_add(card_header_bytes)
                     .and_then(try_round_up);
-                let layout = alloc_size.and_then(|alloc_size| {
-                    Layout::from_size_align(alloc_size, WORD).ok()
-                });
+                let layout = alloc_size
+                    .and_then(|alloc_size| Layout::from_size_align(alloc_size, WORD).ok());
                 let Some(layout) = layout else {
                     panic!(
                         "GC BUG: oldgen request describes no allocation: \

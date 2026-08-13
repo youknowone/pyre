@@ -1730,15 +1730,16 @@ pub fn release_sys_modules_for_shutdown() -> Vec<(Wtf8Buf, PyObjectRef)> {
     modules
 }
 
-/// GC root walk over every bound module's dict storage.
+/// GC root walk over every bound module's wrapped name and dict storage.
 ///
 /// The walk is keyed on [`MODULE_DICT_ROOTS`], not on the live name→module
 /// map: a module that lost its name to a later import is still immortal and
 /// still reachable from Python, so its dict must keep being marked.
 ///
 /// Modules (`malloc_typed`) are Box-immortal, while their non-moving
-/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_dict` field
-/// first so the header is marked and its custom trace can reach the
+/// `W_ModuleDictObject`s are GC-managed. Visit each `Module.w_name` and
+/// `Module.w_dict` field first so their headers are marked and the dict's
+/// custom trace can reach the
 /// authoritative `dstorage` / `object_storage` / cell registry. A movable
 /// value bound at module scope
 /// — e.g. `gc.collect` reached through `gc.__dict__`, or any
@@ -1769,6 +1770,7 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         }
         unsafe {
             let module = &mut *(module as *mut pyre_object::module::Module);
+            visitor(&mut module.w_name);
             visitor(&mut module.w_dict);
             let w_dict = module.w_dict;
             pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(w_dict, visitor);

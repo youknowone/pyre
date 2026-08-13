@@ -1,15 +1,14 @@
 //! `pypy/interpreter/module.py` — Python `module` type.
 //!
-//! A module holds a name (str) and its backing dict object.
+//! A module holds its wrapped name and backing dict objects.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
-use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 /// Python module object.
 ///
-/// Layout: `[ob_type | name | w_dict]`
+/// Layout: `[ob_type | w_name | w_dict]`
 ///
 /// `w_dict` mirrors PyPy `module.py:20 self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
@@ -21,10 +20,9 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 #[repr(C)]
 pub struct Module {
     pub ob_header: PyObject,
-    /// Heap-allocated module name.  WTF-8 rather than a Rust `String`: a name
-    /// reaches here straight from `module.__init__`, and surrogateescape
-    /// decoding of an undecodable filename puts a lone surrogate in it.
-    pub name: *mut Wtf8Buf,
+    /// `module.py:22 self.w_name = w_name`. `PY_NULL` is the anonymous
+    /// sentinel installed by `module.__new__` before `module.__init__` runs.
+    pub w_name: PyObjectRef,
     /// Authoritative dict object (`PyPy module.w_dict`).  Always non-null
     /// after construction.
     pub w_dict: PyObjectRef,
@@ -49,11 +47,9 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 /// `type(m)` / slot dispatch pointing at freed memory. `W_ObjectObject`
 /// traces its `w_class` for the same reason (`object_object_custom_trace`).
 ///
-/// `name`/`dict` are non-PyObject raw heap pointers and are intentionally
-/// absent; they are owned via `lltype::malloc_raw` and traced through
-/// their own type ids.
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 2] = [
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 3] = [
     std::mem::offset_of!(Module, ob_header.w_class),
+    std::mem::offset_of!(Module, w_name),
     std::mem::offset_of!(Module, w_dict),
 ];
 
@@ -84,11 +80,15 @@ fn module_value(name: &str) -> Module {
     // `w_module_dict_new`; `pypy/objspace/std/celldict.py` strategy semantics
     // (`get_global_cache`, `invalidate_caches`,
     // `switch_to_object_strategy`) cover the module surface.
-    let name_box = crate::lltype::malloc_raw(Wtf8Buf::from_string(name.to_string()));
+    let w_name = if name.is_empty() {
+        PY_NULL
+    } else {
+        crate::w_str_new(name)
+    };
     let w_dict = crate::dictmultiobject::w_module_dict_new();
-    if !name.is_empty() {
+    if !w_name.is_null() {
         unsafe {
-            crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", crate::w_str_new(name));
+            crate::dictmultiobject::w_dict_setitem_str(w_dict, "__name__", w_name);
         }
     }
     Module {
@@ -96,7 +96,7 @@ fn module_value(name: &str) -> Module {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
         },
-        name: name_box,
+        w_name,
         w_dict,
     }
 }
@@ -169,22 +169,22 @@ pub fn w_module_new_aliasing_dict_managed(name: &str, w_dict_object: PyObjectRef
 }
 
 fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module {
-    if !name.is_empty() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
+    let w_name = if name.is_empty() {
+        PY_NULL
+    } else {
+        crate::w_str_new(name)
+    };
+    if !w_name.is_null() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
         unsafe {
-            crate::dictmultiobject::w_dict_setitem_str(
-                w_dict_object,
-                "__name__",
-                crate::w_str_new(name),
-            );
+            crate::dictmultiobject::w_dict_setitem_str(w_dict_object, "__name__", w_name);
         }
     }
-    let name = crate::lltype::malloc_raw(Wtf8Buf::from_string(name.to_string()));
     Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
         },
-        name,
+        w_name,
         w_dict: w_dict_object,
     }
 }
@@ -193,25 +193,22 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
-pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static Wtf8 {
+pub unsafe fn w_module_get_name(obj: PyObjectRef) -> PyObjectRef {
     let module = &*(obj as *const Module);
-    &*module.name
+    module.w_name
 }
 
-/// Replace the module name (`module.py:24` re-seeding).  Used by
-/// `module.__init__(name, doc)` after `module.__new__` allocates an
-/// anonymous module. `name` stays a `malloc_raw` box outside the collector;
-/// free the previous box before installing the new one to avoid leaking it.
+/// Replace the wrapped module name (`module.py:22 self.w_name = w_name`). Used
+/// by `module.__init__(name, doc)` after `module.__new__` allocates an
+/// anonymous module. The holder may already be old, so publish the new edge
+/// through the ordinary minimark write barrier.
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
-pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &Wtf8) {
+pub unsafe fn w_module_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     let module = &mut *(obj as *mut Module);
-    let old = module.name;
-    module.name = crate::lltype::malloc_raw(name.to_owned());
-    if !old.is_null() {
-        drop(Box::from_raw(old));
-    }
+    module.w_name = w_name;
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
 /// Get the aliased `W_DictObject` (`PY_NULL` when storage-only).
@@ -273,7 +270,8 @@ mod tests {
         unsafe {
             assert!(is_module(obj));
             assert!(!is_int(obj));
-            assert_eq!(w_module_get_name(obj), Wtf8::new("test_mod"));
+            let w_name = w_module_get_name(obj);
+            assert_eq!(crate::w_str_get_value(w_name), "test_mod");
         }
     }
 }

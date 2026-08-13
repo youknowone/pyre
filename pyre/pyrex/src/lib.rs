@@ -1189,18 +1189,20 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
             return true;
         }
         if pyre_object::is_module(value) {
-            // `Module.name` is the interpreter's own field, not the
-            // program-writable `__name__` attribute, so it is always a string —
-            // but `types.ModuleType.__new__` leaves it empty until `__init__`
-            // seeds it. An anonymous module proves nothing about reachability,
-            // so it takes the collecting path rather than a `sys.modules[""]`
-            // lookup that only an adversarial program could satisfy.
-            // A name carrying a lone surrogate cannot key the `&str` lookup, so
-            // it answers `false` and takes the collecting path.
-            let name = pyre_object::w_module_get_name(value);
-            return name.as_str().is_ok_and(|name| {
-                !name.is_empty() && importing::get_sys_module(name).is_some_and(|m| m == value)
-            });
+            // `Module.w_name` is the interpreter's own field, not the
+            // program-writable `__name__` attribute. `module.__new__` leaves it
+            // null until `__init__` seeds it, and a valid Python name may carry
+            // a lone surrogate that cannot key pyre's native UTF-8 registry.
+            // Either shape proves nothing about reachability and therefore
+            // takes the collecting path.
+            let w_name = pyre_object::w_module_get_name(value);
+            if w_name.is_null() || !pyre_object::is_str(w_name) {
+                return false;
+            }
+            let Ok(name) = pyre_object::w_str_get_wtf8(w_name).as_str() else {
+                return false;
+            };
+            return importing::get_sys_module(name).is_some_and(|m| m == value);
         }
     }
     false
@@ -1221,25 +1223,8 @@ fn clear_shutdown_module_name(dict: pyre_object::PyObjectRef, name: &rustpython_
     }
 }
 
-/// Which of `_PyModule_ClearDict`'s two name passes to run.
-///
-/// They are separated because rebinding a name to `None` frees nothing on its
-/// own here: without refcounting a finalizer runs only from a collection, so
-/// the passes are ordering-inert unless one is swept between them. The caller
-/// sweeps once for the whole walk rather than once per module.
-#[derive(Clone, Copy)]
-enum ShutdownClearPass {
-    /// "clear only names starting with a single underscore", so that a
-    /// finalizer released here still reads its module's public globals.
-    PrivateNames,
-    /// "clear all names except for `__builtins__`".
-    RemainingNames,
-}
-
-/// `_PyModule_ClearDict`: rebind the string-keyed module globals one pass
-/// selects. A non-string key is left alone, as upstream leaves it — the value
-/// under it is released by the collection that follows the whole walk.
-fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef, pass: ShutdownClearPass) {
+/// `_PyModule_ClearDict`: clear string-keyed module globals in two name passes.
+fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef) {
     if dict.is_null() {
         return;
     }
@@ -1248,11 +1233,12 @@ fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef, pass: ShutdownClea
         .map(|(name, _)| name)
         .collect();
     for name in &keys {
-        let selected = match pass {
-            ShutdownClearPass::PrivateNames => shutdown_module_private_name(name),
-            ShutdownClearPass::RemainingNames => name.as_bytes() != b"__builtins__",
-        };
-        if selected {
+        if shutdown_module_private_name(name) {
+            clear_shutdown_module_name(dict, name);
+        }
+    }
+    for name in &keys {
+        if name.as_bytes() != b"__builtins__" {
             clear_shutdown_module_name(dict, name);
         }
     }
@@ -1281,33 +1267,28 @@ fn clear_shutdown_modules(
         pyre_object::gc_roots::pin_root(module);
     }
     collect_and_run_finalizers(ec_ptr);
-    let clear_pass = |pass| {
-        for index in (0..names.len()).rev() {
-            let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
-            let is_core_module = sys_module_slot.is_some_and(|slot| {
-                module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
-            }) || builtins_module_slot.is_some_and(|slot| {
-                module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
-            });
-            if is_core_module {
-                continue;
-            }
-            if module.is_null() || !unsafe { pyre_object::is_module(module) } {
-                continue;
-            }
-            let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-            clear_shutdown_module_dict(dict, pass);
+    for index in (0..names.len()).rev() {
+        let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
+        let is_core_module = sys_module_slot.is_some_and(|slot| {
+            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
+        }) || builtins_module_slot.is_some_and(|slot| {
+            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
+        });
+        if is_core_module {
+            continue;
         }
-    };
-    // Both passes run over the whole walk before either sweeps, rather than
-    // both passes per module. The sweep between them is what makes the
-    // private-name pass mean anything: `_obj.__del__` runs while its module's
-    // public globals still hold their values. A sweep per module would give
-    // the same ordering and cost a full mark-and-sweep for each of the ~100
-    // modules a bare `import unittest` loads.
-    clear_pass(ShutdownClearPass::PrivateNames);
-    collect_and_run_finalizers(ec_ptr);
-    clear_pass(ShutdownClearPass::RemainingNames);
+        if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+            continue;
+        }
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        clear_shutdown_module_dict(dict);
+    }
+    // One collection for the whole walk, not one per module. `finalize_modules`
+    // clears the module dictionaries and lets refcounting release what they
+    // held; a sweep per module buys no ordering here, because a finalizer that
+    // reads a global reaches its own already-cleared namespace either way, and
+    // it costs a full mark-and-sweep for each of the ~100 modules a bare
+    // `import unittest` loads.
     collect_and_run_finalizers(ec_ptr);
 }
 
@@ -1374,12 +1355,6 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     collect_and_run_finalizers(ec_ptr);
     let shutdown_modules = pyre_interpreter::importing::release_sys_modules_for_shutdown();
     clear_shutdown_modules(shutdown_modules, ec_ptr);
-    // The walk pins every module for its whole length, so none of its own
-    // sweeps can reach what a module dict is the last holder of — a value under
-    // a non-string key, which neither name pass rebinds. Its roots are gone by
-    // here, so this one does, and teardown stops leaving those finalizers
-    // unrun. It is the last collection before the process exits.
-    collect_and_run_finalizers(ec_ptr);
 }
 
 /// Resolve a pending `SystemExit`'s status, then finalize and exit with it.

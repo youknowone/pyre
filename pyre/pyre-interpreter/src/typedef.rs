@@ -2833,10 +2833,11 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )));
     }
     let w_doc = w_doc.unwrap_or_else(pyre_object::w_none);
-    // `w_str_get_wtf8` rather than `w_str_get_value`: `module('\udcff')` is
-    // reachable from an import whose filename was surrogateescape-decoded.
-    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    unsafe { pyre_object::w_module_set_name(self_, name) };
+    // module.py:69 `self.w_name = w_name`: retain the wrapped string itself.
+    // Module names can contain lone surrogates (the import traceback suite
+    // exercises one), so projecting through `w_str_get_value` would both lose
+    // the upstream storage shape and panic on a valid Python `str`.
+    unsafe { pyre_object::w_module_set_name(self_, w_name) };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
     unsafe {
         pyre_object::w_dict_setitem_str(w_dict, "__name__", w_name);
@@ -21576,7 +21577,7 @@ pub(crate) fn buffer_as_bytes_like(
     // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
     // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
     // through to the iterable path.
-    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+    #[cfg(all(unix, not(feature = "sandbox")))]
     if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
         let (address, length, _readonly) = view?;
         let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
@@ -30179,6 +30180,23 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn module_init_retains_a_surrogate_name_object() {
+        let module = pyre_object::w_module_new_managed("");
+        let mut name = rustpython_wtf8::Wtf8Buf::from_string("@test_tmp-".to_string());
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xDCFF).unwrap());
+        let w_name = pyre_object::w_str_from_wtf8(name);
+
+        super::module_descr_init(&[module, w_name]).unwrap();
+
+        assert_eq!(unsafe { pyre_object::w_module_get_name(module) }, w_name);
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        assert_eq!(
+            unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") },
+            Some(w_name)
+        );
+    }
+
     /// Concurrent `init_typeobjects` callers must not observe the
     /// post-registration patch passes mid-write: the libtest harness
     /// calls it from many test threads, and an unsynchronized second

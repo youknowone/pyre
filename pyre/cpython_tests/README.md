@@ -69,9 +69,9 @@ not even be imported/run — an interpreter or stdlib-compat gap) · `CRASH`
 
 - `.github/workflows/pyre-ci.yml` job `cpython-tests` — gates PRs on the
   baseline-`PASS` subset, dynasm with **JIT on** (`MAJIT_STRICT=1`), on
-  `macos-latest` (aarch64). The baseline is recorded on darwin-aarch64 and the
-  JIT codegen is architecture-specific, so the gate runs on the same arch the
-  baseline was observed on (x86_64 JIT-on is a separate, unstable surface).
+  `ubuntu-24.04` (x86_64). The baseline is recorded on linux-x86_64 and the JIT
+  codegen is architecture-specific, so local baseline comparisons must use the
+  same host.
 - `.github/workflows/pyre-cpython-nightly.yml` — non-gating nightly `--full`
   across three lanes (dynasm JIT-on, dynasm JIT-off, cranelift) with reports
   uploaded as artifacts. A module that passes JIT-off but not JIT-on is a JIT
@@ -79,8 +79,8 @@ not even be imported/run — an interpreter or stdlib-compat gap) · `CRASH`
 
 ## Current state and backlog (Phase 0)
 
-The baseline currently records **205 `PASS`**, 165 `IMPORTERROR`, 22 `FAIL`,
-22 `SKIP`, 14 `CRASH`, and 6 `TIMEOUT` (434 modules, stdlib 3.14.6). The
+The baseline currently records **206 `PASS`**, 161 `IMPORTERROR`, 26 `FAIL`,
+22 `SKIP`, 13 `CRASH`, and 6 `TIMEOUT` (434 modules, stdlib 3.14.6). The
 `PASS` set grows as the gaps below are closed; non-passing modules include both
 import/stdlib gaps and tests that reach semantic failures, crashes, or timeouts.
 (It was 0 `PASS` / 414 `IMPORTERROR` before the
