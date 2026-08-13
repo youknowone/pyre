@@ -648,6 +648,12 @@ pub enum OpKind {
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
+    /// RPython `flowmodel.py:Constant(str_value)` after
+    /// `StringRepr.convert_const` resolves the host string to a
+    /// prebuilt `Ptr(STR)`. The pre-jtransform string-constant fold
+    /// carries bytes here; the assembler mints the lltype pointer and
+    /// materialises it through the ref constant pool.
+    ConstStr(Vec<u8>),
     /// RPython `flowmodel.py:Constant(host_object)` resolved by the
     /// rtyper to a singleton instance pointer
     /// (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  Stored as a thin

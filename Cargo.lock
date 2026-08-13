@@ -2056,6 +2056,7 @@ dependencies = [
  "quote",
  "rustpython-compiler",
  "rustpython-compiler-core",
+ "rustpython-wtf8",
  "serde",
  "serde_json",
  "syn",

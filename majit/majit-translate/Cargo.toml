@@ -42,6 +42,7 @@ libc = { workspace = true }
 # Critically this is NOT a dependency on pyre: rustpython-compiler-core is
 # external to both majit and pyre. The `rpython/` ⊥ `pypy/` boundary holds.
 rustpython-compiler-core = { workspace = true }
+rustpython-wtf8 = { workspace = true }
 # `md-5` mirrors upstream `hashlib.md5(...).hexdigest()` used by
 # `rpython/translator/backendopt/stat.py:48` to fingerprint each
 # graph's `co_code` when `print_statistics(save_per_graph_details=...)`

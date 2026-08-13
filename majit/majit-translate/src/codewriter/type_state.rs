@@ -122,6 +122,7 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
         // kind; folded to `ConstBool(true)` by `jtransform` before emit.
         OpKind::ConstSymbolic { .. } => Some(ConcreteType::Signed),
         OpKind::ConstFloat(_) => Some(ConcreteType::Float),
+        OpKind::ConstStr(_) => Some(ConcreteType::GcRef),
         OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
             concrete_if_known(valuetype_to_concrete(ty))

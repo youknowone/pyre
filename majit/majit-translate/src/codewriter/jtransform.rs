@@ -530,6 +530,7 @@ fn is_source_constant_variable(
                 OpKind::ConstInt(_)
                 | OpKind::ConstBool(_)
                 | OpKind::ConstFloat(_)
+                | OpKind::ConstStr(_)
                 | OpKind::ConstRef(_)
                 | OpKind::ConstRefNull
                 | OpKind::ConstNone
@@ -6451,6 +6452,7 @@ fn remap_op(
         | OpKind::ConstBool(_)
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

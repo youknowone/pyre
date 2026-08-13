@@ -1495,6 +1495,23 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstStr(bytes) => {
+                let p = crate::translator::rtyper::lltypesystem::rstr::const_str_cache_llstr(bytes)
+                    .expect("prebuilt STR constant must materialize");
+                let const_value = crate::flowspace::model::ConstValue::LLPtr(Box::new(p));
+                let idx = self.emit_const_r(&const_value, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::ConstRefNull => {
                 let const_value = crate::flowspace::model::ConstValue::LLAddress(
                     crate::translator::rtyper::lltypesystem::lltype::_address::Null,
@@ -2731,6 +2748,7 @@ impl Assembler {
                 OpKind::ConstBool(_) => "ConstBool",
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
+                OpKind::ConstStr(_) => "ConstStr",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
                 OpKind::ConstNone => "ConstNone",
@@ -4418,7 +4436,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `identity_id()` enters the shared `constants_r` pool via
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
-        OpKind::ConstRef(_) | OpKind::ConstRefNull | OpKind::ConstRefAddr(_) => "ref_copy".into(),
+        OpKind::ConstStr(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstRefAddr(_) => "ref_copy".into(),
         // `ConstNone` (Void `None`) is const-inlined by
         // `legacy_const_define_hlvalue`, and `decompose_slice_args` DROPS
         // the getslice `stop` operand for a `[start:]` slice

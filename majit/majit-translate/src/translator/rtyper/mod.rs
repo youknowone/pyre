@@ -19,6 +19,8 @@
 //! * `unit_variant_fold` pre-folds Rust unit-variant constructors into
 //!   prebuilt PBC-like constants, matching the effect of upstream
 //!   frozen-PBC/instance-repr lowering before `jtransform`.
+//! * `str_const_fold` resolves synthetic string-literal calls to the
+//!   prebuilt-string constant shape produced by `StringRepr.convert_const`.
 //!
 //! `lltypesystem::ll2ctypes`, `lltypesystem::llarena`, and
 //! `tool::rffi_platform` are intentionally absent; their module roots
@@ -68,5 +70,6 @@ pub mod rtuple;
 pub mod rtyper;
 pub mod rvirtualizable;
 pub mod rweakref;
+pub(crate) mod str_const_fold;
 pub mod tool;
 pub(crate) mod unit_variant_fold;

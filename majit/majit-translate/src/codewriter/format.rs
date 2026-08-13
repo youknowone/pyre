@@ -488,6 +488,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
         OpKind::Call { .. } => "call".to_string(),
         OpKind::ConstInt(_) => "const_int".to_string(),
         OpKind::ConstFloat(_) => "const_float".to_string(),
+        OpKind::ConstStr(_) => "const_str".to_string(),
         OpKind::CallElidable {
             result_kind,
             args_i,
@@ -602,6 +603,9 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
         }
         OpKind::ConstFloat(bits) => {
             let _ = write!(out, "${}", f64::from_bits(*bits));
+        }
+        OpKind::ConstStr(bytes) => {
+            let _ = write!(out, "${bytes:?}");
         }
         // jtransform.py:414-435 `rewrite_call`:
         //   sublists = [lst_i?, lst_r?, lst_f?, calldescr?]   # only kinds present
@@ -790,6 +794,7 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         },
         OpKind::ConstInt(_) => RegKind::Int,
         OpKind::ConstFloat(_) => RegKind::Float,
+        OpKind::ConstStr(_) => RegKind::Ref,
         OpKind::ConstBool(_) => RegKind::Int,
         OpKind::BinOp { result_ty, .. }
         | OpKind::UnaryOp { result_ty, .. }
