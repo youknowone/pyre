@@ -7,6 +7,10 @@ repository.workspace = true
 description = "Intermediate representation for majit JIT compiler"
 
 [features]
+# Compile the heavyweight JIT audit state. Production callers also gate every
+# instrumentation site, so leaving this feature off removes both the state and
+# the calls that would reach it.
+jit-audits = []
 # Exposes `forwarding::test_support` cross-crate so downstream test suites
 # (backends / gc / jit-trace) can build bound Operands from a single helper
 # instead of duplicating it. Enabled only from `[dev-dependencies]`, so it

@@ -715,6 +715,31 @@ def _jit_panic_reason(stderr):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _jit_stats_merged(stderr):
+    """Every `[jit-stats]` line merged into one `key -> value` map, UNFILTERED.
+
+    `None` when the run printed no such line at all, which is a different
+    condition from printing one with no keys.
+
+    Split out from `_jit_stats_snapshot` because the two callers want opposite
+    things. A committed baseline may only contain the host-stable surface, so
+    the snapshot narrows to `JITSTATS_SNAPSHOT_FIELDS`; a *non-vacuity* check
+    has to read a counter precisely because it is NOT recorded — see
+    `JITSTATS_DENOMINATOR_FIELDS`. Narrowing first would hide it.
+    """
+    fields = {}
+    seen = False
+    for line in stderr.splitlines():
+        if not line.startswith("[jit-stats]"):
+            continue
+        seen = True
+        for token in line[len("[jit-stats]") :].split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+    return fields if seen else None
+
+
 def _jit_stats_snapshot(stderr):
     """Return every jit-stats line merged into normalized key/value text.
 
@@ -738,17 +763,8 @@ def _jit_stats_snapshot(stderr):
     questions: merging arms the floor, the filter keeps the recorded surface
     host-stable.
     """
-    fields = {}
-    seen = False
-    for line in stderr.splitlines():
-        if not line.startswith("[jit-stats]"):
-            continue
-        seen = True
-        for token in line[len("[jit-stats]") :].split():
-            if "=" in token:
-                key, value = token.split("=", 1)
-                fields[key] = value
-    if not seen:
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
         return None
     fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
     # This watches what the JIT compiles, never how well. A regression that
@@ -868,6 +884,16 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_store_journal_rollback_failed",
 )
 
+# A zero-valued badness counter is meaningful only if its source census ran.
+# Pair counters whose census has a reliable denominator and reject runs where
+# that denominator is absent or zero. The denominator is not baselined because
+# it describes a host-dependent descriptor population; only non-vacuity is
+# stable across hosts. `field_pos_attached_misplaced` is intentionally absent:
+# its checked population can legitimately be empty for compiled fixtures.
+JITSTATS_DENOMINATOR_FIELDS = {
+    "field_pos_spec_misplaced": "field_pos_spec_checked",
+}
+
 # The count-valued counters, and what a move in either direction means:
 #
 # * `guard_failures` counts every guard failure that re-enters the metainterp,
@@ -882,8 +908,11 @@ JITSTATS_BADNESS_FIELDS = (
 #   makes the tracer stop admitting a frame at all — a widened
 #   `unsupported_jit_shape` predicate, a pre-trace decline — aborts nothing
 #   (`loops_aborted` holds) and *lowers* `guard_failures` (the compiled guards
-#   that used to fail are gone), so a fall here is the only signal that a hot
-#   loop went back to running interpreted.
+#   that used to fail are gone), so a fall here is the signal that a hot loop
+#   went back to running interpreted.
+#   This counts all compilations, including straight-line traces, so it cannot
+#   distinguish a loop-shaped trace from a flat trace. Inspect `Label` and
+#   `Jump` operations when that distinction matters.
 # * `bridges_compiled` is that same signal one level down: guards that stop
 #   earning a bridge keep re-entering the metainterp forever. It was left
 #   ungated for a long time on the grounds that it "moves in both directions
@@ -911,10 +940,9 @@ JITSTATS_BADNESS_FIELDS = (
 # reshuffling them, but the merged set also carries keys that are not comparable
 # against a file checked into the repo:
 #
-# * `all_descrs` and `descr_set_resolved` are HOST-DEPENDENT — the Charon/LLBC
-#   extraction runs per host, so the same commit reads `all_descrs` 1168 on
-#   macOS, 1396 on ubuntu and 1365 on windows. Committing either makes every
-#   host but one disagree.
+# * `all_descrs` and `descr_set_resolved` are host-dependent because Charon/LLBC
+#   extraction runs per host. Committing either count would make otherwise
+#   equivalent hosts disagree.
 # * the `mc_diag` tallies include contention counters (`busy_skip`,
 #   `stfe_cell_busy`, `stfe_tick`) that move with machine load.
 # * `PYRE_WASM_JIT_STATS=1` adds wall-clock (`compile_ms`) and repeated
@@ -953,7 +981,8 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain. `retraces_compiled` has the same polarity: a fall means an
+# is the gain — within the limit recorded above, that it counts compiles and not
+# loop-shaped ones. `retraces_compiled` has the same polarity: a fall means an
 # assembled retrace stopped being attached. The blackhole adoption counters are
 # inverted the same way: a fall means the interpreter stopped receiving an
 # image and went back to replay.
@@ -1030,6 +1059,30 @@ def _jit_stats_change(saved, current):
         else:
             regressions.append(f"{field} {old} -> {new}")
     return regressions, improvements
+
+
+def _jit_stats_vacuous(stderr):
+    """Return why a gated badness counter is vacuous this run, or "".
+
+    A badness counter's zero means "clean" only when its source census ran.
+    Require a nonzero denominator without baselining its host-dependent value.
+    This detects total loss of a census, not a producer that merely omits some
+    census updates.
+    """
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
+        return ""  # the caller already failed this run for the missing line
+    for numerator, denominator in JITSTATS_DENOMINATOR_FIELDS.items():
+        raw = fields.get(denominator)
+        if raw is not None and raw.isdigit() and int(raw) > 0:
+            continue
+        return (
+            f"{denominator}={raw if raw is not None else '<absent>'} — "
+            f"the census behind `{numerator}` did not run, so that counter's 0 "
+            f"means 'nothing was checked', not 'nothing is misplaced', and its "
+            f"gate passed without inspecting anything"
+        )
+    return ""
 
 
 def _jit_stats_context(current):
@@ -1410,6 +1463,12 @@ class Check:
         # baseline is a bench nobody recorded, an absent line is a bench that
         # stopped reporting.
         self.jitstats_absent = []
+        # Benches whose run printed the line, but with a badness counter's
+        # census denominator at zero — the counter's gate passed on an
+        # instrument that inspected nothing. Tracked apart from
+        # `jitstats_absent` because the line IS there and every other gate on it
+        # is still meaningful; only the paired counters are void.
+        self.jitstats_vacuous = []
 
     # ── backend helpers ──
 
@@ -1650,6 +1709,11 @@ class Check:
         #   "recorded and clean" — which is how the floor came to cover 3 of 340
         #   synthetic fixtures without anyone noticing.
         # * A counter that moved, in either direction.
+        # * A badness counter reading 0 because its census never ran, rather
+        #   than because nothing is wrong — `JITSTATS_DENOMINATOR_FIELDS`. The
+        #   other three disarms are visible as an absence (no line, no file, no
+        #   move); this one is invisible, because a disarmed census and a clean
+        #   one print the same digit.
         if self.args.snapshot_mode != "record":
             if jitstats is None:
                 self.jitstats_absent.append(f"{backend}/{name}")
@@ -1664,6 +1728,10 @@ class Check:
                     f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
                     f"`pyre/check.py --snapshot --backend {backend}`"
                 )
+            vacuous = _jit_stats_vacuous(stderr)
+            if vacuous:
+                self.jitstats_vacuous.append(f"{backend}/{name}")
+                return "fail", vacuous
             regressions, improvements = _jit_stats_change(
                 jitstats_path.read_text(encoding="utf-8"), jitstats
             )
@@ -2015,6 +2083,21 @@ class Check:
             and float(exec_b) <= EXEC_TIME_FLOOR_S
         )
 
+    def _baseline_exec_time_thin(self, baseline, baseline_time):
+        """Whether a baseline clears the floor but not the floor gate's bar.
+
+        Reporting only: the ceiling accepts any value above
+        `EXEC_TIME_FLOOR_S`, while the floor gate requires
+        `FLOOR_GATE_MIN_BASELINE_S`. Mark ratios in the intervening band so
+        they are not mistaken for values accepted by both directions.
+        """
+        exec_b = self._exec_time(baseline, baseline_time)
+        return (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and EXEC_TIME_FLOOR_S < float(exec_b) < FLOOR_GATE_MIN_BASELINE_S
+        )
+
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
         baseline_cmd, expected_output, baseline_key, minimum=None,
@@ -2206,7 +2289,17 @@ class Check:
             den = self._exec_time("pypy", pypy_val)
             if den in (None, "-") or float(den) <= 0 or num in (None, "-"):
                 return "-"
-            marker = "~" if self._baseline_exec_time_clamped("pypy", pypy_val) else ""
+            # Display only: neither marker reaches a verdict. `~` says no gate
+            # was applied; `?` says one was, against a baseline under the bar
+            # the floor gate uses. An unmarked ratio now means both directions
+            # of the gate accepted the denominator, which is what a reader has
+            # been entitled to assume all along.
+            if self._baseline_exec_time_clamped("pypy", pypy_val):
+                marker = "~"
+            elif self._baseline_exec_time_thin("pypy", pypy_val):
+                marker = "?"
+            else:
+                marker = ""
             return f"{marker}{float(num) / float(den):.1f}x"
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
@@ -2542,7 +2635,15 @@ class Check:
         # `N to run,` rather than the runner's own "no regressions": a
         # selection that came out empty prints every counter as zero and
         # still exits 0, which reads as a pass and tests nothing.
-        selected = re.search(r"^(\d+) to run,", output, re.M)
+        #
+        # The default runner gates only modules whose recorded baseline passes.
+        # Report skipped and non-gated counts so this subset is not mistaken
+        # for the full suite.
+        selected = re.search(
+            r"^(\d+) to run, (\d+) skipped(?:, (\d+) not gated \(non-PASS\))?,",
+            output,
+            re.M,
+        )
         if code == 124:
             detail = f"timeout (>{CPYTHON_SUITE_TIMEOUT_S}s)"
         elif selected is None:
@@ -2561,7 +2662,13 @@ class Check:
             self._append_comparison(backend, name, "-", "-", "FAIL")
             return
         self._record(backend, True, name, "")
-        print(f"{green('PASS')}  {selected.group(1)} modules, {elapsed:.0f}s")
+        ran, not_run, degated = (
+            selected.group(1), selected.group(2), selected.group(3) or "0",
+        )
+        print(
+            f"{green('PASS')}  {ran} gated, {degated} not gated, "
+            f"{not_run} skipped, {elapsed:.0f}s"
+        )
         self._append_comparison(backend, name, "-", "-", f"{elapsed:.0f}s")
 
     # ── synthetic parity suite ──
@@ -2750,6 +2857,14 @@ class Check:
                 "  ~ pypy exec clamped to floor; ratio is not a measurement, "
                 "and no ratio gate is applied to it"
             )
+        # Sniffing the rendered cell, like the line above: no other cell value
+        # contains a `?` (they are times, ratios, FAIL/WRONG/UNSTABLE/skip/-).
+        if any("?" in c[b] for c in self.comparisons for b in cols):
+            print(
+                "  ? pypy exec is above the floor but under "
+                "FLOOR_GATE_MIN_BASELINE_S; the ceiling is applied, the floor "
+                "gate declines the same baseline as too small to judge"
+            )
         print("  " + "─" * (54 + 19 * len(cols)))
         for c in self.comparisons:
             row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
@@ -2786,6 +2901,7 @@ class Check:
                 (yellow, "jit-stats unstable (not gated)", self.jitstats_unstable),
                 (red, "jit-stats baseline missing", self.jitstats_missing),
                 (red, "jit-stats line absent", self.jitstats_absent),
+                (red, "jit-stats census vacuous", self.jitstats_vacuous),
             ):
                 if benches:
                     print(

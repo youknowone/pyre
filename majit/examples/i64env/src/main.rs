@@ -244,7 +244,7 @@ mod tests {
 
     /// How many unroll-free fallback compiles `jit_tier_is_alive` currently
     /// sees — see the block at its assertion. `MC_DIAG` slot 73.
-    const EXPECT_UNPEELED: u64 = 1;
+    const EXPECT_UNPEELED: u64 = 0;
 
     /// Like [`probe`], but also reports `LAST_OPS_AFTER`, read *inside* the
     /// lock.
@@ -361,6 +361,22 @@ mod tests {
     fn jit_tier_is_alive() {
         let (got, compiles, ops_after, unpeeled, shape) =
             probe_with_ops("jit_tier_is_alive", &count_program(1000, 1), 3, 3);
+        // `unpeeled` counts loops this run compiled through the unroll-free
+        // fallback: the unrolled compile raised `InvalidLoop`, and the retry
+        // WITHOUT the peel succeeded. The retry succeeding is what makes a
+        // relapse silent — measured on this crate with the `identity_input_ref`
+        // repair present and absent, one variable:
+        //
+        //   INVARIANT:     `compiles`, `closes_a_loop()` and the result read
+        //                  the same in both arms, so not one of them notices.
+        //   DISCRIMINATING: `unpeeled` 0 vs 1, and `ops_after` 9 vs 4.
+        //
+        // So the `ops_after` pin below is the other half of this one: they are
+        // two arms of one defect, not two independent measurements.
+        //
+        // Not a target value in either direction. A rise means a subject lost
+        // its peel and the unroll-free fallback is live on it again; the
+        // response is to find the subject, not to raise the pin.
         assert_eq!(
             unpeeled, EXPECT_UNPEELED,
             "expected {EXPECT_UNPEELED} unroll-free fallback compile(s) out of \
@@ -402,11 +418,14 @@ mod tests {
              file would still pass"
         );
 
+        // 9 is the peeled body: `Label`/`IntAdd`/`IntGt`/`GuardTrue` twice plus
+        // the closing `Jump`. A drop to 4 is the unpeeled fallback body — read
+        // it together with the `unpeeled` pin above, which moves with it.
         assert_eq!(
-            ops_after, 4,
-            "compiled body is {ops_after} ops, not the pinned 4 — 1 is a bare \
-             `Finish()`, i.e. a dispatch that lowered nothing at all, and 9 is \
-             the peeled shape the legacy bare merge point produced"
+            ops_after, 9,
+            "compiled body is {ops_after} ops, not the pinned 9 — 4 is the \
+             unpeeled fallback body and 1 is a bare `Finish()`, i.e. a dispatch \
+             that lowered nothing at all"
         );
         println!(
             "[tier-alive] count_program(1000, 1) = {got}, compiled {compiles} loop(s) of {ops_after} ops, 0 degraded arms"

@@ -1037,6 +1037,25 @@ fn real_main() {
         let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
 
+        // `MAJIT_MINT_INDEX_CENSUS=1`: how many `fielddescrof` mints resolved a
+        // slot for `index_in_parent`, and how many carried out the `0` they were
+        // initialised with. The split the emitted descr cannot record — an
+        // unwritten initialiser and a real slot-0 claim are the same bytes once
+        // this function returns.
+        //
+        // Read in the minting build process: runtime statistics run in another
+        // process and would see fresh zeroed atomics. A cached build emits no
+        // warning, so force the build script to rerun when collecting this
+        // census.
+        if std::env::var_os("MAJIT_MINT_INDEX_CENSUS").is_some() {
+            let [claimed, placeholder] = majit_ir::descr::GcCache::mint_index_census();
+            println!(
+                "cargo::warning=mint_index_census: claimed={claimed} placeholder={placeholder} \
+                 (fielddescrof mints; placeholder=0 means no descr in this build carries an \
+                 unresolved index_in_parent)"
+            );
+        }
+
         // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
         // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
         // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).

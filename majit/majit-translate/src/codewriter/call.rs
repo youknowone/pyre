@@ -8874,6 +8874,43 @@ mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
 
+    #[test]
+    fn serialized_descr_set_keys_ignore_descriptor_address_order() {
+        use majit_ir::effectinfo::DescrSetMember;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct StubDescr(u32);
+        impl majit_ir::Descr for StubDescr {
+            fn index(&self) -> u32 {
+                self.0
+            }
+        }
+
+        let a: DescrRef = Arc::new(StubDescr(1));
+        let b: DescrRef = Arc::new(StubDescr(2));
+        let (first, second) =
+            if majit_ir::effectinfo::descr_ptr_id(&a) < majit_ir::effectinfo::descr_ptr_id(&b) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+        let pairs = vec![
+            (first, Some(DescrSetMember::Array { array_id: 2 })),
+            (second, Some(DescrSetMember::Array { array_id: 1 })),
+        ];
+
+        let (_, keys) = canonicalize_keyed_descrs(pairs, None).unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                DescrSetMember::Array { array_id: 1 },
+                DescrSetMember::Array { array_id: 2 },
+            ],
+            "serialized keys must follow structural member order, not Arc address order",
+        );
+    }
+
     /// A `TypedItemsBlock` puts its items at the length word rounded up to the
     /// element's alignment. Only a target whose word is narrower than an
     /// element can tell the two apart: with a 4-byte word, an `i64` item sits

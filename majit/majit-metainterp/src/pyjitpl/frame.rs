@@ -479,6 +479,8 @@ impl MIFrame {
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
         for (i, &value) in self.jitcode.constants_i.iter().enumerate() {
             let slot = num_regs_i + i;
+            #[cfg(feature = "jit-audits")]
+            majit_ir::reg_write_audit::note_int_write(self.int_regs.as_ptr() as usize, slot, None);
             self.int_regs[slot] = Some(ctx.const_int(value));
             self.int_values[slot] = Some(value);
         }
@@ -576,6 +578,12 @@ impl MIFrame {
         }
         match kind {
             JitArgKind::Int => {
+                #[cfg(feature = "jit-audits")]
+                majit_ir::reg_write_audit::note_int_write(
+                    self.int_regs.as_ptr() as usize,
+                    target_index,
+                    Some(opref),
+                );
                 self.int_regs[target_index] = Some(opref);
                 self.int_values[target_index] = Some(concrete);
             }
@@ -670,6 +678,12 @@ impl MIFrame {
                 match argcode {
                     b'i' => {
                         let opref = OpRef::const_int(0);
+                        #[cfg(feature = "jit-audits")]
+                        majit_ir::reg_write_audit::note_int_write(
+                            self.int_regs.as_ptr() as usize,
+                            index,
+                            Some(opref),
+                        );
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                         (None, None, None)
@@ -846,6 +860,12 @@ impl MIFrame {
                 match argcode {
                     b'i' => {
                         let opref = OpRef::const_int(0);
+                        #[cfg(feature = "jit-audits")]
+                        majit_ir::reg_write_audit::note_int_write(
+                            self.int_regs.as_ptr() as usize,
+                            index,
+                            Some(opref),
+                        );
                         self.int_regs[index] = Some(opref);
                         self.int_values[index] = Some(0);
                     }
@@ -899,6 +919,8 @@ impl MIFrame {
             for index in it.by_ref() {
                 let idx = index as usize;
                 let tagged = if Some(idx) == clear_int_idx {
+                    #[cfg(feature = "jit-audits")]
+                    majit_ir::reg_write_audit::note_int_read_diverted(idx, "clear_int_idx");
                     SnapshotTagged::Const(0, Type::Int)
                 } else if skip_int_identity.is_some_and(|(b, e)| idx >= b && idx < e)
                     && idx < num_regs_i
@@ -931,6 +953,12 @@ impl MIFrame {
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]
                         .expect("get_list_of_active_snapshot_boxes: int register uninitialized");
+                    #[cfg(feature = "jit-audits")]
+                    majit_ir::reg_write_audit::note_int_read(
+                        self.int_regs.as_ptr() as usize,
+                        idx,
+                        opref,
+                    );
                     let value = self.int_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: int value uninitialized");
                     if opref.is_constant() {
@@ -939,6 +967,8 @@ impl MIFrame {
                         SnapshotTagged::Box(opref, Type::Int)
                     }
                 } else {
+                    #[cfg(feature = "jit-audits")]
+                    majit_ir::reg_write_audit::note_int_read_diverted(idx, "constants-pool");
                     SnapshotTagged::Const(self.jitcode.constants_i[idx - num_regs_i], Type::Int)
                 };
                 boxes.push(tagged);
@@ -1070,6 +1100,12 @@ impl MIFrame {
         for (kind, value, concrete) in argboxes {
             match kind {
                 JitArgKind::Int => {
+                    #[cfg(feature = "jit-audits")]
+                    majit_ir::reg_write_audit::note_int_write(
+                        self.int_regs.as_ptr() as usize,
+                        count_i,
+                        Some(*value),
+                    );
                     self.int_regs[count_i] = Some(*value);
                     self.int_values[count_i] = Some(*concrete);
                     count_i += 1;

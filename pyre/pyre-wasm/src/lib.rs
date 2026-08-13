@@ -582,6 +582,43 @@ pub extern "C" fn pyre_jit_field_pos_attached_checked() -> u64 {
     pyre_jit::field_position_counts().attached_checked
 }
 
+/// The four `derive_index_in_parent` dispositions, the rest of the
+/// `field_position_census`.
+///
+/// `unresolved` — parent resolved, non-empty, field absent from it — is the
+/// population the `attached_*` pair structurally cannot see: both halves of
+/// that pair are counted inside a lookup that must first succeed, so a field
+/// its parent does not contain is counted by neither and numerator and
+/// denominator read healthy together. It is the only counter that reports it.
+///
+/// Export all dispositions explicitly: the runner can reject a requested
+/// missing symbol, but it cannot detect a counter it never requested. These
+/// counts describe name resolution rather than target-dependent offsets, but
+/// their values still depend on the workload.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_parent_absent() -> u64 {
+    pyre_jit::field_position_counts().parent_absent
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_parent_empty() -> u64 {
+    pyre_jit::field_position_counts().parent_empty
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_rederived() -> u64 {
+    pyre_jit::field_position_counts().rederived
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_field_pos_unresolved() -> u64 {
+    pyre_jit::field_position_counts().unresolved
+}
+
 #[cfg(any(feature = "web", feature = "wasm-host"))]
 static PANIC_HOOK: Once = Once::new();
 

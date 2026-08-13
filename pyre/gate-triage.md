@@ -968,14 +968,15 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (58): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (61): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
-`PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
+`PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
+`PYRE_CELL_CENSUS`,
 `PYRE_DESCR_SPELLING_GATE`,
-`PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
+`PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
@@ -996,6 +997,12 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`.
+
+`PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`
+example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
+value knobs bound the capture window, sampling rate, and report size. This is a
+diagnostic tool rather than a temporary runtime experiment, so it retires only
+if the example itself is removed.
 
 ## §7 — General MAJIT gates
 

@@ -444,7 +444,6 @@ crate::py_module! {
                 ("GetModuleFileName", 1, process::get_module_file_name),
                 ("TerminateProcess", 2, process::terminate_process),
                 ("CreatePipe", 2, process::create_pipe),
-                ("CreateProcess", 9, process::create_process),
             ] {
                 crate::module_ns_store(
                     ns,
@@ -455,6 +454,24 @@ crate::py_module! {
                     ),
                 );
             }
+            // Fixed-arity builtin fast paths only cover zero through four
+            // arguments. CreateProcess still needs an exact-arity check, so
+            // register it through the general call path with a checked body.
+            crate::module_ns_store(
+                ns,
+                "CreateProcess",
+                crate::gateway::with_module(
+                    "_winapi",
+                    crate::make_module_builtin_function(
+                        "CreateProcess",
+                        crate::py_checked_arity_fn!(
+                            "CreateProcess",
+                            9,
+                            process::create_process
+                        ),
+                    ),
+                ),
+            );
             // `options` is the one argument with a default (`0`), so the
             // count is not fixed.
             crate::module_ns_store(

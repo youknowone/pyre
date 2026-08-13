@@ -1774,6 +1774,12 @@ where
             // Preserve that mutation instead of restoring the pre-snapshot
             // state-field materialization save.
             if Some(idx) != root_inflight_int_result {
+                #[cfg(feature = "jit-audits")]
+                majit_ir::reg_write_audit::note_int_write(
+                    self.frames.frames[0].int_regs.as_ptr() as usize,
+                    idx,
+                    saved_int_regs[idx],
+                );
                 self.frames.frames[0].int_regs[idx] = saved_int_regs[idx];
                 self.frames.frames[0].int_values[idx] = saved_int_values[idx];
             }
@@ -3036,6 +3042,12 @@ where
                 match kind {
                     JitArgKind::Int => {
                         let (value, concrete) = self.read_int_reg(caller_src);
+                        #[cfg(feature = "jit-audits")]
+                        majit_ir::reg_write_audit::note_int_write(
+                            portal_frame.int_regs.as_ptr() as usize,
+                            callee_dst,
+                            Some(value),
+                        );
                         portal_frame.int_regs[callee_dst] = Some(value);
                         portal_frame.int_values[callee_dst] = Some(concrete);
                     }
@@ -6307,6 +6319,12 @@ where
                     match kind {
                         JitArgKind::Int => {
                             let (value, concrete) = self.read_int_reg(caller_src);
+                            #[cfg(feature = "jit-audits")]
+                            majit_ir::reg_write_audit::note_int_write(
+                                sub_frame.int_regs.as_ptr() as usize,
+                                callee_dst,
+                                Some(value),
+                            );
                             sub_frame.int_regs[callee_dst] = Some(value);
                             sub_frame.int_values[callee_dst] = Some(concrete);
                         }
@@ -8562,6 +8580,12 @@ where
 
         for (callee_dst, caller_src) in args_i.into_iter().enumerate() {
             let (value, concrete) = self.read_int_reg(caller_src);
+            #[cfg(feature = "jit-audits")]
+            majit_ir::reg_write_audit::note_int_write(
+                sub_frame.int_regs.as_ptr() as usize,
+                callee_dst,
+                Some(value),
+            );
             sub_frame.int_regs[callee_dst] = Some(value);
             sub_frame.int_values[callee_dst] = Some(concrete);
         }
@@ -8600,6 +8624,8 @@ where
 
     fn set_int_reg(&mut self, reg: usize, opref: Option<OpRef>, value: Option<i64>) {
         let frame = self.frames.current_mut();
+        #[cfg(feature = "jit-audits")]
+        majit_ir::reg_write_audit::note_int_write(frame.int_regs.as_ptr() as usize, reg, opref);
         frame.int_regs[reg] = opref;
         frame.int_values[reg] = value;
     }

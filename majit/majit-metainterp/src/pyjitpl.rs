@@ -646,9 +646,58 @@ fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_i
         .collect()
 }
 
+#[cfg(feature = "jit-audits")]
+thread_local! {
+    /// Scope key for the `translate_trace_iter` OpRef-variant audit: one value
+    /// per `prepare_bridge_trace_for_optimizer` call, never reused.
+    ///
+    /// A generation counter keeps separate bridge preparations apart without
+    /// depending on allocation addresses that may be reused.
+    static AUDIT_PREPARE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Open a new audit scope, one per bridge preparation.
+///
+/// Bump once per preparation, not per operand; otherwise every note would have
+/// a unique scope and collisions would become unrepresentable.
+///
+/// Wrapping is unreachable at one increment per compiled bridge and is spelled
+/// explicitly so the counter can never abort a debug build from an audit path.
+#[cfg(feature = "jit-audits")]
+fn next_audit_prepare_generation() {
+    AUDIT_PREPARE_GENERATION.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The scope opened by the most recent `prepare_bridge_trace_for_optimizer` on
+/// this thread; 0 before any has run.
+///
+/// Private translation helpers call this only within
+/// `prepare_bridge_trace_for_optimizer`, after opening a generation.
+#[cfg(feature = "jit-audits")]
+fn audit_prepare_generation() -> usize {
+    AUDIT_PREPARE_GENERATION.with(std::cell::Cell::get)
+}
+
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
+    }
+    // Record which variants claim each SLOT of this cache — the query below
+    // and, once resolved, the operand the slot actually holds. Both are noted
+    // under `opref.raw()`, the slot, not under their own raws: they carry
+    // different raws by construction (`InputArgInt(0)` lands on a slot filled
+    // for `InputArgRef(4824)`), so keying each by its own raw files them
+    // apart and compares nothing.
+    //
+    // This is wider than the bank compare below, which fires only when the
+    // two banks disagree on `ty()`; `InputArgInt(n)` against `IntOp(n)` is the
+    // same `ty()` and passes it silently. The per-preparation generation
+    // scopes the keys to one bridge, so two bridges reusing a position are not
+    // a collision.
+    #[cfg(feature = "jit-audits")]
+    {
+        let audit_scope = audit_prepare_generation();
+        majit_ir::opref_audit::note_key("translate_trace_iter", audit_scope, opref.raw(), opref);
     }
     // opencoder.py:286-289 `_get(self, i)` parity — `assert _cache[i] is
     // not None`. The bridge fresh-iterator
@@ -732,6 +781,12 @@ fn prepare_bridge_trace_for_optimizer(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
+    // Open this bridge's audit scope before anything reads it. Every caller of
+    // `translate_trace_iter_opref` and `translate_trace_iter_box_map` is below
+    // this line, so the keys they file all carry this call's generation and no
+    // two preparations share one.
+    #[cfg(feature = "jit-audits")]
+    next_audit_prepare_generation();
     // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
@@ -6580,8 +6635,8 @@ impl<M: Clone> MetaInterp<M> {
         // cpu.vector_ext and cpu.vector_ext.is_enabled()`. No pyre jitdriver
         // declares vectorize=True, so `jitdriver_sd.vec` is false and the
         // gate reduces to `warmstate.vec_all`; `vector_register_size()` is
-        // `cpu.vector_ext` collapsed to a byte width (0 ⇒ absent/disabled,
-        // non-zero ⇒ is_enabled()). The unroll-free retry is the simple-loop
+        // `cpu.vector_ext` collapsed to a byte width (0 means absent/disabled,
+        // non-zero means is_enabled()). The unroll-free retry is the simple-loop
         // path (compile.py:233 compile_simple_loop), which is not vectorized.
         let optimized_ops = {
             let driver_vec = false; // jitdriver_sd.vec

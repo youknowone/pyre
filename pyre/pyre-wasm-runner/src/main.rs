@@ -934,6 +934,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             counter("pyre_jit_field_pos_attached_checked", &mut missing);
         let field_pos_attached_misplaced =
             counter("pyre_jit_field_pos_attached_misplaced", &mut missing);
+        // The rest of the `field_position_census`. `field_pos_unresolved` is
+        // the only counter that sees fields whose parent does not contain them:
+        // both halves of the `attached_*` pair are counted inside a lookup that
+        // must first succeed, so that population is missing from numerator and
+        // denominator alike and the pair reads healthy while blind.
+        //
+        // Asking for them is what makes them gateable. The refusal below fires
+        // only for names in THIS list, so a counter nobody asks for is not
+        // caught by it — it simply never appears, and `_jit_stats_change` reads
+        // an absent field as 0, the healthy value.
+        let field_pos_parent_absent = counter("pyre_jit_field_pos_parent_absent", &mut missing);
+        let field_pos_parent_empty = counter("pyre_jit_field_pos_parent_empty", &mut missing);
+        let field_pos_rederived = counter("pyre_jit_field_pos_rederived", &mut missing);
+        let field_pos_unresolved = counter("pyre_jit_field_pos_unresolved", &mut missing);
         // Walks that ended uncommitted after a residual had already run an
         // irreversible effect. Reached through the slot-indexed `pyre_fbw_diag`
         // export rather than a counter of its own; slot 1 is
@@ -991,6 +1005,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
              field_pos_spec_misplaced={field_pos_spec_misplaced} \
              field_pos_attached_checked={field_pos_attached_checked} \
              field_pos_attached_misplaced={field_pos_attached_misplaced} \
+             field_pos_parent_absent={field_pos_parent_absent} \
+             field_pos_parent_empty={field_pos_parent_empty} \
+             field_pos_rederived={field_pos_rederived} \
+             field_pos_unresolved={field_pos_unresolved} \
              fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed} \
              fbw_blackhole_adopted_single_frame={fbw_blackhole_adopted_single_frame} \
              fbw_blackhole_adopted_multi_frame={fbw_blackhole_adopted_multi_frame}"

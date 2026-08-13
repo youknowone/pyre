@@ -688,6 +688,16 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
+    /// Bridge mode from `optimizer.building_bridge` (unroll.py:183-236
+    /// `optimize_bridge`).
+    ///
+    /// A bridge's inputargs are rebuilt from the deadframe frame-first, so the
+    /// virtualizable identity sits at slot 0 whatever the front end's own
+    /// layout says. `inputarg_base` cannot carry that distinction: Phase 2
+    /// shifts the base as well (`unroll.rs` `phase2_inputarg_base`), so a
+    /// consumer keying on `inputarg_base != 0` treats an unrolled loop body as
+    /// a bridge. This flag is the discriminator; the base is the namespace.
+    pub building_bridge: bool,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -1691,6 +1701,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -2313,6 +2324,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -6299,6 +6311,44 @@ impl OptContext {
         // separate section after vable_array. opencoder.py:767
         // create_top_snapshot writes both arrays into the snapshot.
         snapshot.vref_array = vref_oprefs;
+
+        // Compare every snapshot cell's carried type with the type encoded by
+        // its `OpRef` variant. `None` is an unclassified producer rather than
+        // agreement. This complements the variant audit because `OpRef::ty()`
+        // deliberately collapses variants within one type bank.
+        #[cfg(feature = "jit-audits")]
+        if majit_ir::opref_audit::enabled() {
+            let mut agree = 0usize;
+            let mut disagree = 0usize;
+            let mut untyped = 0usize;
+            let cells = snapshot
+                .framestack
+                .iter()
+                .flat_map(|frame| frame.boxes.iter())
+                .chain(snapshot.vable_array.iter())
+                .chain(snapshot.vref_array.iter());
+            for cell in cells {
+                let encoded = cell.opref.ty();
+                match cell.tp {
+                    None => untyped += 1,
+                    Some(tp) if Some(tp) == encoded => agree += 1,
+                    Some(tp) => {
+                        disagree += 1;
+                        eprintln!(
+                            "[snapbox-tp] DISAGREE opref={:?} tp={:?} ty={:?}",
+                            cell.opref, tp, encoded
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "[snapbox-tp] cells={} agree={} disagree={} untyped={}",
+                agree + disagree + untyped,
+                agree,
+                disagree,
+                untyped
+            );
+        }
 
         if crate::callee_rca_enabled() {
             let env = OptBoxEnv { ctx: self };
