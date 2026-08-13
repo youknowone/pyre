@@ -1159,12 +1159,12 @@ fn real_main() {
                     false,
                 )
             } else {
-                println!(
-                    "cargo::warning=codegen determinism: the second in-process generation \
-                     panicked (see the panic above), so nothing was compared; the codegen does \
-                     not survive running twice in one process. Compare across processes with \
-                     {DETERMINISM_CHECK_ENV}=cache instead"
-                );
+                report_determinism(&format!(
+                    "the second in-process generation panicked (see the panic above), so \
+                     nothing was compared; the codegen does not survive running twice in one \
+                     process. Compare across processes with {DETERMINISM_CHECK_ENV}=cache \
+                     instead"
+                ));
                 false
             }
         }
@@ -1184,11 +1184,10 @@ fn real_main() {
                 // say so rather than let an empty comparison read as clean.
                 // Storing below is what gives the next run something to
                 // compare against.
-                println!(
-                    "cargo::warning=codegen determinism: cache key {cache_key} has no stored \
-                     entry, so nothing was compared; re-run this build to compare against the \
-                     entry it is about to store"
-                );
+                report_determinism(&format!(
+                    "cache key {cache_key} has no stored entry, so nothing was compared; \
+                     re-run this build to compare against the entry it is about to store"
+                ));
                 true
             }
         }
@@ -1210,10 +1209,9 @@ fn real_main() {
             ),
             _ => "refusing to store them".to_string(),
         };
-        println!(
-            "cargo::warning=codegen determinism: the outputs at cache key {cache_key} are not \
-             reproducible; {consequence}"
-        );
+        report_determinism(&format!(
+            "the outputs at cache key {cache_key} are not reproducible; {consequence}"
+        ));
         return;
     }
 
@@ -1423,10 +1421,12 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
 /// output that cannot be read on one side is an inconclusive comparison, and
 /// an inconclusive comparison must not report as a clean one.
 ///
-/// Reports through `cargo::warning`, which cargo surfaces for a workspace
-/// crate's build script. A bare `println!` / `eprintln!` needs `-vv`, which is
-/// how a build-script line documenting the cache restore went unread long
-/// enough to be mistaken for the restore not happening.
+/// Reports through [`report_determinism`], which writes `cargo::warning` —
+/// cargo surfaces that for a workspace crate's build script, where a bare
+/// `println!` / `eprintln!` needs `-vv`, which is how a build-script line
+/// documenting the cache restore went unread long enough to be mistaken for the
+/// restore not happening — and repeats the same finding on stderr for a build
+/// script invoked directly.
 ///
 /// Names the identical outputs as well as the differing ones. Which files hold
 /// still localises the cause faster than which files move: `jitcodes.bin`
@@ -1441,6 +1441,21 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
 /// inverse excuses [`IN_PROCESS_STATEFUL_OUTPUTS`]. Both are still reported on
 /// their own lines: a check that files a by-design difference as a defect is one
 /// people learn to ignore, and then it reports nothing at all.
+/// Emit one determinism finding on both streams.
+///
+/// `cargo::warning` is honoured on stdout only, while every line this build
+/// script narrates is an `eprintln!` on stderr. A build script invoked directly
+/// — the prepass rig runs one with the two streams captured to separate files —
+/// therefore put its pass sentence on stderr and its entire failure report on
+/// stdout, so filtering stderr for `codegen determinism` yielded the two
+/// exclusion lines and no verdict at all. That reads as a quieter pass, and a
+/// failing generation was taken for a passing one on exactly that reading. The
+/// direct run also exits 0 either way, so the exit code does not correct it.
+fn report_determinism(finding: &str) {
+    println!("cargo::warning=codegen determinism: {finding}");
+    eprintln!("[pyre-jit-trace build.rs] codegen determinism: {finding}");
+}
+
 fn codegen_outputs_match(
     label: &str,
     baseline: &std::path::Path,
@@ -1508,17 +1523,21 @@ fn codegen_outputs_match(
         return true;
     }
     for entry in &differing {
-        println!("cargo::warning=codegen determinism: DIFFERS from {label}: {entry}");
+        report_determinism(&format!("DIFFERS from {label}: {entry}"));
     }
     for entry in &unreadable {
-        println!("cargo::warning=codegen determinism: NOT COMPARED against {label}: {entry}");
+        report_determinism(&format!("NOT COMPARED against {label}: {entry}"));
     }
-    println!(
-        "cargo::warning=codegen determinism: {} of {} outputs unchanged from {label}: {}",
+    report_determinism(&format!(
+        "{} of {} outputs unchanged from {label}: {}",
         identical.len(),
         CODEGEN_OUTPUTS.len(),
         identical.join(" ")
-    );
+    ));
+    // Both exclusions already went to stderr above, in either outcome. Repeat
+    // them as warnings so the cargo-visible report of a failure carries what
+    // was left out of the verdict it just reported; a plain `println!` here
+    // keeps them off stderr a second time.
     if !host_addressed.is_empty() {
         println!(
             "cargo::warning=codegen determinism: excluded as host addresses (expected to differ \
