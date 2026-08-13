@@ -5,46 +5,104 @@
 //! implementation, ported into `pyre_native::zlib` (flate2 / zlib-rs) and kept
 //! outside the LLBC extraction; this module is the W_Root object glue.
 //!
-//! `Compress` / `Decompress` / `_ZlibDecompressor` hold flate2 streaming state
-//! that cannot live in the Python dict, so it is parked in process-global
-//! registries keyed by an id stashed in each instance dict (`_id`). A streamer
-//! dropped by GC leaks its (post-finish, buffer-freed) registry entry; the
-//! heavy flate2 buffers are released by the backend at finish/eof.
+//! `Compress` / `Decompress` / `_ZlibDecompressor` own their native stream
+//! directly, matching `interp_zlib.py`'s `self.stream`.  Each stream also owns
+//! its PyPy-style per-object lock; there is no process-global side table.
 
 use pyre_native::zlib as backend;
 use pyre_object::*;
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-// ── streaming-state registries ──────────────────────────────────────────
-
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static COMPRESSORS: Mutex<BTreeMap<u64, backend::Compressor>> = Mutex::new(BTreeMap::new());
-static DECOMPRESSORS: Mutex<BTreeMap<u64, backend::Decompressor>> = Mutex::new(BTreeMap::new());
-static ZDECOMPRESSORS: Mutex<BTreeMap<u64, backend::ZlibDecompressor>> =
-    Mutex::new(BTreeMap::new());
-
-fn next_id() -> u64 {
-    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+/// PyPy `interp_zlib.py:134 Compress`: the stream and lock belong to the
+/// wrapper object.  The mapdict prefix preserves PyPy's ability to subclass
+/// the type without moving its native payload into a side table.
+#[crate::pyre_class("zlib.Compress")]
+#[derive(Default)]
+pub struct W_Compress {
+    pub map: *const u8,
+    pub storage: *mut pyre_object::object_array::ItemsBlock,
+    backend: *mut Mutex<backend::Compressor>,
 }
 
-fn get_id(obj: PyObjectRef) -> u64 {
-    let d = crate::baseobjspace::getdict_native(obj);
-    if d.is_null() {
-        return 0;
-    }
-    match unsafe { w_dict_getitem_str(d, "_id") } {
-        Some(v) if unsafe { is_int(v) } => (unsafe { w_int_get_value(v) }) as u64,
-        _ => 0,
+/// PyPy `interp_zlib.py:268 Decompress` object-owned stream state.
+#[crate::pyre_class("zlib.Decompress")]
+#[derive(Default)]
+pub struct W_Decompress {
+    pub map: *const u8,
+    pub storage: *mut pyre_object::object_array::ItemsBlock,
+    backend: *mut Mutex<backend::Decompressor>,
+}
+
+/// PyPy `interp_zlib.py:419 ZlibDecompressor` object-owned buffered stream.
+#[crate::pyre_class("zlib._ZlibDecompressor")]
+#[derive(Default)]
+pub struct W_ZlibDecompressor {
+    pub map: *const u8,
+    pub storage: *mut pyre_object::object_array::ItemsBlock,
+    backend: *mut Mutex<backend::ZlibDecompressor>,
+}
+
+macro_rules! assert_mapdict_prefix {
+    ($ty:ty) => {
+        const _: () = assert!(
+            std::mem::offset_of!($ty, map)
+                == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
+            "zlib wrapper must keep W_ObjectObject's map offset"
+        );
+        const _: () = assert!(
+            std::mem::offset_of!($ty, storage)
+                == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
+            "zlib wrapper must keep W_ObjectObject's storage offset"
+        );
+    };
+}
+
+assert_mapdict_prefix!(W_Compress);
+assert_mapdict_prefix!(W_Decompress);
+assert_mapdict_prefix!(W_ZlibDecompressor);
+
+fn compressor_this(obj: PyObjectRef) -> Result<&'static mut W_Compress, crate::PyError> {
+    W_Compress::from_obj(obj).ok_or_else(|| crate::PyError::type_error("expected Compress object"))
+}
+
+fn decompressor_this(obj: PyObjectRef) -> Result<&'static mut W_Decompress, crate::PyError> {
+    W_Decompress::from_obj(obj)
+        .ok_or_else(|| crate::PyError::type_error("expected Decompress object"))
+}
+
+fn zdecompressor_this(obj: PyObjectRef) -> Result<&'static mut W_ZlibDecompressor, crate::PyError> {
+    W_ZlibDecompressor::from_obj(obj)
+        .ok_or_else(|| crate::PyError::type_error("expected _ZlibDecompressor object"))
+}
+
+/// Sweep-time counterparts of the three RPython `_finalize_` methods.  The
+/// Box contains the per-object mutex and native stream; dropping it neither
+/// allocates nor calls back into Python.
+pub unsafe fn w_compress_dealloc(obj: PyObjectRef) {
+    if let Some(this) = W_Compress::from_obj(obj)
+        && !this.backend.is_null()
+    {
+        unsafe { drop(Box::from_raw(this.backend)) };
+        this.backend = std::ptr::null_mut();
     }
 }
 
-fn set_id(obj: PyObjectRef, id: u64) {
-    let d = crate::baseobjspace::getdict_native(obj);
-    if !d.is_null() {
-        unsafe { w_dict_setitem_str(d, "_id", w_int_new(id as i64)) };
+pub unsafe fn w_decompress_dealloc(obj: PyObjectRef) {
+    if let Some(this) = W_Decompress::from_obj(obj)
+        && !this.backend.is_null()
+    {
+        unsafe { drop(Box::from_raw(this.backend)) };
+        this.backend = std::ptr::null_mut();
+    }
+}
+
+pub unsafe fn w_zdecompress_dealloc(obj: PyObjectRef) {
+    if let Some(this) = W_ZlibDecompressor::from_obj(obj)
+        && !this.backend.is_null()
+    {
+        unsafe { drop(Box::from_raw(this.backend)) };
+        this.backend = std::ptr::null_mut();
     }
 }
 
@@ -103,8 +161,11 @@ fn zdict_or_none(o: PyObjectRef) -> Result<Option<Vec<u8>>, crate::PyError> {
     }
 }
 
-fn to_wbits(v: i64) -> i8 {
-    v as i8
+/// `rzlib` passes window bits through a C `int`.  Preserve that 32-bit
+/// wrapping boundary; narrowing to `i8` would incorrectly turn e.g. 271 into
+/// the valid value 15.
+fn to_wbits(v: i64) -> i32 {
+    v as i32
 }
 
 // ── checksums ───────────────────────────────────────────────────────────
@@ -133,19 +194,46 @@ fn adler32_compute(buf: &[u8], start: u32) -> u32 {
 
 // ── Compress (compressobj) ──────────────────────────────────────────────
 
-static COMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static DECOMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static ZDECOMPRESS_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static COMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static DECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static ZDECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn compress_type() -> PyObjectRef {
-    *COMPRESS_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("Compress", init_compress_type);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+    *COMPRESS_RUNTIME_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "Compress",
+            init_compress_type,
+            crate::typedef::w_object(),
+            <W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        );
+        pyre_object::pyobject::set_instantiate(
+            unsafe { &*<W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
+            tp,
+        );
         tp as usize
     }) as PyObjectRef
 }
 
 fn init_compress_type(ns: PyObjectRef) {
+    let new_sig = {
+        let mut b = crate::SignatureBuilder::default();
+        b.append("cls");
+        b.marker_posonly();
+        b.append("level");
+        b.append("method");
+        b.append("wbits");
+        b.append("memLevel");
+        b.append("strategy");
+        b.append("zdict");
+        b.signature()
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr_maybe_sig(compress_new, Some(new_sig)),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -156,17 +244,33 @@ fn init_compress_type(ns: PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("compress() missing data"));
                     }
-                    let id = get_id(args[0]);
                     let data = as_bytes(args[1])?;
-                    let mut reg = COMPRESSORS.lock().unwrap();
-                    let c = reg
-                        .get_mut(&id)
-                        .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                    let this = compressor_this(args[0])?;
+                    if this.backend.is_null() {
+                        return Err(zlib_error("Error -2: inconsistent stream state"));
+                    }
+                    let mut c = unsafe { &*this.backend }.lock().unwrap();
                     let out = c.compress(&data).map_err(zlib_error)?;
                     Ok(bytesobject::w_bytes_from_bytes(&out))
                 },
                 2,
             ),
+        )
+    };
+    for name in ["copy", "__copy__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                crate::make_builtin_function_with_arity(name, compress_copy, 1),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__deepcopy__",
+            crate::make_builtin_function_with_arity("__deepcopy__", compress_copy, 2),
         )
     };
     unsafe {
@@ -177,7 +281,6 @@ fn init_compress_type(ns: PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("flush() missing self"));
                 }
-                let id = get_id(args[0]);
                 // interp_zlib.py:196 `@unwrap_spec(mode="c_int")` — the
                 // converter reports a value outside the C `int` range rather
                 // than truncating it into a different flush mode.
@@ -185,10 +288,11 @@ fn init_compress_type(ns: PyObjectRef) {
                     Some(o) if !unsafe { is_none(o) } => crate::baseobjspace::c_int_w(o)?,
                     _ => backend::Z_FINISH,
                 };
-                let mut reg = COMPRESSORS.lock().unwrap();
-                let c = reg
-                    .get_mut(&id)
-                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                let this = compressor_this(args[0])?;
+                if this.backend.is_null() {
+                    return Err(zlib_error("Error -2: inconsistent stream state"));
+                }
+                let mut c = unsafe { &*this.backend }.lock().unwrap();
                 let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
@@ -196,25 +300,120 @@ fn init_compress_type(ns: PyObjectRef) {
     };
 }
 
+fn compress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or_else(compress_type);
+    let level = int_or_default(args.get(1).copied().unwrap_or(PY_NULL), -1)? as i32;
+    let method = int_or_default(args.get(2).copied().unwrap_or(PY_NULL), 8)? as i32;
+    let wbits = to_wbits(int_or_default(
+        args.get(3).copied().unwrap_or(PY_NULL),
+        backend::MAX_WBITS as i64,
+    )?);
+    let mem_level = int_or_default(args.get(4).copied().unwrap_or(PY_NULL), 8)? as i32;
+    let strategy = int_or_default(args.get(5).copied().unwrap_or(PY_NULL), 0)? as i32;
+    let zdict = zdict_or_none(args.get(6).copied().unwrap_or(PY_NULL))?;
+    make_compress_for(cls, level, method, wbits, mem_level, strategy, zdict)
+}
+
 fn make_compress(
     level: i32,
-    wbits: i8,
+    method: i32,
+    wbits: i32,
+    mem_level: i32,
+    strategy: i32,
     zdict: Option<Vec<u8>>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let c = backend::Compressor::new(level, wbits, zdict.as_deref()).map_err(zlib_error)?;
-    let id = next_id();
-    COMPRESSORS.lock().unwrap().insert(id, c);
-    let obj = w_instance_new(compress_type());
-    set_id(obj, id);
-    Ok(obj)
+    make_compress_for(
+        compress_type(),
+        level,
+        method,
+        wbits,
+        mem_level,
+        strategy,
+        zdict,
+    )
+}
+
+fn make_compress_for(
+    cls: PyObjectRef,
+    level: i32,
+    method: i32,
+    wbits: i32,
+    mem_level: i32,
+    strategy: i32,
+    zdict: Option<Vec<u8>>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !(-1..=9).contains(&level)
+        || method != 8
+        || !((-15..=-9).contains(&wbits) || (8..=15).contains(&wbits) || (25..=31).contains(&wbits))
+        || !(1..=9).contains(&mem_level)
+        || !(0..=4).contains(&strategy)
+    {
+        // interp_zlib.py:244-247: rzlib.deflateInit reports invalid
+        // initialization options as ValueError, distinct from operational
+        // zlib.error failures.
+        return Err(crate::PyError::value_error("Invalid initialization option"));
+    }
+    let c = backend::Compressor::new(level, method, wbits, mem_level, strategy, zdict.as_deref())
+        .map_err(zlib_error)?;
+    allocate_compress(cls, c)
+}
+
+/// `interp_zlib.py:171 Compress.copy` and `descr_deepcopy`: copy the live
+/// deflate stream while holding the source object's lock, then construct the
+/// base `Compress` type (PyPy deliberately does not preserve a subclass).
+fn compress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let copied = {
+        let this = compressor_this(obj)?;
+        if this.backend.is_null() {
+            return Err(crate::PyError::value_error(
+                "Compressor was already flushed",
+            ));
+        }
+        let mut compressor = unsafe { &*this.backend }.lock().unwrap();
+        if compressor.is_finished() {
+            return Err(crate::PyError::value_error(
+                "Compressor was already flushed",
+            ));
+        }
+        compressor.copy().map_err(zlib_error)?
+    };
+    allocate_compress(compress_type(), copied)
+}
+
+fn allocate_compress(
+    cls: PyObjectRef,
+    backend: backend::Compressor,
+) -> Result<PyObjectRef, crate::PyError> {
+    let backend = Box::into_raw(Box::new(Mutex::new(backend)));
+    let _roots = gc_roots::push_roots();
+    gc_roots::pin_root(cls);
+    let cls_slot = gc_roots::shadow_stack_len() - 1;
+    let obj = W_Compress::allocate_stable(W_Compress {
+        ob: PyObject::default(),
+        map: std::ptr::null(),
+        storage: std::ptr::null_mut(),
+        backend,
+    });
+    Ok(crate::typedef::tag_subclass_instance(obj, unsafe {
+        gc_roots::shadow_stack_get(cls_slot)
+    }))
 }
 
 // ── Decompress (decompressobj) ──────────────────────────────────────────
 
 fn decompress_type() -> PyObjectRef {
-    *DECOMPRESS_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("Decompress", init_decompress_type);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+    *DECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "Decompress",
+            init_decompress_type,
+            crate::typedef::w_object(),
+            <W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        );
+        pyre_object::pyobject::set_instantiate(
+            unsafe { &*<W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
+            tp,
+        );
         tp as usize
     }) as PyObjectRef
 }
@@ -232,40 +431,90 @@ fn decompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::Bui
     };
 }
 
+// interp_zlib.py:308 `decompress(self, data, __posonly__=None,
+// max_length=0)`, exposed as `($self, data, /, max_length=0)`.  The signature
+// binder is essential here: pip's wheel reader passes max_length by keyword,
+// and an unbound native callable otherwise sees the kwargs transport object as
+// a positional integer.
+fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let data_obj = args.get(1).copied().unwrap_or(PY_NULL);
+    if data_obj.is_null() {
+        return Err(crate::PyError::type_error("decompress() missing data"));
+    }
+    let data = as_bytes(data_obj)?;
+    // An omitted `max_length` is unlimited; a supplied value — including
+    // `None` — goes through `int_w`.  Zero also means unlimited here, and a
+    // negative value is rejected.
+    let max_length = match args.get(2).copied() {
+        Some(o) if !o.is_null() => {
+            let v = crate::baseobjspace::int_w(o)?;
+            if v < 0 {
+                return Err(crate::PyError::value_error(
+                    "max_length must be non-negative",
+                ));
+            }
+            (v != 0).then_some(v as usize)
+        }
+        _ => None,
+    };
+    let this = decompressor_this(args[0])?;
+    if this.backend.is_null() {
+        return Err(zlib_error("Error -2: inconsistent stream state"));
+    }
+    let mut d = unsafe { &*this.backend }.lock().unwrap();
+    let out = d.decompress(&data, max_length).map_err(zlib_error)?;
+    Ok(bytesobject::w_bytes_from_bytes(&out))
+}
+
 fn init_decompress_type(ns: PyObjectRef) {
+    let new_sig = {
+        let mut b = crate::SignatureBuilder::default();
+        b.append("cls");
+        b.marker_posonly();
+        b.append("wbits");
+        b.append("zdict");
+        b.signature()
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__new__",
+            crate::typedef::make_new_descr_maybe_sig(decompress_new, Some(new_sig)),
+        )
+    };
+    let decompress_sig = {
+        let mut b = crate::SignatureBuilder::default();
+        b.append("self");
+        b.append("data");
+        b.marker_posonly();
+        b.append("max_length");
+        b.signature()
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "decompress",
-            crate::make_builtin_function("decompress", |args| {
-                if args.len() < 2 {
-                    return Err(crate::PyError::type_error("decompress() missing data"));
-                }
-                let id = get_id(args[0]);
-                let data = as_bytes(args[1])?;
-                // An omitted `max_length` is unlimited; a supplied value —
-                // including `None` — goes through `int_w`, which raises for
-                // `None`.  Zero also means unlimited here, and a negative
-                // value is rejected.
-                let max_length = match args.get(2).copied() {
-                    Some(o) => {
-                        let v = crate::baseobjspace::int_w(o)?;
-                        if v < 0 {
-                            return Err(crate::PyError::value_error(
-                                "max_length must be non-negative",
-                            ));
-                        }
-                        (v != 0).then_some(v as usize)
-                    }
-                    None => None,
-                };
-                let mut reg = DECOMPRESSORS.lock().unwrap();
-                let d = reg
-                    .get_mut(&id)
-                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
-                let out = d.decompress(&data, max_length).map_err(zlib_error)?;
-                Ok(bytesobject::w_bytes_from_bytes(&out))
-            }),
+            crate::make_builtin_function_maybe_sig(
+                "decompress",
+                decompress_decompress,
+                Some(decompress_sig),
+            ),
+        )
+    };
+    for name in ["copy", "__copy__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                crate::make_builtin_function_with_arity(name, decompress_copy, 1),
+            )
+        };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__deepcopy__",
+            crate::make_builtin_function_with_arity("__deepcopy__", decompress_copy, 2),
         )
     };
     unsafe {
@@ -276,7 +525,6 @@ fn init_decompress_type(ns: PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("flush() missing self"));
                 }
-                let id = get_id(args[0]);
                 let length = match args.get(1).copied() {
                     Some(o) if !unsafe { is_none(o) } => {
                         let v = crate::baseobjspace::int_w(o)?;
@@ -289,55 +537,138 @@ fn init_decompress_type(ns: PyObjectRef) {
                     }
                     _ => backend::DEF_BUF_SIZE,
                 };
-                let mut reg = DECOMPRESSORS.lock().unwrap();
-                let d = reg
-                    .get_mut(&id)
-                    .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+                let this = decompressor_this(args[0])?;
+                if this.backend.is_null() {
+                    return Err(zlib_error("Error -2: inconsistent stream state"));
+                }
+                let mut d = unsafe { &*this.backend }.lock().unwrap();
                 let out = d.flush(length).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
         )
     };
     decompress_getset(ns, "unused_data", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = DECOMPRESSORS.lock().unwrap();
-        let data = reg
-            .get(&id)
-            .map(|d| d.unused_data().to_vec())
-            .unwrap_or_default();
+        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+        let data = if this.backend.is_null() {
+            Vec::new()
+        } else {
+            unsafe { &*this.backend }
+                .lock()
+                .unwrap()
+                .unused_data()
+                .to_vec()
+        };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     decompress_getset(ns, "unconsumed_tail", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = DECOMPRESSORS.lock().unwrap();
-        let data = reg
-            .get(&id)
-            .map(|d| d.unconsumed_tail().to_vec())
-            .unwrap_or_default();
+        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+        let data = if this.backend.is_null() {
+            Vec::new()
+        } else {
+            unsafe { &*this.backend }
+                .lock()
+                .unwrap()
+                .unconsumed_tail()
+                .to_vec()
+        };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     decompress_getset(ns, "eof", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = DECOMPRESSORS.lock().unwrap();
-        Ok(w_bool_from(reg.get(&id).map(|d| d.eof()).unwrap_or(false)))
+        let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+        Ok(w_bool_from(
+            !this.backend.is_null() && unsafe { &*this.backend }.lock().unwrap().eof(),
+        ))
     });
 }
 
-fn make_decompress(wbits: i8, zdict: Option<Vec<u8>>) -> Result<PyObjectRef, crate::PyError> {
+fn decompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or_else(decompress_type);
+    let wbits = to_wbits(int_or_default(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        backend::MAX_WBITS as i64,
+    )?);
+    let zdict = zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL))?;
+    make_decompress_for(cls, wbits, zdict)
+}
+
+fn make_decompress(wbits: i32, zdict: Option<Vec<u8>>) -> Result<PyObjectRef, crate::PyError> {
+    make_decompress_for(decompress_type(), wbits, zdict)
+}
+
+fn make_decompress_for(
+    cls: PyObjectRef,
+    wbits: i32,
+    zdict: Option<Vec<u8>>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !(wbits == 0
+        || (-15..=-8).contains(&wbits)
+        || (8..=15).contains(&wbits)
+        || (24..=31).contains(&wbits)
+        || (40..=47).contains(&wbits))
+    {
+        // interp_zlib.py:411-414 mirrors the deflate constructor's ValueError
+        // conversion for inflateInit2.
+        return Err(crate::PyError::value_error("Invalid initialization option"));
+    }
     let d = backend::Decompressor::new(wbits, zdict).map_err(zlib_error)?;
-    let id = next_id();
-    DECOMPRESSORS.lock().unwrap().insert(id, d);
-    let obj = w_instance_new(decompress_type());
-    set_id(obj, id);
-    Ok(obj)
+    allocate_decompress(cls, d)
+}
+
+/// `interp_zlib.py:343 Decompress.copy`: clone both inflate state and its
+/// visible tails/dictionary under the per-object lock, returning the base type.
+fn decompress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(PY_NULL);
+    let copied = {
+        let this = decompressor_this(obj)?;
+        if this.backend.is_null() {
+            return Err(crate::PyError::value_error(
+                "Decompressor was already flushed",
+            ));
+        }
+        let decompressor = unsafe { &*this.backend }.lock().unwrap();
+        if decompressor.is_finished() {
+            return Err(crate::PyError::value_error(
+                "Decompressor was already flushed",
+            ));
+        }
+        decompressor.copy().map_err(zlib_error)?
+    };
+    allocate_decompress(decompress_type(), copied)
+}
+
+fn allocate_decompress(
+    cls: PyObjectRef,
+    backend: backend::Decompressor,
+) -> Result<PyObjectRef, crate::PyError> {
+    let backend = Box::into_raw(Box::new(Mutex::new(backend)));
+    let _roots = gc_roots::push_roots();
+    gc_roots::pin_root(cls);
+    let cls_slot = gc_roots::shadow_stack_len() - 1;
+    let obj = W_Decompress::allocate_stable(W_Decompress {
+        ob: PyObject::default(),
+        map: std::ptr::null(),
+        storage: std::ptr::null_mut(),
+        backend,
+    });
+    Ok(crate::typedef::tag_subclass_instance(obj, unsafe {
+        gc_roots::shadow_stack_get(cls_slot)
+    }))
 }
 
 // ── _ZlibDecompressor (buffered; used by gzip reading) ──────────────────
 
 fn zdecompress_type() -> PyObjectRef {
-    *ZDECOMPRESS_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("_ZlibDecompressor", init_zdecompress_type);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+    *ZDECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "_ZlibDecompressor",
+            init_zdecompress_type,
+            crate::typedef::w_object(),
+            <W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        );
+        pyre_object::pyobject::set_instantiate(
+            unsafe { &*<W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
+            tp,
+        );
         tp as usize
     }) as PyObjectRef
 }
@@ -367,11 +698,27 @@ fn zdecompress_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )?);
     let zdict = zdict_or_none(args.get(2).copied().unwrap_or(PY_NULL))?;
     let d = backend::ZlibDecompressor::new(wbits, zdict).map_err(zlib_error)?;
-    let id = next_id();
-    ZDECOMPRESSORS.lock().unwrap().insert(id, d);
-    let obj = w_instance_new(zdecompress_type());
-    set_id(obj, id);
-    Ok(obj)
+    let cls = args.first().copied().unwrap_or_else(zdecompress_type);
+    allocate_zdecompress(cls, d)
+}
+
+fn allocate_zdecompress(
+    cls: PyObjectRef,
+    backend: backend::ZlibDecompressor,
+) -> Result<PyObjectRef, crate::PyError> {
+    let backend = Box::into_raw(Box::new(Mutex::new(backend)));
+    let _roots = gc_roots::push_roots();
+    gc_roots::pin_root(cls);
+    let cls_slot = gc_roots::shadow_stack_len() - 1;
+    let obj = W_ZlibDecompressor::allocate_stable(W_ZlibDecompressor {
+        ob: PyObject::default(),
+        map: std::ptr::null(),
+        storage: std::ptr::null_mut(),
+        backend,
+    });
+    Ok(crate::typedef::tag_subclass_instance(obj, unsafe {
+        gc_roots::shadow_stack_get(cls_slot)
+    }))
 }
 
 // `_ZlibDecompressor.decompress(self, /, data, max_length=-1)` — `self`
@@ -394,11 +741,11 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
         _ => None,
     };
-    let id = get_id(args[0]);
-    let mut reg = ZDECOMPRESSORS.lock().unwrap();
-    let d = reg
-        .get_mut(&id)
-        .ok_or_else(|| zlib_error("Error -2: inconsistent stream state"))?;
+    let this = zdecompressor_this(args[0])?;
+    if this.backend.is_null() {
+        return Err(zlib_error("Error -2: inconsistent stream state"));
+    }
+    let mut d = unsafe { &*this.backend }.lock().unwrap();
     match d.decompress(&data, max_length) {
         Ok(out) => Ok(bytesobject::w_bytes_from_bytes(&out)),
         Err(backend::DecompressError::Zlib(m)) => Err(zlib_error(m)),
@@ -422,6 +769,19 @@ fn init_zdecompress_type(ns: PyObjectRef) {
             crate::typedef::make_new_descr_maybe_sig(zdecompress_new, Some(new_sig)),
         )
     };
+    for name in ["__reduce__", "__reduce_ex__"] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                name,
+                crate::make_builtin_function(name, |_| {
+                    Err(crate::PyError::type_error(
+                        "cannot pickle 'zlib._ZlibDecompressor' object",
+                    ))
+                }),
+            )
+        };
+    }
     let decompress_sig = {
         let mut b = crate::SignatureBuilder::default();
         b.append("self");
@@ -442,24 +802,28 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         )
     };
     zdecompress_getset(ns, "unused_data", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = ZDECOMPRESSORS.lock().unwrap();
-        let data = reg
-            .get(&id)
-            .map(|d| d.unused_data().to_vec())
-            .unwrap_or_default();
+        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+        let data = if this.backend.is_null() {
+            Vec::new()
+        } else {
+            unsafe { &*this.backend }
+                .lock()
+                .unwrap()
+                .unused_data()
+                .to_vec()
+        };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     zdecompress_getset(ns, "eof", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = ZDECOMPRESSORS.lock().unwrap();
-        Ok(w_bool_from(reg.get(&id).map(|d| d.eof()).unwrap_or(false)))
+        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
+        Ok(w_bool_from(
+            !this.backend.is_null() && unsafe { &*this.backend }.lock().unwrap().eof(),
+        ))
     });
     zdecompress_getset(ns, "needs_input", |args| {
-        let id = get_id(args.get(1).copied().unwrap_or(PY_NULL));
-        let reg = ZDECOMPRESSORS.lock().unwrap();
+        let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
         Ok(w_bool_from(
-            reg.get(&id).map(|d| d.needs_input()).unwrap_or(true),
+            this.backend.is_null() || unsafe { &*this.backend }.lock().unwrap().needs_input(),
         ))
     });
 }
@@ -530,10 +894,8 @@ crate::py_module! {
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py:228 `Compress___new__(level, method, wbits, memLevel,
-        // strategy, w_zdict)` — all six positional-or-keyword.  `method` /
-        // `memLevel` / `strategy` are accepted-and-ignored: `Compressor::new`
-        // threads only level / wbits / zdict (interp_zlib.py:244 notes the
-        // undocumented pass-through).
+        // strategy, w_zdict)` — all six positional-or-keyword and all native
+        // initialization options are passed through to deflateInit2.
         fn compressobj(
             #[default(w_none())] level: PyObjectRef,
             #[default(w_none())] method: PyObjectRef,
@@ -542,10 +904,19 @@ crate::py_module! {
             #[default(w_none())] strategy: PyObjectRef,
             #[default(w_none())] zdict: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let _ = (method, memLevel, strategy);
             let level = int_or_default(level, -1)? as i32;
+            let method = int_or_default(method, 8)? as i32;
             let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
-            make_compress(level, wbits, zdict_or_none(zdict)?)
+            let mem_level = int_or_default(memLevel, 8)? as i32;
+            let strategy = int_or_default(strategy, 0)? as i32;
+            make_compress(
+                level,
+                method,
+                wbits,
+                mem_level,
+                strategy,
+                zdict_or_none(zdict)?,
+            )
         }
         // interp_zlib.py:400 `Decompress___new__(wbits, w_zdict)`.
         fn decompressobj(

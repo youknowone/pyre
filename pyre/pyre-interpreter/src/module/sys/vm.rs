@@ -1264,6 +1264,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         module_ns_store(ns, "version_info", vi);
     }
+    // PyPy exposes its implementation release independently from the Python
+    // language compatibility version.  pip's vendored packaging consumes the
+    // named fields through sys.implementation.version; a plain tuple (or the
+    // language's sys.version_info) is observably wrong.
+    {
+        let pyre_version_info_type = crate::_structseq::make_struct_seq(
+            "sys.pyre_version_info",
+            &["major", "minor", "micro", "releaselevel", "serial"],
+        );
+        let parse_component = |value: &str| value.parse::<i64>().unwrap_or(0);
+        let vi = crate::_structseq::new_instance(
+            pyre_version_info_type,
+            vec![
+                w_int_new(parse_component(env!("CARGO_PKG_VERSION_MAJOR"))),
+                w_int_new(parse_component(env!("CARGO_PKG_VERSION_MINOR"))),
+                w_int_new(parse_component(env!("CARGO_PKG_VERSION_PATCH"))),
+                w_str_new("final"),
+                w_int_new(0),
+            ],
+        );
+        module_ns_store(ns, "pyre_version_info", vi);
+    }
     // sys.modules — live dict synced with the import cache.
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
@@ -1738,24 +1760,45 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
-    // sys.implementation — structseq-like namespace with name, version, ...
+    // sys.implementation — PyPy app.py's implementation_dict, with the Pyre
+    // implementation version rather than Python's language version.
     {
         let impl_obj = w_instance_new(simple_namespace_type());
         crate::baseobjspace::setdictvalue_native(impl_obj, "name", w_str_new("pyre"));
+        let implementation_version = crate::runtime_ops::module_ns_get(ns, "pyre_version_info")
+            .expect("sys.pyre_version_info was installed above");
+        crate::baseobjspace::setdictvalue_native(impl_obj, "version", implementation_version);
+        let version_major = env!("CARGO_PKG_VERSION_MAJOR")
+            .parse::<i64>()
+            .unwrap_or(0);
+        let version_minor = env!("CARGO_PKG_VERSION_MINOR")
+            .parse::<i64>()
+            .unwrap_or(0);
+        let version_micro = env!("CARGO_PKG_VERSION_PATCH")
+            .parse::<i64>()
+            .unwrap_or(0);
+        let implementation_hexversion =
+            (version_major << 24) | (version_minor << 16) | (version_micro << 8) | 0xf0;
         crate::baseobjspace::setdictvalue_native(
             impl_obj,
-            "version",
-            w_tuple_new(vec![
-                w_int_new(3),
-                w_int_new(14),
-                w_int_new(6),
-                w_str_new("final"),
-                w_int_new(0),
-            ]),
+            "hexversion",
+            w_int_new(implementation_hexversion),
         );
-        crate::baseobjspace::setdictvalue_native(impl_obj, "hexversion", w_int_new(0x030e06f0));
-        crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre-314"));
-        crate::baseobjspace::setdictvalue_native(impl_obj, "_multiarch", w_str_new(""));
+        crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre314"));
+        let multiarch = if cfg!(target_os = "macos") {
+            "darwin"
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            "x86_64-linux-gnu"
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            "aarch64-linux-gnu"
+        } else {
+            ""
+        };
+        crate::baseobjspace::setdictvalue_native(
+            impl_obj,
+            "_multiarch",
+            w_str_new(multiarch),
+        );
         module_ns_store(ns, "implementation", impl_obj);
     }
     // sys.hash_info — structseq with width/modulus/... fields.
@@ -1811,32 +1854,42 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         module_ns_store(ns, "int_info", ii);
     }
     module_ns_store(ns, "hexversion", w_int_new(0x030e06f0));
-    // sys.executable — absolute path to the running interpreter so that
-    // subprocess spawns via `sys.executable` resolve.
-    #[cfg(not(feature = "sandbox"))]
-    let executable = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_owned))
-        .unwrap_or_else(|| "pyre".to_owned());
-    // Under sandbox a fixed placeholder: current_exe() leaks the host binary
-    // path (and username), and subprocess spawning is unavailable anyway.
-    #[cfg(feature = "sandbox")]
-    let executable = "/bin/pyre".to_owned();
-    module_ns_store(ns, "executable", w_str_new(&executable));
-    // sys.prefix / exec_prefix
-    module_ns_store(ns, "prefix", w_str_new(""));
-    module_ns_store(ns, "exec_prefix", w_str_new(""));
-    module_ns_store(ns, "base_prefix", w_str_new(""));
-    module_ns_store(ns, "base_exec_prefix", w_str_new(""));
-    // FrozenImporter uses the resolved stdlib root to reconstruct source
-    // filenames for frozen stdlib modules.
     #[cfg(feature = "host_env")]
-    let stdlib_dir = crate::importing::detect_stdlib_path()
-        .and_then(|path| path.to_str().map(w_str_new))
-        .unwrap_or_else(w_none);
+    {
+        // `app_main.setup_bootstrap_path` obtains all five values from one
+        // initpath computation before site runs.  In particular,
+        // `sys.executable` retains a venv symlink/copy while stdlib lookup
+        // follows it to `base_prefix`; independent `current_exe` and stdlib
+        // probes collapse that distinction and make pyvenv.cfg ineffective.
+        let paths = crate::importing::startup_path_config();
+        let fs_path = |path: &std::path::Path| {
+            w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(path.as_os_str()))
+        };
+        module_ns_store(ns, "executable", fs_path(&paths.executable));
+        module_ns_store(ns, "_base_executable", fs_path(&paths.base_executable));
+        module_ns_store(ns, "prefix", fs_path(&paths.prefix));
+        module_ns_store(ns, "exec_prefix", fs_path(&paths.prefix));
+        module_ns_store(ns, "base_prefix", fs_path(&paths.base_prefix));
+        module_ns_store(ns, "base_exec_prefix", fs_path(&paths.base_prefix));
+        // FrozenImporter uses the resolved stdlib root to reconstruct source
+        // filenames for frozen stdlib modules.
+        let stdlib_dir = paths
+            .stdlib
+            .as_deref()
+            .map(fs_path)
+            .unwrap_or_else(w_none);
+        module_ns_store(ns, "_stdlib_dir", stdlib_dir);
+    }
     #[cfg(not(feature = "host_env"))]
-    let stdlib_dir = w_none();
-    module_ns_store(ns, "_stdlib_dir", stdlib_dir);
+    {
+        module_ns_store(ns, "executable", w_str_new(""));
+        module_ns_store(ns, "_base_executable", w_str_new(""));
+        module_ns_store(ns, "prefix", w_str_new(""));
+        module_ns_store(ns, "exec_prefix", w_str_new(""));
+        module_ns_store(ns, "base_prefix", w_str_new(""));
+        module_ns_store(ns, "base_exec_prefix", w_str_new(""));
+        module_ns_store(ns, "_stdlib_dir", w_none());
+    }
     // sys._framework — macOS framework name (empty string on non-framework builds)
     module_ns_store(ns, "_framework", w_str_new(""));
     // sys._jit — namespace with is_enabled/is_available methods.

@@ -1,0 +1,3 @@
+- name: Stage the Pyre standard library
+  shell: bash
+  run: python3 scripts/stage-stdlib.py dist-assets/lib/pyre3.14

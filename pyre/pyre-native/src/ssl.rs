@@ -15,6 +15,7 @@ use rustls::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer,
 };
 use rustls::sign::CertifiedKey;
+use sha1::{Digest, Sha1};
 use x509_parser::prelude::FromDer;
 
 static INSTALL_PROVIDER: Once = Once::new();
@@ -212,7 +213,7 @@ const VERIFY_X509_STRICT: i32 = 32;
 const VERIFY_X509_PARTIAL_CHAIN: i32 = 0x80000;
 
 /// Revocation scope requested by `verify_flags`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CrlScope {
     Disabled,
     EndEntityOnly,
@@ -991,6 +992,151 @@ pub fn certificate_decode_file(path: &str) -> NativeResult<*mut DecodedCertifica
     let data = std::fs::read(path).map_err(io_error)?;
     let certs = read_pem_certificates(&data)?;
     certificate_decode_der(certs[0].as_ref())
+}
+
+fn push_rfc2253_value(output: &mut String, value: &[u8]) {
+    for (index, byte) in value.iter().copied().enumerate() {
+        let must_hex_escape = !(0x20..=0x7e).contains(&byte) || byte == 0;
+        if must_hex_escape {
+            use std::fmt::Write;
+            let _ = write!(output, "\\{byte:02X}");
+            continue;
+        }
+        let leading = index == 0 && (byte == b' ' || byte == b'#');
+        let trailing = index + 1 == value.len() && byte == b' ';
+        if leading || trailing || matches!(byte, b',' | b'+' | b'"' | b'\\' | b'<' | b'>' | b';') {
+            output.push('\\');
+        }
+        output.push(byte as char);
+    }
+}
+
+/// RFC 2253 subject rendering used by PyPy's `Certificate.__repr__`.
+#[inline(never)]
+pub fn certificate_subject_rfc2253(der: &[u8]) -> NativeResult<String> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(der)
+        .map_err(|error| pem_error(format!("unable to decode certificate: {error}")))?;
+    let mut output = String::new();
+    let rdns: Vec<_> = certificate.subject().iter_rdn().collect();
+    for (rdn_index, rdn) in rdns.into_iter().rev().enumerate() {
+        if rdn_index != 0 {
+            output.push(',');
+        }
+        for (attribute_index, attribute) in rdn.iter().enumerate() {
+            if attribute_index != 0 {
+                output.push('+');
+            }
+            let name = x509_parser::objects::oid2abbrev(
+                attribute.attr_type(),
+                x509_parser::objects::oid_registry(),
+            )
+            .map(str::to_owned)
+            .unwrap_or_else(|_| attribute.attr_type().to_id_string());
+            output.push_str(&name);
+            output.push('=');
+            push_rfc2253_value(&mut output, attribute.as_slice());
+        }
+    }
+    Ok(output)
+}
+
+/// OpenSSL's `X509_subject_name_hash`: the low 32 bits of SHA-1 over the
+/// canonical subject Name encoding, interpreted in little-endian order.
+fn der_length(output: &mut Vec<u8>, length: usize) {
+    if length < 128 {
+        output.push(length as u8);
+        return;
+    }
+    let bytes = length.to_be_bytes();
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    output.push(0x80 | (bytes.len() - first) as u8);
+    output.extend_from_slice(&bytes[first..]);
+}
+
+fn der_value(tag: u8, contents: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(contents.len() + 6);
+    output.push(tag);
+    der_length(&mut output, contents.len());
+    output.extend_from_slice(contents);
+    output
+}
+
+fn canonical_string_value(
+    attribute: &x509_parser::x509::AttributeTypeAndValue<'_>,
+) -> (u8, Vec<u8>) {
+    let tag = attribute.attr_value().tag().0;
+    let input = attribute.as_slice();
+    let decoded = match tag {
+        // UTF8String plus the single-byte ASN.1 character string types in
+        // OpenSSL's ASN1_MASK_CANON.
+        12 | 18 | 19 | 20 | 22 | 26 => {
+            if tag == 20 {
+                input
+                    .iter()
+                    .flat_map(|byte| char::from(*byte).to_string().into_bytes())
+                    .collect()
+            } else {
+                input.to_vec()
+            }
+        }
+        // UniversalString and BMPString.
+        28 => input
+            .chunks_exact(4)
+            .filter_map(|bytes| {
+                char::from_u32(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            })
+            .flat_map(|value| value.to_string().into_bytes())
+            .collect(),
+        30 => char::decode_utf16(
+            input
+                .chunks_exact(2)
+                .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]])),
+        )
+        .map(|value| value.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect::<String>()
+        .into_bytes(),
+        // Types outside ASN1_MASK_CANON are copied without conversion.
+        _ => return (tag as u8, input.to_vec()),
+    };
+    let is_space = |byte: &u8| matches!(*byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let mut output = Vec::with_capacity(decoded.len());
+    for word in decoded.split(is_space).filter(|part| !part.is_empty()) {
+        if !output.is_empty() {
+            output.push(b' ');
+        }
+        output.extend(word.iter().map(u8::to_ascii_lowercase));
+    }
+    (12, output)
+}
+
+fn canonical_name_der(name: &x509_parser::x509::X509Name<'_>) -> Vec<u8> {
+    let mut output = Vec::new();
+    for rdn in name.iter_rdn() {
+        let mut entries = Vec::new();
+        for attribute in rdn.iter() {
+            let mut entry = der_value(6, attribute.attr_type().as_bytes());
+            let (tag, value) = canonical_string_value(attribute);
+            entry.extend_from_slice(&der_value(tag, &value));
+            entries.push(der_value(0x30, &entry));
+        }
+        // ASN.1 SET OF canonical ordering is lexicographic over each complete
+        // DER element. OpenSSL's X509_NAME_ENTRIES encoder applies this sort.
+        entries.sort();
+        let contents: Vec<u8> = entries.into_iter().flatten().collect();
+        output.extend_from_slice(&der_value(0x31, &contents));
+    }
+    output
+}
+
+#[inline(never)]
+pub fn certificate_subject_hash(der: &[u8]) -> NativeResult<i64> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(der)
+        .map_err(|error| pem_error(format!("unable to decode certificate: {error}")))?;
+    let digest = Sha1::digest(canonical_name_der(certificate.subject()));
+    Ok(u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) as i64)
 }
 
 /// # Safety
@@ -1929,6 +2075,7 @@ impl CapturingClientSessionStore {
         &self,
         context_identity: usize,
         config: Arc<rustls::ClientConfig>,
+        verified_chain_builder: Arc<VerifiedChainBuilder>,
     ) -> Option<NativeSession> {
         let (server_name, value) = self
             .latest_tls12
@@ -1939,6 +2086,7 @@ impl CapturingClientSessionStore {
         Some(NativeSession {
             context_identity,
             config,
+            verified_chain_builder,
             server_name,
             value,
             id: self
@@ -2036,6 +2184,7 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
 pub struct NativeSession {
     context_identity: usize,
     config: Arc<rustls::ClientConfig>,
+    verified_chain_builder: Arc<VerifiedChainBuilder>,
     server_name: rustls::pki_types::ServerName<'static>,
     value: rustls::client::Tls12ClientSessionValue,
     id: Vec<u8>,
@@ -2052,6 +2201,7 @@ pub unsafe fn session_clone(session: *const NativeSession) -> *mut NativeSession
     Box::into_raw(Box::new(NativeSession {
         context_identity: session.context_identity,
         config: session.config.clone(),
+        verified_chain_builder: session.verified_chain_builder.clone(),
         server_name: session.server_name.clone(),
         value: session.value.clone(),
         id: session.id.clone(),
@@ -2087,23 +2237,253 @@ pub unsafe fn session_timeout(session: *const NativeSession) -> u64 {
     unsafe { (&*session).timeout }
 }
 
-fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<Vec<u8>>)> {
-    let builder = rustls::ClientConfig::builder_with_provider(provider_for_context(context))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertificatePurpose {
+    Unverified,
+    ServerAuth,
+    ClientAuth,
+}
+
+/// Immutable verification inputs owned by one TLS connection.
+///
+/// PyPy obtains the chain from the live `SSL` object with
+/// `SSL_get0_verified_chain`. rustls does not retain WebPKI's selected path, so
+/// after a successful full handshake we run the same WebPKI path builder over
+/// the same roots, CRLs, algorithms, time, and peer certificates. This keeps
+/// the selected trust anchor on the connection instead of reconstructing it
+/// from issuer-name equality.
+#[derive(Debug)]
+struct VerifiedChainBuilder {
+    purpose: CertificatePurpose,
+    roots: Arc<rustls::RootCertStore>,
+    root_der: Vec<Vec<u8>>,
+    deferred_roots: Vec<Vec<u8>>,
+    crls: Vec<CertificateRevocationListDer<'static>>,
+    crl_scope: CrlScope,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+    verify_flags: i32,
+}
+
+impl VerifiedChainBuilder {
+    fn unverified(supported: rustls::crypto::WebPkiSupportedAlgorithms) -> Self {
+        Self {
+            purpose: CertificatePurpose::Unverified,
+            roots: Arc::new(rustls::RootCertStore::empty()),
+            root_der: Vec::new(),
+            deferred_roots: Vec::new(),
+            crls: Vec::new(),
+            crl_scope: CrlScope::Disabled,
+            supported,
+            verify_flags: 0,
+        }
+    }
+
+    fn build(
+        &self,
+        peer_chain: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Option<Vec<Vec<u8>>> {
+        let (end_entity, intermediates) = peer_chain.split_first()?;
+        if self.purpose == CertificatePurpose::Unverified {
+            return Some(
+                peer_chain
+                    .iter()
+                    .map(|certificate| certificate.as_ref().to_vec())
+                    .collect(),
+            );
+        }
+
+        let certificate = webpki::EndEntityCert::try_from(end_entity).ok()?;
+        let parsed_crls = self
+            .crls
+            .iter()
+            .map(|crl| {
+                webpki::BorrowedCertRevocationList::from_der(crl.as_ref())
+                    .map(webpki::CertRevocationList::from)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let crl_refs: Vec<&webpki::CertRevocationList<'_>> = parsed_crls.iter().collect();
+        let revocation = if crl_refs.is_empty() {
+            None
+        } else {
+            let builder = webpki::RevocationOptionsBuilder::new(&crl_refs).ok()?;
+            let builder = if self.crl_scope == CrlScope::EndEntityOnly {
+                builder.with_depth(webpki::RevocationCheckDepth::EndEntity)
+            } else {
+                builder
+            };
+            Some(builder.build())
+        };
+        let usage = match self.purpose {
+            CertificatePurpose::ServerAuth => webpki::KeyUsage::server_auth(),
+            CertificatePurpose::ClientAuth => webpki::KeyUsage::client_auth(),
+            CertificatePurpose::Unverified => unreachable!(),
+        };
+        let path = certificate.verify_for_usage(
+            self.supported.all,
+            &self.roots.roots,
+            intermediates,
+            now,
+            usage,
+            revocation,
+            None,
+        );
+        let Ok(path) = path else {
+            // `ExplicitEndEntityVerifier` is the WebPKI-independent fallback
+            // corresponding to OpenSSL's explicitly trusted leaf / partial
+            // chain behavior. Its verified path contains that leaf only.
+            if self.purpose == CertificatePurpose::ServerAuth
+                && self
+                    .root_der
+                    .iter()
+                    .any(|trusted| trusted.as_slice() == end_entity.as_ref())
+                && x509_parser::parse_x509_certificate(end_entity.as_ref())
+                    .ok()
+                    .is_some_and(|(_, certificate)| {
+                        certificate.subject() == certificate.issuer()
+                            || self.verify_flags & VERIFY_X509_PARTIAL_CHAIN != 0
+                    })
+            {
+                return Some(vec![end_entity.as_ref().to_vec()]);
+            }
+            return None;
+        };
+
+        let anchor_index = self
+            .roots
+            .roots
+            .iter()
+            .position(|anchor| std::ptr::eq(anchor, path.anchor()))?;
+        let anchor_der = self.root_der.get(anchor_index)?;
+        let mut chain = Vec::with_capacity(path.intermediate_certificates().count() + 2);
+        chain.push(end_entity.as_ref().to_vec());
+        chain.extend(
+            path.intermediate_certificates()
+                .map(|certificate| certificate.der().as_ref().to_vec()),
+        );
+        if chain
+            .last()
+            .is_none_or(|certificate| certificate != anchor_der)
+        {
+            chain.push(anchor_der.clone());
+        }
+        Some(chain)
+    }
+}
+
+/// Clone the eager roots and append only usable hashed-directory anchors,
+/// retaining a DER vector in exactly the same order as `RootCertStore.roots`.
+fn verification_roots(
+    context: &Context,
+) -> (Arc<rustls::RootCertStore>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let mut roots = context.roots.clone();
+    let mut root_der = context.root_der.clone();
+    let mut deferred_roots = Vec::new();
+    for der in capath_certificates(context).iter() {
+        if root_der.iter().any(|known| known == der) {
+            continue;
+        }
+        if roots.add(CertificateDer::from(der.clone())).is_ok() {
+            root_der.push(der.clone());
+            deferred_roots.push(der.clone());
+        }
+    }
+    (Arc::new(roots), root_der, deferred_roots)
+}
+
+fn verified_chain_builder(
+    context: &Context,
+    purpose: CertificatePurpose,
+    roots: Arc<rustls::RootCertStore>,
+    root_der: Vec<Vec<u8>>,
+    deferred_roots: Vec<Vec<u8>>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+) -> Arc<VerifiedChainBuilder> {
+    Arc::new(VerifiedChainBuilder {
+        purpose,
+        roots,
+        root_der,
+        deferred_roots,
+        crls: context.crls.clone(),
+        crl_scope: crl_scope(context.verify_flags),
+        supported,
+        verify_flags: context.verify_flags,
+    })
+}
+
+/// OpenSSL builds the chain sent for a configured leaf from the context's
+/// certificate store at handshake time. Complete each immutable rustls
+/// `CertifiedKey` through WebPKI as its `ClientConfig`/`ServerConfig` is built,
+/// preserving the originally loaded chain when no valid completion exists.
+fn completed_certified_keys(
+    context: &Context,
+    purpose: CertificatePurpose,
+    roots: Arc<rustls::RootCertStore>,
+    root_der: Vec<Vec<u8>>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+) -> Vec<Arc<CertifiedKey>> {
+    let builder = VerifiedChainBuilder {
+        purpose,
+        roots,
+        root_der,
+        deferred_roots: Vec::new(),
+        crls: Vec::new(),
+        crl_scope: CrlScope::Disabled,
+        supported,
+        verify_flags: context.verify_flags,
+    };
+    context
+        .certified_keys
+        .iter()
+        .map(|key| {
+            let Some(chain) = builder.build(&key.cert, rustls::pki_types::UnixTime::now()) else {
+                return key.clone();
+            };
+            let mut completed = CertifiedKey::new(
+                chain.into_iter().map(CertificateDer::from).collect(),
+                key.key.clone(),
+            );
+            completed.ocsp = key.ocsp.clone();
+            Arc::new(completed)
+        })
+        .collect()
+}
+
+fn client_config(
+    context: &Context,
+) -> NativeResult<(rustls::ClientConfig, Arc<VerifiedChainBuilder>)> {
+    let provider = provider_for_context(context);
+    let supported = provider.signature_verification_algorithms;
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(enabled_versions(context)?)
         .map_err(|error| (0, format!("[SSL] invalid TLS configuration: {error}")))?;
-    let deferred_roots = capath_certificates(context).as_ref().clone();
-    let mut roots = context.roots.clone();
-    for der in &deferred_roots {
-        // A hashed directory is intentionally tolerant of stale or malformed
-        // entries. Only usable X.509 anchors participate in rustls lookup.
-        let _ = roots.add(CertificateDer::from(der.clone()));
-    }
+    let (roots, root_der, deferred_roots) = verification_roots(context);
+    let chain_builder = if context.verify_mode == CERT_NONE {
+        Arc::new(VerifiedChainBuilder::unverified(supported))
+    } else {
+        verified_chain_builder(
+            context,
+            CertificatePurpose::ServerAuth,
+            roots.clone(),
+            root_der.clone(),
+            deferred_roots,
+            supported,
+        )
+    };
+    let certified_keys = completed_certified_keys(
+        context,
+        CertificatePurpose::ClientAuth,
+        roots.clone(),
+        root_der.clone(),
+        supported,
+    );
     let wants_client_cert = if context.verify_mode == CERT_NONE {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
     } else if !roots.is_empty() {
-        let mut verifier_builder = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots));
+        let mut verifier_builder = rustls::client::WebPkiServerVerifier::builder(roots);
         if !context.crls.is_empty() {
             verifier_builder = verifier_builder.with_crls(context.crls.clone());
             if crl_scope(context.verify_flags) == CrlScope::EndEntityOnly {
@@ -2116,12 +2496,10 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
                 format!("[SSL] cannot build certificate verifier: {error}"),
             )
         })?;
-        let mut trusted_der = context.root_der.clone();
-        trusted_der.extend(deferred_roots.iter().cloned());
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(ExplicitEndEntityVerifier {
                 inner: verifier,
-                trusted_der,
+                trusted_der: root_der,
                 verify_flags: context.verify_flags,
             });
         let mut verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
@@ -2138,40 +2516,48 @@ fn client_config(context: &Context) -> NativeResult<(rustls::ClientConfig, Vec<V
             .dangerous()
             .with_custom_certificate_verifier(verifier)
     } else {
-        builder.with_root_certificates(roots)
+        builder.with_root_certificates((*roots).clone())
     };
-    let mut config = if !context.certified_keys.is_empty() {
+    let mut config = if !certified_keys.is_empty() {
         wants_client_cert.with_client_cert_resolver(Arc::new(MultiCertResolver {
-            keys: context.certified_keys.clone(),
+            keys: certified_keys,
         }))
     } else {
         wants_client_cert.with_no_client_auth()
     };
     config.alpn_protocols = context.alpn_protocols.clone();
-    Ok((config, deferred_roots))
+    Ok((config, chain_builder))
 }
 
-fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
+fn server_config(
+    context: &Context,
+) -> NativeResult<(rustls::ServerConfig, Option<Arc<VerifiedChainBuilder>>)> {
     if context.certified_keys.is_empty() {
         return Err((
             0,
             "[SSL] server-side connection requires a certificate and private key".to_string(),
         ));
     }
-    let builder = rustls::ServerConfig::builder_with_provider(provider_for_context(context))
+    let provider = provider_for_context(context);
+    let supported = provider.signature_verification_algorithms;
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(enabled_versions(context)?)
         .map_err(|error| (0, format!("[SSL] invalid TLS configuration: {error}")))?;
-    let wants_server_cert = if context.verify_mode == CERT_NONE {
-        builder.with_no_client_auth()
+    let (roots, root_der, deferred_roots) = verification_roots(context);
+    let certified_keys = completed_certified_keys(
+        context,
+        CertificatePurpose::ServerAuth,
+        roots.clone(),
+        root_der.clone(),
+        supported,
+    );
+    let (wants_server_cert, chain_builder) = if context.verify_mode == CERT_NONE {
+        (builder.with_no_client_auth(), None)
     } else {
         // A hashed directory is as much a trust source for client certificates
         // as an eagerly loaded file, so it must reach the verifier.  Silently
         // dropping client authentication when no root is configured would
         // accept unauthenticated clients under CERT_REQUIRED.
-        let mut roots = context.roots.clone();
-        for der in capath_certificates(context).iter() {
-            let _ = roots.add(CertificateDer::from(der.clone()));
-        }
         if roots.is_empty() {
             return Err((
                 0,
@@ -2179,7 +2565,15 @@ fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
                     .to_string(),
             ));
         }
-        let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+        let chain_builder = verified_chain_builder(
+            context,
+            CertificatePurpose::ClientAuth,
+            roots.clone(),
+            root_der,
+            deferred_roots,
+            supported,
+        );
+        let mut verifier = rustls::server::WebPkiClientVerifier::builder(roots);
         if !context.crls.is_empty() {
             verifier = verifier.with_crls(context.crls.clone());
             if crl_scope(context.verify_flags) == CrlScope::EndEntityOnly {
@@ -2193,10 +2587,13 @@ fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
         }
         .build()
         .map_err(|error| (0, format!("[SSL] cannot build client verifier: {error}")))?;
-        builder.with_client_cert_verifier(verifier)
+        (
+            builder.with_client_cert_verifier(verifier),
+            Some(chain_builder),
+        )
     };
     let mut config = wants_server_cert.with_cert_resolver(Arc::new(MultiCertResolver {
-        keys: context.certified_keys.clone(),
+        keys: certified_keys,
     }));
     config.alpn_protocols = context.alpn_protocols.clone();
     config.session_storage = context.server_session_store.clone();
@@ -2204,7 +2601,7 @@ fn server_config(context: &Context) -> NativeResult<rustls::ServerConfig> {
     if let Some(tickets) = context.num_tickets {
         config.send_tls13_tickets = tickets;
     }
-    Ok(config)
+    Ok((config, chain_builder))
 }
 
 fn enabled_versions(
@@ -2259,7 +2656,13 @@ struct TlsRecordObserver {
 }
 
 impl TlsRecordObserver {
-    fn observe(&mut self, bytes: &[u8], write: bool, events: &mut Vec<TlsMessageEvent>) {
+    fn observe(
+        &mut self,
+        bytes: &[u8],
+        write: bool,
+        events: &mut Vec<TlsMessageEvent>,
+        handshake_transcript: &mut Vec<u8>,
+    ) {
         self.records.extend_from_slice(bytes);
         loop {
             if self.records.len() < 5 {
@@ -2315,6 +2718,7 @@ impl TlsRecordObserver {
                             break;
                         }
                         let message: Vec<u8> = self.handshakes.drain(..4 + message_len).collect();
+                        handshake_transcript.extend_from_slice(&message);
                         events.push(TlsMessageEvent {
                             write,
                             version,
@@ -2328,6 +2732,99 @@ impl TlsRecordObserver {
             }
         }
     }
+}
+
+/// Per-connection capture of the TLS 1.2 master secret. rustls deliberately
+/// exposes this only through its `KeyLog` hook; retaining it on the connection
+/// lets us implement RFC 5929 `tls-unique` without exporting it or involving
+/// process-global state.
+#[derive(Debug, Default)]
+struct CapturingKeyLog {
+    tls12_master_secret: Mutex<Option<Vec<u8>>>,
+}
+
+impl rustls::KeyLog for CapturingKeyLog {
+    fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+        if label == "CLIENT_RANDOM" {
+            *self
+                .tls12_master_secret
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(secret.to_vec());
+        }
+    }
+
+    fn will_log(&self, label: &str) -> bool {
+        label == "CLIENT_RANDOM"
+    }
+}
+
+macro_rules! hmac_digest {
+    ($name:ident, $digest:ty, $block_size:expr) => {
+        fn $name(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let mut key_block = vec![0u8; $block_size];
+            if key.len() > $block_size {
+                let digest = <$digest>::digest(key);
+                key_block[..digest.len()].copy_from_slice(&digest);
+            } else {
+                key_block[..key.len()].copy_from_slice(key);
+            }
+            let mut inner_pad = key_block.clone();
+            let mut outer_pad = key_block;
+            for byte in &mut inner_pad {
+                *byte ^= 0x36;
+            }
+            for byte in &mut outer_pad {
+                *byte ^= 0x5c;
+            }
+            let mut inner = <$digest>::new();
+            inner.update(&inner_pad);
+            inner.update(data);
+            let inner = inner.finalize();
+            let mut outer = <$digest>::new();
+            outer.update(&outer_pad);
+            outer.update(inner);
+            outer.finalize().to_vec()
+        }
+    };
+}
+
+hmac_digest!(hmac_sha256, sha2::Sha256, 64);
+hmac_digest!(hmac_sha384, sha2::Sha384, 128);
+
+fn tls12_p_hash(
+    secret: &[u8],
+    seed: &[u8],
+    hmac: fn(&[u8], &[u8]) -> Vec<u8>,
+    length: usize,
+) -> Vec<u8> {
+    let mut a = hmac(secret, seed);
+    let mut output = Vec::with_capacity(length);
+    while output.len() < length {
+        let mut input = Vec::with_capacity(a.len() + seed.len());
+        input.extend_from_slice(&a);
+        input.extend_from_slice(seed);
+        output.extend_from_slice(&hmac(secret, &input));
+        a = hmac(secret, &a);
+    }
+    output.truncate(length);
+    output
+}
+
+fn tls12_finished(secret: &[u8], transcript: &[u8], label: &[u8], sha384: bool) -> Vec<u8> {
+    let transcript_hash = if sha384 {
+        sha2::Sha384::digest(transcript).to_vec()
+    } else {
+        sha2::Sha256::digest(transcript).to_vec()
+    };
+    let mut seed = Vec::with_capacity(label.len() + transcript_hash.len());
+    seed.extend_from_slice(label);
+    seed.extend_from_slice(&transcript_hash);
+    tls12_p_hash(
+        secret,
+        &seed,
+        if sha384 { hmac_sha384 } else { hmac_sha256 },
+        12,
+    )
 }
 
 fn rustls_error(error: impl std::fmt::Display) -> (i32, String) {
@@ -2422,11 +2919,16 @@ pub struct TlsConnection {
     accepted: Option<rustls::server::Accepted>,
     pending_tls: Vec<u8>,
     pending_tls_start: usize,
-    deferred_roots: Vec<Vec<u8>>,
-    verified_deferred_root: Option<Vec<u8>>,
+    verified_chain_builder: Option<Arc<VerifiedChainBuilder>>,
+    verified_chain: Option<Vec<Vec<u8>>>,
+    verified_chain_computed: bool,
+    verified_root_taken: bool,
     incoming_observer: TlsRecordObserver,
     outgoing_observer: TlsRecordObserver,
     message_events: Vec<TlsMessageEvent>,
+    tls12_handshake_transcript: Vec<u8>,
+    key_log: Arc<CapturingKeyLog>,
+    tls_unique: Option<Vec<u8>>,
     pending_received_tls: Vec<u8>,
     pending_received_tls_start: usize,
     client_config: Option<Arc<rustls::ClientConfig>>,
@@ -2463,11 +2965,13 @@ impl TlsConnection {
                 &self.pending_tls[before..],
                 true,
                 &mut self.message_events,
+                &mut self.tls12_handshake_transcript,
             );
             if self.pending_tls.len() == before {
                 break;
             }
         }
+        self.capture_tls_unique();
         Ok(())
     }
 
@@ -2532,6 +3036,85 @@ impl TlsConnection {
         self.server_hit_counted = true;
     }
 
+    fn capture_verified_chain(&mut self) {
+        if self.verified_chain_computed {
+            return;
+        }
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if inner.is_handshaking() {
+            return;
+        }
+        self.verified_chain_computed = true;
+        // PyPy/OpenSSL's SSL_get0_verified_chain returns NULL for a resumed
+        // TLS 1.2 connection even though SSL_get_peer_cert_chain retains the
+        // peer certificate list from the session.
+        if inner.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+            return;
+        }
+        let (Some(builder), Some(peer_chain)) = (
+            self.verified_chain_builder.as_ref(),
+            inner.peer_certificates(),
+        ) else {
+            return;
+        };
+        self.verified_chain = builder.build(peer_chain, rustls::pki_types::UnixTime::now());
+    }
+
+    fn capture_tls_unique(&mut self) {
+        if self.tls_unique.is_some()
+            || !(self.incoming_observer.encrypted || self.outgoing_observer.encrypted)
+        {
+            return;
+        }
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if inner.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2) {
+            return;
+        }
+        let Some(handshake_kind) = inner.handshake_kind() else {
+            return;
+        };
+        let Some(suite) = inner.negotiated_cipher_suite() else {
+            return;
+        };
+        let secret = self
+            .key_log
+            .tls12_master_secret
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(secret) = secret else {
+            return;
+        };
+        let sha384 = matches!(
+            suite.suite(),
+            rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        );
+        let label = if handshake_kind == rustls::HandshakeKind::Resumed {
+            b"server finished".as_slice()
+        } else {
+            b"client finished".as_slice()
+        };
+        self.tls_unique = Some(tls12_finished(
+            &secret,
+            &self.tls12_handshake_transcript,
+            label,
+            sha384,
+        ));
+        // Do not retain key material or the handshake transcript once the
+        // RFC 5929 binding has been derived.
+        self.key_log
+            .tls12_master_secret
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.tls12_handshake_transcript.clear();
+    }
+
     fn process_acceptor_tls(&mut self) -> TlsResult<()> {
         loop {
             if self.pending_received_tls_start == self.pending_received_tls.len() {
@@ -2566,6 +3149,7 @@ impl TlsConnection {
                         &self.pending_tls[before..],
                         true,
                         &mut self.message_events,
+                        &mut self.tls12_handshake_transcript,
                     );
                     self.acceptor = None;
                     return Err(rustls_protocol_error(error));
@@ -2601,8 +3185,9 @@ pub unsafe fn connection_new(
     }
     let mut retained_client_config = None;
     let mut retained_client_store = None;
-    let (connection, acceptor, deferred_roots) = if server_side {
-        (None, Some(rustls::server::Acceptor::default()), Vec::new())
+    let key_log = Arc::new(CapturingKeyLog::default());
+    let (connection, acceptor, verified_chain_builder) = if server_side {
+        (None, Some(rustls::server::Acceptor::default()), None)
     } else {
         let name = match server_hostname {
             Some(hostname) => rustls::pki_types::ServerName::try_from(hostname.to_string())
@@ -2612,8 +3197,9 @@ pub unsafe fn connection_new(
             ),
         };
         let store = Arc::new(CapturingClientSessionStore::new());
-        let (mut config, deferred_roots) = if session.is_null() {
-            client_config(context)?
+        let (mut config, verified_chain_builder) = if session.is_null() {
+            let (config, builder) = client_config(context)?;
+            (config, builder)
         } else {
             let session = unsafe { &*session };
             if session.context_identity != context.identity {
@@ -2622,9 +3208,13 @@ pub unsafe fn connection_new(
             if session.server_name == name {
                 store.seed(session);
             }
-            ((*session.config).clone(), Vec::new())
+            (
+                (*session.config).clone(),
+                session.verified_chain_builder.clone(),
+            )
         };
         config.resumption = rustls::client::Resumption::store(store.clone());
+        config.key_log = key_log.clone();
         let config = Arc::new(config);
         retained_client_config = Some(config.clone());
         retained_client_store = Some(store);
@@ -2633,7 +3223,7 @@ pub unsafe fn connection_new(
                 rustls::ClientConnection::new(config, name).map_err(rustls_error)?,
             )),
             None,
-            deferred_roots,
+            Some(verified_chain_builder),
         )
     };
     Ok(Box::into_raw(Box::new(TlsConnection {
@@ -2642,11 +3232,16 @@ pub unsafe fn connection_new(
         accepted: None,
         pending_tls: Vec::new(),
         pending_tls_start: 0,
-        deferred_roots,
-        verified_deferred_root: None,
+        verified_chain_builder,
+        verified_chain: None,
+        verified_chain_computed: false,
+        verified_root_taken: false,
         incoming_observer: TlsRecordObserver::default(),
         outgoing_observer: TlsRecordObserver::default(),
         message_events: Vec::new(),
+        tls12_handshake_transcript: Vec::new(),
+        key_log,
+        tls_unique: None,
         pending_received_tls: Vec::new(),
         pending_received_tls_start: 0,
         client_config: retained_client_config,
@@ -2677,9 +3272,12 @@ pub unsafe fn connection_receive_tls(
     data: &[u8],
 ) -> TlsResult<usize> {
     let connection = unsafe { &mut *connection };
-    connection
-        .incoming_observer
-        .observe(data, false, &mut connection.message_events);
+    connection.incoming_observer.observe(
+        data,
+        false,
+        &mut connection.message_events,
+        &mut connection.tls12_handshake_transcript,
+    );
     connection.pending_received_tls.extend_from_slice(data);
     if connection.inner.is_none() {
         if connection.accepted.is_some() {
@@ -2689,17 +3287,9 @@ pub unsafe fn connection_receive_tls(
         return Ok(data.len());
     }
 
-    let was_handshaking = connection
-        .inner
-        .as_ref()
-        .is_some_and(|inner| inner.is_handshaking());
     connection.process_received_tls()?;
-    let inner = connection.inner.as_ref().expect("active connection");
-    if was_handshaking && !inner.is_handshaking() {
-        connection.verified_deferred_root =
-            matching_deferred_root(inner, &connection.deferred_roots);
-        connection.deferred_roots.clear();
-    }
+    connection.capture_verified_chain();
+    connection.capture_tls_unique();
     Ok(data.len())
 }
 
@@ -2740,7 +3330,8 @@ pub unsafe fn connection_accept_server(
             "[SSL] no accepted ClientHello is waiting for configuration".to_string(),
         )
     })?;
-    let mut config = server_config(unsafe { &*context })?;
+    let (mut config, verified_chain_builder) = server_config(unsafe { &*context })?;
+    config.key_log = connection.key_log.clone();
     if !config.alpn_protocols.is_empty()
         && let Some(offered) = accepted.client_hello().alpn()
         && !offered
@@ -2757,11 +3348,19 @@ pub unsafe fn connection_accept_server(
     match accepted.into_connection(config) {
         Ok(server) => {
             connection.inner = Some(rustls::Connection::Server(server));
+            connection.verified_chain_builder = verified_chain_builder;
+            connection.verified_chain = None;
+            connection.verified_chain_computed = false;
+            connection.verified_root_taken = false;
+            connection.tls_unique = None;
             connection.server_context = context;
             unsafe { &*context }
                 .accept_count
                 .fetch_add(1, Ordering::Relaxed);
-            connection.process_received_tls()
+            connection.process_received_tls()?;
+            connection.capture_verified_chain();
+            connection.capture_tls_unique();
+            Ok(())
         }
         Err((error, mut alert)) => {
             let _ = alert.write_all(&mut connection.pending_tls);
@@ -2789,9 +3388,12 @@ pub unsafe fn connection_reject_server(
     }
     let alert = [21, 3, 3, 0, 2, 2, alert_description];
     connection.pending_tls.extend_from_slice(&alert);
-    connection
-        .outgoing_observer
-        .observe(&alert, true, &mut connection.message_events);
+    connection.outgoing_observer.observe(
+        &alert,
+        true,
+        &mut connection.message_events,
+        &mut connection.tls12_handshake_transcript,
+    );
     Ok(())
 }
 
@@ -2806,17 +3408,15 @@ pub unsafe fn connection_take_message_events(
     std::mem::take(unsafe { &mut (&mut *connection).message_events })
 }
 
-fn matching_deferred_root(
-    connection: &rustls::Connection,
-    candidates: &[Vec<u8>],
-) -> Option<Vec<u8>> {
-    let peer_chain = connection.peer_certificates()?;
-    let tail = peer_chain.last()?;
-    let (_, tail) = x509_parser::parse_x509_certificate(tail.as_ref()).ok()?;
-    candidates.iter().find_map(|candidate| {
-        let (_, root) = x509_parser::parse_x509_certificate(candidate).ok()?;
-        (tail.issuer() == root.subject()).then(|| candidate.clone())
-    })
+/// Return RFC 5929 `tls-unique` for a completed TLS 1.2 handshake.
+///
+/// # Safety
+/// `connection` must point to a live connection.
+#[inline(never)]
+pub unsafe fn connection_tls_unique(connection: *mut TlsConnection) -> Option<Vec<u8>> {
+    let connection = unsafe { &mut *connection };
+    connection.capture_tls_unique();
+    connection.tls_unique.clone()
 }
 
 /// Return, once, the trust anchor selected from an OpenSSL-style lazy CA
@@ -2826,7 +3426,20 @@ fn matching_deferred_root(
 /// `connection` must point to a live connection.
 #[inline(never)]
 pub unsafe fn connection_take_verified_root(connection: *mut TlsConnection) -> Option<Vec<u8>> {
-    unsafe { (&mut *connection).verified_deferred_root.take() }
+    let connection = unsafe { &mut *connection };
+    connection.capture_verified_chain();
+    if connection.verified_root_taken {
+        return None;
+    }
+    let root = connection.verified_chain.as_ref()?.last()?;
+    let builder = connection.verified_chain_builder.as_ref()?;
+    let root = builder
+        .deferred_roots
+        .iter()
+        .find(|candidate| *candidate == root)?
+        .clone();
+    connection.verified_root_taken = true;
+    Some(root)
 }
 
 /// Drain all currently generated encrypted TLS records.
@@ -2983,6 +3596,34 @@ pub unsafe fn connection_peer_certificate(connection: *const TlsConnection) -> O
         .map(|cert| cert.as_ref().to_vec())
 }
 
+/// Return the certificate list exactly as transmitted by the peer.  This is
+/// OpenSSL's `SSL_get_peer_cert_chain` / PyPy's `get_unverified_chain`, not a
+/// chain reconstructed from issuer names.
+///
+/// # Safety
+/// `connection` must point to a live connection.
+#[inline(never)]
+pub unsafe fn connection_peer_certificates(connection: *const TlsConnection) -> Vec<Vec<u8>> {
+    unsafe { (&*connection).inner.as_ref() }
+        .and_then(|inner| inner.peer_certificates())
+        .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+        .unwrap_or_default()
+}
+
+/// Return the path selected by certificate verification for this connection.
+/// With verification disabled this is the peer's transmitted chain, matching
+/// PyPy's `SSL_get0_verified_chain` behavior. A resumed TLS 1.2 session has no
+/// new verified path and therefore returns an empty vector.
+///
+/// # Safety
+/// `connection` must point to a live connection.
+#[inline(never)]
+pub unsafe fn connection_verified_certificates(connection: *mut TlsConnection) -> Vec<Vec<u8>> {
+    let connection = unsafe { &mut *connection };
+    connection.capture_verified_chain();
+    connection.verified_chain.clone().unwrap_or_default()
+}
+
 #[inline(never)]
 pub unsafe fn connection_session_reused(connection: *const TlsConnection) -> Option<bool> {
     let inner = unsafe { (&*connection).inner.as_ref() }?;
@@ -3008,14 +3649,19 @@ pub unsafe fn connection_session(connection: *const TlsConnection) -> *mut Nativ
     {
         return std::ptr::null_mut();
     }
-    let (Some(store), Some(config)) = (
+    let (Some(store), Some(config), Some(verified_chain_builder)) = (
         connection.client_session_store.as_ref(),
         connection.client_config.as_ref(),
+        connection.verified_chain_builder.as_ref(),
     ) else {
         return std::ptr::null_mut();
     };
     store
-        .snapshot(connection.context_identity, config.clone())
+        .snapshot(
+            connection.context_identity,
+            config.clone(),
+            verified_chain_builder.clone(),
+        )
         .map(|session| Box::into_raw(Box::new(session)))
         .unwrap_or(std::ptr::null_mut())
 }
@@ -3030,4 +3676,34 @@ pub unsafe fn connection_cipher(connection: *const TlsConnection) -> Option<(Str
     let name = openssl_cipher_name(suite)?;
     let bits = if name.contains("AES128") { 128 } else { 256 };
     Some((name.to_string(), bits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVER_CERTIFICATE: &[u8] =
+        include_bytes!("../../../lib-python/3/test/certdata/keycert3.pem");
+
+    fn server_der() -> Vec<u8> {
+        read_pem_certificates(SERVER_CERTIFICATE).unwrap()[0]
+            .as_ref()
+            .to_vec()
+    }
+
+    #[test]
+    fn certificate_subject_matches_openssl_rfc2253() {
+        assert_eq!(
+            certificate_subject_rfc2253(&server_der()).unwrap(),
+            "CN=localhost,O=Python Software Foundation,L=Castle Anthrax,C=XY"
+        );
+    }
+
+    #[test]
+    fn certificate_subject_hash_matches_openssl_canonical_name() {
+        assert_eq!(
+            certificate_subject_hash(&server_der()).unwrap(),
+            0x2aff_206c
+        );
+    }
 }

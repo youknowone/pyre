@@ -1248,6 +1248,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     crate::module_ns_store(
         ns,
+        "get_tag",
+        // PyPy `interp_imp.py:get_tag`: the cache tag for .pyc files.  Keep
+        // this identical to sys.implementation.cache_tag.
+        crate::make_builtin_function_with_arity(
+            "get_tag",
+            |_| Ok(pyre_object::w_str_new("pyre314")),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
         "source_hash",
         crate::make_builtin_function_with_arity(
             "source_hash",

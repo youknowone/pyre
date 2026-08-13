@@ -718,6 +718,29 @@ unsafe fn ssl_socket_destructor(obj_addr: usize) {
     };
 }
 
+#[cfg(any(unix, windows))]
+unsafe fn mmap_destructor(obj_addr: usize) {
+    unsafe { pyre_interpreter::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
+}
+
+unsafe fn zlib_compress_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
+unsafe fn zlib_decompress_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
+unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
@@ -791,6 +814,20 @@ unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// though its rustls transport state contains no Python references.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+}
+
+/// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
+/// mapping/fd payload contains no Python references.
+#[cfg(any(unix, windows))]
+unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+}
+
+/// PyPy's zlib stream TypeDefs are acceptable base classes.  Their native
+/// payloads contain no Python references, but Python subclasses use the normal
+/// mapdict prefix and therefore require the same custom trace as W_MMap.
+unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
 
@@ -3608,6 +3645,46 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::gc::stats::W_GcStats
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `interp_zlib.py` stores each rzlib stream and its lock directly on the
+    // corresponding W_Root owner.  Register these unconditional native owners
+    // before target-gated DirEntry/SSL/mmap so their ids agree on wasm/native.
+    for (descr, destructor) in [
+        (
+            <pyre_interpreter::module::zlib::W_Compress
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            zlib_compress_destructor as majit_gc::trace::DestructorFn,
+        ),
+        (
+            <pyre_interpreter::module::zlib::W_Decompress
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            zlib_decompress_destructor as majit_gc::trace::DestructorFn,
+        ),
+        (
+            <pyre_interpreter::module::zlib::W_ZlibDecompressor
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            zlib_zdecompress_destructor as majit_gc::trace::DestructorFn,
+        ),
+    ] {
+        let tid = gc.register_type(
+            TypeInfo::object_subclass_with_custom_trace(
+                descr.object_size,
+                object_tid,
+                zlib_object_custom_trace,
+            )
+            .with_destructor_fn(destructor),
+        );
+        descr.gc_type_id.set(tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            descr.pytype_ptr as usize,
+            tid,
+        );
+        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+    }
     // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
     // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
     // after the last unconditional vtable-bearing object (`W_GcStats`) so only
@@ -3719,6 +3796,33 @@ fn build_gc() -> Box<MiniMarkGC> {
             &mut pytype_to_tid,
             <pyre_interpreter::module::_ssl::W_Certificate
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+    }
+    // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
+    // subclass mapdict prefix and a sweep destructor for the native mapping
+    // and duplicated fd.
+    #[cfg(any(unix, windows))]
+    {
+        let mmap_descr = <pyre_interpreter::module::mmap::W_MMap
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let mmap_tid = gc.register_type(
+            TypeInfo::object_subclass_with_custom_trace(
+                mmap_descr.object_size,
+                object_tid,
+                mmap_custom_trace,
+            )
+            .with_destructor_fn(mmap_destructor),
+        );
+        mmap_descr.gc_type_id.set(mmap_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            mmap_descr.pytype_ptr as usize,
+            mmap_tid,
+        );
+        pytype_to_tid.insert(mmap_descr.pytype_ptr as usize, mmap_tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            mmap_descr.pytype_ptr as usize,
+            mmap_descr.ptr_offsets,
         );
     }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
@@ -7832,11 +7936,18 @@ pub(crate) fn pyre_portal_runner(
         return Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(0)));
     }
     let frame = unsafe { &mut *frame_ptr };
-    if !pycode.is_null() {
-        frame.pycode = pycode as *const ();
-    }
-    if !ec.is_null() {
-        frame.execution_context = ec;
+    // warmspot.py:976 forwards the CRN values to `portal_ptr`; it does not
+    // rewrite the red frame's identity.  Pyre's portal dispatch is frame-only,
+    // so retain the activation's own pycode / execution context rather than
+    // replacing them from a potentially stale green snapshot.
+    if majit_metainterp::majit_log_enabled()
+        && ((!pycode.is_null() && frame.pycode != pycode as *const ())
+            || (!ec.is_null() && frame.execution_context != ec))
+    {
+        eprintln!(
+            "[blackhole-resume] portal CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
+            frame.pycode, frame.execution_context,
+        );
     }
     frame.set_last_instr_from_next_instr(next_instr);
     match portal_runner_result(frame) {

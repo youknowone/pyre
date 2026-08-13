@@ -169,6 +169,9 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Stage the Pyre standard library
+        shell: bash
+        run: python3 scripts/stage-stdlib.py dist-assets/lib/pyre3.14
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

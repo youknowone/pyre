@@ -650,26 +650,33 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (167, Some(0)),
     // `gc._get_stats()` returns a native W_GcStats with scalar-only payload.
     (168, Some(0)),
-    // W_GcStats is the final unconditional rclass registration.
-    // `posix.DirEntry` follows it on native builds, last of the rclass
-    // registrations and before the bare twister id. `posix` is compiled out
-    // on wasm32, so its object-hierarchy slot is too.
-    #[cfg(not(target_arch = "wasm32"))]
+    // PyPy zlib's three stream objects own their stream and per-object lock.
+    // They are unconditional so these ids agree on native and wasm.
     (169, Some(0)),
+    (170, Some(0)),
+    (171, Some(0)),
+    // `posix.DirEntry` follows the zlib owners on native builds.
+    #[cfg(not(target_arch = "wasm32"))]
+    (172, Some(0)),
     // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
     // extend the append-only native rclass tail; wasm omits the host TLS
     // module and therefore the hierarchy entries as well. Sandbox filtering
     // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
-    (170, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (171, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (172, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (173, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (174, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (175, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (176, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (177, Some(0)),
+    // `mmap.mmap` owns its native mapping/fd payload and follows the optional
+    // SSL tail on Unix.  In sandbox builds `active_subclass_range_hierarchy`
+    // removes SSL's five entries, leaving this logical slot renumbered to 173.
+    #[cfg(unix)]
+    (178, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

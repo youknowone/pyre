@@ -4,6 +4,7 @@
 //! `ssl.py`.  This module supplies its low-level primitives while the actual
 //! TLS engine lives in `pyre-native`, outside the translated interpreter.
 
+use base64::Engine;
 use pyre_object::*;
 
 const PROTOCOL_TLS: i32 = 2;
@@ -91,6 +92,7 @@ pub struct W_SSLSocket {
 #[derive(Default)]
 pub struct W_Certificate {
     pub der: PyObjectRef,
+    pub hash: i64,
 }
 
 /// The `library` and `reason` an OpenSSL-shaped `[library: reason] text`
@@ -493,6 +495,21 @@ fn allocate_ssl_session(backend: *mut pyre_native::ssl::NativeSession) -> PyObje
             w_class: std::ptr::null_mut(),
         },
         backend,
+    })
+}
+
+fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
+    let _ = certificate_methods::type_object();
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&der));
+    let der_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    W_Certificate::allocate_stable(W_Certificate {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        der: unsafe { pyre_object::gc_roots::shadow_stack_get(der_slot) },
+        hash: -1,
     })
 }
 
@@ -1962,8 +1979,45 @@ mod ssl_socket_methods {
             Ok(decoded_certificate_dict(decoded))
         }
 
+        /// PyPy `_cffi_ssl/_stdssl/__init__.py:get_unverified_chain`: expose
+        /// one `_ssl.Certificate` per certificate sent by the peer.  Python
+        /// 3.14's public `ssl` layer converts these objects to DER bytes for
+        /// `SSLSocket`/`SSLObject`, which is the API pip's truststore consumes.
+        fn get_unverified_chain(&self) -> Result<PyObjectRef, crate::PyError> {
+            if self.backend.is_null()
+                || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
+            {
+                return Err(crate::PyError::value_error("handshake not done yet"));
+            }
+            let chain = unsafe { pyre_native::ssl::connection_peer_certificates(self.backend) };
+            if chain.is_empty() {
+                return Ok(w_none());
+            }
+            Ok(w_list_new(
+                chain.into_iter().map(allocate_certificate).collect(),
+            ))
+        }
+
+        /// PyPy `_cffi_ssl/_stdssl/__init__.py:get_verified_chain`: return the
+        /// path selected by certificate verification, including its trust
+        /// anchor even when the peer did not transmit that anchor.
+        fn get_verified_chain(&mut self) -> Result<PyObjectRef, crate::PyError> {
+            if self.backend.is_null()
+                || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
+            {
+                return Err(crate::PyError::value_error("handshake not done yet"));
+            }
+            let chain = unsafe { pyre_native::ssl::connection_verified_certificates(self.backend) };
+            if chain.is_empty() {
+                return Ok(w_none());
+            }
+            Ok(w_list_new(
+                chain.into_iter().map(allocate_certificate).collect(),
+            ))
+        }
+
         fn get_channel_binding(
-            &self,
+            &mut self,
             #[default("tls-unique")] kind: &str,
         ) -> Result<PyObjectRef, crate::PyError> {
             if kind != "tls-unique" {
@@ -1978,14 +2032,11 @@ mod ssl_socket_methods {
             {
                 return Ok(w_none());
             }
-            // RFC 5929 `tls-unique` is the TLS 1.2 Finished verify_data, which
-            // rustls does not expose.  Any substitute would agree only with
-            // another pyre peer, so a binding negotiated against an OpenSSL,
-            // Java, or Go implementation would fail authentication with no
-            // indication of why.  Report the gap instead of a private value.
-            Err(crate::PyError::value_error(
-                "'tls-unique' channel binding type not implemented",
-            ))
+            let Some(binding) = (unsafe { pyre_native::ssl::connection_tls_unique(self.backend) })
+            else {
+                return Ok(w_none());
+            };
+            Ok(w_bytes_from_bytes(&binding))
         }
 
         fn shutdown(&mut self) -> Result<PyObjectRef, crate::PyError> {
@@ -2078,13 +2129,65 @@ mod certificate_methods {
             ))
         }
 
-        fn public_bytes(&self, #[default(2)] encoding: i64) -> Result<PyObjectRef, crate::PyError> {
+        fn public_bytes(&self, #[default(1)] encoding: i64) -> Result<PyObjectRef, crate::PyError> {
             if encoding == 2 {
                 return Ok(self.der);
             }
-            Err(crate::PyError::value_error(
-                "unsupported certificate encoding",
-            ))
+            if encoding == 1 || encoding == 0x101 {
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(unsafe { pyre_object::bytesobject::w_bytes_data(self.der) });
+                let mut pem = String::with_capacity(encoded.len() + 64);
+                pem.push_str("-----BEGIN CERTIFICATE-----\n");
+                for line in encoded.as_bytes().chunks(64) {
+                    pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+                    pem.push('\n');
+                }
+                pem.push_str("-----END CERTIFICATE-----\n");
+                // Peer/path certificates carry no OpenSSL auxiliary trust
+                // data, so PEM_write_bio_X509_AUX has the same output as PEM.
+                return Ok(w_str_new(&pem));
+            }
+            Err(crate::PyError::value_error("Unsupported format"))
+        }
+
+        fn get_info(&self) -> Result<PyObjectRef, crate::PyError> {
+            let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
+            let decoded = native_result(pyre_native::ssl::certificate_decode_der(der))?;
+            Ok(decoded_certificate_dict(decoded))
+        }
+
+        fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
+            let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
+            let subject = native_result(pyre_native::ssl::certificate_subject_rfc2253(der))?;
+            Ok(w_str_new(&format!("<Certificate '{subject}'>")))
+        }
+
+        fn __hash__(&mut self) -> Result<i64, crate::PyError> {
+            if self.hash == -1 {
+                let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
+                self.hash = native_result(pyre_native::ssl::certificate_subject_hash(der))?;
+                if self.hash == -1 {
+                    self.hash = -2;
+                }
+            }
+            Ok(self.hash)
+        }
+
+        fn __eq__(&self, other: PyObjectRef) -> PyObjectRef {
+            let exact = unsafe {
+                pyre_object::is_exact_type(
+                    other,
+                    &*<W_Certificate as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+                )
+            };
+            if !exact {
+                return pyre_object::w_not_implemented();
+            }
+            let other = W_Certificate::from_obj(other).expect("exact Certificate instance");
+            w_bool_from(
+                unsafe { pyre_object::bytesobject::w_bytes_data(self.der) }
+                    == unsafe { pyre_object::bytesobject::w_bytes_data(other.der) },
+            )
         }
     }
 } // certificate_methods

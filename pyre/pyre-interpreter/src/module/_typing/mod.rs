@@ -3,7 +3,7 @@
 //! that `typing.py` imports.  These are app-level Python (mirroring
 //! Objects/typevarobject.c) that delegates the substitution logic back to
 //! `typing.py`, while `Union` is bound to the builtin `types.UnionType`.
-//! `_idfunc` is interp-level: the non-binding identity used as `NewType.__call__`.
+//! `_idfunc` is interp-level: the identity used as `NewType.__call__`.
 
 crate::py_module! {
     "_typing",
@@ -20,9 +20,17 @@ crate::py_module! {
         ],
     },
     functions: {
-        // `NewType.__call__` (typing.py) — a non-binding identity; a binding
-        // function would receive the NewType instance as an implicit self and
-        // return it instead of the argument.
-        "_idfunc" / 1 = |args| Ok(args[0]),
+        // PyPy `lib_pypy/_typing.py:19` spells this `def _idfunc(_, x):
+        // return x`: `DescrOperation.get_and_call_args` passes the NewType
+        // receiver explicitly for every Function subclass, including a module
+        // builtin stored as `NewType.__call__`.  CPython 3.14 exposes the same
+        // helper as a non-descriptor METH_O builtin, so retain its direct
+        // `_typing._idfunc(x)` surface as the one-argument case.
+        "_idfunc" / * = |args| match args {
+            [value] | [_, value] => Ok(*value),
+            _ => Err(crate::PyError::type_error(
+                "_typing._idfunc() takes exactly one argument",
+            )),
+        },
     },
 }

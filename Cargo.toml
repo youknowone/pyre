@@ -64,17 +64,18 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-# Pinned to upstream main after the pyre compatibility fixes merged in #8390.
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
+# Pinned to upstream main after the pyre compatibility fixes from #8390 and
+# the future-annotation block fix from #8506 merged.
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "d64cc2cff5ee611862ca9d2a27ccbd9a6f740e5d" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "212c0d0b154b45565b7f27fcb116abc6299608ca" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -164,6 +165,7 @@ scrypt = { version = "0.11", default-features = false }
 # zlib backend (pyre-native only): zlib-rs is a pure-Rust zlib port whose
 # DEFLATE output is byte-identical to the reference C zlib.
 flate2 = { version = "1.1.9", default-features = false }
+zlib-rs = { version = "0.6.5", default-features = false, features = ["rust-allocator", "__internal-api"] }
 # binascii transforms (pure-Rust logic).
 base64 = "0.22"
 crc32fast = "1.4"
@@ -171,6 +173,7 @@ crc32fast = "1.4"
 # TLS backend (pyre-native only).  The interpreter sees opaque, non-inlined
 # entry points so rustls and its crypto provider stay outside Charon/LLBC.
 rustls = { version = "0.23.39", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-webpki = { version = "0.103.5", default-features = false, features = ["alloc"] }
 rustls-pemfile = "2.2"
 x509-parser = "0.18"
 pem-rfc7468 = { version = "1", features = ["alloc"] }

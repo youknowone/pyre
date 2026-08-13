@@ -5,12 +5,17 @@
 //! interpreter maps onto `zlib.error`.  Kept outside the LLBC extraction so
 //! the native codec never lowers into the traceable graph.
 
-use flate2::{
-    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status, write::ZlibEncoder,
-};
-use std::io::Write;
+use core::mem::MaybeUninit;
+use std::ffi::CStr;
 
-pub const MAX_WBITS: i8 = 15;
+use zlib_rs::{
+    DeflateError, DeflateFlush, InflateError, InflateFlush, ReturnCode, Status,
+    c_api::z_stream,
+    deflate::{self, DeflateConfig, DeflateStream, Method, Strategy},
+    inflate::{self, InflateConfig, InflateStream},
+};
+
+pub const MAX_WBITS: i32 = 15;
 pub const DEF_BUF_SIZE: usize = 16 * 1024;
 
 // flush modes (libz values); mirrored as module constants on the Python side.
@@ -27,43 +32,266 @@ const Z_BEST_COMPRESSION: i32 = 9;
 const CHUNKSIZE: usize = u32::MAX as usize;
 const USE_AFTER_FINISH_ERR: &str = "Error -2: inconsistent stream state";
 
-fn level_compression(level: i32) -> Option<Compression> {
-    match level {
-        Z_DEFAULT_COMPRESSION => Some(Compression::default()),
-        Z_NO_COMPRESSION..=Z_BEST_COMPRESSION => Some(Compression::new(level as u32)),
-        _ => None,
-    }
+fn valid_level(level: i32) -> bool {
+    matches!(
+        level,
+        Z_DEFAULT_COMPRESSION | Z_NO_COMPRESSION..=Z_BEST_COMPRESSION
+    )
 }
 
 enum InitOptions {
-    Standard { header: bool, wbits: u8 },
-    Gzip { wbits: u8 },
+    Standard { header: bool, wbits: i32 },
+    Gzip { wbits: i32 },
+    Auto { wbits: i32 },
+    HeaderWindow,
 }
 
 impl InitOptions {
-    fn new(wbits: i8) -> Result<Self, String> {
-        let header = wbits > 0;
-        let wbits = wbits.unsigned_abs();
+    fn new(wbits: i32) -> Result<Self, String> {
+        let header = wbits >= 0;
+        let wbits = wbits
+            .checked_abs()
+            .ok_or_else(|| "Invalid initialization option".to_owned())?;
         match wbits {
-            9..=15 => Ok(Self::Standard { header, wbits }),
-            25..=31 => Ok(Self::Gzip { wbits: wbits - 16 }),
+            0 if header => Ok(Self::HeaderWindow),
+            8..=15 => Ok(Self::Standard { header, wbits }),
+            24..=31 => Ok(Self::Gzip { wbits: wbits - 16 }),
+            40..=47 => Ok(Self::Auto { wbits: wbits - 32 }),
             _ => Err("Invalid initialization option".to_owned()),
         }
     }
 
-    fn decompress(self) -> Decompress {
+    fn inflate_window_bits(self) -> i32 {
         match self {
-            Self::Standard { header, wbits } => Decompress::new_with_window_bits(header, wbits),
-            Self::Gzip { wbits } => Decompress::new_gzip(wbits),
+            Self::Standard { header, wbits } => {
+                if header {
+                    wbits
+                } else {
+                    -wbits
+                }
+            }
+            Self::Gzip { wbits } => wbits + 16,
+            Self::Auto { wbits } => wbits + 32,
+            Self::HeaderWindow => 0,
         }
     }
 
-    fn compress(self, level: Compression) -> Compress {
+    fn deflate_window_bits(self) -> Result<i32, String> {
         match self {
-            Self::Standard { header, wbits } => {
-                Compress::new_with_window_bits(level, header, wbits)
+            Self::Standard { header, wbits } => Ok(if header { wbits } else { -wbits }),
+            Self::Gzip { wbits } => Ok(wbits + 16),
+            Self::Auto { .. } | Self::HeaderWindow => {
+                Err("Invalid initialization option".to_owned())
             }
-            Self::Gzip { wbits } => Compress::new_gzip(level, wbits),
+        }
+    }
+}
+
+fn return_code_message(code: ReturnCode) -> &'static str {
+    match code {
+        ReturnCode::Ok => "",
+        ReturnCode::StreamEnd => "stream end",
+        ReturnCode::NeedDict => "need dictionary",
+        ReturnCode::ErrNo => "file error",
+        ReturnCode::StreamError => "stream error",
+        ReturnCode::DataError => "data error",
+        ReturnCode::MemError => "insufficient memory",
+        ReturnCode::BufError => "buffer error",
+        ReturnCode::VersionError => "incompatible version",
+    }
+}
+
+fn stream_message(stream: &z_stream) -> Option<&str> {
+    if stream.msg.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(stream.msg).to_str().ok() }
+    }
+}
+
+/// The public `zlib_rs::Deflate` wrapper deliberately exposes only the common
+/// constructor.  PyPy's `rzlib.deflateInit` and `deflateCopy` require the full
+/// zlib configuration and an exact native-state copy, so keep the crate's
+/// public low-level `z_stream` here instead.  This is the pure-Rust equivalent
+/// of the stream pointer owned by `interp_zlib.py:Compress`.
+struct RawDeflate {
+    stream: z_stream,
+}
+
+impl RawDeflate {
+    fn new(config: DeflateConfig) -> Result<Self, String> {
+        let mut stream = z_stream::default();
+        let code = deflate::init(&mut stream, config);
+        if code == ReturnCode::Ok {
+            Ok(Self { stream })
+        } else {
+            Err(return_code_message(code).to_owned())
+        }
+    }
+
+    fn total_in(&self) -> u64 {
+        self.stream.total_in as u64
+    }
+
+    fn total_out(&self) -> u64 {
+        self.stream.total_out as u64
+    }
+
+    fn compress(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        flush: DeflateFlush,
+    ) -> Result<Status, DeflateError> {
+        self.stream.avail_in = input.len().min(u32::MAX as usize) as u32;
+        self.stream.avail_out = output.len().min(u32::MAX as usize) as u32;
+        self.stream.next_in = input.as_ptr();
+        self.stream.next_out = output.as_mut_ptr();
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut self.stream) }
+            .expect("initialized deflate stream");
+        match deflate::deflate(stream, flush) {
+            ReturnCode::Ok => Ok(Status::Ok),
+            ReturnCode::StreamEnd => Ok(Status::StreamEnd),
+            ReturnCode::BufError => Ok(Status::BufError),
+            ReturnCode::StreamError => Err(DeflateError::StreamError),
+            ReturnCode::DataError => Err(DeflateError::DataError),
+            ReturnCode::MemError => Err(DeflateError::MemError),
+            ReturnCode::NeedDict => unreachable!("compression does not use dictionaries here"),
+            ReturnCode::ErrNo | ReturnCode::VersionError => {
+                unreachable!("pure-Rust deflate returned an unsupported status")
+            }
+        }
+    }
+
+    fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<(), DeflateError> {
+        let stream = unsafe { DeflateStream::from_stream_mut(&mut self.stream) }
+            .expect("initialized deflate stream");
+        match deflate::set_dictionary(stream, dictionary) {
+            ReturnCode::Ok => Ok(()),
+            ReturnCode::StreamError => Err(DeflateError::StreamError),
+            ReturnCode::DataError => Err(DeflateError::DataError),
+            ReturnCode::MemError => Err(DeflateError::MemError),
+            code => unreachable!("deflate set_dictionary returned {code:?}"),
+        }
+    }
+
+    fn copy(&mut self) -> Result<Self, String> {
+        let mut destination = MaybeUninit::<DeflateStream<'static>>::uninit();
+        let code = {
+            let source = unsafe { DeflateStream::from_stream_mut(&mut self.stream) }
+                .expect("initialized deflate stream");
+            deflate::copy(&mut destination, source)
+        };
+        if code != ReturnCode::Ok {
+            return Err(return_code_message(code).to_owned());
+        }
+        let copied = unsafe { destination.assume_init() };
+        let stream = unsafe { core::mem::transmute::<DeflateStream<'static>, z_stream>(copied) };
+        Ok(Self { stream })
+    }
+}
+
+impl Drop for RawDeflate {
+    fn drop(&mut self) {
+        if let Some(stream) = unsafe { DeflateStream::from_stream_mut(&mut self.stream) } {
+            let _ = deflate::end(stream);
+        }
+    }
+}
+
+/// Low-level inflate owner paired with [`RawDeflate`].  `inflate::copy` fixes
+/// every internal allocation in the clone, exactly like zlib's `inflateCopy`;
+/// no replay log or side table is involved.
+struct RawInflate {
+    stream: z_stream,
+}
+
+impl RawInflate {
+    fn new(window_bits: i32) -> Result<Self, String> {
+        let mut stream = z_stream::default();
+        let code = inflate::init(&mut stream, InflateConfig { window_bits });
+        if code == ReturnCode::Ok {
+            // zlib-rs' low-level `inflate::copy` requires a non-null next_out
+            // even when avail_out is zero.  Its stable wrapper gets exactly
+            // such a dangling empty-slice pointer from `Writer::new(&mut [])`;
+            // reproduce that initialized-stream shape so a pristine PyPy
+            // `Decompress.copy()` succeeds before the first input byte.
+            stream.next_out = core::ptr::NonNull::<u8>::dangling().as_ptr();
+            Ok(Self { stream })
+        } else {
+            Err(return_code_message(code).to_owned())
+        }
+    }
+
+    fn total_in(&self) -> u64 {
+        self.stream.total_in as u64
+    }
+
+    fn total_out(&self) -> u64 {
+        self.stream.total_out as u64
+    }
+
+    fn error_message(&self) -> Option<&str> {
+        stream_message(&self.stream)
+    }
+
+    fn decompress(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        flush: InflateFlush,
+    ) -> Result<Status, InflateError> {
+        self.stream.avail_in = input.len().min(u32::MAX as usize) as u32;
+        self.stream.avail_out = output.len().min(u32::MAX as usize) as u32;
+        self.stream.next_in = input.as_ptr();
+        self.stream.next_out = output.as_mut_ptr();
+        let stream = unsafe { InflateStream::from_stream_mut(&mut self.stream) }
+            .expect("initialized inflate stream");
+        match unsafe { inflate::inflate(stream, flush) } {
+            ReturnCode::Ok => Ok(Status::Ok),
+            ReturnCode::StreamEnd => Ok(Status::StreamEnd),
+            ReturnCode::BufError => Ok(Status::BufError),
+            ReturnCode::NeedDict => Err(InflateError::NeedDict {
+                dict_id: self.stream.adler as u32,
+            }),
+            ReturnCode::StreamError => Err(InflateError::StreamError),
+            ReturnCode::DataError => Err(InflateError::DataError),
+            ReturnCode::MemError => Err(InflateError::MemError),
+            ReturnCode::ErrNo | ReturnCode::VersionError => {
+                unreachable!("pure-Rust inflate returned an unsupported status")
+            }
+        }
+    }
+
+    fn set_dictionary(&mut self, dictionary: &[u8]) -> Result<(), InflateError> {
+        let stream = unsafe { InflateStream::from_stream_mut(&mut self.stream) }
+            .expect("initialized inflate stream");
+        match inflate::set_dictionary(stream, dictionary) {
+            ReturnCode::Ok => Ok(()),
+            ReturnCode::StreamError => Err(InflateError::StreamError),
+            ReturnCode::DataError => Err(InflateError::DataError),
+            code => unreachable!("inflate set_dictionary returned {code:?}"),
+        }
+    }
+
+    fn copy(&self) -> Result<Self, String> {
+        let source = unsafe { InflateStream::from_stream_ref(&self.stream) }
+            .expect("initialized inflate stream");
+        let mut destination = MaybeUninit::<InflateStream<'static>>::uninit();
+        let code = unsafe { inflate::copy(&mut destination, source) };
+        if code != ReturnCode::Ok {
+            return Err(return_code_message(code).to_owned());
+        }
+        let copied = unsafe { destination.assume_init() };
+        let stream = unsafe { core::mem::transmute::<InflateStream<'static>, z_stream>(copied) };
+        Ok(Self { stream })
+    }
+}
+
+impl Drop for RawInflate {
+    fn drop(&mut self) {
+        if let Some(stream) = unsafe { InflateStream::from_stream_mut(&mut self.stream) } {
+            inflate::end(stream);
         }
     }
 }
@@ -116,11 +344,11 @@ impl<'a> Chunker<'a> {
 /// optional dictionary retry (the `DecompressWithDict::maybe_set_dict` path).
 fn decompress_chunks(
     data: &mut Chunker<'_>,
-    d: &mut Decompress,
+    d: &mut RawInflate,
     zdict: Option<&[u8]>,
     bufsize: usize,
     max_length: Option<usize>,
-    calc_flush: impl Fn(bool) -> FlushDecompress,
+    calc_flush: impl Fn(bool) -> InflateFlush,
 ) -> Result<(Vec<u8>, bool), String> {
     if data.is_empty() {
         return Ok((Vec::new(), true));
@@ -132,15 +360,18 @@ fn decompress_chunks(
         let chunk = data.chunk();
         let flush = calc_flush(chunk.len() == data.len());
         loop {
-            let additional = core::cmp::min(bufsize, max_length - buf.capacity());
+            let additional = core::cmp::min(bufsize, max_length - buf.len());
             if additional == 0 {
                 return Ok((buf, false));
             }
-            buf.reserve_exact(additional);
+            let mut output = vec![0; additional];
 
             let prev_in = d.total_in();
-            let res = d.decompress_vec(chunk, &mut buf, flush);
+            let prev_out = d.total_out();
+            let res = d.decompress(chunk, &mut output, flush);
             let consumed = d.total_in() - prev_in;
+            let produced = (d.total_out() - prev_out) as usize;
+            buf.extend_from_slice(&output[..produced]);
 
             data.advance(consumed as usize);
 
@@ -157,12 +388,14 @@ fn decompress_chunks(
                 }
                 Err(e) => {
                     // maybe_set_dict: retry once with the stored dictionary.
-                    match zdict.filter(|_| e.needs_dictionary().is_some()) {
+                    match zdict.filter(|_| matches!(e, InflateError::NeedDict { .. })) {
                         Some(zd) => {
-                            d.set_dictionary(zd).map_err(|e| e.to_string())?;
+                            d.set_dictionary(zd).map_err(|e| e.as_str().to_owned())?;
                             continue 'outer;
                         }
-                        None => return Err(e.to_string()),
+                        None => {
+                            return Err(d.error_message().unwrap_or(e.as_str()).to_owned());
+                        }
                     }
                 }
             }
@@ -172,11 +405,11 @@ fn decompress_chunks(
 
 fn decompress_all(
     data: &[u8],
-    d: &mut Decompress,
+    d: &mut RawInflate,
     zdict: Option<&[u8]>,
     bufsize: usize,
     max_length: Option<usize>,
-    calc_flush: impl Fn(bool) -> FlushDecompress,
+    calc_flush: impl Fn(bool) -> InflateFlush,
 ) -> Result<(Vec<u8>, bool), String> {
     let mut chunker = Chunker::new(data);
     decompress_chunks(&mut chunker, d, zdict, bufsize, max_length, calc_flush)
@@ -186,20 +419,23 @@ fn decompress_all(
 
 /// `zlib.compress(data, level, wbits)`.
 #[inline(never)]
-pub fn compress(data: &[u8], level: i32, wbits: i8) -> Result<Vec<u8>, String> {
-    let level = level_compression(level).ok_or_else(|| "Bad compression level".to_owned())?;
-    let compress = InitOptions::new(wbits)?.compress(level);
-    let mut encoder = ZlibEncoder::new_with_compress(Vec::new(), compress);
-    encoder.write_all(data).unwrap();
-    Ok(encoder.finish().unwrap())
+pub fn compress(data: &[u8], level: i32, wbits: i32) -> Result<Vec<u8>, String> {
+    if !valid_level(level) {
+        return Err("Bad compression level".to_owned());
+    }
+    let mut compressor = Compressor::new(level, 8, wbits, 8, 0, None)?;
+    let mut output = compressor.compress(data)?;
+    output.extend(compressor.flush(Z_FINISH)?);
+    Ok(output)
 }
 
 /// `zlib.decompress(data, wbits, bufsize)`.
 #[inline(never)]
-pub fn decompress(data: &[u8], wbits: i8, bufsize: usize) -> Result<Vec<u8>, String> {
-    let mut d = InitOptions::new(wbits)?.decompress();
-    let (buf, stream_end) =
-        decompress_all(data, &mut d, None, bufsize, None, |_| FlushDecompress::Sync)?;
+pub fn decompress(data: &[u8], wbits: i32, bufsize: usize) -> Result<Vec<u8>, String> {
+    let mut d = RawInflate::new(InitOptions::new(wbits)?.inflate_window_bits())?;
+    let (buf, stream_end) = decompress_all(data, &mut d, None, bufsize, None, |_| {
+        InflateFlush::SyncFlush
+    })?;
     if !stream_end {
         return Err("Error -5 while decompressing data: incomplete or truncated stream".to_owned());
     }
@@ -209,17 +445,38 @@ pub fn decompress(data: &[u8], wbits: i8, bufsize: usize) -> Result<Vec<u8>, Str
 // ── streaming compressor (zlib.Compress) ────────────────────────────────
 
 pub struct Compressor {
-    compress: Option<Compress>,
+    compress: Option<RawDeflate>,
 }
 
 impl Compressor {
     #[inline(never)]
-    pub fn new(level: i32, wbits: i8, zdict: Option<&[u8]>) -> Result<Self, String> {
-        let level =
-            level_compression(level).ok_or_else(|| "invalid initialization option".to_owned())?;
-        let mut compress = InitOptions::new(wbits)?.compress(level);
+    pub fn new(
+        level: i32,
+        method: i32,
+        wbits: i32,
+        mem_level: i32,
+        strategy: i32,
+        zdict: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        if !valid_level(level) {
+            return Err("Invalid initialization option".to_owned());
+        }
+        let method =
+            Method::try_from(method).map_err(|_| "Invalid initialization option".to_owned())?;
+        let strategy =
+            Strategy::try_from(strategy).map_err(|_| "Invalid initialization option".to_owned())?;
+        let window_bits = InitOptions::new(wbits)?.deflate_window_bits()?;
+        let mut compress = RawDeflate::new(DeflateConfig {
+            level,
+            method,
+            window_bits,
+            mem_level,
+            strategy,
+        })?;
         if let Some(zdict) = zdict {
-            compress.set_dictionary(zdict).map_err(|e| e.to_string())?;
+            compress
+                .set_dictionary(zdict)
+                .map_err(|e| e.as_str().to_owned())?;
         }
         Ok(Self {
             compress: Some(compress),
@@ -235,12 +492,15 @@ impl Compressor {
         let mut buf = Vec::new();
         for mut chunk in data.chunks(CHUNKSIZE) {
             while !chunk.is_empty() {
-                buf.reserve(DEF_BUF_SIZE);
+                let mut output = [0; DEF_BUF_SIZE];
                 let prev_in = compressor.total_in();
+                let prev_out = compressor.total_out();
                 compressor
-                    .compress_vec(chunk, &mut buf, FlushCompress::None)
-                    .map_err(|_| "error while compressing".to_owned())?;
+                    .compress(chunk, &mut output, DeflateFlush::NoFlush)
+                    .map_err(|e| e.as_str().to_owned())?;
                 let consumed = (compressor.total_in() - prev_in) as usize;
+                let produced = (compressor.total_out() - prev_out) as usize;
+                buf.extend_from_slice(&output[..produced]);
                 chunk = &chunk[consumed..];
             }
         }
@@ -254,10 +514,11 @@ impl Compressor {
     pub fn flush(&mut self, mode: i32) -> Result<Vec<u8>, String> {
         let flush = match mode {
             Z_NO_FLUSH => return Ok(vec![]),
-            Z_PARTIAL_FLUSH => FlushCompress::Partial,
-            Z_SYNC_FLUSH => FlushCompress::Sync,
-            Z_FULL_FLUSH => FlushCompress::Full,
-            Z_FINISH => FlushCompress::Finish,
+            Z_PARTIAL_FLUSH => DeflateFlush::PartialFlush,
+            Z_SYNC_FLUSH => DeflateFlush::SyncFlush,
+            Z_FULL_FLUSH => DeflateFlush::FullFlush,
+            Z_FINISH => DeflateFlush::Finish,
+            5 => DeflateFlush::Block,
             _ => return Err("invalid mode".to_owned()),
         };
         let compressor = self
@@ -266,13 +527,14 @@ impl Compressor {
             .ok_or_else(|| USE_AFTER_FINISH_ERR.to_owned())?;
         let mut buf = Vec::new();
         let status = loop {
-            if buf.len() == buf.capacity() {
-                buf.reserve(DEF_BUF_SIZE);
-            }
+            let mut output = [0; DEF_BUF_SIZE];
+            let prev_out = compressor.total_out();
             let status = compressor
-                .compress_vec(&[], &mut buf, flush)
-                .map_err(|_| "error while compressing".to_owned())?;
-            if buf.len() != buf.capacity() {
+                .compress(&[], &mut output, flush)
+                .map_err(|e| e.as_str().to_owned())?;
+            let produced = (compressor.total_out() - prev_out) as usize;
+            buf.extend_from_slice(&output[..produced]);
+            if produced != output.len() || status == Status::StreamEnd {
                 break status;
             }
         };
@@ -290,12 +552,26 @@ impl Compressor {
     pub fn is_finished(&self) -> bool {
         self.compress.is_none()
     }
+
+    /// PyPy `Compress.copy`: clone the live native deflate stream.  The
+    /// caller holds this object's per-instance lock while copying.
+    #[inline(never)]
+    pub fn copy(&mut self) -> Result<Self, String> {
+        let compress = self
+            .compress
+            .as_mut()
+            .ok_or_else(|| "Compressor was already flushed".to_owned())?
+            .copy()?;
+        Ok(Self {
+            compress: Some(compress),
+        })
+    }
 }
 
 // ── streaming decompressor (zlib.Decompress) ────────────────────────────
 
 pub struct Decompressor {
-    decompress: Option<Decompress>,
+    decompress: Option<RawInflate>,
     zdict: Option<Vec<u8>>,
     eof: bool,
     unused_data: Vec<u8>,
@@ -304,14 +580,14 @@ pub struct Decompressor {
 
 impl Decompressor {
     #[inline(never)]
-    pub fn new(wbits: i8, zdict: Option<Vec<u8>>) -> Result<Self, String> {
-        let mut decompress = InitOptions::new(wbits)?.decompress();
+    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, String> {
+        let mut decompress = RawInflate::new(InitOptions::new(wbits)?.inflate_window_bits())?;
         if let Some(d) = &zdict
             && wbits < 0
         {
             decompress
                 .set_dictionary(d)
-                .map_err(|_| "failed to set dictionary".to_owned())?;
+                .map_err(|e| e.as_str().to_owned())?;
         }
         Ok(Self {
             decompress: Some(decompress),
@@ -330,6 +606,27 @@ impl Decompressor {
     }
     pub fn unconsumed_tail(&self) -> &[u8] {
         &self.unconsumed_tail
+    }
+    pub fn is_finished(&self) -> bool {
+        self.decompress.is_none()
+    }
+
+    /// PyPy `Decompress.copy`: the inflate stream and all Python-visible
+    /// buffered state are copied together.
+    #[inline(never)]
+    pub fn copy(&self) -> Result<Self, String> {
+        let decompress = self
+            .decompress
+            .as_ref()
+            .ok_or_else(|| "Decompressor was already flushed".to_owned())?
+            .copy()?;
+        Ok(Self {
+            decompress: Some(decompress),
+            zdict: self.zdict.clone(),
+            eof: self.eof,
+            unused_data: self.unused_data.clone(),
+            unconsumed_tail: self.unconsumed_tail.clone(),
+        })
     }
 
     /// zlib.rs `PyDecompress::decompress_inner`.
@@ -356,15 +653,15 @@ impl Decompressor {
             // ignore zdict on a flush, finish on the final chunk
             let calc_flush = |final_chunk| {
                 if final_chunk {
-                    FlushDecompress::Finish
+                    InflateFlush::Finish
                 } else {
-                    FlushDecompress::None
+                    InflateFlush::NoFlush
                 }
             };
             decompress_all(data, d, None, bufsize, max_length, calc_flush)
         } else {
             decompress_all(data, d, zdict.as_deref(), bufsize, max_length, |_| {
-                FlushDecompress::Sync
+                InflateFlush::SyncFlush
             })
         };
         let (ret, stream_end) = match res {
@@ -405,8 +702,8 @@ impl Decompressor {
     #[inline(never)]
     pub fn flush(&mut self, length: usize) -> Result<Vec<u8>, String> {
         let data = core::mem::take(&mut self.unconsumed_tail);
-        let (ret, _) = self.decompress_inner(&data, length, None, true)?;
-        if self.eof {
+        let (ret, stream_end) = self.decompress_inner(&data, length, None, true)?;
+        if stream_end {
             self.decompress = None;
         }
         ret
@@ -424,7 +721,7 @@ pub enum DecompressError {
 }
 
 pub struct ZlibDecompressor {
-    decompress: Decompress,
+    decompress: Option<RawInflate>,
     zdict: Option<Vec<u8>>,
     unused_data: Vec<u8>,
     input_buffer: Vec<u8>,
@@ -434,17 +731,17 @@ pub struct ZlibDecompressor {
 
 impl ZlibDecompressor {
     #[inline(never)]
-    pub fn new(wbits: i8, zdict: Option<Vec<u8>>) -> Result<Self, String> {
-        let mut decompress = InitOptions::new(wbits)?.decompress();
+    pub fn new(wbits: i32, zdict: Option<Vec<u8>>) -> Result<Self, String> {
+        let mut decompress = RawInflate::new(InitOptions::new(wbits)?.inflate_window_bits())?;
         if let Some(d) = &zdict
             && wbits < 0
         {
             decompress
                 .set_dictionary(d)
-                .map_err(|_| "failed to set dictionary".to_owned())?;
+                .map_err(|e| e.as_str().to_owned())?;
         }
         Ok(Self {
-            decompress,
+            decompress: Some(decompress),
             zdict,
             unused_data: Vec::new(),
             input_buffer: Vec::new(),
@@ -475,13 +772,14 @@ impl ZlibDecompressor {
         }
 
         let Self {
-            decompress,
+            decompress: decompress_slot,
             zdict,
             unused_data,
             input_buffer,
             eof,
             needs_input,
         } = self;
+        let decompress = decompress_slot.as_mut().ok_or(DecompressError::Eof)?;
 
         let mut chunks = Chunker::chain(input_buffer.as_slice(), data);
 
@@ -492,7 +790,7 @@ impl ZlibDecompressor {
             zdict.as_deref(),
             DEF_BUF_SIZE,
             max_length,
-            |_| FlushDecompress::Sync,
+            |_| InflateFlush::SyncFlush,
         ) {
             Ok((buf, stream_end)) => (Ok(buf), stream_end),
             Err(err) => (Err(err), false),
@@ -506,6 +804,10 @@ impl ZlibDecompressor {
             if !chunks.is_empty() {
                 *unused_data = chunks.to_vec();
             }
+            // interp_zlib.py frees this stream immediately at EOF and
+            // unregisters its finalizer; retaining it until object sweep is a
+            // lifetime divergence and keeps a full inflate window alive.
+            *decompress_slot = None;
         } else if chunks.is_empty() {
             input_buffer.clear();
             *needs_input = true;
@@ -540,7 +842,7 @@ mod tests {
     fn roundtrip_all_levels_and_wbits() {
         let data = b"the quick brown fox jumps over the lazy dog".repeat(20);
         for level in 0..=9 {
-            for &wbits in &[15i8, 31, -15] {
+            for &wbits in &[15i32, 31, -15] {
                 let c = compress(&data, level, wbits).unwrap();
                 let d = decompress(&c, wbits, DEF_BUF_SIZE).unwrap();
                 assert_eq!(d, data, "level={level} wbits={wbits}");
@@ -556,7 +858,7 @@ mod tests {
 
     #[test]
     fn streaming_roundtrip() {
-        let mut co = Compressor::new(-1, MAX_WBITS, None).unwrap();
+        let mut co = Compressor::new(-1, 8, MAX_WBITS, 8, 0, None).unwrap();
         let mut out = co.compress(b"hello ").unwrap();
         out.extend(co.compress(b"world").unwrap());
         out.extend(co.flush(Z_FINISH).unwrap());
@@ -566,6 +868,80 @@ mod tests {
         let got = do_.decompress(&out, None).unwrap();
         assert_eq!(got, b"hello world");
         assert!(do_.eof());
+    }
+
+    #[test]
+    fn streaming_block_flush_roundtrip() {
+        let data = b"block-flush payload ".repeat(200);
+        let mut co = Compressor::new(6, 8, MAX_WBITS, 8, 0, None).unwrap();
+        let mut encoded = co.compress(&data[..1000]).unwrap();
+        encoded.extend(co.flush(5).unwrap());
+        encoded.extend(co.compress(&data[1000..]).unwrap());
+        encoded.extend(co.flush(Z_FINISH).unwrap());
+        assert_eq!(decompress(&encoded, MAX_WBITS, DEF_BUF_SIZE).unwrap(), data);
+    }
+
+    #[test]
+    fn compressor_options_are_validated_by_deflate_init() {
+        assert!(Compressor::new(6, 7, 15, 8, 0, None).is_err());
+        assert!(Compressor::new(6, 8, 15, 0, 0, None).is_err());
+        assert!(Compressor::new(6, 8, 15, 8, 99, None).is_err());
+        assert!(Compressor::new(6, 8, -8, 8, 0, None).is_err());
+        assert!(Compressor::new(6, 8, 24, 8, 0, None).is_err());
+    }
+
+    #[test]
+    fn compressor_copy_forks_native_stream() {
+        let prefix = b"shared prefix ".repeat(50);
+        let left = b"left branch".repeat(20);
+        let right = b"right branch".repeat(20);
+        let mut original = Compressor::new(6, 8, 15, 8, 0, None).unwrap();
+        let shared = original.compress(&prefix).unwrap();
+        let mut copied = original.copy().unwrap();
+
+        let mut left_encoded = shared.clone();
+        left_encoded.extend(original.compress(&left).unwrap());
+        left_encoded.extend(original.flush(Z_FINISH).unwrap());
+        let mut right_encoded = shared;
+        right_encoded.extend(copied.compress(&right).unwrap());
+        right_encoded.extend(copied.flush(Z_FINISH).unwrap());
+
+        assert_eq!(
+            decompress(&left_encoded, 15, DEF_BUF_SIZE).unwrap(),
+            [prefix.as_slice(), left.as_slice()].concat()
+        );
+        assert_eq!(
+            decompress(&right_encoded, 15, DEF_BUF_SIZE).unwrap(),
+            [prefix.as_slice(), right.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn decompressor_copy_forks_native_stream() {
+        let data = b"decompress copy payload ".repeat(100);
+        let encoded = compress(&data, 6, 15).unwrap();
+        let mut original = Decompressor::new(15, None).unwrap();
+        let prefix = original.decompress(&encoded[..16], None).unwrap();
+        let mut copied = original.copy().unwrap();
+        let left = original.decompress(&encoded[16..], None).unwrap();
+        let right = copied.decompress(&encoded[16..], None).unwrap();
+        assert_eq!([prefix.as_slice(), left.as_slice()].concat(), data);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn pristine_streams_can_be_copied() {
+        let mut compressor = Compressor::new(6, 8, 15, 8, 0, None).unwrap();
+        compressor.copy().unwrap();
+        let decompressor = Decompressor::new(15, None).unwrap();
+        decompressor.copy().unwrap();
+    }
+
+    #[test]
+    fn header_window_autodetection() {
+        let data = b"window-sized-from-zlib-header".repeat(20);
+        let encoded = compress(&data, 1, MAX_WBITS).unwrap();
+        assert_eq!(decompress(&encoded, 0, DEF_BUF_SIZE).unwrap(), data);
     }
 
     #[test]

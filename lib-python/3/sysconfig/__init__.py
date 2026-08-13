@@ -106,7 +106,24 @@ if os.name == 'nt':
 else:
     _INSTALL_SCHEMES['venv'] = _INSTALL_SCHEMES['posix_venv']
 
+# PyPy's packaged stdlib normally lives directly below ``base_prefix``, so
+# its generic prefix templates happen to identify the loaded stdlib.  A
+# cargo-dist Homebrew formula must place non-binary archive contents below
+# ``pkgshare`` instead.  Keep the PyPy ownership rule -- the interpreter tells
+# sysconfig where its stdlib is -- rather than reconstructing that location
+# from a package-manager-specific prefix.  Site-packages, scripts, and data
+# remain rooted at the active prefix exactly as in the ordinary schemes.
+if sys.implementation.name == 'pyre':
+    for _scheme in ('posix_prefix', 'posix_venv', 'nt', 'nt_venv'):
+        _INSTALL_SCHEMES[_scheme]['stdlib'] = '{stdlib_dir}'
+        _INSTALL_SCHEMES[_scheme]['platstdlib'] = '{stdlib_dir}'
+
 def _get_implementation():
+    # PyPy keeps its implementation-specific installation tree separate from
+    # CPython's (`lib/pypyX.Y`).  Pyre follows the same layout and ownership
+    # rule rather than claiming CPython's `lib/pythonX.Y` scheme.
+    if sys.implementation.name == 'pyre':
+        return 'Pyre'
     return 'Python'
 
 # NOTE: site.py has copy of this function.
@@ -369,7 +386,16 @@ def _get_sysconfigdata():
 
     name = _get_sysconfigdata_name()
     path = os.environ.get('_PYTHON_SYSCONFIGDATA_PATH')
-    module = _import_from_directory(path, name) if path else importlib.import_module(name)
+    try:
+        module = _import_from_directory(path, name) if path else importlib.import_module(name)
+    except ImportError:
+        # PyPy's source-tree bootstrap uses a dynamic, relocatable module and
+        # release packaging may replace it with the generated platform-named
+        # snapshot above.  Preserve an explicitly requested module name as a
+        # hard error; otherwise use the same two-level lookup for Pyre.
+        if '_PYTHON_SYSCONFIGDATA_NAME' in os.environ:
+            raise
+        module = importlib.import_module('_sysconfigdata')
 
     return module.build_time_vars
 
@@ -546,6 +572,7 @@ def _init_config_vars():
     _CONFIG_VARS['platlibdir'] = sys.platlibdir
     _CONFIG_VARS['implementation'] = _get_implementation()
     _CONFIG_VARS['implementation_lower'] = _get_implementation().lower()
+    _CONFIG_VARS['stdlib_dir'] = getattr(sys, '_stdlib_dir', '')
     _CONFIG_VARS['abiflags'] = abiflags
     try:
         _CONFIG_VARS['py_version_nodot_plat'] = sys.winver.replace('.', '')
@@ -573,7 +600,7 @@ def _init_config_vars():
             # containing Makefile.
             base = os.path.dirname(get_makefile_filename())
             srcdir = os.path.join(base, srcdir)
-        else:
+        elif sys.implementation.name != 'pyre':
             # srcdir is not meaningful since the installation is
             # spread about the filesystem.  We choose the
             # directory containing the Makefile since we know it

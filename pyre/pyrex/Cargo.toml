@@ -75,3 +75,10 @@ pyre-sandbox = { workspace = true }
 # where production installs the hash hook), so enable pyre-interpreter's
 # `test-hooks` feature to install the thread-local hook on the test threads.
 pyre-interpreter = { workspace = true, features = ["test-hooks"] }
+
+[package.metadata.dist]
+# All three declared executables are one cargo-dist application.  The two
+# alternate backend binaries have `required-features`; without explicitly
+# enabling both, dist plans them into every archive but Cargo never emits them
+# and packaging fails only after the full release build.
+features = ["cranelift", "dynasm"]

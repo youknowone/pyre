@@ -110,3 +110,6 @@ widestring = "1.2"
 # Compresses the embedded stdlib VFS blob at build time (only does work when the
 # wasm_vfs feature is enabled; otherwise build.rs returns early).
 lz4_flex = "0.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }

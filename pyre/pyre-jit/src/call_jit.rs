@@ -1120,12 +1120,20 @@ pub extern "C" fn bh_portal_runner_c(
         return pyre_object::PY_NULL as i64;
     }
     let frame = unsafe { &mut *frame_ptr };
-    // warmspot.py:976: set portal args on frame before dispatch.
-    if !pycode.is_null() {
-        frame.pycode = pycode as *const ();
-    }
-    if !ec.is_null() {
-        frame.execution_context = ec;
+    // warmspot.py:976 calls `portal_ptr(*args)`; it does not copy the green
+    // `pycode` back onto the red frame.  The frame was constructed for this
+    // activation and already owns its pycode / execution context (the same
+    // frame-only contract as `ll_portal_runner_shim` above).  In particular,
+    // a stale CRN green must never collapse this frame onto another code
+    // object's identity.
+    if majit_metainterp::majit_log_enabled()
+        && ((!pycode.is_null() && frame.pycode != pycode as *const ())
+            || (!ec.is_null() && frame.execution_context != ec))
+    {
+        eprintln!(
+            "[blackhole-resume] CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
+            frame.pycode, frame.execution_context,
+        );
     }
     frame.set_last_instr_from_next_instr(next_instr as usize);
     match crate::eval::portal_runner_result(frame) {
@@ -3062,11 +3070,19 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                 return Some(pyre_object::PY_NULL as i64);
             }
             let frame = unsafe { &mut *frame_ptr };
-            if !pycode.is_null() {
-                frame.pycode = pycode as *const ();
-            }
-            if !ec.is_null() {
-                frame.execution_context = ec;
+            // The red frame is the activation identity.  PyPy forwards the
+            // CRN arguments to `portal_ptr` without mutating that frame; pyre's
+            // frame-only portal entry likewise reads the pycode / execution
+            // context already stored on the callee frame.  Do not overwrite
+            // them from a possibly stale green snapshot.
+            if majit_metainterp::majit_log_enabled()
+                && ((!pycode.is_null() && frame.pycode != pycode as *const ())
+                    || (!ec.is_null() && frame.execution_context != ec))
+            {
+                eprintln!(
+                    "[blackhole-resume] CALL_ASSEMBLER CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
+                    frame.pycode, frame.execution_context,
+                );
             }
             frame.set_last_instr_from_next_instr(next_instr);
             // The blackhole wrote the failing guard's recorded operand depth

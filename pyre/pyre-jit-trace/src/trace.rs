@@ -4594,12 +4594,14 @@ fn run_perfn_walk<Sym: WalkSym>(
                              (unjournaled effect or inline sub-walk) — legacy drop kept"
                     );
                 }
-            } else if let Some(resume_py_pc) =
-                crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc)
-            {
-                let mirror = crate::jitcode_dispatch::fbw_branch_abort_stack_take()
-                    .filter(|(py_pc, _)| *py_pc == resume_py_pc)
-                    .map(|(_, stack)| stack);
+            } else {
+                let mirror = crate::jitcode_dispatch::fbw_branch_abort_stack_take();
+                let resume_py_pc = mirror
+                    .as_ref()
+                    .map(|(py_pc, _)| *py_pc)
+                    .or_else(|| crate::jitcode_dispatch::fbw_abort_resume_py_pc(sym, abort_jit_pc))
+                    .unwrap_or(0);
+                let mirror = mirror.map(|(_, stack)| stack);
                 // RPython resumes a mid-expression abort from the complete
                 // MIFrame register image.  Without that image, the vable
                 // shadow is only authoritative at a merge point: delivering

@@ -9645,6 +9645,17 @@ fn guarded_branch_core<Sym: WalkSym>(
                 }
                 // Stamp the abort coordinate at the raise point so the
                 // driver gate cannot observe an unrelated prior abort.
+                //
+                // `MIFrame.run_one_step` has already advanced `frame.pc`, and
+                // `opimpl_goto_if_not` has already selected its link, when a
+                // tracing abort converts the frame to a blackhole
+                // (`pyjitpl.py:1892-1914`, `blackhole.py:1800-1810`).  Preserve
+                // that post-branch Python continuation and its popped stack,
+                // rather than making the interpreter re-run the guard opcode.
+                // The latter needs the transient truth operand which JitCode
+                // keeps only in an Int register, and replaying from the trace
+                // entry when it is absent double-applies prior residuals.
+                latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
                 ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
                 return Err(DispatchError::BranchGuardUnrestorableKeptStackPermanent { pc: op.pc });
             }
@@ -9674,6 +9685,7 @@ fn guarded_branch_core<Sym: WalkSym>(
             // Stamp the abort coordinate at the raise point so the
             // walk-end branch-flush gate cannot flush the outer frame
             // from a callee-coordinate abort.
+            latch_taken_python_branch_abort_stack(ctx, gate_frame.as_ref(), guard_opcode);
             ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
             return Err(DispatchError::BranchGuardKeptStackUnsupported { pc: op.pc });
         }
@@ -9710,6 +9722,58 @@ fn guarded_branch_core<Sym: WalkSym>(
     }
     write_branch_result(ctx, op.pc, result_write)?;
     Ok((DispatchOutcome::Continue, taken_pc))
+}
+
+/// Preserve the already-selected Python successor for a kept-stack branch
+/// abort, matching the forward `MIFrame.pc` copied by
+/// `convert_and_run_from_pyjitpl`.
+fn latch_taken_python_branch_abort_stack<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame: Option<&ActiveResumeFrame>,
+    guard_opcode: OpCode,
+) {
+    let Some(frame) = frame else {
+        return;
+    };
+    let py_pc = ctx.vstack_cur_pypc as usize;
+    let pjc = &frame.0;
+    if pjc.code_ptr.is_null() {
+        return;
+    }
+    let code = unsafe { &*pjc.code_ptr };
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, py_pc) else {
+        return;
+    };
+    let truth = match guard_opcode {
+        OpCode::GuardTrue => true,
+        OpCode::GuardFalse => false,
+        _ => return,
+    };
+    let jump = match instr {
+        pyre_interpreter::Instruction::PopJumpIfTrue { .. } => truth,
+        pyre_interpreter::Instruction::PopJumpIfFalse { .. } => !truth,
+        _ => return,
+    };
+    let successor = if jump {
+        crate::liveness::target_pc(code, &instr, py_pc, op_arg)
+    } else {
+        Some(crate::pyjitpl::semantic_fallthrough_pc(code, py_pc))
+    };
+    let Some(successor) = successor else {
+        return;
+    };
+    let Some(depth) = crate::liveness::liveness_for(pjc.code_ptr)
+        .depth_at_py_pc()
+        .get(successor)
+        .copied()
+        .map(usize::from)
+    else {
+        return;
+    };
+    if !ctx.vstack_valid || depth > ctx.vstack_depth || depth > ctx.vstack_boxes.len() {
+        return;
+    }
+    fbw_branch_abort_stack_latch(successor, ctx.vstack_boxes[..depth].to_vec());
 }
 
 fn goto_if_not_branch_on<Sym: WalkSym>(

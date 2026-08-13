@@ -1345,7 +1345,12 @@ pub(crate) fn fbw_qmut_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
 /// branch abort.  The caller has already proved the mirror valid and trims it
 /// to the depth on entry to `py_pc`.
 pub(crate) fn fbw_branch_abort_stack_latch(py_pc: usize, stack: Vec<OpRef>) {
-    FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = Some((py_pc, stack)));
+    FBW_BRANCH_ABORT_STACK.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((py_pc, stack));
+        }
+    });
 }
 
 /// Consume the kept-stack branch-abort carrier above.

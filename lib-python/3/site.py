@@ -290,6 +290,11 @@ def check_enableusersite():
 
 # Copy of sysconfig._get_implementation()
 def _get_implementation():
+    # Keep this in sync with sysconfig._get_implementation().  As in PyPy,
+    # third-party packages live under the interpreter's own implementation
+    # directory instead of CPython's `pythonX.Y` tree.
+    if sys.implementation.name == 'pyre':
+        return 'Pyre'
     return 'Python'
 
 # Copy of sysconfig._getuserbase()
@@ -333,7 +338,7 @@ def _get_path(userbase):
     if sys.platform == 'darwin' and sys._framework:
         return f'{userbase}/lib/{implementation_lower}/site-packages'
 
-    return f'{userbase}/lib/python{version[0]}.{version[1]}{abi_thread}/site-packages'
+    return f'{userbase}/lib/{implementation_lower}{version[0]}.{version[1]}{abi_thread}/site-packages'
 
 
 def getuserbase():

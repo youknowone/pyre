@@ -846,6 +846,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             ));
                         }
                     };
+                    // `interp_func.py:412` audits the argument as it was
+                    // passed, after the conversion and before the syscall.
+                    crate::module::sys::vm::audit("socket.sethostname", &[args[0]])?;
                     rustpython_host_env::socket::sethostname(&name).map_err(|e| {
                         crate::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
