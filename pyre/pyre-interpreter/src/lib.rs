@@ -1145,26 +1145,29 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
         subclass_range_alias(177, typed::<crate::module::_ssl::W_Certificate>()),
         // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
+        // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
+        // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         subclass_range_alias(178, typed::<crate::module::mmap::W_MMap>()),
-        // Without the five SSL native types it occupies the next append-only
-        // slot after DirEntry.
-        #[cfg(all(any(unix, windows), feature = "sandbox"))]
-        subclass_range_alias(173, typed::<crate::module::mmap::W_MMap>()),
     ]
 }
 
 /// The rclass hierarchy present in this interpreter configuration.
 ///
-/// `_ssl` owns five native hierarchy slots and is compiled out of a sandbox
-/// build.  On Unix mmap follows those slots, so removing the five SSL entries
-/// leaves mmap at the next contiguous id (173).
+/// `_ssl` owns five native hierarchy slots and `mmap` owns one behind them
+/// wherever it is compiled.  A sandbox build has neither module, and both sit
+/// at the tail of `SUBCLASS_RANGE_HIERARCHY`, so dropping that many trailing
+/// entries leaves exactly the ids such a build registers.
 pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
     #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
     {
         const SSL_HIERARCHY_SLOTS: usize = 5;
-        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS]
+        #[cfg(any(unix, windows))]
+        const MMAP_HIERARCHY_SLOTS: usize = 1;
+        #[cfg(not(any(unix, windows)))]
+        const MMAP_HIERARCHY_SLOTS: usize = 0;
+        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS - MMAP_HIERARCHY_SLOTS]
     }
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
     {

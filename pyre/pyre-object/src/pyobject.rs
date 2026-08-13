@@ -673,8 +673,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     #[cfg(not(target_arch = "wasm32"))]
     (177, Some(0)),
     // `mmap.mmap` owns its native mapping/fd payload and follows the optional
-    // SSL tail on Unix.  In sandbox builds `active_subclass_range_hierarchy`
-    // removes SSL's five entries, leaving this logical slot renumbered to 173.
+    // SSL tail on Unix.  A sandbox build has no `mmap` module either, so
+    // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(unix)]
     (178, Some(0)),
 ];

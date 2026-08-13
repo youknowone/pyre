@@ -718,7 +718,7 @@ unsafe fn ssl_socket_destructor(obj_addr: usize) {
     };
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 unsafe fn mmap_destructor(obj_addr: usize) {
     unsafe { pyre_interpreter::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
@@ -819,7 +819,7 @@ unsafe fn memory_bio_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 
 /// `mmap.mmap` is subclassable and carries the same mapdict prefix; its
 /// mapping/fd payload contains no Python references.
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
 }
@@ -3801,7 +3801,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // PyPy's W_MMap directly owns rmmap.MMap.  The typed wrapper carries the
     // subclass mapdict prefix and a sweep destructor for the native mapping
     // and duplicated fd.
-    #[cfg(any(unix, windows))]
+    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
     {
         let mmap_descr = <pyre_interpreter::module::mmap::W_MMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;

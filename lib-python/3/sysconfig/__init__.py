@@ -572,7 +572,11 @@ def _init_config_vars():
     _CONFIG_VARS['platlibdir'] = sys.platlibdir
     _CONFIG_VARS['implementation'] = _get_implementation()
     _CONFIG_VARS['implementation_lower'] = _get_implementation().lower()
-    _CONFIG_VARS['stdlib_dir'] = getattr(sys, '_stdlib_dir', '')
+    # `sys._stdlib_dir` is None whenever the interpreter could not name a
+    # stdlib directory (a `pythonXY.zip` layout, or no stdlib found at all).
+    # The attribute is always present, so the getattr default never fires
+    # there and `'{stdlib_dir}'.format()` would substitute the string 'None'.
+    _CONFIG_VARS['stdlib_dir'] = getattr(sys, '_stdlib_dir', '') or ''
     _CONFIG_VARS['abiflags'] = abiflags
     try:
         _CONFIG_VARS['py_version_nodot_plat'] = sys.winver.replace('.', '')

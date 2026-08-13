@@ -577,7 +577,7 @@ unsafe fn is_ssl_mapdict_layout(_obj: PyObjectRef) -> bool {
     false
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 #[inline]
 unsafe fn is_mmap_mapdict_layout(obj: PyObjectRef) -> bool {
     use pyre_object::lltype::PyreClassPyTypeOf;
@@ -589,7 +589,7 @@ unsafe fn is_mmap_mapdict_layout(obj: PyObjectRef) -> bool {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(all(any(unix, windows), not(feature = "sandbox"))))]
 #[inline]
 unsafe fn is_mmap_mapdict_layout(_obj: PyObjectRef) -> bool {
     false

@@ -885,23 +885,6 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
     );
 }
 
-/// PyPy-style ABI suffix used by `_imp` and `_sysconfig`.  It is build
-/// metadata, so it remains present even when a target has no extension-module
-/// loader in this binary.
-pub(crate) fn extension_suffix() -> String {
-    let multiarch = if cfg!(target_os = "macos") {
-        "-darwin"
-    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "-x86_64-linux-gnu"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "-aarch64-linux-gnu"
-    } else {
-        ""
-    };
-    let extension = if cfg!(windows) { ".pyd" } else { ".so" };
-    format!(".pyre314-pyre0{multiarch}{extension}")
-}
-
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
@@ -1631,12 +1614,17 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
         return Some((vec![lib_pyzip], None));
     }
 
-    // pypy/module/sys/initpath.py `compute_stdlib_path_maybe_source`: the
-    // untranslated/source layout is two entries and `lib_pypy` comes first.
-    let lib_pypy = prefix.join("lib_pypy");
+    // pypy/module/sys/initpath.py `compute_stdlib_path_maybe_source` puts
+    // `lib_pypy` on sys.path ahead of `lib-python/3`.  pyre does not: most of
+    // `lib_pypy` is PyPy's cffi/pure-Python shims for modules pyre implements
+    // natively or not at all (`_testcapi`, `_md5`, `_sha*`, `_sqlite3`, ...),
+    // and the CPython suite branches on whether `import X` succeeds.  Exposing
+    // a partial shim turns a clean skip into a run against a module that
+    // cannot answer.  The supported surface is `lib-python/3` plus the builtin
+    // modules; anything `lib_pypy` still owns is staged into `lib-python/3`.
     let lib_python = prefix.join("lib-python").join("3");
-    if lib_pypy.is_dir() && lib_python.join("site.py").is_file() {
-        let mut paths = vec![lib_pypy, lib_python.clone()];
+    if lib_python.join("site.py").is_file() {
+        let mut paths = vec![lib_python.clone()];
         append_macos_stdlib_paths(&mut paths, &lib_python);
         return Some((paths, Some(lib_python)));
     }
@@ -1847,17 +1835,9 @@ fn compute_startup_path_config_from(
         if let Some(stdlib_path) = explicit_stdlib.filter(|path| path.is_dir() || path.is_file()) {
             let prefix = prefix_from_stdlib(&stdlib_path);
             let stdlib_dir = stdlib_path.is_dir().then(|| stdlib_path.clone());
-            // An explicitly named `lib-python/3` still sits in a source layout,
-            // where `lib_pypy` holds the other half of the standard library
-            // (`_sysconfigdata`, `_lzma`, `cffi`, `readline`, ...). Naming the
-            // stdlib directory says where it is, not that it is the only entry,
-            // so reproduce the two-entry shape `stdlib_at_prefix` builds.
-            let lib_pypy = prefix.join("lib_pypy");
-            let mut paths = if lib_pypy.is_dir() && stdlib_dir.is_some() {
-                vec![lib_pypy, stdlib_path]
-            } else {
-                vec![stdlib_path]
-            };
+            // Naming the stdlib directory says where it is, not that it is the
+            // only entry, so reproduce the shape `stdlib_at_prefix` builds.
+            let mut paths = vec![stdlib_path];
             if let Some(stdlib_dir) = stdlib_dir.as_deref() {
                 append_macos_stdlib_paths(&mut paths, stdlib_dir);
             }
@@ -1875,6 +1855,18 @@ fn compute_startup_path_config_from(
             }
             if !starts.contains(&executable) {
                 starts.push(executable.clone());
+            }
+            // `find_invoked_executable` reports an unresolvable argv[0] as an
+            // empty path, which is the right spelling for `sys.executable` but
+            // says nothing about where the stdlib is.  The process image still
+            // knows, so search from it before giving up: without this a caller
+            // that passes a made-up argv[0] (the `-i` REPL spawned by
+            // `test_inspect`, whose argv[0] is `<stdin>`) gets `sys.path ==
+            // ['']` and cannot import anything at all.
+            if let Ok(image) = std::env::current_exe()
+                && !starts.contains(&image)
+            {
+                starts.push(image);
             }
             starts
                 .iter()
@@ -2655,12 +2647,19 @@ fn ensure_stdlib_path() {
     }
     let config = startup_path_config();
     if config.stdlib_paths.is_empty() {
-        eprintln!(
+        let warning = format!(
             "debug: WARNING: Library path not found, using the existing sys.path;\n\
              debug: WARNING: sys.prefix = {:?}\n\
-             debug: WARNING: Make sure the pyre binary is kept inside its tree of files.",
+             debug: WARNING: Make sure the pyre binary is kept inside its tree of files.\n",
             config.prefix
         );
+        // A sandbox build compiles this path too, and there the real stderr is
+        // not ours to write; `host_seam::ops` is that build's stderr.  It is
+        // also the only build that has it, so the ordinary one keeps `eprint!`.
+        #[cfg(feature = "sandbox")]
+        let _ = crate::host_seam::ops::write(2, warning.as_bytes());
+        #[cfg(not(feature = "sandbox"))]
+        eprint!("{warning}");
     }
     for path in &config.stdlib_paths {
         add_sys_path(path);

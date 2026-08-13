@@ -64,15 +64,12 @@ def stage(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     # pypy/tool/release/package.py copies lib-python first, then overlays
-    # lib_pypy into the same implementation-version directory.
+    # lib_pypy into the same implementation-version directory.  pyre stages
+    # only `lib-python/3`: overlaying `lib_pypy` would put its cffi/pure-Python
+    # shims (`_testcapi`, `_md5`, `_sha*`, `_sqlite3`, ...) on the release
+    # import path, which is the same shadowing the source layout refuses.  What
+    # pyre still owns from `lib_pypy` lives in `lib-python/3` instead.
     shutil.copytree(ROOT / "lib-python" / "3", destination, ignore=ignored)
-    shutil.copytree(ROOT / "lib_pypy", destination, dirs_exist_ok=True, ignore=ignored)
-
-    # `lib_pypy/__init__.py` only identifies the source-tree package.  In a
-    # release its contents are the top level of the merged stdlib.
-    init_file = destination / "__init__.py"
-    if init_file.exists():
-        init_file.unlink()
 
     if not (destination / "site.py").is_file():
         raise SystemExit("staged stdlib does not contain site.py")

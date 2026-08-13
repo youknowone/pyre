@@ -11,10 +11,12 @@ except IndexError:
     # EXT_SUFFIX is build ABI metadata, and remains useful to wheel tooling
     # when this interpreter build has no native-extension loader.  CPython's
     # sysconfig tests likewise distinguish an absent loader from an absent
-    # build suffix.  Keep PyPy's `<impl>-<abi>-<multiarch>` shape.
+    # build suffix.  This must spell the suffix the extension loader itself
+    # builds its candidate filenames from (`cpyext::extension_suffix`), so a
+    # build that gains the loader keeps the metadata it already published.
     multiarch = sys.implementation._multiarch
     shared_ext = '.pyd' if sys.platform == 'win32' else '.so'
-    so_ext = '.pyre314-pyre0%s%s' % (
+    so_ext = '.pyre314%s%s' % (
         ('-' + multiarch) if multiarch else '', shared_ext)
 
 pydot = '%d.%d' % sys.version_info[:2]
