@@ -2964,19 +2964,57 @@ pub fn fuse_boxing_alloc(
     // the op rather than being dropped.  Returns `0` when the cluster carries no
     // resolvable constant type-pointer (e.g. a synthetic test fixture).
     fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .find_map(|o| match &o.kind {
-                OpKind::FieldWrite {
-                    base: b,
-                    field,
-                    value,
-                    ..
-                } if b == base && field.name.as_str() == field_name => value.as_variable().cloned(),
-                _ => None,
-            })
+        let (_, value) = unique_store(graph, base, field_name)?;
+        value.as_variable().cloned()
+    }
+    /// The one value `base.field_name` holds, or `None` when the graph carries
+    /// no such store or two that disagree.
+    ///
+    /// The scan has to be graph-wide: the stores feeding an aggregate sit in
+    /// whichever block built it, which is not the block that consumes it once
+    /// a call has ended one in between.  That width is also why agreement has
+    /// to be checked.  The pass has no reaching-definition analysis to ask
+    /// which store arrives at the consumer, so with two stores on the same
+    /// field it cannot tell which one the malloc sees — `let mut o = W_X { f:
+    /// a }; if c { o.f = b; }` writes `f` twice, and their order in the block
+    /// list carries no meaning.  Answering with the first would initialise the
+    /// allocation from an arbitrary arm; declining instead leaves
+    /// `malloc_typed` residual for the fail-closed reject, the same graceful
+    /// outcome an absent store takes.
+    ///
+    /// Refusing on ambiguity rather than picking is the rule
+    /// `rpython/translator/backendopt/malloc.py:176-186` applies to the same
+    /// question: a variable reaching a link with more than one creation point
+    /// (`len(info.creationpoints) > 1`) is downgraded to a plain use, which
+    /// disables the malloc optimisation for it — "aliasing problems".  Its
+    /// `_try_inline_malloc` states the precondition positively: the values
+    /// must be only ever created by one `malloc`.
+    fn unique_store<'g>(
+        graph: &'g FunctionGraph,
+        base: &Variable,
+        field_name: &str,
+    ) -> Option<(&'g FieldDescriptor, &'g LinkArg)> {
+        let mut found: Option<(&FieldDescriptor, &LinkArg)> = None;
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::FieldWrite {
+                base: b,
+                field,
+                value,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if b != base || field.name.as_str() != field_name {
+                continue;
+            }
+            match found {
+                None => found = Some((field, value)),
+                Some((_, seen)) if seen == value => {}
+                Some(_) => return None,
+            }
+        }
+        found
     }
     /// The op-result variables `var` can be, following the links when `var` is
     /// a `Block.inputargs` phi rather than an op result.
@@ -3244,22 +3282,14 @@ pub fn fuse_boxing_alloc(
             // Resolve every payload field's store: `FieldWrite { base: %agg,
             // field.name == payload }`.  A malformed cluster missing any payload
             // store is left untouched so the annotate wall still flags it rather
-            // than emitting a half-initialised allocation.
+            // than emitting a half-initialised allocation, and so is one whose
+            // field is written twice over — `unique_store` cannot say which
+            // write the malloc sees.
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
-                let found = graph
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.operations)
-                    .find_map(|o| match &o.kind {
-                        OpKind::FieldWrite {
-                            base, field, value, ..
-                        } if base == agg && field.name.as_str() == field_name.as_str() => {
-                            Some((field.clone(), value.clone()))
-                        }
-                        _ => None,
-                    });
+                let found = unique_store(graph, agg, field_name.as_str())
+                    .map(|(field, value)| (field.clone(), value.clone()));
                 match found {
                     Some((field, value)) => payloads.push(Payload {
                         field,
@@ -7668,6 +7698,231 @@ mod tests {
                         if base == root && field.name.as_str() == "ob_header")
                 }),
                 "the written aggregate must keep its ob_header store"
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_a_field_written_twice_over() {
+        // Resolving `%agg` and `%header` through their phis widened the pass
+        // to clusters built in a dominator, and a value that lives across a
+        // branch can be *rewritten* on one arm: `let mut o = W_X { f: a };
+        // if c { o.f = b; }` leaves two `FieldWrite`s naming the same base and
+        // field.  Both lookups scan the whole graph, so with no
+        // reaching-definition analysis neither can say which store the malloc
+        // sees; taking the first would initialise the allocation from an
+        // arbitrary arm.  Disagreeing stores must decline, on the payload and
+        // on the header alike.  Two stores that agree carry no ambiguity to
+        // resolve, so those still fuse -- that row is what separates
+        // "declines on a second store" from "declines on a *conflicting* one".
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        fn ctor(graph: &mut FunctionGraph, blk: BlockId, name: &str) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(name),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some(name.into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+
+        /// A `W_FloatObject` cluster built in the dominator, malloc'd behind a
+        /// branch, with `rewrite` free to add a second store on one arm.
+        fn cluster(
+            rewrite: &dyn Fn(&mut FunctionGraph, BlockId, &Var, &Var),
+        ) -> (FunctionGraph, BlockId) {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let cast = |graph: &mut FunctionGraph, addr: i64| {
+                let ty = graph
+                    .push_op_var(entry, OpKind::ConstRefAddr(addr), true)
+                    .unwrap();
+                call(graph, entry, &["__pyre_cast_instance", "PyType"], vec![ty])
+            };
+            let ob_type = cast(&mut graph, FLOAT_TYPE_ADDR);
+            let w_class_cast = cast(&mut graph, FLOAT_TYPE_ADDR);
+            let w_class = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "pyobject", "get_instantiate"],
+                vec![w_class_cast],
+            );
+            let header = ctor(&mut graph, entry, "PyObject");
+            graph.push_op_var(
+                entry,
+                field(&header, "ob_type", "PyObject", &ob_type),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&header, "w_class", "PyObject", &w_class),
+                false,
+            );
+            let payload = graph
+                .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+                .unwrap();
+            let agg = ctor(&mut graph, entry, "W_FloatObject");
+            graph.push_op_var(
+                entry,
+                field(&agg, "ob_header", "W_FloatObject", &header),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "floatval", "W_FloatObject", &payload),
+                false,
+            );
+
+            // The branch the rewrite sits on.  Both arms carry the aggregate
+            // to the join, so the malloc sees a phi over one ctor -- the shape
+            // `store_roots` resolves.
+            let cond = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "gc_interp", "enabled"],
+                vec![],
+            );
+            let (arm, arm_args) = graph.create_block_with_arg_vars(1);
+            let (skip, skip_args) = graph.create_block_with_arg_vars(1);
+            graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond.clone()));
+            graph.closeblock(
+                entry,
+                vec![
+                    Link::from_variables(
+                        &graph,
+                        vec![agg.clone()],
+                        arm,
+                        Some(ExitCase::Bool(true)),
+                    ),
+                    Link::from_variables(
+                        &graph,
+                        vec![agg.clone()],
+                        skip,
+                        Some(ExitCase::Bool(false)),
+                    ),
+                ],
+            );
+            rewrite(&mut graph, arm, &agg, &header);
+
+            let (join, join_args) = graph.create_block_with_arg_vars(1);
+            graph.set_goto(arm, join, vec![arm_args[0].clone()]);
+            graph.set_goto(skip, join, vec![skip_args[0].clone()]);
+            let ret = call(
+                &mut graph,
+                join,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![join_args[0].clone()],
+            );
+            graph.set_return(join, Some(ret));
+            (graph, join)
+        }
+
+        let untouched = |_: &mut FunctionGraph, _: BlockId, _: &Var, _: &Var| {};
+        let payload_again = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            let other = graph
+                .push_op_var(blk, OpKind::ConstFloat(1.0f64.to_bits()), true)
+                .unwrap();
+            graph.push_op_var(blk, field(agg, "floatval", "W_FloatObject", &other), false);
+        };
+        let payload_same = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            // The very value the dominator already stored.  `LinkArg` equality
+            // makes this store redundant rather than ambiguous.
+            let same = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|o| match &o.kind {
+                    OpKind::FieldWrite {
+                        base, field, value, ..
+                    } if base == agg && field.name.as_str() == "floatval" => {
+                        value.as_variable().cloned()
+                    }
+                    _ => None,
+                })
+                .expect("the dominator stores floatval");
+            graph.push_op_var(blk, field(agg, "floatval", "W_FloatObject", &same), false);
+        };
+        let header_again = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
+            let other_header = ctor(graph, blk, "PyObject");
+            graph.push_op_var(
+                blk,
+                field(agg, "ob_header", "W_FloatObject", &other_header),
+                false,
+            );
+        };
+        let obtype_again = |graph: &mut FunctionGraph, blk: BlockId, _: &Var, header: &Var| {
+            let other = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(OTHER_TYPE_ADDR), true)
+                .unwrap();
+            let cast = call(graph, blk, &["__pyre_cast_instance", "PyType"], vec![other]);
+            graph.push_op_var(blk, field(header, "ob_type", "PyObject", &cast), false);
+        };
+
+        let rows: [(
+            &str,
+            &dyn Fn(&mut FunctionGraph, BlockId, &Var, &Var),
+            usize,
+        ); 5] = [
+            ("no second store", &untouched, 1),
+            ("floatval rewritten on one arm", &payload_again, 0),
+            ("floatval restored to the same value", &payload_same, 1),
+            ("ob_header rewritten on one arm", &header_again, 0),
+            ("ob_type rewritten on one arm", &obtype_again, 0),
+        ];
+        for (row, rewrite, expected) in rows {
+            let (mut graph, join) = cluster(rewrite);
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+                expected,
+                "{row}: wrong number of fused clusters"
+            );
+            let residual = graph.block(join).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{row}: malloc_typed residual must survive exactly when the cluster declines"
             );
         }
     }
