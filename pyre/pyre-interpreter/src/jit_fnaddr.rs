@@ -478,6 +478,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "w_list_new_empty",
         w_list_new_empty as *const (),
     );
+    let w_none: fn() -> pyre_object::PyObjectRef = pyre_object::noneobject::w_none;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::noneobject::w_none",
+        "pyre_object::w_none",
+        w_none as *const (),
+    );
     let w_list_new_object: fn(Vec<pyre_object::PyObjectRef>) -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_object;
     push_alias_pair(
