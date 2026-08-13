@@ -166,6 +166,108 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
 #[test]
 #[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
+fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
+    let root = workspace_root();
+    let dynasm = root.join("target/release/pyre-dynasm");
+    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
+    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
+    let wasm_module = if host_module.exists() {
+        host_module
+    } else {
+        plain_module
+    };
+    let script = root.join("pyre/bench/fib_recursive.py");
+
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime recursive-CA regression needs {}; build the requested artifacts first",
+            artifact.display()
+        );
+    }
+    let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+    assert!(dynasm_run.status.success(), "dynasm recursive fib failed");
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    let wasm_run = run_runtime_program(
+        &wasm_runner,
+        &script,
+        &[
+            ("PYRE_WASM_MODULE", module),
+            ("PYRE_WASM_ENGINE", "wasmtime"),
+            ("PYRE_WASM_JIT_STATS", "1"),
+            ("PYRE_WASM_DUMP_ALL_TRACES", "1"),
+            ("PYRE_WASM_NO_CACHE", "1"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+    assert!(
+        wasm_run.status.success(),
+        "wasm recursive fib failed:\n{stderr}"
+    );
+    assert_eq!(
+        wasm_run.stdout, dynasm_run.stdout,
+        "wasm recursive fib output diverged from dynasm:\n{stderr}"
+    );
+    assert_eq!(stat_value(&stderr, "compiles"), 4);
+    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 3);
+    assert!(
+        !stderr.contains("memory.fill"),
+        "recursive CA still refills a nursery that is already zeroed:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
+fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
+    let root = workspace_root();
+    let dynasm = root.join("target/release/pyre-dynasm");
+    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
+    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
+    let wasm_module = if host_module.exists() {
+        host_module
+    } else {
+        plain_module
+    };
+    let script = root.join("pyre/bench/fannkuch.py");
+    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
+        assert!(
+            artifact.exists(),
+            "runtime fannkuch regression needs {}; build the requested artifacts first",
+            artifact.display()
+        );
+    }
+
+    let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
+    assert!(dynasm_run.status.success(), "dynasm fannkuch failed");
+    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
+    let wasm_run = run_runtime_program(
+        &wasm_runner,
+        &script,
+        &[
+            ("PYRE_WASM_MODULE", module),
+            ("PYRE_WASM_ENGINE", "wasmtime"),
+            ("PYRE_WASM_JIT_STATS", "1"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&wasm_run.stderr);
+    assert!(wasm_run.status.success(), "wasm fannkuch failed:\n{stderr}");
+    assert_eq!(
+        wasm_run.stdout, dynasm_run.stdout,
+        "wasm fannkuch output diverged from dynasm:\n{stderr}"
+    );
+    assert_eq!(stat_value(&stderr, "compiles"), 28);
+    assert!(
+        stat_value(&stderr, "jit_calls") < 100,
+        "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
+            run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
@@ -461,11 +563,243 @@ fn test_int_sub_ovf_guards_overflow() {
 
 #[test]
 fn test_int_mul_ovf_guards_overflow() {
-    for (a, b, expected) in [(6, 7, 42), (i64::MIN, 1, i64::MIN), (-9, -7, 63)] {
+    for (a, b, expected) in [
+        (6, 7, 42),
+        (-9, -7, 63),
+        (i32::MIN as i64, i32::MIN as i64, 1_i64 << 62),
+        (
+            i32::MAX as i64,
+            i32::MAX as i64,
+            (i32::MAX as i64) * (i32::MAX as i64),
+        ),
+        (i64::MIN, 1, i64::MIN),
+        (i32::MAX as i64 + 1, 2, 1_i64 << 32),
+    ] {
         assert_eq!(execute_ovf_trace(OpCode::IntMulOvf, a, b), (1, expected));
     }
-    for (a, b) in [(i64::MIN, -1), (i64::MAX, 2), (1_i64 << 62, 3)] {
+    for (a, b) in [
+        (i64::MIN, -1),
+        (i64::MAX, 2),
+        (1_i64 << 62, 3),
+        (i32::MAX as i64 + 1, 1_i64 << 32),
+    ] {
         assert_eq!(execute_ovf_trace(OpCode::IntMulOvf, a, b).0, 0);
+    }
+}
+
+#[test]
+fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let ops = vec![
+        make_op(
+            OpCode::IntMulOvf,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        guard,
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let mut extend32_s = 0;
+    let mut i64_mul = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I64Extend32S => extend32_s += 1,
+                    wasmparser::Operator::I64Mul => i64_mul += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(extend32_s, 2, "both factors need an exact signed-32 check");
+    assert!(
+        i64_mul > 1,
+        "the software full-width overflow fallback must remain in the module"
+    );
+}
+
+/// PyPy's native backends append guard recovery stubs after the hot trace.
+/// Keep fail-argument stores out of the successful guard arm in Wasm too: a
+/// selector branch should reach one cold `br_table` dispatcher, where the
+/// original int/ref/float-bit spills are performed.
+#[test]
+fn test_guard_recovery_is_out_of_line() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Float, 2),
+    ];
+    let fail_args = smallvec![
+        rb(OpRef::input_arg_int(0)),
+        rb(OpRef::input_arg_ref(1)),
+        rb(OpRef::input_arg_float(2)),
+    ];
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+    guard.setfailargs(fail_args.clone());
+    let finish = Op::new(OpCode::Finish, &fail_args);
+    finish.setfailargs(fail_args);
+    let (bytes, guards) =
+        build_module_default(&inputargs, &[guard, finish], &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2);
+
+    let mut control_is_if = Vec::new();
+    let mut stores_inside_if = 0;
+    let mut br_tables = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::If { .. } => control_is_if.push(true),
+                    wasmparser::Operator::Block { .. } | wasmparser::Operator::Loop { .. } => {
+                        control_is_if.push(false);
+                    }
+                    wasmparser::Operator::End => {
+                        control_is_if.pop();
+                    }
+                    wasmparser::Operator::I64Store { .. }
+                        if control_is_if.iter().any(|inside_if| *inside_if) =>
+                    {
+                        stores_inside_if += 1;
+                    }
+                    wasmparser::Operator::BrTable { .. } => br_tables += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(stores_inside_if, 0, "guard arms must not spill fail args");
+    assert_eq!(br_tables, 1, "all exits must share one cold dispatcher");
+}
+
+#[test]
+fn test_fused_integer_guard_true_uses_inverse_comparison_directly() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let compare = make_op(
+        OpCode::IntLt,
+        &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+        OpRef::int_op(2),
+    );
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(2)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
+    let (bytes, _) = build_module_default(
+        &inputargs,
+        &[compare, guard, finish],
+        &indexmap::IndexMap::new(),
+    );
+    validate_wasm(&bytes);
+
+    let mut ge_s = 0;
+    let mut i32_eqz = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::I64GeS => ge_s += 1,
+                    wasmparser::Operator::I32Eqz => i32_eqz += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(ge_s, 1, "IntLt guard failure should be emitted as IntGe");
+    assert_eq!(i32_eqz, 0, "integer inverse must not materialize i32.eqz");
+}
+
+#[test]
+fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
+    const FAIL_INDEX_BASE: u32 = 37;
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Float, 2),
+    ];
+    let fail_args = smallvec![
+        rb(OpRef::input_arg_ref(1)),
+        rb(OpRef::input_arg_float(2)),
+        rb(OpRef::input_arg_int(0)),
+    ];
+    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+    guard.setfailargs(fail_args.clone());
+    let finish = Op::new(OpCode::Finish, &fail_args);
+    finish.setfailargs(fail_args);
+    let ops = [guard, finish];
+    let (bytes, guards, _, _, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        codegen::AllocHelpers::default(),
+        0,
+        None,
+        0,
+        0,
+        FAIL_INDEX_BASE,
+        0,
+        0,
+        codegen::FrameGeometry::fixed(),
+        codegen::CaParams::default(),
+    )
+    .expect("wasm codegen should succeed");
+    assert_eq!(guards[0].fail_index, FAIL_INDEX_BASE);
+
+    let ref_bits = 0x1234_5678_i64;
+    let float_bits = (-13.25_f64).to_bits() as i64;
+    let mut store = Store::new(&Engine::default(), ());
+    let engine = store.engine().clone();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
+    for (slot, bits) in [0_i64, ref_bits, float_bits].into_iter().enumerate() {
+        memory
+            .write(
+                &mut store,
+                codegen::FRAME_SLOT_BASE as usize + slot * 8,
+                &bits.to_le_bytes(),
+            )
+            .unwrap();
+    }
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .unwrap();
+
+    let mut word = [0; 8];
+    memory.read(&store, 0, &mut word).unwrap();
+    assert_eq!(i64::from_le_bytes(word), FAIL_INDEX_BASE as i64);
+    for (slot, expected) in [ref_bits, float_bits, 0].into_iter().enumerate() {
+        memory
+            .read(
+                &store,
+                codegen::FRAME_SLOT_BASE as usize + slot * 8,
+                &mut word,
+            )
+            .unwrap();
+        assert_eq!(i64::from_le_bytes(word), expected);
     }
 }
 

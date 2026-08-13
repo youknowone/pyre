@@ -2050,17 +2050,6 @@ fn build_function(
     // Def / last-use positions for the post-collection Ref reload filter.
     let liveness = HomeLiveness::collect(inputargs, ops);
 
-    // A Label-less trace with bridge dispatch — a `PYRE_WASM_CA` recursion
-    // loop, or (chaining on) a bridge whose own guards chain nested
-    // sub-bridges: there is no `loop`, but its guard/Finish exits still need
-    // to `br` to the function epilogue so the epilogue's cell dispatch can
-    // chain a failing guard in-module (instead of each guard early-returning
-    // to the host). Wrap the body in one exit `block` and route exits through
-    // it, exactly as a loop does. A loop-closing bridge's terminal external
-    // JUMP is unaffected — `return_call_indirect` leaves the function from
-    // inside the block.
-    let straightline_dispatch = !has_loop && bridge_dispatch;
-
     // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
     // loop-closing bridge can re-enter AT any LABEL — key = label ordinal + 1
     // — skipping the code before it, in-module instead of round-tripping
@@ -2085,15 +2074,20 @@ fn build_function(
         .take(num_labels)
         .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
         .collect();
+
+    // x86/assembler.py:835-846 `write_pending_failure_recoveries` places the
+    // guard recovery stubs after the hot trace. Wasm uses one universal hot
+    // exit block and records only an exit ordinal at each guard site; the
+    // fail-argument spills are emitted in the cold dispatcher below. This is
+    // also the shape used by the dynasm sibling's pending guard tokens.
+    sink.block(BlockType::Empty); // A $hot_exit
     if key_dispatch {
-        // block $exit (A) — guard/Finish exits br here -> epilogue.
         // Per resumable label j (opened outermost = the loop header):
         //   block $past_loader_j (B_j) — the fall-through path br's over the
         //     label-j resume loader.
         //   block $loader_j (C_j) — the `br_table` lands here (its end) for
         //     key j+1: the label-j resume loader.
         // block $dispatch (D) — key 0 br's here: run from the entry.
-        sink.block(BlockType::Empty); // A $exit
         for _ in 0..num_labels {
             sink.block(BlockType::Empty); // B_j (j descending)
             sink.block(BlockType::Empty); // C_j
@@ -2155,14 +2149,6 @@ fn build_function(
             sink.local_get(local_idx);
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
         }
-    }
-
-    // Non-key_dispatch loop: the single exit block A (preamble + body share it).
-    // key_dispatch already opened A/B/C above. A Label-less dispatch trace (CA
-    // loop, or a bridge chaining nested sub-bridges) also opens A so its
-    // guard/Finish exits `br` out to the epilogue.
-    if (has_loop || straightline_dispatch) && !key_dispatch {
-        sink.block(BlockType::Empty);
     }
 
     // Seed with the fail-index base so each guard/finish exit writes
@@ -2247,18 +2233,18 @@ fn build_function(
         // a segment that still has `num_labels - labels_passed` labels ahead
         // sits inside that many (B_j, C_j) pairs, so it br's to depth
         // `2 * remaining`; the body is unchanged at 1 (every pair closes
-        // before the loop). `None` for straight-line traces (no block
-        // emitted).
+        // before the loop). Straight-line traces use the universal hot exit
+        // block at depth 0.
         let block_exit_depth = match (has_loop, in_loop_body) {
-            // Label-less dispatch trace: one exit block A (depth 0), no `loop`.
-            (false, _) if straightline_dispatch => Some(0u32),
-            (false, _) => None,
-            (true, false) => Some(if key_dispatch {
-                2 * (num_labels - labels_passed) as u32
-            } else {
-                0u32
-            }),
-            (true, true) => Some(1u32),
+            (false, _) => 0u32,
+            (true, false) => {
+                if key_dispatch {
+                    2 * (num_labels - labels_passed) as u32
+                } else {
+                    0u32
+                }
+            }
+            (true, true) => 1u32,
         };
         // The guard whose condition the previous op already pushed and tested.
         // `block_exit_depth` is unchanged across the pair: only a LABEL moves
@@ -2277,14 +2263,14 @@ fn build_function(
                 ref_homes,
             ) {
                 Some(guard) => {
-                    push_cond(&mut sink, constants, value_types, op, kind);
-                    // GUARD_TRUE exits when the condition is false. `i32.eqz`
-                    // rather than the inverted comparison: `!(a < b)` is
-                    // `a >= b` for integers but not for floats, where an
-                    // unordered operand makes both forms false.
-                    if guard.opcode == OpCode::GuardTrue {
-                        sink.i32_eqz();
-                    }
+                    push_guard_failure_cond(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        op,
+                        kind,
+                        guard.opcode,
+                    );
                     emit_guard_if_exit(
                         &mut sink,
                         constants,
@@ -2419,10 +2405,9 @@ fn build_function(
             }
 
             OpCode::Finish => {
-                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
-                if let Some(d) = block_exit_depth {
-                    sink.br(d);
-                }
+                sink.i32_const(guard_idx as i32);
+                sink.local_set(bridge_slot_local);
+                sink.br(block_exit_depth);
                 guard_idx += 1;
             }
 
@@ -3438,10 +3423,9 @@ fn build_function(
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
                 // GuardAlwaysFails always exits.
-                emit_guard_exit(&mut sink, constants, value_types, guard_idx, op);
-                if let Some(d) = block_exit_depth {
-                    sink.br(d);
-                }
+                sink.i32_const(guard_idx as i32);
+                sink.local_set(bridge_slot_local);
+                sink.br(block_exit_depth);
                 guard_idx += 1;
             }
 
@@ -3604,10 +3588,13 @@ fn build_function(
                         & !7;
                 if let (Some(base), Some(inline)) = (residual_type_base, ca.inline) {
                     // rewrite.py's nursery fast path plus assembler.py's inline
-                    // shadow-stack header. The `memory.fill` is deliberate:
-                    // home slots are read as roots before every definition, and
-                    // guard/deopt fail slots may be read by the host. Do not rely
-                    // on nursery reset's pre-existing memset for either class.
+                    // shadow-stack header. The wasm nursery is allocated
+                    // zeroed and its target-specific reset zeroes the complete
+                    // arena before reuse (`Nursery::reset`); the slow born-old
+                    // path also clears its payload. Do not repeat a full-frame
+                    // `memory.fill` on every CALL_ASSEMBLER. The callee prologue
+                    // still explicitly clears its Ref homes, and the fixed
+                    // JitFrame metadata fields are initialized below.
                     sink.i32_const(inline.nursery_free_addr as i32);
                     sink.i32_load(mem32(0));
                     sink.local_tee(alloc_scratch_local);
@@ -3642,14 +3629,8 @@ fn build_function(
                     sink.local_get(alloc_scratch_local);
                     sink.i64_const(inline.jitframe_tid as i64);
                     sink.i64_store(mem64(0));
-                    // Explicitly initialise the complete JitFrame payload and
-                    // item area, then replicate JitFrame::init + jf_gcmap.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i32_const(0);
-                    sink.i32_const(ca_payload_size as i32);
-                    sink.memory_fill(0);
+                    // Replicate JitFrame::init + jf_gcmap on the already-zero
+                    // payload. Every nonzero metadata field is written below.
                     for offset in [
                         majit_backend::jitframe::JF_FRAME_INFO_OFS,
                         majit_backend::jitframe::JF_DESCR_OFS,
@@ -4780,9 +4761,46 @@ fn build_function(
 
     if has_loop {
         sink.end(); // end loop
-        sink.end(); // end block
-    } else if straightline_dispatch {
-        sink.end(); // end exit block A (Label-less dispatch trace, no `loop`)
+    }
+    // A well-formed trace exits through a guard or Finish. Preserve the old
+    // malformed/natural-fallthrough behavior without letting it enter the cold
+    // dispatcher with an uninitialized selector.
+    sink.local_get(0);
+    sink.return_();
+    sink.end(); // end A $hot_exit
+
+    // Structured-Wasm equivalent of the native backends' out-of-line guard
+    // recovery stubs. Locals retain their fail-site SSA values across the
+    // branch, so each handler can perform the original positional spills here
+    // without adding hot-path frame traffic or GC roots.
+    let cold_exits: Vec<&Op> = ops
+        .iter()
+        .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish)
+        .collect();
+    if !cold_exits.is_empty() {
+        let exit_count = cold_exits.len() as u32;
+        sink.block(BlockType::Empty); // $cold_done
+        for _ in cold_exits.iter().rev() {
+            sink.block(BlockType::Empty);
+        }
+        sink.local_get(bridge_slot_local);
+        if fail_index_base != 0 {
+            sink.i32_const(fail_index_base as i32);
+            sink.i32_sub();
+        }
+        sink.br_table((0..exit_count).collect::<Vec<_>>(), exit_count);
+        for (ordinal, op) in cold_exits.into_iter().enumerate() {
+            sink.end();
+            emit_guard_exit(
+                &mut sink,
+                constants,
+                value_types,
+                fail_index_base + ordinal as u32,
+                op,
+            );
+            sink.br(exit_count - ordinal as u32 - 1);
+        }
+        sink.end(); // end $cold_done
     }
 
     // Epilogue bridge dispatch. Control reaches here only
@@ -5182,7 +5200,7 @@ fn emit_guard_true(
     value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
-    block_exit_depth: Option<u32>,
+    block_exit_depth: u32,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_eqz();
@@ -5202,7 +5220,7 @@ fn emit_guard_false(
     value_types: &[ValType],
     guard_idx: u32,
     op: &Op,
-    block_exit_depth: Option<u32>,
+    block_exit_depth: u32,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(0);
@@ -5277,36 +5295,29 @@ fn next_op_can_accept_cc<'a>(
     Some(next_op)
 }
 
-/// Common guard exit: condition is on stack (i32), emit if + exit.
+/// Common guard exit: condition is on stack (i32), emit a tiny hot failure arm.
 ///
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
 /// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
-/// this opens. `None` for straight-line traces with no exit block.
+/// this opens. The actual fail-argument recovery is emitted out of line by
+/// `build_function`, matching x86's `write_pending_failure_recoveries`.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
-    constants: &indexmap::IndexMap<u32, i64>,
+    _constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
     guard_idx: u32,
-    op: &Op,
-    block_exit_depth: Option<u32>,
+    _op: &Op,
+    block_exit_depth: u32,
 ) {
     sink.if_(BlockType::Empty);
-    emit_guard_exit(sink, constants, value_types, guard_idx, op);
-    match block_exit_depth {
-        // Loop traces: `br` out of this `if` and the enclosing exit `block`
-        // (the `+ 1` accounts for the `if`) to the function epilogue.
-        Some(d) => {
-            sink.br(d + 1);
-        }
-        // Straight-line traces have no enclosing block, so fall-through would
-        // reach the terminal Finish and overwrite frame[0] with its
-        // fail_index, discarding this guard's exit. Return the frame pointer
-        // directly (the epilogue's value) to hand control to the metainterp.
-        None => {
-            sink.local_get(0);
-            sink.return_();
-        }
-    }
+    // The bridge-slot scratch is the first i32 local after the value locals,
+    // the UintMulHigh scratch locals, and the overflow flag. It is dead until
+    // the bridge epilogue overwrites it with `local.tee`, so it doubles as the
+    // cold-exit selector without growing the local or GC-root set.
+    let exit_selector_local = value_types.len() as u32 + UMULHI_SCRATCH + 2;
+    sink.i32_const(guard_idx as i32);
+    sink.local_set(exit_selector_local);
+    sink.br(block_exit_depth + 1);
     sink.end();
 }
 
@@ -5513,8 +5524,18 @@ fn emit_ovf_binop(
     }
     let result_local = 1 + vi;
 
-    emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
-    emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    if matches!(binop, BinOp::I64Mul) {
+        // Keep both factors in the umulhi scratch bank. The hot signed-32
+        // overflow check below reuses them without resolving the SSA operands
+        // again; the slow 64-bit path is free to overwrite the same bank.
+        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+        sink.local_tee(num_vars + 1);
+        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+        sink.local_tee(num_vars + 2);
+    } else {
+        emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
+        emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
+    }
     apply_binop(sink, binop);
     sink.local_set(result_local);
 
@@ -5546,6 +5567,26 @@ fn emit_ovf_binop(
             sink.local_set(ovf_flag_local);
         }
         BinOp::I64Mul => {
+            // Multiplying two signed-32-bit integers cannot overflow i64: the
+            // largest magnitude is 2^62. This is the common Python-loop shape
+            // (e.g. nested_loop's 0..19999 counters), and avoids expanding
+            // every multiplication into a software 64x64->128 product. The
+            // exact sign-extension checks preserve the full-width slow path
+            // for every value outside that proven-safe domain.
+            sink.local_get(num_vars + 1);
+            sink.i64_extend32_s();
+            sink.local_get(num_vars + 1);
+            sink.i64_eq();
+            sink.local_get(num_vars + 2);
+            sink.i64_extend32_s();
+            sink.local_get(num_vars + 2);
+            sink.i64_eq();
+            sink.i32_and();
+            sink.if_(BlockType::Empty);
+            sink.i64_const(0);
+            sink.local_set(ovf_flag_local);
+            sink.else_();
+
             // Convert the unsigned high word to the signed high word:
             // smulhi = umulhi - ((a >>s 63) & b) - ((b >>s 63) & a).
             let high_local = num_vars + 1;
@@ -5569,6 +5610,7 @@ fn emit_ovf_binop(
             sink.i64_ne();
             sink.i64_extend_i32_u();
             sink.local_set(ovf_flag_local);
+            sink.end();
         }
         _ => unreachable!("overflow emitter requires add, sub, or mul"),
     }
@@ -5727,6 +5769,49 @@ fn push_cond(
             emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.i64_eqz();
         }
+    }
+}
+
+/// Push whether a fused GuardTrue/GuardFalse fails. Native backends invert the
+/// integer condition code in place (`x86/assembler.py:1778-1784`); spelling the
+/// inverse Wasm comparison directly avoids materialising `cmp; i32.eqz` at the
+/// hot guard site. Float ordered comparisons deliberately keep `i32.eqz`:
+/// their apparent inverse is not equivalent for NaN/unordered operands.
+fn push_guard_failure_cond(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &[ValType],
+    op: &Op,
+    kind: CondKind,
+    guard_opcode: OpCode,
+) {
+    if guard_opcode == OpCode::GuardFalse {
+        push_cond(sink, constants, value_types, op, kind);
+        return;
+    }
+    debug_assert_eq!(guard_opcode, OpCode::GuardTrue);
+    let inverse = match kind {
+        CondKind::Int(cmp) => Some(CondKind::Int(match cmp {
+            CmpOp::I64LtS => CmpOp::I64GeS,
+            CmpOp::I64LeS => CmpOp::I64GtS,
+            CmpOp::I64Eq => CmpOp::I64Ne,
+            CmpOp::I64Ne => CmpOp::I64Eq,
+            CmpOp::I64GtS => CmpOp::I64LeS,
+            CmpOp::I64GeS => CmpOp::I64LtS,
+            CmpOp::I64LtU => CmpOp::I64GeU,
+            CmpOp::I64LeU => CmpOp::I64GtU,
+            CmpOp::I64GtU => CmpOp::I64LeU,
+            CmpOp::I64GeU => CmpOp::I64LtU,
+        })),
+        CondKind::IsTrue => Some(CondKind::IsZero),
+        CondKind::IsZero => Some(CondKind::IsTrue),
+        CondKind::Float(_) => None,
+    };
+    if let Some(inverse) = inverse {
+        push_cond(sink, constants, value_types, op, inverse);
+    } else {
+        push_cond(sink, constants, value_types, op, kind);
+        sink.i32_eqz();
     }
 }
 

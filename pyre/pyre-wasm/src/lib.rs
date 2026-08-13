@@ -162,12 +162,56 @@ mod residual_host {
     unsafe impl Sync for Scratch {}
     static SCRATCH: Scratch = Scratch(UnsafeCell::new([0u8; SCRATCH_LEN]));
 
+    /// Direct-call the small family of blackhole helpers whose real wasm ABI
+    /// is exactly the uniform `i64` signature carried by the residual call.
+    ///
+    /// The generic path below must reflect the callee's wasm type in the host:
+    /// an `r` argument may be a real `i32` pointer, a void descriptor may name
+    /// a word-returning target, and guessing either signature traps at a wasm
+    /// `call_indirect`.  These five targets are different: their declarations
+    /// are explicit `extern "C" fn(i64, ...) -> i64` wrappers, and the CPU
+    /// function table stores those exact function addresses.  Comparing the
+    /// table index (`fn as usize` on wasm32) therefore proves both the callee
+    /// identity and its ABI.  Calling the named wrapper directly matches the
+    /// native blackhole dispatch while avoiding a guest -> host -> guest
+    /// reflection round-trip.
+    ///
+    /// Keep this as an exact-function allow-list, not a signature inference.
+    /// A mismatched arity deliberately falls through to the reflective path.
+    fn direct_uniform_i64_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+        match args {
+            [value] if func_ptr == pyre_jit::call_jit::bh_box_int_fn as usize => {
+                Some(pyre_jit::call_jit::bh_box_int_fn(*value))
+            }
+            [value] if func_ptr == pyre_jit::call_jit::bh_truth_fn as usize => {
+                Some(pyre_jit::call_jit::bh_truth_fn(*value))
+            }
+            [lhs, rhs, op_code] if func_ptr == pyre_jit::call_jit::bh_binary_op_fn as usize => {
+                Some(pyre_jit::call_jit::bh_binary_op_fn(*lhs, *rhs, *op_code))
+            }
+            [lhs, rhs, op_code] if func_ptr == pyre_jit::call_jit::bh_compare_fn as usize => {
+                Some(pyre_jit::call_jit::bh_compare_fn(*lhs, *rhs, *op_code))
+            }
+            [obj, key, value]
+                if func_ptr == pyre_interpreter::opcode_ops::bh_store_subscr_fn as usize =>
+            {
+                Some(pyre_interpreter::opcode_ops::bh_store_subscr_fn(
+                    *obj, *key, *value,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn residual_host_call(func_ptr: usize, args: &[i64]) -> i64 {
         assert!(
             args.len() <= MAX_ARGS,
             "residual_host_call: arity {} exceeds {MAX_ARGS}",
             args.len()
         );
+        if let Some(result) = direct_uniform_i64_call(func_ptr, args) {
+            return result;
+        }
         let base = SCRATCH.0.get() as *mut u8;
         unsafe {
             (base.add(CALL_FUNC_OFS) as *mut i64).write_unaligned(func_ptr as i64);
