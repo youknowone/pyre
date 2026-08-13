@@ -4007,17 +4007,25 @@ fn run_perfn_walk<Sym: WalkSym>(
         // pyjitpl` (`blackhole.py:1799`) finishes the frames instead, which is
         // what the latch staged.
         //
-        // Three classes keep their own, more precise recovery and are excluded
+        // Four classes keep their own, more precise recovery and are excluded
         // so this general leg cannot pre-empt them:
         // `VableEscapedDuringResidualCall` latches a narrower resume-marker
         // image and has an escape-pc fallback (arm below);
-        // `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
-        // and `AbortPermanentMarkerReached` are not in
-        // `leaves_complete_image`: they route to the gh#467 CALL-forward
+        // `LoopBearingCalleeInlineUnsupported` and
+        // `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
         // carrier, which resumes the OUTER frame at its CALL rather than
-        // inside the discarded callee attempt.  The exact nested-residual
-        // variant marked `blackhole_required: true` instead owns a complete
-        // per-frame image and deliberately reaches this PyPy-style handoff;
+        // inside the discarded callee attempt.  The nested-residual variant
+        // marked `blackhole_required: true` owns a complete per-frame image
+        // and so passes `leaves_complete_image`, but the handoff finishes the
+        // callee inside the blackhole, which has no counterpart to
+        // `PyFrame.finish_value`'s `frame_finished_execution` store — the
+        // walker emits that store itself (`finish_current_frame_execution`)
+        // and the interpreter performs it on RETURN_VALUE, while the
+        // blackhole does neither.  A frame that outlives the call then reads
+        // back as still executing, which `parity_tests/`
+        // `jit_inline_traceback_frame_clear.py` catches on
+        // `sys._getframe().clear()` once the loop compiles.  Restore the
+        // carrier for it until the blackhole can publish that transition;
         // `ForceQuasiImmutable` resumes AT the forcing opcode via
         // `flush_qmut_abort_state` (arm below), which re-runs the write the
         // walk stopped in front of instead of finishing the frame past it.
@@ -4042,6 +4050,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 error,
                 crate::jitcode_dispatch::DispatchError::TraceTooLong { .. }
                     | crate::jitcode_dispatch::DispatchError::VableEscapedDuringResidualCall { .. }
+                    | crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported { .. }
                     | crate::jitcode_dispatch::DispatchError::ForceQuasiImmutable { .. }
             ))
             && walk_abort_leg_enabled()
