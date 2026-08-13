@@ -1022,17 +1022,12 @@ impl UnionBuilder {
         Ok(())
     }
 
-    fn finish(self, parameters: PyObjectRef) -> crate::PyResult {
-        let members: Vec<_> = self
-            .member_slots
-            .iter()
-            .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
-            .collect();
-        match members.as_slice() {
+    fn finish(self, parameters_slot: usize) -> crate::PyResult {
+        match self.member_slots.as_slice() {
             [] => Err(crate::PyError::type_error(
                 "Cannot take a Union of no types.",
             )),
-            [member] => Ok(*member),
+            [slot] => Ok(pyre_object::gc_roots::shadow_stack_get(*slot)),
             _ => {
                 let hashable_args = pyre_object::w_frozenset_new();
                 unsafe {
@@ -1051,11 +1046,21 @@ impl UnionBuilder {
                             .collect(),
                     )
                 };
+                // Read the members and the parameters tuple out of the shadow
+                // stack only here: the frozenset copy and the tuple above are
+                // collection points, and a `Vec` or a by-value argument built
+                // before them holds addresses the walk cannot forward.  The
+                // frozenset itself is allocated old-gen and does not move.
+                let members: Vec<_> = self
+                    .member_slots
+                    .iter()
+                    .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+                    .collect();
                 Ok(pyre_object::w_union_from_parts(
                     members,
                     hashable_args,
                     unhashable_args,
-                    parameters,
+                    pyre_object::gc_roots::shadow_stack_get(parameters_slot),
                 ))
             }
         }
@@ -1074,7 +1079,7 @@ fn build_union(items: &[PyObjectRef], parameters: PyObjectRef) -> crate::PyResul
     for i in 0..items.len() {
         builder.add(pyre_object::gc_roots::shadow_stack_get(item_base + i))?;
     }
-    builder.finish(pyre_object::gc_roots::shadow_stack_get(parameters_slot))
+    builder.finish(parameters_slot)
 }
 
 /// CPython 3.14 `unions_equal`: compare the construction-time hashable

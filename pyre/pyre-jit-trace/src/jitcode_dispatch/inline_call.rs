@@ -5402,10 +5402,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             (norm, live_norm)
         } else {
             let Some(concrete_result) = concrete_result else {
-                return Err(DispatchError::LoopBearingCalleeInlineUnsupported {
-                    pc: op.pc,
-                    blackhole_required: false,
-                });
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             };
             let raw = crate::helpers::emit_trace_call_int_typed(
                 ctx.trace_ctx,
