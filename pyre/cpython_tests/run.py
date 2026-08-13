@@ -208,6 +208,29 @@ def last_stderr_line(err: str) -> str:
     return ""
 
 
+def traceback_verdict(lines: list[str], header: int) -> str:
+    """The exception line closing the traceback unittest printed at `header`.
+
+    A block runs from the `FAIL:`/`ERROR:` header to the `====` rule opening
+    the next one (or unittest's closing `Ran N tests`). Every frame inside a
+    traceback is indented, so the first unindented line after the `Traceback`
+    banner is the statement it ended on. An assertion failure continues with a
+    multi-line diff below that line; only the line itself is taken.
+    """
+    for line in lines[header + 1:]:
+        stripped = line.strip()
+        if stripped.startswith("====") or stripped.startswith("Ran "):
+            break
+        # Continuation lines of a traceback are indented, its separator rules
+        # are punctuation, and blank lines end nothing.
+        if not stripped or line[:1].isspace() or set(stripped) <= {"-", "="}:
+            continue
+        if stripped.startswith(("Traceback (", "File ")):
+            continue
+        return stripped[:160]
+    return "(no traceback)"
+
+
 def failure_digest(out: str, err: str) -> str:
     """Which cases unittest reported against, and its closing verdict.
 
@@ -220,14 +243,21 @@ def failure_digest(out: str, err: str) -> str:
     unittest writes `FAIL: <case>` / `ERROR: <case>` headers and one closing
     `FAILED (...)`; those are the runner's own account of what went wrong, and
     they are what a CI log needs to carry.
+
+    The header names the case but not the cause, and a case that only fails on
+    the CI host cannot be re-run locally to find out — so each header carries
+    the closing line of its traceback (the exception type and message), which
+    is the one line that says what actually went wrong.
     """
     lines = f"{out}\n{err}".splitlines()
     cases: list[str] = []
     verdict = ""
-    for line in lines:
+    for idx, line in enumerate(lines):
         line = line.strip()
-        if line.startswith(("FAIL: ", "ERROR: ")) and line not in cases:
-            cases.append(line)
+        if line.startswith(("FAIL: ", "ERROR: ")):
+            entry = f"{line} -> {traceback_verdict(lines, idx)}"
+            if entry not in cases:
+                cases.append(entry)
         elif line.startswith("FAILED ("):
             verdict = line
     shown = cases[:4]
@@ -282,7 +312,9 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     if ran:
         # An IMPORTERROR never reached unittest, so its tail is all there is;
         # a FAIL has unittest's own account, and only that names a test.
-        return "FAIL", f"rc={rc} {failure_digest(out, err) or last}"[:300]
+        # Wide enough for four cases that each now carry their exception line;
+        # at 300 the digest was cut off inside the first case's name.
+        return "FAIL", f"rc={rc} {failure_digest(out, err) or last}"[:900]
     return "IMPORTERROR", f"rc={rc} {last}"[:120]
 
 
