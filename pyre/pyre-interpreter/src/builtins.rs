@@ -4596,6 +4596,7 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// iterator-adapter graph: a `take_while` closure inlined per wrapper gives
 /// every `__pyre_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
+#[majit_macros::unroll_safe]
 pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
     let mut count = 0;
     while count < args.len() && !args[count].is_null() {
