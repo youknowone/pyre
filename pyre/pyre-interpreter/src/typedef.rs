@@ -2833,7 +2833,9 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         )));
     }
     let w_doc = w_doc.unwrap_or_else(pyre_object::w_none);
-    let name = unsafe { pyre_object::w_str_get_value(w_name) };
+    // `w_str_get_wtf8` rather than `w_str_get_value`: `module('\udcff')` is
+    // reachable from an import whose filename was surrogateescape-decoded.
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     unsafe { pyre_object::w_module_set_name(self_, name) };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
     unsafe {

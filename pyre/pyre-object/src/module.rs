@@ -5,6 +5,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 /// Python module object.
 ///
@@ -20,8 +21,10 @@ use crate::pyobject::*;
 #[repr(C)]
 pub struct Module {
     pub ob_header: PyObject,
-    /// Heap-allocated module name string.
-    pub name: *mut String,
+    /// Heap-allocated module name.  WTF-8 rather than a Rust `String`: a name
+    /// reaches here straight from `module.__init__`, and surrogateescape
+    /// decoding of an undecodable filename puts a lone surrogate in it.
+    pub name: *mut Wtf8Buf,
     /// Authoritative dict object (`PyPy module.w_dict`).  Always non-null
     /// after construction.
     pub w_dict: PyObjectRef,
@@ -81,7 +84,7 @@ fn module_value(name: &str) -> Module {
     // `w_module_dict_new`; `pypy/objspace/std/celldict.py` strategy semantics
     // (`get_global_cache`, `invalidate_caches`,
     // `switch_to_object_strategy`) cover the module surface.
-    let name_box = crate::lltype::malloc_raw(name.to_string());
+    let name_box = crate::lltype::malloc_raw(Wtf8Buf::from_string(name.to_string()));
     let w_dict = crate::dictmultiobject::w_module_dict_new();
     if !name.is_empty() {
         unsafe {
@@ -175,7 +178,7 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
             );
         }
     }
-    let name = crate::lltype::malloc_raw(name.to_string());
+    let name = crate::lltype::malloc_raw(Wtf8Buf::from_string(name.to_string()));
     Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
@@ -190,7 +193,7 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
-pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
+pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static Wtf8 {
     let module = &*(obj as *const Module);
     &*module.name
 }
@@ -202,10 +205,10 @@ pub unsafe fn w_module_get_name(obj: PyObjectRef) -> &'static str {
 ///
 /// # Safety
 /// `obj` must point to a valid `Module`.
-pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &str) {
+pub unsafe fn w_module_set_name(obj: PyObjectRef, name: &Wtf8) {
     let module = &mut *(obj as *mut Module);
     let old = module.name;
-    module.name = crate::lltype::malloc_raw(name.to_string());
+    module.name = crate::lltype::malloc_raw(name.to_owned());
     if !old.is_null() {
         drop(Box::from_raw(old));
     }
@@ -270,7 +273,7 @@ mod tests {
         unsafe {
             assert!(is_module(obj));
             assert!(!is_int(obj));
-            assert_eq!(w_module_get_name(obj), "test_mod");
+            assert_eq!(w_module_get_name(obj), Wtf8::new("test_mod"));
         }
     }
 }

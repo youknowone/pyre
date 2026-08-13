@@ -1195,8 +1195,12 @@ fn release_frees_nothing(value: pyre_object::PyObjectRef) -> bool {
             // seeds it. An anonymous module proves nothing about reachability,
             // so it takes the collecting path rather than a `sys.modules[""]`
             // lookup that only an adversarial program could satisfy.
+            // A name carrying a lone surrogate cannot key the `&str` lookup, so
+            // it answers `false` and takes the collecting path.
             let name = pyre_object::w_module_get_name(value);
-            return !name.is_empty() && importing::get_sys_module(name).is_some_and(|m| m == value);
+            return name.as_str().is_ok_and(|name| {
+                !name.is_empty() && importing::get_sys_module(name).is_some_and(|m| m == value)
+            });
         }
     }
     false
