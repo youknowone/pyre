@@ -1,10 +1,6 @@
 {
   "host": "linux-aarch64",
   "modules": {
-    "test.test_ctypes": {
-      "dynasm": "FAIL",
-      "reason": "ctypes cannot hand a Python callback to C: a CFUNCTYPE instance carries no C-callable thunk, so ctypes.util.dllist's dl_iterate_phdr call fails. Also FAIL under PYRE_NO_JIT=1. test_dlerror wants dlsym returning NULL with a clear dlerror to raise"
-    },
     "test.test_dataclasses": {
       "dynasm": "FAIL",
       "reason": "JIT wrong code, not a platform difference: _process_class raises a spurious 'dictionary changed size during iteration' over cls.__dict__ although the only delattr completes before the loop. PYRE_NO_JIT=1 passes and darwin-arm64 passes, so it is neither the arch nor the OS alone"
