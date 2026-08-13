@@ -1832,7 +1832,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_heapsize;
+    use super::{parse_heapsize, set_last_exec_ctx, setup_exec_context};
 
     #[test]
     fn heapsize_suffixes_and_validation() {
@@ -1845,5 +1845,23 @@ mod tests {
         assert!(parse_heapsize("0").is_err());
         assert!(parse_heapsize("abc").is_err());
         assert!(parse_heapsize("").is_err());
+    }
+
+    #[test]
+    fn repeated_runtime_setup_reuses_space_signal_action() {
+        // pypy/module/signal/moduledef.py:64-66 owns this action on `space`,
+        // not on an ExecutionContext.  Embeddings may create more than one
+        // top-level EC in a process; each must cache the same action pointer
+        // without adding another process-lifetime Box/actionflag entry.
+        let first = setup_exec_context();
+        let first_action = first
+            .check_signal_action
+            .expect("runtime setup installs signal action");
+        let second = setup_exec_context();
+        let second_action = second
+            .check_signal_action
+            .expect("repeated runtime setup installs signal action");
+        assert!(std::ptr::addr_eq(first_action, second_action));
+        set_last_exec_ctx(std::ptr::null());
     }
 }

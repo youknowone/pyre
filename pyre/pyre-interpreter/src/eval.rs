@@ -1186,6 +1186,8 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
         crate::cpyext::walk_gc_roots(&mut forward);
     }
     crate::executioncontext::walk_space_user_del_action_roots(visitor);
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::module::signal::interp_signal::walk_check_signal_action_roots(visitor);
     crate::module::gc::hook::walk_hook_roots(visitor);
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

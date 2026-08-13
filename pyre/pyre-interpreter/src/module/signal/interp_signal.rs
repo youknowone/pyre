@@ -10,6 +10,7 @@ use crate::executioncontext::{
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// executioncontext.py:436-441 `space.getexecutioncontext().checksignals()`
 /// — deliver a signal that may have arrived during a syscall.  Resolves
@@ -440,35 +441,67 @@ impl AsyncActionOps for CheckSignalAction {
 
 impl PeriodicAsyncActionOps for CheckSignalAction {}
 
+// `moduledef.py:64-66` stores one `CheckSignalAction` on the object space.
+// Pyre's typed Rust object space is still process-owned, so keep the same
+// singleton shape here rather than leaking and registering a new action for
+// every top-level ExecutionContext created by an embedding.
+static CHECK_SIGNAL_ACTION: OnceLock<usize> = OnceLock::new();
+
+fn check_signal_action() -> *mut CheckSignalAction {
+    CHECK_SIGNAL_ACTION.get().copied().unwrap_or(0) as *mut CheckSignalAction
+}
+
+/// Trace the object-space-owned signal action's managed `space` slot.  PyPy's
+/// translated object graph reaches it through `space.check_signal_action`;
+/// pyre's process-owned Rust allocation needs that edge forwarded explicitly.
+pub(crate) fn walk_check_signal_action_roots(
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let action = check_signal_action();
+    if action.is_null() {
+        return;
+    }
+    let slot = unsafe { &mut (*action).base.base.space };
+    if !slot.is_null() {
+        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+    }
+}
+
 /// moduledef.py:62-66 + app_main.py:926 — install the signal-checking
-/// action on the execution context and route SIGINT to
-/// `default_int_handler` (so Ctrl-C raises `KeyboardInterrupt`).  Called
-/// once at interpreter startup.  Idempotent: a second call is a no-op.
+/// action on the process object space, cache its pointer on this execution
+/// context, and route SIGINT to `default_int_handler` (so Ctrl-C raises
+/// `KeyboardInterrupt`).  Repeated top-level runtime setup reuses the same
+/// action, matching `space.check_signal_action` rather than registering a
+/// duplicate periodic action.
 pub fn install_signal_handling(ec: &mut ExecutionContext) {
     if ec.check_signal_action.is_some() {
         return;
     }
-    // moduledef.py:64-66 — register the periodic signal-check action.
-    // The action outlives the call (the EC and actionflag hold pointers
-    // into it for the whole run), so it is leaked deliberately.
-    let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space));
-    let async_ptr: *mut dyn AsyncActionOps = &mut *action;
-    action.register_periodic_action(ec.actionflag.shared_mut(), false);
-    ec.check_signal_action = Some(async_ptr);
+    let action_addr = *CHECK_SIGNAL_ACTION.get_or_init(|| {
+        // moduledef.py:64-66 — construct and register the one signal action
+        // owned by the process object space.
+        let action: &'static mut CheckSignalAction =
+            Box::leak(CheckSignalAction::new(ec.space));
+        action.register_periodic_action(ec.actionflag.shared_mut(), false);
 
-    // Hand the ticker cell address to the OS handler so it can force the
-    // ticker negative (rsignal.py:31-32 `pypysig_getaddr_occurred`).
-    let ticker_addr = ec.actionflag.ticker_addr();
-    signalstate::register_ticker(ticker_addr);
+        // Hand the ticker cell address to the OS handler so it can force the
+        // ticker negative (rsignal.py:31-32 `pypysig_getaddr_occurred`).
+        let ticker_addr = ec.actionflag.ticker_addr();
+        signalstate::register_ticker(ticker_addr);
 
-    // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
-    #[cfg(unix)]
-    {
-        let sigint = libc::SIGINT;
-        if signalstate::pypysig_setflag(sigint) {
-            set_handler(sigint, default_int_handler_obj());
+        // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
+        #[cfg(unix)]
+        {
+            let sigint = libc::SIGINT;
+            if signalstate::pypysig_setflag(sigint) {
+                set_handler(sigint, default_int_handler_obj());
+            }
         }
-    }
+        action as *mut CheckSignalAction as usize
+    });
+    let action = action_addr as *mut CheckSignalAction;
+    let async_ptr: *mut dyn AsyncActionOps = action;
+    ec.check_signal_action = Some(async_ptr);
 }
 
 /// _signal module — PyPy: pypy/module/signal/.

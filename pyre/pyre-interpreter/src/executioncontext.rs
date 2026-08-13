@@ -341,8 +341,8 @@ pub struct ExecutionContext {
     /// `pypy/interpreter/baseobjspace.py` `space.check_signal_action` —
     /// the `CheckSignalAction` registered when the `signal` module loads.
     /// `checksignals` calls its `perform` directly.  Stored as a trait
-    /// pointer into the leaked action owned by `module::_signal`
-    /// (`install_signal_handling`); `None` until installed.
+    /// pointer into the process object-space singleton owned by
+    /// `module::_signal` (`install_signal_handling`); `None` until installed.
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
     /// `executioncontext.py sys_exc_operror` — the active exception for
     /// `sys.exc_info()` / bare `raise`, saved/restored across handler
