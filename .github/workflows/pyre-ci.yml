@@ -573,9 +573,12 @@ jobs:
     name: CPython suite (gate)
     runs-on: ubuntu-24.04
     # Artifacts are named for this Linux runner, so wait for the Linux prepare
-    # leg; waiting for macOS races the Linux upload. Separately, the baseline is
-    # darwin-arm64-specific (`CPYTHON_SUITE_BASELINE_HOST`); `PLATFORM_GATED`
-    # only handles modules CPython skips wholesale on this host.
+    # leg; waiting for macOS races the Linux upload. This job is the only place
+    # CI runs the suite — `pyre/check.py` keeps the stage behind
+    # `--cpython-suite`, which no job passes, so its wall time is paid once.
+    # Separately, the baseline is darwin-arm64-specific
+    # (`CPYTHON_SUITE_BASELINE_HOST`); `PLATFORM_GATED` only handles modules
+    # CPython skips wholesale on this host.
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     timeout-minutes: 30

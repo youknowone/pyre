@@ -2432,9 +2432,14 @@ class Check:
 
         The baseline records one verdict per module per backend, observed on
         darwin-arm64, and dynasm's codegen is arch-specific -- so the
-        comparison only means anything there, which is also why the CI job
-        pins `runs-on: macos-latest`.  On any other host the stage reports
-        that it did not run instead of counting as a pass.
+        comparison only means anything there.  On any other host the stage
+        reports that it did not run instead of counting as a pass.
+
+        Off by default and reached only through `--cpython-suite`: the suite
+        costs more wall time than every other stage here put together, and the
+        `cpython-tests` CI job already runs it on its own schedule.  Pass the
+        flag locally when a change could move a verdict the synthetic corpus
+        does not cover.
         """
         name = "cpython-suite"
         backend = "dynasm"
@@ -2824,9 +2829,10 @@ def parse_args():
         help="skip pyre/bench/synth feature-parity benchmarks",
     )
     parser.add_argument(
-        "--no-cpython-suite",
+        "--cpython-suite",
         action="store_true",
-        help="skip the vendored CPython suite gate (pyre/cpython_tests)",
+        help="also run the vendored CPython suite gate (pyre/cpython_tests); "
+             "off by default because it dominates this script's wall time",
     )
     parser.add_argument(
         "--synthetic-only",
@@ -3011,7 +3017,7 @@ def main():
         print()
         chk.run_synthetic_suite()
 
-    if not args.no_cpython_suite and not args.synthetic_only:
+    if args.cpython_suite and not args.synthetic_only:
         print()
         print(bold("vendored CPython suite"))
         chk.run_cpython_suite()
