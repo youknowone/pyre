@@ -808,6 +808,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "qmut_deps_simple_loop",
                 "qmut_deps_entry_bridge",
                 "qmut_deps_blackhole_arm",
+                "retrace_close_resumed",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

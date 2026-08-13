@@ -5295,6 +5295,24 @@ impl TraceCtx {
         std::mem::take(&mut self.merge_point_resumed)
     }
 
+    /// Both halves of pyjitpl.py:1571/1574 `saved_pc`, for a close that did
+    /// NOT end the trace and so has to hand the walk back.
+    ///
+    /// The two are one operation upstream and must stay one here: a re-entry
+    /// that latches the skip without handing over the pc rewinds the walk to
+    /// wherever its segment began while its state stands at the merge point
+    /// just reached, and the instructions in between are re-executed against
+    /// state belonging to neither. Both driver re-entries call this so neither
+    /// can acquire one half without the other.
+    ///
+    /// `close_green_pc` is `None` for a close that named no merge-point pc, in
+    /// which case there is nothing to correct and the walk keeps the pc it was
+    /// called with.
+    pub fn resume_walk_after_close(&mut self) {
+        self.walk_resume_pc = self.close_green_pc.and_then(|p| usize::try_from(p).ok());
+        self.merge_point_resumed = true;
+    }
+
     pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
         self.current_merge_points
             .iter()

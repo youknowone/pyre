@@ -874,7 +874,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 78;
+pub const MC_DIAG_SLOTS: usize = 79;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1213,6 +1213,12 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     "qmut_deps_simple_loop",
     "qmut_deps_entry_bridge",
     "qmut_deps_blackhole_arm",
+    // The second of the driver's two "close kept the trace alive, hand the
+    // walk back" re-entries (`take_keep_tracing_after_close`). Its sibling has
+    // no slot because the corpus reaches it; this one is reached by nothing
+    // runnable today, so a zero here is the difference between "the resumption
+    // is correct" and "the resumption has never run".
+    "retrace_close_resumed",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

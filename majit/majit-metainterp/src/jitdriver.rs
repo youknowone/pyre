@@ -3102,11 +3102,9 @@ impl<S: JitState> JitDriver<S> {
                                     // dropping the only record of it, or the re-entered walk
                                     // replays the instructions between the two against state
                                     // that belongs to neither.
-                                    ctx.walk_resume_pc =
-                                        ctx.close_green_pc.and_then(|p| usize::try_from(p).ok());
+                                    ctx.resume_walk_after_close();
                                     ctx.close_greens = None;
                                     ctx.close_green_pc = None;
-                                    ctx.merge_point_resumed = true;
                                 }
                                 // The walk-final handoff staged at the top of this arm describes a trace
                                 // that ENDED; discard it, same as the `take_keep_tracing_after_close` path
@@ -3434,12 +3432,25 @@ impl<S: JitState> JitDriver<S> {
                         self.meta.single_pass_outcome = None;
                         self.meta.single_pass_scalar_values = None;
                         self.meta.single_pass_virt_array_values = None;
-                        // pyjitpl.py:1577 `self.pc = saved_pc` — the resumed walk
+                        // pyjitpl.py:1571/1574 `saved_pc` — the resumed walk
                         // re-enters at the merge point's own guest pc, so the
                         // merge-point op must fall through once instead of
-                        // closing again with nothing recorded in between.
+                        // closing again with nothing recorded in between, and
+                        // the walk must be seeded THERE rather than wherever
+                        // its segment began. `register_retrace_merge_point`
+                        // registered this merge point under `close_header_pc`,
+                        // the same pc `close_green_pc` names, so resuming
+                        // anywhere else also disagrees with that registration.
+                        //
+                        // The slot is here because nothing available reaches
+                        // this branch: it fires on no test in this crate, no
+                        // majit example, and no aheui corpus program at
+                        // thresholds 2/8/32/128. A zero says "still unreached";
+                        // the first non-zero is the first evidence this
+                        // resumption is exercised at all.
+                        crate::mc_diag_bump(78); // retrace_close_resumed
                         if let Some(ctx) = self.meta.trace_ctx() {
-                            ctx.merge_point_resumed = true;
+                            ctx.resume_walk_after_close();
                         }
                         continue;
                     }
