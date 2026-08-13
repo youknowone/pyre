@@ -672,10 +672,14 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (176, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (177, Some(0)),
-    // `mmap.mmap` owns its native mapping/fd payload and follows the optional
-    // SSL tail on Unix.  A sandbox build has no `mmap` module either, so
+    // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
+    // and the file handle on Windows — and follows the optional SSL tail
+    // wherever the module is compiled.  The gate must match the alias gate in
+    // `all_subclass_range_aliases`: an alias whose typeid is absent here fails
+    // `compute_subclass_ranges_from_hierarchy`'s in-the-hierarchy expectation.
+    // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     (178, Some(0)),
 ];
 
