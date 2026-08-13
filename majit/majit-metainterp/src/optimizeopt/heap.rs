@@ -2012,7 +2012,22 @@ impl OptHeap {
             let read = ei.check_readonly_descr_array(effect_idx);
             // heap.py:556 — no sentinel special case, for the reason given
             // in the field loop above.
-            let write = ei.check_write_descr_array(effect_idx);
+            //
+            // Raw-set fallback, the array twin of the field loop's: on the
+            // macro / `JitDriver` path `compute_bitstrings` never runs, so
+            // `effect_idx` is the unset sentinel and the bitstring lookup
+            // always misses. Invalidate when the call's concrete
+            // `_write_descrs_arrays` names this exact array descr by pointer
+            // identity. Gated on `!compute_bitstrings_has_run()` so the
+            // translated interpreter's bitstring path is unchanged.
+            //
+            // The soundness argument is the field loop's verbatim: a call
+            // whose write set was never computed is `EF_RANDOM_EFFECTS` and
+            // is routed to `clean_caches` before reaching this function, so a
+            // sentinel descr bitchecking false here is correct.
+            let write = ei.check_write_descr_array(effect_idx)
+                || (!majit_ir::effectinfo::compute_bitstrings_has_run()
+                    && ei.writes_array_descr_by_identity(&descr));
             if !read && !write {
                 continue;
             }

@@ -1174,6 +1174,25 @@ impl EffectInfo {
         )
     }
 
+    /// Array twin of [`Self::writes_field_descr_by_identity`], for the same
+    /// macro / `JitDriver` path where `compute_bitstrings` never runs.
+    ///
+    /// Without it a `residual_writes` array declaration is inert: the raw set
+    /// names the descr, but every array descr's `ei_index` is still the
+    /// `u32::MAX` sentinel so `check_write_descr_array` always misses, and the
+    /// trace keeps serving a `getarrayitem_gc_i` cached from before the call.
+    /// The field side has been recovering exactly this case since the write-set
+    /// table was introduced; the array side had no counterpart.
+    pub fn writes_array_descr_by_identity(&self, descr: &DescrRef) -> bool {
+        match self._write_descrs_arrays.as_deref() {
+            Some(arrays) => {
+                let target = descr_ptr_id(descr);
+                arrays.iter().any(|d| descr_ptr_id(d) == target)
+            }
+            None => false,
+        }
+    }
+
     /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)
     pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
