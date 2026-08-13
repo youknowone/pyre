@@ -1435,7 +1435,7 @@ pub struct StructLayout {
 }
 
 /// Single field within a `StructLayout`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructFieldLayout {
     pub name: String,
     /// RPython: `cfield.offset`
@@ -2493,13 +2493,27 @@ impl CallControl {
                 }
                 let (struct_size, struct_size_path) =
                     compute_struct_size_with_path(self, owner_root);
-                let exact_field_offset = owner_id
-                    .or(registry_struct_id)
-                    .and_then(|sid| self.struct_layouts.get(&sid))
-                    .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
-                    .map(|f| f.offset);
-                majit_ir::descr::record_field_offset_source(exact_field_offset.is_some());
-                let field_offset = exact_field_offset.unwrap_or(offset);
+                let offset_of = |sid| {
+                    self.struct_layouts
+                        .get(&sid)
+                        .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
+                        .map(|f| f.offset)
+                };
+                let concrete_offset = owner_id.and_then(offset_of);
+                let template_offset = if concrete_offset.is_none() {
+                    registry_struct_id.and_then(offset_of)
+                } else {
+                    None
+                };
+                let field_offset_source = if concrete_offset.is_some() {
+                    majit_ir::descr::FieldOffsetSource::ConcreteHit
+                } else if template_offset.is_some() {
+                    majit_ir::descr::FieldOffsetSource::TemplateHit
+                } else {
+                    majit_ir::descr::FieldOffsetSource::AccumulatorFallback
+                };
+                majit_ir::descr::record_field_offset_source(field_offset_source);
+                let field_offset = concrete_offset.or(template_offset).unwrap_or(offset);
                 let rank = self.field_immutability(Some(owner_root), field_name);
                 let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
                 let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);

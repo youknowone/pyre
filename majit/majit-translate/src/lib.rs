@@ -861,18 +861,6 @@ fn expand_immutable_fields_to_all_spellings(
     out
 }
 
-fn struct_layout_fields_equal(left: &[StructFieldLayout], right: &[StructFieldLayout]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.name == right.name
-                && left.offset == right.offset
-                && left.size == right.size
-                && left.flag == right.flag
-                && left.field_type == right.field_type
-                && left.rank == right.rank
-        })
-}
-
 fn struct_layout_census_enabled() -> bool {
     std::env::var_os("MAJIT_STRUCT_LAYOUT_CENSUS")
         .is_some_and(|value| value == std::ffi::OsStr::new("1"))
@@ -1327,8 +1315,7 @@ fn analyze_pipeline_from_module_paths(
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
-                    observed.size == layout.size
-                        && struct_layout_fields_equal(&observed.fields, &layout.fields)
+                    observed.size == layout.size && observed.fields == layout.fields
                 }) {
                     spellings.push(struct_name.clone());
                 } else {

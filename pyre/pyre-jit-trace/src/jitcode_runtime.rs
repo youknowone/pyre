@@ -794,6 +794,27 @@ pub fn field_position_jit_stats() -> String {
         attached_misplaced,
     } = field_position_counts();
     let mint = *BUILD_FIELD_MINT_CENSUS + majit_ir::descr::field_mint_census_snapshot();
+    let mint_fields = mint
+        .fields()
+        .into_iter()
+        .map(|(name, value)| {
+            let report_name = if let Some(suffix) = name.strip_prefix("cache_hit_") {
+                format!("field_cache_hit_{suffix}")
+            } else if let Some(suffix) = name.strip_prefix("offset_") {
+                format!("field_offset_{suffix}")
+            } else if let Some(suffix) = name.strip_prefix("struct_size_") {
+                format!("compute_struct_size_{suffix}")
+            } else if let Some(suffix) = name.strip_prefix("ei_") {
+                format!("ei_descr_mint_{suffix}")
+            } else if name == "owner_id_registry_miss" {
+                "field_owner_id_registry_miss".to_owned()
+            } else {
+                name.to_owned()
+            };
+            format!("{report_name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let (
         [published, fieldless, shadowing, aliased, aliased_multi],
         [slots, misplaced],
@@ -820,50 +841,12 @@ pub fn field_position_jit_stats() -> String {
          field_pos_rederived={rederived} field_pos_unresolved={unresolved} \
          field_pos_spec_checked={spec_checked} field_pos_spec_misplaced={spec_misplaced} \
          field_pos_attached_checked={attached_checked} \
-         field_pos_attached_misplaced={attached_misplaced} \
-         field_cache_hit_disagree={} field_cache_hit_offset={} \
-         field_cache_hit_size={} field_cache_hit_type={} \
-         field_cache_hit_immutability={} field_cache_hit_virtualizable={} \
-         field_cache_hit_index_in_parent={} field_offset_layout_hit={} \
-         field_offset_accumulator_fallback={} compute_struct_size_layout={} \
-         compute_struct_size_heuristic={} compute_struct_size_fields_missing={} \
-         field_owner_id_registry_miss={} fieldless_size_shell_mints={} \
-         fieldless_size_shell_upgrades={} ei_descr_mint_differing={} \
-         ei_descr_mint_identical={} ei_descr_mint_struct_size={} \
-         ei_descr_mint_offset={} ei_descr_mint_field_size={} \
-         ei_descr_mint_field_type={} ei_descr_mint_flag={} \
-         ei_descr_mint_index_in_parent={} ei_descr_mint_immutable={} \
-         ei_descr_mint_quasi_immutable={} \
+         field_pos_attached_misplaced={attached_misplaced} {mint_fields} \
          size_shell_published={published} size_shell_fieldless={fieldless} \
          size_shell_shadowing={shadowing} size_shell_aliased={aliased} \
          size_shell_aliased_multi={aliased_multi} \
          positional_slots={slots} positional_misplaced={misplaced} \
          key_compared={key_compared} key_conflicting={key_conflicting}{sample}",
-        mint.cache_hit_disagree,
-        mint.cache_hit_offset,
-        mint.cache_hit_size,
-        mint.cache_hit_type,
-        mint.cache_hit_immutability,
-        mint.cache_hit_virtualizable,
-        mint.cache_hit_index_in_parent,
-        mint.offset_layout_hit,
-        mint.offset_accumulator_fallback,
-        mint.struct_size_layout,
-        mint.struct_size_heuristic,
-        mint.struct_size_fields_missing,
-        mint.owner_id_registry_miss,
-        mint.fieldless_size_shell_mints,
-        mint.fieldless_size_shell_upgrades,
-        mint.ei_differing,
-        mint.ei_identical,
-        mint.ei_struct_size,
-        mint.ei_offset,
-        mint.ei_field_size,
-        mint.ei_field_type,
-        mint.ei_flag,
-        mint.ei_index_in_parent,
-        mint.ei_immutable,
-        mint.ei_quasi_immutable,
     )
 }
 

@@ -84,6 +84,21 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "static_ref_bindings.bin",
 ];
 
+/// Outputs whose contents count work against process-global state and therefore
+/// cannot be compared between two generations in the same process.
+///
+/// `field_mint_census.bin` includes `fieldless_size_shell_mints` and
+/// `ei_identical`. The process-global GcCache and ei-descr ledger persist across
+/// the two generations, so the second generation legitimately does less work:
+/// it mints no fieldless shells and finds more identical entries already stored.
+/// The reset at the start of each generation remains necessary so the file
+/// describes the generation that wrote it instead of accumulating both runs.
+///
+/// Excluded from the in-process verdict only. A cross-process cache comparison
+/// still judges the census, unlike [`HOST_ADDRESSED_OUTPUTS`], whose exclusions
+/// apply only across processes.
+const IN_PROCESS_STATEFUL_OUTPUTS: &[&str] = &["field_mint_census.bin"];
+
 /// Opt-in self-check that the generated outputs are a function of the inputs
 /// [`codegen_cache_key`] hashes. Deliberately not part of that key: it changes
 /// nothing about what gets generated, it only compares two generations.
@@ -928,6 +943,7 @@ fn real_main() {
     // `DeterminismCheck::InProcess` compares against; the parameter shadows
     // the outer `out_dir` so both calls read as "write into out_dir".
     let generate_into = |out_dir: &str| {
+        majit_ir::descr::reset_field_mint_census();
         let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
             &module_path_refs,
             &analyze_config,
@@ -1421,10 +1437,10 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
 /// other only an order — so both lengths are reported, not just that they
 /// differ.
 ///
-/// `cross_process` excuses [`HOST_ADDRESSED_OUTPUTS`] from the verdict. They
-/// are still reported, on their own line: a check that files a by-design
-/// difference as a defect is one people learn to ignore, and then it reports
-/// nothing at all.
+/// `cross_process` excuses [`HOST_ADDRESSED_OUTPUTS`] from the verdict; its
+/// inverse excuses [`IN_PROCESS_STATEFUL_OUTPUTS`]. Both are still reported on
+/// their own lines: a check that files a by-design difference as a defect is one
+/// people learn to ignore, and then it reports nothing at all.
 fn codegen_outputs_match(
     label: &str,
     baseline: &std::path::Path,
@@ -1434,6 +1450,7 @@ fn codegen_outputs_match(
     let mut identical: Vec<&str> = Vec::new();
     let mut differing: Vec<String> = Vec::new();
     let mut host_addressed: Vec<&str> = Vec::new();
+    let mut in_process_stateful: Vec<&str> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
     for name in CODEGEN_OUTPUTS {
         match (
@@ -1443,6 +1460,9 @@ fn codegen_outputs_match(
             (Ok(a), Ok(b)) if a == b => identical.push(name),
             (Ok(_), Ok(_)) if cross_process && HOST_ADDRESSED_OUTPUTS.contains(name) => {
                 host_addressed.push(name);
+            }
+            (Ok(_), Ok(_)) if !cross_process && IN_PROCESS_STATEFUL_OUTPUTS.contains(name) => {
+                in_process_stateful.push(name);
             }
             (Ok(a), Ok(b)) => {
                 let offset = a
@@ -1471,6 +1491,14 @@ fn codegen_outputs_match(
             host_addressed.join(" ")
         );
     }
+    if !in_process_stateful.is_empty() {
+        eprintln!(
+            "[pyre-jit-trace build.rs] codegen determinism: {} process-stateful output(s) \
+             differ from {label} as expected, excluded from the in-process verdict: {}",
+            in_process_stateful.len(),
+            in_process_stateful.join(" ")
+        );
+    }
     if differing.is_empty() && unreadable.is_empty() {
         eprintln!(
             "[pyre-jit-trace build.rs] codegen determinism: all {} reproducible outputs are \
@@ -1496,6 +1524,13 @@ fn codegen_outputs_match(
             "cargo::warning=codegen determinism: excluded as host addresses (expected to differ \
              across processes): {}",
             host_addressed.join(" ")
+        );
+    }
+    if !in_process_stateful.is_empty() {
+        println!(
+            "cargo::warning=codegen determinism: excluded as process-stateful (expected to \
+             differ across in-process generations): {}",
+            in_process_stateful.join(" ")
         );
     }
     false

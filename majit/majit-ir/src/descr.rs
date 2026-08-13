@@ -754,59 +754,6 @@ static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_DISAGREE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_OFFSET: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_SIZE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_TYPE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_IMMUTABILITY: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_VIRTUALIZABLE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_CACHE_HIT_INDEX_IN_PARENT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-static FIELD_OFFSET_LAYOUT_HIT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_OFFSET_ACCUMULATOR_FALLBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static COMPUTE_STRUCT_SIZE_LAYOUT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static COMPUTE_STRUCT_SIZE_HEURISTIC: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static COMPUTE_STRUCT_SIZE_FIELDS_MISSING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELD_OWNER_ID_REGISTRY_MISS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-static FIELDLESS_SIZE_SHELL_MINTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static FIELDLESS_SIZE_SHELL_UPGRADES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-static EI_DESCR_MINT_DIFFERING: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_IDENTICAL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_STRUCT_SIZE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_OFFSET: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_FIELD_SIZE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_FIELD_TYPE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_FLAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_INDEX_IN_PARENT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_IMMUTABLE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static EI_DESCR_MINT_QUASI_IMMUTABLE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 static FIELD_MINT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static FIELD_MINT_BACKTRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -818,74 +765,92 @@ pub enum StructSizePath {
     FieldsMissing,
 }
 
-/// Release-safe field-mint census snapshotted across the build/runtime process
-/// boundary by `pyre-jit-trace`'s build script.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FieldMintCensus {
-    pub cache_hit_disagree: usize,
-    pub cache_hit_offset: usize,
-    pub cache_hit_size: usize,
-    pub cache_hit_type: usize,
-    pub cache_hit_immutability: usize,
-    pub cache_hit_virtualizable: usize,
-    pub cache_hit_index_in_parent: usize,
-    pub offset_layout_hit: usize,
-    pub offset_accumulator_fallback: usize,
-    pub struct_size_layout: usize,
-    pub struct_size_heuristic: usize,
-    pub struct_size_fields_missing: usize,
-    pub owner_id_registry_miss: usize,
-    pub fieldless_size_shell_mints: usize,
-    pub fieldless_size_shell_upgrades: usize,
-    pub ei_differing: usize,
-    pub ei_identical: usize,
-    pub ei_struct_size: usize,
-    pub ei_offset: usize,
-    pub ei_field_size: usize,
-    pub ei_field_type: usize,
-    pub ei_flag: usize,
-    pub ei_index_in_parent: usize,
-    pub ei_immutable: usize,
-    pub ei_quasi_immutable: usize,
+/// Which source supplied one field offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldOffsetSource {
+    ConcreteHit,
+    TemplateHit,
+    AccumulatorFallback,
 }
 
-impl std::ops::Add for FieldMintCensus {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self {
-        Self {
-            cache_hit_disagree: self.cache_hit_disagree + rhs.cache_hit_disagree,
-            cache_hit_offset: self.cache_hit_offset + rhs.cache_hit_offset,
-            cache_hit_size: self.cache_hit_size + rhs.cache_hit_size,
-            cache_hit_type: self.cache_hit_type + rhs.cache_hit_type,
-            cache_hit_immutability: self.cache_hit_immutability + rhs.cache_hit_immutability,
-            cache_hit_virtualizable: self.cache_hit_virtualizable + rhs.cache_hit_virtualizable,
-            cache_hit_index_in_parent: self.cache_hit_index_in_parent
-                + rhs.cache_hit_index_in_parent,
-            offset_layout_hit: self.offset_layout_hit + rhs.offset_layout_hit,
-            offset_accumulator_fallback: self.offset_accumulator_fallback
-                + rhs.offset_accumulator_fallback,
-            struct_size_layout: self.struct_size_layout + rhs.struct_size_layout,
-            struct_size_heuristic: self.struct_size_heuristic + rhs.struct_size_heuristic,
-            struct_size_fields_missing: self.struct_size_fields_missing
-                + rhs.struct_size_fields_missing,
-            owner_id_registry_miss: self.owner_id_registry_miss + rhs.owner_id_registry_miss,
-            fieldless_size_shell_mints: self.fieldless_size_shell_mints
-                + rhs.fieldless_size_shell_mints,
-            fieldless_size_shell_upgrades: self.fieldless_size_shell_upgrades
-                + rhs.fieldless_size_shell_upgrades,
-            ei_differing: self.ei_differing + rhs.ei_differing,
-            ei_identical: self.ei_identical + rhs.ei_identical,
-            ei_struct_size: self.ei_struct_size + rhs.ei_struct_size,
-            ei_offset: self.ei_offset + rhs.ei_offset,
-            ei_field_size: self.ei_field_size + rhs.ei_field_size,
-            ei_field_type: self.ei_field_type + rhs.ei_field_type,
-            ei_flag: self.ei_flag + rhs.ei_flag,
-            ei_index_in_parent: self.ei_index_in_parent + rhs.ei_index_in_parent,
-            ei_immutable: self.ei_immutable + rhs.ei_immutable,
-            ei_quasi_immutable: self.ei_quasi_immutable + rhs.ei_quasi_immutable,
+macro_rules! define_field_mint_census {
+    ($($name:ident),+ $(,)?) => {
+        struct FieldMintCounters {
+            $($name: std::sync::atomic::AtomicUsize,)+
         }
-    }
+
+        static FIELD_MINT: FieldMintCounters = FieldMintCounters {
+            $($name: std::sync::atomic::AtomicUsize::new(0),)+
+        };
+
+        /// Zero every field-mint counter, so a subsequent snapshot describes
+        /// only the work done after this call. `pyre-jit-trace`'s build script
+        /// runs code generation twice in one process under
+        /// `PYRE_CODEGEN_DETERMINISM_CHECK=in-process`; without this the second
+        /// generation's census would carry the first generation's increments.
+        pub fn reset_field_mint_census() {
+            $(FIELD_MINT.$name.store(0, std::sync::atomic::Ordering::Relaxed);)+
+        }
+
+        /// Release-safe field-mint census snapshotted across the build/runtime process
+        /// boundary by `pyre-jit-trace`'s build script.
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct FieldMintCensus {
+            $(pub $name: usize,)+
+        }
+
+        impl FieldMintCensus {
+            pub fn fields(&self) -> [(&'static str, usize); [$(stringify!($name)),+].len()] {
+                [$( (stringify!($name), self.$name), )+]
+            }
+        }
+
+        impl std::ops::Add for FieldMintCensus {
+            type Output = Self;
+
+            fn add(self, rhs: Self) -> Self {
+                Self {
+                    $($name: self.$name + rhs.$name,)+
+                }
+            }
+        }
+
+        pub fn field_mint_census_snapshot() -> FieldMintCensus {
+            FieldMintCensus {
+                $($name: FIELD_MINT.$name.load(std::sync::atomic::Ordering::Relaxed),)+
+            }
+        }
+    };
+}
+
+define_field_mint_census! {
+    cache_hit_disagree,
+    cache_hit_offset,
+    cache_hit_size,
+    cache_hit_type,
+    cache_hit_immutability,
+    cache_hit_virtualizable,
+    cache_hit_index_in_parent,
+    offset_layout_hit,
+    offset_accumulator_fallback,
+    struct_size_layout,
+    struct_size_heuristic,
+    struct_size_fields_missing,
+    owner_id_registry_miss,
+    fieldless_size_shell_mints,
+    fieldless_size_shell_upgrades,
+    ei_differing,
+    ei_identical,
+    ei_struct_size,
+    ei_offset,
+    ei_field_size,
+    ei_field_type,
+    ei_flag,
+    ei_index_in_parent,
+    ei_immutable,
+    ei_quasi_immutable,
+    offset_concrete_hit,
+    offset_template_hit,
 }
 
 pub fn field_mint_trace_enabled() -> bool {
@@ -898,57 +863,38 @@ fn field_mint_backtrace_enabled() -> bool {
     *FIELD_MINT_BACKTRACE_ENABLED.get_or_init(|| std::env::var_os("RUST_BACKTRACE").is_some())
 }
 
-pub fn record_field_offset_source(layout_hit: bool) {
+pub fn record_field_offset_source(source: FieldOffsetSource) {
     use std::sync::atomic::Ordering::Relaxed;
-    if layout_hit {
-        FIELD_OFFSET_LAYOUT_HIT.fetch_add(1, Relaxed);
-    } else {
-        FIELD_OFFSET_ACCUMULATOR_FALLBACK.fetch_add(1, Relaxed);
+    match source {
+        FieldOffsetSource::ConcreteHit => {
+            FIELD_MINT.offset_layout_hit.fetch_add(1, Relaxed);
+            FIELD_MINT.offset_concrete_hit.fetch_add(1, Relaxed);
+        }
+        FieldOffsetSource::TemplateHit => {
+            FIELD_MINT.offset_layout_hit.fetch_add(1, Relaxed);
+            FIELD_MINT.offset_template_hit.fetch_add(1, Relaxed);
+        }
+        FieldOffsetSource::AccumulatorFallback => {
+            FIELD_MINT.offset_accumulator_fallback.fetch_add(1, Relaxed);
+        }
     }
 }
 
 pub fn record_compute_struct_size_path(path: StructSizePath) {
     use std::sync::atomic::Ordering::Relaxed;
     match path {
-        StructSizePath::Layout => COMPUTE_STRUCT_SIZE_LAYOUT.fetch_add(1, Relaxed),
-        StructSizePath::Heuristic => COMPUTE_STRUCT_SIZE_HEURISTIC.fetch_add(1, Relaxed),
-        StructSizePath::FieldsMissing => COMPUTE_STRUCT_SIZE_FIELDS_MISSING.fetch_add(1, Relaxed),
+        StructSizePath::Layout => FIELD_MINT.struct_size_layout.fetch_add(1, Relaxed),
+        StructSizePath::Heuristic => FIELD_MINT.struct_size_heuristic.fetch_add(1, Relaxed),
+        StructSizePath::FieldsMissing => {
+            FIELD_MINT.struct_size_fields_missing.fetch_add(1, Relaxed)
+        }
     };
 }
 
 pub fn record_field_owner_id_registry_miss() {
-    FIELD_OWNER_ID_REGISTRY_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn field_mint_census_snapshot() -> FieldMintCensus {
-    use std::sync::atomic::Ordering::Relaxed;
-    FieldMintCensus {
-        cache_hit_disagree: FIELD_CACHE_HIT_DISAGREE.load(Relaxed),
-        cache_hit_offset: FIELD_CACHE_HIT_OFFSET.load(Relaxed),
-        cache_hit_size: FIELD_CACHE_HIT_SIZE.load(Relaxed),
-        cache_hit_type: FIELD_CACHE_HIT_TYPE.load(Relaxed),
-        cache_hit_immutability: FIELD_CACHE_HIT_IMMUTABILITY.load(Relaxed),
-        cache_hit_virtualizable: FIELD_CACHE_HIT_VIRTUALIZABLE.load(Relaxed),
-        cache_hit_index_in_parent: FIELD_CACHE_HIT_INDEX_IN_PARENT.load(Relaxed),
-        offset_layout_hit: FIELD_OFFSET_LAYOUT_HIT.load(Relaxed),
-        offset_accumulator_fallback: FIELD_OFFSET_ACCUMULATOR_FALLBACK.load(Relaxed),
-        struct_size_layout: COMPUTE_STRUCT_SIZE_LAYOUT.load(Relaxed),
-        struct_size_heuristic: COMPUTE_STRUCT_SIZE_HEURISTIC.load(Relaxed),
-        struct_size_fields_missing: COMPUTE_STRUCT_SIZE_FIELDS_MISSING.load(Relaxed),
-        owner_id_registry_miss: FIELD_OWNER_ID_REGISTRY_MISS.load(Relaxed),
-        fieldless_size_shell_mints: FIELDLESS_SIZE_SHELL_MINTS.load(Relaxed),
-        fieldless_size_shell_upgrades: FIELDLESS_SIZE_SHELL_UPGRADES.load(Relaxed),
-        ei_differing: EI_DESCR_MINT_DIFFERING.load(Relaxed),
-        ei_identical: EI_DESCR_MINT_IDENTICAL.load(Relaxed),
-        ei_struct_size: EI_DESCR_MINT_STRUCT_SIZE.load(Relaxed),
-        ei_offset: EI_DESCR_MINT_OFFSET.load(Relaxed),
-        ei_field_size: EI_DESCR_MINT_FIELD_SIZE.load(Relaxed),
-        ei_field_type: EI_DESCR_MINT_FIELD_TYPE.load(Relaxed),
-        ei_flag: EI_DESCR_MINT_FLAG.load(Relaxed),
-        ei_index_in_parent: EI_DESCR_MINT_INDEX_IN_PARENT.load(Relaxed),
-        ei_immutable: EI_DESCR_MINT_IMMUTABLE.load(Relaxed),
-        ei_quasi_immutable: EI_DESCR_MINT_QUASI_IMMUTABLE.load(Relaxed),
-    }
+    FIELD_MINT
+        .owner_id_registry_miss
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One `FIELD_INDEX_UNRESOLVED` event, named, keyed so identical mints fold
@@ -1401,7 +1347,9 @@ impl GcCache {
             sd.set_cache_key(*k);
         }
         sd.mark_fieldless_shell_mint();
-        FIELDLESS_SIZE_SHELL_MINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FIELD_MINT
+            .fieldless_size_shell_mints
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // descr.py:119: gccache.init_size_descr(STRUCT, sizedescr)
         // gc.py:536-542: sets descr.tid — must happen BEFORE Arc wrap.
         self.init_size_descr(&key, &mut sd);
@@ -2089,24 +2037,24 @@ impl GcCache {
                 || index_disagrees;
             if disagrees {
                 use std::sync::atomic::Ordering::Relaxed;
-                FIELD_CACHE_HIT_DISAGREE.fetch_add(1, Relaxed);
+                FIELD_MINT.cache_hit_disagree.fetch_add(1, Relaxed);
                 if offset_disagrees {
-                    FIELD_CACHE_HIT_OFFSET.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_offset.fetch_add(1, Relaxed);
                 }
                 if size_disagrees {
-                    FIELD_CACHE_HIT_SIZE.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_size.fetch_add(1, Relaxed);
                 }
                 if type_disagrees {
-                    FIELD_CACHE_HIT_TYPE.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_type.fetch_add(1, Relaxed);
                 }
                 if immutability_disagrees {
-                    FIELD_CACHE_HIT_IMMUTABILITY.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_immutability.fetch_add(1, Relaxed);
                 }
                 if virtualizable_disagrees {
-                    FIELD_CACHE_HIT_VIRTUALIZABLE.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_virtualizable.fetch_add(1, Relaxed);
                 }
                 if index_disagrees {
-                    FIELD_CACHE_HIT_INDEX_IN_PARENT.fetch_add(1, Relaxed);
+                    FIELD_MINT.cache_hit_index_in_parent.fetch_add(1, Relaxed);
                 }
                 if field_mint_trace_enabled() {
                     let cached_parent_has_positional_list = descr
@@ -2555,7 +2503,9 @@ impl GcCache {
                     .as_size_descr()
                     .is_some_and(|sd| !sd.all_fielddescrs().is_empty());
             if upgrades_fieldless_shell {
-                FIELDLESS_SIZE_SHELL_UPGRADES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                FIELD_MINT
+                    .fieldless_size_shell_upgrades
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if let Some(old) = self._cache_size.get(&key)
                 && !arc_in_vec(&self._size_keepalive, old)
@@ -2931,28 +2881,28 @@ pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
             return;
         };
         if stored_struct_size != rejected_struct_size {
-            EI_DESCR_MINT_STRUCT_SIZE.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_struct_size.fetch_add(1, Relaxed);
         }
         if stored_offset != rejected_offset {
-            EI_DESCR_MINT_OFFSET.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_offset.fetch_add(1, Relaxed);
         }
         if stored_field_size != rejected_field_size {
-            EI_DESCR_MINT_FIELD_SIZE.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_field_size.fetch_add(1, Relaxed);
         }
         if stored_field_type != rejected_field_type {
-            EI_DESCR_MINT_FIELD_TYPE.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_field_type.fetch_add(1, Relaxed);
         }
         if stored_flag != rejected_flag {
-            EI_DESCR_MINT_FLAG.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_flag.fetch_add(1, Relaxed);
         }
         if stored_index_in_parent != rejected_index_in_parent {
-            EI_DESCR_MINT_INDEX_IN_PARENT.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_index_in_parent.fetch_add(1, Relaxed);
         }
         if stored_immutable != rejected_immutable {
-            EI_DESCR_MINT_IMMUTABLE.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_immutable.fetch_add(1, Relaxed);
         }
         if stored_quasi_immutable != rejected_quasi_immutable {
-            EI_DESCR_MINT_QUASI_IMMUTABLE.fetch_add(1, Relaxed);
+            FIELD_MINT.ei_quasi_immutable.fetch_add(1, Relaxed);
         }
     }
 
@@ -2964,9 +2914,9 @@ pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
         indexmap::map::Entry::Occupied(entry) => {
             let stored = entry.get();
             if stored == &spec {
-                EI_DESCR_MINT_IDENTICAL.fetch_add(1, Relaxed);
+                FIELD_MINT.ei_identical.fetch_add(1, Relaxed);
             } else {
-                EI_DESCR_MINT_DIFFERING.fetch_add(1, Relaxed);
+                FIELD_MINT.ei_differing.fetch_add(1, Relaxed);
                 count_field_axes(stored, &spec);
                 if field_mint_trace_enabled() {
                     eprintln!(
