@@ -22,7 +22,7 @@ assert signal.getsignal(signal.SIGILL) is signal.SIG_DFL
 
 
 # unix
-if "win" not in sys.platform:
+if not sys.platform.startswith("win"):
     signal.signal(signal.SIGALRM, handler)
     assert signal.getsignal(signal.SIGALRM) is handler
 

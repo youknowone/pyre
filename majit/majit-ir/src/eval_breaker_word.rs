@@ -1,8 +1,9 @@
 //! The single process-global eval-breaker word polled by JIT-compiled loop
 //! back-edges. One `AtomicUsize` whose bits fold the two former back-edge
 //! polls into one load + one nonzero branch:
-//!   bit0 EB_ASYNC — mirrors a negative async ticker (`ActionFlag._ticker < 0`);
-//!                   OR'd in by the OS signal handler and the action dispatcher.
+//!   bit0 EB_ASYNC — an async ticker request; OR'd in by the OS signal handler
+//!                   and action dispatcher, then copied into
+//!                   `ActionFlag._ticker` at a safe interpreter checkpoint.
 //!   bit1 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
 //!                   while it drains mutators to safepoints.
 //!   bit2 EB_FINALIZING — mirrors interpreter finalization; once armed,

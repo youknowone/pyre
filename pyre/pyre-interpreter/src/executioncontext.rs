@@ -764,6 +764,10 @@ impl ExecutionContext {
                 let w_exc = crate::builtins::exc_exception_new(&[w_async_exception_type])?;
                 return Err(unsafe { crate::PyError::from_exc_object(w_exc) });
             }
+            // The OS signal handler may only touch atomics.  Copy its breaker
+            // request into the ordinary ActionFlag ticker here, under the GIL,
+            // before the upstream decrement-and-dispatch sequence below.
+            self.actionflag.sync_async_ticker();
         }
         // executioncontext.py:158-165 bytecode_trace:
         //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
@@ -954,6 +958,9 @@ impl ExecutionContext {
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
         self.bytecode_only_trace(frame)?;
+        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
+            self.actionflag.sync_async_ticker();
+        }
         if self.actionflag.get_ticker() < 0 {
             // executioncontext.py:207-208 — `if actionflag.get_ticker()
             // < 0: actionflag.action_dispatcher(self, frame)`.  Routed
@@ -1515,6 +1522,16 @@ pub fn disarm_async_eval_breaker() {
     majit_ir::eval_breaker_word::clear_async();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn has_pending_signal_action() -> bool {
+    crate::module::signal::signalstate::has_pending_signals()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn has_pending_signal_action() -> bool {
+    false
+}
+
 /// `dont_look_inside` so the tracer treats it as an opaque call and never
 /// follows the action machinery's trait-object virtual dispatch +
 /// `Result<(), PyError>` propagation (which the JIT codewriter cannot
@@ -1831,16 +1848,12 @@ pub trait ActionFlagOps {
 ///
 /// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
 /// and, when the `signal` module loads, rebinds `space.actionflag` to a
-/// `SignalActionFlag` whose ticker IS the C `pypysig_counter` cell so the
-/// OS signal handler can force it negative.  pyre merges the two: the
-/// ticker stays a plain `_ticker` field (a plain field read is what the
-/// JIT codewriter can model in the per-bytecode hot path — an atomic /
-/// volatile global read is not), and the OS signal handler writes -1 into
-/// it through a pointer registered at startup
-/// (`signalstate::register_ticker` ← `ticker_addr`).  This is the same
-/// arrangement as upstream's volatile `pypysig_counter.value`: the
-/// handler stores through the cell's address while the interpreter reads
-/// the field directly.
+/// `SignalActionFlag` whose ticker is the C `pypysig_counter` cell.  pyre
+/// merges the two while respecting Rust's memory model: `_ticker` remains a
+/// plain field for the translated per-bytecode hot path, the OS handler arms
+/// the atomic process eval breaker, and `sync_async_ticker` makes the field
+/// negative at the next safe interpreter checkpoint.  No asynchronous code
+/// reads or writes `_ticker`.
 #[derive(Clone)]
 pub struct ActionFlag {
     base: AbstractActionFlag,
@@ -1865,12 +1878,21 @@ impl ActionFlag {
         let _ = (ec, frame);
     }
 
-    /// Address of the ticker cell, handed to `signalstate::register_ticker`
-    /// so the OS signal handler can force the ticker negative.  Stable for
-    /// the process lifetime — the `ExecutionContext` is created once and
-    /// never moved (held behind an `Rc` in pyrex).
+    /// Address used to identify this as the signal-driving ticker.  The OS
+    /// handler never dereferences it; it is stable for the process lifetime
+    /// because the owning process `ActionFlag` allocation never moves.
     pub fn ticker_addr(&mut self) -> *mut isize {
         &mut self._ticker
+    }
+
+    /// Transfer an asynchronous eval-breaker request into the registered
+    /// ticker.  Called only by the owning interpreter thread while it holds
+    /// the GIL and after observing `EB_ASYNC`; the OS signal handler never
+    /// accesses `_ticker` itself.
+    pub(crate) fn sync_async_ticker(&mut self) {
+        if self.is_registered_ticker() {
+            self._ticker = -1;
+        }
     }
 
     /// True when `self._ticker` is the signal-registered ticker cell — the
@@ -1909,8 +1931,8 @@ impl ActionFlagOps for ActionFlag {
     }
 
     /// interp_signal.py:30-32 `SignalActionFlag.get_ticker` — `p.c_value`.
-    /// The cell is the `_ticker` field; the OS handler writes it through
-    /// the registered pointer (`ticker_addr`).
+    /// The safe-checkpoint synchronization above is the Rust equivalent of
+    /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
         self._ticker
     }
@@ -1923,17 +1945,18 @@ impl ActionFlagOps for ActionFlag {
             if value < 0 {
                 arm_async_eval_breaker();
             } else {
-                if !crate::module::thread::has_pending_async_exception() {
+                let async_work_pending = crate::module::thread::has_pending_async_exception()
+                    || has_pending_signal_action();
+                if !async_work_pending {
                     disarm_async_eval_breaker();
                 }
-                // A signal delivered between the ticker store and this clear
-                // rearms the ticker to -1 and re-sets the async bit; the clear
-                // would then drop it, leaving a negative ticker with the bit
-                // clear so a non-allocating compiled loop misses the signal.
-                // Re-read the ticker — the handler writes it through the
-                // registered pointer, so force a fresh load — and restore the
-                // bit if it was rearmed.
-                if unsafe { std::ptr::read_volatile(&self._ticker) } < 0 {
+                // A signal/async exception published between the first
+                // pending check and the clear above must re-arm the bit.  If
+                // it arrives after this second check, its publisher runs
+                // after the clear and leaves the bit armed itself.
+                if crate::module::thread::has_pending_async_exception()
+                    || has_pending_signal_action()
+                {
                     arm_async_eval_breaker();
                 }
             }
@@ -2004,8 +2027,8 @@ impl SpaceActionFlag {
 
     fn inner(&self) -> &ActionFlag {
         // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
-        // Interpreter calls are serialized by the GIL; shared signal writes
-        // touch only `_ticker` through its registered raw address.
+        // Interpreter calls are serialized by the GIL; the signal handler
+        // touches only process-global atomics, never this allocation.
         unsafe { &*self.ptr }
     }
 
@@ -2026,6 +2049,10 @@ impl SpaceActionFlag {
 
     pub fn ticker_addr(&mut self) -> *mut isize {
         self.inner_mut().ticker_addr()
+    }
+
+    pub(crate) fn sync_async_ticker(&mut self) {
+        self.inner_mut().sync_async_ticker()
     }
 }
 
