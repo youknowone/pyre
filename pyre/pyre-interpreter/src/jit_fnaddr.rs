@@ -1261,7 +1261,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // module itself is gated at `module/mod.rs:80`; the row has to carry
     // both or a sandbox build on Linux satisfies `unix` with the module
     // configured out.
-    #[cfg(all(unix, not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        any(unix, windows),
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
     {
         let mmap_type: fn() -> pyre_object::PyObjectRef =
             crate::module::mmap::interp_mmap::mmap_type;

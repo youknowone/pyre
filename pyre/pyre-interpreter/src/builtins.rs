@@ -78,7 +78,7 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
                 // releasing the view it came from would let `close`/`resize`
                 // unmap while this one still reads the mapping.
                 let _ = w_obj;
-                #[cfg(all(unix, not(feature = "sandbox")))]
+                #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
                 if crate::module::mmap::interp_mmap::is_mmap(*w_obj) {
                     crate::module::mmap::interp_mmap::mmap_exports_incref(*w_obj);
                 }
@@ -114,7 +114,7 @@ pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
             pyre_object::memoryview::w_memoryview_exports_incref(obj);
             return true;
         }
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if crate::module::mmap::interp_mmap::is_mmap(obj) {
             crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
             return true;
@@ -137,7 +137,7 @@ pub(crate) unsafe fn buffer_export_decref(obj: PyObjectRef) {
         } else if pyre_object::memoryview::is_w_memoryview(obj) {
             pyre_object::memoryview::w_memoryview_exports_decref(obj);
         } else {
-            #[cfg(all(unix, not(feature = "sandbox")))]
+            #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
             crate::module::mmap::interp_mmap::mmap_exports_decref(obj);
         }
     }
@@ -394,7 +394,7 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
 
 /// Build the `W_MMap.readbuf_w`/`writebuf_w` view: one contiguous external
 /// byte window whose owner remains the mmap object.
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 unsafe fn w_memoryview_new_mmap(
     w_obj: PyObjectRef,
     address: usize,
@@ -657,7 +657,7 @@ fn w_memoryview_new_with_flags_impl(
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
             let (address, length, readonly) = view?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
@@ -1781,7 +1781,7 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 /// Drop an mmap-backed view's export directly, bypassing any Python-callable
 /// release.  Returns `true` when it handled an mmap backing.
-#[cfg(all(unix, not(feature = "sandbox")))]
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 unsafe fn release_external_backing(backing: PyObjectRef) -> bool {
     if crate::module::mmap::interp_mmap::is_mmap(backing) {
         unsafe { crate::module::mmap::interp_mmap::mmap_exports_decref(backing) };
@@ -1790,7 +1790,7 @@ unsafe fn release_external_backing(backing: PyObjectRef) -> bool {
     false
 }
 
-#[cfg(not(all(unix, not(feature = "sandbox"))))]
+#[cfg(not(all(any(unix, windows), not(feature = "sandbox"))))]
 unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
     false
 }
@@ -15547,7 +15547,7 @@ unsafe fn fileio_writebuf(
                 obj,
             ));
         }
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
             let (address, length, readonly) = view?;
             if !readonly {
