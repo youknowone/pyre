@@ -23,7 +23,12 @@
 ///
 /// pyre-side: blackhole `bhimpl_*` helper trampolines, all `extern "C"`
 /// so the compiled `JitCode` can call them via raw fn-pointer slots.
-#[derive(Debug)]
+///
+/// Deliberately not `Debug`: the derived formatter requires
+/// `core::marker::FnPtr` for every helper field, and Charon does not model
+/// that built-in trait impl. Deriving it makes extraction emit two trait
+/// resolution warnings per function pointer even though `Cpu` is never
+/// formatted.
 pub struct Cpu {
     /// `bhimpl_residual_call` general entry point.
     /// `(callable, null_or_self, arg0) → result`.
