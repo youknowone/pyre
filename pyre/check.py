@@ -136,6 +136,15 @@ WASM_ENGINE = "wasmtime"
 # slower still on loaded CI runners, so give it extra headroom by default to
 # avoid flaky timeouts. Overridable with --wasm-timeout-scale.
 WASM_TIMEOUT_SCALE = 4.0
+# Ceiling on wasm's execution-only user-CPU as a multiple of dynasm's on the
+# same fixture, both startup-subtracted. Unlike the vs-cpython / vs-pypy gates
+# this baseline is not a per-bench tuned constant: it is dynasm's own time from
+# the same invocation, so the pair sees one host under one load and there is no
+# recorded number that can age. Gated only when dynasm actually ran the fixture
+# in this run and its execution-only time clears FLOOR_GATE_MIN_BASELINE_S;
+# below that the denominator is startup noise, and the comparison table marks
+# the ratio `~` the way the pypy gates already do.
+WASM_MAX_DYNASM_RATIO = 3.0
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
 # runner.  Keep the timeout as a hang guard by granting native backends 2x
@@ -1351,6 +1360,15 @@ class Check:
         # interpreter/backend key -> measured empty-program user-CPU startup (s).
         # Populated by measure_startups(); missing key => 0.0 (no subtraction).
         self.startup = {}
+        # (backend, bench name) -> raw user-CPU of that backend's run in THIS
+        # invocation. Feeds the wasm-vs-dynasm gate, which needs a baseline
+        # measured on the same host under the same load; a recorded one would
+        # age out of the machine it was taken on.
+        self.bench_elapsed = {}
+        # Fixtures where the wasm run had no dynasm time to divide by, so
+        # WASM_MAX_DYNASM_RATIO was never applied. Reported in the summary: an
+        # unevaluated gate otherwise prints the same green as a satisfied one.
+        self.wasm_ratio_ungated = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
         self.jitstats_diffs = []
@@ -2150,6 +2168,12 @@ class Check:
             self._append_comparison(backend, name, t_cpython, t_pypy, "WRONG")
             return
 
+        # Recorded before the gates so a later median retry cannot make one
+        # backend's stored time depend on which gates its own run happened to
+        # trip. dynasm runs before wasm in ALL_BACKENDS, so the wasm gate below
+        # finds this fixture's dynasm time already in place.
+        self.bench_elapsed[(backend, name)] = elapsed
+
         def _ratio(elapsed_val, pypy_val):
             num = self._exec_time(backend, elapsed_val)
             den = self._exec_time("pypy", pypy_val)
@@ -2226,6 +2250,37 @@ class Check:
                     f"({ratio} vs pypy)",
                 )
             )
+
+        # wasm carries no tuned per-fixture ratio, so it gates against dynasm's
+        # execution-only time from this same invocation instead. Placed after
+        # the other ratio gates so a fixture that is slow against several
+        # baselines still reports each one.
+        if backend == "wasm":
+            dynasm_elapsed = self.bench_elapsed.get(("dynasm", name))
+            if dynasm_elapsed is None:
+                self.wasm_ratio_ungated.append(name)
+            elif not self._baseline_exec_time_clamped("dynasm", dynasm_elapsed):
+                passed, bound, checked_elapsed, checked_baseline, retry_note = (
+                    self._performance_gate_passed(
+                        backend, script, timeout, elapsed,
+                        WASM_MAX_DYNASM_RATIO, dynasm_elapsed,
+                        [self._pyre("dynasm"), script], pypy_output, "dynasm",
+                    )
+                )
+                if not passed:
+                    detail = self._gate_fail_detail(
+                        backend, "dynasm", checked_elapsed, checked_baseline,
+                        WASM_MAX_DYNASM_RATIO, bound,
+                    )
+                    suffix = f" ({retry_note})" if retry_note else ""
+                    failures.append(
+                        (
+                            f"{red('SLOWER')}  pyre {detail}{suffix}",
+                            detail,
+                            fmt_time(f"{elapsed:.2f}"),
+                            f"({ratio} vs pypy)",
+                        )
+                    )
 
         snap_status, snap_reason = self._apply_snapshot_gate(
             backend, name, script, output, stderr, elapsed, timeout,
@@ -2615,6 +2670,17 @@ class Check:
                 dim(
                     f"cpython reference skipped (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s) "
                     f"for {len(self.cpython_reference_skips)}: {names}"
+                )
+            )
+        # A wasm run with no dynasm run beside it leaves WASM_MAX_DYNASM_RATIO
+        # with nothing to divide by. Said out loud because the per-fixture line
+        # for an unevaluated gate is the same green as a satisfied one.
+        if self.wasm_ratio_ungated:
+            print(
+                dim(
+                    f"wasm/dynasm {WASM_MAX_DYNASM_RATIO:g}x ratio not evaluated for "
+                    f"{len(self.wasm_ratio_ungated)} fixture(s): dynasm did not run "
+                    f"them in this invocation"
                 )
             )
         # The same weaker baseline, asked for rather than discovered. Listed
