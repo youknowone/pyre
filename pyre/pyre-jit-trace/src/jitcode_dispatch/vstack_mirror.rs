@@ -222,7 +222,9 @@ pub(crate) fn classify_vstack_opcode(
         // LOAD_SPECIAL pops the context-manager object at `prev_depth - 1`
         // and pushes the special method followed by the call self/NULL slot
         // upward from that position.  Clear that popped slot and the pushed
-        // range so each pushed slot is sourced from the virtualizable shadow.
+        // range so each pushed slot is sourced from the virtualizable shadow,
+        // except the trailing `self_or_null` the reconcile stamps as an
+        // explicit NULL constant.
         Instruction::LoadSpecial { method }
             if matches!(
                 method.get(op_arg),
@@ -230,7 +232,7 @@ pub(crate) fn classify_vstack_opcode(
                     | pyre_interpreter::bytecode::SpecialMethod::Exit
             ) =>
         {
-            VstackOpClass::MultiResultFromShadow
+            VstackOpClass::LoadSpecialMethod
         }
 
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
@@ -682,13 +684,29 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             ctx.vstack_boxes.clear();
             ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
         }
-        VstackOpClass::MultiResultFromShadow => {
+        VstackOpClass::MultiResultFromShadow | VstackOpClass::LoadSpecialMethod => {
             // UNPACK_* pops ONE sequence (at `prev_depth - 1`) and pushes its
             // elements upward.  Clear only the affected range
             // `[pop_point .. new_depth)` to NONE so the hole-fill below
             // sources each pushed element from the shadow (all were written
             // through `setarrayitem_vable_r`); slots BELOW the popped sequence
             // keep their mirror-tracked boxes.
+            //
+            // LOAD_SPECIAL has that same shape but its second push is the
+            // call's `self_or_null` slot, a live NULL for the bound method it
+            // just resolved.  The shadow cannot give that slot back:
+            // `reseed_vstack_from_shadow` reads a dense array in which an
+            // absent slot and a written NULL are the same word, so it rejects
+            // NULL and the slot stays a NONE hole `stack_sync` omits.  A
+            // blackhole resuming into the `WITH_EXCEPT_START` that reads it
+            // then sees whatever the slot held before — the bound `__exit__`
+            // this same opcode pushed one slot below — and calls it with the
+            // receiver twice.  Stamp the constant, as the method-form
+            // LOAD_GLOBAL arm above does for the other callable/NULL pair.
+            let trailing_null = match effective_class {
+                VstackOpClass::LoadSpecialMethod => Some(ctx.trace_ctx.const_null()),
+                _ => None,
+            };
             let pop_point = ctx.vstack_depth.saturating_sub(1);
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {
@@ -696,6 +714,11 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             }
             for s in pop_point..new_depth {
                 ctx.vstack_boxes[s] = OpRef::NONE;
+            }
+            if new_depth > 0 {
+                if let Some(null) = trailing_null {
+                    ctx.vstack_boxes[new_depth - 1] = null;
+                }
             }
         }
         VstackOpClass::Unmodeled => {

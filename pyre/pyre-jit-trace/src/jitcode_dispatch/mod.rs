@@ -6811,6 +6811,15 @@ enum VstackOpClass {
     /// sequence keep their mirror-tracked boxes (the hole-fill never
     /// overwrites a non-NONE slot).  Never latches the mirror invalid.
     MultiResultFromShadow,
+    /// `LOAD_SPECIAL` (`__enter__` / `__exit__`): pop the context manager and
+    /// push the resolved special method followed by the call's `self_or_null`
+    /// slot.  Same pop-then-push-a-group shape as
+    /// [`VstackOpClass::MultiResultFromShadow`], except that the top slot is a
+    /// live NULL the shadow cannot return — its source is a dense array where
+    /// an absent slot and a written NULL are the same word — so reconcile
+    /// stamps the NULL constant there instead, as [`Self::LoadGlobalMethod`]
+    /// does for the other callable/NULL pair.
+    LoadSpecialMethod,
     /// Anything that does not fit the shapes above — FOR_ITER or any opcode
     /// this classifier does not recognise.  Latches `vstack_valid = false`
     /// so the overlay omits those slots, which resume re-materializes (zero

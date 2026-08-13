@@ -6967,6 +6967,13 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // FOR_ITER item is in-flight (try_walker_inline_user_call).
             | I::Call { .. }
             | I::CallKw { .. }
+            // CALL_FUNCTION_EX is the same MayForce call boundary as CALL and
+            // CALL_KW.  The codewriter lowers it through
+            // PyreHelperKind::CallFunctionEx, and
+            // fbw_callee_body_replay_safety defers CallFn, CallKw, and
+            // CallFunctionEx together; omitting only the starred-call spelling
+            // here added no safety beyond the Layer 2 defense above.
+            | I::CallFunctionEx
             | I::LoadGlobal { .. }
             | I::Resume { .. }
             // container builders: produce new heap objects but do not mutate
@@ -6974,6 +6981,17 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::BuildList { .. }
             | I::BuildSet { .. }
             | I::BuildMap { .. }
+            // MAKE_FUNCTION is another fresh-object builder: codewriter.rs
+            // lowers PyreHelperKind::MakeFunction as a Plain allocation that
+            // runs no user code and cannot raise. SET_FUNCTION_ATTRIBUTE only
+            // initializes that newly-built function's typed fields, likewise
+            // without user code or an exception, so replay drops or rebuilds
+            // the incomplete function rather than mutating a pre-existing
+            // object. MakeCell belongs to the containing frame's prologue and
+            // CopyFreeVars to the nested function's prologue, not to this
+            // definition sequence.
+            | I::MakeFunction { .. }
+            | I::SetFunctionAttribute { .. }
             // In-frame exception raise / handling. These opcodes already trace
             // in the while-loop form (whose body bypasses this FOR_ITER-only
             // scan): the raised exception is virtualized and a walk abort
@@ -6984,6 +7002,18 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::CheckExcMatch
             | I::PopExcept
             | I::Reraise { .. }
+            // `LOAD_SPECIAL` and `WITH_EXCEPT_START` are NOT admitted. The
+            // opcodes themselves are safe — neither runs user code, and the
+            // calls they set up are ordinary `Call` boundaries admitted above —
+            // but admitting them puts `with` inside `for` in the JIT, and a
+            // `@contextmanager` generator used that way loses a `GeneratorExit`
+            // to the caller: `test.test_pow` `test_negative_exponent` (nested
+            // `for` around `with self.subTest(...)`) errors with a bare
+            // `GeneratorExit`, at a coordinate that moves between runs and is
+            // clean under `PYRE_JIT=0`. `bench/synth/foriter_load_special_with`
+            // records the shape's answer while the frame stays interpreted;
+            // `bench/synth/exception_with_exit_self_null_slot` is the `while`
+            // form, which never depended on this gate.
             // oparg prefix + inline-cache padding (no-ops in the body scan)
             | I::ExtendedArg
             | I::Cache
@@ -7297,22 +7327,39 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
             body_state = pyre_interpreter::OpArgState::default();
             continue;
         }
+        // CALL_INTRINSIC_1 names several unrelated operations. UnaryPositive
+        // and ListToTuple are the two variants codewriter.rs actually lowers:
+        // the first follows the same implicit-dunder exact-resume path as
+        // UnaryNegative, while the second returns a fresh tuple. Keep counting
+        // the opcode in body_has_call so a unary-positive user frame still
+        // taints LIST_APPEND, but do not admit the def-time/import/error-path
+        // variants whose lowering deliberately aborts permanently.
+        let supported_call_intrinsic_1 = matches!(
+            body_instr,
+            I::CallIntrinsic1 { func }
+                if matches!(
+                    func.get(body_arg),
+                    pyre_interpreter::bytecode::IntrinsicFunction1::UnaryPositive
+                        | pyre_interpreter::bytecode::IntrinsicFunction1::ListToTuple
+                )
+        );
         let permitted = for_iter_body_op_is_jit_safe(body_instr)
+            || supported_call_intrinsic_1
             || matches!(
                 body_instr,
                 I::StoreSubscr
-                            | I::StoreAttr { .. }
-                            | I::StoreName { .. }
-                            | I::StoreGlobal { .. }
-                            | I::StoreDeref { .. }
-                            | I::DeleteSubscr
-                            | I::DeleteAttr { .. }
-                            | I::LoadName { .. }
-                            // `call_method(set, 'add', v)` / `setitem(d, k, v)`
-                            // spelled as one opcode; void residuals, not folds.
-                            | I::ListExtend { .. }
-                            | I::SetAdd { .. }
-                            | I::MapAdd { .. }
+                    | I::StoreAttr { .. }
+                    | I::StoreName { .. }
+                    | I::StoreGlobal { .. }
+                    | I::StoreDeref { .. }
+                    | I::DeleteSubscr
+                    | I::DeleteAttr { .. }
+                    | I::LoadName { .. }
+                    // `call_method(set, 'add', v)` / `setitem(d, k, v)`
+                    // spelled as one opcode; void residuals, not folds.
+                    | I::ListExtend { .. }
+                    | I::SetAdd { .. }
+                    | I::MapAdd { .. }
             )
             || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
         if !permitted {
