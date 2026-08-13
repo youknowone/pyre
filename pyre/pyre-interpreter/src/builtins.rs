@@ -16157,6 +16157,11 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// target-neutral so the seek-back behavior Windows relies on is covered by
 /// the ordinary test build too.
 fn file_write_at(data: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> Result<usize, crate::PyError> {
+    if bytes.is_empty() {
+        // `interp_bytesio.py:124-125` returns before writing for a zero-length
+        // buffer, so writing nothing past the end must not extend the file.
+        return Ok(pos);
+    }
     let end = pos
         .checked_add(bytes.len())
         .ok_or_else(|| crate::PyError::overflow_error("write position out of range"))?;
@@ -18021,6 +18026,14 @@ mod tests {
         let end = file_write_at(&mut data, 12, b"x").unwrap();
         assert_eq!(end, 13);
         assert_eq!(&data[11..], b"\0x");
+    }
+
+    #[test]
+    fn in_memory_file_empty_write_past_the_end_keeps_the_size() {
+        let mut data = b"abc".to_vec();
+        let end = file_write_at(&mut data, 4096, b"").unwrap();
+        assert_eq!(end, 4096);
+        assert_eq!(&data, b"abc");
     }
 
     #[test]
