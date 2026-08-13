@@ -1567,30 +1567,14 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 
 /// descroperation.py `descr__call__` — `space.lookup(w_obj, '__call__')`.
 ///
-/// Consulted once the builtin callables above have had their turn, so it
-/// admits only the receivers none of them claim: an object carrying a generic
-/// payload (`weakref.ref` and friends, whose class holds the `__call__`), and
-/// an instance of a user-defined class — including one deriving from a builtin
-/// type, where `class C(int)` carries its `__call__` on the type just as a
-/// plain `class C` does.  `space.lookup` applies equally to interp-level
-/// `W_Root` payloads whose `TypeDef` publishes a call slot, so the accelerator
-/// key wrapper is admitted here as well.
+/// Consulted once the builtin callables above have had their turn.  PyPy's
+/// `space.lookup` applies uniformly to every `W_Root`: the storage layout is
+/// irrelevant when the object's dynamic type publishes a `__call__` slot.
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    // Most fixed-layout builtin payloads are deliberately not generic
-    // instances.  Admit the accelerator payloads whose TypeDefs publish
-    // `__call__`, while retaining the guard for all other internal objects.
-    let typed_callable = crate::module::_functools::W_KeyWrapper::from_obj(callable).is_some()
-        || crate::module::_json::W_Scanner::from_obj(callable).is_some()
-        || crate::module::_json::W_Encoder::from_obj(callable).is_some();
-    if !unsafe { pyre_object::is_instance(callable) || pyre_object::w_type_is_heaptype(w_type) }
-        && !typed_callable
-    {
-        return Ok(None);
-    }
     let Some(call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") }) else {
         return Ok(None);
     };

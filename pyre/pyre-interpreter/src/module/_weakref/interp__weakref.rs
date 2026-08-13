@@ -78,6 +78,55 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     }
 }
 
+/// Field bridge for the exact typed `W_Weakref` and the still-generated
+/// mapdict layout of a Python `weakref.ref` subclass.  PyPy presents the same
+/// `W_WeakrefBase` fields on both translated classes; only their physical
+/// composition differs (`typedef.py:174-227`).
+#[inline]
+fn weakref_obj_weak(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_obj_weak(obj) }
+    } else {
+        read_attr(obj, ATTR_W_OBJ_WEAK)
+    }
+}
+
+#[inline]
+fn weakref_callable(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_callable(obj) }
+    } else {
+        read_attr(obj, ATTR_W_CALLABLE)
+    }
+}
+
+#[inline]
+fn weakref_set_callable(obj: PyObjectRef, value: PyObjectRef) {
+    if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_set_callable(obj, value) };
+    } else {
+        write_attr(obj, ATTR_W_CALLABLE, value);
+    }
+}
+
+#[inline]
+fn weakref_hash(obj: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_hash(obj) }
+    } else {
+        read_attr(obj, ATTR_W_HASH)
+    }
+}
+
+#[inline]
+fn weakref_set_hash(obj: PyObjectRef, value: PyObjectRef) {
+    if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_set_hash(obj, value) };
+    } else {
+        write_attr(obj, ATTR_W_HASH, value);
+    }
+}
+
 /// Scoped GC root for a freshly-allocated instance still held only in a
 /// Rust local. The weakref / proxy constructors allocate the instance,
 /// then allocate a `GcWeakrefBox` (an `rweakref` `Weakref` via
@@ -212,7 +261,11 @@ pub fn weakref_type() -> PyObjectRef {
             crate::typedef::w_object(),
             &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
         );
-        unsafe { pyre_object::w_type_set_hasdict(tp, true) };
+        // This mixed-module type is created lazily after the eager
+        // `init_typeobjects` registry pass. Bind its translated static layout
+        // now, exactly as `py_class_typed!` and `getset_descriptor_type` do,
+        // so W_Weakref::allocate_stable stamps the live ReferenceType class.
+        pyre_object::set_instantiate(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE, tp);
         tp as usize
     }) as PyObjectRef
 }
@@ -601,6 +654,44 @@ pub fn W_Weakref_new(
     } else {
         w_subtype
     };
+    // typeobject.py `allocate_instance`: a subclass whose Layout adds no
+    // storage keeps the builtin W_Weakref layout and changes only `w_class`.
+    // In particular `class R(ref): __slots__ = ()` has neither mapdict nor
+    // member slots in which the three interpreter-owned fields could live.
+    let exact_type = std::ptr::eq(actual_type, weakref_type());
+    let shares_base_layout = !exact_type
+        && unsafe {
+            !pyre_object::w_type_get_hasdict(actual_type)
+                && pyre_object::w_type_get_nslots(actual_type)
+                    == pyre_object::w_type_get_nslots(weakref_type())
+        };
+    if exact_type || shares_base_layout {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        pyre_object::gc_roots::pin_root(w_callable);
+        let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+        );
+        pyre_object::gc_roots::pin_root(w_obj_weak);
+        let callable = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let callable = if !callable.is_null() && !unsafe { pyre_object::is_none(callable) } {
+            callable
+        } else {
+            pyre_object::PY_NULL
+        };
+        let weakref = pyre_object::weakref::w_weakref_object_new(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+            callable,
+            pyre_object::PY_NULL,
+        );
+        return if exact_type {
+            weakref
+        } else {
+            crate::typedef::tag_subclass_instance(weakref, actual_type)
+        };
+    }
+
     let mut obj = w_instance_new(actual_type);
     let _root = InstanceRoot::new(&mut obj);
     // W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj).
@@ -661,7 +752,7 @@ pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObj
 /// ```
 #[majit_macros::dont_look_inside]
 pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
-    let slot = read_attr(w_ref, ATTR_W_OBJ_WEAK);
+    let slot = weakref_obj_weak(w_ref);
     unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(slot) }
 }
 
@@ -760,7 +851,7 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(args[0]);
     let current_self = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    let cached = read_attr(current_self(), ATTR_W_HASH);
+    let cached = weakref_hash(current_self());
     if !cached.is_null() {
         return Ok(cached);
     }
@@ -778,7 +869,7 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let h = pyre_object::w_int_new(crate::baseobjspace::hash_w_strict(
         pyre_object::gc_roots::shadow_stack_get(obj_slot),
     )?);
-    write_attr(current_self(), ATTR_W_HASH, h);
+    weakref_set_hash(current_self(), h);
     Ok(h)
 }
 
@@ -854,7 +945,7 @@ pub fn descr__ne__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `__callback__ = GetSetProperty(W_Weakref.descr_callback)`.
 /// GetSetProperty passes `(descriptor, instance)` to the getter.
 pub fn descr_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_callable = read_attr(args[1], ATTR_W_CALLABLE);
+    let w_callable = weakref_callable(args[1]);
     if w_callable.is_null() {
         Ok(pyre_object::w_none())
     } else {
@@ -1024,7 +1115,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
     unsafe { pyre_object::weakref::w_weakref_lifeline_set_other_refs(w_obj, pyre_object::PY_NULL) };
     for &slot in ref_slots.iter().rev() {
         let w_ref = pyre_object::gc_roots::shadow_stack_get(slot);
-        let w_callable = read_attr(w_ref, ATTR_W_CALLABLE);
+        let w_callable = weakref_callable(w_ref);
         if w_callable.is_null() {
             continue;
         }
@@ -1046,7 +1137,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
                 );
             }
         }
-        write_attr(current_ref(), ATTR_W_CALLABLE, pyre_object::w_none());
+        weakref_set_callable(current_ref(), pyre_object::PY_NULL);
     }
 }
 
@@ -2236,6 +2327,28 @@ pub(crate) fn lock_proxy_tests() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_exact_weakref_uses_typed_fields_and_hash_cache() {
+        crate::typedef::init_typeobjects();
+        let referent = pyre_object::w_str_new("weakref target");
+        let weakref = W_Weakref_new(weakref_type(), referent, PY_NULL);
+        assert!(unsafe { pyre_object::weakref::is_typed_weakref(weakref) });
+        assert!(!unsafe { pyre_object::w_type_get_hasdict(weakref_type()) });
+        assert!(
+            crate::typedef::r#type(weakref)
+                .is_some_and(|tp| std::ptr::eq(tp.as_ptr(), weakref_type()))
+        );
+        assert!(std::ptr::eq(dereference(weakref), referent));
+        let called = crate::call::call_function_impl_result(weakref, &[]).unwrap();
+        assert!(std::ptr::eq(called, referent));
+        assert!(unsafe { pyre_object::is_none(descr_callback(&[PY_NULL, weakref]).unwrap()) });
+
+        let first = descr_hash(&[weakref]).unwrap();
+        let second = descr_hash(&[weakref]).unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert!(std::ptr::eq(weakref_hash(weakref), first,));
+    }
 
     /// pypy/module/_weakref/interp__weakref.py:347-354 force —
     /// dead proxy must raise ReferenceError, not RuntimeError.

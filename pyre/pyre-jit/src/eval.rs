@@ -3902,6 +3902,26 @@ fn build_gc() -> Box<MiniMarkGC> {
         lifeline_descr.pytype_ptr as usize,
         lifeline_descr.ptr_offsets,
     );
+    // `interp__weakref.py:193-205 W_Weakref` exact builtin payload. Like the
+    // lifeline above, its allocation is selected by its translated GC layout;
+    // Python class identity remains in the header's `w_class`. Append it after
+    // the lifeline so the already-published lifeline tid stays stable. The
+    // separate generated user-subclass layout remains mapdict-backed.
+    let weakref_descr =
+        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        weakref_descr.object_size,
+        weakref_descr.ptr_offsets.to_vec(),
+    ));
+    if weakref_descr.gc_type_id.is_unassigned() {
+        weakref_descr.gc_type_id.set(weakref_object_tid);
+    } else {
+        debug_assert_eq!(weakref_descr.gc_type_id.get(), weakref_object_tid);
+    }
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        weakref_descr.pytype_ptr as usize,
+        weakref_descr.ptr_offsets,
+    );
 
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
