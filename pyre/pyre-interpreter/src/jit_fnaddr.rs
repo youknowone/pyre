@@ -344,24 +344,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     push_alias_pair(
         &mut entries,
-        "pyre_interpreter::gateway::method_arity_failure",
-        "gateway::method_arity_failure",
-        crate::gateway::method_arity_failure as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::gateway::method_noarg_failure",
-        "gateway::method_noarg_failure",
-        crate::gateway::method_noarg_failure as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::gateway::method_min_arity_failure",
-        "gateway::method_min_arity_failure",
-        crate::gateway::method_min_arity_failure as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
         "pyre_interpreter::builtins::builtin_kwargs_marker_dict",
         "builtins::builtin_kwargs_marker_dict",
         crate::builtins::builtin_kwargs_marker_dict as *const (),
@@ -704,30 +686,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::pin_root",
         pyre_object::gc_roots::pin_root as *const (),
     );
-    // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY`
-    // bit, `box_str_constant` reads the TLS `STRING_CONSTANT_CACHE`, and
-    // `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — all through
+    // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
+    // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
     // state the tracer cannot model (the `pin_root` / `try_gc_write_barrier`
-    // twins).  Their `#[dont_look_inside]` calls bind the Rust `fn` directly
-    // by qualified path (`-> ()` / pointer / `-> bool` signatures are
-    // JIT-representable).
+    // twins). Their `#[dont_look_inside]` calls bind the Rust `fn` directly by
+    // qualified path (`-> ()` / `-> bool` signatures are JIT-representable).
     push_alias_pair(
         &mut entries,
         "pyre_object::gc_roots::mark_prebuilt_roots_dirty",
         "pyre_object::mark_prebuilt_roots_dirty",
         pyre_object::gc_roots::mark_prebuilt_roots_dirty as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::unicodeobject::box_str_constant",
-        "pyre_object::box_str_constant",
-        pyre_object::unicodeobject::box_str_constant as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::unicodeobject::w_str_new",
-        "pyre_object::w_str_new",
-        pyre_object::unicodeobject::w_str_new as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -792,15 +760,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // #346: direct allocation roots residualised via `#[dont_look_inside]`;
     // each binds both the qualified module path and the glob-re-exported root
     // alias. `function_new_impl` lives in this crate so it binds through
-    // `crate::`. The bytes/bytearray constructors allocate a GC-managed storage
-    // box (off-GC storage) that is not phaseA-liftable, so they
+    // `crate::`. The bytearray constructors allocate a GC-managed storage box
+    // (off-GC storage) that is not phaseA-liftable, so they
     // residualise like the `malloc_typed` (`NewWithVtable`) roots below.
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::bytesobject::w_bytes_from_bytes",
-        "pyre_object::w_bytes_from_bytes",
-        pyre_object::bytesobject::w_bytes_from_bytes as *const (),
-    );
     push_alias_pair(
         &mut entries,
         "pyre_object::bytearrayobject::w_bytearray_new",
@@ -846,24 +808,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "bool_invert_deprecation_text",
         bool_invert_deprecation_text as *const (),
     );
-    // `lookup_exc_class` is `#[dont_look_inside]` (it hides the
-    // `EXC_CLASS_REGISTRY` static); bind it so the residual call from
-    // `warn::warn_category_w` and the `_warnings` category helpers resolves.
-    let lookup_exc_class: fn(&str) -> Option<pyre_object::PyObjectRef> =
-        crate::builtins::lookup_exc_class;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::builtins::lookup_exc_class",
-        "pyre_interpreter::lookup_exc_class",
-        lookup_exc_class as *const (),
-    );
-    push_fnaddr(
-        &mut entries,
-        "lookup_exc_class",
-        lookup_exc_class as *const (),
-    );
-    // `emit_stdout` / `emit_stderr` are `#[dont_look_inside]` (host stdio
-    // handles); bind them so the residual calls resolve.
+    // `emit_stdout` is `#[dont_look_inside]` (host stdio handle); bind it so
+    // the residual call resolves.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
     push_alias_pair(
         &mut entries,
@@ -872,14 +818,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         emit_stdout as *const (),
     );
     push_fnaddr(&mut entries, "emit_stdout", emit_stdout as *const ());
-    let emit_stderr: fn(&[u8]) = crate::host_seam::emit_stderr;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::host_seam::emit_stderr",
-        "pyre_interpreter::emit_stderr",
-        emit_stderr as *const (),
-    );
-    push_fnaddr(&mut entries, "emit_stderr", emit_stderr as *const ());
     // `w_set_new` / `w_frozenset_new` are `#[dont_look_inside]` for the same
     // host `IndexMap::new` storage-box reason; bind their zero-arg
     // `fn() -> PyObjectRef` so the residual calls resolve.
@@ -919,12 +857,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dictmultiobject::w_dict_len",
         "pyre_object::w_dict_len",
         pyre_object::dictmultiobject::w_dict_len as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::dictmultiobject::w_dict_setitem_str",
-        "pyre_object::w_dict_setitem_str",
-        pyre_object::dictmultiobject::w_dict_setitem_str as *const (),
     );
     // The wtf8-keyed dict adapters residualise their fallible `Wtf8::as_str`
     // dispatch: `wtf8_key_is_utf8` is the `bool` validity probe, and
@@ -1082,47 +1014,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::memoryview_gather_bytes",
         memoryview_gather_bytes as *const (),
     );
-    // #346: `lookup_in_type_where_uncached` is the scalar-`Option` residual
-    // boundary over the cold uncached MRO walk. With `compute_mro` opaque,
-    // `lookup_where`'s `mro` phi-merges the cached slice against the opaque
-    // `Vec` borrow (`<other> ∪ _ptr`), a union the annotator cannot model, so
-    // this projection carries `#[dont_look_inside]`. No build-time constant, so
-    // bind its `fn` directly by qualified path.
-    let lookup_in_type_where_uncached: unsafe fn(
-        pyre_object::PyObjectRef,
-        &str,
-    ) -> Option<pyre_object::PyObjectRef> = crate::baseobjspace::lookup_in_type_where_uncached;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::lookup_in_type_where_uncached",
-        "pyre_interpreter::lookup_in_type_where_uncached",
-        lookup_in_type_where_uncached as *const (),
-    );
-    // #346: the WTF-8 twin of the projection above. `lookup_in_type_wtf8_uncached`
-    // maps the tuple-payload `Option<(PyObjectRef, PyObjectRef)>` of the already
-    // opaque `lookup_where_pair_wtf8_uncached` to the value; tracing that `.map`
-    // walls the annotator on the tuple's classdef-less payload, so it is
-    // `#[dont_look_inside]` and residualises to the single-word `Option`.
-    let lookup_in_type_wtf8_uncached: unsafe fn(
-        pyre_object::PyObjectRef,
-        &rustpython_wtf8::Wtf8,
-    ) -> Option<pyre_object::PyObjectRef> = crate::baseobjspace::lookup_in_type_wtf8_uncached;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::lookup_in_type_wtf8_uncached",
-        "pyre_interpreter::lookup_in_type_wtf8_uncached",
-        lookup_in_type_wtf8_uncached as *const (),
-    );
-    // #346: the getattribute attribute-miss / special-attribute path.  Its cold
-    // `[Option; 2].iter().flatten()` metaclass walks and array indexing are
-    // opaque to the annotator, so it is `#[dont_look_inside]` and residualises
-    // over the blessed `PyResult` carrier; bind its `fn` by qualified path.
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::object_getattr_miss",
-        "pyre_interpreter::object_getattr_miss",
-        crate::baseobjspace::object_getattr_miss as *const (),
-    );
     // `gc_interp::enabled` reads (and lazily inits) the `STATE` atomic, and
     // `longobject::bigint_gc_type_id` /
     // `dictmultiobject::dict_view_iterator_gc_type_id` read the
@@ -1164,9 +1055,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `set_sys_modules_dict` stamps, `sys_modules_registry_get` the
     // `SYS_MODULES` name→module registry those stamps mirror,
     // `set_in_flight_exception` writes the
-    // `IN_FLIGHT_EXCEPTION` thread-local, `lookup_exc_class` reads the
-    // `EXC_CLASS_REGISTRY` `OnceLock`, `check_sys_modules` the process-owned
-    // `SYS_MODULES` registry, `mmap_type` the lazily-installed
+    // `IN_FLIGHT_EXCEPTION` thread-local, `mmap_type` the lazily-installed
     // `mmap` type object, and the two `note_eval_activation_*` twins move the
     // `EVAL_NESTING` thread-local `at_outermost_activation` already reads.
     // None is a build-time constant, so each carries `#[dont_look_inside]`
@@ -1239,21 +1128,14 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::state_ns",
         warnings_state_ns as *const (),
     );
-    // The host-boundary seams beside them: the two fd writers every
-    // diagnostic path funnels through, and the thread-identity read.
+    // The host-boundary seams beside them: the stdout fd writer and the
+    // thread-identity read.
     let emit_stdout: fn(&[u8]) = crate::host_seam::emit_stdout;
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::host_seam::emit_stdout",
         "pyre_interpreter::emit_stdout",
         emit_stdout as *const (),
-    );
-    let emit_stderr: fn(&[u8]) = crate::host_seam::emit_stderr;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::host_seam::emit_stderr",
-        "pyre_interpreter::emit_stderr",
-        emit_stderr as *const (),
     );
     let current_ident: fn() -> i64 = crate::module::thread::current_ident;
     push_alias_pair(
@@ -1269,22 +1151,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::eval::set_in_flight_exception",
         "pyre_interpreter::set_in_flight_exception",
         set_in_flight_exception as *const (),
-    );
-    let lookup_exc_class: fn(&str) -> Option<pyre_object::PyObjectRef> =
-        crate::builtins::lookup_exc_class;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::builtins::lookup_exc_class",
-        "pyre_interpreter::lookup_exc_class",
-        lookup_exc_class as *const (),
-    );
-    let check_sys_modules: fn(&str) -> Option<pyre_object::PyObjectRef> =
-        crate::importing::check_sys_modules;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::importing::check_sys_modules",
-        "pyre_interpreter::check_sys_modules",
-        check_sys_modules as *const (),
     );
     // `mmap_type` is `#[cfg(unix)]` inside `interp_mmap`, and the `mmap`
     // module itself is gated at `module/mod.rs:80`; the row has to carry
@@ -2044,18 +1910,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked as *const (),
     );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::dict_eq_hook::hash_str_hooked_bytes",
-        "pyre_object::hash_str_hooked_bytes",
-        pyre_object::dict_eq_hook::hash_str_hooked_bytes as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::dictmultiobject::dict_entries_probe_str",
-        "pyre_object::dict_entries_probe_str",
-        pyre_object::dictmultiobject::dict_entries_probe_str as *const (),
-    );
+    /*
+     * Fat-pointer arguments (`&str`, `&[u8]`, `&Wtf8`) are two words, but the
+     * residual-call ABI passes one register per argument slot; publishing these
+     * addresses would pass one word where the callee reads two.
+     */
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_probe_object",
@@ -2132,14 +1991,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dict_entries_insert_object",
         pyre_object::dictmultiobject::dict_entries_insert_object as *const (),
     );
-    // The index-returning twins of the `dict_entries_probe_*` pair, for
-    // `setitem_str`'s borrow-key membership test.
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::dictmultiobject::dict_entries_index_of_str_hashed",
-        "pyre_object::dict_entries_index_of_str_hashed",
-        pyre_object::dictmultiobject::dict_entries_index_of_str_hashed as *const (),
-    );
+    // The index-returning twin of the object-key probe.
     push_alias_pair(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_index_of_object",
@@ -2170,19 +2022,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::dictmultiobject::w_dict_unicode_key_hash",
         "pyre_object::w_dict_unicode_key_hash",
         w_dict_unicode_key_hash as *const (),
-    );
-    // The module-dict storage's own `String`-keyed probe / store pair.
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::celldict::module_dict_entries_get",
-        "pyre_object::module_dict_entries_get",
-        pyre_object::celldict::module_dict_entries_get as *const (),
-    );
-    push_alias_pair(
-        &mut entries,
-        "pyre_object::celldict::module_dict_entries_insert",
-        "pyre_object::module_dict_entries_insert",
-        pyre_object::celldict::module_dict_entries_insert as *const (),
     );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
