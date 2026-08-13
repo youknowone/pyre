@@ -140,6 +140,13 @@ struct MetaInterpStaticData {
     /// `state::bytecode_for_address`) and from future callers that
     /// hold a `&mut MetaInterpStaticData` directly.
     canonical: majit_metainterp::MetaInterpStaticData,
+    /// Translated-mode `pyjitpl.py:2326-2342 indirectcall_dict` values for
+    /// frozen source-translation targets. The artifact-level dictionary maps
+    /// fnaddr to dense index without decoding bodies; this owner memoizes only
+    /// bodies actually requested, preserving upstream's stable JitCode object
+    /// identity within this interpreter/JIT state.
+    frozen_indirectcall_dict:
+        indexmap::IndexMap<usize, std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
 }
 
 #[allow(dead_code)]
@@ -159,6 +166,7 @@ impl MetaInterpStaticData {
             op_float_return: u8::MAX,
             op_void_return: u8::MAX,
             canonical: majit_metainterp::MetaInterpStaticData::new(),
+            frozen_indirectcall_dict: indexmap::IndexMap::new(),
         }
     }
 
@@ -172,6 +180,20 @@ impl MetaInterpStaticData {
         targets: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
     ) {
         self.canonical.setup_indirectcalltargets(targets);
+    }
+
+    fn frozen_bytecode_for_address(
+        &mut self,
+        fnaddress: usize,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        if let Some(jitcode) = self.frozen_indirectcall_dict.get(&fnaddress) {
+            return Some(std::sync::Arc::clone(jitcode));
+        }
+        let index = crate::jitcode_runtime::indirectcalltarget_index_for_address(fnaddress)?;
+        let jitcode = crate::jitcode_runtime::indirectcalltarget_by_index(index)?;
+        self.frozen_indirectcall_dict
+            .insert(fnaddress, std::sync::Arc::clone(&jitcode));
+        Some(jitcode)
     }
 
     /// pyjitpl.py:2326-2343 `bytecode_for_address(fnaddress)`.
@@ -429,11 +451,21 @@ impl MetaInterpStaticData {
         // wherever the first lazy body decode lands.
         crate::runtime_fnaddr_patch::prime_address_correspondences();
         let reserved = crate::jitcode_runtime::jitcode_count();
+        // Pyre has two JitCode producers (the frozen source-translation table
+        // and the lazy per-PyCode writer), so it must reserve the frozen
+        // table's dense index range before appending runtime entries. RPython
+        // needs no placeholder objects: its one codewriter has already
+        // produced the complete list at `warmspot.py:281-282`. These slots
+        // therefore share one inert null skeleton until an actual frozen body
+        // is installed, instead of manufacturing thousands of heavyweight
+        // skeletons solely to occupy indices.
+        let placeholder = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
         while self.jitcodes.len() < reserved {
             let index = self.jitcodes.len() as i32;
-            let payload = std::sync::Arc::new(crate::PyJitCode::skeleton(std::ptr::null()));
-            Self::stamp_payload_index(index, &payload);
-            self.jitcodes.push(Box::new(JitCode { index, payload }));
+            self.jitcodes.push(Box::new(JitCode {
+                index,
+                payload: std::sync::Arc::clone(&placeholder),
+            }));
         }
     }
 
@@ -615,21 +647,10 @@ pub fn blackhole_control_opcodes() -> (i32, i32, i32) {
 /// `Assembler::indirectcalltargets_vec` in `pyre-jit`.
 pub fn setup_indirectcalltargets(targets: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>) {
     ensure_finish_setup();
-    // The source translator and runtime per-CodeObject writer are two Rust
-    // assembler objects standing in for one RPython CodeWriter assembler.
-    // Keep the frozen source-translation PBC family when runtime targets are
-    // published instead of replacing it with the latest runtime-only batch.
-    let frozen = crate::jitcode_runtime::indirectcalltargets();
-    let mut merged = frozen.to_vec();
-    for target in targets {
-        if !merged
-            .iter()
-            .any(|existing| existing.fnaddr == target.fnaddr)
-        {
-            merged.push(target);
-        }
-    }
-    METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(merged));
+    // Frozen source-translation targets stay in the artifact-backed lazy
+    // dictionary used by `bytecode_for_address`; only runtime-writer targets
+    // need concrete objects in the canonical staticdata list.
+    METAINTERP_SD.with(|r| r.borrow_mut().setup_indirectcalltargets(targets));
 }
 
 /// pyjitpl.py:2326-2343 module-level entry point for
@@ -643,7 +664,11 @@ pub fn bytecode_for_address(
     fnaddress: usize,
 ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     ensure_finish_setup();
-    METAINTERP_SD.with(|r| r.borrow_mut().bytecode_for_address(fnaddress))
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        sd.frozen_bytecode_for_address(fnaddress)
+            .or_else(|| sd.bytecode_for_address(fnaddress))
+    })
 }
 
 use std::cell::RefCell;

@@ -208,16 +208,16 @@ pub fn indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCode
 
 fn build_indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCode>] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
-    let indices: Vec<usize> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    let entries: Vec<(usize, i64)> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize indirectcalltargets.bin \
              ({} bytes): {e}",
             BYTES.len(),
         )
     });
-    let vec: Vec<Arc<majit_metainterp::jitcode::JitCode>> = indices
+    let vec: Vec<Arc<majit_metainterp::jitcode::JitCode>> = entries
         .into_iter()
-        .map(|index| {
+        .map(|(index, _)| {
             let canonical = get_jitcode_by_index(index).unwrap_or_else(|| {
                 panic!(
                     "pyre-jit-trace: indirect-call target index {index} is \
@@ -231,6 +231,49 @@ fn build_indirectcalltargets() -> &'static [Arc<majit_metainterp::jitcode::JitCo
         })
         .collect();
     Box::leak(vec.into_boxed_slice())
+}
+
+/// RPython `bytecode_for_address`'s translated-mode dictionary, represented
+/// without eagerly materializing its AOT JitCode values.
+///
+/// In a translated PyPy binary the JitCode shells already exist as static
+/// objects and the first lookup only builds `fnaddr -> object`.  Pyre's shells
+/// are serialized build artifacts, so deserializing all ~1,500 bodies to make
+/// that dictionary turns static binary data into a large first-loop RSS tax.
+/// Preserve the same dict lookup while keeping `index` as the value; only the
+/// matched JitCode body is decoded.
+static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> =
+    LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/indirectcalltargets.bin"));
+        let entries: Vec<(usize, i64)> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize indirectcalltargets.bin \
+             ({} bytes): {e}",
+                BYTES.len(),
+            )
+        });
+        let mut by_fnaddr = indexmap::IndexMap::with_capacity(entries.len());
+        for (index, build_fnaddr) in entries {
+            let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
+            assert!(
+                by_fnaddr.insert(fnaddr, index).is_none(),
+                "duplicate fnaddr in frozen indirectcalltargets"
+            );
+        }
+        by_fnaddr
+    });
+
+pub(crate) fn indirectcalltarget_index_for_address(fnaddress: usize) -> Option<usize> {
+    INDIRECTCALLTARGET_BY_FNADDR.get(&fnaddress).copied()
+}
+
+pub(crate) fn indirectcalltarget_by_index(
+    index: usize,
+) -> Option<Arc<majit_metainterp::jitcode::JitCode>> {
+    let canonical = get_jitcode_by_index(index)?;
+    Some(Arc::new(
+        majit_metainterp::jitcode::JitCode::from_canonical((*canonical).clone()),
+    ))
 }
 
 // Cached index of the build-time portal jitcode within `ALL_JITCODES`.
@@ -1856,6 +1899,30 @@ mod tests {
     fn deserializes_jitcodes_without_error() {
         let jitcodes = all_jitcodes();
         assert!(!jitcodes.is_empty(), "expected at least one jitcode");
+    }
+
+    #[test]
+    fn indirect_target_lookup_decodes_only_the_matched_jitcode() {
+        std::thread::spawn(|| {
+            assert!(jitcode_cells().iter().all(|cell| cell.get().is_none()));
+            let (&fnaddr, &index) = INDIRECTCALLTARGET_BY_FNADDR
+                .iter()
+                .next()
+                .expect("expected at least one frozen indirect-call target");
+            assert_eq!(indirectcalltarget_index_for_address(fnaddr), Some(index));
+            let jitcode = indirectcalltarget_by_index(index)
+                .expect("frozen indirect-call target index must resolve");
+            assert_eq!(jitcode.fnaddr as usize, fnaddr);
+            assert_eq!(
+                jitcode_cells()
+                    .iter()
+                    .filter(|cell| cell.get().is_some())
+                    .count(),
+                1
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

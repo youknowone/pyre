@@ -253,6 +253,16 @@ pub fn prime_address_correspondences() {
     LazyLock::force(&STATIC_ADDR_CORRESPONDENCE);
 }
 
+/// Resolve one build-process function address to this process's address.
+/// Used by the lazy indirect-call-target index, which needs the shell's
+/// `fnaddr` but deliberately does not deserialize the shell's JitCode body.
+pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
+    FNADDR_CORRESPONDENCE
+        .get(&build_fnaddr)
+        .copied()
+        .unwrap_or(build_fnaddr)
+}
+
 /// High 16 bits of a deferred prebuilt-string sentinel (see
 /// [`majit_translate::assembler::STR_CONST_SENTINEL_BASE`]).  x86-64 user
 /// addresses occupy `0..2^48`, so a real GCREF / host-static address always

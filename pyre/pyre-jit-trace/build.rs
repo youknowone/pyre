@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v6";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v7";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -49,24 +49,25 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// captured so `runtime_fnaddr_patch` can re-pair them with the runtime's
 /// addresses (see the comments at their write sites).
 ///
-/// The other three carry the values those tables exist to repair — the
+/// The other four carry the values those tables exist to repair — the
 /// codewriter bakes `pyre_interpreter::jit_trace_fnaddrs()` addresses into
 /// `JitCode.fnaddr` and funcptr/static-data entries of `JitCode.constants_i`,
 /// which `runtime_fnaddr_patch::patch_constants_i_fnaddrs` and
 /// `patch_static_addr_constants` overwrite after deserialization. They reach
 /// `jitcodes.bin` directly, `descrs.bin` through `BhDescr::JitCode.fnaddr`
-/// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`), and
+/// (`codewriter/assembler.rs`, `fnaddr: jitcode.fnaddr`),
+/// `indirectcalltargets.bin` through its `(index, jitcode.fnaddr)` pairs, and
 /// `jit_metadata.json` through the same pipeline serialized as JSON.
 ///
 /// Excluded from the cross-process verdict only. Within one process the
 /// addresses are the same, so `DeterminismCheck::InProcess` still judges every
 /// one of them — a difference there is real, and `jitcodes.bin` / `descrs.bin`
-/// moving between two in-process generations is the defect that mode was
-/// written for.
+/// / `indirectcalltargets.bin` moving between two in-process generations is
+/// the defect that mode was written for.
 ///
 /// What decides the cross-process verdict after these exclusions:
-/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `indirectcalltargets.bin`,
-/// `jit_drivers.bin`, `insns.bin`, `ei_descr_mints.bin`, `liveness.bin`.
+/// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
+/// `ei_descr_mints.bin`, `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
@@ -78,6 +79,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jit_metadata.json",
     "jitcodes.bin",
+    "indirectcalltargets.bin",
     "descrs.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
@@ -232,7 +234,7 @@ fn emit_llbc_extraction_placeholders() {
     .unwrap();
     std::fs::write(
         format!("{out_dir}/indirectcalltargets.bin"),
-        bincode::serialize(&Vec::<usize>::new()).unwrap(),
+        bincode::serialize(&Vec::<(usize, i64)>::new()).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -983,8 +985,16 @@ fn real_main() {
         let jitcodes_index_bin = bincode::serialize(&(jitcode_names, jitcode_offsets)).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes.bin"), &jitcodes_bin).unwrap();
         std::fs::write(format!("{out_dir}/jitcodes_index.bin"), &jitcodes_index_bin).unwrap();
-        let indirectcalltargets_bin =
-            bincode::serialize(&pipeline.indirectcalltarget_indices).unwrap();
+        // Keep the shell fnaddr beside each dense index.  A translated PyPy
+        // binary already owns these JitCode shells as AOT objects; pyre must
+        // not deserialize every body merely to build
+        // `bytecode_for_address`'s runtime fnaddr dictionary.
+        let indirectcalltargets: Vec<(usize, i64)> = pipeline
+            .indirectcalltarget_indices
+            .iter()
+            .map(|&index| (index, pipeline.jitcodes[index].fnaddr))
+            .collect();
+        let indirectcalltargets_bin = bincode::serialize(&indirectcalltargets).unwrap();
         std::fs::write(
             format!("{out_dir}/indirectcalltargets.bin"),
             &indirectcalltargets_bin,
