@@ -386,6 +386,19 @@ fn extension_import_error(message: String, name: &str, path: &Path) -> crate::Py
     )
 }
 
+/// Resolve an extension's init entry point, or `None` if the library has none.
+///
+/// `dlsym` reports a miss by returning NULL, and a resolver that itself
+/// returns NULL leaves `dlerror` unset, so the lookup reports success with
+/// address 0. `rdynload.dlsym` rejects that, and it must be rejected here too:
+/// address 0 transmuted to the init signature is a call through a null pointer.
+fn lookup_init_address(handle: usize, symbol: &str) -> Option<usize> {
+    match rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol.as_bytes()) {
+        Ok(0) | Err(_) => None,
+        Ok(address) => Some(address),
+    }
+}
+
 /// PyPy `cpyext.api.create_extension_module`, single-phase branch.
 pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, crate::PyError> {
     let _load_guard = extension_load_lock();
@@ -396,17 +409,16 @@ pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, cra
     // opening on this host abstraction.
     if let Some(handle) = cached_extension_handle(path) {
         let symbol = init_symbol(name)?;
-        rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol.as_bytes())
-            .map_err(|_error| {
-                extension_import_error(
-                    format!(
-                        "function {symbol} not found in library '{}'",
-                        path.display()
-                    ),
-                    name,
-                    path,
-                )
-            })?;
+        if lookup_init_address(handle, &symbol).is_none() {
+            return Err(extension_import_error(
+                format!(
+                    "function {symbol} not found in library '{}'",
+                    path.display()
+                ),
+                name,
+                path,
+            ));
+        }
         if let Some(module) = cached_extension(name, path) {
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -438,19 +450,17 @@ pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, cra
             return Err(error);
         }
     };
-    let address =
-        rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol.as_bytes())
-            .map_err(|_error| {
-                rustpython_host_env::ctypes::drop_library(handle);
-                extension_import_error(
-                    format!(
-                        "function {symbol} not found in library '{}'",
-                        path.display()
-                    ),
-                    name,
-                    path,
-                )
-            })?;
+    let Some(address) = lookup_init_address(handle, &symbol) else {
+        rustpython_host_env::ctypes::drop_library(handle);
+        return Err(extension_import_error(
+            format!(
+                "function {symbol} not found in library '{}'",
+                path.display()
+            ),
+            name,
+            path,
+        ));
+    };
 
     let old_context = PACKAGE_CONTEXT
         .lock()
