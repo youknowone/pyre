@@ -1743,9 +1743,18 @@ fn sre_match_group(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Ok(unsafe { slice_w(m, span, w_none()) });
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let m = RootedObject::pin(m as PyObjectRef);
+    // Publish the match and every selector as one live set before performing
+    // any forwarding query.  Besides matching RPython's `args_w` liveness,
+    // this avoids a foreign collection entering between sequential pins while
+    // a later dynamically-created group name is still unpublished.
+    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let m = RootedObject(args_base);
+    // RPython's GC transform keeps every entry in `args_w` live across each
+    // `slice_w` allocation.  The gateway's native argument copy is not a GC
+    // root, so read selectors back from that live set after every allocation.
     let mut results: Vec<RootedObject> = Vec::with_capacity(group_args.len());
-    for &w_arg in group_args {
+    for i in 0..group_args.len() {
+        let w_arg = pyre_object::gc_roots::shadow_stack_get(args_base + 1 + i);
         let span = do_span(m.get() as *const W_SRE_Match, Some(w_arg))?;
         results.push(RootedObject::pin(unsafe {
             slice_w(m.get() as *const W_SRE_Match, span, w_none())
