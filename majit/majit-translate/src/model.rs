@@ -3032,6 +3032,18 @@ pub fn fuse_boxing_alloc(
     // so fall back to a leaf match when the exact key misses.  An unknown struct
     // yields `None` and is left unfused — the same fail-safe the old hardcoded
     // set applied to any struct outside the numeric four.
+    //
+    // The `PyObject` base field carries the type pointer, which
+    // `resolve_vtable_addr` lifts into `NewWithVtable.vtable`, so it is skipped
+    // here (the runtime stamps `ob_type`/`w_class` from the descriptor).  Two
+    // spellings reach this pass: the hand-written boxing structs
+    // (`W_FloatObject` etc.) name it `ob_header`, while `#[pyre_class]` injects
+    // it as `ob` (pyre-macros `expand_pyre_class`).  Both name the same base,
+    // so both are recognised as the header and neither is re-emitted as a
+    // payload setfield.
+    fn is_header_field(name: &str) -> bool {
+        name == "ob_header" || name == "ob"
+    }
     fn payload_fields(
         owner: &str,
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
@@ -3053,7 +3065,7 @@ pub fn fuse_boxing_alloc(
         };
         Some(
             rows.iter()
-                .filter(|(name, _)| name != "ob_header")
+                .filter(|(name, _)| !is_header_field(name))
                 .cloned()
                 .collect(),
         )
@@ -3294,7 +3306,8 @@ pub fn fuse_boxing_alloc(
         w_class: Option<Payload>,
     }
     let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
-        let header = store_value(graph, agg, "ob_header")?;
+        let header = store_value(graph, agg, "ob_header")
+            .or_else(|| store_value(graph, agg, "ob"))?;
         let mut roots = Vec::new();
         if !store_roots(graph, &header, 8, &mut roots) {
             return None;
