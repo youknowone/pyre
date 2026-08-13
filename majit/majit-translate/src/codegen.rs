@@ -171,6 +171,7 @@ mod tests {
                 main_jitcode_index: 0,
             }],
             jitcodes: vec![main_jitcode],
+            symbolic_fnaddr_paths: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             indirectcalltarget_indices: Vec::new(),
             insns: indexmap::IndexMap::new(),

@@ -7,6 +7,7 @@
 //! (oopspec) and recursive (portal) call classification.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
@@ -6676,17 +6677,52 @@ fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
     ((hasher.finish() & !SYMBOLIC_FNADDR_HIGH_MASK) | SYMBOLIC_FNADDR_BASE) as i64
 }
 
+static SYMBOLIC_FNADDR_PATHS: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::new();
+
+fn record_symbolic_fnaddr(value: i64, description: String) {
+    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut paths = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    paths
+        .entry(value)
+        .and_modify(|existing| {
+            if description < *existing {
+                existing.clone_from(&description);
+            }
+        })
+        .or_insert(description);
+}
+
+pub(crate) fn symbolic_fnaddr_paths_snapshot() -> Vec<(i64, String)> {
+    let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let paths = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut snapshot: Vec<_> = paths
+        .iter()
+        .map(|(&value, description)| (value, description.clone()))
+        .collect();
+    snapshot.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    snapshot
+}
+
 pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
-    stable_symbolic_fnaddr(path)
+    let symbolic = stable_symbolic_fnaddr(path);
+    record_symbolic_fnaddr(symbolic, path.canonical_key());
+    symbolic
 }
 
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     if let Some(segments) = crate::model::fn_const_segments(target) {
-        return stable_symbolic_fnaddr(&CallPath::from_segments(
-            segments.iter().map(String::as_str),
-        ));
+        let path = CallPath::from_segments(segments.iter().map(String::as_str));
+        let symbolic = stable_symbolic_fnaddr(&path);
+        record_symbolic_fnaddr(symbolic, path.canonical_key());
+        return symbolic;
     }
-    stable_symbolic_fnaddr(target)
+    let symbolic = stable_symbolic_fnaddr(target);
+    record_symbolic_fnaddr(symbolic, format!("target:{target}"));
+    symbolic
 }
 
 impl Default for CallControl {
@@ -9034,6 +9070,23 @@ mod tests {
         let jitcode = cc.get_jitcode(&path);
 
         assert_eq!(jitcode.fnaddr, symbolic_fnaddr_for_path(&path));
+    }
+
+    #[test]
+    fn symbolic_fnaddr_minters_record_descriptions() {
+        let path = CallPath::from_segments(["symbolic_registry", "path_callee"]);
+        let path_symbolic = symbolic_fnaddr_for_path(&path);
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["symbolic_registry".to_string()],
+            "TargetCallee",
+        );
+        let target_symbolic = symbolic_fnaddr_for_target(&target);
+        let target_description = format!("target:{target}");
+
+        let paths = symbolic_fnaddr_paths_snapshot();
+        assert!(paths.contains(&(path_symbolic, path.canonical_key())));
+        assert!(target_description.starts_with("target:"));
+        assert!(paths.contains(&(target_symbolic, target_description)));
     }
 
     #[test]

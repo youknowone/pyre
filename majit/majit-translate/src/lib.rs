@@ -2054,6 +2054,7 @@ fn analyze_pipeline_from_module_paths(
         functions: Vec::new(),
         jit_drivers: Vec::new(),
         jitcodes: Vec::new(),
+        symbolic_fnaddr_paths: Vec::new(),
         indirectcalltarget_indices: Vec::new(),
         jitcodes_by_path: indexmap::IndexMap::new(),
         insns: indexmap::IndexMap::new(),
@@ -2099,6 +2100,7 @@ fn analyze_pipeline_from_module_paths(
         })
         .collect();
     pipeline.jitcodes = jitcodes;
+    pipeline.symbolic_fnaddr_paths = call::symbolic_fnaddr_paths_snapshot();
     pipeline.indirectcalltarget_indices = indirectcalltarget_indices;
     // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
     // captured before `call_control` is dropped. Needed because consumers

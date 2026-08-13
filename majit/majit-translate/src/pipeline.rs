@@ -111,6 +111,10 @@ pub struct ProgramPipelineResult {
     /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
     /// identity with the values appearing here.
     pub jitcodes: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    /// Every symbolic fnaddr placeholder minted while codewriting, paired with
+    /// a description of the callee it stands for.  Lets a consumer resolve a
+    /// symbolic funcbox constant back to the function it replaced.
+    pub symbolic_fnaddr_paths: Vec<(i64, String)>,
     /// RPython `Assembler.indirectcalltargets`, encoded by identity as dense
     /// indices into `jitcodes`.
     #[serde(default)]
@@ -212,6 +216,7 @@ mod tests {
                 main_jitcode_index: 0,
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
+            symbolic_fnaddr_paths: Vec::new(),
             indirectcalltarget_indices: Vec::new(),
             jitcodes_by_path: indexmap::IndexMap::new(),
             insns: indexmap::IndexMap::new(),

@@ -2402,7 +2402,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
         && majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
     {
-        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op_pc });
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op_pc,
+            symbolic: addr,
+        });
     }
     // Authoritative-executor gate: fire ONLY when the walk is the sole
     // concrete-execution leg (the production full-body walk and its

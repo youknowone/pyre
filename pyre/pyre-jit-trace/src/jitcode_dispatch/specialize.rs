@@ -9897,7 +9897,7 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }
@@ -10459,7 +10459,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, raw_item, dst,
     ) {
         Ok(()) => Ok(Some(())),
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
             }
@@ -10768,7 +10768,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     );
     match commit_result {
         Ok(()) => {}
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK pc={pc}");
             }

@@ -2102,7 +2102,7 @@ pub enum DispatchError {
     /// `walker_capture_snapshot_for_last_guard` snapshots.  Surfaced here to
     /// abort the trace gracefully (interpreter fallback) instead of committing
     /// a trace that SIGSEGVs on its first side exit.  Default OFF.
-    OrthodoxSubWalkTraceUnsupported { pc: usize },
+    OrthodoxSubWalkTraceUnsupported { pc: usize, symbolic: i64 },
     /// The LIST_APPEND opcode's void `jit_list_append` residual
     /// (`ListAppendValue`) reached the authoritative full-body walker but the
     /// orthodox `w_list_append` fold declined (the list needs a resize, or the

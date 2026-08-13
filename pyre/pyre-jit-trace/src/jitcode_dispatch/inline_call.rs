@@ -2144,13 +2144,19 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     macro_rules! builtin_inline_decline {
         ($why:expr, $addr:expr) => {
             if fbw_inline_diag_enabled() {
+                let name = if unsafe { pyre_interpreter::is_function(callable) } {
+                    unsafe { pyre_interpreter::function_get_name(callable) }
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "[builtin-inline-decline] pc={} why={} callable={} operand={} fnaddr={:#x}",
+                    "[builtin-inline-decline] pc={} why={} callable={} operand={} fnaddr={:#x} name={}",
                     op.pc,
                     $why,
                     unsafe { pyre_object::type_name_of(callable) },
                     unsafe { pyre_object::type_name_of(callable_operand) },
                     $addr,
+                    name,
                 );
             }
         };
@@ -2455,16 +2461,38 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // descent back and let the ordinary residual call run, the same way
         // the orthodox `w_list_append` descent does.  A descent that already
         // applied an effect cannot be rewound this way, so it keeps the abort.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
             if fbw_store_journal_len() == journal_before
                 && fbw_has_unjournaled_effect() == unjournaled_before =>
         {
+            if fbw_inline_diag_enabled() {
+                eprintln!(
+                    "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} disp=rollback",
+                    unsafe { pyre_interpreter::function_get_name(callable) },
+                    op.pc,
+                    pc,
+                    symbolic as u64,
+                );
+            }
             ctx.trace_ctx.cut_trace(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             bool_box_truth_reset();
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            if let DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic } = &error {
+                if fbw_inline_diag_enabled() {
+                    eprintln!(
+                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} disp=propagate",
+                        unsafe { pyre_interpreter::function_get_name(callable) },
+                        op.pc,
+                        pc,
+                        *symbolic as u64,
+                    );
+                }
+            }
+            return Err(error);
+        }
     };
     match walk_result {
         DispatchOutcome::SubReturn {
