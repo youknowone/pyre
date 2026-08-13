@@ -1509,9 +1509,16 @@ fn path_hook_accepts(
     let _roots = push_roots();
     let filename_slot = shadow_stack_len();
     pin_root(pyre_object::w_str_new(filename));
-    for hook in hooks {
+    // A hook call runs arbitrary Python and can drive a collection, which moves
+    // the hooks themselves. A Rust vector is not walked, so publish each hook in
+    // a shadow-stack slot and read it back after the previous call.
+    let hooks_base = shadow_stack_len();
+    for hook in &hooks {
+        pin_root(*hook);
+    }
+    for i in 0..hooks.len() {
         match pyre_interpreter::call::call_function_impl_result(
-            hook,
+            shadow_stack_get(hooks_base + i),
             &[shadow_stack_get(filename_slot)],
         ) {
             // `importer = hook(filename); break` — the first hook that does not
