@@ -7080,9 +7080,21 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
     // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-    // admitted only when the body performs no CALL. The scan narrows how
-    // often the in-flight delivery gap is reached; it is not a boundary
-    // the gap stays behind. This body is call-free and the scan admits it:
+    // admitted only when the body performs no CALL. A compiled loop's
+    // live-at-exit values stay reachable from the exit state until the
+    // next JIT activity overwrites it, so the loop variable keeps its
+    // final binding past the `STORE_FAST` that restores the isolated
+    // comprehension slot to unbound. A call-free body binds values the
+    // enclosing frame holds anyway; a per-element call binds a freshly
+    // constructed object, and `extra_tests/parity_tests/
+    // weakref_gc_lifeline.py` then sees the last element survive the
+    // collection that should have run its weakref callback. Decline
+    // call-bearing bodies to interpretation until the exit state stops
+    // rooting what it no longer resumes.
+    //
+    // The scan narrows how often the in-flight delivery gap is reached;
+    // it is not a boundary the gap stays behind. This body is call-free
+    // and the scan admits it:
     //
     //     for index in items:
     //         out.append([index for _ in range(1)])
@@ -7112,8 +7124,8 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // accounting (it is not a body effect, mirroring RPython's
     // `COND_CALL_GC_WB`, which pyjitpl never executes and the optimizer
     // never treats as a side effect). That exemption keeps the append
-    // itself from forcing the refusal; it does not make the enclosing
-    // loop exact-resume safe, per the shape above.
+    // itself out of the body-effect accounting; it does not make the
+    // enclosing loop exact-resume safe, per the shape above.
     //
     // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
     // too: the fold virtualizes the inner list, whose separately
@@ -12946,9 +12958,10 @@ mod tests {
 
     #[test]
     fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
-        // A per-element CALL enters a user Python frame; a mid-body abort then
-        // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
-        // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
+        // A per-element CALL binds a freshly constructed object to the
+        // comprehension's isolated slot, and the compiled loop's exit state
+        // keeps that last binding reachable, so a call-bearing LIST_APPEND
+        // body stays interpreter-only.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",
