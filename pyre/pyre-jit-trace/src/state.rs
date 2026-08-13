@@ -1903,13 +1903,20 @@ pub(crate) struct BridgeSemanticMaps {
 /// Which bucket a caller can produce is fixed by the argument it passes, so the
 /// two ends must not be welded together:
 /// * `setup_bridge_sym` is the one consumer that reads `stack_depth_at_pc`
-///   unconditionally (`stack_only.max(..)` → `semantic_prefix_len`), and it
-///   passes `None` — so `no_py_pc` is the only bucket reachable from there and
-///   `in_range_*` is structurally unreachable.
+///   outside a `pcdep_entries` loop (`stack_only.max(..)` →
+///   `semantic_prefix_len`), and it passes `None` — so `no_py_pc` is the only
+///   bucket reachable from there and `in_range_*` is structurally unreachable.
 /// * `in_range_nonzero` can only come from the one caller that supplies a
 ///   `Some` coordinate, `resume_snapshot.rs`
 ///   `walker_capture_snapshot_for_last_guard_impl`'s `liveness_py_pc`, whose
-///   depth feeds that function's own `semantic_limit`.
+///   depth feeds that function's own `semantic_limit`. That call is dominated
+///   by `resolve_resume_pc_with_jitcode_pc` on the same payload, `op_live` and
+///   coordinate, and that helper returns `Some` only under
+///   `can_decode_live_vars` — the very predicate selecting the twin arm here.
+///   So `site=non_decodable` is unreachable from that caller: only
+///   `EMPTY_TWIN_MISS` can fire there. A printed `site=non_decodable` line
+///   therefore never belongs to the one `Some` caller, which is what excludes
+///   it from every fire the corpus has produced so far.
 ///
 /// That caller's coordinate is a Python PC by construction, so a nonzero depth
 /// there is the designed result of the leg, not an anomaly — the bucket records
@@ -1957,6 +1964,13 @@ static EMPTY_TWIN_NON_DECODABLE: EmptyTwinSite = EmptyTwinSite::new("non_decodab
 /// jitcode-keyed containing depth used there. Before that twin became the
 /// production fallback, the 399-file synth corpus showed all 20 executions at
 /// `jit_pc >= 0` with `twin = Some(3..=5)` while the function returned 0.
+///
+/// Read the `Some`-ness of that pair narrowly. `twin` is a FLOOR lookup over
+/// `depth_containing_by_jit_pc`, whose keys are those of a table the codewriter
+/// pads with key 0 (`py_floor_by_jit_pc`'s `insert(0, (0, 0))`), so once the
+/// twin is populated at all it answers `Some` at every non-negative offset. A
+/// `None` here therefore records an empty twin, not an out-of-range offset;
+/// only the values carry per-coordinate information.
 ///
 /// The counters remain per leg, not per call site, so a fire cannot be
 /// attributed to one of the callers. `setup_bridge_sym` is the consumer whose
