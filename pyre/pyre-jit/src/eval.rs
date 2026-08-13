@@ -6920,26 +6920,16 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
 /// and resumes forward through `try_commit_midbody_abort` or exception
 /// delivery. CALL-forward remains limited to the before-run case. The extend
 /// is consequently applied exactly once and no iteration tail is dropped.
-/// `LIST_APPEND`, `SET_ADD` and `MAP_ADD` — the list/set/dict comprehension
-/// accumulators — are admitted on the same footing, because upstream spells them
-/// as operations this body scan already admits and gives them no accumulator
-/// status of their own: `pyopcode.py:1492 LIST_APPEND` is
-/// `space.call_method(v, 'append', w)` and `pyopcode.py:1515 SET_ADD` is
-/// `space.call_method(w_set, 'add', w_value)`, the `LOAD_ATTR` + `CALL` pair
-/// above, and `pyopcode.py:1525 MAP_ADD` is
-/// `space.setitem(w_dict, w_key, w_value)`, i.e. `STORE_SUBSCR`. `SET_ADD` and
-/// `MAP_ADD` are not folded here — the codewriter lowers both to a void
-/// `residual_call_r_v` (`bh_set_add_fn` / `bh_map_add_fn`), so they carry
-/// exactly the body-effect accounting of the residual they are — while
-/// `LIST_APPEND` folds, leaving only the idempotent `list_write_barrier` behind.
-/// A mid-body abort resumes through the same `try_commit_midbody_abort` path as
-/// the store family for all three.
-///
-/// The admission does not depend on what else the body does. A body whose
-/// element expression CALLS a user Python function is admitted like any other:
-/// the explicit spelling of the same loop, `out.append(f(x))`, is a `LOAD_ATTR`
-/// + `CALL` pair this scan has always admitted, and the two carry the same
-/// body-effect signature.
+/// `SET_ADD` and `MAP_ADD` — the set/dict comprehension accumulators — are
+/// admitted on the same footing, because upstream spells them as operations this
+/// body scan already admits and gives them no accumulator status of their own:
+/// `pyopcode.py:1515 SET_ADD` is `space.call_method(w_set, 'add', w_value)`, the
+/// `LOAD_ATTR` + `CALL` pair above, and `pyopcode.py:1525 MAP_ADD` is
+/// `space.setitem(w_dict, w_key, w_value)`, i.e. `STORE_SUBSCR`. Neither is
+/// folded here — the codewriter lowers both to a void `residual_call_r_v`
+/// (`bh_set_add_fn` / `bh_map_add_fn`), so they carry exactly the body-effect
+/// accounting of the residual they are, and a mid-body abort resumes through the
+/// same `try_commit_midbody_abort` path as the store family.
 fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -7089,8 +7079,18 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     };
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
-    // A value-producing body — arithmetic, subscript, or an
-    // Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
+    // A `LIST_APPEND` (inlined-comprehension accumulator) body is
+    // admitted only when the body performs no CALL: a per-element call
+    // that enters a user Python frame (a class ctor / user function)
+    // bumps the eval-loop entry odometer, and a subsequent mid-body
+    // abort routes through `fbw_foriter_inflight_take`, which REFUSES
+    // delivery to avoid a double-apply — dropping the trace-attempt
+    // iteration's item. That user-frame in-flight-delivery gap is a
+    // separate concern (single-executor tracing, gh#73/#34); decline
+    // call-bearing bodies to interpretation until it is closed.
+    //
+    // A value-producing but call-free body — arithmetic, subscript, or
+    // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
     // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
     // exact-resume safe: the only residual an Object-strategy append
     // leaves in the folded body is the idempotent `list_write_barrier`,
@@ -7106,13 +7106,45 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // speculative-replay sub-walk, so the block is bound at every
     // guard-exit deopt and the shape compiles bit-exact on all backends
     // (`bench/synth/nested_list_comprehension_hot.py`).
+    let body_has_call = {
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        let mut scan_pc = pc + 1;
+        let mut has_call = false;
+        while scan_pc < exit && scan_pc < instructions.len() {
+            let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
+            if let I::ForIter { delta } = scan_instr {
+                // A nested loop owns its body.  It is validated when
+                // the outer instruction walk reaches that FOR_ITER;
+                // calls inside it must not taint a LIST_APPEND owned by
+                // this lexical loop (and vice versa).
+                scan_pc = pyre_interpreter::jump_target_forward(
+                    instructions,
+                    scan_pc + 1,
+                    delta.get(scan_arg).as_usize(),
+                );
+                scan_state = pyre_interpreter::OpArgState::default();
+                continue;
+            }
+            if matches!(
+                scan_instr,
+                I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
+            ) {
+                has_call = true;
+                break;
+            }
+            scan_pc += 1;
+        }
+        has_call
+    };
     let mut body_state = pyre_interpreter::OpArgState::default();
     let mut body_pc = pc + 1;
     while body_pc < exit && body_pc < instructions.len() {
         let (body_instr, body_arg) = body_state.get(instructions[body_pc]);
         if let I::ForIter { delta } = body_instr {
             // Validate the nested body exactly once, under its own
-            // lexical FOR_ITER.
+            // lexical FOR_ITER.  Scanning it again as part of the
+            // outer body conflates unrelated calls with its
+            // LIST_APPEND and declines safe PEP 709 comprehensions.
             body_pc = pyre_interpreter::jump_target_forward(
                 instructions,
                 body_pc + 1,
@@ -7132,16 +7164,13 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                             | I::DeleteSubscr
                             | I::DeleteAttr { .. }
                             | I::LoadName { .. }
-                            // `call_method(list, 'append', v)` /
                             // `call_method(set, 'add', v)` / `setitem(d, k, v)`
-                            // spelled as one opcode. `SET_ADD` / `MAP_ADD` stay
-                            // void residuals; `LIST_APPEND` folds and leaves
-                            // only its write barrier.
-                            | I::ListAppend { .. }
+                            // spelled as one opcode; void residuals, not folds.
                             | I::ListExtend { .. }
                             | I::SetAdd { .. }
                             | I::MapAdd { .. }
-            );
+            )
+            || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
         if !permitted {
             if for_iter_gate_diag_enabled() {
                 eprintln!(
@@ -12899,22 +12928,18 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_call_bearing_list_append_comprehension_body_is_jit_safe() {
-        // A per-element CALL does not change the accumulator's admission. The
-        // explicit spelling of the same loop, `out.append(f(i))`, is the
-        // `LOAD_ATTR` + `CALL` pair this scan has always admitted; both are
-        // checked here so the two spellings cannot drift apart again.
+    fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
+        // A per-element CALL enters a user Python frame; a mid-body abort then
+        // refuses the in-flight FOR_ITER delivery (a separate user-frame gap,
+        // gh#73/#34), so a call-bearing LIST_APPEND body stays interpreter-only.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",
             "def f(n):\n    def g(x):\n        return x\n    return [g(i) for i in range(n)]\n",
-            "def f(n):\n    def g(x):\n        return x\n    return [[g(i)] for i in range(n)]\n",
-            "def f(n):\n    def g(x):\n        return x\n    return [g(i) for i in range(n) if g(i)]\n",
-            "def f(n):\n    def g(x):\n        return x\n    out = []\n    for i in range(n):\n        out.append(g(i))\n    return out\n",
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(for_iter_bodies_all_jit_safe(&code), "{source}");
+            assert!(!for_iter_bodies_all_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -12976,10 +13001,7 @@ mod tests {
     fn unsafe_later_comprehension_does_not_blacklist_an_earlier_loop() {
         use pyre_interpreter::{Instruction as I, compile_exec};
         let module = compile_exec(
-            // The final comprehension's `CALL_FUNCTION_EX` is off the body
-            // allow-list, so that loop declines while the `while` region above
-            // it stays admissible.
-            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    return [len(*item) for item in escaped]\n",
+            "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    return [len(item) for item in escaped]\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
@@ -13058,10 +13080,7 @@ mod tests {
     fn loop_region_includes_out_of_line_handler_rejoining_mid_body() {
         use pyre_interpreter::{Instruction as I, compile_exec};
         let module = compile_exec(
-            // The handler's comprehension calls with `*y`, whose
-            // `CALL_FUNCTION_EX` is off the body allow-list: the region gate
-            // has to reach that out-of-line handler to see it.
-            "def run(items, k):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            out.extend([str(*y) for y in range(k)])\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
+            "def run(items, k):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            out.extend([str(y) for y in range(k)])\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
@@ -13135,10 +13154,10 @@ mod tests {
 
     #[test]
     fn nested_comprehension_calls_after_it_stays_jit_safe() {
-        // Each loop body is validated under its own lexical FOR_ITER, so the
-        // outer body's calls are never scanned as part of the inner
-        // comprehension. This is the nested-loop shape used by
-        // test_math.testDist.
+        // The inner comprehension owns its call-free LIST_APPEND. Calls after
+        // that loop belong to the outer body and must not retroactively turn
+        // the inner append into a call-bearing comprehension. This is the
+        // nested-loop shape used by test_math.testDist.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def f(rows, pred, sink):\n    for p in rows:\n        for q in rows:\n            diffs = [x for x in q]\n            if pred(diffs):\n                sink(diffs)\n            elif pred(q):\n                sink(q)\n",

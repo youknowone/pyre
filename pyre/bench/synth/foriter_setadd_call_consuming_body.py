@@ -1,16 +1,16 @@
 # pyre-check: max-pypy-ratio=20
-# The SET_ADD spelling of `foriter_listappend_call_consuming_body`. `heappop`
-# consumes the very heap the comprehension is draining, so a body execution
-# replayed or dropped by the tracer changes the heap, not just the result.
+# A set comprehension whose element call consumes the very heap it is draining,
+# so a body execution replayed or dropped by the tracer changes the heap, not
+# just the result.
 #
 # The set is the weaker of the two checks here: it absorbs a duplicated pop
-# silently, so `len(heap) == 0` is what carries the detection in this spelling
-# — a replayed body leaves the heap short, a dropped one leaves it long.
+# silently, so `len(heap) == 0` is what carries the detection — a replayed body
+# leaves the heap short, a dropped one leaves it long.
 #
-# SET_ADD is admitted by the FOR_ITER body allow-list on the same footing as
-# LIST_APPEND. Keeping both spellings lets a divergence between them show up as
-# a fixture disagreement rather than as a silent difference in which
-# accumulator the gate happens to cover.
+# `for_iter_body_is_jit_safe_at` admits SET_ADD with no condition on what else
+# the body does, so a call-bearing set comprehension is traced. The LIST_APPEND
+# spelling of the same loop is declined by that gate's CALL scan, which is why
+# only the set spelling is pinned here.
 import heapq
 
 N = 300
