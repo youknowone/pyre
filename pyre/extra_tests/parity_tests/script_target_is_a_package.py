@@ -1,3 +1,6 @@
+# CPython-suite gap: test.test_cmd_line_script is IMPORTERROR, so no suite test names a directory or a zipfile as the script argument.
+# parity-tests reason: the sys.argv[0] / sys.path[0] / __file__ values a package target reports are compared against CPython directly.
+
 """A directory or a zipfile named as the script argument runs its `__main__`.
 
 `app_main.py:1054-1105` walks `sys.path_hooks` with the script filename; when a
