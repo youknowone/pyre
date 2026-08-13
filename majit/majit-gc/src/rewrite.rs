@@ -1215,7 +1215,7 @@ impl GcRewriterImpl {
         // SETFIELD_GC for this header slot.
         if let Some(w_class) = descr.w_class_obj()
             && w_class != 0
-            && let Some(w_class_fd) = descr.gc_fielddescrs().iter().find(|fd| fd.is_w_class())
+            && let Some(w_class_fd) = descr.class_word_field()
         {
             self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
         }
@@ -1243,7 +1243,15 @@ impl GcRewriterImpl {
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(&result);
         for fd in descr.gc_fielddescrs() {
-            if fd.is_w_class() && descr.w_class_obj().is_some_and(|w| w != 0) {
+            // Skip the declared class-word slot: `handle_new` above already
+            // stored the real class object there, so a delayed NULL would
+            // overwrite it.  Matched by byte position rather than by descr
+            // identity because the slot the layout declares and the descr in
+            // this list can be distinct objects describing the same field.
+            let is_class_word_slot = descr
+                .class_word_field()
+                .is_some_and(|cw| cw.offset() == fd.offset());
+            if is_class_word_slot && descr.w_class_obj().is_some_and(|w| w != 0) {
                 continue;
             }
             entries.insert(fd.offset() as i64);

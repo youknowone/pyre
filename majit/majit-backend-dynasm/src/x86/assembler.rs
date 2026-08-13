@@ -7910,9 +7910,7 @@ impl<'a> Assembler386<'a> {
         let (vtable, w_class_init) = op
             .with_size_descr(|sd| {
                 let w_class_init = sd.w_class_obj().and_then(|w_class| {
-                    sd.gc_fielddescrs()
-                        .iter()
-                        .find(|fd| fd.is_w_class())
+                    sd.class_word_field()
                         .map(|fd| (fd.offset() as i32, w_class))
                 });
                 (sd.vtable() as i64, w_class_init)

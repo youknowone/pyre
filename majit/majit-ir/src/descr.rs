@@ -4383,6 +4383,46 @@ pub trait SizeDescr: Descr {
     fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
     }
+
+    /// The field slot of *this* layout that holds the class word, or `None`
+    /// when this layout has no class word at all.
+    ///
+    /// This is the transposition of `gc.py:33-37`, where a host that sets
+    /// `gcremovetypeptr` gets `fielddescr_vtable = None`: absence of the
+    /// header field is a property the layout *declares*, never one a consumer
+    /// infers from a lookup that missed.
+    ///
+    /// It is deliberately a per-`SizeDescr` question and not a per-host one.
+    /// Upstream's `fielddescr_vtable` answers "what descr do I store
+    /// through" for a single lltype at a fixed offset, and upstream excludes
+    /// `typeptr` from `all_fielddescrs` (`heaptracker.py:66`) so no field
+    /// list ever contains it.  Here the header descr *is* in the list, and
+    /// every consumer needs to know which slot of the struct in front of it
+    /// is the class word — a question one process-global descr cannot
+    /// answer.  Compounding that, pyre has two identity-stable `w_class`
+    /// descrs by construction (a parentless tracer singleton on the op side,
+    /// a per-layout `SimpleFieldDescr` on the allocation side), so consumers
+    /// that must establish the two describe the same bytes compare
+    /// `offset()`/`field_size()` and cannot compare identity.
+    ///
+    /// The default body is the *only* place the class word is recovered by
+    /// name, and it is what a declaring producer replaces.
+    ///
+    /// It searches `gc_fielddescrs()` before `all_fielddescrs()`.  The class
+    /// word is a GC pointer, so a real layout lists the *same* `Arc` in both
+    /// (`gc_fielddescrs` is documented as the `only_gc=True` filter of
+    /// `all_fielddescrs`) and the order cannot matter.  It matters only for a
+    /// descr that populates the two lists with different objects, and for
+    /// that case the GC list is the answer every byte-offset consumer here
+    /// was already using.
+    // TODO(declared-class-word): drop this body once the field-list builder
+    // declares the slot; a producer that overrides it already opts out.
+    fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
+        self.gc_fielddescrs()
+            .iter()
+            .chain(self.all_fielddescrs())
+            .find(|fd| fd.is_w_class())
+    }
 }
 
 /// Type-erased marker for `VirtualizableInfo`. Upstream parity:
@@ -7430,6 +7470,78 @@ mod tests {
         // even a few times would repeat the array descr's own name.
         assert_eq!(from_array.matches("SimpleArrayDescr").count(), 1);
         assert_eq!(from_interior.matches("SimpleInteriorFieldDescr").count(), 1);
+    }
+
+    /// `class_word_field()` is the layout's own answer, and "this layout has
+    /// no class word" is a real answer rather than a lookup that missed —
+    /// the `fielddescr_vtable = None` case of `gc.py:33-37`.
+    ///
+    /// The list precedence is pinned because it is observable: a descr whose
+    /// two field lists hold different objects gets the GC-list one, which is
+    /// what every byte-offset consumer searched before this accessor existed.
+    #[test]
+    fn class_word_field_is_absent_for_a_layout_without_one() {
+        #[derive(Debug)]
+        struct Layout {
+            all_fields: Vec<Arc<dyn FieldDescr>>,
+            gc_fields: Vec<Arc<dyn FieldDescr>>,
+        }
+        impl Descr for Layout {
+            fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+                Some(self)
+            }
+        }
+        impl SizeDescr for Layout {
+            fn size(&self) -> usize {
+                32
+            }
+            fn type_id(&self) -> u32 {
+                7
+            }
+            fn is_immutable(&self) -> bool {
+                false
+            }
+            fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+                &self.all_fields
+            }
+            fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+                &self.gc_fields
+            }
+        }
+
+        let named = |offset: usize, name: &str| -> Arc<dyn FieldDescr> {
+            Arc::new(SimpleFieldDescr::new_with_name(
+                0,
+                offset,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                name.to_string(),
+                name.to_string(),
+            ))
+        };
+
+        // A header-less layout: every field is a value field.
+        let headerless = Layout {
+            all_fields: vec![named(0, "Point.x"), named(8, "Point.y")],
+            gc_fields: vec![],
+        };
+        assert!(headerless.class_word_field().is_none());
+
+        // The GC list wins when the two lists disagree.
+        let split = Layout {
+            all_fields: vec![named(24, "PyObject.w_class")],
+            gc_fields: vec![named(8, "w_class")],
+        };
+        assert_eq!(split.class_word_field().map(|fd| fd.offset()), Some(8));
+
+        // Falling back to the all-list covers impls that populate only it.
+        let all_only = Layout {
+            all_fields: vec![named(8, "PyObject.w_class")],
+            gc_fields: vec![],
+        };
+        assert_eq!(all_only.class_word_field().map(|fd| fd.offset()), Some(8));
     }
 
     #[test]

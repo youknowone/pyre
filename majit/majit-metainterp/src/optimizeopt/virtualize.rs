@@ -990,12 +990,7 @@ impl OptVirtualize {
                 let stored = vinfo
                     .descr
                     .as_size_descr()
-                    .and_then(|sd| {
-                        sd.all_fielddescrs()
-                            .iter()
-                            .find(|fd| fd.is_w_class())
-                            .map(|fd| fd.index_in_parent() as u32)
-                    })
+                    .and_then(|sd| sd.class_word_field().map(|fd| fd.index_in_parent() as u32))
                     .and_then(|widx| get_field(&vinfo.fields, widx));
                 if let Some(val_ref) = stored {
                     let b_old = Operand::from_bound_op(op_rc);

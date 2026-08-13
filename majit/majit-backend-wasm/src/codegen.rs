@@ -5251,9 +5251,7 @@ fn build_function(
                 // vtable write above covers `ob_type`, this covers `w_class`.
                 let w_class_init = sd.and_then(|sd| {
                     sd.w_class_obj().and_then(|w_class| {
-                        sd.gc_fielddescrs()
-                            .iter()
-                            .find(|fd| fd.is_w_class())
+                        sd.class_word_field()
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });

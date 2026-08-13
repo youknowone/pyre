@@ -70,9 +70,16 @@ fn w_class_store_is_covered_by_alloc(
     let Some(w_class) = size.w_class_obj().filter(|&w| w != 0) else {
         return false;
     };
-    let Some(init_field) = size.gc_fielddescrs().iter().find(|fd| fd.is_w_class()) else {
+    let Some(init_field) = size.class_word_field() else {
         return false;
     };
+    // ⛔ Do NOT drop this comparison because the slot is now declared. The
+    // declared slot replaces the *name* test and nothing else. `field` comes
+    // from the operation and `init_field` from the layout, and pyre mints
+    // those from two independent producers, so they are distinct objects that
+    // may or may not describe the same bytes. This is the check that they do;
+    // removing it would let a store to any field of a class-word-bearing
+    // struct be elided as "already written by the allocation".
     if init_field.offset() != field.offset() || init_field.field_size() != field.field_size() {
         return false;
     }
