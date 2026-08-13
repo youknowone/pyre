@@ -748,8 +748,14 @@ pub trait JitCodeSym {
     ///
     /// The inline-frame snapshot trim must use THIS end: it blanks the range
     /// unconditionally, and blanking a working register would drop live data.
+    ///
+    /// The default is the EMPTY range, not `int_identity_slots_end()`. A
+    /// symbol reserves identity slots in its sub-JitCodes only by opting in
+    /// (`split_dispatch`, which is what raises `split_identity_floor`); a
+    /// symbol that has not opted in has ordinary working registers there, and
+    /// an over-wide default would silently blank them out of the snapshot.
     fn int_identity_reserved_end(&self) -> usize {
-        self.int_identity_slots_end()
+        self.int_identity_slots_base()
     }
 
     /// First int-bank register used as a canonical identity slot

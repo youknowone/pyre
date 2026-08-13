@@ -157,6 +157,16 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // not a per-array count.
     let has_vable_identity = num_virt_arrays > 0;
     let num_vable_identity_slots = usize::from(has_vable_identity);
+    // Int-bank slots a sub-JitCode actually reserves, i.e. the ones the
+    // inline-frame snapshot trim may blank. Only `split_dispatch` pushes a
+    // sub-JitCode's register allocation past the identity range
+    // (`split_identity_floor`), so the reservation — and the trim — is empty
+    // without it. See `int_identity_reserved_end` below.
+    let num_reserved_identity_slots = if config.split_dispatch {
+        num_scalars + num_vable_identity_slots
+    } else {
+        0
+    };
     let num_ref_scalars = ref_scalars.len();
     let num_float_scalars = float_scalars.len();
     // First ref-bank register available for ref-scalar identity slots.
@@ -2410,8 +2420,18 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // `jitcode_lower/mod.rs` exactly: the working-register floor stops
             // after the scalars plus the single vable-identity slot, because a
             // virt array's element count is only known from the live object.
+            //
+            // It must also mirror the CONDITION under which that end is
+            // applied. `split_identity_floor` (`jitcode_lower/api.rs`) raises a
+            // sub-JitCode's `alloc_reg()` floor past the range only when
+            // `split_dispatch` is on; with it off, no sub-JitCode reserves
+            // anything and `[base, end)` holds ordinary working registers. The
+            // inline-frame snapshot trim keyed on this end blanks the range
+            // unconditionally, so reporting a non-empty range here would drop
+            // live data from a sub-frame's snapshot. Report an empty range
+            // instead, so the trim is inert exactly where the reservation is.
             fn int_identity_reserved_end(&self) -> usize {
-                #int_identity_base + #num_scalars + #num_vable_identity_slots
+                #int_identity_base + #num_reserved_identity_slots
             }
 
             fn loop_header_pc(&self) -> usize {
