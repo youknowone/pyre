@@ -2383,11 +2383,28 @@ fn forwards_to_returnblock(
     Err("forwarding chain is longer than the block count".to_string())
 }
 
-/// A bounded `Debug` rendering of an op kind, for diagnostics that name
-/// the operation that disqualified a rewrite.  Truncates on a `char`
-/// boundary so a non-ASCII name cannot panic the build.
+/// A bounded rendering of an op kind, for diagnostics that name the
+/// operation that disqualified a rewrite.
+///
+/// Field accesses render as `owner::field` rather than through `Debug`:
+/// which field a `Result` shell is read through is the whole content of
+/// the diagnostic (`__pos_0` is the payload the rewrite would substitute,
+/// `__discriminant` is a match on the shell), and the `Debug` form buries
+/// it behind the base `Variable`'s interior-mutability wrappers.
+/// Truncates on a `char` boundary so a non-ASCII name cannot panic.
 fn truncated_kind(kind: &OpKind) -> String {
-    let text = format!("{kind:?}");
+    let field_access = |verb, field: &crate::model::FieldDescriptor| {
+        format!(
+            "{verb} {}::{}",
+            field.owner_root.as_deref().unwrap_or("<unknown-owner>"),
+            field.name,
+        )
+    };
+    let text = match kind {
+        OpKind::FieldRead { field, .. } => field_access("FieldRead", field),
+        OpKind::FieldWrite { field, .. } => field_access("FieldWrite", field),
+        _ => format!("{kind:?}"),
+    };
     if text.chars().count() <= 100 {
         return text;
     }
