@@ -181,11 +181,7 @@ fn rewrite_jit_inline_ref_param_fields(
             self.field_pointees.get(&key).cloned()
         }
 
-        fn array_field_elem(
-            &self,
-            struct_path: &syn::Path,
-            field_name: &str,
-        ) -> Option<syn::Path> {
+        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
             let struct_last = struct_path.segments.last()?.ident.to_string();
             let key = format!("{}::{}", struct_last, field_name);
             self.array_field_elems.get(&key).cloned()

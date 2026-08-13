@@ -492,12 +492,27 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// getfield — pointer identity, which `compute_bitstrings` keys on.  Must run
 /// before `finish_setup_descrs` (jitcode assembly does), matching the
 /// non-trivial-raw-set construction-timing `call_descr` asserts.
+///
+/// `arrays` is the element-write half: `(item_size, is_item_signed)` per array
+/// the residual mutates through its base pointer.  It cannot use the field
+/// half's pointer-identity trick — a read's array descr comes from
+/// `MetaInterpStaticData::dispatch_array_descr_cache` at trace time while this
+/// one is minted during jitcode assembly, so the two are never the same `Arc`.
+/// The array descrs built here therefore only have to carry the right SHAPE;
+/// `EffectInfo::writes_array_descr_by_shape` is what reads them back, and the
+/// remaining fields are pinned to the `Assembler::add_gc_int_array_descr` shape
+/// the reads intern (`base_size = 0`, no length header, `Type::Int`).
+///
+/// An empty `arrays` leaves the affirmative "writes no arrays" that
+/// `EffectInfo::const_new` already installs, so a fields-only caller is
+/// unaffected by the array half existing.
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
-pub fn struct_fields_write_effect_info(
+pub fn residual_write_effect_info(
     layouts: &[(usize, u64, bool, &[(usize, bool, &str, usize, bool)])],
+    arrays: &[(usize, bool)],
     can_raise: bool,
 ) -> majit_ir::EffectInfo {
     // Mirror `JitCodeBuilder::field_specs_from_layout`: sort by offset so
@@ -563,11 +578,35 @@ pub fn struct_fields_write_effect_info(
                 .cloned()
                 .unwrap_or_else(|| {
                     panic!(
-                        "struct_fields_write_effect_info: field `{write_field}` not registered for type {type_id}"
+                        "residual_write_effect_info: field `{write_field}` not registered for type {type_id}"
                     )
                 }) as majit_ir::DescrRef
         }));
     }
+    let ads: Vec<majit_ir::DescrRef> = arrays
+        .iter()
+        .map(|&(item_size, is_item_signed)| {
+            majit_ir::descr::make_array_descr_from_lltype_shape(
+                /* type_id */ 0,
+                // A raw slice data pointer: the base points straight at
+                // `items[0]`, so there is no header to skip and no length word
+                // to read.
+                /* base_size */
+                0,
+                item_size,
+                /* len_offset */ None,
+                majit_ir::value::Type::Int,
+                /* is_array_of_pointers */ false,
+                /* is_array_of_structs */ false,
+                is_item_signed,
+                /* is_gc_managed */ true,
+                /* lendescr */ None,
+                /* is_pure */ false,
+                /* ei_index */ u32::MAX,
+                /* interior_field_descrs */ Vec::new(),
+            ) as majit_ir::DescrRef
+        })
+        .collect();
     let extra_effect = if can_raise {
         majit_ir::ExtraEffect::CanRaise
     } else {
@@ -575,6 +614,7 @@ pub fn struct_fields_write_effect_info(
     };
     let mut ei = majit_ir::EffectInfo::const_new(extra_effect, majit_ir::OopSpecIndex::None);
     ei._write_descrs_fields = Some(fds);
+    ei._write_descrs_arrays = Some(ads);
     ei
 }
 

@@ -167,6 +167,49 @@ fn a_different_element_shape_does_not_match() {
     );
 }
 
+/// The macro's emitted expression, evaluated directly: a `field[]` declaration
+/// lowers to one `(size_of::<Elem>(), true)` array spec, and the descr
+/// `residual_write_effect_info` mints from it must carry the shape the reads
+/// intern.  This is the join between the two halves — the macro picks the
+/// numbers, this function turns them into a descr, and the shape predicate
+/// reads it back.
+#[test]
+fn the_emitted_array_spec_mints_the_shape_the_reads_intern() {
+    let ei = majit_metainterp::residual_write_effect_info(
+        &[],
+        // What `residual_write_effect_info_tokens` emits for a `Val` element
+        // array: `(::core::mem::size_of::<Val>(), true)`.
+        &[(8, true)],
+        true,
+    );
+    assert!(
+        ei.writes_array_descr_by_shape(&mint_element_array_descr()),
+        "the descr minted from the emitted spec must match the one \
+         `add_gc_int_array_descr(8, true)` interns for the read"
+    );
+    assert!(
+        !ei.writes_array_descr_by_shape(&mint_program_byte_array_descr()),
+        "and must not reach an array of a different element shape"
+    );
+}
+
+/// A fields-only caller must be unaffected by the array half existing: an empty
+/// `arrays` has to leave the same affirmative "writes no arrays" that
+/// `EffectInfo::const_new` installs, not an unknown-writes `None`.
+#[test]
+fn an_empty_array_spec_list_still_declares_that_nothing_is_written() {
+    let ei = majit_metainterp::residual_write_effect_info(&[], &[], true);
+    assert_eq!(
+        ei._write_descrs_arrays.as_deref().map(<[_]>::len),
+        Some(0),
+        "an empty array spec list must stay an affirmative empty write set"
+    );
+    assert!(
+        !ei.writes_array_descr_by_shape(&mint_element_array_descr()),
+        "a residual that declares no array writes must not invalidate one"
+    );
+}
+
 /// The field half of the same contract, as the control: it must already pass.
 /// If this ever goes red the fallback mechanism itself moved, and the array
 /// test above is measuring something other than the missing array twin.

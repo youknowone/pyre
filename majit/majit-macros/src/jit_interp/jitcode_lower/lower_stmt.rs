@@ -19,13 +19,19 @@ pub(super) const REFUSAL_SEPARATOR: &str = " || ";
 
 impl<'c> Lowerer<'c> {
     /// If `func` is a registered `residual_writes` mutator, return the
-    /// `struct_field_write_effect_info(...)` expression naming the written
-    /// fields, so the residual call records a write-set `EffectInfo` that
-    /// invalidates cached getfields on those fields.  `None` for a
+    /// `residual_write_effect_info(...)` expression naming the written fields
+    /// and arrays, so the residual call records a write-set `EffectInfo` that
+    /// invalidates cached getfields and cached array elements.  `None` for a
     /// plain residual call (empty write-set).  `can_raise` carries the
     /// call policy's extra-effect into the write-set `EffectInfo` so a
     /// `ResidualVoidCannotRaise` mutator keeps `CannotRaise` instead of
     /// silently widening to `CanRaise`.
+    ///
+    /// A `field` declaration names the field itself; a `field[]` declaration
+    /// names the ELEMENTS of the array `field` points at.  The two are separate
+    /// caches in `OptHeap` — invalidating the base field hands the next element
+    /// load a fresh base, which only helps when the base actually changes — so a
+    /// residual that mutates a buffer in place has to say `field[]`.
     pub(super) fn residual_write_effect_info_tokens(
         &self,
         func: &Expr,
@@ -36,22 +42,46 @@ impl<'c> Lowerer<'c> {
         let writes: Vec<_> = config
             .residual_writes
             .iter()
-            .filter(|(segments, _, _)| *segments == func_segments)
+            .filter(|(segments, _, _, _)| *segments == func_segments)
             .collect();
         let mut layouts: Vec<(&syn::Path, Vec<TokenStream>)> = Vec::new();
-        for (_, path, field) in writes {
-            let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
-                fields
-            } else {
-                layouts.push((path, Vec::new()));
-                &mut layouts.last_mut().unwrap().1
-            };
+        // `(key, element_path)` for the `field[]` declarations, deduplicated by
+        // key: naming one array from two helpers of the same residual would
+        // otherwise repeat its descr in the write set.
+        let mut arrays: Vec<(String, &syn::Path)> = Vec::new();
+        for (_, path, field, writes_elements) in writes {
             let struct_last = path
                 .segments
                 .last()
                 .map(|segment| segment.ident.to_string())
                 .unwrap_or_default();
             let key = format!("{}::{}", struct_last, field);
+            if *writes_elements {
+                let Some((_, _, element_path)) = config.array_fields.get(&key) else {
+                    return Some(
+                        syn::Error::new(
+                            field.span(),
+                            format!(
+                                "jit_interp: residual_writes `{key}[]` declares a write to the \
+                                 elements of an array field, but `{key}` is not declared in \
+                                 `array_fields`, so there is no element type to mint the written \
+                                 array descr from"
+                            ),
+                        )
+                        .to_compile_error(),
+                    );
+                };
+                if !arrays.iter().any(|(seen, _)| *seen == key) {
+                    arrays.push((key, element_path));
+                }
+                continue;
+            }
+            let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
+                fields
+            } else {
+                layouts.push((path, Vec::new()));
+                &mut layouts.last_mut().unwrap().1
+            };
             let is_ref = config.ref_fields.contains_key(&key);
             // Same declared width the getfield/setfield lowering registers, so
             // this write-EI rebuild mints the field descr the reads resolve to
@@ -90,13 +120,26 @@ impl<'c> Lowerer<'c> {
                 }
             })
             .collect();
+        let arrays: Vec<_> = arrays
+            .iter()
+            .map(|(_, element_path)| {
+                // `is_item_signed = true` mirrors the literal the READ side
+                // passes (`add_gc_int_array_descr(size_of::<Elem>(), true)` in
+                // `lower_ref_binding_array_read`).  It is not derived from the
+                // element type on purpose: the write descr has to match what
+                // the reads intern, and deriving it here would make an unsigned
+                // element type produce a shape no read ever mints.
+                quote! { (::core::mem::size_of::<#element_path>(), true) }
+            })
+            .collect();
         Some(quote! {
             // The residual mutates a host-owned native struct field (no
             // GC header) → `is_gc_managed = false`, matching the
             // getfield/setfield lowering so the write-EI rebuilds the
             // SAME parent SizeDescr identity the getfield reads back.
-            majit_metainterp::struct_fields_write_effect_info(
+            majit_metainterp::residual_write_effect_info(
                 &[#(#layouts),*],
+                &[#(#arrays),*],
                 #can_raise,
             )
         })

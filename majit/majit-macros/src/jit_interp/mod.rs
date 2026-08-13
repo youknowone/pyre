@@ -372,6 +372,12 @@ pub struct ResidualWriteEntry {
     /// pointer carried by `ref_scalar` type-puns several repr(C) layouts whose
     /// shared field offsets nevertheless have distinct field-descr identities.
     pub struct_type: Option<Path>,
+    /// Set by the `[]` suffix (`selected_ref.data[] => [...]`): the helpers
+    /// mutate the ELEMENTS of the array `<field>` points at, not the field
+    /// itself.  The two are independent claims — a residual that reallocates a
+    /// buffer writes both, and one that only stores through it writes only the
+    /// elements — so a declaration of each is written separately.
+    pub writes_elements: bool,
     pub helpers: Vec<Path>,
 }
 
@@ -802,6 +808,18 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
         let ref_scalar: Ident = content.parse()?;
         content.parse::<Token![.]>()?;
         let field: Ident = content.parse()?;
+        // `<field>[]` — the elements behind the pointer, not the pointer field.
+        let writes_elements = content.peek(syn::token::Bracket);
+        if writes_elements {
+            let brackets;
+            bracketed!(brackets in content);
+            if !brackets.is_empty() {
+                return Err(brackets.error(
+                    "residual_writes element syntax takes no index: write `field[]`, \
+                     which declares a write to some element of the array",
+                ));
+            }
+        }
         let struct_type = if content.peek(Token![@]) {
             content.parse::<Token![@]>()?;
             Some(content.parse::<Path>()?)
@@ -817,6 +835,7 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
             ref_scalar,
             field,
             struct_type,
+            writes_elements,
             helpers: helpers.into_iter().collect(),
         });
         let _ = content.parse::<Token![,]>();

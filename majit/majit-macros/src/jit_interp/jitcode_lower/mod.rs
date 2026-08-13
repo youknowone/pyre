@@ -183,7 +183,9 @@ pub struct LowererConfig {
     /// naming the field so the optimizer invalidates the cached
     /// `getfield_gc_i`.  Source: `JitInterpConfig.residual_writes`, the struct
     /// `Path` recovered from `state_ref_scalars[ref_scalar]`.
-    pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident)>,
+    /// The trailing `bool` is the `[]` suffix: the helper writes the ELEMENTS
+    /// of the array the field points at, rather than the field itself.
+    pub(super) residual_writes: Vec<(Vec<String>, syn::Path, Ident, bool)>,
     /// `(pool-base ref-scalar name, getter function path segments, element type)`.
     /// A call `<getter>(state.<base>, <int>)` whose function path matches
     /// `getter` AND whose arg0 is the `base` lowers to `getarrayitem_gc_r`
@@ -1165,9 +1167,14 @@ impl LowererConfig {
                         .map(|(_, p)| p.clone())
                 });
                 entry.helpers.iter().filter_map(move |helper| {
-                    struct_path
-                        .clone()
-                        .map(|p| (canonical_path_segments(helper), p, entry.field.clone()))
+                    struct_path.clone().map(|p| {
+                        (
+                            canonical_path_segments(helper),
+                            p,
+                            entry.field.clone(),
+                            entry.writes_elements,
+                        )
+                    })
                 })
             })
             .collect();
@@ -2610,6 +2617,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2635,6 +2647,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2660,6 +2677,11 @@ mod tests {
                 "#,
             ),
             &[inline_policy("callee")],
+            // ref_params, ref_fields, array_fields, int_fields,
+            // native_int_binops, native_tag_small, headerless_structs — the
+            // surface these tests assert is the call encoding, which none of
+            // them participate in.
+            &[],
             &[],
             &[],
             &[],
