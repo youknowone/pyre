@@ -5359,6 +5359,39 @@ pub unsafe fn create_all_slots(
             newslotnames.push("__dict_data__".to_string());
         }
 
+        // `W_WeakrefBase`/`W_Weakref` keep `w_obj_weak`, `w_callable` and
+        // `w_hash` as interpreter-owned fields.  A `weakref.ref` subclass that
+        // adds no storage keeps the typed layout, and one that gets an instance
+        // dict keeps them there; a subclass declaring a non-empty `__slots__`
+        // has neither, so reserve private layout slots for them.  Without this
+        // the constructor's stores are dropped and every such reference reads
+        // back dead — `weakref.KeyedRef` is exactly that shape.
+        let weakref_ref_type = crate::module::_weakref::interp__weakref::weakref_type();
+        let is_weakref_subclass = !weakref_ref_type.is_null()
+            && !std::ptr::eq(w_type, weakref_ref_type)
+            && crate::baseobjspace::issubtype_w(w_type, weakref_ref_type);
+        if is_weakref_subclass && !newslotnames.is_empty() {
+            let reserved = crate::module::_weakref::interp__weakref::RESERVED_FIELD_SLOTS;
+            let mut inherited_fields = false;
+            let mut ancestor_layout = base_layout;
+            while !ancestor_layout.is_null() {
+                if (*ancestor_layout)
+                    .newslotnames
+                    .iter()
+                    .any(|name| name == reserved[0])
+                {
+                    inherited_fields = true;
+                    break;
+                }
+                ancestor_layout = (*ancestor_layout).base_layout;
+            }
+            if !inherited_fields {
+                // No Member is stored for these: they are interpreter storage,
+                // not attributes the subclass exposes.
+                newslotnames.extend(reserved.iter().map(|name| (*name).to_string()));
+            }
+        }
+
         // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
         if wantdict {
             create_dict_slot(w_type);

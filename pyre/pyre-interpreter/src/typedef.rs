@@ -10838,24 +10838,27 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     // typedef identifies the fixed builtin prefix. CPython appends one pointer
     // per user slot to that same prefix.
     let mut slots = unsafe { pyre_object::w_type_get_nslots(w_type) } as i64;
-    // A dict subclass is represented by a composed instance in pyre and owns
-    // one private `__dict_data__` Layout slot for its mapping payload. CPython
-    // keeps that payload in the fixed PyDictObject prefix, so the private slot
-    // must not contribute to the public `tp_basicsize` projection.
+    // Some composed instances own private Layout slots for a builtin's
+    // intrinsic fields: a dict subclass keeps its mapping payload in
+    // `__dict_data__`, a slotted `weakref.ref` subclass its three
+    // `W_WeakrefBase` fields. CPython keeps both in the fixed struct prefix,
+    // so neither contributes to the public `tp_basicsize` projection.
     let mut current = unsafe { pyre_object::w_type_get_layout_ptr(w_type) };
     while !current.is_null() {
-        if unsafe {
-            (*current)
-                .newslotnames
-                .iter()
-                .any(|name| name == "__dict_data__")
-        } {
-            slots -= 1;
-            break;
-        }
+        slots -= unsafe { &(*current).newslotnames }
+            .iter()
+            .filter(|name| is_reserved_payload_slot(name))
+            .count() as i64;
         current = unsafe { (*current).base_layout };
     }
     Some((base + slots * word, item))
+}
+
+/// Whether `name` is a Layout slot pyre reserves for a builtin's intrinsic
+/// fields rather than for an attribute the class declared.
+fn is_reserved_payload_slot(name: &str) -> bool {
+    name == "__dict_data__"
+        || crate::module::_weakref::interp__weakref::RESERVED_FIELD_SLOTS.contains(&name)
 }
 
 fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {

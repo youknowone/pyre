@@ -30,6 +30,52 @@ const ATTR_W_OBJ_WEAK: &str = "w_obj_weak";
 const ATTR_W_CALLABLE: &str = "w_callable";
 const ATTR_W_HASH: &str = "w_hash";
 
+/// Private layout-slot names reserved on a `weakref.ref` subclass that
+/// declares a non-empty `__slots__`. Such an instance has no dict, so the
+/// three fields above have no other object-resident storage; type creation
+/// appends these names to the subclass Layout (`call.rs` `create_all_slots`)
+/// and they carry no Member, being interpreter storage rather than attributes
+/// the class exposes.
+pub const RESERVED_FIELD_SLOTS: [&str; 3] = [
+    "__weakref_obj__",
+    "__weakref_callback__",
+    "__weakref_hash__",
+];
+
+/// Layout-slot index reserved for the field `name` on `obj`, walking the
+/// layout chain from the object's type toward its base. `None` when no layout
+/// in the chain reserves the slot, which is the ordinary dict-backed case.
+fn field_slot(obj: PyObjectRef, name: &str) -> Option<u32> {
+    let slot_name = match name {
+        ATTR_W_OBJ_WEAK => RESERVED_FIELD_SLOTS[0],
+        ATTR_W_CALLABLE => RESERVED_FIELD_SLOTS[1],
+        ATTR_W_HASH => RESERVED_FIELD_SLOTS[2],
+        _ => return None,
+    };
+    unsafe {
+        let w_type = crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr());
+        if w_type.is_null() {
+            return None;
+        }
+        let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
+        while !layout.is_null() {
+            let current = &*layout;
+            let first_slot = current
+                .nslots
+                .saturating_sub(current.newslotnames.len() as u32);
+            if let Some(offset) = current
+                .newslotnames
+                .iter()
+                .position(|candidate| candidate == slot_name)
+            {
+                return Some(first_slot + offset as u32);
+            }
+            layout = current.base_layout;
+        }
+        None
+    }
+}
+
 /// Read a per-instance slot from the underlying `INSTANCE_DICT` directly,
 /// bypassing the public `getattr` path. The proxy fast-path in
 /// `baseobjspace::getattr_str` would otherwise force the receiver and recurse
@@ -38,6 +84,19 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
+    if let Some(slot) = field_slot(pyre_object::gc_roots::shadow_stack_get(root_base), name) {
+        let value = unsafe {
+            crate::objspace::std::mapdict::getslotvalue(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                slot,
+            )
+        }
+        .unwrap_or(PY_NULL);
+        if value.is_null() || unsafe { pyre_object::is_none(value) } {
+            return PY_NULL;
+        }
+        return value;
+    }
     let w_dict =
         crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
     if w_dict.is_null() {
@@ -64,6 +123,16 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
     pyre_object::gc_roots::pin_root(value);
+    if let Some(slot) = field_slot(pyre_object::gc_roots::shadow_stack_get(root_base), name) {
+        unsafe {
+            crate::objspace::std::mapdict::setslotvalue(
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                slot,
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            )
+        };
+        return;
+    }
     let w_dict =
         crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
     if !w_dict.is_null() {
