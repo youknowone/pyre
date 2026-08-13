@@ -71,7 +71,7 @@ const DEFAULT_ROOT_STACK_DEPTH: usize = 163840;
 /// any/all rooting probes with a pure-integer control at exactly `1.0000`.
 /// The buffer is raw-allocated once instead, as `_prepare_unused_stack` does
 /// (`shadowstack.py:344-349`), and released by [`RootStackOwner`].
-struct RootStack {
+pub struct RootStack {
     base: Cell<*mut PyObjectRef>,
     top: Cell<*mut PyObjectRef>,
     limit: Cell<*mut PyObjectRef>,
@@ -596,7 +596,7 @@ pub fn shadow_stack_len() -> usize {
 /// of tracing into it (`@dont_look_inside`, `rlib/jit.py:139`), the
 /// `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
-fn shadow_stack_cell() -> *const RootStack {
+pub fn shadow_stack_cell() -> *const RootStack {
     with_shadow_stack(|stack| stack as *const RootStack)
 }
 
