@@ -683,3 +683,117 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
 
     assert_eq!(bh.registers_i[1], 21);
 }
+
+// ── Array-backed storage: `array_fields` element read/write ─────────
+//
+// The non-virtualizable array vocabulary. `data` holds the buffer BASE
+// POINTER, so `stack.data[i]` is a `getfield_gc_r` for the base followed by
+// `get/setarrayitem_gc_i` — the elements do not ride a guard's `vable_array`
+// resume section, so a guard's snapshot stays O(1) in the buffer length.
+
+#[repr(C)]
+struct InlineArrayStack {
+    data: *mut i64,
+    sp: usize,
+}
+
+#[jit_inline(
+    ref_params = {
+        stack: ref(InlineArrayStack),
+    },
+    array_fields = {
+        InlineArrayStack::data => i64,
+    },
+)]
+fn inline_array_stack_push(stack: usize, value: i64) {
+    let sp = stack.sp;
+    stack.data[sp] = value;
+    stack.sp = sp + 1usize;
+}
+
+#[jit_inline(
+    ref_params = {
+        stack: ref(InlineArrayStack),
+    },
+    array_fields = {
+        InlineArrayStack::data => i64,
+    },
+)]
+fn inline_array_stack_pop(stack: usize) -> i64 {
+    let sp = stack.sp - 1usize;
+    let value = stack.data[sp];
+    stack.sp = sp;
+    value
+}
+
+/// Whether `key`'s opcode byte appears anywhere in the jitcode body.
+///
+/// Locating instruction boundaries would need a full argcode-driven walk, so
+/// this is containment only: an operand byte could alias the opcode. That is
+/// enough for what these tests claim — that the emitter selected the array
+/// opcode at all rather than falling back to a residual call — and each
+/// caller corroborates it with a register-bank assertion that only the
+/// getfield_gc_r + array-op pair produces.
+fn jitcode_contains_opcode(jitcode: &majit_metainterp::JitCode, key: &str) -> bool {
+    let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+        .get(key)
+        .unwrap_or_else(|| panic!("missing wellknown opcode for {key}"));
+    jitcode.code.contains(&opcode)
+}
+
+#[test]
+fn jit_inline_array_field_write_emits_setarrayitem_gc_i() {
+    let mut asm = majit_metainterp::Assembler::new();
+    let jitcode = __majit_inline_jitcode_inline_array_stack_push_with_asm(&mut asm);
+    assert!(
+        jitcode_contains_opcode(&jitcode, "setarrayitem_gc_i/riid"),
+        "`stack.data[sp] = value` should lower to setarrayitem_gc_i, not a residual call"
+    );
+    // The buffer base is loaded through a getfield_gc_r, so the ref bank
+    // holds both the struct pointer and the buffer pointer.
+    assert!(
+        jitcode.c_num_regs_r >= 2,
+        "struct ref + loaded buffer base both need ref registers, got {}",
+        jitcode.c_num_regs_r
+    );
+}
+
+#[test]
+fn jit_inline_array_field_read_emits_getarrayitem_gc_i() {
+    let mut asm = majit_metainterp::Assembler::new();
+    let jitcode = __majit_inline_jitcode_inline_array_stack_pop_with_asm(&mut asm);
+    assert!(
+        jitcode_contains_opcode(&jitcode, "getarrayitem_gc_i/rid>i"),
+        "`stack.data[sp]` should lower to getarrayitem_gc_i, not a residual call"
+    );
+    assert!(
+        jitcode.c_num_regs_r >= 2,
+        "struct ref + loaded buffer base both need ref registers, got {}",
+        jitcode.c_num_regs_r
+    );
+}
+
+#[test]
+fn jit_inline_array_field_keeps_interpreter_behavior() {
+    // The concrete (non-JIT) path must compute the same thing the jitcode
+    // does: the macro rewrites `stack.data[i]` into a deref through the
+    // base pointer, since the helper receives the struct as raw `usize`.
+    let mut buffer = vec![0i64; 4];
+    let mut stack = InlineArrayStack {
+        data: buffer.as_mut_ptr(),
+        sp: 0,
+    };
+    let stack_ptr = &mut stack as *mut InlineArrayStack as usize;
+
+    inline_array_stack_push(stack_ptr, 10);
+    inline_array_stack_push(stack_ptr, 20);
+    inline_array_stack_push(stack_ptr, 30);
+    assert_eq!(stack.sp, 3);
+    assert_eq!(buffer[..3], [10, 20, 30]);
+
+    assert_eq!(inline_array_stack_pop(stack_ptr), 30);
+    assert_eq!(inline_array_stack_pop(stack_ptr), 20);
+    assert_eq!(stack.sp, 1);
+    assert_eq!(inline_array_stack_pop(stack_ptr), 10);
+    assert_eq!(stack.sp, 0);
+}

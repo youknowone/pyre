@@ -395,6 +395,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     calls: &[crate::jit_interp::CallEntry],
     ref_params: &[(Ident, syn::Path)],
     ref_fields: &[crate::jit_interp::RefFieldEntry],
+    array_fields: &[crate::jit_interp::ArrayFieldEntry],
     int_fields: &[crate::jit_interp::IntFieldEntry],
     native_int_binops: &[(Path, Ident)],
     native_tag_small: &[Path],
@@ -433,6 +434,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         .collect();
     let inline_config = if ref_param_structs.is_empty()
         && ref_fields.is_empty()
+        && array_fields.is_empty()
         && int_fields.is_empty()
         && native_int_binops.is_empty()
         && native_tag_small.is_empty()
@@ -442,6 +444,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     } else {
         Some(LowererConfig::inline_helper(
             ref_fields,
+            array_fields,
             int_fields,
             native_int_binops,
             native_tag_small,

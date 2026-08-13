@@ -1253,6 +1253,12 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_state_ref_field_setfield(expr) {
             return Some(());
         }
+        // Array element write on a local ref binding whose field is declared
+        // in `array_fields`: `<binding>.<field>[<idx>] = <expr>` →
+        // getfield_gc_r for the buffer base, then setarrayitem_gc_i.
+        if let Some(()) = self.lower_ref_binding_array_write(expr) {
+            return Some(());
+        }
         // Field write on a local ref binding with known struct type:
         // `<binding>.<field> = <expr>` → setfield_gc_i/setfield_gc_r.
         if let Some(()) = self.lower_ref_binding_setfield(expr) {

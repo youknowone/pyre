@@ -40,6 +40,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.residual_writes,
         &config.pool_arrays,
         &config.ref_fields,
+        &config.array_fields,
         &config.int_fields,
         &config.call_returns,
         &config.headerless_structs,

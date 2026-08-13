@@ -1126,6 +1126,179 @@ impl<'c> Lowerer<'c> {
         }
     }
 
+    /// Resolve `<local ref binding>.<field>` where `<field>` is declared in
+    /// `array_fields`, emitting the `getfield_gc_r` that loads the array's
+    /// base pointer and returning `(base_reg, element_type)`.
+    ///
+    /// Shared by the element read and the element write so both take the
+    /// buffer pointer through the SAME interned field descr — a store to the
+    /// base (a realloc on growth) then invalidates the load the heapcache
+    /// served, instead of leaving a stale buffer pointer live in the trace.
+    fn lower_array_field_base(&mut self, field: &syn::ExprField) -> Option<(u16, syn::Path)> {
+        let config = self.config?;
+        let Expr::Path(path) = &*field.base else {
+            return None;
+        };
+        let ident = path.path.get_ident()?;
+        let binding = self.bindings.get(&ident.to_string())?.clone();
+        if !matches!(binding.kind, BindingKind::Ref) {
+            return None;
+        }
+        let struct_path = binding.struct_type.as_ref()?.clone();
+        let member = field.member.clone();
+        let member_name = named_member(&field.member)?;
+        let struct_last = struct_path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        let key = format!("{}::{}", struct_last, member_name);
+        let element_type = config.array_fields.get(&key)?.2.clone();
+        let tid = struct_type_id_tokens(&struct_path, false);
+        let base_reg = binding.reg;
+        let buffer_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(base_reg)],
+                vec![Register::ref_(buffer_reg)],
+            ),
+            quote! {
+                __builder.register_struct_layout(
+                    ::core::mem::size_of::<#struct_path>(),
+                    #tid,
+                    false,
+                    false,
+                    &[(
+                        ::core::mem::offset_of!(#struct_path, #member),
+                        true,
+                        stringify!(#member),
+                        ::core::mem::size_of::<usize>(),
+                        false,
+                    )],
+                );
+                __builder.getfield_gc_r(
+                    #buffer_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                    stringify!(#member),
+                );
+            },
+        );
+        Some((buffer_reg, element_type))
+    }
+
+    /// Recognizes an array element READ on a local ref binding:
+    /// `<binding>.<array_field>[<int expr>]` → `getfield_gc_r` for the buffer
+    /// base followed by `getarrayitem_gc_i`.
+    ///
+    /// This is the non-virtualizable counterpart of the `[..; virt]` element
+    /// read: the loaded value is an ordinary trace value, so it does NOT ride
+    /// the guard's `vable_array` resume section and the snapshot stays O(1) in
+    /// the array's length.
+    ///
+    /// No `arraylen_gc` is emitted anywhere on this path — the buffer has no
+    /// object header to read a length from. A bound belongs on a sibling
+    /// `int_fields` length field.
+    pub(super) fn lower_ref_binding_array_read(&mut self, expr: &Expr) -> Option<Binding> {
+        let Expr::Index(index_expr) = expr else {
+            return None;
+        };
+        let Expr::Field(field) = &*index_expr.expr else {
+            return None;
+        };
+        // Lower the index BEFORE the base load would be wasted work only if
+        // the shape does not match; `lower_array_field_base` is the last
+        // rejecting step, so run it first and emit nothing until it accepts.
+        let (buffer_reg, element_type) = self.lower_array_field_base(field)?;
+        let index = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let result_reg = self.alloc_reg();
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_gc_int_array_descr(
+                    ::core::mem::size_of::<#element_type>(),
+                    true,
+                );
+                __builder.getarrayitem_gc_i(
+                    #result_reg as u16,
+                    #buffer_reg as u16,
+                    #index_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack: index.depends_on_stack,
+            struct_type: None,
+        })
+    }
+
+    /// Recognizes an array element WRITE on a local ref binding:
+    /// `<binding>.<array_field>[<int expr>] = <int expr>` → `getfield_gc_r`
+    /// for the buffer base followed by `setarrayitem_gc_i`.
+    ///
+    /// Store counterpart of [`Self::lower_ref_binding_array_read`]; both take
+    /// the element descr from `add_gc_int_array_descr`, so the store
+    /// invalidates the heapcache entry the matching load populated.
+    pub(super) fn lower_ref_binding_array_write(&mut self, expr: &Expr) -> Option<()> {
+        let Expr::Assign(assign) = expr else {
+            return None;
+        };
+        let Expr::Index(index_expr) = &*assign.left else {
+            return None;
+        };
+        let Expr::Field(field) = &*index_expr.expr else {
+            return None;
+        };
+        let (buffer_reg, element_type) = self.lower_array_field_base(field)?;
+        let index = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(index.kind, BindingKind::Int) {
+            return None;
+        }
+        let value = self.lower_value_expr(&assign.right)?;
+        if !matches!(value.kind, BindingKind::Int) {
+            return None;
+        }
+        let index_reg = index.reg;
+        let value_reg = value.reg;
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Vable,
+                vec![
+                    Register::ref_(buffer_reg),
+                    Register::int(index_reg),
+                    Register::int(value_reg),
+                ],
+                vec![],
+            ),
+            quote! {
+                let __descr_idx = __builder.add_gc_int_array_descr(
+                    ::core::mem::size_of::<#element_type>(),
+                    true,
+                );
+                __builder.setarrayitem_gc_i(
+                    #buffer_reg as u16,
+                    #index_reg as u16,
+                    #value_reg as u16,
+                    __descr_idx,
+                );
+            },
+        );
+        Some(())
+    }
+
     /// Recognizes a pool-array element read through the registered getter call
     /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
     /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
