@@ -5688,6 +5688,7 @@ impl CodeWriter {
                 effect_info: key.0.clone(),
                 arg_kinds: key.1.clone(),
                 result_kind: key.2,
+                void_word_abi: false,
             })
         });
         arc.clone() as Arc<dyn majit_ir::Descr>

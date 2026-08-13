@@ -924,6 +924,11 @@ pub struct BhCallDescr {
     pub result_size: usize,
     /// RPython `descr.py:665` `RESULT_ERASED`.
     pub result_erased: CallResultErasedKey,
+    /// A void-recorded call whose C callee returns an ignored machine word.
+    /// `result_type` stays `'v'`; the runtime descriptor uses an eight-byte
+    /// result layout so signature-exact backends call the true ABI.
+    #[serde(default)]
+    pub void_word_abi: bool,
     /// RPython `CallDescr.extrainfo` (`descr.py:453`,
     /// `effectinfo.py:13-263`).
     pub extra_info: majit_ir::descr::EffectInfo,
@@ -999,6 +1004,7 @@ impl BhCallDescr {
                 // char-specific erased key.
                 result_erased
             },
+            void_word_abi: result_class == 'v' && result_size == 8,
             extra_info: cd.get_extra_info().clone(),
         }
     }
@@ -1016,6 +1022,7 @@ impl BhCallDescr {
             result_signed,
             result_size,
             result_erased,
+            void_word_abi: false,
             extra_info,
         }
     }
@@ -1042,8 +1049,19 @@ impl BhCallDescr {
                 result_type == majit_ir::value::Type::Int,
                 result_size,
             ),
+            void_word_abi: false,
             extra_info,
         }
+    }
+
+    pub fn with_void_word_abi(mut self) -> Self {
+        assert_eq!(
+            self.result_type, 'v',
+            "void-word ABI requires a void-recorded call descriptor",
+        );
+        self.result_size = 8;
+        self.void_word_abi = true;
+        self
     }
 }
 

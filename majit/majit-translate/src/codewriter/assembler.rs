@@ -5045,6 +5045,7 @@ enum AssemblerDescrKey {
         result_signed: bool,
         result_size: usize,
         result_erased: crate::jitcode::CallResultErasedKey,
+        void_word_abi: bool,
         effect: EffectInfoKey,
     },
     /// RPython uses the JitCode object itself as an AbstractDescr for
@@ -5059,6 +5060,7 @@ enum AssemblerDescrKey {
         result_signed: bool,
         result_size: usize,
         result_erased: crate::jitcode::CallResultErasedKey,
+        void_word_abi: bool,
         effect: EffectInfoKey,
     },
     Switch(Vec<(i64, usize)>),
@@ -5171,6 +5173,7 @@ impl AssemblerDescrKey {
                 result_signed: calldescr.result_signed,
                 result_size: calldescr.result_size,
                 result_erased: calldescr.result_erased,
+                void_word_abi: calldescr.void_word_abi,
                 effect: EffectInfoKey::from_effect_info(&calldescr.extra_info),
             },
             crate::jitcode::BhDescr::JitCode {
@@ -5185,6 +5188,7 @@ impl AssemblerDescrKey {
                 result_signed: calldescr.result_signed,
                 result_size: calldescr.result_size,
                 result_erased: calldescr.result_erased,
+                void_word_abi: calldescr.void_word_abi,
                 effect: EffectInfoKey::from_effect_info(&calldescr.extra_info),
             },
             crate::jitcode::BhDescr::Switch { dict, .. } => {
@@ -5920,6 +5924,7 @@ mod tests {
             result_signed: false,
             result_size: 8,
             result_erased: crate::jitcode::CallResultErasedKey::Unsigned,
+            void_word_abi: false,
             extra_info: effect.clone(),
         };
         let raw_address = crate::jitcode::BhCallDescr {
@@ -5928,6 +5933,7 @@ mod tests {
             result_signed: false,
             result_size: 8,
             result_erased: crate::jitcode::CallResultErasedKey::Address,
+            void_word_abi: false,
             extra_info: effect,
         };
 

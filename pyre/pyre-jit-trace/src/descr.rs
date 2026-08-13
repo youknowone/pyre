@@ -6807,6 +6807,14 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
         'f' | 'L' => Type::Float,
         _ => Type::Void,
     };
+    if bh.void_word_abi {
+        assert_eq!(
+            result_type,
+            Type::Void,
+            "void-word ABI requires a void BhCallDescr result type",
+        );
+    }
+    let result_size = if bh.void_word_abi { 8 } else { bh.result_size };
     // call.py:320 effectinfo_from_writeanalyze parity: the descr consumed
     // by pyjitpl/residual-call recording must expose the same EffectInfo
     // that the codewriter classified for this call site.
@@ -6822,7 +6830,7 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
         result_type,
         bh.result_type,
         bh.result_signed,
-        bh.result_size,
+        result_size,
         bh.extra_info.clone(),
     )
 }

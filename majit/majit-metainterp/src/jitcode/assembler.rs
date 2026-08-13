@@ -3355,6 +3355,27 @@ impl JitCodeBuilder {
         );
     }
 
+    pub fn residual_call_void_canonical_via_target_with_effect_info_and_word_abi(
+        &mut self,
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        effect_info: majit_ir::descr::EffectInfo,
+        void_word_abi: bool,
+    ) {
+        self.emit_canonical_call_void_via_target_with_word_abi(
+            (
+                jitcode::insns::BC_RESIDUAL_CALL_R_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IR_V,
+                jitcode::insns::BC_RESIDUAL_CALL_IRF_V,
+            ),
+            fn_ptr_idx,
+            arg_regs,
+            effect_info,
+            void_word_abi,
+            "residual_call_void_canonical_via_target",
+        );
+    }
+
     /// Emit the canonical `residual_call_{r,ir,irf}_v` opname/argcodes byte
     /// layout.
     ///
@@ -3602,6 +3623,25 @@ impl JitCodeBuilder {
         effect_info: majit_ir::descr::EffectInfo,
         helper_name: &'static str,
     ) {
+        self.emit_canonical_call_void_via_target_with_word_abi(
+            opcodes,
+            fn_ptr_idx,
+            arg_regs,
+            effect_info,
+            false,
+            helper_name,
+        );
+    }
+
+    fn emit_canonical_call_void_via_target_with_word_abi(
+        &mut self,
+        opcodes: (u8, u8, u8),
+        fn_ptr_idx: u16,
+        arg_regs: &[JitCallArg],
+        effect_info: majit_ir::descr::EffectInfo,
+        void_word_abi: bool,
+        helper_name: &'static str,
+    ) {
         let target = match self.descrs.get(fn_ptr_idx as usize) {
             Some(RuntimeBhDescr::Call(target)) => *target.as_ref(),
             other => panic!(
@@ -3626,6 +3666,11 @@ impl JitCodeBuilder {
             majit_ir::value::Type::Void,
             effect_info,
         );
+        let calldescr = if void_word_abi {
+            calldescr.with_void_word_abi()
+        } else {
+            calldescr
+        };
         let calldescr_idx =
             self.emit_canonical_call_void(opcodes, concrete_ptr, arg_regs, calldescr);
         self.call_descr_to_call_target.insert(calldescr_idx, target);

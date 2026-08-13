@@ -1721,10 +1721,11 @@ fn dispatch_residual_call(
         }
         state
             .builder
-            .residual_call_void_canonical_via_target_with_effect_info(
+            .residual_call_void_canonical_via_target_with_effect_info_and_word_abi(
                 fn_idx,
                 &call_args,
                 stub.effect_info.clone(),
+                stub.void_word_abi,
             );
         return;
     }
@@ -2968,6 +2969,7 @@ mod tests {
                     ),
                     arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Float],
                     result_kind: Some(Kind::Float),
+                    void_word_abi: false,
                 })),
             ],
             Register::new(Kind::Float, 1),
@@ -3009,6 +3011,7 @@ mod tests {
                         super::super::flatten::unresolved_release_gil_effect_info_for_via_target(),
                     arg_kinds: vec![Kind::Int, Kind::Ref],
                     result_kind: None,
+                    void_word_abi: false,
                 })),
             ],
         ));
@@ -3034,6 +3037,78 @@ mod tests {
             .unwrap()
             .as_calldescr();
         assert!(descr.extra_info.is_call_release_gil());
+    }
+
+    #[test]
+    fn residual_call_r_v_preserves_word_returning_and_genuine_void_abis() {
+        let mut word_builder = JitCodeBuilder::default();
+        let word_fn_idx = word_builder.add_fn_ptr(0x7777usize as *const ());
+        let word_insn = super::super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
+            word_fn_idx,
+            0,
+            1,
+            2,
+        );
+        let mut word_ssarepr = SSARepr::new("residual_call_r_v_word_abi");
+        word_ssarepr.insns.push(word_insn);
+        let word_jitcode = assemble(
+            &mut word_ssarepr,
+            word_builder,
+            Some(NumRegs {
+                ref_: 3,
+                ..NumRegs::default()
+            }),
+        );
+        let word_bh = word_jitcode
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_bh_descr())
+            .find_map(|descr| match descr {
+                majit_translate::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
+                _ => None,
+            })
+            .expect("word-returning residual_call_r_v must emit a BhCallDescr");
+        let word_descr = pyre_jit_trace::descr::make_call_descr_from_bh(word_bh);
+        let word_call = word_descr
+            .as_call_descr()
+            .expect("word-returning residual_call_r_v must yield a call descr");
+        assert_eq!(word_call.result_type(), majit_ir::Type::Void);
+        assert_eq!(word_call.result_size(), 8);
+
+        let mut void_builder = JitCodeBuilder::default();
+        let void_fn_idx = void_builder.add_fn_ptr(0x8888usize as *const ());
+        let void_insn =
+            super::super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
+                void_fn_idx,
+                0,
+            );
+        let mut void_ssarepr = SSARepr::new("residual_call_r_v_genuine_void");
+        void_ssarepr.insns.push(void_insn);
+        let void_jitcode = assemble(
+            &mut void_ssarepr,
+            void_builder,
+            Some(NumRegs {
+                ref_: 1,
+                ..NumRegs::default()
+            }),
+        );
+        let void_bh = void_jitcode
+            .exec
+            .descrs
+            .iter()
+            .filter_map(|descr| descr.as_bh_descr())
+            .find_map(|descr| match descr {
+                majit_translate::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
+                _ => None,
+            })
+            .expect("set_current_exception residual_call_r_v must emit a BhCallDescr");
+        let void_descr = pyre_jit_trace::descr::make_call_descr_from_bh(void_bh);
+        let void_call = void_descr
+            .as_call_descr()
+            .expect("set_current_exception residual_call_r_v must yield a call descr");
+        assert_eq!(void_call.result_type(), majit_ir::Type::Void);
+        assert_eq!(void_call.result_size(), 0);
     }
 
     /// `assembler.py:197-206` parity: a `Descr` operand attached to an op

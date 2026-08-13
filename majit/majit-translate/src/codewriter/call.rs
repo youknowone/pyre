@@ -263,6 +263,7 @@ impl CallDescriptor {
             result_signed: self.result_signed,
             result_size: self.result_size,
             result_erased: self.result_erased,
+            void_word_abi: self.result_type == 'v' && self.result_size == 8,
             extra_info: self.extra_info.clone(),
         }
     }

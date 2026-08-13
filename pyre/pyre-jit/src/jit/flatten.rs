@@ -477,6 +477,12 @@ pub struct CallDescrStub {
     /// that the two MUST agree per `descr.create_call_stub` /
     /// `descr.result_type` round-trip in `descr.py:670-674`.
     pub result_kind: Option<Kind>,
+    /// True when a void-recorded residual call targets an `extern "C"`
+    /// helper that returns an ignored machine word.  The opname tail and
+    /// `result_kind` remain void; this bit preserves the callee's low-level
+    /// ABI through `BhCallDescr` so signature-exact backends can select the
+    /// word-returning call type and discard its result.
+    pub void_word_abi: bool,
 }
 
 /// Make [`CallDescrStub`] addressable through `majit_ir::DescrRef` so the
@@ -493,8 +499,8 @@ impl Descr for CallDescrStub {
 
     fn repr(&self) -> String {
         format!(
-            "CallDescrStub(ei={:?}, kinds={:?}, result={:?})",
-            self.effect_info.extraeffect, self.arg_kinds, self.result_kind,
+            "CallDescrStub(ei={:?}, kinds={:?}, result={:?}, void_word_abi={})",
+            self.effect_info.extraeffect, self.arg_kinds, self.result_kind, self.void_word_abi,
         )
     }
 }
@@ -3849,6 +3855,7 @@ fn build_residual_call_ir_r_insn_from_operands(
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -3882,6 +3889,7 @@ fn build_residual_call_ir_r_insn_from_ref_list(
         effect_info,
         arg_kinds,
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -4106,6 +4114,7 @@ fn build_load_global_fn_insn_from_operands(
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -4140,6 +4149,7 @@ pub fn build_load_attr_fn_residual_call_ir_r_insn(
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -4181,6 +4191,7 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -4289,6 +4300,7 @@ where
         ctx.store_name_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
+        true,
         // Tag so the full-body walker can try the module-scope IntMutableCell
         // in-place store fold (`try_walker_store_name_cell_fold`); the fold
         // falls through to this residual for non-module frames / non-int
@@ -4332,6 +4344,7 @@ where
         ctx.store_global_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
+        true,
         // Tag for the same module-scope IntMutableCell in-place store fold as
         // `lower_store_name_hlop_to_insn` (`try_walker_store_name_cell_fold`).
         majit_ir::PyreHelperKind::StoreGlobal,
@@ -4358,6 +4371,7 @@ where
         ctx.delete_name_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
+        true,
         // Tagged so the walker can run the `jit_force_quasi_immutable` test
         // (`pyjitpl.py:1094-1118`) before executing the delete — `delitem_str`
         // calls `mutated()` on a successful removal.
@@ -4460,6 +4474,7 @@ where
         ctx.delete_global_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
+        true,
         // See [`lower_delete_name_hlop_to_insn`].
         majit_ir::PyreHelperKind::DeleteGlobal,
     ))
@@ -4843,6 +4858,7 @@ pub fn build_residual_call_r_r_insn_from_operands(
         effect_info,
         arg_kinds,
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_r_r",
@@ -4974,6 +4990,7 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
         effect_info,
         arg_kinds: vec![Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -5003,6 +5020,7 @@ pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
         effect_info,
         arg_kinds: vec![Kind::Int, Kind::Ref],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -5052,6 +5070,7 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
         effect_info,
         arg_kinds,
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
@@ -5174,6 +5193,7 @@ fn build_residual_call_r_i_insn_from_operands(
         effect_info,
         arg_kinds: vec![Kind::Ref],
         result_kind: Some(Kind::Int),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_r_i",
@@ -5230,6 +5250,7 @@ where
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::StoreSubscr,
     ))
 }
@@ -5271,6 +5292,7 @@ where
         ctx.store_slice_fn_idx,
         vec![obj_operand, start_operand, stop_operand, value_operand],
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::None,
     ))
 }
@@ -5589,6 +5611,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -5633,6 +5656,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -5683,6 +5707,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -5725,6 +5750,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -5778,6 +5804,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: None,
+        void_word_abi: true,
     }));
     Some(Insn::op(
         "residual_call_ir_v",
@@ -5869,6 +5896,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Ref, Kind::Ref],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -5954,6 +5982,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6131,6 +6160,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6564,6 +6594,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6610,6 +6641,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6664,6 +6696,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6718,6 +6751,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6770,6 +6804,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6831,6 +6866,7 @@ where
             Kind::Int,
         ],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6882,6 +6918,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -6931,6 +6968,7 @@ where
         ctx.delete_subscr_fn_idx,
         vec![obj_operand, key_operand],
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::None,
     ))
 }
@@ -6970,6 +7008,7 @@ where
         ctx.list_extend_fn_idx,
         vec![list_operand, iterable_operand],
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::None,
     ))
 }
@@ -7014,6 +7053,7 @@ where
         fn_idx,
         operands,
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::None,
     ))
 }
@@ -7054,6 +7094,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: None,
+        void_word_abi: true,
     }));
     Some(Insn::op(
         "residual_call_ir_v",
@@ -7109,6 +7150,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -7154,6 +7196,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Some(Insn::op_with_result(
         "residual_call_ir_r",
@@ -7264,6 +7307,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
             Operand::Register(Register::new(Kind::Ref, value_reg)),
         ],
         CallFlavor::MayForce,
+        true,
         majit_ir::PyreHelperKind::StoreSubscr,
     )
 }
@@ -7290,6 +7334,7 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
         set_current_exception_fn_idx,
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
         CallFlavor::PlainCannotRaiseNoHeap,
+        false,
         majit_ir::PyreHelperKind::None,
     )
 }
@@ -7307,6 +7352,7 @@ fn build_residual_call_r_v_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
+    void_word_abi: bool,
     pyre_helper: majit_ir::PyreHelperKind,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
@@ -7316,6 +7362,7 @@ fn build_residual_call_r_v_insn_from_operands(
         effect_info,
         arg_kinds,
         result_kind: None,
+        void_word_abi,
     }));
     Insn::op(
         "residual_call_r_v",
@@ -7421,6 +7468,7 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
         result_kind: Some(Kind::Ref),
+        void_word_abi: false,
     }));
     Insn::op_with_result(
         "residual_call_ir_r",
