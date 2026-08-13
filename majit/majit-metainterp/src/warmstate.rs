@@ -273,7 +273,7 @@ pub use crate::memmgr::MemoryManager;
 
 // Warm state manager — the orchestrator of the JIT lifecycle. It keeps track
 // of per-greenkey cells and the global hot counter.
-// rlib/jit.py:588-605 PARAMETERS defaults.
+// Defaults from `rpython.rlib.jit.PARAMETERS`.
 // DEFAULT_ constants must match RPython exactly.
 
 /// rlib/jit.py:588 threshold = 1039 (just above 1024, prime)
@@ -1880,8 +1880,8 @@ impl WarmEnterState {
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
     ///     warmstate.py: set_param() — set a JIT parameter by name.
-    ///     Negative values for thresholds mean "disabled/off" (rpython/rlib/jit.py:843).
-    ///     counter.py:124 — compute_threshold(threshold<=0) returns 0.0 (JIT off).
+    ///     `JitDriver.set_param` defines negative thresholds as disabled, and
+    ///     `JitCounter.compute_threshold` maps a disabled threshold to `0.0`.
     ///     Parameter names match RPython exactly: vec, vec_all, vec_cost.
     pub fn set_param(&mut self, name: &str, value: i64) {
         // counter.py:124 — threshold <= 0 → compute_threshold returns 0.0

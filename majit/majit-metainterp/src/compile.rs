@@ -2891,7 +2891,7 @@ mod tests {
         );
     }
 }
-/// `compile.py:855` ResumeGuardDescr `_attrs_ = ('rd_numb', 'rd_consts',
+/// `compile.py`'s `ResumeGuardDescr._attrs_ = ('rd_numb', 'rd_consts',
 /// 'rd_virtuals', 'rd_pendingfields', 'status')` — the per-guard
 /// resume payload shared by every concrete `AbstractResumeGuardDescr`
 /// subclass.  Pyre stores them in `UnsafeCell` so the optimizer can
@@ -5174,9 +5174,10 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 
 // Resume data for a guard now lives on `StoredExitLayout.resume_layout`
 // (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
-// `HashMap<u32, ResumeData>`. See `pyjitpl.rs CompiledTrace` and the
-// producers/readers below. This mirrors RPython's single guard-owned
-// `ResumeGuardDescr` container (`compile.py:855`).
+// `HashMap<u32, ResumeData>`. `build_guard_metadata` derives the layout from
+// each guard descriptor, and backend exit recovery consumes the stored layout.
+// This mirrors RPython's single guard-owned
+// `ResumeGuardDescr` container declared by `compile.py::ResumeGuardDescr`.
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's

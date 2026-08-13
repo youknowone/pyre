@@ -21,9 +21,8 @@
 //!   - `transform_list_contains` (transform.py:115-134)
 //!   - `transform_dead_op_vars` (transform.py:137-143) — forwards to
 //!     [`crate::translator::simplify::transform_dead_op_vars_in_blocks`].
-//!   - `transform_dead_code` + `cutoff_alwaysraising_block`
-//!     (transform.py:145-198).
-//!   - `default_extra_passes` + `transform_graph` (transform.py:246-272).
+//!   - `transform_dead_code` + `cutoff_alwaysraising_block`.
+//!   - `default_extra_passes` + `transform_graph`.
 //!
 //! `insert_ll_stackcheck` (transform.py:200-243) is rtyper-phase and
 //! therefore out of scope for the annotator-phase port.
@@ -211,7 +210,7 @@ fn dedupe_blocks(blocks: &[BlockRef]) -> Vec<BlockRef> {
     out
 }
 
-/// RPython `transform.py:145-165` — `transform_dead_code(self, block_subset)`.
+/// RPython `transform_dead_code(self, block_subset)` from `transform.py`.
 ///
 /// ```python
 /// def transform_dead_code(self, block_subset):

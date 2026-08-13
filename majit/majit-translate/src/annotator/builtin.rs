@@ -84,7 +84,7 @@ use crate::flowspace::model::ConstValue;
 /// * `kwds_s` — keyword argument annotations, already `s_` prefixed to
 ///   match upstream's `kwds_s['s_'+key] = s_value`. Most analysers do
 ///   not consume keywords.
-///   `unaryop.py:944-946 SomeBuiltin.call`: `args_s, kwds = args.unpack();
+///   `SomeBuiltin.call` in `unaryop.py`: `args_s, kwds = args.unpack();
 /// return self.analyser(*args_s, **kwds_s)` — args_s passes through as a
 ///   Python list possibly carrying `None` for unbound caller args.  The
 ///   analyser body raises AttributeError on the first
@@ -93,7 +93,7 @@ use crate::flowspace::model::ConstValue;
 ///   `&[Option<SomeValue>]`: each analyser body unwraps via [`arg_at`]
 ///   at the touch site, panicking with the analyser name and slot
 ///   index — observationally equivalent to upstream's first-attribute-
-///   touch failure, matching `unaryop.py:940 simple_call_SomeBuiltin`'s
+///   touch failure, matching `simple_call_SomeBuiltin`'s
 ///   bind-then-body sequence.
 pub type BuiltinAnalyzer = fn(
     bk: &Rc<Bookkeeper>,

@@ -3816,7 +3816,7 @@ impl ResumeDataLoopMemo {
         UNASSIGNED
     }
 
-    /// resume.py:192-226 _number_boxes — tag each box in a snapshot section.
+    /// `ResumeDataLoopMemo._number_boxes` tags each box in a snapshot section.
     ///
     /// Exact port of RPython's `_number_boxes(self, iter, iterator, numb_state)`.
     ///
@@ -3827,7 +3827,7 @@ impl ResumeDataLoopMemo {
     /// - `get_type(opref)` → box.type ('i', 'r', 'f') (resume.py:211,214)
     /// - `is_virtual_ref(opref)` → getptrinfo(box).is_virtual() (resume.py:212-213)
     /// - `is_virtual_raw(opref)` → getrawptrinfo(box).is_virtual() (resume.py:215-216)
-    ///   resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
+    ///   `ResumeDataLoopMemo._number_boxes` tags each box in a snapshot section.
     pub fn _number_boxes(
         &mut self,
         boxes: &[SnapshotBox],

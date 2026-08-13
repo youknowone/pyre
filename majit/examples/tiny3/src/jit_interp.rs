@@ -1,10 +1,12 @@
 //! JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 //!
-//! TODO: `rpython/jit/tl/tiny3_hotpath.py:96` models the
-//! operand stack as a linked-list `Stack(value, next)`, identical shape to
-//! tiny2_hotpath.py. pyre's `state_fields = { stackpos, stack: [int; virt] }`
-//! does not express linked-list stacks — see the same adaptation note on
-//! `majit/examples/tiny2/src/jit_interp.rs`.
+//! TODO: `rpython/jit/tl/tiny3_hotpath.py` uses its `Stack` class to represent
+//! the operand stack as a linked list of `Stack(value, next)` nodes. Each push
+//! allocates one cons cell that RPython's JIT peels as a chain of virtuals.
+//! pyre's `state_fields = { stackpos, stack: [int; virt] }` requires a
+//! contiguous virtualizable array and cannot express that linked-list shape.
+//! The array backing is a source-shape deviation, although its optimized trace
+//! is equivalent for the shallow, constant-height stacks used by tiny3.
 //!
 //! Greens: [pc]
 //! Reds:   [stackpos, stack]  (args at bottom, computation stack on top)

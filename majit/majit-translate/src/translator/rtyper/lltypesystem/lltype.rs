@@ -4348,10 +4348,10 @@ impl Array {
     }
 
     /// Raw `Array(OF, hints={...})`. Upstream
-    /// `rpython/rtyper/lltypesystem/lltype.py:428-439 Array.__init__`
+    /// `rpython.rtyper.lltypesystem.lltype.Array.__init__`
     /// + `_install_extras` forwards the `hints` kwarg to
     ///   `self._hints`. Used by
-    ///   `SmallFunctionSetPBCRepr._setup_repr` (rpbc.py:416-418) which
+    ///   `SmallFunctionSetPBCRepr._setup_repr`, which
     ///   builds `Array(self.pointer_repr.lowleveltype,
     ///                hints={'nolength': True, 'immutable': True,
     ///                       'static_immutable': True})`.

@@ -2098,7 +2098,7 @@ impl AbstractShortPreambleBuilderState {
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
     /// Non-recursive: iterates preamble_op's args (adding non-input deps
     /// + guards to short), then appends preamble_op + result guards.
-    ///   Called by force_op_from_preamble (unroll.py:32).
+    /// Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// Dependency args carry the dep's replay op object (produce_arg
     /// object-carry); a non-input, non-const arg whose bound op still
@@ -2345,7 +2345,7 @@ impl ShortPreambleBuilder {
     }
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
-    /// Non-recursive. Called by force_op_from_preamble (unroll.py:32).
+    /// Non-recursive. Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// RPython passes `preamble_op.preamble_op` directly — the replay op
     /// IS the carried object, so there is no entry-selection lookup. The
@@ -3116,7 +3116,7 @@ impl ExtendedShortPreambleBuilder {
     }
 
     /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
-    /// Called by force_op_from_preamble (unroll.py:32).
+    /// Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// RPython passes `preamble_op.preamble_op` directly — the pop's
     /// replay Rc is the carried object (threaded by the produce_op

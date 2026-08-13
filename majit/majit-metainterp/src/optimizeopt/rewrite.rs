@@ -664,8 +664,8 @@ impl OptRewrite {
     /// rewrite.py:163-184 `optimize_guard` proper (the contradiction check
     /// + emit) is the call-time half. The `make_constant(box, CONST_1)` half
     ///   of the upstream `optimize_guard` is split into
-    ///   `propagate_postprocess` (rewrite.py:352-371) per RPython's
-    ///   `have_postprocess` model — see the bottom of this file.
+    ///   `OptRewrite::propagate_postprocess` per RPython's
+    ///   `have_postprocess` model.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 

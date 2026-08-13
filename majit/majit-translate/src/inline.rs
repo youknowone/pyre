@@ -1223,7 +1223,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::BinOp { op, .. } => is_pure_binop_opname(op),
         // Per-opname classification mirrors `enum_ops_without_sideeffects()`'s
         // `LL_OPERATIONS[opname].sideeffects` lookup
-        // (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
+        // (`lloperation.enum_ops_without_sideeffects`).
         // Pyre's `OpKind::UnaryOp` carries the opname as a string
         // field, so the parity-correct classification is opname-keyed
         // rather than enum-blanket.
@@ -1308,7 +1308,7 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
 /// upstream — direct port of the unary entries in
 /// `simplify.CanRemove` (`rpython/translator/simplify.py:405-417`)
 /// + `enum_ops_without_sideeffects()`
-///   (`rpython/rtyper/lltypesystem/lloperation.py:128-134`).
+///   (`lloperation.enum_ops_without_sideeffects`).
 ///
 /// Any opname not in this list is treated as side-effecting so the
 /// dead-op DCE pass does not silently remove it.  Notably absent:
@@ -1408,7 +1408,7 @@ fn is_pure_binop_opname(opname: &str) -> bool {
         return true;
     }
     // Post-rtyper / lltype binops — `enum_ops_without_sideeffects()`
-    // (`lloperation.py:128-134`) registers `int_add int_sub int_mul
+    // `lloperation.enum_ops_without_sideeffects` registers `int_add int_sub int_mul
     // int_lt ... uint_add ... float_add ...` with sideeffects=False.
     // Pyre's BinOp arrives here pre-rtyper (frontend names like
     // `add`); the post-rtyper shape is also accepted so a future

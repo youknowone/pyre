@@ -113,7 +113,8 @@ pub fn serialize_optimizer_knowledge(
             continue;
         }
         bitfield <<= 1;
-        // bridgeopt.py:79-80: info = getptrinfo(box)
+        // `bridgeopt.serialize_optimizer_knowledge` obtains `info` with
+        // `getptrinfo(box)` and records whether it has a known class.
         // known_class = info is not None and info.get_known_class(cpu) is not None
         if env.has_known_class(*opref) {
             bitfield |= 1;

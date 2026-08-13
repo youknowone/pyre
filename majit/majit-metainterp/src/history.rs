@@ -2962,9 +2962,9 @@ impl TraceCtx {
     /// (`resoperation.py`).  Production guard recording goes through
     /// the snapshot path (`record_guard_typed` + `capture_resumedata`
     /// + `set_last_guard_resume_position`); the optimizer's
-    ///   `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
+    ///   `OptContext::store_final_boxes_in_guard` then
     ///   derives `op.fail_args` from the snapshot via
-    ///   `op.store_final_boxes(liveboxes)` (`mod.rs:3392`).  This setter
+    ///   `Op::store_final_boxes(liveboxes)`. This setter
     ///   is for tests and other callers that construct synthetic guard
     ///   shapes outside the standard `capture_resumedata` flow —
     ///   matching how RPython's `test_resume.py` /

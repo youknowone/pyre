@@ -2036,11 +2036,12 @@ impl DynasmBackend {
     /// RPython does this via AbstractDescr.show() which works for any
     /// descr from any loop/bridge.
     ///
-    /// `compile.py:618-671` parity: the four `DoneWithThisFrame*`
+    /// `compile.py`'s four `DoneWithThisFrame*` descriptors
     /// + `ExitFrameWithExceptionDescrRef` singletons attached to
     ///   `self.cpu` are compared by pointer identity against the raw
     ///   `jf_descr` value — same as RPython
-    ///   `llgraph/runner.py:1478-1484` (`faildescr == self.cpu.done_with_this_frame_descr_*`).
+    ///   `llgraph/runner.py`'s `LLGraphCPU.execute_token`
+    ///   (`faildescr == self.cpu.done_with_this_frame_descr_*`).
     ///
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.

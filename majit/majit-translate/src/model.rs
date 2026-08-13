@@ -3795,7 +3795,8 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             }
             Some(ExitSwitch::LastException) | None => {}
         }
-        // Terminal blocks implicitly read every inputarg (`simplify.py:459-462`).
+        // `simplify.transform_dead_op_vars` treats every terminal-block
+        // input argument as read.
         if block.exits.is_empty() {
             read_vars.extend(block.inputargs.iter().cloned());
         }
@@ -3921,7 +3922,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          each block with no exits (`returnblock` / `exceptblock` /
 ///          otherwise terminal), the inputargs are also added — return
 ///          and except blocks implicitly use their inputs
-///          (`simplify.py:459-462`).
+///          (`simplify.transform_dead_op_vars`).
 ///   2. For every Link, record `dependencies[targetarg].add(linkarg)`
 ///      mapping (`simplify.py:457-458`).  This is the key
 ///      difference from a naïve forward pass — link args are NOT

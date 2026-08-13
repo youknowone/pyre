@@ -1337,7 +1337,8 @@ impl VirtualState {
     ///
     /// Mirrors `AbstractVirtualStateInfo.generate_guards` (virtualstate.py:72-101)
     /// + the per-subclass `_generate_guards` dispatch. The alias-consistency
-    ///   check (virtualstate.py:84-94) lives at the entry of every recursive
+    ///   check in `AbstractVirtualStateInfo.generate_guards` lives at the entry
+    ///   of every recursive
     ///   call so nested virtual fields/items participate in the same renum
     ///   namespace.
     ///
@@ -1477,9 +1478,9 @@ impl VirtualState {
         // the incoming to be a matching virtual struct. The sole force_boxes
         // relaxation lives in `NotVirtualStateInfoPtr._generate_guards`
         // (virtualstate.py:522-524) — the expected-non-virtual, incoming-
-        // virtual branch handled directly above. A Virtual target with a
-        // non-virtual incoming therefore falls through to the structural
-        // match below and is rejected by its `_ => Err(VirtualStatesCantMatch::default())` arm.
+        // virtual branch handled by the preceding `NotVirtual` arm. A Virtual
+        // target with a non-virtual incoming therefore reaches the structural
+        // state-kind match and is rejected by its fallback arm.
 
         // virtualstate.py:392-394 NotVirtualStateInfo._generate_guards:
         //
@@ -1489,8 +1490,8 @@ impl VirtualState {
         //
         // This isinstance check lives in NotVirtualStateInfo(Int/Ptr)
         // subclasses, NOT in VirtualStateInfo. When `expected` is itself
-        // a Virtual/VArray/VStruct, the comparison is handled by the
-        // VirtualStateInfo._generate_guards path (the main match below),
+        // a Virtual/VArray/VStruct, the structural state-kind match implements
+        // `VirtualStateInfo._generate_guards`,
         // which does struct-level field comparison — not type-tag matching.
         //
         // This gate is ALSO what rejects a Virtual / VArray / VStruct /
@@ -1549,8 +1550,9 @@ impl VirtualState {
         //         ...
         //         raise e
         //
-        // pyre returns Err(VirtualStatesCantMatch::default()) instead of raising; the wrapper below
-        // populates `state.bad` on Err before propagating. Per-arm
+        // Pyre returns `Err(VirtualStatesCantMatch::default())` instead of
+        // raising; `VirtualStateInfo::generate_guards` populates `state.bad`
+        // before propagating the error. Per-arm
         // pointer-identity keys (`expected as *const _`) match Python
         // object-identity dict keying.
         let result = match (expected_info, incoming_info) {

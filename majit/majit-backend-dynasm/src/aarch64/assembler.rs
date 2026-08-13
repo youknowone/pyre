@@ -211,7 +211,8 @@ const CC_LE: u8 = 12; // signed <=
 const CC_G: u8 = 13; // signed >
 
 /// Invert a condition code.
-/// Widest value `cmp Xn, #imm` encodes — `codebuilder.py:389 CMP_ri`.
+/// Widest value accepted by `codebuilder.py`'s `CMP_ri` encoding of
+/// `cmp Xn, #imm`.
 const MAX_CMP_IMM12: u32 = 4095;
 
 /// Forward reach of `b.cond`: a signed 19-bit displacement in 4-byte words.
@@ -1077,8 +1078,8 @@ impl<'a> AssemblerARM64<'a> {
             let l = self.load_loc_to_reg(lhs, 17);
             let d = dst_reg;
             // Rd/Rn take the SP-form register family for the `#imm12`
-            // encoding; `XSP(r)` encodes identically to `X(r)` for the
-            // non-SP registers the allocator hands out here.
+            // encoding; `XSP(r)` encodes identically to `X(r)` for every
+            // non-SP register allocated to this instruction.
             match opcode {
                 OpCode::IntSub => {
                     dynasm!(self.mc ; .arch aarch64 ; sub XSP(d), XSP(l), im as u32)
@@ -1178,16 +1179,16 @@ impl<'a> AssemblerARM64<'a> {
             }
             _ => return,
         };
-        // `opassembler.py:129 emit_int_comp_op` takes `CMP_ri` when the
-        // right-hand side is an immediate; `codebuilder.py:389 CMP_ri` holds
+        // `opassembler.py`'s `emit_int_comp_op` takes `CMP_ri` when the
+        // right-hand side is an immediate; `codebuilder.py`'s `CMP_ri` holds
         // a 12-bit unsigned field, so anything wider still needs a register.
         if let Loc::Immed(i) = loc1
             && let Ok(imm) = u32::try_from(i.value)
             && imm <= MAX_CMP_IMM12
         {
-            // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic
-            // register operand, so encode it the way
-            // `codebuilder.py:389 CMP_ri` does: SUBS with Rd = xzr.
+            // dynasm's `cmp Xn|SP, #uimm` form cannot take a dynamic register
+            // operand. `codebuilder.py`'s `CMP_ri` encodes the equivalent
+            // instruction as SUBS with Rd = xzr.
             let word: u32 = (0b1111000100u32 << 22) | (imm << 10) | ((r0 as u32) << 5) | 0b11111;
             dynasm!(self.mc ; .arch aarch64 ; .u32 word);
             return;

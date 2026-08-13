@@ -5048,10 +5048,11 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 ///   * `int_and(int_eq(lhs, INT_MIN), int_eq(rhs, -1)) ->
 ///     guard_false` (overflow corner — `INT_MIN // -1` would
 ///     overflow to `INT_MIN` in two's-complement; PyPy
-///     `intobject.py:316/491/804` routes this case through
+///     `intobject.py`'s `_floordiv`, `descr_floordiv`, and `descr_rfloordiv`
+///     route this case through
 ///     `ovf2long` to long arithmetic).
 ///     Other negative operand combinations are valid: PyPy
-///     `intobject.py:316 _floordiv` only handles `ZeroDivisionError`,
+///     `intobject.py`'s `_floordiv` only handles `ZeroDivisionError`,
 ///     and the no-branch floor correction
 ///     (`(a ^ b) < 0 && d * b != a -> d - 1`) yields Python-floor
 ///     semantics for every legal sign combination of `(a, b)`.

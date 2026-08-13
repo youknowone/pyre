@@ -253,14 +253,14 @@ impl CodeWriter {
     ///
     /// Steps:
     ///   0. annotate + rtype (majit-specific; RPython does this before codewriter)
-    ///   1. jtransform — `transform_graph()` (codewriter.py:42)
-    ///   2. regalloc — `perform_register_allocation()` per kind (codewriter.py:45-47)
-    ///   3. flatten — `flatten_graph()` (codewriter.py:53)
-    ///      3b. liveness — `compute_liveness()` (codewriter.py:56, called inside assemble)
-    ///   4. assemble — `assembler.assemble()` (codewriter.py:67)
-    ///   5. `jitcode.index = index` (codewriter.py:68)
+    ///   1. jtransform — `transform_graph()` in `CodeWriter.make_jitcodes`
+    ///   2. regalloc — `perform_register_allocation()` per kind
+    ///   3. flatten — `flatten_graph()`
+    ///      3b. liveness — `compute_liveness()`, called while assembling
+    ///   4. assemble — `assembler.assemble()`
+    ///   5. assign `jitcode.index`
     ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
-    ///      (codewriter.py:71-72)
+    ///      in `CodeWriter.make_jitcodes`
     ///
     /// **Type-source contract (post graph-side concretetype migration)**
     ///
@@ -751,7 +751,8 @@ impl CodeWriter {
                 crate::flatten::flatten_graph(rewritten_graph, &mut regallocs)
             });
 
-        // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
+        // Steps 3b and 4 of `CodeWriter.make_jitcodes`: compute liveness and
+        // assemble the SSA representation.
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before

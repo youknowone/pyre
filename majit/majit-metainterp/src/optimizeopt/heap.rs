@@ -142,7 +142,7 @@ type FieldKey = (OpRef, usize);
 ///   field-cache identity, with a separate `field_idx` / `descr_idx`
 ///   (u32) only where the RPython source indexes `PtrInfo` slots or
 ///   EffectInfo bitsets.
-///   heap.py:168-226 CachedField(AbstractCachedEntry)
+///   `heap.py::CachedField`, an `AbstractCachedEntry` subclass.
 struct CachedField {
     /// heap.py:39 cached_structs — struct boxes with a cached value
     /// for this descr. Replaces RPython's parallel `cached_infos`;
@@ -1454,7 +1454,8 @@ impl OptHeap {
     /// - Immutable (green) field caches: values never change.
     /// - Unescaped object caches: calls cannot access objects that haven't
     ///   been passed to a call or stored into the heap.
-    ///   heap.py:379-391: invalidate non-pure field/array caches.
+    ///   `OptHeap.force_from_effectinfo`: invalidate non-pure field and array
+    ///   caches.
     ///   Only `is_always_pure` (immutable) fields survive.
     ///
     /// heap.py:189-196 `CachedField.invalidate(descr)` clears

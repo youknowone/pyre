@@ -480,12 +480,12 @@ fn task_error(error: impl std::fmt::Debug) -> TaskError {
 ///   helper carries the closed-world equivalent: a registry mapping
 ///   the dotted names that upstream config defaults ship into the
 ///   already-ported Rust callable. Misses surface as `TaskError`
-///   (the same shape upstream's `Exception("Function %s not found")`
-///   at `:31` produces); future heuristic ports register an entry
+///   (the same shape that upstream's `print_statistics` produces with
+///   `Exception("Function %s not found")`); future heuristic ports register an entry
 ///   alongside their landing commit.
 ///
-/// The two production callers live at `:83 inline_heuristic` and
-/// `:101 profile_based_inline_heuristic`. Both default to
+/// The two production callers are `inline_heuristic` and
+/// `profile_based_inline_heuristic`. Both default to
 /// `"rpython.translator.backendopt.inline.inlining_heuristic"`
 /// (`translationoption.py:216`, `:239`) which maps to
 /// [`inline::inlining_heuristic`].

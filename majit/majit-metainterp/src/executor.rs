@@ -377,7 +377,7 @@ pub fn execute_varargs<M: Clone>(
     result
 }
 
-/// executor.py:555 `execute_nonspec_const` for binary integer opcodes.
+/// `executor.py::execute_nonspec_const` for binary integer opcodes.
 ///
 /// Returns the folded `i64` result when the operation is recognized and
 /// the result is well-defined; returns `None` to abort folding when:
@@ -522,9 +522,9 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
     Some(result as i64)
 }
 
-/// `executor.py:555 execute_nonspec_const` delegates to `_execute_arglist`,
-/// which raises `NotImplementedError` at `:610` when no helper is registered
-/// for the opnum. RPython's `optimizer.py:810 constant_fold` does not catch
+/// `executor.py::execute_nonspec_const` delegates to `_execute_arglist`,
+/// which raises `NotImplementedError` when no helper is registered
+/// for the opnum. RPython's `Optimizer.constant_fold` does not catch
 /// that exception; it propagates to the caller. Pyre encodes the same
 /// dispatch distinction at the type level:
 ///   * `Err(NoConstExecutor)` — no helper claimed the opnum (terminal
@@ -535,8 +535,8 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
 ///     skipped" distinctly from "no helper".
 ///   * `Ok(Some(value))` — successful fold.
 ///
-///     executor.py:555 `execute_nonspec_const` free function — the
-///     generic opnum dispatch invoked by `optimizer.py:810 constant_fold`
+///     `executor.py::execute_nonspec_const` free function — the
+///     generic opnum dispatch invoked by `Optimizer.constant_fold`
 ///     once every arg has been resolved to a `Const*` via
 ///     `get_constant_box`. Mirrors the RPython structure:
 ///
@@ -747,9 +747,9 @@ pub fn execute_nonspec_const(
         }
     }
 
-    // `executor.py:610 _execute_arglist` raises `NotImplementedError`
+    // `executor.py::_execute_arglist` raises `NotImplementedError`
     // when `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` is None.
-    // RPython's `optimizer.py:810 constant_fold` lets that propagate; Pyre
+    // RPython's `Optimizer.constant_fold` lets that propagate; Pyre
     // encodes the same missing-helper signal as `Err(NoConstExecutor)`.
     Err(NoConstExecutor)
 }

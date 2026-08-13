@@ -3423,7 +3423,7 @@ impl Repr for SmallFunctionSetPBCRepr {
         }
         *self.descriptions.borrow_mut() = descriptions.clone();
 
-        // upstream rpbc.py:416-418 — `POINTER_TABLE = Array(
+        // `SmallFunctionSetPBCRepr._setup_repr` defines `POINTER_TABLE = Array(
         //   self.pointer_repr.lowleveltype, hints={...})`.
         let item_type = self.pointer_repr.lowleveltype().clone();
         let array_type = Array::with_hints(
@@ -6165,7 +6165,7 @@ impl Repr for ClassesPBCRepr {
     ///   `convert_desc` walks `getuniqueclassdef` → `getclassrepr_arc`
     ///   → `getruntime(self.lowleveltype)` to materialise the vtable
     ///   pointer constant.
-    ///   RPython `ClassesPBCRepr.rtype_getattr(self, hop)` (rpbc.py:970-987):
+    ///   RPython `ClassesPBCRepr.rtype_getattr(self, hop)`:
     ///
     /// ```python
     /// def rtype_getattr(self, hop):

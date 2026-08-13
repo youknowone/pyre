@@ -3087,12 +3087,14 @@ impl TraceCtx {
     ///      trace time.
     ///      Reconstruct a ref value whose recorder box carries no stamped concrete,
     ///      by re-executing its recorded producer against now-resolvable operands.
-    ///      history.py:948 `resbox = execute_with_descr(...)` deferred to
+    ///      `history.TreeLoop.check_consistency_of_branch` defers
+    ///      `resbox = execute_with_descr(...)` to
     ///      resume-image build time: an inlined sub-walk that reads a loop-invariant
     ///      OUTER input arg records a `getfield_gc_r` while the obj is still symbolic
     ///      (its concrete lives only in the outer frame's register shadow), so
-    ///      `concrete_of_opref` stays `None` until the seeded input arg lets the load
-    ///      re-run here.  Follows a chain of `getfield_gc_r` ops down to a resolvable
+    ///      `concrete_of_opref` stays `None` until the seeded input argument lets
+    ///      `recover_ref_value` re-run the load. The method follows a chain of
+    ///      `getfield_gc_r` operations down to a resolvable
     ///      root; `depth` bounds the walk.  Returns `None` when the chain roots at an
     ///      op that is neither stamped nor a ref getfield, or the obj is null.
     pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {

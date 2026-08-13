@@ -1186,8 +1186,8 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
 ///      state slot — a 4-6 session proc-macro refactor with non-obvious
 ///      failure modes. Per CLAUDE.md, the proc-macro bridge is itself
 ///      a permitted Rust adaptation, so quarantining the 6 keys is the
-///      orthodox shape: keep `wellknown_bh_insns()` strictly canonical,
-///      keep the proc-macro state addressing here.
+///      orthodox shape: keep `wellknown_bh_insns()` strictly canonical and
+///      keep proc-macro state addressing in `pyre_local_bh_insns()`.
 ///
 /// All extension keys retain their fixed `BC_*` byte values in the same
 /// number-space as the canonical opcodes; only the catalogue is split

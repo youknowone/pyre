@@ -1907,8 +1907,8 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome.take()
     }
 
-    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
-    /// `blackhole.py:1799 convert_and_run_from_pyjitpl`.
+    /// `MetaInterp.run_blackhole_interp_to_cancel_tracing` delegates to
+    /// `blackhole.convert_and_run_from_pyjitpl`.
     ///
     /// A tracing abort can land anywhere in the portal jitcode, including in
     /// the middle of a source opcode whose remaining effects have not run.  The
@@ -1934,8 +1934,8 @@ impl<S: JitState> JitDriver<S> {
     /// the very double-application this conversion exists to prevent. Every
     /// post-chain path therefore returns `Some`, using the `single_pass_finish`
     /// + `usize::MAX` "no forward pc" outcome when it has no merge point to
-    ///   resume at. Upstream has no such split: `blackhole.py:1799
-    /// convert_and_run_from_pyjitpl` never returns to its caller at all.
+    ///   resume at. Upstream has no such split:
+    /// `blackhole.convert_and_run_from_pyjitpl` never returns to its caller.
     ///
     /// **Seeding.** The walk keeps state fields on the sym; the blackhole reads
     /// them out of the identity registers `StateFieldLayout` names.  The abort
