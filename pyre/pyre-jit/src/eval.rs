@@ -7082,21 +7082,27 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // A `LIST_APPEND` (inlined-comprehension accumulator) body is
     // admitted only when the body performs no CALL. The scan narrows how
     // often the in-flight delivery gap is reached; it is not a boundary
-    // the gap stays behind. A mid-body abort routes through
-    // `fbw_foriter_inflight_take`, which REFUSES delivery once a body
-    // effect has committed, destroys the stash and leaves the frame at
-    // the FOR_ITER header against an iterator the walk already advanced
-    // — losing that whole iteration. A per-element call entering a user
-    // Python frame reaches that abort, but so does this, which the scan
-    // admits:
+    // the gap stays behind. This body is call-free and the scan admits it:
     //
     //     for index in items:
     //         out.append([index for _ in range(1)])
     //
     // Over 60 items it appends 59 on dynasm and on cranelift, twice in
-    // 400 runs; with the JIT off it appends 60. `SET_ADD` and `MAP_ADD`
-    // spell the same shape and carry no scan at all. Closing this is the
-    // in-flight delivery gap (single-executor tracing, gh#73/#34).
+    // 400 runs; with the JIT off it appends 60. What it loses is a whole
+    // OUTER iteration, and the route is a mislabelled in-flight
+    // coordinate rather than the R1 body-effect refusal. Both loops live
+    // in one per-CodeObject JitCode with a merge point each; the outer
+    // loop's `for_iter_next` residual sits at JitCode pc 153 (its walk
+    // entry for Python pc 5) and the inner one at 631 (entry for Python
+    // pc 34). `inflight_foriter_body_pc` resolves 153 to Python pc 34, so
+    // an outer consume is stashed under the INNER loop's body pc.
+    // `fbw_foriter_inflight_take` then delivers it — no body-effect
+    // signal stands, the census reads `DELIVERED=2 REFUSED=0` — and
+    // `deliver_inflight_foriter_item`'s header check finds the live frame
+    // at the outer header, declines the non-header push, and the item is
+    // dropped. `SET_ADD` and `MAP_ADD` spell the same shape and carry no
+    // scan at all. Closing this is the in-flight delivery gap
+    // (single-executor tracing, gh#73/#34).
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
