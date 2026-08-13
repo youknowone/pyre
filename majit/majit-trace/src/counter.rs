@@ -182,12 +182,15 @@ impl JitCounter {
     #[inline(always)]
     pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
         // counter.py:104-121 applies the decay synchronously inside the minor
-        // collection. pyre defers it to the next table access because the
-        // metainterp owns the counter table, and reaching it from inside the
-        // collector would re-enter a borrow the GC does not hold.
+        // collection, where the hook closes over the process's one JitCounter.
+        // pyre defers it to the next table access instead: the counter is
+        // reached through the `JIT_DRIVER` cell in eval.rs, whose accessor
+        // mints a `&'static mut JitDriverPair`, and a minor collection can be
+        // triggered by an allocation the metainterp makes while already holding
+        // one. Decaying from inside the collector would alias it.
         //
         // Each JitCounter keeps its own last-seen generation because JIT_DRIVER
-        // in eval.rs is thread-local, giving each mutator thread its own counter.
+        // is thread-local, giving each mutator thread its own counter.
         // Every elapsed interval is applied before every mutating table access;
         // would_tick_fire decay-adjusts its read. A value written after a
         // collection is therefore not retro-decayed.

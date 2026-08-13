@@ -1537,11 +1537,17 @@ class Check:
         # what let eight baselines go stale unnoticed.
         #
         # Measured, not assumed, and read back from the runner jobs rather than
-        # predicted. A fresh local build and ubuntu-24.04 report str_fstring
-        # guard_failures 658/659 on dynasm/cranelift. macos-latest reports the
-        # inverse 659/658, and windows-latest reports 658/658. Every other gated
-        # counter is identical (six loops and three bridges), and each mismatch
-        # reproduced in both stability reruns.
+        # predicted. ubuntu-24.04 reports str_fstring guard_failures 658/659 on
+        # dynasm/cranelift. macos-latest reports the inverse 659/658, and
+        # windows-latest reports 658/658. Every other gated counter is identical
+        # (six loops and three bridges), and each mismatch reproduced in both
+        # stability reruns.
+        #
+        # A local arm64 macOS build observes the macos-latest pair rather than
+        # ubuntu's: two full local gates pass against plain `.darwin` overlays
+        # holding dynasm 659 and cranelift 658. Darwin is therefore carried
+        # platform-wide, and the darwin GitHub-runner overlay that once held the
+        # same cranelift value was dropped as unreachable.
         #
         # This is a collection-schedule boundary, not a compile-shape change.
         # On a local arm64 macOS cranelift build, adding check.py's two wasm
@@ -1552,10 +1558,7 @@ class Check:
         # is where a collection-triggered breaker lands, not how many loops or
         # bridges compile. The runner did not enable either census, so exactly
         # which host input moves that placement remains unidentified; the
-        # observed counter and stable runner split are direct measurements. The
-        # fresh local macOS build matches ubuntu rather than the macOS runner,
-        # which is why these are GitHub-runner overlays rather than
-        # platform-wide ones.
+        # observed counter and stable runner split are direct measurements.
         #
         # An overlay shadows the shared baseline permanently, so one written
         # against a value that later converges becomes a failure main does not
