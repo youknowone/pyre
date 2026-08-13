@@ -5950,7 +5950,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// constant under a `QUASIIMMUT_FIELD(w_type, _version_tag)`. `mutated()`
 /// (typeobject.py:285-291) bumps the tag and walks subclasses, and the setter
 /// revokes each level's loops.
-fn register_quasi_immutable_deps(_green_key: u64) {
+pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps: Vec<(u64, u32)> =
         std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);

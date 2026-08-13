@@ -3226,6 +3226,11 @@ pub fn trace_and_compile_from_bridge(
     // blackhole re-run on a path that would ignore the concrete result.
     allow_finish_direct_return: bool,
 ) -> BridgeResolution {
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.clear_last_compiled_artifact_invalidation_flag();
+    }
+
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
@@ -4029,6 +4034,8 @@ fn jit_ca_handle_guard_failure(
             }
         }
     };
+    // compile.py:204-207 record_loop_or_bridge registers every bridge's dependencies.
+    crate::eval::register_quasi_immutable_deps(source_green_key);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -4109,6 +4116,8 @@ fn try_compile_ca_bridge(
         trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, 0, false),
         BridgeResolution::CompiledContinue
     );
+    // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
+    crate::eval::register_quasi_immutable_deps(owning_key);
     // `MetaInterp::compile_bridge` records a wasm `Unsupported` before the
     // walker returns.  Reuse that canonical guard identity here rather than
     // creating a separate CA-side decline table.

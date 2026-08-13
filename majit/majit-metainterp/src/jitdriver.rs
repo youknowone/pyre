@@ -6063,6 +6063,10 @@ impl<S: JitState> JitDriver<S> {
         self.meta.last_compiled_artifact_invalidation_flag()
     }
 
+    pub fn clear_last_compiled_artifact_invalidation_flag(&mut self) {
+        self.meta.clear_last_compiled_artifact_invalidation_flag();
+    }
+
     /// warmstate.py:437-444 starting cell's green_key (the cell on which
     /// TRACING must be cleared in the finally block). Returns None when
     /// no trace is in progress.

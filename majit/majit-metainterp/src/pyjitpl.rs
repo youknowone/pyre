@@ -9754,6 +9754,12 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_artifact_invalidation_flag.clone()
     }
 
+    /// The flag names the artifact this compilation published, so a new
+    /// compilation attempt starts without one.
+    pub fn clear_last_compiled_artifact_invalidation_flag(&mut self) {
+        self.last_compiled_artifact_invalidation_flag = None;
+    }
+
     /// Cranelift direct body-entry selector for the first compiled loop LABEL.
     ///
     /// PyPy x86 stores each TargetToken's machine-code LABEL address in
