@@ -2278,7 +2278,12 @@ impl<M: Clone> MetaInterp<M> {
     /// hook see every failure, since bridge-compilation thresholds and guard
     /// attribution still apply to the poll.
     #[inline]
-    fn record_guard_failure_event(&mut self, green_key: u64, fail_index: u32, back_edge_poll: bool) {
+    fn record_guard_failure_event(
+        &mut self,
+        green_key: u64,
+        fail_index: u32,
+        back_edge_poll: bool,
+    ) {
         if guardlog_enabled() {
             eprintln!("@@@GUARD key={green_key} fail={fail_index}");
         }

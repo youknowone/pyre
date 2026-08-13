@@ -9371,10 +9371,9 @@ mod tests {
             let mut cc = CallControl::new();
             let mut graph = FunctionGraph::new("allocating");
             let start = graph.startblock;
-            graph.blocks[start.0].operations.push(SpaceOperation {
-                result: None,
-                kind,
-            });
+            graph.blocks[start.0]
+                .operations
+                .push(SpaceOperation { result: None, kind });
             graph.set_return(start, None);
             let path = CallPath::from_segments(["allocating"]);
             cc.register_function_graph(path.clone(), graph);
