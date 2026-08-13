@@ -1501,24 +1501,23 @@ fn path_hook_accepts(
 
     let sys = importing::importhook("sys", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
     let path_hooks = pyre_interpreter::baseobjspace::getattr_str(sys, "path_hooks")?;
-    if !unsafe { pyre_object::is_list(path_hooks) } {
-        return Ok(false);
-    }
+    // `for hook in sys.path_hooks` is a plain iteration, so a `sitecustomize`
+    // that replaces the list with a tuple or any other iterable still gets its
+    // hooks called.
+    let hooks = pyre_interpreter::baseobjspace::unpackiterable(path_hooks, -1)?;
 
     let _roots = push_roots();
     let filename_slot = shadow_stack_len();
     pin_root(pyre_object::w_str_new(filename));
-    let len = unsafe { pyre_object::listobject::w_list_len(path_hooks) };
-    for i in 0..len {
-        let Some(hook) = (unsafe { pyre_object::listobject::w_list_getitem(path_hooks, i as i64) })
-        else {
-            continue;
-        };
+    for hook in hooks {
         match pyre_interpreter::call::call_function_impl_result(
             hook,
             &[shadow_stack_get(filename_slot)],
         ) {
-            Ok(_) => return Ok(true),
+            // `importer = hook(filename); break` — the first hook that does not
+            // raise `ImportError` ends the walk, and `importer is None` then
+            // means no importer claimed the path.
+            Ok(importer) => return Ok(!unsafe { pyre_object::is_none(importer) }),
             Err(error) if is_import_error(&error) => continue,
             Err(error) => return Err(error),
         }
