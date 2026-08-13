@@ -628,50 +628,56 @@ fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
     );
 }
 
-/// PyPy's native backends append guard recovery stubs after the hot trace.
-/// Keep fail-argument stores out of the successful guard arm in Wasm too: a
-/// selector branch should reach one cold `br_table` dispatcher, where the
-/// original int/ref/float-bit spills are performed.
+/// Each guard spills its own fail arguments before it branches to the shared
+/// bridge-dispatch epilogue.
 #[test]
-fn test_guard_recovery_is_out_of_line() {
+fn test_guard_fail_args_spill_in_their_own_failure_arms() {
     let inputargs = vec![
         InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
-        InputArg::from_type(Type::Float, 2),
+        InputArg::from_type(Type::Int, 1),
     ];
-    let fail_args = smallvec![
+    let first_guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
+    first_guard.setfailargs(smallvec![
         rb(OpRef::input_arg_int(0)),
-        rb(OpRef::input_arg_ref(1)),
-        rb(OpRef::input_arg_float(2)),
-    ];
-    let guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
-    guard.setfailargs(fail_args.clone());
-    let finish = Op::new(OpCode::Finish, &fail_args);
-    finish.setfailargs(fail_args);
-    let (bytes, guards) =
-        build_module_default(&inputargs, &[guard, finish], &indexmap::IndexMap::new());
+        rb(OpRef::input_arg_int(1)),
+    ]);
+    let second_guard = Op::new(OpCode::GuardFalse, &[rb(OpRef::input_arg_int(1))]);
+    second_guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_int(1)),
+        rb(OpRef::input_arg_int(0)),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    let (bytes, guards) = build_module_default(
+        &inputargs,
+        &[first_guard, second_guard, finish],
+        &indexmap::IndexMap::new(),
+    );
     validate_wasm(&bytes);
-    assert_eq!(guards.len(), 2);
+    assert_eq!(guards.len(), 3);
 
-    let mut control_is_if = Vec::new();
-    let mut stores_inside_if = 0;
+    let mut control_stack = Vec::new();
+    let mut stores_per_guard_arm = Vec::new();
     let mut br_tables = 0;
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
             let mut operators = body.get_operators_reader().unwrap();
             while !operators.eof() {
                 match operators.read().unwrap() {
-                    wasmparser::Operator::If { .. } => control_is_if.push(true),
+                    wasmparser::Operator::If { .. } => control_stack.push(Some(0usize)),
                     wasmparser::Operator::Block { .. } | wasmparser::Operator::Loop { .. } => {
-                        control_is_if.push(false);
+                        control_stack.push(None);
                     }
                     wasmparser::Operator::End => {
-                        control_is_if.pop();
+                        if let Some(Some(stores)) = control_stack.pop() {
+                            stores_per_guard_arm.push(stores);
+                        }
                     }
-                    wasmparser::Operator::I64Store { .. }
-                        if control_is_if.iter().any(|inside_if| *inside_if) =>
-                    {
-                        stores_inside_if += 1;
+                    wasmparser::Operator::I64Store { .. } => {
+                        if let Some(Some(stores)) =
+                            control_stack.iter_mut().rev().find(|frame| frame.is_some())
+                        {
+                            *stores += 1;
+                        }
                     }
                     wasmparser::Operator::BrTable { .. } => br_tables += 1,
                     _ => {}
@@ -679,8 +685,11 @@ fn test_guard_recovery_is_out_of_line() {
             }
         }
     }
-    assert_eq!(stores_inside_if, 0, "guard arms must not spill fail args");
-    assert_eq!(br_tables, 1, "all exits must share one cold dispatcher");
+    assert_eq!(stores_per_guard_arm, [3, 3]);
+    assert_eq!(
+        br_tables, 0,
+        "guard exits must not use a selector dispatcher"
+    );
 }
 
 #[test]

@@ -2084,11 +2084,8 @@ fn build_function(
         .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
         .collect();
 
-    // x86/assembler.py:835-846 `write_pending_failure_recoveries` places the
-    // guard recovery stubs after the hot trace. Wasm uses one universal hot
-    // exit block and records only an exit ordinal at each guard site; the
-    // fail-argument spills are emitted in the cold dispatcher below. This is
-    // also the shape used by the dynasm sibling's pending guard tokens.
+    // The enclosing exit block gives each guard and Finish a direct path to
+    // the bridge-dispatch epilogue after it has spilled its fail arguments.
     sink.block(BlockType::Empty); // A $hot_exit
     if key_dispatch {
         // Per resumable label j (opened outermost = the loop header):
@@ -2136,7 +2133,7 @@ fn build_function(
     // Load inputs from frame into locals, and store Ref inputs to their homes.
     // The input value lives at the frame slot its producer wrote it to: the
     // caller fills slot `k` for the k-th input — `execute_token` for a loop
-    // entry, `emit_guard_exit`'s positional fail-arg spill for a bridge entry —
+    // entry, `emit_guard_spill`'s positional fail-arg spill for a bridge entry —
     // so read from the POSITIONAL slot `k`, not `ia.index` (a value number that
     // equals `k` for a loop but not for a bridge, whose live-in args carry their
     // trace value numbers). The local index stays `1 + ia.index` because the
@@ -2414,8 +2411,7 @@ fn build_function(
             }
 
             OpCode::Finish => {
-                sink.i32_const(guard_idx as i32);
-                sink.local_set(bridge_slot_local);
+                emit_guard_spill(&mut sink, constants, value_types, guard_idx, op);
                 sink.br(block_exit_depth);
                 guard_idx += 1;
             }
@@ -4785,45 +4781,11 @@ fn build_function(
         sink.end(); // end loop
     }
     // A well-formed trace exits through a guard or Finish. Preserve the old
-    // malformed/natural-fallthrough behavior without letting it enter the cold
-    // dispatcher with an uninitialized selector.
+    // malformed/natural-fallthrough behavior without reaching bridge dispatch
+    // with a stale frame fail index.
     sink.local_get(0);
     sink.return_();
     sink.end(); // end A $hot_exit
-
-    // Structured-Wasm equivalent of the native backends' out-of-line guard
-    // recovery stubs. Locals retain their fail-site SSA values across the
-    // branch, so each handler can perform the original positional spills here
-    // without adding hot-path frame traffic or GC roots.
-    let cold_exits: Vec<&Op> = ops
-        .iter()
-        .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish)
-        .collect();
-    if !cold_exits.is_empty() {
-        let exit_count = cold_exits.len() as u32;
-        sink.block(BlockType::Empty); // $cold_done
-        for _ in cold_exits.iter().rev() {
-            sink.block(BlockType::Empty);
-        }
-        sink.local_get(bridge_slot_local);
-        if fail_index_base != 0 {
-            sink.i32_const(fail_index_base as i32);
-            sink.i32_sub();
-        }
-        sink.br_table((0..exit_count).collect::<Vec<_>>(), exit_count);
-        for (ordinal, op) in cold_exits.into_iter().enumerate() {
-            sink.end();
-            emit_guard_exit(
-                &mut sink,
-                constants,
-                value_types,
-                fail_index_base + ordinal as u32,
-                op,
-            );
-            sink.br(exit_count - ordinal as u32 - 1);
-        }
-        sink.end(); // end $cold_done
-    }
 
     // Epilogue bridge dispatch. Control reaches here only
     // after a guard `br`'d out of the exit block, having written its
@@ -5317,33 +5279,40 @@ fn next_op_can_accept_cc<'a>(
     Some(next_op)
 }
 
-/// Common guard exit: condition is on stack (i32), emit a tiny hot failure arm.
+/// Common guard exit: condition is on stack (i32), spill and branch on failure.
+///
+/// The spill belongs in this arm rather than in one shared exit handler after
+/// the trace. x86/assembler.py:835-846 `write_pending_failure_recoveries` can
+/// place its recovery stubs after the hot code because `GuardToken.fail_locs`
+/// (llsupport/assembler.py:24) freezes the register or stack location the
+/// allocator gave each fail argument *at the guard*, so a stub reads a fixed
+/// home and nothing keeps the value live past its own guard. Wasm has no way
+/// to record such a location: the allocator is the engine's, and it derives
+/// liveness from where the emitted code reads a local. Routing every guard to
+/// one handler block therefore makes it a join point whose live-in set is the
+/// union of every guard's fail arguments, so each becomes live at every guard
+/// in the trace, and the resulting long ranges spill in the hot body. Reading
+/// them here ends each range at the guard that needs it.
 ///
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
 /// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
-/// this opens. The actual fail-argument recovery is emitted out of line by
-/// `build_function`, matching x86's `write_pending_failure_recoveries`.
+/// this opens. The stores run only on the failing edge, so the fallthrough
+/// carries no frame traffic.
 fn emit_guard_if_exit(
     sink: &mut InstructionSink<'_>,
-    _constants: &indexmap::IndexMap<u32, i64>,
+    constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
     guard_idx: u32,
-    _op: &Op,
+    op: &Op,
     block_exit_depth: u32,
 ) {
     sink.if_(BlockType::Empty);
-    // The bridge-slot scratch is the first i32 local after the value locals,
-    // the UintMulHigh scratch locals, and the overflow flag. It is dead until
-    // the bridge epilogue overwrites it with `local.tee`, so it doubles as the
-    // cold-exit selector without growing the local or GC-root set.
-    let exit_selector_local = value_types.len() as u32 + UMULHI_SCRATCH + 2;
-    sink.i32_const(guard_idx as i32);
-    sink.local_set(exit_selector_local);
+    emit_guard_spill(sink, constants, value_types, guard_idx, op);
     sink.br(block_exit_depth + 1);
     sink.end();
 }
 
-fn emit_guard_exit(
+fn emit_guard_spill(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &[ValType],
