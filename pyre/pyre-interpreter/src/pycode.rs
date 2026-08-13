@@ -795,15 +795,34 @@ fn box_code_constant_with_firstlineno(code: &crate::CodeObject, firstlineno: i32
 /// `ConstantData` for bytecode decoding, but that representation must not
 /// replace the interpreter-level owner.
 unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef) {
+    let count = pyre_object::w_tuple_len(constants);
+    let values: Vec<_> = (0..count)
+        .map(|index| unsafe { pyre_object::w_tuple_getitem(constants, index as i64) })
+        .collect();
+    unsafe { w_code_fill_const_slots(obj, &values) };
+}
+
+/// `w_code_fill_consts_from_tuple` for a caller that already holds the wrapped
+/// values — the marshal reader, whose `co_consts` arrive as decoded objects
+/// rather than as a tuple.
+pub(crate) unsafe fn w_code_fill_consts(obj: PyObjectRef, constants: &[PyObjectRef]) {
+    let values: Vec<_> = constants.iter().map(|&value| Some(value)).collect();
+    unsafe { w_code_fill_const_slots(obj, &values) };
+}
+
+/// Store one realized constant per `co_consts_w` slot. A `None` entry leaves
+/// the slot unrealized, which is how a tuple shorter than the slot array and a
+/// failed element fetch both read.
+unsafe fn w_code_fill_const_slots(obj: PyObjectRef, constants: &[Option<PyObjectRef>]) {
     let code = unsafe { &*(obj as *const PyCode) };
     if code.co_consts_w.is_null() {
         return;
     }
     let slots = unsafe { &*code.co_consts_w };
-    let count = slots.len().min(pyre_object::w_tuple_len(constants));
+    let count = slots.len().min(constants.len());
     let mut filled = false;
-    for (index, slot) in slots.iter().take(count).enumerate() {
-        if let Some(value) = unsafe { pyre_object::w_tuple_getitem(constants, index as i64) } {
+    for (slot, &value) in slots.iter().zip(constants).take(count) {
+        if let Some(value) = value {
             slot.store(value, std::sync::atomic::Ordering::Release);
             filled = true;
         }

@@ -818,6 +818,65 @@ impl wire::MarshalBag for PyreMarshalBag {
     fn constant_ref_from_value(&self, value: &Rooted) -> Option<ConstantData> {
         unsafe { crate::pycode::obj_to_constant_data(value.get()).ok() }
     }
+
+    /// A `co_consts` entry the compiler enum cannot describe — a list, a dict,
+    /// a set — is legal in a code object and marshals fine; it takes a shape
+    /// placeholder here and reaches its slot through
+    /// `make_code_with_constants`, which is what `read_code_consts` does for
+    /// `code.replace(co_consts=...)`.
+    fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
+        Ok(unsafe { crate::pycode::obj_to_constant_data(value.get()) }
+            .unwrap_or(ConstantData::None))
+    }
+
+    fn make_code_with_constants(
+        &self,
+        code: CodeObject<ConstantData>,
+        constants: Vec<Rooted>,
+    ) -> Rooted {
+        let code = Rooted::new(crate::pycode::box_code_constant(&code));
+        // `box_code_constant` allocates, so read each constant out of its
+        // shadow-stack slot only now.
+        let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
+        unsafe { crate::pycode::w_code_fill_consts(code.get(), &constants) };
+        code
+    }
+
+    fn bytes_from_value(&self, value: &Rooted) -> Option<Vec<u8>> {
+        let value = value.get();
+        unsafe {
+            bytesobject::is_bytes_like(value).then(|| bytesobject::bytes_like_data(value).to_vec())
+        }
+    }
+
+    fn str_from_value(&self, value: &Rooted) -> Option<String> {
+        let value = value.get();
+        unsafe {
+            pyre_object::is_str(value).then(|| {
+                pyre_object::w_str_get_wtf8(value)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        }
+    }
+
+    fn tuple_elements_from_value(&self, value: &Rooted) -> Option<Vec<Rooted>> {
+        let value = value.get();
+        if !unsafe { is_tuple(value) } {
+            return None;
+        }
+        let count = unsafe { pyre_object::w_tuple_len(value) };
+        Some(
+            (0..count)
+                .map(|index| {
+                    Rooted::new(
+                        unsafe { pyre_object::w_tuple_getitem(value, index as i64) }
+                            .unwrap_or_else(pyre_object::w_none),
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Resolve the optional `version` slot: an omitted slot uses the current
