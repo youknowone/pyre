@@ -1183,14 +1183,43 @@ impl EffectInfo {
     /// trace keeps serving a `getarrayitem_gc_i` cached from before the call.
     /// The field side has been recovering exactly this case since the write-set
     /// table was introduced; the array side had no counterpart.
-    pub fn writes_array_descr_by_identity(&self, descr: &DescrRef) -> bool {
-        match self._write_descrs_arrays.as_deref() {
-            Some(arrays) => {
-                let target = descr_ptr_id(descr);
-                arrays.iter().any(|d| descr_ptr_id(d) == target)
-            }
-            None => false,
-        }
+    ///
+    /// This matches on the array's STRUCTURAL shape where the field twin uses
+    /// pointer identity, and the asymmetry is deliberate.  A field descr has a
+    /// single producer — `gc_cache()._cache_field`, which both the getfield
+    /// lowering and the write-EI builder mint through — so two references to
+    /// one field are always the same `Arc`.  An array descr on this path is
+    /// minted per-`MetaInterpStaticData` in `dispatch_array_descr_cache` at
+    /// trace time, while the write-EI is built during jitcode assembly, so the
+    /// two are never the same `Arc`.  Structure is the right key regardless:
+    /// `Assembler::add_gc_int_array_descr` already dedups on exactly this
+    /// tuple, so for these arrays the shape IS the identity.
+    ///
+    /// Conflating two arrays that share a shape can only over-invalidate,
+    /// which costs a reload and can never miscompile — the same asymmetry the
+    /// `residual_writes` table is built on.  And the caller gates this on
+    /// `!compute_bitstrings_has_run()`, so the translated interpreter's
+    /// registered array descrs never reach it.
+    pub fn writes_array_descr_by_shape(&self, descr: &DescrRef) -> bool {
+        let Some(arrays) = self._write_descrs_arrays.as_deref() else {
+            return false;
+        };
+        let shape = |d: &DescrRef| {
+            d.as_array_descr().map(|a| {
+                (
+                    a.base_size(),
+                    a.item_size(),
+                    a.item_type(),
+                    a.is_item_signed(),
+                )
+            })
+        };
+        // A non-array descr in either position has no shape to compare, so it
+        // matches nothing rather than matching everything.
+        let Some(target) = shape(descr) else {
+            return false;
+        };
+        arrays.iter().any(|d| shape(d) == Some(target))
     }
 
     /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)

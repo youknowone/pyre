@@ -2027,7 +2027,7 @@ impl OptHeap {
             // sentinel descr bitchecking false here is correct.
             let write = ei.check_write_descr_array(effect_idx)
                 || (!majit_ir::effectinfo::compute_bitstrings_has_run()
-                    && ei.writes_array_descr_by_identity(&descr));
+                    && ei.writes_array_descr_by_shape(&descr));
             if !read && !write {
                 continue;
             }

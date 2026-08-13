@@ -99,7 +99,7 @@ fn array_write_set_is_visible_to_force_from_effectinfo() {
     // Exactly what `OptHeap::force_from_effectinfo`'s array loop evaluates.
     let visible_to_optimizer = ei.check_write_descr_array(descr.get_ei_index())
         || (!majit_ir::effectinfo::compute_bitstrings_has_run()
-            && ei.writes_array_descr_by_identity(&descr));
+            && ei.writes_array_descr_by_shape(&descr));
 
     assert_eq!(
         named_by_identity, visible_to_optimizer,
@@ -109,6 +109,61 @@ fn array_write_set_is_visible_to_force_from_effectinfo() {
          run; the array loop has no such fallback, so the declared write is \
          silently dropped and the trace keeps serving a stale \
          `getarrayitem_gc_i` from before the call"
+    );
+}
+
+/// The shape the opcode-fetch path interns: `program: &[u8]`, one-byte
+/// unsigned items. Signedness matters — a signed byte descr makes the backend
+/// emit `movsx` and corrupt dispatch — so this is a genuinely distinct array.
+fn mint_program_byte_array_descr() -> DescrRef {
+    make_array_descr_from_lltype_shape(
+        0,
+        0,
+        1,
+        None,
+        Type::Int,
+        false,
+        false,
+        /* is_item_signed */ false,
+        true,
+        None,
+        false,
+        u32::MAX,
+        Vec::new(),
+    )
+}
+
+/// The write set is built during jitcode assembly and the cached read descr is
+/// minted at trace time from a different cache, so the two are NEVER the same
+/// `Arc`. Matching has to survive that, which is why the array predicate keys
+/// on shape rather than pointer identity.
+#[test]
+fn a_distinct_arc_of_the_same_shape_still_matches() {
+    let cached = mint_element_array_descr();
+    let declared = mint_element_array_descr();
+    assert!(
+        !std::sync::Arc::ptr_eq(&cached, &declared),
+        "test setup: these must be distinct Arcs, or this proves nothing"
+    );
+
+    let ei = ei_writing_array(&declared);
+    assert!(
+        ei.writes_array_descr_by_shape(&cached),
+        "a residual's declared array write must reach the cached read even \
+         though the two descrs were minted separately"
+    );
+}
+
+/// …and it must not match everything, or the predicate is vacuous and the test
+/// above passes for the wrong reason. A write to the `Val` element array must
+/// not invalidate the opcode-fetch byte array.
+#[test]
+fn a_different_element_shape_does_not_match() {
+    let ei = ei_writing_array(&mint_element_array_descr());
+    assert!(
+        !ei.writes_array_descr_by_shape(&mint_program_byte_array_descr()),
+        "declaring a write to the 8-byte signed element array must not \
+         invalidate the 1-byte unsigned opcode array"
     );
 }
 
