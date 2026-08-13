@@ -5508,7 +5508,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
     {
         if let Some(outcome) = spec_gate("builtin_range", || {
-            try_walker_specialize_builtin_range(ctx, code, op, &r_args, dst)
+            try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
         })? {
             return Ok((outcome, op.next_pc));
         }

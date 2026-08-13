@@ -474,12 +474,14 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
     crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
 }
 
-/// Whether sampling an exception string override before recording can have no
-/// app-visible effect. Portal-frame vable traffic and constant/int boxing are
-/// local; branches, other calls, and live-heap writes decline the sample.
-pub(crate) fn exception_string_override_sample_safe(
+/// Whether running a straight-line callee body before deciding to keep it can
+/// have no app-visible effect: no branch, no live-heap write, and no residual
+/// outside `pure_helpers`.  Portal-frame vable traffic and constant/int boxing
+/// are local, so both callers pass those.
+fn body_sample_safe_with(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
+    pure_helpers: &[majit_ir::PyreHelperKind],
 ) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -491,10 +493,7 @@ pub(crate) fn exception_string_override_sample_safe(
         }
         if d.opname.starts_with("residual_call") {
             let kind = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs);
-            if !matches!(
-                kind,
-                Some(majit_ir::PyreHelperKind::LoadConst | majit_ir::PyreHelperKind::BoxInt)
-            ) {
+            if !kind.is_some_and(|kind| pure_helpers.contains(&kind)) {
                 return false;
             }
         } else if d.opname.starts_with("setfield_gc")
@@ -510,6 +509,48 @@ pub(crate) fn exception_string_override_sample_safe(
         pc = d.next_pc;
     }
     true
+}
+
+/// Whether sampling an exception string override before recording can have no
+/// app-visible effect. Portal-frame vable traffic and constant/int boxing are
+/// local; branches, other calls, and live-heap writes decline the sample.
+pub(crate) fn exception_string_override_sample_safe(
+    body_code: &[u8],
+    callee_descr_refs: &[DescrRef],
+) -> bool {
+    body_sample_safe_with(
+        body_code,
+        callee_descr_refs,
+        &[
+            majit_ir::PyreHelperKind::LoadConst,
+            majit_ir::PyreHelperKind::BoxInt,
+        ],
+    )
+}
+
+/// The same question for the `_index` callee ([`prepare_walker_inline_index`]),
+/// which additionally reads the value it returns off its own instance.
+///
+/// `LOAD_ATTR` is admitted where the exception-override route refuses it.  The
+/// residual covers both a plain instance-attribute read, which runs no app-level
+/// code, and a descriptor whose getter does, and the bytecode alone cannot tell
+/// them apart — but the ones that matter here are separable at run time by the
+/// executed-effect odometer, which is what [`try_walker_inline_index`] consults
+/// once the body has run.  `STORE_ATTR` is a distinct residual
+/// ([`majit_ir::PyreHelperKind::StoreAttr`]) and stays rejected here, so the
+/// ordinary writing `__index__` never runs at all: it has to be refused before
+/// execution, because by the time the odometer could report it the write has
+/// already happened once.
+pub(crate) fn index_inline_sample_safe(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
+    body_sample_safe_with(
+        body_code,
+        callee_descr_refs,
+        &[
+            majit_ir::PyreHelperKind::LoadConst,
+            majit_ir::PyreHelperKind::BoxInt,
+            majit_ir::PyreHelperKind::LoadAttr,
+        ],
+    )
 }
 
 /// The bounded builtin-dispatch route only admits a straight-line app-level
@@ -1601,6 +1642,7 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
                 exc_override_sample_safe: exception_string_override_sample_safe(
                     body.code, descr_refs,
                 ),
+                index_sample_safe: index_inline_sample_safe(body.code, descr_refs),
                 exc_override_has_nested_call: exception_string_override_has_nested_call(
                     body.code, descr_refs,
                 ),
@@ -2639,6 +2681,70 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     callable_guard_op: OpRef,
     callable_guard_value: pyre_object::PyObjectRef,
     arg_concretes: Vec<ConcreteValue>,
+    callee_args: Vec<OpRef>,
+    callee_arg_concretes: Vec<ConcreteValue>,
+    method_form: bool,
+    bound_method: Option<BoundMethodInline>,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    exception_receiver_guard: Option<ExceptionInlineReceiverGuard>,
+    arg_class_guard: Option<ArgClassGuard>,
+    entry_is_call_boundary: bool,
+    require_str_result: bool,
+    constructor_result: Option<(OpRef, ConcreteValue)>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        callable,
+        callable_guard_op,
+        callable_guard_value,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        method_form,
+        bound_method,
+        w_code,
+        nparams,
+        has_closure,
+        exception_receiver_guard,
+        arg_class_guard,
+        entry_is_call_boundary,
+        require_str_result,
+        constructor_result,
+        None,
+        false,
+    )
+}
+
+/// The resolved-call inliner with an optional receiver for a nested call's
+/// result.  RPython's `MIFrame.finishframe` hands a returned box to the
+/// previous frame (`pyjitpl.py:1688-1698`) before that caller continues its
+/// current operation.  `intermediate_result` represents that hand-off for a
+/// user call nested inside a specialized builtin: it deliberately leaves the
+/// outer residual's destination untouched, so guards still snapshot the
+/// caller at the builtin-call boundary.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    callable: pyre_object::PyObjectRef,
+    callable_guard_op: OpRef,
+    callable_guard_value: pyre_object::PyObjectRef,
+    arg_concretes: Vec<ConcreteValue>,
     mut callee_args: Vec<OpRef>,
     mut callee_arg_concretes: Vec<ConcreteValue>,
     method_form: bool,
@@ -2651,6 +2757,8 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     entry_is_call_boundary: bool,
     require_str_result: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
+    intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
+    require_exact_int_result: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -4786,6 +4894,25 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 );
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
+            if require_exact_int_result
+                && !matches!(
+                    concrete_for_shadow,
+                    ConcreteValue::Ref(obj)
+                        if walker_is_exact_machine_int_concrete(obj)
+                )
+            {
+                // `descroperation.py:608-620 _index` validates the app-level
+                // result before its caller continues, and a long, a bool or an
+                // int subclass are all legal there — only the machine-int
+                // arithmetic downstream cannot take them.  Decline instead of
+                // aborting: the caller rewinds the emission and falls through
+                // to its residual, which re-runs the whole builtin.  That is
+                // sound because the body is admitted only when re-running it
+                // observes and changes nothing (`exc_override_sample_safe`),
+                // and it keeps a legal program from killing the enclosing
+                // loop's trace, which `callee_inline_unsupported` would.
+                return Ok(None);
+            }
             // `descr_call` discards `__init__`'s result after checking it is
             // None and returns the instance instead (`check_init_returned_none`).
             // A non-None result is a TypeError the inlined body cannot raise, so
@@ -4814,6 +4941,33 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
                 }
                 None => (value, concrete_for_shadow),
             };
+            if let Some(result) = intermediate_result {
+                // The caller stays pinned at its own CALL boundary, so a guard
+                // it emits after this hand-off resumes by re-entering that CALL
+                // and running the callee a second time, and its rewinding
+                // declines cut the trace without undoing what the body already
+                // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
+                // answers whether that is survivable: "a nonzero count delta
+                // means the callee attempt cannot be discarded and re-executed
+                // without risking a double".  Abort rather than decline —
+                // `latch_abort_call_resume` deliberately declines to latch the
+                // CALL when effects ran, so the interpreter resumes past it
+                // instead of re-running the effects.
+                if fbw_executed_effect_count() != executed_effects_before {
+                    latch_abort_call_resume(
+                        code,
+                        op,
+                        ctx,
+                        is_top_inline,
+                        unjournaled_before_subwalk,
+                        executed_effects_before,
+                        abort_flush_call_jitcode_coord,
+                    );
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                }
+                *result = Some((value, concrete_for_shadow));
+                return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+            }
             match dst_bank {
                 'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
                 'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
@@ -5690,6 +5844,204 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// Whether a concrete object is the canonical machine-word `int` layout that
+/// the range virtualizer can unbox.  Longs and int subclasses stay on the
+/// residual path even though Python-level `type(x) is int` may hold for the
+/// separate long payload layout.
+pub(crate) fn walker_is_exact_machine_int_concrete(obj: pyre_object::PyObjectRef) -> bool {
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return true;
+    }
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq(
+                (*obj).w_class,
+                pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+            )
+    }
+}
+
+/// A fully preflighted user `__index__` call nested inside a builtin.
+/// Keeping the resolved pieces together lets `range` preflight every bound
+/// before the first conversion emits guards or enters a callee frame.
+pub(crate) struct IndexInlineCandidate {
+    arg: OpRef,
+    concrete_arg: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+    method: pyre_object::PyObjectRef,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+}
+
+/// Resolve and statically preflight the call made by
+/// `descroperation.py:599-620 _index`.  The body is held to the existing
+/// strict straight-line inline shape; a non-user descriptor, loop/raise body,
+/// or other unsupported function shape leaves the enclosing builtin on its
+/// ordinary residual path without having emitted anything.
+///
+/// The body must additionally pass [`index_inline_sample_safe`].  This call is
+/// nested inside a builtin the caller keeps pinned at its own CALL boundary, so
+/// every guard the caller emits afterwards resumes by re-entering that CALL, and
+/// the interpreter then performs `space.index` again — a second `__index__` on
+/// an object the inlined body already ran once.  The caller also declines on
+/// paths that only rewind the trace, which likewise cannot undo an executed
+/// body.  Both are harmless exactly when re-running the body changes nothing.
+///
+/// That predicate settles it before the body runs for every shape it can read
+/// off the bytecode, which is the only place a writing body can be caught: the
+/// executed-effect odometer reports a write only after it has happened.  It also
+/// rejects a branch, so the odometer's verdict on the one recorded path speaks
+/// for every later execution as well.
+pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    arg: OpRef,
+    concrete_arg: pyre_object::PyObjectRef,
+) -> Option<IndexInlineCandidate> {
+    // Every other lever that inlines app-level Python out of a specializer
+    // declines once it is itself inside a callee sub-walk — `try_walker_inline_
+    // type_call`, `..._property_get`, `..._property_set`, `..._subscr_getitem`
+    // and `try_walker_specialize_seqiter_getitem_next` all lead with this.
+    if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
+        return None;
+    }
+    let (w_type, version_tag, method) =
+        unsafe { pyre_interpreter::baseobjspace::index_fast_path(concrete_arg) }?;
+    let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
+    // `get_and_call_function(w_impl, w_obj)` supplies exactly `self`.
+    if nparams != 1 || has_closure {
+        return None;
+    }
+    let body_facts = sub_jitcode_body_facts_for_code(w_code)?;
+    if body_facts.has_abort_permanent
+        || body_facts.owns_loop_header
+        || body_facts.contains_raise
+        || !body_facts.index_sample_safe
+    {
+        return None;
+    }
+    // `index_inline_sample_safe` admits `LOAD_ATTR` because the residual covers
+    // both a plain instance read and a descriptor whose getter runs app-level
+    // code, and the bytecode cannot tell them apart.  Separate them here, while
+    // declining is still free: every name the body can name has to be a plain
+    // mapdict slot on this very receiver, which is the question
+    // `mapdict.py:1479-1537 LOAD_ATTR_caching` asks.  A property, a slot this
+    // receiver does not carry, and a read chained through some other object all
+    // fail it.  Deciding it after the body has run would be too late — a
+    // getter's effect has happened by then.  Both storage shapes count: an
+    // `__index__` returning an int attribute holds it unboxed
+    // (`mapdict.py:600-601 _prim_direct_read`), which is the common case here.
+    let mut name_idx = 0usize;
+    while let Some(name) =
+        crate::jitcode_dispatch::walker_load_name_from_code(w_code as usize, name_idx)
+    {
+        let plain_slot = unsafe {
+            pyre_interpreter::objspace::std::mapdict::load_attr_fast_path(concrete_arg, &name)
+                .is_some()
+                || pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(
+                    concrete_arg,
+                    &name,
+                )
+                .is_some()
+        };
+        if !plain_slot {
+            return None;
+        }
+        name_idx += 1;
+    }
+    let body = crate::state::sub_jitcode_body_for_code(w_code)?;
+    let (callee_descr_refs, _, _) = crate::state::sub_jitcode_descr_pool_for_code(w_code)?;
+    let callee_frame_reg = crate::state::ensure_jitcode_index(w_code)
+        .filter(|&jc| crate::state::built_as_portal_at(jc))
+        .map(|jc| crate::state::portal_red_regs_at(jc).0)
+        .unwrap_or(u16::MAX);
+    if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_frame_reg) {
+        return None;
+    }
+    Some(IndexInlineCandidate {
+        arg,
+        concrete_arg,
+        w_type,
+        version_tag,
+        method,
+        w_code,
+        nparams,
+        has_closure,
+    })
+}
+
+/// Inline one preflighted `_index` user call and return its box to the
+/// enclosing builtin without writing the builtin residual's destination.
+pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    candidate: IndexInlineCandidate,
+) -> Result<Option<(OpRef, ConcreteValue)>, DispatchError> {
+    let IndexInlineCandidate {
+        arg,
+        concrete_arg,
+        w_type,
+        version_tag,
+        method,
+        w_code,
+        nparams,
+        has_closure,
+    } = candidate;
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_arg),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let mut result = None;
+    let inlined = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![arg],
+        vec![ConcreteValue::Ref(concrete_arg)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((arg, concrete_arg, w_type, version_tag)),
+        None,
+        // This method call is nested inside `range(...)`, not represented by
+        // a caller bytecode CALL of its own.
+        false,
+        false,
+        None,
+        Some(&mut result),
+        true,
+    )?;
+    match (inlined, result) {
+        (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
+            Ok(Some(result))
+        }
+        (None, None) => Ok(None),
+        _ => Err(DispatchError::callee_inline_unsupported(op.pc)),
+    }
 }
 
 /// Inline `obj[key]` into the receiver type's Python `__getitem__`.

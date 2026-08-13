@@ -13354,6 +13354,30 @@ pub(crate) unsafe fn int_as_base(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
+/// Resolve the user `__index__` call performed by
+/// `descroperation.py:599-620 _index` without executing it.  This is the
+/// trace-side admission counterpart of [`getitem_fast_path`]: the caller pins
+/// the returned type and version tag before inlining the returned descriptor.
+/// Exact int/long inputs return `None` because `_index` returns those directly
+/// and has no user call to inline.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn index_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        if w_obj.is_null() || pyre_object::pyobject::is_int_or_long(w_obj) {
+            return None;
+        }
+        let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+        let method = lookup_in_type_where(w_type, "__index__")?;
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
 pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("space.index: null object"));

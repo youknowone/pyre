@@ -309,6 +309,8 @@ pub(crate) struct InlineBodyFacts {
     pub(crate) exc_override_straight_line: bool,
     /// Effect-free enough to speculatively sample before emitting IR.
     pub(crate) exc_override_sample_safe: bool,
+    /// The same, admitting the instance-attribute read an `__index__` performs.
+    pub(crate) index_sample_safe: bool,
     /// Body performs a nested Python call.
     pub(crate) exc_override_has_nested_call: bool,
     /// Body carries a loop header of its own (a `jit_merge_point`).
