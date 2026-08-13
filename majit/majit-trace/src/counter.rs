@@ -165,12 +165,14 @@ impl JitCounter {
                 // This predicate is &self, so decay-adjust the read instead of
                 // mutating the table to apply the pending generations. Step
                 // through them one at a time rather than raising the multiplier
-                // to `elapsed`: `decay_all_counters` rounds back to f32 after
-                // every step, and this answer has to be the one a `tick` would
-                // give once it drains the same generations.
+                // to `elapsed`: every step rounds back to f32, and this answer
+                // has to be the one a `tick` would give once it drains the same
+                // generations. Narrow the multiplier the way decay_all_counters
+                // does, for the same reason.
+                let mult = self.decay_by_mult as f32;
                 let mut time = entry.times[i];
                 for _ in 0..elapsed {
-                    time = (time as f64 * self.decay_by_mult) as f32;
+                    time *= mult;
                 }
                 return time as f64 + increment >= 1.0;
             }
@@ -273,11 +275,18 @@ impl JitCounter {
     }
 
     /// counter.py:266-278 decay_all_counters()
+    ///
+    /// counter.py:278-279 hands `decay_by_mult` to `pypy__decay_jit_counters`,
+    /// whose C body narrows it with `float f = (float)f1` once and then
+    /// multiplies each entry in single precision. Narrowing the multiplier here
+    /// rather than the product keeps those bits: widening the entry to f64,
+    /// multiplying, and narrowing back rounds twice, and the two disagree
+    /// whenever the exact product lands near an f32 tie.
     pub fn decay_all_counters(&mut self) {
-        let mult = self.decay_by_mult;
+        let mult = self.decay_by_mult as f32;
         for entry in &mut self.timetable {
             for time in &mut entry.times {
-                *time = (*time as f64 * mult) as f32;
+                *time *= mult;
             }
         }
     }
@@ -495,8 +504,10 @@ mod tests {
         let increment = 0.001;
         assert!(!counter.tick(h, increment));
 
-        let expected =
-            (((0.5f32 as f64 * 0.96) as f32 as f64 * 0.96) as f32 as f64 + increment) as f32;
+        // pypy__decay_jit_counters narrows the multiplier once and multiplies
+        // in single precision; two elapsed intervals are two such multiplies.
+        let mult = 0.96f64 as f32;
+        let expected = ((0.5f32 * mult * mult) as f64 + increment) as f32;
         let actual = counter_time(&counter, h);
         assert!((actual - expected).abs() < 1.0e-6, "actual={actual}");
     }
