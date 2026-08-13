@@ -601,7 +601,7 @@ impl W_BufferedReader {
         &mut self,
         #[default(pyre_object::w_none())] w_size: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
-        let size = super::iobase_convert_size(Some(w_size))?;
+        let size = super::iobase_convert_size(w_size)?;
         self.read_size(size)
     }
 
@@ -632,7 +632,7 @@ impl W_BufferedReader {
         #[default(pyre_object::w_none())] w_limit: PyObjectRef,
     ) -> Result<PyObjectRef, crate::PyError> {
         self.check_closed("readline of closed file")?;
-        let mut limit = super::iobase_convert_size(Some(w_limit))?;
+        let mut limit = super::iobase_convert_size(w_limit)?;
         let mut have = self.readahead();
         if limit >= 0 {
             have = have.min(limit as usize);

@@ -550,11 +550,13 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-fn iobase_convert_size(value: Option<PyObjectRef>) -> Result<i64, crate::PyError> {
-    match value {
-        None => Ok(-1),
-        Some(value) if unsafe { pyre_object::is_none(value) } => Ok(-1),
-        Some(value) => crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?),
+/// A null value means the argument was not supplied and produces the same
+/// `-1` result as `None`.
+fn iobase_convert_size(value: PyObjectRef) -> Result<i64, crate::PyError> {
+    if value.is_null() || unsafe { pyre_object::is_none(value) } {
+        Ok(-1)
+    } else {
+        crate::baseobjspace::int_w(crate::baseobjspace::space_index(value)?)
     }
 }
 
@@ -571,7 +573,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let limit = iobase_convert_size(args.get(1).copied())?;
+    let limit = iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL))?;
     let peek = match crate::baseobjspace::getattr_str(self_obj, "peek") {
         Ok(method) => Some(method),
         Err(error) if error.kind == crate::PyErrorKind::AttributeError => None,
@@ -644,7 +646,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    let hint = iobase_convert_size(args.get(1).copied())?;
+    let hint = iobase_convert_size(args.get(1).copied().unwrap_or(PY_NULL))?;
     let iterator = crate::baseobjspace::iter(self_obj)?;
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();

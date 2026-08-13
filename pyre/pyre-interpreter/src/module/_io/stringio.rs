@@ -303,7 +303,7 @@ impl W_StringIO {
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
-        let size = super::iobase_convert_size(Some(w_size))?;
+        let size = super::iobase_convert_size(w_size)?;
         let this = Self::from_slot(slot);
         this.check_closed()?;
         if this.pos >= this.len() as i64 {
@@ -330,7 +330,7 @@ impl W_StringIO {
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
-        let limit = super::iobase_convert_size(Some(w_limit))?;
+        let limit = super::iobase_convert_size(w_limit)?;
         let this = Self::from_slot(slot);
         this.check_closed()?;
         if this.pos >= this.len() as i64 {
@@ -433,7 +433,7 @@ impl W_StringIO {
         let size = if unsafe { pyre_object::is_none(w_size) } {
             current
         } else {
-            super::iobase_convert_size(Some(w_size))?
+            super::iobase_convert_size(w_size)?
         };
         let this = Self::from_slot(slot);
         this.check_closed()?;

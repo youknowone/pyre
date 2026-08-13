@@ -287,7 +287,7 @@ impl W_BytesIO {
     ) -> Result<PyObjectRef, crate::PyError> {
         // interp_bytesio.py:96-100 plus interp_iobase.py `convert_size`.
         self.check_closed()?;
-        let size = super::iobase_convert_size(Some(w_size))?;
+        let size = super::iobase_convert_size(w_size)?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
             &self.read_bytes(size),
         ))
@@ -307,7 +307,7 @@ impl W_BytesIO {
     ) -> Result<PyObjectRef, crate::PyError> {
         // interp_bytesio.py:105-108 plus interp_iobase.py `convert_size`.
         self.check_closed()?;
-        let limit = super::iobase_convert_size(Some(w_limit))?;
+        let limit = super::iobase_convert_size(w_limit)?;
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(
             &self.readline_bytes(limit),
         ))
