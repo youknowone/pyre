@@ -1847,14 +1847,16 @@ fn expand_pyre_methods(
                     MethodKind::Getter(..) | MethodKind::Setter(..) | MethodKind::Deleter(..) => 1,
                     _ => 0,
                 };
-                let from_obj_call = if recv.mutability.is_some() {
-                    quote! { <#self_ty>::from_obj(args[#self_idx]) }
+                let bind_self = if recv.mutability.is_some() {
+                    quote! { s }
                 } else {
                     // `from_obj` returns `Option<&mut Self>` even for
                     // `&self` callers — reborrow as `&Self` so the
                     // method's signature matches without a separate
-                    // `from_obj_ref` API.
-                    quote! { <#self_ty>::from_obj(args[#self_idx]).map(|m| &*m) }
+                    // `from_obj_ref` API. Bind the reborrow in the `Some`
+                    // arm: routing it through `Option::map` would add a
+                    // closure aggregate and `call_once` to every wrapper.
+                    quote! { &*s }
                 };
                 let needed = self_idx + 1;
                 let preamble = quote! {
@@ -1865,8 +1867,8 @@ fn expand_pyre_methods(
                             ),
                         );
                     }
-                    let __pyre_self = match #from_obj_call {
-                        ::std::option::Option::Some(s) => s,
+                    let __pyre_self = match <#self_ty>::from_obj(args[#self_idx]) {
+                        ::std::option::Option::Some(s) => #bind_self,
                         ::std::option::Option::None => {
                             return ::std::result::Result::Err(
                                 crate::PyError::type_error(

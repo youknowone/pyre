@@ -11926,10 +11926,9 @@ impl<'a> Lowering<'a> {
         // the metadata word. A def-id alone does NOT imply thin: a DST newtype
         // is a nominal ADT with a def-id. Gate on the pointee's RESOLVED layout
         // size being concrete (`Some`) — `None` is the DST/unsized signature.
-        // Read-only `#[pyre_class]` accessors reach here via
-        // `from_obj(...).map(|m| &*m) -> Option<&Self>` and
-        // `getdebug_data() -> Option<&FrameDebugData>`; every such `W_*` /
-        // `FrameDebugData` pointee is Sized (carries a concrete layout size).
+        // `getdebug_data() -> Option<&FrameDebugData>` is a live shared-ref
+        // producer reaching here; its `FrameDebugData` pointee is Sized
+        // (carries a concrete layout size).
         if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
             && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
             && let Some(def_id) = adt_node_def_id(stripped)
