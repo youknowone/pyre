@@ -724,11 +724,15 @@ pub fn binary_slice_values(
         }
         if pyre_object::is_str(obj) {
             // Slice on code-point boundaries over the WTF-8 view, so a
-            // surrogate-bearing or multi-byte string slices correctly.
+            // surrogate-bearing or multi-byte string slices correctly.  The
+            // bounds convert through the object's own index storage
+            // (`_index_to_byte`, unicodeobject.py:1251) and the count is the
+            // stored `_length`: deriving either by walking the payload would
+            // make a one-character slice cost the whole string.  A bound equal
+            // to the count resolves to the end of the buffer, which is what
+            // the `stop` default asks for.
             let full = pyre_object::w_str_get_wtf8(obj);
-            let mut offsets: Vec<usize> = full.code_point_indices().map(|(i, _)| i).collect();
-            offsets.push(full.as_bytes().len());
-            let len = (offsets.len() - 1) as i64;
+            let len = pyre_object::w_str_len(obj) as i64;
             let s = if pyre_object::is_none(start) {
                 0
             } else {
@@ -741,8 +745,11 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = (if e < 0 { (len + e).max(0) } else { e.min(len) } as usize).max(s);
-            let part = rustpython_wtf8::Wtf8::from_bytes(&full.as_bytes()[offsets[s]..offsets[e]])
-                .expect("code-point-aligned slice is WTF-8");
+            let part = rustpython_wtf8::Wtf8::from_bytes(
+                &full.as_bytes()[pyre_object::w_str_index_to_byte(obj, s)
+                    ..pyre_object::w_str_index_to_byte(obj, e)],
+            )
+            .expect("code-point-aligned slice is WTF-8");
             // Substring slicing churns fresh dynamic strings; make it collectable.
             return Ok(pyre_object::w_str_from_wtf8_managed(part.to_wtf8_buf()));
         }
