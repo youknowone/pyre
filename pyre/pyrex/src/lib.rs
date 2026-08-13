@@ -1759,6 +1759,12 @@ fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str)
     match result {
         Ok(true) => {
             importing::restage_sys_path_0(std::ffi::OsStr::new(filename));
+            // `app_main.py:869-870` binds `__main__.__loader__` before
+            // `app_main.py:875-882` imports `site`, so a `sitecustomize` that
+            // reads the main module finds it already there.  This target has no
+            // source file of its own to bind, and runpy rebinds the attribute to
+            // the package's own loader when it runs `__main__` below.
+            seed_main_loader(canonical, None, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
             if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
                 handle_main_error(e, canonical, ec_ptr);
