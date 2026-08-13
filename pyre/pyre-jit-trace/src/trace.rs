@@ -3916,7 +3916,17 @@ fn run_perfn_walk<Sym: WalkSym>(
             let loop_header_pc = *loop_header_pc;
             let poll_resume_pc = back_edge_pc.unwrap_or(loop_header_pc);
             let restart_pc = close_loop_restart_pc.expect("close loop has a restart pc");
-            WALK_END_RESTART_PC.with(|c| c.set(Some(restart_pc)));
+            // The handback only runs on the leg where the end-flush below
+            // declined, and a decline keeps the legacy replay, whose contract
+            // is that the frame still holds pre-walk state (the same statement
+            // the escape-flush undo leg makes).  Moving `last_instr` alone
+            // breaks it: the frame then carries the loop header's pc over the
+            // entry's locals.  Only the marker legs need the handback — a
+            // loop-header marker inside a super-instruction leaves the frame
+            // advanced past the header, so its resume pc differs from the
+            // header and the frame is already not at pre-walk state.
+            let handback_pc = (restart_pc != loop_header_pc).then_some(restart_pc);
+            WALK_END_RESTART_PC.with(|c| c.set(handback_pc));
             // The closing frame and GuardFutureCondition remain anchored at
             // the loop header; the synthesized poll receives its owning
             // back-edge coordinate separately.
