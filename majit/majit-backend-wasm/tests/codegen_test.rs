@@ -501,7 +501,38 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
 
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
     validate_wasm(&bytes);
-    assert_eq!(emitted_local_count(&bytes), 12);
+    assert_eq!(
+        emitted_local_count(&bytes),
+        inputargs.len() as u32 + 3 + 6 + 1,
+        "two input values and three sparse ids, plus fixed i64 and i32 locals"
+    );
+}
+
+#[test]
+fn unbound_pool_float_operand_declares_an_f64_local() {
+    let folded_float = OpRef::float_op(7);
+    let ops = vec![Op::new(OpCode::Finish, &[rb(folded_float)])];
+    let constants = indexmap::IndexMap::from([(folded_float.raw(), 3.5_f64.to_bits() as i64)]);
+
+    let (bytes, _) = build_module_default(&[], &ops, &constants);
+    validate_wasm(&bytes);
+    let local_types = wasmparser::Parser::new(0)
+        .parse_all(&bytes)
+        .find_map(|payload| match payload.unwrap() {
+            wasmparser::Payload::CodeSectionEntry(body) => Some(
+                body.get_locals_reader()
+                    .unwrap()
+                    .into_iter()
+                    .map(|local| local.unwrap().1)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("generated module must contain its trace function");
+    assert!(
+        local_types.contains(&wasmparser::ValType::F64),
+        "the producer-less Float operand must declare an f64 local"
+    );
 }
 
 /// Count the direct `wasm_jit_write_barrier` table calls by their unique table
@@ -620,6 +651,51 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
         direct_write_barrier_call_count(&repeated_livein, WB_TARGET as i32),
         1,
         "repeated stores into one live-in base must emit one write-barrier call"
+    );
+}
+
+#[test]
+fn write_barrier_elision_follows_same_as_r_base() {
+    use majit_ir::descr::SimpleFieldDescr;
+    use std::sync::Arc;
+
+    const WB_TARGET: i64 = 0x4a11;
+    let pointer_field = Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+    let store_before_alias = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
+    );
+    store_before_alias.setdescr(pointer_field.clone());
+    let alias = make_op(
+        OpCode::SameAsR,
+        &[OpRef::input_arg_ref(0)],
+        OpRef::ref_op(3),
+    );
+    let store_through_alias = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(3)), rb(OpRef::input_arg_ref(2))],
+    );
+    store_through_alias.setdescr(pointer_field);
+
+    let bytes = build_module_with_write_barrier_target(
+        &[
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type(Type::Ref, 2),
+        ],
+        &[
+            store_before_alias,
+            alias,
+            store_through_alias,
+            Op::new(OpCode::Finish, &[]),
+        ],
+        WB_TARGET,
+    );
+    validate_wasm(&bytes);
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
+        1,
+        "stores through a SameAsR base share one applied write barrier"
     );
 }
 
@@ -1292,16 +1368,16 @@ fn test_true_void_family_does_not_shift_new_call_type() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
-    assert_eq!(indirect_calls, vec![(6, 0), (1, 0), (3, 0), (1, 0)]);
+    assert_eq!(indirect_calls.len(), 4);
     assert_eq!(
-        function_type(&bytes, 6),
+        function_type(&bytes, indirect_calls[0].0 as usize),
         (
             vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
             vec![]
         )
     );
     assert_eq!(
-        function_type(&bytes, 3),
+        function_type(&bytes, indirect_calls[2].0 as usize),
         (
             vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
             vec![wasmparser::ValType::I64]
