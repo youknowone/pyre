@@ -3494,6 +3494,15 @@ impl<'a> AssemblerARM64<'a> {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
                 };
+                // assembler.py:254 `_push_all_regs_to_jitframe` — the helper
+                // below can collect, and `emit_malloc_slowpath_helper_call`
+                // only saves the volatiles to the *stack*, where the
+                // collector can neither find nor rewrite them.  Spill every
+                // register into the jitframe first, so the gcmap pushed below
+                // describes the live references and the collector forwards
+                // them.  Must precede the argument setup, which clobbers
+                // x0/x1/x2.
+                self.push_all_regs_to_jitframe(&[], true);
                 // _build_malloc_slowpath(kind='var') parity:
                 // x0 = base_size, x1 = item_size, x2 = length
                 self.emit_mov_imm64(0, base_size);
@@ -3509,9 +3518,17 @@ impl<'a> AssemblerARM64<'a> {
                         self.emit_mov_imm64(2, 0);
                     }
                 }
-                // push_gcmap
+                // assembler.py:649-650 push_gcmap — a null gcmap tells the
+                // collector this frame holds no references, so every pointer
+                // spilled above would survive the collection unforwarded.
+                // `push_gcmap` marshals through x16, which is neither an
+                // argument register nor the helper register.
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                    self.push_gcmap(gcmap as *mut usize);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                }
                 self.emit_mov_imm64(
                     3,
                     crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64,
@@ -3520,6 +3537,12 @@ impl<'a> AssemblerARM64<'a> {
                 self.reload_frame_if_necessary();
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                // assembler.py:283 `_pop_all_regs_from_jitframe` — the helper
+                // restored the volatiles from the stack, so they still name
+                // the pre-collection addresses; the jitframe slots are the
+                // ones the collector rewrote.  x0 is excluded because it
+                // carries the allocation result.
+                self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
                 // `dynasm_nursery_slowpath_varsize` returns x0 = 0 on
                 // real host OOM (calloc failure preserved as NULL per
                 // runner.rs).  Route through the propagate path before
