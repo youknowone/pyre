@@ -1070,6 +1070,15 @@ fn derive_pc_live_indices_from_sparse(
 /// the spliced bytes.  For each `catch_exception`, the bare `-live-` directly
 /// before it is the anchor, keyed to the canraise opcode that owns the call
 /// (the py_pc whose `pc_first_insn_pos` range contains the marker).
+///
+/// `derive_after_call_indices_from_sparse` stores one anchor per Python PC.
+/// Multiple `catch_exception` sites owned by one PC would overwrite that entry,
+/// causing `catch_target_extra_ref_colors` to widen from only the final site's
+/// landing. The representation is sound because `catch_exception` is emitted
+/// once for each can-raise block exit, while additional catch links from a
+/// multi-exit block lower through `make_exception_link`, which emits no
+/// `catch_exception`. Enabling `PYRE_CATCH_LIVE_CENSUS` reports `multi_site_pcs`
+/// so this one-site-per-PC invariant can be checked against any input corpus.
 fn derive_after_call_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
@@ -4442,6 +4451,26 @@ fn catch_live_census_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_CATCH_LIVE_CENSUS").is_some())
 }
 
+/// Return the Ref-register colors live at every landing named by a
+/// `catch_exception` instruction's `TLabel` operands.
+fn catch_landing_ref_colors(
+    args: &[super::flatten::Operand],
+    label2alive: &std::collections::HashMap<
+        String,
+        std::collections::HashSet<super::flatten::Register>,
+    >,
+) -> std::collections::BTreeSet<u16> {
+    use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
+    args.iter()
+        .filter_map(|op| match op {
+            SsaOperand::TLabel(label) => label2alive.get(&label.name),
+            _ => None,
+        })
+        .flat_map(|alive| alive.iter())
+        .filter_map(|reg| (reg.kind == SsaKind::Ref).then_some(reg.index))
+        .collect()
+}
+
 #[derive(Default)]
 struct CatchLiveCensus {
     catch_sites: usize,
@@ -4488,7 +4517,6 @@ fn catch_target_extra_ref_colors(
     >,
     code: &CodeObject,
 ) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> {
-    use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     let mut out: std::collections::BTreeMap<usize, std::collections::BTreeSet<u16>> =
         std::collections::BTreeMap::new();
     let census_enabled = catch_live_census_enabled();
@@ -4513,16 +4541,6 @@ fn catch_target_extra_ref_colors(
     // Folded ties resolve to the higher PC; both candidates share the folded
     // marker anyway, so widening lands on the same `out` key.
     let pre_merge_pc_pos = census_enabled.then(|| sparse_pc_owner_table(ssarepr));
-    let catch_ref_colors_from_args = |args: &[SsaOperand]| -> std::collections::BTreeSet<u16> {
-        args.iter()
-            .filter_map(|op| match op {
-                SsaOperand::TLabel(label) => label2alive.get(&label.name),
-                _ => None,
-            })
-            .flat_map(|alive| alive.iter())
-            .filter_map(|reg| (reg.kind == SsaKind::Ref).then_some(reg.index))
-            .collect()
-    };
     let catch_ref_colors_at = |catch_idx: usize| -> std::collections::BTreeSet<u16> {
         let Some(super::flatten::Insn::Op { opname, args, .. }) = ssarepr.insns.get(catch_idx)
         else {
@@ -4531,7 +4549,7 @@ fn catch_target_extra_ref_colors(
         if opname != "catch_exception" {
             return std::collections::BTreeSet::new();
         }
-        catch_ref_colors_from_args(args)
+        catch_landing_ref_colors(args, label2alive)
     };
     let census = {
         let mut census = CatchLiveCensus::default();
@@ -4666,6 +4684,121 @@ fn catch_target_extra_ref_colors(
         );
     }
     out
+}
+
+/// When `PYRE_CATCH_LIVE_CENSUS` is enabled, verify after marker finalization
+/// that every `catch_exception` landing's live Ref colors occur in the resume
+/// marker owned by the same Python PC.
+///
+/// `catch_target_extra_ref_colors` has two widening routes. The anchored route
+/// reads the single `after_call_markers[pc]` entry and therefore cannot
+/// represent multiple anchored sites owned by one PC; `multi_site_*` counters
+/// report that population. The anchorless route reads each site directly and
+/// has no one-entry limit. Independently, intersecting marker liveness with SSA
+/// liveness can remove a color carried by dataflow unless one of those routes
+/// adds it back.
+///
+/// Unreachable PCs are skipped because `filter_liveness_in_place` clears their
+/// markers and no execution can resume from them; an empty marker for such a PC
+/// is therefore valid.
+fn catch_live_coverage_census(
+    ssarepr: &super::flatten::SSARepr,
+    live_markers: &[usize],
+    first_insn_post_merge: &[Option<usize>],
+    label2alive: &std::collections::HashMap<
+        String,
+        std::collections::HashSet<super::flatten::Register>,
+    >,
+    is_reachable: impl Fn(usize) -> bool,
+    code: &CodeObject,
+) {
+    use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
+    let mut pc_pos: Vec<(usize, usize)> = first_insn_post_merge
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, entry)| entry.map(|pos| (pos, pc)))
+        .collect();
+    pc_pos.sort_unstable();
+
+    let mut sites: Vec<(usize, Option<usize>, std::collections::BTreeSet<u16>)> = Vec::new();
+    let mut sites_per_pc: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    for (q, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Op { opname, args, .. } = insn else {
+            continue;
+        };
+        if opname != "catch_exception" {
+            continue;
+        }
+        let owner = sparse_owner_pc(&pc_pos, q);
+        if let Some(pc) = owner {
+            *sites_per_pc.entry(pc).or_default() += 1;
+        }
+        sites.push((q, owner, catch_landing_ref_colors(args, label2alive)));
+    }
+
+    let marker_ref_colors = |idx: usize| -> std::collections::BTreeSet<u16> {
+        ssarepr
+            .insns
+            .get(idx)
+            .and_then(|insn| insn.live_args())
+            .map(|args| {
+                args.iter()
+                    .filter_map(|op| match op {
+                        SsaOperand::Register(reg) if reg.kind == SsaKind::Ref => Some(reg.index),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let multi_site_pcs = sites_per_pc.values().filter(|&&n| n > 1).count();
+    let mut unowned_sites = 0usize;
+    let mut skipped_unreachable = 0usize;
+    let mut uncovered_sites = 0usize;
+    let mut uncovered_colors = 0usize;
+    let mut multi_site_uncovered = 0usize;
+    for (q, owner, landing) in &sites {
+        let Some(pc) = *owner else {
+            unowned_sites += 1;
+            continue;
+        };
+        if !is_reachable(pc) {
+            skipped_unreachable += 1;
+            continue;
+        }
+        let Some(&marker) = live_markers.get(pc) else {
+            unowned_sites += 1;
+            continue;
+        };
+        let covered = marker_ref_colors(marker);
+        let missing: Vec<u16> = landing.difference(&covered).copied().collect();
+        if missing.is_empty() {
+            continue;
+        }
+        uncovered_sites += 1;
+        uncovered_colors += missing.len();
+        let sites_at_pc = sites_per_pc.get(&pc).copied().unwrap_or(0);
+        if sites_at_pc > 1 {
+            multi_site_uncovered += 1;
+        }
+        eprintln!(
+            "[catch-live-uncovered] code={} q={q} owning_py_pc={pc} marker={marker} \
+             sites_at_pc={sites_at_pc} landing_ref_colors={landing:?} \
+             missing_ref_colors={missing:?}",
+            code.obj_name
+        );
+    }
+    eprintln!(
+        "[catch-live-coverage] code={} sites={} owned_pcs={} multi_site_pcs={multi_site_pcs} \
+         unowned_sites={unowned_sites} skipped_unreachable={skipped_unreachable} \
+         uncovered_sites={uncovered_sites} uncovered_colors={uncovered_colors} \
+         multi_site_uncovered={multi_site_uncovered}",
+        code.obj_name,
+        sites.len(),
+        sites_per_pc.len(),
+    );
 }
 
 /// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
@@ -5245,6 +5378,16 @@ fn filter_liveness_in_place(
             }
         }
         existing.extend(non_register);
+    }
+    if catch_live_census_enabled() {
+        catch_live_coverage_census(
+            ssarepr,
+            &live_markers,
+            &first_insn_post_merge,
+            &label2alive,
+            |pc| live_vars.is_reachable(pc),
+            code,
+        );
     }
     (
         live_markers_out,
