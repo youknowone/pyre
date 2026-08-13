@@ -7101,27 +7101,27 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     //     for index in items:
     //         out.append([index for _ in range(1)])
     //
-    // The route was a mislabelled coordinate, not the R1 body-effect
-    // refusal. Both loops live in one per-CodeObject JitCode with a merge
-    // point each; the outer loop's `for_iter_next` residual sits at
-    // JitCode pc 153 and the inner one at 631, and
-    // `inflight_foriter_body_pc` resolved 153 to the INNER loop's Python
-    // pc, so an outer consume was stashed under the inner body pc.
-    // `fbw_foriter_inflight_take` then delivered it (the census read
-    // `DELIVERED=2 REFUSED=0`) and `deliver_inflight_foriter_item`'s
-    // header check, seeing the frame at the outer header, declined the
-    // push and dropped the item.
+    // The route was TWO in-flight entries and a take that selected on
+    // recency, not the R1 body-effect refusal and not a mislabelled
+    // coordinate: `inflight_foriter_body_pc` resolves the outer loop's
+    // `for_iter_next` (JitCode pc 153) to Python pc 5 and the inner one
+    // (631) to 34, both correct. The outer `list` loop captured through
+    // the residual leg and the inner `range` body through the specialised
+    // leg, so `fbw_foriter_inflight_take` popped the inner entry — whose
+    // body pc a frame parked at the outer header can never accept — and
+    // cleared the outer entry it could have delivered. Selecting the
+    // entry that matches the parked frame fixes that, and is what the
+    // take now does.
     //
-    // It does not reproduce here. #1174 made that walk raise
+    // The shape no longer reaches it here: #1174 made that walk raise
     // `callee_inline_blackhole_required` where it raised
-    // `callee_inline_unsupported`, so the shape stops aborting and never
-    // reaches the take: 0 in-flight takes and 0 divergences across the
-    // whole probe family. The mislabelling is unexercised rather than
-    // gone — `inflight_foriter_body_pc` and
-    // `containing_py_pc_for_jitcode_pc` are untouched and the JitCode
-    // still carries both merge points. `SET_ADD` and `MAP_ADD` spell the
-    // same shape and carry no scan at all. Closing this is the in-flight
-    // delivery gap (single-executor tracing, gh#73/#34).
+    // `callee_inline_unsupported`, so it stops aborting — 0 in-flight
+    // takes and 0 divergences across the whole probe family — which also
+    // means this base cannot re-witness the fix end to end; the selection
+    // is pinned by `take_selects_the_entry_the_parked_frame_can_accept_…`
+    // instead. `SET_ADD` and `MAP_ADD` spell the same shape and carry no
+    // scan at all. Closing the rest is the in-flight delivery gap
+    // (single-executor tracing, gh#73/#34).
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
@@ -8484,9 +8484,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// double-apply guard lives in `fbw_foriter_inflight_take`.
 fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     let code_ptr = unsafe { pyre_interpreter::pyframe_get_pycode(frame) } as usize;
-    let Some((item, body_pc)) =
-        pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take(code_ptr)
-    else {
+    // The stash can hold one entry per in-flight FOR_ITER of this frame, and
+    // only the one whose header the frame is parked at can be pushed here, so
+    // the take selects on those coordinates rather than on recency.
+    let frame_addr = &*frame as *const PyFrame as usize;
+    let resume_py_pc = frame.next_instr();
+    let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take(
+        code_ptr,
+        frame_addr,
+        resume_py_pc,
+    ) else {
         return false;
     };
     // #57 Option C (Finding #3, loud-failure assert): the R1 guard in

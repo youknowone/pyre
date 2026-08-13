@@ -859,16 +859,34 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// clear at the abort point — the clean continuation case.
 pub fn fbw_foriter_inflight_take(
     fallback_code_ptr: usize,
+    frame: usize,
+    resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
-    // Take the MOST-RECENT (top) entry and drop the rest, matching the
-    // single-slot behaviour: one take delivers the innermost in-flight item
-    // and leaves nothing for a subsequent deliver call.  (S2 will instead
-    // deliver every entry at its true frame slot.)
+    // Take the entry that belongs to the header the live frame is PARKED at,
+    // then drop the rest: one take still delivers at most one item and leaves
+    // nothing for a subsequent deliver call.
+    //
+    // Selecting the most-recent entry instead loses an iteration whenever two
+    // FOR_ITERs of one frame are in flight at once, which needs no nesting of
+    // frames: an outer `list` loop captures through the residual leg
+    // (`residual_call.rs`, `ForIterNext`) while a `range` body inside it
+    // captures through the specialised leg (`specialize.rs`, `w_range_iter_next`).
+    // `deliver_inflight_foriter_item` can only push at the header the frame is
+    // parked on, so a most-recent entry naming the INNER body pc fails its
+    // header check and is refused — and the `clear` below has already destroyed
+    // the outer entry, which that same frame COULD have taken. Neither item is
+    // delivered and the outer iteration is lost. Matching the frame first
+    // delivers the deliverable one; the entries that no frame can accept keep
+    // the single-slot drop.
     let stash = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
-        let top = stack.pop();
+        let at = stack
+            .iter()
+            .rposition(|entry| foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1))
+            .or_else(|| stack.len().checked_sub(1))?;
+        let picked = stack.remove(at);
         stack.clear();
-        top
+        Some(picked)
     });
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
@@ -930,7 +948,43 @@ mod foriter_delivery_tests {
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0), Some((item, 34)));
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+
+        fbw_store_journal_reset();
+    }
+
+    /// Two FOR_ITERs of one frame can be in flight at once (an outer `list`
+    /// loop through the residual leg, a `range` body inside it through the
+    /// specialised leg). The deliver site can only push at the header the
+    /// frame is parked on, so the take must select on that coordinate: taking
+    /// the most-recent entry returns a body pc this frame will refuse AND
+    /// discards the entry it could have delivered, losing the outer iteration.
+    #[test]
+    fn take_selects_the_entry_the_parked_frame_can_accept_not_the_most_recent() {
+        fbw_store_journal_reset();
+        let outer = 1usize as pyre_object::PyObjectRef;
+        let inner = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6));
+        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35));
+
+        // Parked at the OUTER header (pc 5), whose fallthrough body pc is 6.
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
+
+        fbw_store_journal_reset();
+    }
+
+    /// With no entry the parked frame can accept, the single-slot most-recent
+    /// behaviour stands: the deliver site refuses on its header check exactly
+    /// as before, so this change never widens what gets pushed.
+    #[test]
+    fn take_falls_back_to_the_most_recent_entry_when_none_matches_the_frame() {
+        fbw_store_journal_reset();
+        let older = 1usize as pyre_object::PyObjectRef;
+        let newer = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(older, InflightForiterBody::Py(6));
+        fbw_foriter_inflight_capture(newer, InflightForiterBody::Py(35));
+
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 99), Some((newer, 35)));
 
         fbw_store_journal_reset();
     }
@@ -943,7 +997,7 @@ mod foriter_delivery_tests {
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0), None);
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
 
         fbw_store_journal_reset();
     }
