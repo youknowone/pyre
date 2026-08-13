@@ -1961,6 +1961,65 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "newlist_clear dst");
     }
 
+    /// Store an integer element into a GC-managed array.
+    ///
+    /// blackhole.py:1351 `bhimpl_setarrayitem_gc_i @arguments("cpu","r","i",
+    /// "i","d")`: reads `registers_r[array_reg]` as the array pointer,
+    /// `registers_i[index_reg]` (or a const-pool slot) as the element index,
+    /// `registers_i[value_reg]` (or a const-pool slot) as the new value, and
+    /// `descrs[descr_idx]` as the array descriptor.
+    ///
+    /// Encoding: `[BC_SETARRAYITEM_GC_I][array_reg u8][index_reg u8]
+    ///             [value_reg u8][descr_idx lo u8][descr_idx hi u8]`.
+    ///
+    /// Store counterpart of [`Self::getarrayitem_gc_i`]. Both take the
+    /// element descr from [`Self::add_gc_int_array_descr`], so a store
+    /// invalidates the heapcache entry the matching load populated.
+    pub fn setarrayitem_gc_i(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value_reg: u16,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(index_reg);
+        self.touch_int_reg_or_pool_slot(value_reg);
+        self.write_insn("setarrayitem_gc_i/riid");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_i array");
+        self.push_reg_u8(index_reg, "setarrayitem_gc_i index");
+        self.push_reg_u8(value_reg, "setarrayitem_gc_i value");
+        self.push_u16(descr_idx);
+    }
+
+    /// `c`-argcode form of [`Self::setarrayitem_gc_i`] —
+    /// `assembler.py:99-107 emit_const(allow_short=True)` writes a small
+    /// ConstInt VALUE (-128..127) inline as one signed byte
+    /// (`setarrayitem_gc_i` is in `USE_C_FORM`, `assembler.py:339`).
+    ///
+    /// Note the constant operand differs from
+    /// [`Self::setarrayitem_gc_r_c`], where it is the INDEX: here the index
+    /// stays a register and the stored value is inline, matching the
+    /// `/ricd` argcode string the blackhole registers.
+    ///
+    /// Encoding: `[BC_SETARRAYITEM_GC_I_C][array_reg u8][index_reg u8]
+    ///             [value i8][descr_idx lo u8][descr_idx hi u8]`.
+    pub fn setarrayitem_gc_i_c(
+        &mut self,
+        array_reg: u16,
+        index_reg: u16,
+        value: i8,
+        descr_idx: u16,
+    ) {
+        self.touch_ref_reg(array_reg);
+        self.touch_int_reg_or_pool_slot(index_reg);
+        self.write_insn("setarrayitem_gc_i/ricd");
+        self.push_reg_u8(array_reg, "setarrayitem_gc_i array");
+        self.push_reg_u8(index_reg, "setarrayitem_gc_i index");
+        self.push_u8(value as u8);
+        self.push_u16(descr_idx);
+    }
+
     /// Store a Ref element into a GC-managed array.
     ///
     /// blackhole.py `bhimpl_setarrayitem_gc_r @arguments("cpu","r","i",
@@ -7085,6 +7144,63 @@ mod tests {
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("raise/r");
         assert_eq!(jitcode.code, vec![opcode, 0]);
+    }
+
+    #[test]
+    fn setarrayitem_gc_i_encodes_the_riid_operand_order() {
+        // `handler_setarrayitem_gc_i` (blackhole.rs) reads
+        // `code[position]` as the array ref reg, `+1` as the index int
+        // reg, `+2` as the value int reg, then the descr — the `riid`
+        // argcode string it is registered under. Pin that order here so
+        // the emit side cannot drift from the handler that decodes it.
+        let mut builder = JitCodeBuilder::new();
+        let descr_idx = builder.add_gc_int_array_descr(8, true);
+        builder.setarrayitem_gc_i(1, 2, 3, descr_idx);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("setarrayitem_gc_i/riid");
+        assert_eq!(
+            jitcode.code,
+            vec![
+                opcode,
+                1,
+                2,
+                3,
+                (descr_idx & 0xff) as u8,
+                (descr_idx >> 8) as u8
+            ]
+        );
+        // The array operand is a REF reg and the other two are INT regs,
+        // so the banks must be sized independently.
+        assert_eq!(jitcode.c_num_regs_r, 2);
+        assert_eq!(jitcode.c_num_regs_i, 4);
+    }
+
+    #[test]
+    fn setarrayitem_gc_i_c_encodes_the_value_inline_not_the_index() {
+        // The `_c` form's constant operand is the stored VALUE, not the
+        // index — `setarrayitem_gc_i/ricd`, unlike `setarrayitem_gc_r`'s
+        // `/rcrd` where it is the index. `handler_setarrayitem_gc_i_c`
+        // reads `code[position + 1]` as an index REGISTER and
+        // `code[position + 2]` as a signed inline byte.
+        let mut builder = JitCodeBuilder::new();
+        let descr_idx = builder.add_gc_int_array_descr(8, true);
+        builder.setarrayitem_gc_i_c(1, 2, -5, descr_idx);
+        let jitcode = builder.finish();
+        let opcode = jitcode::insn_byte("setarrayitem_gc_i/ricd");
+        assert_eq!(
+            jitcode.code,
+            vec![
+                opcode,
+                1,
+                2,
+                (-5i8) as u8,
+                (descr_idx & 0xff) as u8,
+                (descr_idx >> 8) as u8
+            ]
+        );
+        // Only the index is an int reg here; the value never touches the
+        // int bank.
+        assert_eq!(jitcode.c_num_regs_i, 3);
     }
 
     #[test]
