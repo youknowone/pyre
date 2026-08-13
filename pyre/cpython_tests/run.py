@@ -753,7 +753,9 @@ def write_baseline(path: Path, baseline: dict, overlay: dict, results: dict,
             host_entry = overlay_modules.get(m)
             if host_entry is not None and host_entry.pop(backend, None) is not None:
                 overlay_dirty = True
-                if not host_entry:
+                # `reason` is prose about the divergence, so it cannot keep the
+                # entry alive once no backend still records one.
+                if not any(k != "reason" for k in host_entry):
                     del overlay_modules[m]
             continue
         if overlay_modules.setdefault(m, {}).get(backend) != status:
