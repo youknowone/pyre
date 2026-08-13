@@ -74,7 +74,10 @@ impl MappedObj {
 #[cfg(any(unix, windows))]
 struct NativeMMap {
     mapped: Option<MappedObj>,
-    #[cfg(any(unix, windows))]
+    /// `rmmap.py`'s `_POSIX` branch — the descriptor the object duplicated at
+    /// construction, kept so `resize()` can grow the file and so `close()`
+    /// releases it.  A Windows mapping tracks `handle` instead.
+    #[cfg(unix)]
     fd: Option<rustpython_host_env::crt_fd::Owned>,
     /// `rmmap.py:953-970` — the file handle the object duplicated at
     /// construction, or `INVALID_HANDLE` for a mapping backed by no file of
