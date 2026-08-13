@@ -720,15 +720,18 @@ unsafe fn ssl_socket_destructor(obj_addr: usize) {
 
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
-/// `W_Random`; instance `map`+`storage`,
-/// `mapdict.py:907-910`).  The `storage` list is an off-GC
-/// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
-/// reaches the off-GC dict entries — this forwards each boxed
-/// attribute-value slot in place via `instance_walk_boxed_storage`,
-/// which consults the map to skip erased unboxed (`Vec<i64>`) slots
-/// (`mapdict.py:438/447` boxed `erase_item` vs `:601/612`
-/// `erase_unboxed`).  The off-GC `Vec` stays put; only its
-/// `PyObjectRef` contents are relocated.
+/// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
+///
+/// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
+/// allocated stable and non-moving by `alloc_mapdict_storage_block`), so the
+/// collector reaches its slots only through this trace:
+/// `instance_walk_boxed_storage` forwards the `storage` reference itself and
+/// then every slot in `0..capacity` in place.  It consults no map — an
+/// unboxed longlong attribute stores the erased `GC_INT_ARRAY` block
+/// (`erase_unboxed`, `mapdict.py:601/612`), which is an ordinary GC reference
+/// like every boxed slot (`mapdict.py:438/447` `erase_item`), so no slot has
+/// to be skipped.  The block itself never moves; only the slot contents are
+/// relocated.
 ///
 /// `ob_header.w_class` is the instance's class reachability edge — the
 /// equivalent of PyPy reaching the class through the traced
