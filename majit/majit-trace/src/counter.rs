@@ -154,12 +154,25 @@ impl JitCounter {
     /// TODO: no RPython counterpart. Read-only peek
     /// used by warmstate's cold fast path to avoid GreenKey allocation.
     pub fn would_tick_fire(&self, hash: u64, increment: f64) -> bool {
+        let elapsed = DECAY_GENERATION
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.last_decay_generation);
         let index = self._get_index(hash);
         let subhash = Self::_get_subhash(hash);
         let entry = &self.timetable[index];
         for i in 0..ASSOCIATIVITY {
             if entry.subhashes[i] == subhash {
-                return entry.times[i] as f64 + increment >= 1.0;
+                // This predicate is &self, so decay-adjust the read instead of
+                // mutating the table to apply the pending generations. Step
+                // through them one at a time rather than raising the multiplier
+                // to `elapsed`: `decay_all_counters` rounds back to f32 after
+                // every step, and this answer has to be the one a `tick` would
+                // give once it drains the same generations.
+                let mut time = entry.times[i];
+                for _ in 0..elapsed {
+                    time = (time as f64 * self.decay_by_mult) as f32;
+                }
+                return time as f64 + increment >= 1.0;
             }
         }
         increment >= 1.0
@@ -169,24 +182,16 @@ impl JitCounter {
     #[inline(always)]
     pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
         // counter.py:104-121 applies the decay synchronously inside the minor
-        // collection. pyre defers it to the next tick because the metainterp
-        // owns the counter table, and reaching it from inside the collector
-        // would re-enter a borrow the GC does not hold. Counters are only read
-        // at tick time.
+        // collection. pyre defers it to the next table access because the
+        // metainterp owns the counter table, and reaching it from inside the
+        // collector would re-enter a borrow the GC does not hold.
         //
         // Each JitCounter keeps its own last-seen generation because JIT_DRIVER
         // in eval.rs is thread-local, giving each mutator thread its own counter.
-        // This still saturates: if two or more 32-collection intervals elapse
-        // between ticks, counter.py has applied that many decays while this
-        // applies one. Carrying the elapsed count would match it, but would move
-        // inline_chain_depth_typeflip's recorded jit-stats (bridges_compiled
-        // 19 -> 18, guard_failures 3820 -> 3681); left for a change that can
-        // re-record them on every platform.
-        let generation = DECAY_GENERATION.load(Ordering::Relaxed);
-        if generation != self.last_decay_generation {
-            self.last_decay_generation = generation;
-            self.decay_all_counters();
-        }
+        // Every elapsed interval is applied before every mutating table access;
+        // would_tick_fire decay-adjusts its read. A value written after a
+        // collection is therefore not retro-decayed.
+        self.apply_pending_decay();
 
         let index = self._get_index(hash);
         let subhash = Self::_get_subhash(hash);
@@ -213,6 +218,8 @@ impl JitCounter {
 
     /// counter.py:204-230 change_current_fraction(hash, new_fraction)
     pub fn change_current_fraction(&mut self, hash: u64, new_fraction: f64) {
+        self.apply_pending_decay();
+
         let index = self._get_index(hash);
         let subhash = Self::_get_subhash(hash);
         let entry = &mut self.timetable[index];
@@ -232,6 +239,8 @@ impl JitCounter {
 
     /// counter.py:232-237 reset(hash)
     pub fn reset(&mut self, hash: u64) {
+        self.apply_pending_decay();
+
         let index = self._get_index(hash);
         let subhash = Self::_get_subhash(hash);
         let entry = &mut self.timetable[index];
@@ -245,6 +254,8 @@ impl JitCounter {
     /// TODO: no RPython equivalent.
     /// Zero all timetable entries.
     pub fn reset_all(&mut self) {
+        self.apply_pending_decay();
+
         for entry in &mut self.timetable {
             *entry = Entry::default();
         }
@@ -252,6 +263,8 @@ impl JitCounter {
 
     /// counter.py:258-264 set_decay(decay)
     pub fn set_decay(&mut self, decay: i32) {
+        self.apply_pending_decay();
+
         let clamped = decay.clamp(0, 1000);
         self.decay_by_mult = 1.0_f64 - (clamped as f64 * 0.001);
     }
@@ -263,6 +276,18 @@ impl JitCounter {
             for time in &mut entry.times {
                 *time = (*time as f64 * mult) as f32;
             }
+        }
+    }
+
+    /// Apply every 32-collection interval that elapsed since this counter
+    /// last looked. counter.py:104-121 decays inside the collection, so a
+    /// pending decay must land before anything reads or writes the table —
+    /// otherwise it would decay values written after the collection.
+    fn apply_pending_decay(&mut self) {
+        let generation = DECAY_GENERATION.load(Ordering::Relaxed);
+        while self.last_decay_generation != generation {
+            self.last_decay_generation = self.last_decay_generation.wrapping_add(1);
+            self.decay_all_counters();
         }
     }
 }
@@ -371,6 +396,25 @@ impl DeterministicJitCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static DECAY_GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn advance_decay_generation(intervals: usize) {
+        DECAY_GENERATION.fetch_add(intervals, Ordering::Relaxed);
+    }
+
+    fn counter_time(counter: &JitCounter, hash: u64) -> f32 {
+        let index = counter._get_index(hash);
+        let subhash = JitCounter::_get_subhash(hash);
+        let entry = &counter.timetable[index];
+        for i in 0..ASSOCIATIVITY {
+            if entry.subhashes[i] == subhash {
+                return entry.times[i];
+            }
+        }
+        0.0
+    }
 
     #[test]
     fn test_basic_counting() {
@@ -432,6 +476,46 @@ mod tests {
             }
         }
         assert!(time > 0.7 && time < 0.8, "time={}", time);
+    }
+
+    #[test]
+    fn test_tick_applies_every_pending_decay_generation() {
+        let _generation_guard = DECAY_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counter = JitCounter::new(DEFAULT_SIZE);
+        counter.set_decay(40);
+        let h = 3u64 << counter.shift;
+        counter.change_current_fraction(h, 0.5);
+
+        advance_decay_generation(2);
+        let increment = 0.001;
+        assert!(!counter.tick(h, increment));
+
+        let expected =
+            (((0.5f32 as f64 * 0.96) as f32 as f64 * 0.96) as f32 as f64 + increment) as f32;
+        let actual = counter_time(&counter, h);
+        assert!((actual - expected).abs() < 1.0e-6, "actual={actual}");
+    }
+
+    #[test]
+    fn test_change_current_fraction_is_not_retro_decayed() {
+        let _generation_guard = DECAY_GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counter = JitCounter::new(DEFAULT_SIZE);
+        counter.set_decay(40);
+        let h = 4u64 << counter.shift;
+        counter.change_current_fraction(h, 0.5);
+
+        advance_decay_generation(1);
+        counter.change_current_fraction(h, 0.98);
+        let increment = 0.001;
+        assert!(!counter.tick(h, increment));
+
+        let expected = (0.98f32 as f64 + increment) as f32;
+        let actual = counter_time(&counter, h);
+        assert!((actual - expected).abs() < 1.0e-6, "actual={actual}");
     }
 
     #[test]
