@@ -892,6 +892,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             }
         }
     }
+    probe_call_hist_dump();
     // Emit the sign-stable badness counters under MAJIT_STATS (the same env
     // check.py sets for every backend), so the regression floor gates wasm on
     // the same fields as the native backends. Kept separate from the verbose
@@ -1490,6 +1491,30 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
 }
 
 /// Dispatch a residual call requested by a running trace.
+// PROBE(PYRE_WASM_CALL_HIST): temporary per-callee crossing histogram.
+static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn probe_call_hist_dump() {
+    if std::env::var_os("PYRE_WASM_CALL_HIST").is_none() {
+        return;
+    }
+    let g = PROBE_CALL_HIST.lock().unwrap();
+    let Some(m) = g.as_ref() else { return };
+    let total: u64 = m.values().sum();
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    eprintln!("[probe] call_hist total={total} distinct={}", v.len());
+    for (slot, n) in v.into_iter().take(15) {
+        let pct = if total > 0 {
+            *n as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!("[probe] call_hist slot={slot} n={n} pct={pct:.1}");
+    }
+}
+
 fn jit_call_trampoline(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
@@ -1501,6 +1526,12 @@ fn jit_call_trampoline(
     let call_area = frame_ptr as usize + call_area_ofs as usize;
 
     let func_ptr = read_u32(&memory, &*caller, call_area + 8);
+    if std::env::var_os("PYRE_WASM_CALL_HIST").is_some() {
+        let mut g = PROBE_CALL_HIST.lock().unwrap();
+        *g.get_or_insert_with(Default::default)
+            .entry(func_ptr)
+            .or_insert(0) += 1;
+    }
 
     // `func_ptr == 0` is the "newstr" sentinel; without a host string
     // allocator (matching the browser glue's null table slot) it yields 0.

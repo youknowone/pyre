@@ -950,7 +950,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (54): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (55): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -975,8 +975,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_PROBE_SUBSCR`, `PYRE_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
 `PYRE_RERAISE_DIAG`, `PYRE_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
-`PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_NO_CACHE`,
-`PYRE_WASM_STARTUP_TRACE`.
+`PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
+`PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`.
 
 ## §7 — General MAJIT gates
 
