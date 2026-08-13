@@ -1435,6 +1435,43 @@ fn absolute_script_path(filename: &str) -> Option<String> {
     })
 }
 
+/// Rewrite an extended-length `\\?\` path back to its ordinary spelling.
+///
+/// `canonicalize` answers in the extended-length form on Windows, which no
+/// `sys.path[0]` upstream ever carries: `resolvedirof` (`initpath.py:66-78`)
+/// builds the entry with `rabspath`, so it keeps the drive-letter spelling the
+/// program compares against `os.path.dirname(__file__)`.  Only the two forms
+/// `canonicalize` produces are unwrapped; anything else is left alone, since a
+/// path that genuinely needs the prefix must keep it.
+#[cfg(all(windows, not(feature = "sandbox")))]
+fn ordinary_path_spelling(path: PathBuf) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    // Compare in UTF-16 units rather than through `to_string_lossy`, which
+    // would rewrite an unpaired surrogate in a directory name.
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    let Some(rest) = wide.strip_prefix(verbatim.as_slice()) else {
+        return path;
+    };
+    let unc: Vec<u16> = "UNC\\".encode_utf16().collect();
+    if let Some(share) = rest.strip_prefix(unc.as_slice()) {
+        let mut out: Vec<u16> = r"\\".encode_utf16().collect();
+        out.extend_from_slice(share);
+        return PathBuf::from(std::ffi::OsString::from_wide(&out));
+    }
+    // `\\?\C:\…` — a drive-letter path, the form a local directory takes.
+    if rest.get(1) == Some(&u16::from(b':')) {
+        return PathBuf::from(std::ffi::OsString::from_wide(rest));
+    }
+    path
+}
+
+#[cfg(all(not(windows), not(feature = "sandbox")))]
+fn ordinary_path_spelling(path: PathBuf) -> PathBuf {
+    path
+}
+
 fn script_startup_dir(path: &str) -> PathBuf {
     // Initialize sys.path with the script's directory. Under sandbox,
     // `canonicalize()` issues raw host-FS syscalls (realpath) past the
@@ -1459,7 +1496,7 @@ fn script_startup_dir(path: &str) -> PathBuf {
         } else {
             parent
         };
-        parent.canonicalize().unwrap_or_else(|_| sys_path_cwd())
+        ordinary_path_spelling(parent.canonicalize().unwrap_or_else(|_| sys_path_cwd()))
     }
 }
 
