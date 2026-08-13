@@ -2906,9 +2906,12 @@ pub fn fuse_boxing_alloc(
     // Derive a boxing struct's scalar payload fields from its registered field
     // layout, in struct-declaration order, skipping the `ob_header` (PyObject
     // base): the header's type pointer is captured separately into
-    // `NewWithVtable.vtable` (see `resolve_vtable_addr`) and the runtime stamps
+    // `NewWithVtable.vtable` (see `resolve_header_plan`) and the runtime stamps
     // `ob_type` / `w_class` from it, so only the non-header setfield(s) are
     // re-emitted (oracle: `box_trace.rs trace_box_float` / `trace_box_int`).
+    // The one header field that survives as its own store is a `w_class` the
+    // vtable cannot stand for, which `resolve_header_plan` hands back as a
+    // payload.
     // This mirrors the type-generic malloc lowering in the front end
     // (`rpython/rtyper/rbuiltin.py:349-385` `rtype_malloc`; `rclass.py` reads
     // the exact lltype's field layout); `struct_field_attrs` is the
@@ -2969,7 +2972,7 @@ pub fn fuse_boxing_alloc(
     // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
     // a subclass there.
     fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
-        let (_, value) = unique_store(graph, base, field_name)?;
+        let (_, value, _) = unique_store(graph, base, field_name)?;
         value.as_variable().cloned()
     }
     /// The unique graph-wide store to `base.field_name`, or `None` if absent
@@ -2982,14 +2985,14 @@ pub fn fuse_boxing_alloc(
         graph: &'g FunctionGraph,
         base: &Variable,
         field_name: &str,
-    ) -> Option<(&'g FieldDescriptor, &'g LinkArg)> {
-        let mut found: Option<(&FieldDescriptor, &LinkArg)> = None;
+    ) -> Option<(&'g FieldDescriptor, &'g LinkArg, &'g ValueType)> {
+        let mut found: Option<(&FieldDescriptor, &LinkArg, &ValueType)> = None;
         for op in graph.blocks.iter().flat_map(|b| &b.operations) {
             let OpKind::FieldWrite {
                 base: b,
                 field,
                 value,
-                ..
+                ty,
             } = &op.kind
             else {
                 continue;
@@ -2998,8 +3001,8 @@ pub fn fuse_boxing_alloc(
                 continue;
             }
             match found {
-                None => found = Some((field, value)),
-                Some((_, seen)) if seen == value => {}
+                None => found = Some((field, value, ty)),
+                Some((_, seen, _)) if seen == value => {}
                 Some(_) => return None,
             }
         }
@@ -3154,52 +3157,89 @@ pub fn fuse_boxing_alloc(
             _ => None,
         })
     }
-    // The vtable the fusion keeps stands in for BOTH dropped header stores: the
-    // runtime stamps `ob_type` and `w_class` from it.  That is only faithful
-    // where the cluster's own `w_class` is the type object of the very type
-    // `ob_type` names, i.e. `get_instantiate(&T)` with that same `&T`.  A
-    // constructor taking `w_class` from anywhere else is building a SUBCLASS
-    // instance — `w_bytes_subclass_from_bytes` (bytesobject.rs) pins the
-    // caller's class on the shadow stack and reads it back — and
-    // re-synthesising `w_class` from the vtable would answer the base type for
-    // `type(B(b'x'))`.  An unresolvable spelling declines, leaving
-    // `malloc_typed` residual.
-    let resolve_vtable_addr = |graph: &FunctionGraph, agg: &Variable| -> i64 {
-        let Some(header) = store_value(graph, agg, "ob_header") else {
-            return 0;
-        };
+    struct Payload {
+        field: FieldDescriptor,
+        value: LinkArg,
+        ty: ValueType,
+    }
+    /// What the fusion keeps of the cluster's `ob_header`.
+    ///
+    /// `vtable` is the `ob_type` type-pointer the `NewWithVtable` carries; the
+    /// runtime stamps both header slots from it.
+    ///
+    /// `w_class` is the class store to re-emit as a `FieldWrite` of its own,
+    /// present exactly when the kept vtable does not stand for it — the
+    /// cluster's `w_class` is not `get_instantiate(&T)` for the very `&T` its
+    /// `ob_type` names.  Dropping such a store and re-synthesising the class
+    /// from the vtable answers the wrong type: `w_long_from_raw`
+    /// (longobject.rs) pairs `&LONG_TYPE` with `get_instantiate(&INT_TYPE)` so
+    /// that `type(1 << 100) is int`, and `w_bytes_subclass_from_bytes`
+    /// (bytesobject.rs) pins the caller's class on the shadow stack and reads
+    /// it back for `type(B(b'x'))`.  Keeping it as a separate store is what
+    /// upstream does with every field an allocation does not carry:
+    /// `jtransform.py:1040-1045 rewrite_op_malloc` emits `new_with_vtable`
+    /// carrying only the sizedescr, and each remaining field arrives as its own
+    /// `setfield`.
+    struct HeaderPlan {
+        vtable: i64,
+        w_class: Option<Payload>,
+    }
+    let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
+        let header = store_value(graph, agg, "ob_header")?;
         let mut roots = Vec::new();
         if !store_roots(graph, &header, 8, &mut roots) {
-            return 0;
+            return None;
         }
         let mut resolved: Option<i64> = None;
+        // `None` until the first root is read; `Some(None)` once a root's class
+        // folds into the vtable, `Some(Some(_))` once one does not.
+        let mut w_class: Option<Option<(FieldDescriptor, LinkArg, ValueType)>> = None;
         for root in &roots {
-            let Some(vtable) = store_value(graph, root, "ob_type")
-                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))
-            else {
-                return 0;
-            };
-            let w_class = store_value(graph, root, "w_class")
-                .and_then(|value| get_instantiate_arg_addr(graph, &value, 8));
-            if w_class != Some(vtable) {
-                return 0;
+            let vtable = store_value(graph, root, "ob_type")
+                .and_then(|obtype| const_ref_addr(graph, &obtype, 8))?;
+            // A header with no `w_class` store leaves nothing to keep and
+            // nothing that proves the vtable stands for it, so it declines.
+            let (field, value, ty) = unique_store(graph, root, "w_class")?;
+            let folds = value
+                .as_variable()
+                .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
+                == Some(vtable);
+            let store = (!folds).then(|| (field.clone(), value.clone(), ty.clone()));
+            match &w_class {
+                None => w_class = Some(store),
+                // Predecessors disagreeing about the class — one folding into
+                // the vtable and another not, or two naming different classes
+                // — merge into one malloc with no single store standing for
+                // the cluster.
+                Some(seen) => {
+                    let agrees = match (seen, &store) {
+                        (None, None) => true,
+                        (Some((seen_field, seen_value, _)), Some((field, value, _))) => {
+                            seen_field == field && seen_value == value
+                        }
+                        _ => false,
+                    };
+                    if !agrees {
+                        return None;
+                    }
+                }
             }
             match resolved {
                 None => resolved = Some(vtable),
                 Some(seen) if seen == vtable => {}
                 // Predecessors building headers for different types merge into
                 // one malloc: no single vtable stands for the whole cluster.
-                Some(_) => return 0,
+                Some(_) => return None,
             }
         }
-        resolved.unwrap_or(0)
+        Some(HeaderPlan {
+            vtable: resolved?,
+            w_class: w_class
+                .flatten()
+                .map(|(field, value, ty)| Payload { field, value, ty }),
+        })
     };
 
-    struct Payload {
-        field: FieldDescriptor,
-        value: LinkArg,
-        ty: ValueType,
-    }
     struct Site {
         block: usize,
         op: usize,
@@ -3207,6 +3247,10 @@ pub fn fuse_boxing_alloc(
         result: crate::flowspace::model::Variable,
         owner: String,
         vtable: i64,
+        /// The header's `w_class` store when the vtable does not stand for it,
+        /// re-emitted ahead of the payload stores so the whole rewrite lands in
+        /// struct order (`ob_header` is field zero of every boxing struct).
+        w_class: Option<Payload>,
         payloads: Vec<Payload>,
     }
 
@@ -3271,7 +3315,7 @@ pub fn fuse_boxing_alloc(
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
                 let found = unique_store(graph, agg, field_name.as_str())
-                    .map(|(field, value)| (field.clone(), value.clone()));
+                    .map(|(field, value, _)| (field.clone(), value.clone()));
                 match found {
                     Some((field, value)) => payloads.push(Payload {
                         field,
@@ -3287,33 +3331,31 @@ pub fn fuse_boxing_alloc(
             if !complete {
                 continue;
             }
-            let vtable = resolve_vtable_addr(graph, agg);
             // Leave the cluster unfused when the `ob_header.ob_type` store
-            // carries no resolvable constant type-pointer (`resolve_vtable_addr`
-            // == 0).  A `NewWithVtable` requires a non-zero type pointer — a
-            // zero vtable would stamp a null `ob_type`, and the assembler
-            // fail-closes on it (`assembler.rs` `new_with_vtable`).  Untouched,
-            // the `lltype::malloc_typed` stays a residual call, the same
-            // graceful outcome an incomplete payload store takes above.  Two
-            // things reach here.  The type pointer may be genuinely absent —
-            // the `PyType` singleton addresses unavailable
-            // (`HostStaticAddrs.pytypes` empty, as in the pure-translate
-            // registry fixture), so the `&FLOAT_TYPE` read lowers to a
-            // residual `FunctionPath` call rather than a `ConstRefAddr`; the
-            // production driver supplies those addresses, so there the
-            // pointer resolves.  Or the cluster's `w_class` may not be the
-            // one the kept vtable stands for, which `resolve_vtable_addr`
-            // also answers `0` for — see its comment.
-            if vtable == 0 {
+            // carries no resolvable constant type-pointer.  A `NewWithVtable`
+            // requires a non-zero type pointer — a zero vtable would stamp a
+            // null `ob_type`, and the assembler fail-closes on it
+            // (`assembler.rs` `new_with_vtable`).  Untouched, the
+            // `lltype::malloc_typed` stays a residual call, the same graceful
+            // outcome an incomplete payload store takes above.  The type
+            // pointer may be genuinely absent — the `PyType` singleton
+            // addresses unavailable (`HostStaticAddrs.pytypes` empty, as in the
+            // pure-translate registry fixture), so the `&FLOAT_TYPE` read
+            // lowers to a residual `FunctionPath` call rather than a
+            // `ConstRefAddr`; the production driver supplies those addresses,
+            // so there the pointer resolves.  Predecessors that disagree about
+            // the type or the class also decline — see `HeaderPlan`.
+            let Some(header) = resolve_header_plan(graph, agg) else {
                 continue;
-            }
+            };
             sites.push(Site {
                 block: bi,
                 op: oi,
                 aggregate: agg.clone(),
                 result: result.clone(),
                 owner,
-                vtable,
+                vtable: header.vtable,
+                w_class: header.w_class,
                 payloads,
             });
         }
@@ -3332,9 +3374,12 @@ pub fn fuse_boxing_alloc(
                 vtable: site.vtable,
             },
         };
-        // Payload stores follow the `NewWithVtable`, in struct order.  Each is
-        // a plain `FieldWrite` the assembler lowers to its own `setfield_gc`.
-        for (k, payload) in site.payloads.into_iter().enumerate() {
+        // The kept stores follow the `NewWithVtable`, in struct order: the
+        // header's `w_class` where the vtable does not stand for it, then the
+        // payloads.  Each is a plain `FieldWrite` the assembler lowers to its
+        // own `setfield_gc`, which is the shape `jtransform.py:1044` leaves
+        // every field the allocation itself does not carry.
+        for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
             block.operations.insert(
                 site.op + 1 + k,
                 SpaceOperation {
@@ -3609,6 +3654,9 @@ pub fn thread_undefined_op_operands(graph: &mut FunctionGraph) {
 /// original aggregate ctor, the inner `PyObject` header ctor, their
 /// `ob_header` / `ob_type` / `w_class` field stores, and the
 /// `__pyre_cast_instance` casts feeding `ob_type` / `w_class` are all dead.
+/// The exception is a `w_class` the vtable cannot stand for: `fuse_boxing_alloc`
+/// re-emits that store on the new object, so its value stays live and the
+/// liveness gate below keeps the producer.
 ///
 /// `front::mir` threads each of those dead values across the block boundary
 /// the preceding `Call` opens (`get_instantiate` / `malloc_typed` each end a
@@ -7291,16 +7339,18 @@ mod tests {
     }
 
     #[test]
-    fn fuse_boxing_alloc_declines_a_w_class_the_vtable_cannot_stand_for() {
-        // Fusion drops the header and lets the runtime stamp both `ob_type`
-        // and `w_class` off the kept vtable, so it may only fire where the
-        // cluster's own `w_class` is `get_instantiate(&T)` for the very `&T`
-        // its `ob_type` names.  `w_bytes_subclass_from_bytes` (bytesobject.rs)
-        // stores the base `ob_type` beside a `w_class` read back off the
-        // shadow stack; re-synthesising that from the vtable would answer the
-        // base type for `type(B(b'x'))`.  A `get_instantiate` of some other
-        // type is the same hazard spelled differently.  Both keep the cluster
-        // unfused and its `malloc_typed` residual.
+    fn fuse_boxing_alloc_keeps_a_w_class_the_vtable_cannot_stand_for() {
+        // Fusion lets the runtime stamp both `ob_type` and `w_class` off the
+        // kept vtable, which answers for the cluster's own `w_class` only where
+        // that is `get_instantiate(&T)` for the very `&T` its `ob_type` names.
+        // Any other spelling is a class the vtable cannot re-synthesise:
+        // `w_long_from_raw` (longobject.rs) pairs `&LONG_TYPE` with
+        // `get_instantiate(&INT_TYPE)`, and `w_bytes_subclass_from_bytes`
+        // (bytesobject.rs) stores the base `ob_type` beside a `w_class` read
+        // back off the shadow stack, where re-synthesising would answer the
+        // base type for `type(B(b'x'))`.  Both still lower — the store is kept
+        // as its own `FieldWrite`, which is what `jtransform.py:1044` leaves
+        // every field the allocation does not carry.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
@@ -7407,9 +7457,9 @@ mod tests {
             graph
         }
 
-        // The first row is the control: the same cluster, differing only in
-        // the `w_class` feed, does fuse — so a decline below is attributable
-        // to the feed and not to some other unmet gate.
+        // The first row is the control: the same cluster, differing only in the
+        // `w_class` feed, fuses with the store folded away — so a kept store
+        // below is attributable to the feed and not to some other gate.
         let same = |graph: &mut FunctionGraph, blk| instantiate_of(graph, blk, FLOAT_TYPE_ADDR);
         let other = |graph: &mut FunctionGraph, blk| instantiate_of(graph, blk, OTHER_TYPE_ADDR);
         let shadow_stack = |graph: &mut FunctionGraph, blk| {
@@ -7421,17 +7471,19 @@ mod tests {
                 vec![base],
             )
         };
-        let rows: [(&str, &dyn Fn(&mut FunctionGraph, BlockId) -> Var, usize); 3] = [
-            ("get_instantiate of the type ob_type names", &same, 1),
-            ("get_instantiate of another type", &other, 0),
-            ("a w_class read off the shadow stack", &shadow_stack, 0),
+        // Every row fuses; they differ in whether the `w_class` store survives
+        // the rewrite as a `FieldWrite` of its own.
+        let rows: [(&str, &dyn Fn(&mut FunctionGraph, BlockId) -> Var, bool); 3] = [
+            ("get_instantiate of the type ob_type names", &same, false),
+            ("get_instantiate of another type", &other, true),
+            ("a w_class read off the shadow stack", &shadow_stack, true),
         ];
-        for (feed, build, expected) in rows {
+        for (feed, build, keeps_store) in rows {
             let mut graph = cluster(build);
             let entry = graph.startblock;
             assert_eq!(
                 fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
-                expected,
+                1,
                 "{feed}: wrong number of fused clusters"
             );
             let residual = graph.block(entry).operations.iter().any(|op| {
@@ -7441,11 +7493,50 @@ mod tests {
                         if segments.last().map(String::as_str) == Some("malloc_typed")
                 )
             });
+            assert!(!residual, "{feed}: the fused cluster leaves no residual");
+            // The kept store must land on the NEW object, not on the dropped
+            // header aggregate, and carry the very value the cluster stored.
+            let result = match &graph.block(entry).operations.iter().find_map(|op| {
+                matches!(op.kind, OpKind::NewWithVtable { .. }).then(|| op.result.clone())
+            }) {
+                Some(Some(result)) => result.clone(),
+                _ => panic!("{feed}: no NewWithVtable was emitted"),
+            };
+            let kept: Vec<_> = graph
+                .block(entry)
+                .operations
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite {
+                        base, field, value, ..
+                    } if base == &result && field.name == "w_class" => Some(value.clone()),
+                    _ => None,
+                })
+                .collect();
             assert_eq!(
-                residual,
-                expected == 0,
-                "{feed}: malloc_typed residual must survive exactly when the cluster declines"
+                kept.len(),
+                usize::from(keeps_store),
+                "{feed}: wrong number of w_class stores on the new object"
             );
+            if keeps_store {
+                // Read the expectation off the cluster's own store, which is
+                // still in the block — `prune_dead_boxing_remnants` is what
+                // drops it, and that runs separately.  Excluding the new
+                // object's base keeps this from matching the kept store and
+                // comparing it against itself.
+                let expected = graph
+                    .block(entry)
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        OpKind::FieldWrite {
+                            base, field, value, ..
+                        } if base != &result && field.name == "w_class" => Some(value.clone()),
+                        _ => None,
+                    })
+                    .expect("the cluster stored a w_class");
+                assert_eq!(kept[0], expected, "{feed}: the kept store lost its value");
+            }
         }
     }
 
