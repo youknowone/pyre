@@ -1389,9 +1389,10 @@ class Check:
         # measured on the same host under the same load; a recorded one would
         # age out of the machine it was taken on.
         self.bench_elapsed = {}
-        # Fixtures where the wasm run had no dynasm time to divide by, so
-        # WASM_MAX_DYNASM_RATIO was never applied. Reported in the summary: an
-        # unevaluated gate otherwise prints the same green as a satisfied one.
+        # Fixtures where the wasm run had no dynasm time to divide by -- absent
+        # or under the noise floor -- so WASM_MAX_DYNASM_RATIO was never
+        # applied. Reported in the summary: an unevaluated gate otherwise
+        # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
@@ -2289,9 +2290,22 @@ class Check:
         # baselines still reports each one.
         if backend == "wasm":
             dynasm_elapsed = self.bench_elapsed.get(("dynasm", name))
-            if dynasm_elapsed is None:
+            dynasm_exec = (
+                self._exec_time("dynasm", dynasm_elapsed)
+                if dynasm_elapsed is not None
+                else None
+            )
+            # Both sides of this ratio are measured in this invocation, so the
+            # denominator carries the full startup-subtraction error rather
+            # than a recorded constant's stability. `_baseline_exec_time_clamped`
+            # would only reject one already pinned to EXEC_TIME_FLOOR_S, which
+            # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
+            # something the same size as its own error.
+            if dynasm_exec in (None, "-") or (
+                float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
+            ):
                 self.wasm_ratio_ungated.append(name)
-            elif not self._baseline_exec_time_clamped("dynasm", dynasm_elapsed):
+            else:
                 passed, bound, checked_elapsed, checked_baseline, retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
@@ -2704,15 +2718,17 @@ class Check:
                     f"for {len(self.cpython_reference_skips)}: {names}"
                 )
             )
-        # A wasm run with no dynasm run beside it leaves WASM_MAX_DYNASM_RATIO
-        # with nothing to divide by. Said out loud because the per-fixture line
-        # for an unevaluated gate is the same green as a satisfied one.
+        # A wasm run with no usable dynasm denominator beside it leaves
+        # WASM_MAX_DYNASM_RATIO with nothing to divide by. Said out loud
+        # because the per-fixture line for an unevaluated gate is the same
+        # green as a satisfied one.
         if self.wasm_ratio_ungated:
             print(
                 dim(
                     f"wasm/dynasm {WASM_MAX_DYNASM_RATIO:g}x ratio not evaluated for "
                     f"{len(self.wasm_ratio_ungated)} fixture(s): dynasm did not run "
-                    f"them in this invocation"
+                    f"them in this invocation, or its execution-only time stayed "
+                    f"under {FLOOR_GATE_MIN_BASELINE_S * 1000:g}ms"
                 )
             )
         # The same weaker baseline, asked for rather than discovered. Listed
