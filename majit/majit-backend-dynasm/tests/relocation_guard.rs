@@ -48,14 +48,40 @@ struct Statement {
     text: String,
 }
 
-/// Advance `index` past a `//` line comment or a `"…"` literal starting there,
-/// returning the index just after it, or `None` if neither starts at `index`.
+/// Advance `index` past a comment or a `"…"` literal starting there, returning
+/// the index just after it, or `None` if none of those starts at `index`.
+///
+/// Both comment forms have to be recognised, and for the same reason: rustc
+/// strips them before `dynasm!` ever sees the tokens, so a `;` inside one is not
+/// a statement separator. Skipping only `//` would let
+/// `mov rax, QWORD /* ; */ ->resume_label` — a real `AbsToRel` — split into two
+/// fragments, neither of which carries both halves the scan looks for.
 fn skip_comment_or_string(chars: &[char], index: usize) -> Option<usize> {
     match (chars[index], chars.get(index + 1)) {
         ('/', Some('/')) => {
             let mut end = index;
             while end < chars.len() && chars[end] != '\n' {
                 end += 1;
+            }
+            Some(end)
+        }
+        // Rust block comments nest, so track depth rather than stopping at the
+        // first closing delimiter.
+        ('/', Some('*')) => {
+            let mut end = index + 2;
+            let mut depth = 1usize;
+            while end < chars.len() && depth > 0 {
+                match (chars[end], chars.get(end + 1)) {
+                    ('/', Some('*')) => {
+                        depth += 1;
+                        end += 2;
+                    }
+                    ('*', Some('/')) => {
+                        depth -= 1;
+                        end += 2;
+                    }
+                    _ => end += 1,
+                }
             }
             Some(end)
         }
@@ -274,6 +300,39 @@ fn scan_separates_address_dependent_forms() {
         scan(nested_semicolon).len(),
         1,
         "a `;` inside an interpolated expression must not split the statement"
+    );
+
+    // rustc strips comments before `dynasm!` sees the tokens, so a `;` inside
+    // one separates nothing. Both forms, and block comments nest.
+    let commented_semicolon = "dynasm!(self.mc ; mov rax, QWORD /* ; */ ->resume_label);\n";
+    assert_eq!(
+        scan(commented_semicolon).len(),
+        1,
+        "a `;` inside a block comment must not split the statement"
+    );
+    let nested_block_comment =
+        "dynasm!(self.mc ; mov rax, QWORD /* outer /* ; inner */ ; */ ->resume_label);\n";
+    assert_eq!(
+        scan(nested_block_comment).len(),
+        1,
+        "a nested block comment must be skipped whole"
+    );
+    let line_commented_semicolon =
+        "dynasm!(self.mc\n    ; mov rax, QWORD // ;\n      ->resume_label\n);\n";
+    assert_eq!(
+        scan(line_commented_semicolon).len(),
+        1,
+        "a `;` inside a line comment must not split the statement"
+    );
+
+    // A `dynasm!` spelled inside a comment is prose, not an invocation, so it
+    // must not register as a body the corpus scan then counts.
+    let commented_out_invocation = "/* dynasm!(self.mc ; call extern helper as _); */\n";
+    let (statements, bodies) = dynasm_statements(commented_out_invocation);
+    assert_eq!(
+        (statements.len(), bodies),
+        (0, 0),
+        "a commented-out invocation is not a dynasm body"
     );
 }
 
