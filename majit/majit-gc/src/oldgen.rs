@@ -87,14 +87,23 @@ impl OldGen {
     ) -> *mut u8 {
         self.try_alloc_with_card_header(total_size, card_header_bytes)
             .unwrap_or_else(|| {
-                let obj_size = Self::allocation_size(total_size);
-                let alloc_size = round_up(
-                    card_header_bytes
-                        .checked_add(obj_size)
-                        .expect("allocation size overflow"),
-                );
-                let layout =
-                    Layout::from_size_align(alloc_size, WORD).expect("invalid allocation layout");
+                // The fallible path also returns None for a request no
+                // allocation could ever satisfy, and `handle_alloc_error`
+                // reports only the byte count. Name the request first, or an
+                // undecodable object size reaches the operator as a bare
+                // `LayoutError` with nothing to attribute it to.
+                let alloc_size = Self::allocation_size(total_size)
+                    .checked_add(card_header_bytes)
+                    .and_then(try_round_up);
+                let layout = alloc_size.and_then(|alloc_size| {
+                    Layout::from_size_align(alloc_size, WORD).ok()
+                });
+                let Some(layout) = layout else {
+                    panic!(
+                        "GC BUG: oldgen request describes no allocation: \
+                         total_size={total_size} card_header_bytes={card_header_bytes}"
+                    );
+                };
                 alloc::handle_alloc_error(layout)
             })
     }

@@ -1704,13 +1704,7 @@ impl MiniMarkGC {
         let mut barriers = Vec::with_capacity(self.pinned_objects.len());
         for &obj_addr in &self.pinned_objects {
             let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-            let type_info = self.types.get(type_id);
-            let payload_size = if type_info.item_size > 0 {
-                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-                type_info.total_instance_size(length)
-            } else {
-                type_info.size
-            };
+            let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_barriers");
             let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
             barriers.push((obj_addr - GcHeader::SIZE, object_size));
         }
@@ -2623,14 +2617,12 @@ impl MiniMarkGC {
         let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
         let type_id = unsafe { (*hdr_ptr).type_id() };
         self.validate_type_id(type_id, obj_addr, "allocate_shadow");
-        let type_info = self.types.get(type_id);
-        let payload_size = if type_info.item_size > 0 {
-            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-            type_info.total_instance_size(length)
-        } else {
-            type_info.size
-        };
+        let payload_size = self.size_for_typeid(obj_addr, type_id, "allocate_shadow");
         let total_size = GcHeader::SIZE + payload_size;
+        let (item_size, length_offset) = {
+            let type_info = self.types.get(type_id);
+            (type_info.item_size, type_info.length_offset)
+        };
         let shadow_hdr_ptr = self.oldgen.alloc(total_size);
         let shadow_obj = shadow_hdr_ptr as usize + GcHeader::SIZE;
         unsafe {
@@ -2648,9 +2640,9 @@ impl MiniMarkGC {
             if self.gc_state == GcState::Marking {
                 (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::VISITED);
             }
-            if type_info.item_size > 0 {
-                let len_ofs = type_info.length_offset;
-                *((shadow_obj + len_ofs) as *mut usize) = *((obj_addr + len_ofs) as *const usize);
+            if item_size > 0 {
+                *((shadow_obj + length_offset) as *mut usize) =
+                    *((obj_addr + length_offset) as *const usize);
             }
             let nursery_hdr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
             (*nursery_hdr).set_flag(flags::HAS_SHADOW);
@@ -2711,6 +2703,60 @@ impl MiniMarkGC {
                 self.nursery.start_ptr() as usize,
                 site,
             );
+        }
+    }
+
+    /// `base.py:134-144 _get_size_for_typeid` — the payload size of `obj_addr`,
+    /// reading the length field when the type is varsize. `None` when the
+    /// length cannot describe an allocation.
+    ///
+    /// Upstream rounds the result here. Pyre's callers each apply their own
+    /// rounding (nursery geometry, arena minimum, inspector alignment), so the
+    /// rounding stays at the call sites.
+    fn try_size_for_typeid(&self, obj_addr: usize, type_id: u32) -> Option<usize> {
+        let type_info = self.types.get(type_id);
+        if type_info.item_size == 0 {
+            return Some(type_info.size);
+        }
+        let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+        type_info
+            .item_size
+            .checked_mul(length)
+            .and_then(|items| type_info.size.checked_add(items))
+            // No object can be larger than `isize::MAX` — `Layout` refuses to
+            // describe one — so a larger result is a decode failure, not a
+            // request the allocator could ever serve.
+            .filter(|&size| size <= isize::MAX as usize - GcHeader::SIZE)
+    }
+
+    /// Panicking [`Self::try_size_for_typeid`], for the collector paths that
+    /// are about to allocate or copy that many bytes.
+    ///
+    /// A varsize length is read straight out of the object, so a collector that
+    /// reaches an object before its length field is initialized computes a size
+    /// that describes nothing. Report the inputs here: downstream the allocator
+    /// sees only the product, and fails on a `Layout` it cannot even build.
+    fn size_for_typeid(&self, obj_addr: usize, type_id: u32, site: &str) -> usize {
+        match self.try_size_for_typeid(obj_addr, type_id) {
+            Some(size) => size,
+            None => {
+                let type_info = self.types.get(type_id);
+                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                panic!(
+                    "GC BUG: varsize length describes no allocation: length={} (read at \
+                     obj_addr={:#x} + length_offset={}) item_size={} fixed_size={} \
+                     type_id={} header_addr={:#x} nursery_start={:#x} site={}",
+                    length,
+                    obj_addr,
+                    type_info.length_offset,
+                    type_info.item_size,
+                    type_info.size,
+                    type_id,
+                    obj_addr - GcHeader::SIZE,
+                    self.nursery.start_ptr() as usize,
+                    site,
+                );
+            }
         }
     }
 
@@ -2794,18 +2840,11 @@ impl MiniMarkGC {
                 holder_words,
             );
         }
-        let type_info = self.types.get(type_id);
-
         // Compute the actual payload size (for varsize objects, read the length).
-        let actual_payload_size = if type_info.item_size > 0 {
-            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-            type_info.total_instance_size(length)
-        } else {
-            type_info.size
-        };
+        let actual_payload_size = self.size_for_typeid(obj_addr, type_id, site);
 
         let total_size = GcHeader::SIZE + actual_payload_size;
-        let has_gc_ptrs = type_info.has_gc_ptrs;
+        let has_gc_ptrs = self.types.get(type_id).has_gc_ptrs;
 
         // minimark.py:1513-1519: if the object has a pre-allocated
         // shadow (from id() or identityhash()), copy into it instead
@@ -3955,14 +3994,7 @@ impl MiniMarkGC {
     fn object_total_size(&self, obj_addr: usize) -> usize {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.validate_type_id(type_id, obj_addr, "object_total_size");
-        let type_info = self.types.get(type_id);
-        let payload_size = if type_info.item_size > 0 {
-            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-            type_info.total_instance_size(length)
-        } else {
-            type_info.size
-        };
-        GcHeader::SIZE + payload_size
+        GcHeader::SIZE + self.size_for_typeid(obj_addr, type_id, "object_total_size")
     }
 
     /// `base.py:135-141 get_size` / `inspector.py:76-77
@@ -3975,15 +4007,10 @@ impl MiniMarkGC {
         if type_id as usize >= self.types.len() {
             return None;
         }
-        let type_info = self.types.get(type_id);
-        if type_info.item_size == 0 {
-            return Some(type_info.size);
+        let size = self.try_size_for_typeid(obj.0, type_id)?;
+        if self.types.get(type_id).item_size == 0 {
+            return Some(size);
         }
-        let length = unsafe { *((obj.0 + type_info.length_offset) as *const usize) };
-        let size = type_info
-            .item_size
-            .checked_mul(length)?
-            .checked_add(type_info.size)?;
         let align_mask = GcHeader::ALIGN - 1;
         size.checked_add(align_mask).map(|size| size & !align_mask)
     }
@@ -4008,13 +4035,7 @@ impl MiniMarkGC {
         if type_id >= self.types.len() {
             return None;
         }
-        let type_info = self.types.get(type_id as u32);
-        let payload_size = if type_info.item_size > 0 {
-            let length = unsafe { *((addr + type_info.length_offset) as *const usize) };
-            type_info.total_instance_size(length)
-        } else {
-            type_info.size
-        };
+        let payload_size = self.try_size_for_typeid(addr, type_id as u32)?;
         Some(GcHeader::SIZE + payload_size)
     }
 
@@ -5377,13 +5398,7 @@ impl MiniMarkGC {
         let mut saved: Vec<(usize, usize, Vec<u8>)> = Vec::new();
         for &obj_addr in &self.pinned_objects {
             let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-            let type_info = self.types.get(type_id);
-            let payload_size = if type_info.item_size > 0 {
-                let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
-                type_info.total_instance_size(length)
-            } else {
-                type_info.size
-            };
+            let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_snapshot");
             let total_size = (GcHeader::SIZE + payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE);
             let total_size = (total_size + 7) & !7;
             let header_start = obj_addr - GcHeader::SIZE;
@@ -7796,6 +7811,40 @@ mod tests {
         assert!(gc.alloc_nursery(usize::MAX).is_null());
         assert!(gc.alloc_nursery_no_collect(usize::MAX).is_null());
         assert!(gc.alloc_oldgen_typed(tid, usize::MAX).is_null());
+    }
+
+    /// A varsize length is read out of the object, so a collector reaching an
+    /// object before its length is initialized computes a size that describes
+    /// nothing.  Both shapes must be rejected — in particular the second, where
+    /// the multiplication does *not* overflow and the size is merely far past
+    /// anything `Layout` can express.
+    #[test]
+    fn varsize_length_that_describes_no_allocation_is_rejected() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 0, false, Vec::new()));
+
+        // The length field lives at offset 0, so a local stands in for the
+        // object: nothing here allocates, and nothing is dereferenced beyond it.
+        let length = std::cell::Cell::new(0usize);
+        let obj_addr = length.as_ptr() as usize;
+
+        length.set(4);
+        assert_eq!(gc.try_size_for_typeid(obj_addr, tid), Some(16 + 8 * 4));
+
+        length.set(usize::MAX);
+        assert_eq!(gc.try_size_for_typeid(obj_addr, tid), None);
+
+        length.set(isize::MAX as usize / 8);
+        assert_eq!(gc.try_size_for_typeid(obj_addr, tid), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "varsize length describes no allocation")]
+    fn varsize_length_that_describes_no_allocation_names_its_inputs() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 0, false, Vec::new()));
+        let length = std::cell::Cell::new(usize::MAX);
+        gc.size_for_typeid(length.as_ptr() as usize, tid, "test");
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
