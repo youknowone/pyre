@@ -1214,6 +1214,86 @@ fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crat
     Ok(())
 }
 
+/// Set an extension module's `__spec__`/`__loader__`/`__package__`/`__file__`
+/// from the app-level `_bootstrap_external.spec_from_file_location`, matching
+/// what `ExtensionFileLoader` installs when the same file is imported through
+/// importlib. `PyModule_Create2` supplies only the name, docstring and file, so
+/// without this a natively-resolved extension carries less metadata than the
+/// source module beside it — and the dict the extension cache snapshots is the
+/// incomplete one.
+///
+/// Best-effort throughout, like `set_builtin_module_spec`: an extension
+/// imported before the bootstrap is wired keeps what `PyModule_Create2` gave
+/// it rather than failing the import.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn set_extension_module_spec(
+    name: &str,
+    pathname: &Path,
+    module: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let (Some(bootstrap), Some(ext)) = (
+        get_sys_module("importlib._bootstrap"),
+        get_sys_module("importlib._bootstrap_external"),
+    ) else {
+        return Ok(());
+    };
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    pin_root(module);
+    let boot_slot = shadow_stack_len();
+    pin_root(bootstrap);
+    let ext_slot = shadow_stack_len();
+    pin_root(ext);
+
+    let Ok(from_location) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "spec_from_file_location")
+    else {
+        return Ok(());
+    };
+    let from_location_slot = shadow_stack_len();
+    pin_root(from_location);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let w_path = crate::gateway::fsdecode_os_str(pathname.as_os_str());
+    let path_slot = shadow_stack_len();
+    pin_root(w_path);
+
+    // A suffix `_get_supported_file_loaders` does not know yields `None`; that
+    // is the same "leave it alone" answer as a missing bootstrap.
+    let Ok(spec) = crate::call::call_function_impl_result(
+        shadow_stack_get(from_location_slot),
+        &[shadow_stack_get(name_slot), shadow_stack_get(path_slot)],
+    ) else {
+        return Ok(());
+    };
+    if unsafe { pyre_object::is_none(spec) } {
+        return Ok(());
+    }
+    let spec_slot = shadow_stack_len();
+    pin_root(spec);
+
+    let Ok(init) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(boot_slot), "_init_module_attrs")
+    else {
+        return Ok(());
+    };
+    let init_slot = shadow_stack_len();
+    pin_root(init);
+    let _ = crate::call::call_function_impl_result(
+        shadow_stack_get(init_slot),
+        &[shadow_stack_get(spec_slot), shadow_stack_get(mod_slot)],
+    );
+    Ok(())
+}
+
 /// Set a source module's `__spec__`/`__loader__`/`__file__`/`__cached__` from
 /// the app-level `_bootstrap_external._fix_up_module` — the helper
 /// `PyImport_ExecCodeModuleObject` calls. Returns `false` when the importlib
@@ -3042,7 +3122,12 @@ fn load_part(
             any(target_os = "macos", target_os = "linux")
         ))]
         FindInfo::ExtensionFile { pathname } => {
-            crate::cpyext::load_extension_module(modulename, &pathname)?
+            let module = crate::cpyext::load_extension_module(modulename, &pathname)?;
+            let roots = pyre_object::gc_roots::push_roots();
+            let module_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(module);
+            set_extension_module_spec(modulename, &pathname, module)?;
+            pyre_object::gc_roots::shadow_stack_get(module_slot)
         }
         #[cfg(all(
             feature = "cpyext",
@@ -3054,16 +3139,28 @@ fn load_part(
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(module);
+            set_extension_module_spec(
+                modulename,
+                &pathname,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            )?;
             let path = crate::gateway::fsdecode_os_str(dirpath.as_os_str());
             let path_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(path);
-            let path_list =
-                pyre_object::w_list_new(vec![pyre_object::gc_roots::shadow_stack_get(path_slot)]);
+            // `__path__` is re-stamped after the spec: the loader derives it
+            // from the file name, and the directory found here is the same
+            // answer spelled without that dependency.
+            // The store below allocates, so the fresh list is pinned rather
+            // than held in a local across it.
+            let list_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(pyre_object::w_list_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(path_slot),
+            ]));
             let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
             crate::module_ns_store(
                 unsafe { pyre_object::w_module_get_w_dict(module) },
                 "__path__",
-                path_list,
+                pyre_object::gc_roots::shadow_stack_get(list_slot),
             );
             module
         }

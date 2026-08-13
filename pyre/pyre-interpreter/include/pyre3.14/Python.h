@@ -10,7 +10,11 @@ extern "C" {
 
 #define PY_MAJOR_VERSION 3
 #define PY_MINOR_VERSION 14
-#define PY_VERSION_HEX 0x030E0000
+#define PY_MICRO_VERSION 6
+/* 3.14.6 final, matching sys.hexversion. The release-level nibble is 0xF for a
+   final release, so a value ending in 0x00 would put every `#if PY_VERSION_HEX
+   >= 0x030E00F0` extension on its pre-release branch. */
+#define PY_VERSION_HEX 0x030E06F0
 #define PYTHON_API_VERSION 1013
 
 #if defined(_WIN32)

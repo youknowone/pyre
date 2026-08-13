@@ -16,9 +16,9 @@ use pyre_object::{PY_NULL, PyObjectRef};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 /// The large ownership contribution held by the linked pyre object.
 ///
@@ -89,23 +89,59 @@ struct ExtensionCacheEntry {
     _handle: usize,
 }
 
+/// A mutex whose lock word is rebuilt in the child of a `fork`, keeping the
+/// payload it guards.
+///
+/// The data-less `ForkExtensionLoadLock` below cannot serve these tables: the
+/// value lives *inside* the lock, so a fresh lock has to carry it over.  The
+/// payload is what the child must keep — `fork` copies the address space, so
+/// the loaded libraries, their static module definitions and every raw mirror
+/// are still mapped, and dropping the census would leave `ob_pyre_link` slots
+/// unvisited.  Only the lock word is stale, because the thread that held it
+/// does not exist in the child.
+///
+/// `ptr::read` moves the payload out without acquiring, and `ptr::write` does
+/// not drop the abandoned lock — the same reason the data-less wrappers write
+/// over theirs rather than replacing them by assignment.
+struct ForkMutex<T>(UnsafeCell<parking_lot::Mutex<T>>);
+unsafe impl<T: Send> Sync for ForkMutex<T> {}
+
+impl<T> ForkMutex<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(parking_lot::Mutex::new(value)))
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, T> {
+        unsafe { &*self.0.get() }.lock()
+    }
+
+    unsafe fn reinit_after_fork(&self) {
+        let value = unsafe { (*self.0.get()).data_ptr().read() };
+        unsafe { self.0.get().write(parking_lot::Mutex::new(value)) };
+    }
+}
+
+/// Keyed by path, so the hasher is never fed attacker-chosen keys; the default
+/// one is spelled out only because it is the const-constructible form.
+type ExtensionCache =
+    HashMap<PathBuf, ExtensionCacheEntry, BuildHasherDefault<std::hash::DefaultHasher>>;
+
 /// PyPy `State.extensions`: the upstream owner is a process/interpreter state
 /// dictionary, so a `HashMap` is intentional here rather than a side-table
 /// workaround.  The values are copied module dictionaries, not per-object
 /// optimization metadata.
-static EXTENSIONS: LazyLock<Mutex<HashMap<PathBuf, ExtensionCacheEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static EXTENSIONS: ForkMutex<ExtensionCache> =
+    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// PyPy/rawrefcount's P-list analogue.  The relationship itself lives on the
 /// raw object (`ob_pyre_link`); this Vec is only the collector's census of
 /// mirrors whose inline link must be visited.
-static RAW_OBJECTS: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static RAW_OBJECTS: ForkMutex<Vec<usize>> = ForkMutex::new(Vec::new());
 static CPYEXT_GC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// `State.package_context`, consumed by `PyModule_Create2` while `PyInit_*`
 /// runs. Imports are serialized by the import lock, as in PyPy.
-static PACKAGE_CONTEXT: LazyLock<Mutex<Option<(String, PathBuf)>>> =
-    LazyLock::new(|| Mutex::new(None));
+static PACKAGE_CONTEXT: ForkMutex<Option<(String, PathBuf)>> = ForkMutex::new(None);
 
 /// PyPy performs cpyext initialization under the GIL. Pyre currently has no
 /// process GIL, so this reentrant boundary preserves the same serialization
@@ -181,7 +217,17 @@ fn extension_load_lock() -> ExtensionLoadGuard {
 
 pub fn after_fork_child() {
     unsafe { EXTENSION_LOAD_LOCK.reinit_after_fork() };
-    *PACKAGE_CONTEXT.lock().unwrap() = None;
+    // Every one of these can be held by a thread the child does not have, so
+    // the lock word is replaced before anything acquires it — an import or a
+    // collection in the child would otherwise block forever.
+    unsafe {
+        EXTENSIONS.reinit_after_fork();
+        RAW_OBJECTS.reinit_after_fork();
+        PACKAGE_CONTEXT.reinit_after_fork();
+    }
+    // `PyInit_*` cannot have been mid-flight in the child, and the parent's
+    // half-finished import must not name the next module created here.
+    *PACKAGE_CONTEXT.lock() = None;
 }
 
 pub const fn soabi() -> &'static str {
@@ -215,7 +261,7 @@ fn attach_module(module: PyObjectRef) -> *mut CPyObject {
         ob_pyre_link: module,
         ob_type: (&raw mut CPY_MODULE_TYPE),
     }));
-    RAW_OBJECTS.lock().unwrap().push(raw as usize);
+    RAW_OBJECTS.lock().push(raw as usize);
     CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
     raw
 }
@@ -228,10 +274,7 @@ unsafe fn detach_unowned_module_mirror(raw: *mut CPyObject) {
         return;
     }
     let address = raw as usize;
-    RAW_OBJECTS
-        .lock()
-        .unwrap()
-        .retain(|&candidate| candidate != address);
+    RAW_OBJECTS.lock().retain(|&candidate| candidate != address);
     unsafe {
         (*raw).ob_pyre_link = PY_NULL;
         (*raw).ob_refcnt -= REFCNT_FROM_PYRE;
@@ -248,7 +291,7 @@ pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if !CPYEXT_GC_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    for &address in RAW_OBJECTS.lock().unwrap().iter() {
+    for &address in RAW_OBJECTS.lock().iter() {
         let raw = address as *mut CPyObject;
         unsafe {
             if (*raw).ob_refcnt > REFCNT_FROM_PYRE && !(*raw).ob_pyre_link.is_null() {
@@ -256,7 +299,7 @@ pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
             }
         }
     }
-    for entry in EXTENSIONS.lock().unwrap().values_mut() {
+    for entry in EXTENSIONS.lock().values_mut() {
         let mut dict = entry.dict as PyObjectRef;
         if !dict.is_null() {
             visitor(&mut dict);
@@ -285,7 +328,7 @@ fn module_from_cached_dict(name: &str, dict: PyObjectRef) -> PyObjectRef {
 fn cached_extension(name: &str, path: &Path) -> Option<PyObjectRef> {
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = {
-        let cache = EXTENSIONS.lock().unwrap();
+        let cache = EXTENSIONS.lock();
         let dict = cache.get(path)?.dict as PyObjectRef;
         let slot = pyre_object::gc_roots::shadow_stack_len();
         roots.pin_root(dict);
@@ -298,11 +341,7 @@ fn cached_extension(name: &str, path: &Path) -> Option<PyObjectRef> {
 }
 
 fn cached_extension_handle(path: &Path) -> Option<usize> {
-    EXTENSIONS
-        .lock()
-        .unwrap()
-        .get(path)
-        .map(|entry| entry._handle)
+    EXTENSIONS.lock().get(path).map(|entry| entry._handle)
 }
 
 fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) {
@@ -313,7 +352,7 @@ fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) 
     let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
     let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let dict_copy = unsafe { pyre_object::dictmultiobject::w_dict_copy(dict) };
-    EXTENSIONS.lock().unwrap().insert(
+    EXTENSIONS.lock().insert(
         path.to_path_buf(),
         ExtensionCacheEntry {
             dict: dict_copy as usize,
@@ -415,11 +454,10 @@ pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, cra
 
     let old_context = PACKAGE_CONTEXT
         .lock()
-        .unwrap()
         .replace((name.to_string(), path.to_path_buf()));
     let init: unsafe extern "C" fn() -> *mut CPyObject = unsafe { std::mem::transmute(address) };
     let result = unsafe { init() };
-    *PACKAGE_CONTEXT.lock().unwrap() = old_context;
+    *PACKAGE_CONTEXT.lock() = old_context;
 
     if result.is_null() {
         rustpython_host_env::ctypes::drop_library(handle);
@@ -515,9 +553,12 @@ pub unsafe extern "C" fn PyModule_Create2(
     if unsafe { !(*def).m_methods.is_null() && !(*(*def).m_methods).ml_name.is_null() } {
         return std::ptr::null_mut();
     }
+    // `m_size == 0` is a stateless single-phase module, `-1` keeps its state in
+    // C globals: neither needs `md_state`, so both are in this slice.  A
+    // positive size asks for per-module storage, which is not built yet.
     if unsafe {
         !(*def).m_slots.is_null()
-            || (*def).m_size != -1
+            || !matches!((*def).m_size, -1 | 0)
             || !(*def).m_traverse.is_null()
             || !(*def).m_clear.is_null()
             || !(*def).m_free.is_null()
@@ -528,7 +569,7 @@ pub unsafe extern "C" fn PyModule_Create2(
     let declared_name = unsafe { CStr::from_ptr((*def).m_name) }.to_string_lossy();
     // PyPy `PyModule_Create2` consumes package_context before allocating the
     // module. Releasing the mutex here also avoids holding it across GC.
-    let context = PACKAGE_CONTEXT.lock().unwrap().take();
+    let context = PACKAGE_CONTEXT.lock().take();
     let (name, path) = context
         .as_ref()
         .map(|(name, path)| (name.as_str(), Some(path.as_path())))

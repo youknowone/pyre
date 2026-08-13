@@ -1180,6 +1180,13 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
         any(target_os = "macos", target_os = "linux")
     ))]
     {
+        // The cast reinterprets a mirror's link slot as a GC reference in
+        // place, so the two spellings of a machine word have to stay
+        // interchangeable for the forwarding write to land on the slot.
+        const _: () = assert!(
+            std::mem::size_of::<PyObjectRef>() == std::mem::size_of::<majit_ir::GcRef>()
+                && std::mem::align_of::<PyObjectRef>() == std::mem::align_of::<majit_ir::GcRef>()
+        );
         let mut forward = |slot: &mut PyObjectRef| {
             visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
         };
