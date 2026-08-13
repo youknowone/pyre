@@ -73,7 +73,7 @@ use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::Variable;
 use crate::model::{
-    CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -2344,9 +2344,12 @@ fn forwards_to_returnblock(
             if !b.operations.is_empty() {
                 return Err(format!(
                     "forwarding block {current} carries {} operation(s), \
-                     first {:?}",
+                     first {:?}, {} exit(s), exitswitch {}, {} predecessor(s)",
                     b.operations.len(),
                     truncated_kind(&b.operations[0].kind),
+                    b.exits.len(),
+                    b.exitswitch.is_some(),
+                    graph.predecessors(BlockId(current)).len(),
                 ));
             }
             if b.exitswitch.is_some() {
