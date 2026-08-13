@@ -7081,15 +7081,18 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     };
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
-    // `LIST_APPEND` is the inlined-comprehension accumulator.  PyPy traces
-    // call-bearing comprehension bodies normally: the CALL either inlines or
-    // is recorded as a residual, and an aborted authoritative walk resumes
-    // from its MIFrame state rather than discarding the whole frame.  Pyre's
-    // matching machinery is the mid-body forward-resume plus the in-flight
-    // FOR_ITER continuation below (`try_commit_midbody_abort` /
-    // `fbw_foriter_inflight_*`).  Keeping the old call-free restriction after
-    // those paths landed made `[C(i) for i in range(n)]` run wholly in the
-    // interpreter, unlike mapdict.py's ordinary traced construction loop.
+    // A `LIST_APPEND` (inlined-comprehension accumulator) body is
+    // admitted only when the body performs no CALL. A compiled loop's
+    // live-at-exit values stay reachable from the exit state until the
+    // next JIT activity overwrites it, so the loop variable keeps its
+    // final binding past the `STORE_FAST` that restores the isolated
+    // comprehension slot to unbound. A call-free body binds values the
+    // enclosing frame holds anyway; a per-element call binds a freshly
+    // constructed object, and `extra_tests/parity_tests/
+    // weakref_gc_lifeline.py` then sees the last element survive the
+    // collection that should have run its weakref callback. Decline
+    // call-bearing bodies to interpretation until the exit state stops
+    // rooting what it no longer resumes.
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
@@ -7108,6 +7111,36 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // speculative-replay sub-walk, so the block is bound at every
     // guard-exit deopt and the shape compiles bit-exact on all backends
     // (`bench/synth/nested_list_comprehension_hot.py`).
+    let body_has_call = {
+        let mut scan_state = pyre_interpreter::OpArgState::default();
+        let mut scan_pc = pc + 1;
+        let mut has_call = false;
+        while scan_pc < exit && scan_pc < instructions.len() {
+            let (scan_instr, scan_arg) = scan_state.get(instructions[scan_pc]);
+            if let I::ForIter { delta } = scan_instr {
+                // A nested loop owns its body.  It is validated when
+                // the outer instruction walk reaches that FOR_ITER;
+                // calls inside it must not taint a LIST_APPEND owned by
+                // this lexical loop (and vice versa).
+                scan_pc = pyre_interpreter::jump_target_forward(
+                    instructions,
+                    scan_pc + 1,
+                    delta.get(scan_arg).as_usize(),
+                );
+                scan_state = pyre_interpreter::OpArgState::default();
+                continue;
+            }
+            if matches!(
+                scan_instr,
+                I::Call { .. } | I::CallKw { .. } | I::CallFunctionEx | I::CallIntrinsic1 { .. }
+            ) {
+                has_call = true;
+                break;
+            }
+            scan_pc += 1;
+        }
+        has_call
+    };
     let mut body_state = pyre_interpreter::OpArgState::default();
     let mut body_pc = pc + 1;
     while body_pc < exit && body_pc < instructions.len() {
@@ -7142,7 +7175,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                             | I::SetAdd { .. }
                             | I::MapAdd { .. }
             )
-            || matches!(body_instr, I::ListAppend { .. });
+            || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
         if !permitted {
             if for_iter_gate_diag_enabled() {
                 eprintln!(
@@ -12895,10 +12928,11 @@ mod tests {
     }
 
     #[test]
-    fn for_iter_call_bearing_list_append_comprehension_is_jit_safe() {
-        // PyPy traces calls in comprehension bodies.  Pyre's authoritative
-        // walk now preserves the consumed FOR_ITER item and resumes forward
-        // from the call boundary if that walk aborts.
+    fn for_iter_call_bearing_list_append_comprehension_is_unsafe_for_entry_trace() {
+        // A per-element CALL binds a freshly constructed object to the
+        // comprehension's isolated slot, and the compiled loop's exit state
+        // keeps that last binding reachable, so a call-bearing LIST_APPEND
+        // body stays interpreter-only.
         use pyre_interpreter::compile_exec;
         for source in [
             "def f(n):\n    return [str(i) for i in range(n)]\n",
@@ -12906,7 +12940,7 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(for_iter_bodies_all_jit_safe(&code));
+            assert!(!for_iter_bodies_all_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -12965,14 +12999,14 @@ mod tests {
     }
 
     #[test]
-    fn later_call_bearing_comprehension_does_not_blacklist_an_earlier_loop() {
+    fn unsafe_later_comprehension_does_not_blacklist_an_earlier_loop() {
         use pyre_interpreter::{Instruction as I, compile_exec};
         let module = compile_exec(
             "def run(n):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    return [len(item) for item in escaped]\n",
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "run");
-        assert!(for_iter_bodies_all_jit_safe(&code));
+        assert!(!for_iter_bodies_all_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
 
         let mut outer_header = usize::MAX;
@@ -13003,7 +13037,7 @@ mod tests {
             &code,
             outer_header
         ));
-        assert!(for_iter_body_is_jit_safe_at(
+        assert!(!for_iter_body_is_jit_safe_at(
             &code,
             final_for_iter.expect("fixture must contain the final comprehension")
         ));
@@ -13085,9 +13119,7 @@ mod tests {
         let direct_end = direct_end.expect("fixture must contain the outer backedge");
         let region_end = loop_region_end(&code, outer_header).expect("loop must have a region");
         assert!(region_end > direct_end);
-        // The handler remains part of the outer region, but its call-bearing
-        // LIST_APPEND comprehension is now a supported PyPy-style trace body.
-        assert!(loop_region_for_iter_bodies_all_jit_safe(
+        assert!(!loop_region_for_iter_bodies_all_jit_safe(
             &code,
             outer_header
         ));
