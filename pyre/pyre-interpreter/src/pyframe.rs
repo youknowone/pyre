@@ -922,7 +922,9 @@ impl FrameBox {
         qualname: Option<PyObjectRef>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
-        let register_final = code_yields_inside_try(self.code());
+        let register_final = unsafe {
+            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
+        };
         let is_coroutine = self.code().flags.contains(crate::CodeFlags::COROUTINE);
         let _origin_roots = pyre_object::gc_roots::push_roots();
         let name_slot = name.map(|name| {
@@ -1012,44 +1014,12 @@ impl FrameBox {
         }
         // generator.py:24-27: every Coroutine needs its `_finalize_` hook for
         // the never-awaited warning. Ordinary generators only need one when
-        // collection must unwind a suspended `finally`/`with` body. Upstream
-        // uses `CO_YIELD_INSIDE_TRY` for that second arm. RustPython's
-        // compiler does not expose the flag, so `register_final` reconstructs
-        // exactly that question from its Python 3.14 exception table.
+        // collection must unwind a suspended `finally`/`with` body.
         if is_coroutine || register_final {
             crate::executioncontext::register_finalizer(generator);
         }
         Ok(generator)
     }
-}
-
-/// PyPy `astcompiler/codegen.py:2825-2826` / `generator.py:24-27`:
-/// reconstruct `CO_YIELD_INSIDE_TRY` for RustPython code objects.
-///
-/// Python 3.14 wraps every generator body in a depth-zero, `lasti` exception
-/// entry which only converts an escaping `StopIteration`; that synthetic
-/// entry must not make every generator finalizable. Entries emitted for an
-/// actual `try` around a yield either omit `lasti` at depth zero (`try`) or
-/// carry a non-zero unwind depth (`with`). `lookup_exceptiontable` selects the
-/// innermost entry, matching the compiler's `has_yield_inside_try` question.
-fn code_yields_inside_try(code: &CodeObject) -> bool {
-    let mut index = 0;
-    while index < code.instructions.len() {
-        if matches!(
-            code.instructions[index].op,
-            crate::bytecode::Instruction::YieldValue { .. }
-        ) {
-            let offset = (index * 2) as u32;
-            if let Some((_target, depth, lasti)) =
-                crate::pycode::lookup_exceptiontable(&code.exceptiontable, offset)
-                && (depth != 0 || !lasti)
-            {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
 }
 
 /// Capture `coroutine.cr_origin` from the visible caller chain.
@@ -4859,7 +4829,8 @@ mod tests {
                 _ => None,
             })
             .expect("nested function code");
-        super::code_yields_inside_try(code)
+        let w_code = crate::pycode::box_code_constant(code);
+        unsafe { crate::pycode::w_code_yields_inside_try(w_code) }
     }
 
     #[test]

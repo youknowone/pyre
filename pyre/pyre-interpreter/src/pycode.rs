@@ -9,6 +9,8 @@ use pyre_object::{
     w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
 };
 
+const YIELDS_INSIDE_TRY_BIT: u16 = 0x8000;
+
 /// Compatibility marker for malformed bytecode.
 #[derive(Debug, Clone)]
 pub struct BytecodeCorruption;
@@ -91,6 +93,36 @@ pub fn lookup_exceptiontable(table: &[u8], instr_offset: u32) -> Option<(u32, u3
         }
     }
     best
+}
+
+/// PyPy `astcompiler/codegen.py:2825-2826` / `generator.py:24-27`:
+/// compute the `CO_YIELD_INSIDE_TRY` property once while constructing the
+/// interpreter-level code object.
+///
+/// Python 3.14 wraps every generator body in a depth-zero, `lasti` exception
+/// entry which only converts an escaping `StopIteration`; that synthetic
+/// entry must not make every generator finalizable. Entries emitted for an
+/// actual `try` around a yield either omit `lasti` at depth zero (`try`) or
+/// carry a non-zero unwind depth (`with`). `lookup_exceptiontable` selects the
+/// innermost entry, matching the compiler's `has_yield_inside_try` question.
+fn code_yields_inside_try(code: &crate::CodeObject) -> bool {
+    let mut index = 0;
+    while index < code.instructions.len() {
+        if matches!(
+            code.instructions[index].op,
+            crate::bytecode::Instruction::YieldValue { .. }
+        ) {
+            let offset = (index * 2) as u32;
+            if let Some((_target, depth, lasti)) =
+                lookup_exceptiontable(&code.exceptiontable, offset)
+                && (depth != 0 || !lasti)
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// Iterator over all decoded entries in `table`.
@@ -193,6 +225,8 @@ pub struct PyCode {
     /// - 0-4: impossible (builtins only)
     /// - FLATPYCALL | co_argcount: simple user function
     /// - HOPELESS: has *args/**kwargs/kwonly/too many params
+    /// The unused high bit caches `CO_YIELD_INSIDE_TRY`; accessors mask it
+    /// away from the arity value.
     pub fast_natural_arity: u16,
     /// Cached [`crate::pyframe::npure_cellvars`] — the count of cellvars that
     /// are not also varnames.  Code-invariant, so computed once here instead
@@ -547,11 +581,16 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // by every field initializer below.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     let code_ptr_aligned = !code_ptr.is_null() && (code_ptr as i64) & align_mask == 0;
-    let fast_natural_arity = if !code_ptr_aligned {
+    let mut fast_natural_arity = if !code_ptr_aligned {
         crate::gateway::HOPELESS
     } else {
         compute_flatcall(unsafe { &*(code_ptr as *const crate::CodeObject) })
     };
+    if code_ptr_aligned
+        && code_yields_inside_try(unsafe { &*(code_ptr as *const crate::CodeObject) })
+    {
+        fast_natural_arity |= YIELDS_INSIDE_TRY_BIT;
+    }
     // `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
     let globals_caches = if !code_ptr_aligned {
         std::ptr::null_mut()
@@ -646,6 +685,16 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
 /// via `Box::into_raw`.
 pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
     w_code_new_with_hidden_applevel(code_ptr, false)
+}
+
+/// `generator.py:24-27` — read the code object's cached
+/// `CO_YIELD_INSIDE_TRY` equivalent.
+///
+/// # Safety
+/// `w_code` must point to a valid `PyCode`.
+#[inline]
+pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
+    unsafe { (*(w_code as *const PyCode)).fast_natural_arity & YIELDS_INSIDE_TRY_BIT != 0 }
 }
 
 /// Box a cloned compiler code object into a heap Python code wrapper.
@@ -2186,7 +2235,7 @@ pub unsafe fn w_code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     if obj.is_null() {
         return crate::gateway::HOPELESS;
     }
-    unsafe { (*(obj as *const PyCode)).fast_natural_arity }
+    unsafe { (*(obj as *const PyCode)).fast_natural_arity & !YIELDS_INSIDE_TRY_BIT }
 }
 
 /// Unified accessor: read `fast_natural_arity` from any code object
