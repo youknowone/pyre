@@ -2963,32 +2963,21 @@ pub fn fuse_boxing_alloc(
     // (read out of the `NewWithVtable` size descriptor), so it must travel with
     // the op rather than being dropped.  Returns `0` when the cluster carries no
     // resolvable constant type-pointer (e.g. a synthetic test fixture).
+    //
+    // `jtransform.py:1023 rewrite_op_malloc` gets the vtable from malloc's
+    // `STRUCT`. `malloc_typed(value)` instead recovers it from
+    // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
+    // a subclass there.
     fn store_value(graph: &FunctionGraph, base: &Variable, field_name: &str) -> Option<Variable> {
         let (_, value) = unique_store(graph, base, field_name)?;
         value.as_variable().cloned()
     }
-    /// The one value `base.field_name` holds, or `None` when the graph carries
-    /// no such store or two that disagree.
-    ///
-    /// The scan has to be graph-wide: the stores feeding an aggregate sit in
-    /// whichever block built it, which is not the block that consumes it once
-    /// a call has ended one in between.  That width is also why agreement has
-    /// to be checked.  The pass has no reaching-definition analysis to ask
-    /// which store arrives at the consumer, so with two stores on the same
-    /// field it cannot tell which one the malloc sees — `let mut o = W_X { f:
-    /// a }; if c { o.f = b; }` writes `f` twice, and their order in the block
-    /// list carries no meaning.  Answering with the first would initialise the
-    /// allocation from an arbitrary arm; declining instead leaves
-    /// `malloc_typed` residual for the fail-closed reject, the same graceful
-    /// outcome an absent store takes.
-    ///
-    /// Refusing on ambiguity rather than picking is the rule
-    /// `rpython/translator/backendopt/malloc.py:176-186` applies to the same
-    /// question: a variable reaching a link with more than one creation point
-    /// (`len(info.creationpoints) > 1`) is downgraded to a plain use, which
-    /// disables the malloc optimisation for it — "aliasing problems".  Its
-    /// `_try_inline_malloc` states the precondition positively: the values
-    /// must be only ever created by one `malloc`.
+    /// The unique graph-wide store to `base.field_name`, or `None` if absent
+    /// or conflicting. Without reaching-definition analysis, choosing among
+    /// disagreeing stores would depend on block order, so the pass declines.
+    /// This matches `rpython/translator/backendopt/malloc.py:176-186`, which
+    /// disables malloc optimization for multiple creation points ("aliasing
+    /// problems").
     fn unique_store<'g>(
         graph: &'g FunctionGraph,
         base: &Variable,
@@ -3016,17 +3005,12 @@ pub fn fuse_boxing_alloc(
         }
         found
     }
-    /// The op-result variables `var` can be, following the links when `var` is
-    /// a `Block.inputargs` phi rather than an op result.
-    ///
-    /// A field store is recorded against the variable the producing operation
-    /// wrote, so a header value that crosses a block boundary — each preceding
-    /// call ends a block — leaves its `ob_type` / `w_class` stores behind on
-    /// the predecessor's variable, and a bare `base == var` lookup on the phi
-    /// finds nothing. Collecting the roots first puts the lookup back on the
-    /// variable the stores actually name. Every root is then required to agree,
-    /// exactly as `resolve_addr` requires of a merged pointer. `depth` bounds
-    /// the walk so a loop-carried phi whose own link arg is itself terminates.
+    /// Resolve `var` to producer variables through `Block.inputargs` phis.
+    /// Stores name producers rather than phis, and every incoming root must
+    /// later agree. `depth` terminates loop-carried phis. Upstream records the
+    /// same relation by unioning link args with inputargs in
+    /// `rpython/translator/backendopt/malloc.py:169`; this local pass recovers
+    /// those endpoints on demand.
     fn store_roots(
         graph: &FunctionGraph,
         var: &Variable,
@@ -3281,10 +3265,8 @@ pub fn fuse_boxing_alloc(
             };
             // Resolve every payload field's store: `FieldWrite { base: %agg,
             // field.name == payload }`.  A malformed cluster missing any payload
-            // store is left untouched so the annotate wall still flags it rather
-            // than emitting a half-initialised allocation, and so is one whose
-            // field is written twice over — `unique_store` cannot say which
-            // write the malloc sees.
+            // store is left untouched so the annotate wall still flags it.
+            // Conflicting stores also decline: no reaching write is known.
             let mut payloads = Vec::with_capacity(fields.len());
             let mut complete = true;
             for (field_name, payload_ty) in &fields {
@@ -7704,17 +7686,9 @@ mod tests {
 
     #[test]
     fn fuse_boxing_alloc_declines_a_field_written_twice_over() {
-        // Resolving `%agg` and `%header` through their phis widened the pass
-        // to clusters built in a dominator, and a value that lives across a
-        // branch can be *rewritten* on one arm: `let mut o = W_X { f: a };
-        // if c { o.f = b; }` leaves two `FieldWrite`s naming the same base and
-        // field.  Both lookups scan the whole graph, so with no
-        // reaching-definition analysis neither can say which store the malloc
-        // sees; taking the first would initialise the allocation from an
-        // arbitrary arm.  Disagreeing stores must decline, on the payload and
-        // on the header alike.  Two stores that agree carry no ambiguity to
-        // resolve, so those still fuse -- that row is what separates
-        // "declines on a second store" from "declines on a *conflicting* one".
+        // A cluster built before a branch may be rewritten on one arm. Without
+        // reaching definitions, conflicting payload or header stores must
+        // decline; redundant stores of the same value may still fuse.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
@@ -7809,9 +7783,7 @@ mod tests {
                 false,
             );
 
-            // The branch the rewrite sits on.  Both arms carry the aggregate
-            // to the join, so the malloc sees a phi over one ctor -- the shape
-            // `store_roots` resolves.
+            // Both arms carry one aggregate to the join through a phi.
             let cond = call(
                 &mut graph,
                 entry,
@@ -7861,8 +7833,7 @@ mod tests {
             graph.push_op_var(blk, field(agg, "floatval", "W_FloatObject", &other), false);
         };
         let payload_same = |graph: &mut FunctionGraph, blk: BlockId, agg: &Var, _: &Var| {
-            // The very value the dominator already stored.  `LinkArg` equality
-            // makes this store redundant rather than ambiguous.
+            // Repeating the same `LinkArg` is redundant, not ambiguous.
             let same = graph
                 .blocks
                 .iter()
@@ -7929,18 +7900,9 @@ mod tests {
 
     #[test]
     fn fuse_boxing_alloc_resolves_a_header_that_crosses_a_link() {
-        // Here the *header itself* crosses the boundary, not just the two
-        // values it stores.  That is the shape every constructor with a
-        // preceding call leaves behind — the `PyObject` ctor and its
-        // `ob_type` / `w_class` stores stay in the predecessor while the
-        // header arrives at the `malloc_typed` as a `Block.inputargs` phi.  A
-        // field store is recorded against the variable the producing
-        // operation wrote, so asking the phi for `ob_type` finds nothing and
-        // the cluster declines however constant its type pointer is; the
-        // lookup has to resolve the phi back to its roots first.  Roots
-        // reached through a merge must agree, for the reason `resolve_addr`
-        // requires it of a merged pointer: no single vtable stands for a
-        // header that is one of two types.
+        // The header reaches malloc as a phi while its stores remain on the
+        // producer variable. Resolve that producer first, and require all
+        // merged roots to name one vtable.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
