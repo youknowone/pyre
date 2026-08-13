@@ -213,22 +213,38 @@ def traceback_verdict(lines: list[str], header: int) -> str:
 
     A block runs from the `FAIL:`/`ERROR:` header to the `====` rule opening
     the next one (or unittest's closing `Ran N tests`). Every frame inside a
-    traceback is indented, so the first unindented line after the `Traceback`
-    banner is the statement it ended on. An assertion failure continues with a
-    multi-line diff below that line; only the line itself is taken.
+    traceback is indented, so the exception is the first unindented line after
+    the `Traceback` banner. The banner is what arms the search rather than the
+    exception simply being the block's last unindented line, because an
+    assertion failure prints its diff below the `AssertionError` and those
+    lines are unindented too.
+
+    A chained exception prints one traceback per link, joined by `The above
+    exception ...` / `During handling ...`. The last link is the one the test
+    actually failed with, so each banner overwrites the previous answer.
     """
+    verdict = "(no traceback)"
+    armed = False
     for line in lines[header + 1:]:
         stripped = line.strip()
         if stripped.startswith("====") or stripped.startswith("Ran "):
             break
+        if stripped.startswith("Traceback ("):
+            armed = True
+            continue
         # Continuation lines of a traceback are indented, its separator rules
         # are punctuation, and blank lines end nothing.
         if not stripped or line[:1].isspace() or set(stripped) <= {"-", "="}:
             continue
-        if stripped.startswith(("Traceback (", "File ")):
+        if stripped.startswith("File "):
             continue
-        return stripped[:160]
-    return "(no traceback)"
+        if armed:
+            verdict = stripped[:160]
+            armed = False
+        elif verdict == "(no traceback)":
+            # No banner opened this block — a bare `SkipTest` reason, say.
+            verdict = stripped[:160]
+    return verdict
 
 
 def failure_digest(out: str, err: str) -> str:
