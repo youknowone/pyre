@@ -2368,6 +2368,9 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&entry.op, visitor);
+            if let Some(source_op) = entry.source_op.as_ref() {
+                visit_op(source_op, visitor);
+            }
             entry.res.walk_const_ptr_refs(visitor);
             if let Some(source) = entry.same_as_source.as_ref() {
                 source.walk_const_ptr_refs(visitor);
@@ -2379,6 +2382,7 @@ impl ExportedState {
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             visit_op(&produced.preamble_op, visitor);
+            visit_op(&produced.source_op, visitor);
             produced.res.walk_const_ptr_refs(visitor);
             if let Some(source) = produced.same_as_source.as_ref() {
                 source.walk_const_ptr_refs(visitor);
@@ -2483,6 +2487,9 @@ impl ExportedState {
 
         for preamble_op in &self.exported_short_boxes {
             visit_op(&preamble_op.op, &mut visit);
+            if let Some(source_op) = preamble_op.source_op.as_ref() {
+                visit_op(source_op, &mut visit);
+            }
             visit(preamble_op.res.to_opref());
             if let Some(source) = preamble_op.same_as_source.as_ref() {
                 visit(source.to_opref());
@@ -2872,19 +2879,30 @@ impl OptUnroll {
             &indexmap::IndexMap<majit_ir::operand::Operand, crate::optimizeopt::intutils::IntBound>,
         >,
     ) -> ExportedState {
-        // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
-        let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
-            original_label_args
-                .iter()
-                .map(|&a| ctx.get_replacement_opref(a))
-                .collect()
-        });
+        let preview_short_state = ctx.exported_short_args_state.clone();
+        // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...].
+        // The preview path carried the exact Box objects used for this single
+        // evaluation; their OpRefs are only the positional view of those boxes.
+        let end_args: Vec<OpRef> = preview_short_state.as_ref().map_or_else(
+            || {
+                ctx.preamble_end_args.clone().unwrap_or_else(|| {
+                    original_label_args
+                        .iter()
+                        .map(|&a| ctx.get_replacement_opref(a))
+                        .collect()
+                })
+            },
+            |(_, _, _, _, end_arg_boxes)| end_arg_boxes.iter().map(Operand::to_opref).collect(),
+        );
         // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`
         // — VS captured AFTER `force_box_for_end_of_preamble` and AFTER
         // `flush()`. The caller (`Optimizer::optimize_with_constants_and_inputs_at`)
         // already ran both passes before invoking us, so `end_args` is in
         // the same post-force, post-flush state RPython feeds in.
-        let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
+        let virtual_state = preview_short_state.as_ref().map_or_else(
+            || crate::optimizeopt::virtualstate::export_state(&end_args, ctx),
+            |(virtual_state, _, _, _, _)| virtual_state.clone(),
+        );
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
         let mut infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo> =
             indexmap::IndexMap::new();
@@ -2895,27 +2913,38 @@ impl OptUnroll {
         // it once keeps a single canonical Const cell per arg (Operand::Const
         // compares by cell identity, so re-resolving is tolerable but one cell
         // mirrors RPython's single Const box object).
-        let end_arg_boxes: Vec<Operand> = end_args
-            .iter()
-            .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
-                Some(o) => o,
-                // The None arm fires only for an unregistered ResOp position
-                // (Const / InputArg always resolve); #157 drained those fires
-                // to zero. materialize_operand_at mints+registers a canonical
-                // synthetic so this key is identity-stable and a later resolve
-                // hits the same host — preserving the exported_infos /
-                // next_iteration_args identity carry.
-                None => ctx.materialize_operand_at(a),
-            })
-            .collect();
+        let end_arg_boxes: Vec<Operand> = preview_short_state.as_ref().map_or_else(
+            || {
+                end_args
+                    .iter()
+                    .map(|&a| match ctx.get_box_replacement_operand_opt(a) {
+                        Some(o) => o,
+                        // The None arm fires only for an unregistered ResOp
+                        // position (Const / InputArg always resolve); #157
+                        // drained those fires to zero. Materializing once keeps
+                        // the export/import key identity-stable.
+                        None => ctx.materialize_operand_at(a),
+                    })
+                    .collect()
+            },
+            |(_, _, _, _, end_arg_boxes)| end_arg_boxes.clone(),
+        );
         for (arg, arg_box) in end_args.iter().zip(end_arg_boxes.iter()) {
             self.expand_info(*arg, arg_box, ctx, exported_int_bounds, &mut infos);
         }
         // unroll.py:462-463 `label_args, virtuals =
         //   virtual_state.make_inputargs_and_virtuals(end_args, self.optimizer)`.
-        let (label_args, virtuals, label_source_positions) = virtual_state
-            .make_inputargs_and_virtuals_with_source_positions(&end_args, optimizer, ctx, false)
-            .expect("export_state make_inputargs_and_virtuals failed");
+        let (label_args, virtuals, label_source_positions) =
+            if let Some((_, label_args, virtuals, label_source_positions, _)) = preview_short_state
+            {
+                (label_args, virtuals, label_source_positions)
+            } else {
+                virtual_state
+                    .make_inputargs_and_virtuals_with_source_positions(
+                        &end_args, optimizer, ctx, false,
+                    )
+                    .expect("export_state make_inputargs_and_virtuals failed")
+            };
         if crate::callee_rca_enabled() {
             eprintln!(
                 "[callee-rca][export-state] original_label_args={:?} end_args={:?} \
@@ -4153,16 +4182,19 @@ impl OptUnroll {
             let b_source = ctx
                 .get_box_replacement_operand_opt(source)
                 .expect("import_state source must have a materialized operand slot");
-            // `target` is a Phase-1 next-iteration ref whose producer may not
-            // be carried into this rebuilt context; materialize its canonical
-            // host instead of fabricating a position-only box (`make_equal_to`
-            // would re-materialize the unbound target internally anyway —
-            // resolve-or-materialize here keeps the chain target canonical
-            // from the start).
-            let b_target = match ctx.get_box_replacement_operand_opt(target) {
-                Some(o) => o,
-                None => ctx.materialize_operand_at(target),
-            };
+            // `target` is the literal Phase-1 Box carried by ExportedState.
+            // Forward to that exact Operand, not to a Phase-2 box recovered
+            // from its numeric position: unroll.py:497 writes
+            // `source.set_forwarded(target)`, preserving box identity across
+            // the phase boundary. Re-materializing by OpRef collapses the
+            // source/replay namespaces when their raw positions coincide.
+            // The carried Box arrives as a private `Rc` that
+            // `find_producer_op` cannot reach, so register it as the host for
+            // its position first: otherwise every chain forwarded here ends on
+            // a producerless position and guard resume numbering has no
+            // producer to bind.
+            let b_target = carried.clone();
+            ctx.register_carried_host(&b_target);
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
@@ -4495,7 +4527,8 @@ impl OptUnroll {
         >,
         ctx: &mut OptContext,
     ) {
-        ctx.setinfo_from_preamble_item(opref, info, exported_infos);
+        let op = ctx.materialize_operand_at(opref);
+        ctx.setinfo_from_preamble_item(&op, info, exported_infos);
     }
 }
 
@@ -6108,6 +6141,7 @@ mod tests {
             exported_infos,
             vec![PreambleOp {
                 op: std::rc::Rc::new(Op::new(OpCode::SameAsR, &[Operand::from_opref(old_ref)])),
+                source_op: None,
                 res: Operand::bound_from_opref(old_ref),
                 kind: PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -6125,6 +6159,10 @@ mod tests {
                 kind: PreambleOpKind::Pure,
                 res: Operand::from_opref(old_ref),
                 preamble_op: std::rc::Rc::new(Op::new(
+                    OpCode::SameAsR,
+                    &[Operand::from_opref(old_ref)],
+                )),
+                source_op: std::rc::Rc::new(Op::new(
                     OpCode::SameAsR,
                     &[Operand::from_opref(old_ref)],
                 )),
@@ -6831,7 +6869,12 @@ mod tests {
         // widen() relaxes bounds: lower < MININT/2 → MININT, upper > MAXINT/2 → MAXINT.
         // For [10, 20], both are within MININT/2..MAXINT/2 so widen() preserves them.
         let imported_bound = {
-            let __mb = ctx2.materialize_operand_at(OpRef::int_op(21));
+            // import_state forwards the Phase-2 source Box to the literal
+            // carried Phase-1 Box. Follow that identity edge instead of
+            // fabricating a new box from the carried box's numeric position.
+            let __mb = ctx2
+                .materialize_operand_at(OpRef::input_arg_int(0))
+                .get_box_replacement(false);
             ctx2.getintbound_handle(&__mb).borrow().clone()
         };
         assert_eq!((imported_bound.lower, imported_bound.upper), (10, 20));
@@ -6936,6 +6979,7 @@ mod tests {
                         kind: PreambleOpKind::Pure,
                         res: mask_box.clone(),
                         preamble_op: mask_op.clone(),
+                        source_op: mask_op.clone(),
                         invented_name: false,
                         same_as_source: None,
                         label_arg_idx: Some(0),
@@ -6947,6 +6991,7 @@ mod tests {
                         kind: PreambleOpKind::Pure,
                         res: dep_box.clone(),
                         preamble_op: dep_op.clone(),
+                        source_op: dep_op.clone(),
                         invented_name: false,
                         same_as_source: None,
                         label_arg_idx: Some(1),
@@ -7043,6 +7088,7 @@ mod tests {
             Type::Int,
             ctx.alloc_op_position_typed(Type::Int).raw(),
         );
+        let source_receiver = ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.exported_short_inputargs = vec![si0.to_opref(), si1.to_opref()];
         ctx.exported_short_inputarg_refs = vec![ia0, ia1];
         ctx.exported_short_boxes
@@ -7056,6 +7102,15 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
+                source_op: Some({
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcI,
+                        std::slice::from_ref(&source_receiver),
+                        field_descr.clone(),
+                    );
+                    op.pos.set(OpRef::int_op(11));
+                    std::rc::Rc::new(op)
+                }),
                 res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: Some(1),
@@ -7066,7 +7121,6 @@ mod tests {
         // and result are bound boxes in production (label arg / ProducedShortOp.res
         // = materialize_operand_at, shortpreamble.rs:436). virtualstate.py:711-720
         // create_state receives real AbstractValues, never bare positions.
-        ctx.materialize_operand_at(OpRef::int_op(10));
         ctx.materialize_operand_at(OpRef::int_op(11));
 
         let exported = export_state(
@@ -7096,9 +7150,7 @@ mod tests {
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
         // source of truth, matching RPython's HeapOp.produce_op → opinfo.setfield.
-        let obj_box = ctx2
-            .get_box_replacement_operand_opt(OpRef::int_op(10))
-            .unwrap();
+        let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
         let pop = ctx2
             .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
             .flatten();
@@ -7130,6 +7182,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: Some(1),
@@ -7201,6 +7254,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(11));
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: rooted_resop_operand(Type::Int, 11),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(1),
@@ -7274,6 +7328,7 @@ mod tests {
                     op.pos.set(source);
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: source_box.clone(),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::LoopInvariant,
                 label_arg_idx: Some(0),
@@ -7339,6 +7394,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(20));
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: rooted_resop_operand(Type::Int, 20),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,
@@ -7429,6 +7485,7 @@ mod tests {
                     op.pos.set(OpRef::ref_op(19));
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: rooted_resop_operand(Type::Ref, 19),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
                 label_arg_idx: None,
@@ -7519,6 +7576,7 @@ mod tests {
                     op.pos.set(OpRef::int_op(30));
                     std::rc::Rc::new(op)
                 },
+                source_op: None,
                 res: rooted_resop_operand(Type::Int, 30),
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx: None,

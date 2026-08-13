@@ -1369,6 +1369,7 @@ mod tests {
             &short_inputargs,
             &[crate::optimizeopt::shortpreamble::PreambleOp {
                 op: std::rc::Rc::new(preamble_op),
+                source_op: None,
                 res,
                 kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Pure,
                 label_arg_idx,

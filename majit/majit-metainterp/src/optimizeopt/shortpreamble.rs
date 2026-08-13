@@ -335,6 +335,12 @@ pub struct PreambleOp {
     /// object across the export/import boundary (upstream `preamble_op` is
     /// one ResOperation object, shortpreamble.py:283-296).
     pub op: majit_ir::OpRc,
+    /// The original short operation before `add_op_to_short` remaps its
+    /// arguments into the short-preamble namespace.  Upstream carries this as
+    /// `ProducedShortOp.short_op` (for heap entries,
+    /// `HeapOp.getfield_op`) alongside the replay `preamble_op`; its argument
+    /// boxes are the keys used to read `ExportedState.exported_infos`.
+    pub source_op: Option<majit_ir::OpRc>,
     /// `short_op.res` — the result operand this entry produces. Carried as a
     /// producer-bound / const [`Operand`] so the canonical operand travels
     /// with the struct to the export boundary (`ProducedShortOp.res`),
@@ -437,6 +443,7 @@ impl PreambleOp {
             // short_op.res is the original result box; resolve canonical.
             res: ctx.materialize_operand_at(self.op.pos.get()),
             preamble_op: std::rc::Rc::new(preamble_op),
+            source_op: self.source_op.clone().unwrap_or_else(|| self.op.clone()),
             invented_name: self.invented_name,
             same_as_source: self.same_as_source.clone(),
             label_arg_idx: self.label_arg_idx,
@@ -662,6 +669,7 @@ impl ShortBoxes {
             // shortpreamble.py:371-373: const_short_boxes.append(HeapOp(...))
             let label_arg_idx = self.lookup_label_arg(result);
             self.const_short_boxes.push(PreambleOp {
+                source_op: None,
                 res: ctx.materialize_operand_at(op.pos.get()),
                 op: std::rc::Rc::new(op),
                 kind: PreambleOpKind::Heap,
@@ -778,6 +786,7 @@ impl ShortBoxes {
         self.potential_ops.insert(
             arg_res.clone(),
             PotentialShortOp::Preamble(PreambleOp {
+                source_op: None,
                 res: arg_res,
                 op: std::rc::Rc::new(same_as),
                 kind: PreambleOpKind::InputArg,
@@ -1007,6 +1016,7 @@ impl ShortBoxes {
             short_boxes.push(ProducedShortOp {
                 res: ctx.materialize_operand_at(getfield_op.pos.get()),
                 preamble_op: std::rc::Rc::new(new_op),
+                source_op: short_op.source_op.unwrap_or_else(|| short_op.op.clone()),
                 kind: PreambleOpKind::Heap,
                 invented_name: false,
                 same_as_source: None,
@@ -1060,6 +1070,7 @@ impl ShortBoxes {
         // the lookup keys in `materialize_one`/`produce_arg` are ptr_eq.
         let key = ctx.materialize_operand_at(result);
         let pop = PotentialShortOp::Preamble(PreambleOp {
+            source_op: None,
             res: key.clone(),
             op: std::rc::Rc::new(op),
             kind,
@@ -1125,6 +1136,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_guard(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.guards.push(PreambleOp {
+            source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Guard,
@@ -1138,6 +1150,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_pure_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.pure_ops.push(PreambleOp {
+            source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Pure,
@@ -1151,6 +1164,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_heap_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.heap_ops.push(PreambleOp {
+            source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::Heap,
@@ -1164,6 +1178,7 @@ impl CollectedExtendedShortPreambleBuilder {
     pub fn add_loopinvariant_op(&mut self, op: Op) {
         let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.loopinvariant_ops.push(PreambleOp {
+            source_op: None,
             res: majit_ir::operand::Operand::bound_from_opref(op.pos.get()),
             op: std::rc::Rc::new(op),
             kind: PreambleOpKind::LoopInvariant,
@@ -1309,6 +1324,10 @@ pub struct ProducedShortOp {
     pub res: majit_ir::operand::Operand,
     /// The preamble operation to replay.
     pub preamble_op: majit_ir::OpRc,
+    /// `ProducedShortOp.short_op` in RPython.  Kept separate from
+    /// `preamble_op`: heap replay remaps arg0, while exported-info lookup must
+    /// use the original `HeapOp.getfield_op` arg0 box identity.
+    pub source_op: majit_ir::OpRc,
     /// Whether this short op uses an invented SameAs result.
     pub invented_name: bool,
     /// Original result this invented name aliases.
@@ -1665,6 +1684,7 @@ impl ProducedShortOp {
         // shortpreamble.py:91-95 add_op_to_short uses `produce_arg`,
         // which admits Slot/Const).  We accept Produced too for completeness.
         let object_arg = self.preamble_op.arg(0);
+        let source_obj = self.source_op.arg(0);
         let obj_class = classify_short_arg(
             ctx,
             object_arg.to_opref(),
@@ -1682,19 +1702,33 @@ impl ProducedShortOp {
         // result.  `result_opref` belongs only to that replay operation.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
-        let descr_idx = descr.index();
+        // `info.py:212-214` indexes `_fields` by the field's position in its
+        // parent struct, so the seed has to carry the slot index every reader
+        // resolves a getfield with, not the descr's own index. A pyre field
+        // descr's `index()` is a tagged layout hash of offset/size/type, which
+        // no slot number can equal, so keying the seed with it files the
+        // `FieldEntry::Preamble` where the peeled loop's lookup never reaches.
+        let descr_idx = crate::optimizeopt::heap::OptHeap::field_slot_index(&descr);
         let obj_resolved = ctx.get_replacement_opref(obj);
         // shortpreamble.py:66-68: if g.getarg(0) in exported_infos:
         //     setinfo_from_preamble(g.getarg(0), exported_infos[...])
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
-            ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&source_obj) {
+            ctx.setinfo_from_preamble(&source_obj, rc, Some(exported_infos));
         }
         let mut getfield_op = Op::new(
             OpCode::getfield_for_type(result_type),
             &[ctx.materialize_operand_at(obj_resolved)],
         );
         getfield_op.setdescr(descr.clone());
+        // shortpreamble.py:66-79 keeps the produced `preamble_op` for replay,
+        // but builds `g` with the original heap operation's arguments for
+        // exported-info installation and heap-cache mutation.
+        let mut source_getfield_op = Op::new(
+            OpCode::getfield_for_type(result_type),
+            std::slice::from_ref(&source_obj),
+        );
+        source_getfield_op.setdescr(descr.clone());
         // The replay operation owns `result_opref`; the carried source Box
         // remains distinct. Seed info at the replay slot so
         // `take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos)`
@@ -1726,12 +1760,12 @@ impl ProducedShortOp {
         let parent_descr = getfield_op
             .with_field_descr(|fd| fd.get_parent_descr())
             .flatten();
-        if let Some(info) = ctx.get_const_info_mut(obj_resolved, parent_descr) {
+        if let Some(info) = ctx.get_const_info_mut(source_obj.to_opref(), parent_descr) {
             info.set_preamble_field(descr_idx, pop.clone());
         }
         // shortpreamble.py:72-74: ensure_ptr_info_arg0 + setfield(pop)
         let pop_for_field = pop.clone();
-        ctx.with_ensured_ptr_info_arg0(&getfield_op, |mut struct_info| {
+        ctx.with_ensured_ptr_info_arg0(&source_getfield_op, |mut struct_info| {
             if let Some(mut info) = struct_info.as_mut() {
                 debug_assert!(
                     !info.is_virtual(),
@@ -1741,39 +1775,12 @@ impl ProducedShortOp {
             }
         });
         // shortpreamble.py:62-75 keeps `self.res` (the body-visible Box)
-        // distinct from `preamble_op` (the replayed GETFIELD result), joining
-        // them only through `PreambleOp(self.res, preamble_op, ...)`.
-        //
-        // DEVIATION: the forwarding below collapses the two onto one position.
-        // It is what gives the imported field a body-namespace identity at all,
-        // so it cannot be lifted on its own. `self.res` names a Phase-1
-        // (preamble) OpRef; RPython has no such split, because `self.res` is one
-        // Box that both the preamble and the peeled body hold. Forwarding it to
-        // the Phase-2 replay slot is what makes the peeled body re-export the
-        // field as its own short box, which is in turn what extends the body
-        // JUMP with the slot the extended LABEL declares.
-        //
-        // Measured: dropping just this `make_equal_to` (and the GETARRAYITEM /
-        // LoopInvariant siblings) leaves the body JUMP one arg short, and
-        // `assemble_peeled_trace_with_jump_args`'s `unwrap_or(label_arg)`
-        // fallback then feeds the LABEL slot back to itself — a loop-carried
-        // `s -= 1` freezes at its entry value (`synth/unary_int_loop_carried`
-        // prints -44 instead of -29000). Removing the `force_box` dual-key pop
-        // and the unroll.rs force sweep alongside it does not address that;
-        // closing this needs the imported short box to carry a body-namespace
-        // position by construction.
-        //
-        // The non-invented Pure sibling of this collapse (the replay op sharing
-        // `source`) was a separate defect and is fixed — see mod.rs
-        // `ImportedShortPureOp::new`.
-        let op_source = ctx
-            .get_box_replacement_operand_opt(source)
-            .unwrap_or_else(|| ctx.materialize_operand_at(source));
-        let op_result = ctx
-            .get_box_replacement_operand_opt(result_opref)
-            .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
-        ctx.make_equal_to(&op_source, &op_result);
-        let imported_base = ctx.get_box_replacement_operand(obj_resolved);
+        // distinct from `preamble_op` (the replayed GETFIELD result). The
+        // builder later appends the former to LABEL.used_boxes and the latter
+        // to the preamble JUMP. Forwarding them here erases the replay result:
+        // the LABEL then names an undefined body box and reads a stale frame
+        // slot. PreambleOp bookkeeping is the only join upstream.
+        let imported_base = source_obj.get_box_replacement(false);
         optimizer.register_preamble_cached_field(&imported_base, &descr);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
@@ -1803,6 +1810,7 @@ impl ProducedShortOp {
         let result_type = self.preamble_op.result_type();
         let descr = self.preamble_op.getdescr()?;
         let object_arg = self.preamble_op.arg(0);
+        let source_obj = self.source_op.arg(0);
         let obj_class = classify_short_arg(
             ctx,
             object_arg.to_opref(),
@@ -1840,8 +1848,8 @@ impl ProducedShortOp {
         // getarrayitem: if the base object has exported info, import it
         // before ensuring heap/array PtrInfo.
         // Pass the Rc handle (unroll.py:61 identity preservation).
-        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&object_arg) {
-            ctx.setinfo_from_preamble(obj_resolved, rc, Some(exported_infos));
+        if let Some(crate::optimizeopt::info::OpInfo::Ptr(rc)) = exported_infos.get(&source_obj) {
+            ctx.setinfo_from_preamble(&source_obj, rc, Some(exported_infos));
         }
         let index_const = ctx.make_constant_int(index);
         let mut getarrayitem_op = Op::new(
@@ -1852,6 +1860,13 @@ impl ProducedShortOp {
             ],
         );
         getarrayitem_op.setdescr(descr.clone());
+        // shortpreamble.py:80-85 mutates array info through the same original
+        // `g.getarg(0)` identity while replay keeps its produced argument.
+        let mut source_getarrayitem_op = Op::new(
+            OpCode::getarrayitem_for_type(result_type),
+            &[source_obj.clone(), self.source_op.arg(1)],
+        );
+        source_getarrayitem_op.setdescr(descr.clone());
         // The replay GETARRAYITEM owns `result_opref`; `source` stays the
         // body-visible Box.
         getarrayitem_op.pos.set(result_opref);
@@ -1877,8 +1892,8 @@ impl ProducedShortOp {
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
         };
-        let obj_box = ctx.get_box_replacement_operand_opt(obj_resolved);
-        if obj_resolved.is_constant()
+        let obj_box = Some(source_obj.clone());
+        if source_obj.is_constant()
             || obj_box
                 .as_ref()
                 .and_then(|b| ctx.get_constant_box(b))
@@ -1892,7 +1907,7 @@ impl ProducedShortOp {
             }
         } else {
             let pop_for_array = pop.clone();
-            ctx.with_ensured_ptr_info_arg0(&getarrayitem_op, |mut array_info| {
+            ctx.with_ensured_ptr_info_arg0(&source_getarrayitem_op, |mut array_info| {
                 if let Some(mut info) = array_info.as_mut()
                     && let crate::optimizeopt::info::PtrInfo::Array(array_info) = &mut *info
                 {
@@ -1909,20 +1924,9 @@ impl ProducedShortOp {
                 }
             });
         }
-        // shortpreamble.py:80-85 has the same two-Box shape as GETFIELD: the
-        // carried body result and the replayed GETARRAYITEM result stay
-        // distinct upstream, joined only by PreambleOp bookkeeping. The same
-        // DEVIATION as the GETFIELD path applies — the forwarding below
-        // collapses them, and `produce_heap_field` records why it cannot be
-        // lifted on its own.
-        let op_source = ctx
-            .get_box_replacement_operand_opt(source)
-            .unwrap_or_else(|| ctx.materialize_operand_at(source));
-        let op_result = ctx
-            .get_box_replacement_operand_opt(result_opref)
-            .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
-        ctx.make_equal_to(&op_source, &op_result);
-        let imported_base = ctx.get_box_replacement_operand(obj_resolved);
+        // shortpreamble.py:80-85 preserves the same source/replay distinction
+        // for GETARRAYITEM. PreambleOp bookkeeping joins the two at use time.
+        let imported_base = source_obj.get_box_replacement(false);
         optimizer.register_preamble_cached_arrayitem(&imported_base, &descr, index);
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
@@ -1958,19 +1962,9 @@ impl ProducedShortOp {
             _ => return None,
         };
         // shortpreamble.py:152-159 stores `self.res` as the body-visible Box
-        // and the replay call separately in PreambleOp. As with HeapOp the two
-        // identities stay distinct upstream, and as with HeapOp the forwarding
-        // below is the DEVIATION that collapses them; `produce_heap_field`
-        // records why it cannot be lifted on its own.
+        // and the replay call separately in PreambleOp.
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
-        let op_source = ctx
-            .get_box_replacement_operand_opt(source)
-            .unwrap_or_else(|| ctx.materialize_operand_at(source));
-        let op_result = ctx
-            .get_box_replacement_operand_opt(result_opref)
-            .unwrap_or_else(|| ctx.materialize_operand_at(result_opref));
-        ctx.make_equal_to(&op_source, &op_result);
         // `rewrite.py:31` `self.opt.loop_invariant_results[key] = old_op` —
         // dict-as-map semantics; pyre's Vec-backed parity overwrites the
         // entry when `func_ptr` already exists (PyPy dict behavior),
@@ -3403,6 +3397,7 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
                     // operand (#173 roots the producer, never position-only).
                     res: entry.res.clone(),
                     preamble_op: std::rc::Rc::new(preamble_op),
+                    source_op: entry.source_op.clone().unwrap_or_else(|| entry.op.clone()),
                     invented_name: entry.invented_name,
                     same_as_source: entry.same_as_source.clone(),
                     label_arg_idx: entry.label_arg_idx,
@@ -3753,6 +3748,7 @@ mod tests {
         // not inputargs and are unchanged.
         let exported = vec![
             PreambleOp {
+                source_op: None,
                 op: {
                     let mut op = Op::new(OpCode::IntAdd, &[rop(Type::Int, 10), rop(Type::Int, 11)]);
                     op.pos.set(OpRef::int_op(7));
@@ -3765,6 +3761,7 @@ mod tests {
                 same_as_source: None,
             },
             PreambleOp {
+                source_op: None,
                 op: {
                     let mut op = Op::new(OpCode::IntSub, &[rop(Type::Int, 7), rop(Type::Int, 11)]);
                     op.pos.set(OpRef::int_op(8));
@@ -3801,6 +3798,7 @@ mod tests {
 
         let exported = vec![
             PreambleOp {
+                source_op: None,
                 op: std::rc::Rc::new(ovf),
                 res: rooted_resop_operand(Type::Int, 20),
                 kind: PreambleOpKind::Pure,
@@ -3809,6 +3807,7 @@ mod tests {
                 same_as_source: None,
             },
             PreambleOp {
+                source_op: None,
                 op: std::rc::Rc::new(guard),
                 res: majit_ir::operand::Operand::None,
                 kind: PreambleOpKind::Guard,
@@ -3853,7 +3852,8 @@ mod tests {
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
                     res: res7.clone(),
-                    preamble_op: producer7,
+                    preamble_op: producer7.clone(),
+                    source_op: producer7,
                     invented_name: false,
                     same_as_source: None,
                     label_arg_idx: None,
@@ -3864,7 +3864,8 @@ mod tests {
                 ProducedShortOp {
                     kind: PreambleOpKind::Pure,
                     res: res8.clone(),
-                    preamble_op: producer8,
+                    preamble_op: producer8.clone(),
+                    source_op: producer8,
                     invented_name: false,
                     same_as_source: None,
                     label_arg_idx: None,
@@ -4048,6 +4049,14 @@ mod tests {
             .unwrap();
         assert_eq!(alias.1.kind, PreambleOpKind::Heap);
         assert!(alias.1.invented_name);
+        // shortpreamble.py HeapOp keeps `getfield_op` beside the remapped
+        // `preamble_op`: exported_infos is keyed by the original receiver
+        // box, while the replay must read the renamed short-inputarg box.
+        assert_eq!(alias.1.source_op.arg(0).to_opref(), OpRef::int_op(30));
+        assert_ne!(
+            alias.1.preamble_op.arg(0).to_opref(),
+            alias.1.source_op.arg(0).to_opref()
+        );
         assert_eq!(
             alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(OpRef::int_op(10))
