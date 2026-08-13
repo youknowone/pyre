@@ -17773,9 +17773,18 @@ fn strip_crate_prefix(path: &str) -> String {
 /// collapse sound is the accessor's CONTRACT (return the interior pointer for
 /// descr-based consumption), which the module-qualified name states and the
 /// crate name does not.
+///
+/// Compared with [`path_ends_with_segments`] and not with `str::ends_with`. On
+/// a `::`-joined path `ends_with` is a SUBSTRING test, not a path test: it
+/// accepts `some_host::my_object_array::items_block_items_base`, because
+/// `object_array::…` is a byte suffix of `my_object_array::…` while naming a
+/// different module. A module that merely *ends in* `object_array` would then
+/// have its accessor collapsed to the block header on the strength of its
+/// spelling. The segment-aware comparator already existed in this file; these
+/// gates were the ones not using it.
 fn is_object_items_block_base_accessor(name: &str) -> bool {
-    name.ends_with("object_array::items_block_items_base")
-        || name.ends_with("object_array::items_block_items_ptr")
+    path_ends_with_segments(name, "object_array::items_block_items_base")
+        || path_ends_with_segments(name, "object_array::items_block_items_ptr")
 }
 
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
@@ -17791,7 +17800,7 @@ fn is_object_items_block_base_accessor(name: &str) -> bool {
 /// two gates agree by construction rather than by coincidence.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
     is_object_items_block_base_accessor(name)
-        || name.ends_with("rlist::typed_items_block_items_base")
+        || path_ends_with_segments(name, "rlist::typed_items_block_items_base")
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -17832,6 +17841,19 @@ fn path_has_suffix_ignoring_raw(path: &str, key: &str) -> bool {
             _ => return false,
         }
     }
+}
+
+/// `key` names the trailing `::` segments of `path` — as a PATH, not as a
+/// substring. The drop-in for `path.ends_with(key)` wherever `key` is a
+/// `::`-joined path rather than a bare leaf.
+///
+/// Both arms are needed. [`path_has_suffix_ignoring_raw`] deliberately demands
+/// a *proper* suffix — at least one segment of `path` left over — so on its own
+/// it would reject a `path` that is exactly `key`, which `ends_with` accepted.
+/// Pairing it with [`path_eq_ignoring_raw`] leaves the substring collision as
+/// the only input whose answer changes.
+fn path_ends_with_segments(path: &str, key: &str) -> bool {
+    path_eq_ignoring_raw(path, key) || path_has_suffix_ignoring_raw(path, key)
 }
 
 fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
@@ -21401,10 +21423,27 @@ mod tests {
         assert!(is_object_items_block_base_accessor(host));
         assert!(graph_is_items_block_base_accessor(host));
 
-        // A leaf collision still cannot widen either gate.
+        // A leaf collision still cannot widen either gate. Note this case
+        // proves less than it looks: it is refused for TWO independent
+        // reasons — the leaf is `…_helper`, and the module is `other_mod` —
+        // so it passes even under a plain `ends_with`, and it never tested
+        // whether the comparison respects `::` boundaries at all.
         let collision = "some_host::other_mod::items_block_items_base_helper";
         assert!(!is_object_items_block_base_accessor(collision));
         assert!(!graph_is_items_block_base_accessor(collision));
+
+        // The case that does test it. Every segment of the key appears, the
+        // leaf is exact, and the whole key is a byte-suffix of the path — so
+        // `ends_with` accepts it — yet the module is `my_object_array` and not
+        // `object_array`, so a path comparison must refuse it. This is the one
+        // input whose answer changed when the gates moved off `ends_with`.
+        let neighbour = "some_host::runtime::my_object_array::items_block_items_base";
+        assert!(!is_object_items_block_base_accessor(neighbour));
+        assert!(!graph_is_items_block_base_accessor(neighbour));
+
+        // The same defect on the other predicate's own arm.
+        let neighbour_typed = "majit_rlib::lltypesystem::my_rlist::typed_items_block_items_base";
+        assert!(!graph_is_items_block_base_accessor(neighbour_typed));
     }
 
     #[test]
