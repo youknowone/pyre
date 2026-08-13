@@ -3366,8 +3366,9 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
         return err;
     }
     unsafe {
-        use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len,
-                                    shadow_stack_set};
+        use pyre_object::gc_roots::{
+            pin_root, push_roots, shadow_stack_get, shadow_stack_len, shadow_stack_set,
+        };
 
         // `code_get_field` realises `co_filename`, which allocates and can
         // therefore collect.  A traceback node emitted by compiled code is
@@ -3394,17 +3395,15 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
                 break;
             }
             shadow_stack_set(code_slot, w_code);
-            let is_bootstrap = crate::pycode::code_get_field(
-                shadow_stack_get(code_slot),
-                "co_filename",
-            )
-            .ok()
-            .filter(|f| pyre_object::is_str(*f))
-            // A module imported from a path with no UTF-8 spelling carries a
-            // surrogate escape in `co_filename`; it is not one of the
-            // bootstrap names either way.
-            .and_then(|f| pyre_object::w_str_get_value_opt(f))
-            .is_some_and(is_bootstrap_filename);
+            let is_bootstrap =
+                crate::pycode::code_get_field(shadow_stack_get(code_slot), "co_filename")
+                    .ok()
+                    .filter(|f| pyre_object::is_str(*f))
+                    // A module imported from a path with no UTF-8 spelling carries a
+                    // surrogate escape in `co_filename`; it is not one of the
+                    // bootstrap names either way.
+                    .and_then(|f| pyre_object::w_str_get_value_opt(f))
+                    .is_some_and(is_bootstrap_filename);
             if !is_bootstrap {
                 break;
             }
