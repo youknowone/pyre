@@ -2060,11 +2060,8 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // they've been consumed and carry no pcdep entry.
         //
         // A caller holding no Python coordinate reads the floor-only static
-        // depth twin.  This is independent of whether `jitcode_pc` itself is
-        // a `-live-`-anchored startpoint: the frame width and the per-slot
-        // color map are codewriter sidecars keyed by the containing operation,
-        // while `can_decode_live_vars` only decides whether the register-value
-        // stream can be enumerated directly at that byte.
+        // depth twin.  Frame width is a containing-operation property and does
+        // not require decoding the register-value stream at `jitcode_pc`.
         //
         // Jitcode-keyed spellings of this same static table exist:
         // `depth_containing_for_jitcode_pc` is built (`finalize_jitcode`, the
@@ -2072,9 +2069,8 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
         // `depth_at_py_pc[containing_py]` for every offset, and
         // `depth_trivia_for_jitcode_pc` reads it at the trivia-skipped py.
         // `collect_outer_active_boxes`, the encode half this mirrors, already
-        // sources its own `stack_depth_at_pc` and pcdep from JitCode-keyed
-        // twins with no Python PC in hand. The census below measured what the
-        // containing-depth twin answers here:
+        // sources its own `stack_depth_at_pc` from the JitCode-keyed depth twin
+        // with no Python PC in hand. The census below measured what it answers:
         // over the 399-file synth corpus every one of the 20 executions of this
         // leg carried a non-negative offset at which the containing twin
         // answers 3, 4 or 5. Returning 0 truncated the reconstructed frame's
@@ -2105,30 +2101,30 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             empty_twin_census(site, Some(rp), Some(table.len()), depth, jitcode_pc, twin);
             depth as usize
         };
-        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0 {
+        let (stack_depth_at_pc, pcdep_entries) = if jitcode_pc >= 0
+            && payload
+                .jitcode
+                .can_decode_live_vars(jitcode_pc as usize, sd.op_live)
+        {
             let jp = jitcode_pc as usize;
             // Decode-identity: source depth/pcdep from the carried genuine
-            // `jitcode_pc` via the predecessor-keyed twins.  A `-live-`
-            // startpoint uses the walk-time depth twin, exactly as the encoder
-            // does.  A non-decodable operation byte still owns semantic
-            // sidecars: retain its pcdep and obtain frame width from the static
-            // containing-depth twin instead of collapsing both to empty/zero.
-            // RPython's resume reader keeps these concerns separate too:
-            // `setup_resume_at_op(pc)` selects the frame position and
-            // `consume_boxes(get_current_position_info(), ...)` enumerates
-            // whatever register stream that position carries.
+            // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
+            // decodable, the two sidecars are independently optional: a miss
+            // in one must not discard the other.
             let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
-            if payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                let depth = payload
-                    .depth_for_jitcode_pc_pred(jp)
-                    .map(usize::from)
-                    .unwrap_or_else(|| via_py_pc(py_pc, &EMPTY_TWIN_MISS));
-                (depth, pcdep)
-            } else {
-                (via_py_pc(py_pc, &EMPTY_TWIN_NON_DECODABLE), pcdep)
-            }
+            let depth = payload
+                .depth_for_jitcode_pc_pred(jp)
+                .map(usize::from)
+                .unwrap_or_else(|| via_py_pc(py_pc, &EMPTY_TWIN_MISS));
+            (depth, pcdep)
         } else {
-            // A genuinely absent coordinate can only use a carried Python PC.
+            // RPython resume.py rebuild_from_resumedata does
+            // setup_resume_at_op(pc) and then passes that frame's
+            // get_current_position_info() to consume_boxes.  The latter calls
+            // get_live_vars_info(pc), so a position without a live-anchored
+            // register stream cannot supply a color-to-slot pcdep map.  Keep
+            // the independently useful static frame width, but do not combine
+            // it with pcdep from a coordinate whose values cannot be decoded.
             (via_py_pc(py_pc, &EMPTY_TWIN_NON_DECODABLE), Vec::new())
         };
         BridgeSemanticMaps {
@@ -2150,8 +2146,8 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
 /// `callee_jitcode_pc`). The two `RebuiltFrame` callers (`state.rs`
 /// `reconstruct_inline_recipe` and `setup_bridge_sym`) do hold one — the
 /// forward-carried `RebuiltFrame::py_pc`, but the JitCode-keyed containing
-/// depth and pcdep twins now carry the same semantic information without
-/// routing the JitCode word through a Python-keyed map.
+/// depth twin preserves their frame width without routing the JitCode word
+/// through a Python-keyed map.
 pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     jitcode_index: i32,
     jitcode_pc: i32,
@@ -13753,7 +13749,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_semantic_maps_keep_sidecars_at_non_live_jitcode_offset() {
+    fn bridge_semantic_maps_keep_width_but_drop_pcdep_at_non_live_jitcode_offset() {
         use pyre_interpreter::pyframe::PyFrame;
 
         ensure_test_callbacks();
@@ -13764,9 +13760,10 @@ mod tests {
 
         // A CALL/residual operation start can be a valid JitCode coordinate
         // without being a `-live-`-anchored decode point.  The codewriter still
-        // publishes containing-depth and pcdep sidecars for that coordinate;
-        // bridge reconstruction must not collapse them to 0/empty merely
-        // because the runtime JitCode body below has no live marker at pc=9.
+        // publishes containing-depth and pcdep sidecars for that coordinate.
+        // The static width remains usable, but pcdep describes the register
+        // stream consumed by get_current_position_info; without a live marker
+        // at pc=9 that stream cannot be decoded and the map must be dropped.
         let mut metadata = crate::PyJitCodeMetadata::degenerate();
         metadata.depth_containing_by_jit_pc = vec![(0, 4)];
         metadata.pcdep_by_jit_pc = vec![(0, vec![(1, 7, 3)])];
@@ -13785,7 +13782,7 @@ mod tests {
 
         let maps = bridge_semantic_maps_from_jitcode_pc(jitcode_index, 9);
         assert_eq!(maps.stack_depth_at_pc, 4);
-        assert_eq!(maps.pcdep_entries, vec![(1, 7, 3)]);
+        assert!(maps.pcdep_entries.is_empty());
     }
 
     #[test]
