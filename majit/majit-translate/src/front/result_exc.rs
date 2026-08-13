@@ -493,11 +493,16 @@ pub(crate) fn lower_result_exc_returns(
         // Require the strict pure-forwarder property (empty, unconditional
         // intervening blocks only) for `Err` shells; decline to a residual
         // call otherwise.
-        let forwards_ok = if is_err {
+        let forward_err: Option<String> = if is_err {
             forwards_to_returnblock(graph, bi, &ctor_var)
+                .err()
+                .map(|e| format!("Err shell: {e}"))
         } else {
-            verify_forwards_to_returnblock_general(graph, bi, &ctor_var).is_ok()
+            verify_forwards_to_returnblock_general(graph, bi, &ctor_var)
+                .err()
+                .map(|e| format!("Ok shell: {e}"))
         };
+        let forwards_ok = forward_err.is_none();
         if !well_formed_return || !forwards_ok {
             // Leaving the ctor materialised is sound only when it is a
             // consumed intermediate that never returns — its value must NOT
@@ -511,10 +516,23 @@ pub(crate) fn lower_result_exc_returns(
             // object.  Decline the whole callee (fail-safe → residual call)
             // rather than emit that partial, unsound rewrite.
             if shell_reaches_returnblock(graph, bi, &ctor_var) {
+                // Name the condition(s) that actually fired.  The guard is a
+                // disjunction, so both can hold; join whichever did.
+                let shell_use = (!well_formed_return).then(|| {
+                    format!(
+                        "extra shell use (op_uses={}, link_uses={})",
+                        consumers.op_uses, consumers.link_uses
+                    )
+                });
+                let cause = [shell_use.as_deref(), forward_err.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(format!(
                     "{}: Result return shell in block {bi} reaches returnblock \
-                     but cannot be lowered cleanly (non-pure forward / extra \
-                     shell use) — declining the callee to avoid a partial rewrite",
+                     but cannot be lowered cleanly ({cause}) — declining the \
+                     callee to avoid a partial rewrite",
                     graph.name
                 ));
             }
@@ -599,7 +617,7 @@ fn has_tail_forwarded_call_result(graph: &FunctionGraph) -> bool {
         for op in &graph.blocks[bi].operations {
             if matches!(op.kind, OpKind::Call { .. })
                 && let Some(r) = &op.result
-                && forwards_to_returnblock(graph, bi, r)
+                && forwards_to_returnblock(graph, bi, r).is_ok()
             {
                 return true;
             }
@@ -882,8 +900,10 @@ fn verify_forwards_to_returnblock_general(
                 if op_operand_vars(&op.kind).iter().any(|o| o == &v) {
                     return Err(format!(
                         "{}: Result shell alias is read by an operation in \
-                         block {cur} on the forwarding path — not a pure forward",
-                        graph.name
+                         block {cur} on the forwarding path — not a pure \
+                         forward (op: {})",
+                        graph.name,
+                        truncated_kind(&op.kind),
                     ));
                 }
             }
@@ -1073,7 +1093,7 @@ fn rewire_one_call_site(
         .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(r)))
         .ok_or_else(|| format!("{name}: scoped call result var has no producer block"))?;
     // Tail forward: the callee's Result flows straight to returnblock.
-    if forwards_to_returnblock(graph, a, r) {
+    if forwards_to_returnblock(graph, a, r).is_ok() {
         if !enclosing_scoped {
             return Err(format!(
                 "{name}: tail-forwards a scoped callee's Result out of a \
@@ -1526,7 +1546,7 @@ fn verify_drain_reraise_returns_err_payload(
     // exit, no exitswitch, only empty alias-hop blocks en route.  The tolerant
     // forwarder would license a conditional tail (`if flag { return Err(e) }
     // else { … }`) whose non-reraise branch the substitution silently drops.
-    if forwards_to_returnblock(graph, reraise_target, &outer) {
+    if forwards_to_returnblock(graph, reraise_target, &outer).is_ok() {
         Ok(())
     } else {
         Err(format!(
@@ -2301,11 +2321,17 @@ fn build_shell(
 }
 
 /// Probe: does `var` flow from `block`'s exit through pure positional
-/// forwarding into `returnblock`?  The non-erroring twin of
-/// [`verify_forwards_to_returnblock`] — any non-conforming hop means
-/// "not a tail forward" rather than a build failure (the site is then
-/// matched as a diamond, whose own checks fail loud).
-fn forwards_to_returnblock(graph: &FunctionGraph, block: usize, var: &Variable) -> bool {
+/// forwarding into `returnblock`?  Any non-conforming hop means "not a
+/// tail forward" rather than a build failure (the site is then matched as
+/// a diamond, whose own checks fail loud).  The `Err` describes which hop
+/// disqualified the chain; callers that only need the yes/no answer use
+/// `.is_ok()`.  Six distinct shapes disqualify a chain, and the
+/// `[mir-coverage]` report is only actionable if it names which one.
+fn forwards_to_returnblock(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+) -> Result<(), String> {
     let mut current = block;
     let mut tracked = var.clone();
     for _ in 0..graph.blocks.len() {
@@ -2315,31 +2341,57 @@ fn forwards_to_returnblock(graph: &FunctionGraph, block: usize, var: &Variable) 
         // a tail forward.
         if current != block {
             let b = &graph.blocks[current];
-            if !b.operations.is_empty() || b.exitswitch.is_some() {
-                return false;
+            if !b.operations.is_empty() {
+                return Err(format!(
+                    "forwarding block {current} carries {} operation(s), \
+                     first {:?}",
+                    b.operations.len(),
+                    truncated_kind(&b.operations[0].kind),
+                ));
+            }
+            if b.exitswitch.is_some() {
+                return Err(format!("forwarding block {current} has a conditional exit"));
             }
         }
         let [link] = graph.blocks[current].exits.as_slice() else {
-            return false;
+            return Err(format!(
+                "block {current} has {} exits, not exactly one",
+                graph.blocks[current].exits.len()
+            ));
         };
         let Some(pos) = link
             .args
             .iter()
             .position(|a| matches!(a, LinkArg::Value(v) if *v == tracked))
         else {
-            return false;
+            return Err(format!(
+                "block {current}'s single exit does not carry the tracked value"
+            ));
         };
         if link.target == graph.returnblock {
-            return true;
+            return Ok(());
         }
         let target = link.target.0;
         let Some(next_var) = graph.blocks[target].inputargs.get(pos) else {
-            return false;
+            return Err(format!(
+                "forwarding target block {target} has no inputarg at position {pos}"
+            ));
         };
         tracked = next_var.clone();
         current = target;
     }
-    false
+    Err("forwarding chain is longer than the block count".to_string())
+}
+
+/// A bounded `Debug` rendering of an op kind, for diagnostics that name
+/// the operation that disqualified a rewrite.  Truncates on a `char`
+/// boundary so a non-ASCII name cannot panic the build.
+fn truncated_kind(kind: &OpKind) -> String {
+    let text = format!("{kind:?}");
+    if text.chars().count() <= 100 {
+        return text;
+    }
+    text.chars().take(100).collect::<String>() + "…"
 }
 
 /// Map a continue-arm link variable back to its A-scope origin
