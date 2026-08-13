@@ -7080,23 +7080,34 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
     // A `LIST_APPEND` (inlined-comprehension accumulator) body is
-    // admitted only when the body performs no CALL: a per-element call
-    // that enters a user Python frame (a class ctor / user function)
-    // bumps the eval-loop entry odometer, and a subsequent mid-body
-    // abort routes through `fbw_foriter_inflight_take`, which REFUSES
-    // delivery to avoid a double-apply — dropping the trace-attempt
-    // iteration's item. That user-frame in-flight-delivery gap is a
-    // separate concern (single-executor tracing, gh#73/#34); decline
-    // call-bearing bodies to interpretation until it is closed.
+    // admitted only when the body performs no CALL. The scan narrows how
+    // often the in-flight delivery gap is reached; it is not a boundary
+    // the gap stays behind. A mid-body abort routes through
+    // `fbw_foriter_inflight_take`, which REFUSES delivery once a body
+    // effect has committed, destroys the stash and leaves the frame at
+    // the FOR_ITER header against an iterator the walk already advanced
+    // — losing that whole iteration. A per-element call entering a user
+    // Python frame reaches that abort, but so does this, which the scan
+    // admits:
+    //
+    //     for index in items:
+    //         out.append([index for _ in range(1)])
+    //
+    // Over 60 items it appends 59 on dynasm and on cranelift, twice in
+    // 400 runs; with the JIT off it appends 60. `SET_ADD` and `MAP_ADD`
+    // spell the same shape and carry no scan at all. Closing this is the
+    // in-flight delivery gap (single-executor tracing, gh#73/#34).
     //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
-    // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
-    // exact-resume safe: the only residual an Object-strategy append
-    // leaves in the folded body is the idempotent `list_write_barrier`,
-    // now exempt from the FBW body-effect accounting (it is not a body
-    // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
-    // executes and the optimizer never treats as a side effect).
+    // `[{i: i} …]`, `[f"{i}" …]`) — is admitted. The only residual an
+    // Object-strategy append leaves in the folded body is the idempotent
+    // `list_write_barrier`, now exempt from the FBW body-effect
+    // accounting (it is not a body effect, mirroring RPython's
+    // `COND_CALL_GC_WB`, which pyjitpl never executes and the optimizer
+    // never treats as a side effect). That exemption keeps the append
+    // itself from forcing the refusal; it does not make the enclosing
+    // loop exact-resume safe, per the shape above.
     //
     // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
     // too: the fold virtualizes the inner list, whose separately
