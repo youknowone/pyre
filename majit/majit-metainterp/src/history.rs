@@ -2958,18 +2958,13 @@ impl TraceCtx {
 
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.
     ///
-    /// 1:1 port of RPython's `Op.setfailargs([...])`
-    /// (`resoperation.py`).  Production guard recording goes through
+    /// Port of `resoperation.Op.setfailargs`. Production guard recording uses
     /// the snapshot path (`record_guard_typed` + `capture_resumedata`
     /// + `set_last_guard_resume_position`); the optimizer's
-    ///   `OptContext::store_final_boxes_in_guard` then
-    ///   derives `op.fail_args` from the snapshot via
-    ///   `Op::store_final_boxes(liveboxes)`. This setter
-    ///   is for tests and other callers that construct synthetic guard
-    ///   shapes outside the standard `capture_resumedata` flow —
-    ///   matching how RPython's `test_resume.py` /
-    ///   `test_optimizeopt.py` build `ResOperation`s with `setfailargs`
-    ///   directly rather than through `history.record_default_val`.
+    /// `OptContext::store_final_boxes_in_guard`, which derives `op.fail_args`
+    /// from the snapshot through `Op::store_final_boxes`. This setter serves
+    /// tests and other synthetic guards built outside that flow, matching
+    /// upstream tests that call `ResOperation.setfailargs` directly.
     pub fn set_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
         self.recorder.set_op_fail_args(opref, fail_args);
     }

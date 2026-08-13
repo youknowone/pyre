@@ -3063,40 +3063,15 @@ impl TraceCtx {
         }
     }
 
-    /// Best-effort concrete (runtime) value associated with an OpRef, from
-    /// TraceCtx-local state.  Parallels upstream `box.getref_base()` /
-    /// `box.getint()` / `box.getfloatstorage()` — in RPython each Box
-    /// carries its own runtime concrete via the Box subclass; pyre's
-    /// `OpRef` is opaque, so concrete is reconstructed from the
-    /// available trace-time state.
+    /// Recover a concrete Ref value from trace-local state.
     ///
-    /// Resolution order, mirroring the subclass dispatch upstream performs
-    /// implicitly:
-    ///   1. Constant OpRefs — read inline off the OpRef variant (value +
-    ///      type).  Mirrors `history.py:220/261/307 ConstInt/ConstFloat/
-    ///      ConstPtr` Box.value intrinsic field.
-    ///   2. `standard_virtualizable_box()` — use the runtime shadow held in
-    ///      `virtualizable_values[-1]`.  Standard vable identity check.
-    ///   3. `opref_concrete` — Box.value stamp populated at every record
-    ///      site that has the runtime result in scope (HEAP loads,
-    ///      register reads, resume-data materialization).  Covers
-    ///      non-Const result OpRefs whose runtime concrete is known.
-    ///   4. Fallback — `None`: no concrete is known.  Consumers treat
-    ///      `None` as "never matches a real heap pointer", so PTR_EQ
-    ///      comparisons with the standard vable resolve to "different" at
-    ///      trace time.
-    ///      Reconstruct a ref value whose recorder box carries no stamped concrete,
-    ///      by re-executing its recorded producer against now-resolvable operands.
-    ///      `history.TreeLoop.check_consistency_of_branch` defers
-    ///      `resbox = execute_with_descr(...)` to
-    ///      resume-image build time: an inlined sub-walk that reads a loop-invariant
-    ///      OUTER input arg records a `getfield_gc_r` while the obj is still symbolic
-    ///      (its concrete lives only in the outer frame's register shadow), so
-    ///      `concrete_of_opref` stays `None` until the seeded input argument lets
-    ///      `recover_ref_value` re-run the load. The method follows a chain of
-    ///      `getfield_gc_r` operations down to a resolvable
-    ///      root; `depth` bounds the walk.  Returns `None` when the chain roots at an
-    ///      op that is neither stamped nor a ref getfield, or the obj is null.
+    /// [`TraceCtx::concrete_of_opref`] handles constants, the standard
+    /// virtualizable, and operations whose result was stamped while recording.
+    /// For an unstamped `GetfieldGcR`, this method recursively resolves the
+    /// object and rereads the described field. That case occurs when an inlined
+    /// sub-walk records the load before its outer-frame input acquires a concrete
+    /// resume value. `depth` bounds recursive field chains; unsupported
+    /// producers, null objects, and exhausted depth return `None`.
     pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {
         if let Some(v) = self.concrete_of_opref(opref) {
             return Some(v);

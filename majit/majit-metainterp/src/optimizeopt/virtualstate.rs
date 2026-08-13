@@ -1333,56 +1333,21 @@ impl VirtualState {
         Ok(guards)
     }
 
-    /// virtualstate.py per-entry generate_guards parity, recursive form.
+    /// Recursive port of `AbstractVirtualStateInfo.generate_guards` and each
+    /// subclass's `_generate_guards` implementation. Every recursive call
+    /// performs the alias-consistency check in the shared `renum` namespace.
     ///
-    /// Mirrors `AbstractVirtualStateInfo.generate_guards` (virtualstate.py:72-101)
-    /// + the per-subclass `_generate_guards` dispatch. The alias-consistency
-    ///   check in `AbstractVirtualStateInfo.generate_guards` lives at the entry
-    ///   of every recursive
-    ///   call so nested virtual fields/items participate in the same renum
-    ///   namespace.
+    /// `runtime_box` supplies RPython's concrete "educated guess" for emitting
+    /// non-permanent guards. Nested virtuals obtain their concrete fields and
+    /// items through `OptContext::get_runtime_field`, `get_runtime_item`, and
+    /// `get_runtime_interiorfield`, corresponding to the methods of the same
+    /// names on `GenerateGuardState`. Those helpers return fresh const-pool
+    /// operands so compile-time virtual fields remain distinct from runtime
+    /// values. A missing placeholder or unreadable descriptor propagates
+    /// `None`, causing guards that require runtime evidence to reject the match.
     ///
-    /// `runtime_box`: when Some, non-permanent guard emission is possible.
-    /// When None (generalization_of path, or no runtime guidance), only
-    /// structurally compatible pairs are accepted. RPython uses the
-    /// concrete runtime value as an "educated guess" (virtualstate.py:551-555).
-    ///
-    /// For nested struct/array recursion (virtualstate.py:148-176/241-261/292-326)
-    /// pyre threads the inner `fieldbox`/`fieldbox_runtime` through, and
-    /// the runtime class read for KnownClass branches is performed by
-    /// `cpu.cls_of_box(runtime_box)` (virtualstate.py:601/:608/:620),
-    /// not by the optimizer-tracked PtrInfo.
-    ///
-    /// Nested struct/array recursion: RPython's
-    /// `GenerateGuardState.get_runtime_field` / `get_runtime_item` /
-    /// `get_runtime_interiorfield` (virtualstate.py:39-67) call
-    /// `cpu.bh_getfield_gc_*` / `bh_getarrayitem_gc_*` /
-    /// `bh_getinteriorfield_gc_*` to read the *concrete* value off the
-    /// runtime object and wrap it in a fresh `InputArg*`. The pyre port
-    /// (`OptContext::get_runtime_field`, mod.rs) walks `runtime_box` to
-    /// its `Value::Ref(gcref)` payload and reads at
-    /// `gcref.raw() + descr.offset()` using the FieldDescr's
-    /// size/sign/type triple — direct ptr arithmetic matching the
-    /// backend `Cpu::bh_getfield_gc_*` implementation
-    /// (compiler.rs:14570). The read is wrapped in a freshly allocated
-    /// const-pool OpRef so the recursive `runtime_box` parameter carries
-    /// a concrete value distinct from the compile-time `fieldbox`.
-    ///
-    /// NONE-placeholder slots (`info.rs:755`) propagate as
-    /// `runtime_box=None` so downstream NonNull / IntBounded arms
-    /// (:1474, :1500) reject the case, matching RPython's
-    /// `if fieldbox is None` skip at virtualstate.py:174.
-    ///
-    /// `get_runtime_field` returns `None` when the parent's
-    /// `runtime_box` is not a concrete Ref or when the descr is not a
-    /// FieldDescr — the recursive `runtime_box` is then `None` and
-    /// downstream guards that need a concrete pointer fail-fast.
-    ///
-    /// See `peek_parent_field_oprefs` and the per-variant
-    /// Virtual/VStruct/VArray/VArrayStruct match arms.
-    ///
-    /// `force_boxes`: when true, Virtual incoming can be accepted by
-    /// non-virtual targets (virtualstate.py:523-524 _generate_virtual_guards).
+    /// With `force_boxes`, a non-virtual target may accept a compatible virtual
+    /// incoming value through `NotVirtualStateInfoPtr._generate_virtual_guards`.
     fn generate_guards_for_entry_recursive(
         arg_idx: usize,
         expected: &VirtualStateInfoNode,
@@ -1391,7 +1356,8 @@ impl VirtualState {
         runtime_box: Option<OpRef>,
         state: &mut GenerateGuardState,
     ) -> Result<(), VirtualStatesCantMatch> {
-        // virtualstate.py:83 `assert self.position != -1`. Pyre assigns
+        // `AbstractVirtualStateInfo.generate_guards` requires an assigned
+        // position. Pyre assigns
         // positions in `enum_top_level`; sentinel -1 means a node was
         // never enumerated, which is a constructor bug. RPython's
         // `assert` is always-on (no debug gate); pyre matches with
@@ -1470,40 +1436,16 @@ impl VirtualState {
                 _ => Ok(()),
             };
         }
-        // There is no force_boxes relaxation for an expected (target)
-        // Virtual against a non-virtual incoming. When `self` is a
-        // VirtualStateInfo the dispatch is
-        // `AbstractVirtualStructStateInfo._generate_guards`
-        // (virtualstate.py:141), which has no force-box branch and requires
-        // the incoming to be a matching virtual struct. The sole force_boxes
-        // relaxation lives in `NotVirtualStateInfoPtr._generate_guards`
-        // (virtualstate.py:522-524) — the expected-non-virtual, incoming-
-        // virtual branch handled by the preceding `NotVirtual` arm. A Virtual
-        // target with a non-virtual incoming therefore reaches the structural
-        // state-kind match and is rejected by its fallback arm.
+        // `AbstractVirtualStructStateInfo._generate_guards` has no force-box
+        // relaxation: a virtual target requires a matching virtual incoming.
+        // The converse relaxation belongs to
+        // `NotVirtualStateInfoPtr._generate_virtual_guards` and is handled by
+        // the `state.force_boxes` branch for a non-virtual target.
 
-        // virtualstate.py:392-394 NotVirtualStateInfo._generate_guards:
-        //
-        //     if not isinstance(other, NotVirtualStateInfo):
-        //         raise VirtualStatesCantMatch(
-        //             'comparing a constant against something that is a virtual')
-        //
-        // This isinstance check lives in NotVirtualStateInfo(Int/Ptr)
-        // subclasses, NOT in VirtualStateInfo. When `expected` is itself
-        // a Virtual/VArray/VStruct, the structural state-kind match implements
-        // `VirtualStateInfo._generate_guards`,
-        // which does struct-level field comparison — not type-tag matching.
-        //
-        // This gate is ALSO what rejects a Virtual / VArray / VStruct /
-        // VArrayStruct incoming against a NotVirtual `expected`, the
-        // LEVEL_CONSTANT one included: `info_type_matches`
-        // (virtualstate.rs:103-145) has no arm accepting a Virtual* incoming
-        // for any expected type — Int, Float and Ref all fall to their
-        // `_ => false` catch-alls. That is the port of virtualstate.py:392-394
-        // for the Int/Float constant leaves and of virtualstate.py:525-529 for
-        // the Ptr leaf. The `(Constant(_), _)` arm below is therefore never
-        // entered with a virtual incoming; do NOT add a separate
-        // `other.is_virtual()` arm there — it would be dead code.
+        // `NotVirtualStateInfo._generate_guards` rejects virtual incoming
+        // values before constant or pointer-specific matching. Keeping that
+        // check in `info_type_matches` also ensures the `Constant` match arm is
+        // reached only for non-virtual incoming state.
         if !expected_info.is_virtual()
             && let Some(expected_type) = expected_info.info_type()
             && !info_type_matches(expected_type, incoming_info)

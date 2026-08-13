@@ -223,7 +223,7 @@ impl CodeWriter {
     /// the fused per-graph path. The whole
     /// portal closure is annotated to a fixpoint before any block is rtyped,
     /// matching upstream `translator.annotate()` → `rtyper.specialize()` →
-    /// `codewriter.make_jitcodes()` (driver.py:306/345/361) rather than the
+    /// `codewriter.make_jitcodes()` rather than the
     /// fused per-graph annotate+rtype.
     /// Must run AFTER `grab_initial_jitcodes` (so `candidate_graphs` is the
     /// portal closure) and BEFORE any `drain_pending_graphs` that publishes a
@@ -238,9 +238,11 @@ impl CodeWriter {
         );
     }
 
-    /// RPython: `CodeWriter.transform_graph_to_jitcode()` (codewriter.py:33-72).
+    /// Port of `CodeWriter.transform_graph_to_jitcode`.
     ///
-    /// Transforms a FunctionGraph into a JitCode through the 4-step pipeline.
+    /// Transforms a `FunctionGraph` into a `JitCode` through the upstream
+    /// transform, register-allocation, flattening, liveness, and assembly
+    /// pipeline.
     /// Upstream signature `(self, graph, jitcode, verbose, index)`. Pyre adds
     /// `path` / `callcontrol` / `config` as pyre-specific additions:
     ///   - `path`: graph identity surrogate (upstream uses `graph` object
@@ -251,27 +253,21 @@ impl CodeWriter {
     ///   - `config`: pyre's `GraphTransformConfig` carries options that
     ///     upstream keeps in globals / command-line flags.
     ///
-    /// Steps:
-    ///   0. annotate + rtype (majit-specific; RPython does this before codewriter)
-    ///   1. jtransform — `transform_graph()` in `CodeWriter.make_jitcodes`
-    ///   2. regalloc — `perform_register_allocation()` per kind
-    ///   3. flatten — `flatten_graph()`
-    ///      3b. liveness — `compute_liveness()`, called while assembling
-    ///   4. assemble — `assembler.assemble()`
-    ///   5. assign `jitcode.index`
-    ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
-    ///      in `CodeWriter.make_jitcodes`
+    /// Pyre performs annotation and rtyping before the upstream stages, calls
+    /// `compute_liveness` from its assembler, and fills the call descriptors
+    /// before committing the assembled body. The resulting stage order remains
+    /// the one implemented by `CodeWriter.transform_graph_to_jitcode`.
     ///
     /// **Type-source contract (post graph-side concretetype migration)**
     ///
     /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
     /// kinds via `FunctionGraph::concretetype_of(&v)`, which routes
     /// straight to the backing `Variable.concretetype` cell carried
-    /// inline by the `Variable` objects the IR references — RPython's
-    /// `Variable.concretetype` (`flowspace/model.py:280`) is the
+    /// inline by the `Variable` objects the IR references. RPython's
+    /// `flowspace.model.Variable.concretetype` is the
     /// single source of truth for every value.  No type side-table
     /// parameter survives across stages: the post-rtyper merge
-    /// below (`merge_synth_kinds_into_graph`) stamps each synth
+    /// `merge_synth_kinds_into_graph` stamps each synthetic
     /// Variable's `.concretetype` cell via
     /// `set_concretetype_of_inline`, then `apply_from_flowspace_variables`
     /// copies lltypes from typed Variables in the `value_to_var` map so the
@@ -288,31 +284,15 @@ impl CodeWriter {
     /// kind).  What still ties the codewriter to the legacy IR is that
     /// it consumes [`crate::model::FunctionGraph`] and bridges to the
     /// rtyper's typed Variables through the identity-keyed
-    /// `value_to_var` map.  Migrating to the `Variable`-based IR
-    /// throughout would let pyre drop the `value_to_var` bridge and
-    /// consume the rtyper's Variable graph directly — multi-week
-    /// scope tracked separately.
-    /// Shared dual-gate type-resolve entry.
+    /// `value_to_var` map. A graph-native typed IR would remove that bridge and
+    /// let the codewriter consume the rtyper's `Variable` graph directly.
     ///
-    /// Runs [`dual_gate_check_with_registry`] against the
-    /// program-wide `PyreCallRegistry`; on Match the real path's
-    /// `LegacyToTyped` map (with each `Variable.concretetype`
-    /// cell populated by `RPythonTyper::specialize`) is returned
-    /// directly, on Skip the legacy walker (`legacy_annotator::annotate` +
-    /// `legacy_resolve::resolve_types`) commits kinds to
-    /// `graph.concretetype` cells so non-portal jitcodes that didn't
-    /// pass the real path still get sound kinds.
-    ///
-    /// `diag_label` is appended to the optional Skip log line and the
-    /// real-path panic message; production callers pass
-    /// `path.canonical_key()`-style identification, the lib.rs
-    /// debug-snapshot path passes `graph.name`.
-    /// Run the dual-gate type resolver and commit every resolved kind
-    /// to each backing `Variable.concretetype` cell on `graph` (RPython
-    /// `rtyper.py:258 v.concretetype = ...`).  Returns the
-    /// `LegacyToTyped` map produced by the Match arm so the
-    /// post-jtransform path can rebind operand Variables to the
-    /// upstream-typed ones; Skip arm returns `None`.
+    /// Run the dual-gate type resolver against the program-wide
+    /// `PyreCallRegistry` and commit every resolved kind to the graph's backing
+    /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
+    /// post-jtransform operands can be rebound to typed variables. A Skip runs
+    /// the legacy annotator and resolver, commits their kinds, and returns
+    /// `None`. `diag_label` identifies either outcome in diagnostics.
     pub fn dual_gate_publish_concretetypes(
         &mut self,
         graph: &FunctionGraph,
@@ -736,27 +716,22 @@ impl CodeWriter {
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),
         );
 
-        // Step 3: flatten (codewriter.py:53)
-        // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
+        // Flatten the graph after register allocation.
         // Each Variable's `.concretetype` cell is the kind source
-        // after the merge/hydration steps above; flatten reads it via
+        // after type merge and hydration; flatten reads it via
         // `FunctionGraph::concretetype_of(&var)`.  `flatten_graph`
-        // itself runs `enforce_input_args` (flatten.py:88-100) so the
+        // itself runs `enforce_input_args` so the
         // startblock inputarg colors land in the dense `0..N` prefix
         // of each kind, and the rotation persists into the assembler
-        // call below — matching upstream `flatten.py:63-66`
-        // invocation order verbatim.
+        // assembly, matching the upstream invocation order.
         let mut ssarepr =
             crate::codewriter::transform_profile::time_phase("step3_flatten_graph", || {
                 crate::flatten::flatten_graph(rewritten_graph, &mut regallocs)
             });
 
-        // Steps 3b and 4 of `CodeWriter.make_jitcodes`: compute liveness and
-        // assemble the SSA representation.
-        // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
-        // In majit, assemble() calls compute_liveness() internally and now
-        // returns the body so the codewriter can fill calldescr before
-        // committing the shell via `set_body`.
+        // `assemble_with_callcontrol` computes liveness internally and returns
+        // the body so call descriptors can be filled before `set_body` commits
+        // the JitCode shell.
         let mut body = crate::codewriter::transform_profile::time_phase("step4_assemble", || {
             self.assembler
                 .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))

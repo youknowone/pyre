@@ -2023,15 +2023,15 @@ impl DynasmBackend {
         }
     }
 
-    /// llsupport/regalloc.py:861-871 `_set_initial_bindings` parity:
+    /// Parity with `BaseRegalloc._set_initial_bindings`:
     /// `_ll_initial_locs` stores `loc.value - base_ofs`, measured in bytes
     /// from `FIRST_ITEM_OFFSET`, not input-order slot numbers.
     fn input_initial_loc(position: usize) -> i32 {
         (Self::input_slot(position) * crate::jitframe::SIZEOFSIGNED) as i32
     }
 
-    /// llmodel.py:412 get_latest_descr parity: resolve a raw jf_descr
-    /// pointer to its `DescrRef`. Searches root loop fail_descrs
+    /// Resolve a raw `jf_descr` pointer to its `DescrRef`, as
+    /// `LLGraphCPU.get_latest_descr` does. Searches root loop fail descriptors
     /// first, then all bridge fail_descrs stored in asmmemmgr_blocks.
     /// RPython does this via AbstractDescr.show() which works for any
     /// descr from any loop/bridge.
@@ -2046,10 +2046,8 @@ impl DynasmBackend {
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
     ///
-    /// `frame_ptr` is required so the `propagate_exception_descr` arm
-    /// can run the equivalent of `compile.py:1092-1098`'s
-    /// `cpu.grab_exc_value(deadframe)` — read `jf_guard_exc` (the grab is
-    /// read-only, `llmodel.py:240-242`; the clear alongside it is pyre's)
+    /// `frame_ptr` lets the `propagate_exception_descr` arm implement
+    /// `PropagateExceptionDescr.handle_fail`: read `jf_guard_exc`, clear it,
     /// and stage the value into `jf_frame[0]` before synthesizing the
     /// exit-frame-with-exception descr the toplevel consumer expects.
     fn find_descr_by_ptr(
@@ -2059,7 +2057,7 @@ impl DynasmBackend {
         frame_ptr: *mut JitFrame,
     ) -> majit_ir::DescrRef {
         let attached = self.attached_descr_ptrs();
-        // compile.py:618-669 done_with_this_frame_descr — check all 4 variants.
+        // Check all four `DoneWithThisFrameDescr` variants.
         // Forward through `meta_descr` so the metainterp class hierarchy
         // (DoneWithThisFrameDescr{Void,Int,Ref,Float}) answers
         // `is_finish` / `fail_arg_types` etc. via `compile.py:624 final_descr=True`.
@@ -2070,9 +2068,9 @@ impl DynasmBackend {
                 || ptr == attached.done_with_this_frame_descr_float)
         {
             // Return the metainterp `DoneWithThisFrameDescr*` Arc directly.
-            // `compile.py:618-672` class hierarchy answers
+            // The `DoneWithThisFrameDescr` class hierarchy answers
             // `is_finish`/`fail_arg_types` via its own FailDescr impl —
-            // no backend wrapper needed (Phase C-1 cascade endpoint).
+            // no backend wrapper is needed.
             let att = self.descr_attachments.read().unwrap();
             let meta = if ptr == attached.done_with_this_frame_descr_void {
                 att.done_with_this_frame_descr_void.clone()

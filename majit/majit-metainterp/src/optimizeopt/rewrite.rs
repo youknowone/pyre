@@ -658,18 +658,19 @@ impl OptRewrite {
 
     // ── Guards ──
 
-    /// Optimize GUARD_TRUE following RPython rewrite.py: optimize_guard(op, CONST_1).
+    /// Optimize `GUARD_TRUE` through `OptRewrite.optimize_guard(op, CONST_1)`.
     /// If the condition is a known constant 0, the trace is impossible and must abort.
     ///
-    /// rewrite.py:163-184 `optimize_guard` proper (the contradiction check
-    /// + emit) is the call-time half. The `make_constant(box, CONST_1)` half
+    /// `OptRewrite.optimize_guard` performs the contradiction check and emission
+    /// at call time. Its `make_constant(box, CONST_1)` step
     ///   of the upstream `optimize_guard` is split into
     ///   `OptRewrite::propagate_postprocess` per RPython's
     ///   `have_postprocess` model.
     fn optimize_guard_true(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 
-        // rewrite.py:165-168: box.type=='i' checks intbound.is_constant(),
+        // The integer path in `OptRewrite.optimize_guard` checks
+        // `intbound.is_constant()`,
         // which catches values narrowed to a single point by bounds analysis,
         // not just the constant pool.
         if let Some(val) = ctx
@@ -685,7 +686,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// Optimize GUARD_FALSE following RPython rewrite.py: optimize_guard(op, CONST_0).
+    /// Optimize `GUARD_FALSE` through `OptRewrite.optimize_guard(op, CONST_0)`.
     fn optimize_guard_false(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
 

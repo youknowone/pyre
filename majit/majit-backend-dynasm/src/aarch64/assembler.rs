@@ -210,7 +210,6 @@ const CC_GE: u8 = 11; // signed >=
 const CC_LE: u8 = 12; // signed <=
 const CC_G: u8 = 13; // signed >
 
-/// Invert a condition code.
 /// Widest value accepted by `codebuilder.py`'s `CMP_ri` encoding of
 /// `cmp Xn, #imm`.
 const MAX_CMP_IMM12: u32 = 4095;

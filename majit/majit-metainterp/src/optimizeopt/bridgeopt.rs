@@ -86,17 +86,16 @@ pub fn serialize_optimizer_knowledge(
         })
         .collect();
 
-    // bridgeopt.py:74-88: known classes bitfield
-    // RPython: for each livebox, call getptrinfo(box).get_known_class(cpu).
+    // `serialize_optimizer_knowledge` records a known-class bit for each Ref
+    // livebox by calling `getptrinfo(box).get_known_class(cpu)`.
     // The actual class pointer is recovered at deserialization time
     // via cpu.cls_of_box(frontend_boxes[i]).
     //
-    // RPython Box.type parity: bridgeopt.py:77 uses `box.type != "r"`,
+    // RPython uses the box's intrinsic `type`,
     // where `box.type` is intrinsic/immutable. Pyre reads the same
     // type that `finish()` stores in `numb_state.livebox_types` (this
-    // map feeds `fail_arg_types` / `livebox_types` on the deserialize
-    // side — see bridgeopt.rs below). If we queried `env.get_type()`
-    // here instead, a livebox whose OptContext-side type differs from
+    // map feeds `fail_arg_types` and deserialization). Querying
+    // `env.get_type()` instead could let an OptContext-side type differ from
     // its numbering-time type would cause serialize/deserialize to
     // disagree on which Ref-typed slots get a bitfield bit, producing
     // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
@@ -130,9 +129,9 @@ pub fn serialize_optimizer_knowledge(
         numb_state.append_int((bitfield << (6 - shifts)) as i64);
     }
 
-    // bridgeopt.py:92-122: heap knowledge
+    // Serialize heap and loop-invariant knowledge after the class bitfield.
     let Some(knowledge) = optimizer_knowledge else {
-        // bridgeopt.py:109-111,121-122: no optheap/optrewrite → zeros
+        // No optimizer knowledge means three empty sections.
         numb_state.append_int(0); // struct fields count
         numb_state.append_int(0); // array items count
         numb_state.append_int(0); // loopinvariant count

@@ -2891,22 +2891,10 @@ mod tests {
         );
     }
 }
-/// `compile.py`'s `ResumeGuardDescr._attrs_ = ('rd_numb', 'rd_consts',
-/// 'rd_virtuals', 'rd_pendingfields', 'status')` — the per-guard
-/// resume payload shared by every concrete `AbstractResumeGuardDescr`
-/// subclass.  Pyre stores them in `UnsafeCell` so the optimizer can
-/// mutate the descr in place via `FailDescr::set_rd_*` without
-/// breaking the `Arc<dyn FailDescr>` identity stamped on the op.
-///
-/// Each slot wraps `Arc<[T]>` so `copy_all_attributes_from`
-/// (compile.py:861-867) — `self.rd_consts = other.rd_consts` etc. —
-/// can mirror RPython's reference-share semantics with a single
-/// `Arc::clone()` rather than a `Vec::clone()` that would deep-copy
-/// the bytes.  External setters still accept `Option<Vec<T>>`; the
-/// conversion to `Arc<[T]>` is one move per (rare) write.
-// RdPayload moved to majit-backend::rd_payload (Phase C-1
-// preparatory step toward backend struct deletion).  Re-export from
-// here so existing `compile::RdPayload` references stay resolvable.
+/// Re-export the backend-owned resume payload under its historical
+/// `compile::RdPayload` path. [`copy_all_attributes_from`] shares the payload's
+/// `Arc`-backed sections, matching `ResumeGuardDescr.copy_all_attributes_from`
+/// without changing the descriptor identity stored on a guard operation.
 pub use majit_backend::RdPayload;
 
 fn push_vector_info(head: &mut Option<Box<AccumInfo>>, mut info: AccumInfo) {
@@ -5172,12 +5160,10 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     make_compile_loop_version_descr_with_payload(types, payload)
 }
 
-// Resume data for a guard now lives on `StoredExitLayout.resume_layout`
-// (per-guard `ResumeLayoutSummary`) rather than a separate trace-side
-// `HashMap<u32, ResumeData>`. `build_guard_metadata` derives the layout from
-// each guard descriptor, and backend exit recovery consumes the stored layout.
-// This mirrors RPython's single guard-owned
-// `ResumeGuardDescr` container declared by `compile.py::ResumeGuardDescr`.
+// `StoredExitLayout.resume_layout` is the canonical per-guard
+// `ResumeLayoutSummary`: `build_guard_metadata` derives it from the guard
+// descriptor, and backend exit recovery consumes it. This preserves RPython's
+// single guard-owned `compile.ResumeGuardDescr` container.
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's

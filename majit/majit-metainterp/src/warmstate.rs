@@ -1871,7 +1871,7 @@ impl WarmEnterState {
 
     // ── set_param / get_stats API ──
 
-    /// Set a JIT parameter by name, mirroring warmstate.py set_param_*().
+    /// Set a JIT parameter by its RPython name.
     ///
     /// Supported parameters:
     ///   - "threshold": compilation threshold
@@ -1879,13 +1879,12 @@ impl WarmEnterState {
     ///   - "trace_eagerness": guard fail count before bridge compilation
     ///   - "function_threshold": calls before inlining
     ///   - "max_inline_depth": maximum inlining depth
-    ///     warmstate.py: set_param() — set a JIT parameter by name.
-    ///     `JitDriver.set_param` defines negative thresholds as disabled, and
-    ///     `JitCounter.compute_threshold` maps a disabled threshold to `0.0`.
-    ///     Parameter names match RPython exactly: vec, vec_all, vec_cost.
+    ///
+    /// `JitDriver.set_param` defines negative thresholds as disabled, and
+    /// `JitCounter.compute_threshold` maps a disabled threshold to `0.0`.
     pub fn set_param(&mut self, name: &str, value: i64) {
-        // counter.py:124 — threshold <= 0 → compute_threshold returns 0.0
-        // (JIT off). Negative i64 must clamp to 0, not wrap to u32::MAX.
+        // Clamp disabled thresholds to zero instead of wrapping a negative
+        // value to `u32::MAX`.
         let as_u32 = if value < 0 { 0u32 } else { value as u32 };
         match name {
             "threshold" => self.set_threshold(as_u32),

@@ -473,21 +473,20 @@ fn task_error(error: impl std::fmt::Debug) -> TaskError {
     }
 }
 
-/// RPython `get_function(dottedname)` at `all.py:19-33`.
+/// Closed-world port of RPython's `all.get_function(dottedname)`.
 ///
 /// Upstream resolves an arbitrary dotted name through `__import__`
 /// + `getattr`. Pyre has no Python-style import resolver, so this
 ///   helper carries the closed-world equivalent: a registry mapping
 ///   the dotted names that upstream config defaults ship into the
-///   already-ported Rust callable. Misses surface as `TaskError`
-///   (the same shape that upstream's `print_statistics` produces with
-///   `Exception("Function %s not found")`); future heuristic ports register an entry
-///   alongside their landing commit.
+///   already-ported Rust callable. A missing entry becomes `TaskError`, matching
+///   the failure produced by upstream `get_function` when `getattr` cannot find
+///   the requested callable.
 ///
 /// The two production callers are `inline_heuristic` and
 /// `profile_based_inline_heuristic`. Both default to
 /// `"rpython.translator.backendopt.inline.inlining_heuristic"`
-/// (`translationoption.py:216`, `:239`) which maps to
+/// as configured by `translationoption`, and that dotted name maps to
 /// [`inline::inlining_heuristic`].
 #[expect(
     clippy::type_complexity,

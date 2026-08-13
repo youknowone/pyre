@@ -122,7 +122,7 @@ impl DictArgKey {
 /// it indexes `PtrInfo._fields`.
 type FieldKey = (OpRef, usize);
 
-/// heap.py:20-165 AbstractCachedEntry
+/// Rust representation of `heap.AbstractCachedEntry` and `CachedField`.
 ///
 /// PyPy uses Python inheritance to share `do_setfield`,
 /// `force_lazy_set`, `getfield_from_cache`, `possible_aliasing` and
@@ -142,14 +142,13 @@ type FieldKey = (OpRef, usize);
 ///   field-cache identity, with a separate `field_idx` / `descr_idx`
 ///   (u32) only where the RPython source indexes `PtrInfo` slots or
 ///   EffectInfo bitsets.
-///   `heap.py::CachedField`, an `AbstractCachedEntry` subclass.
 struct CachedField {
-    /// heap.py:39 cached_structs — struct boxes with a cached value
+    /// `AbstractCachedEntry.cached_structs`: struct boxes with a cached value
     /// for this descr. Replaces RPython's parallel `cached_infos`;
     /// the PtrInfo itself is read on-demand from
     /// `ctx.get_ptr_info(opref)` / `ctx.get_const_info(opref)`.
     cached_structs: Vec<Operand>,
-    /// heap.py:40 _lazy_set — at most one pending SetfieldGc per descr.
+    /// `AbstractCachedEntry._lazy_set`: at most one pending `SetfieldGc` per descr.
     /// Stores only the pending `Op` (`_lazy_set = op`); the struct base
     /// is `op.getarg(0)`, resolved on demand by the consumers.
     lazy_set: Option<Op>,
@@ -1450,22 +1449,18 @@ impl OptHeap {
 
     /// Invalidate caches on calls and other side-effecting operations.
     ///
-    /// Caches that survive:
+    /// `OptHeap.force_from_effectinfo` invalidates non-pure field and array
+    /// caches. Caches that survive are:
     /// - Immutable (green) field caches: values never change.
-    /// - Unescaped object caches: calls cannot access objects that haven't
+    /// - Unescaped object caches: calls cannot access objects that have not
     ///   been passed to a call or stored into the heap.
-    ///   `OptHeap.force_from_effectinfo`: invalidate non-pure field and array
-    ///   caches.
-    ///   Only `is_always_pure` (immutable) fields survive.
     ///
-    /// heap.py:189-196 `CachedField.invalidate(descr)` clears
-    /// `opinfo._fields[idx]` for every cached_info BEFORE clearing the
-    /// `cached_infos`/`cached_structs` lists. The Rust port routes that
+    /// `CachedField.invalidate` clears `opinfo._fields[idx]` for every cached
+    /// info before clearing `cached_infos` and `cached_structs`. The Rust port routes that
     /// PtrInfo cleanup through `invalidate_with_ctx` so the per-pass
     /// "single source of truth" stays in sync after a clean.
     fn clean_caches(&mut self, ctx: &mut OptContext) {
-        // heap.py:380-381 `if not we_are_translated(): items.sort(key=str,
-        // reverse=True)` — the ordering exists only untranslated, so walk the
+        // `OptHeap.clean_caches` sorts descriptors only when untranslated, so walk the
         // cache in place through a permuted index list. Materializing the
         // entries instead cost a `DescrRef` clone per cached field on every
         // residual call, which is where clean_caches runs.
@@ -1473,8 +1468,7 @@ impl OptHeap {
         sort_descr_entry_indices_untranslated(&self.cached_fields, &mut order);
         for i in order {
             let (_field_idx, descr, cf) = &mut self.cached_fields[i];
-            // heap.py:384: `cf.invalidate(descr)` — purity self-gate
-            // inside the method (heap.py:189-194). `_field_idx` unused
+            // `CachedField.invalidate` applies its own purity gate. `_field_idx` is unused
             // post-purity-lift; index now recomputed from `descr`.
             cf.invalidate(descr, ctx);
         }

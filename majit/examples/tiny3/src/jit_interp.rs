@@ -1,6 +1,6 @@
 //! JIT-enabled tiny3 interpreter via `#[jit_interp]` proc macro with `state_fields`.
 //!
-//! TODO: `rpython/jit/tl/tiny3_hotpath.py` uses its `Stack` class to represent
+//! Representation difference: `tiny3_hotpath.Stack` represents
 //! the operand stack as a linked list of `Stack(value, next)` nodes. Each push
 //! allocates one cons cell that RPython's JIT peels as a chain of virtuals.
 //! pyre's `state_fields = { stackpos, stack: [int; virt] }` requires a

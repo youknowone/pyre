@@ -383,23 +383,22 @@ pub fn execute_varargs<M: Clone>(
 /// the result is well-defined; returns `None` to abort folding when:
 ///   * the opcode is not a recognized binary int op
 ///   * an OVF arithmetic op (IntAddOvf/SubOvf/MulOvf) overflows —
-///     RPython's `do_int_add_ovf` then hits
-///     `assert metainterp is not None` (executor.py:287) which
+///     RPython's `do_int_add_ovf` then hits its
+///     `assert metainterp is not None`, which
 ///     AssertionErrors in the `constant_fold` path (metainterp=None);
 ///     pyre prefers the softer `None` skip so the op stays in the
 ///     trace and the runtime guard fires
-///   * a shift count is outside `0..64` (mirrors
-///     `blackhole.py:258 check_shift_count`)
+///   * a shift count is outside `0..64`, as rejected by
+///     `blackhole.check_shift_count`
 ///   * IntFloorDiv / IntMod with a zero divisor
 ///
 /// Non-OVF IntAdd/IntSub/IntMul match `bhimpl_int_add/_sub/_mul`
-/// (`blackhole.py:459-468`) which compute `intmask(a + b)` — i.e.
-/// wrapping i64 arithmetic. Earlier `checked_*` use here would have
-/// aborted the fold on a representable wrapping result.
+/// compute `intmask(a + b)`, i.e. wrapping i64 arithmetic. Using
+/// `checked_*` for these non-overflowing opcodes would abort the fold on a
+/// representable wrapping result.
 ///
-/// Mirrors the `do_int_*` entries at executor.py:279-309 (OVF) +
-/// `EXECUTE_BY_NUM_ARGS` binary-int rows (the unrolled dispatch table
-/// generated at executor.py:495-498).
+/// Mirrors the overflow helpers and binary-int rows generated in
+/// `executor.EXECUTE_BY_NUM_ARGS`.
 pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
     let result = match opcode {
         OpCode::IntAdd => a.wrapping_add(b),
@@ -433,7 +432,7 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
             if (r != 0) && ((r ^ b) < 0) { r + b } else { r }
         }
         OpCode::IntSignext if (1..=8).contains(&b) => {
-            // blackhole.py:568 bhimpl_int_signext → support.py:30 int_signext.
+            // `blackhole.bhimpl_int_signext` delegates to `support.int_signext`.
             crate::support::int_signext(a, b)
         }
         OpCode::UintMulHigh => {
@@ -445,8 +444,8 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
     Some(result)
 }
 
-/// executor.py:495-498 ptr-compare row of EXECUTE_BY_NUM_ARGS.
-/// Mirrors blackhole.py bhimpl_ptr_eq/_ne and instance_ptr_eq/_ne —
+/// Pointer-comparison row of `executor.EXECUTE_BY_NUM_ARGS`.
+/// Mirrors `blackhole.bhimpl_ptr_eq`, `bhimpl_ptr_ne`, and their instance forms:
 /// straight pointer identity once both args are constant references.
 pub fn execute_ptr_compare_const(opcode: OpCode, a: usize, b: usize) -> Option<i64> {
     let result = match opcode {
@@ -457,13 +456,12 @@ pub fn execute_ptr_compare_const(opcode: OpCode, a: usize, b: usize) -> Option<i
     Some(result as i64)
 }
 
-/// executor.py:495-498 unary-int row of EXECUTE_BY_NUM_ARGS, the
-/// 1-arg variant. Mirrors blackhole.py:528-566 bhimpl_int_neg /
-/// _invert / _is_zero / _is_true / _force_ge_zero.
+/// Unary-int row of `executor.EXECUTE_BY_NUM_ARGS`. Mirrors the corresponding
+/// `blackhole.bhimpl_int_*` helpers.
 ///
 /// Returns `None` for unrecognized opcodes so the caller can fall
-/// through to other dispatch paths (executor.py:559's `assert False`
-/// shape is reserved for non-matching opnums via the unrolled match).
+/// through to other dispatch paths; upstream's unrolled dispatcher reserves
+/// its terminal assertion for opcodes with no matching row.
 pub fn execute_unary_int_const(opcode: OpCode, a: i64) -> Option<i64> {
     let result = match opcode {
         OpCode::IntNeg => a.wrapping_neg(),
@@ -476,8 +474,8 @@ pub fn execute_unary_int_const(opcode: OpCode, a: i64) -> Option<i64> {
     Some(result)
 }
 
-/// executor.py:495-498 unary-float row mirrors blackhole.py float
-/// unops: bhimpl_float_neg / _abs.
+/// Unary-float row of `executor.EXECUTE_BY_NUM_ARGS`, mirroring
+/// `blackhole.bhimpl_float_neg` and `bhimpl_float_abs`.
 pub fn execute_unary_float_const(opcode: OpCode, a: f64) -> Option<f64> {
     let result = match opcode {
         OpCode::FloatNeg => -a,
@@ -487,14 +485,13 @@ pub fn execute_unary_float_const(opcode: OpCode, a: f64) -> Option<f64> {
     Some(result)
 }
 
-/// executor.py:495-498 binary-float row. Float arithmetic + comparisons
-/// (comparisons return bool wrapped as 0/1 in the caller). Mirrors
-/// blackhole.py bhimpl_float_add/_sub/_mul/_truediv (`:697-718`).
+/// Binary-float row of `executor.EXECUTE_BY_NUM_ARGS`, mirroring the
+/// corresponding `blackhole.bhimpl_float_*` helpers.
 /// FLOAT_TRUEDIV with `b == 0.0` is NOT folded — see upstream
 /// `test_optimizebasic.test_float_division_by_multiplication` which
 /// preserves `float_truediv(f, 0.0)` in the optimized loop rather than
 /// freezing the IEEE inf/nan constant. The runtime executor still
-/// performs `a / b` per `blackhole.py:717` (translated C semantics);
+/// performs `a / b` through `blackhole.bhimpl_float_truediv`;
 /// only trace-time folding is suppressed.
 pub fn execute_binary_float_const(opcode: OpCode, a: f64, b: f64) -> Option<f64> {
     let result = match opcode {
@@ -507,8 +504,8 @@ pub fn execute_binary_float_const(opcode: OpCode, a: f64, b: f64) -> Option<f64>
     Some(result)
 }
 
-/// executor.py:495-498 float→bool row. Mirrors blackhole.py
-/// bhimpl_float_lt/_le/_eq/_ne/_gt/_ge.
+/// Float-comparison row of `executor.EXECUTE_BY_NUM_ARGS`, mirroring the
+/// corresponding `blackhole.bhimpl_float_*` comparison helpers.
 pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64> {
     let result = match opcode {
         OpCode::FloatLt => a < b,
@@ -522,40 +519,14 @@ pub fn execute_float_compare_const(opcode: OpCode, a: f64, b: f64) -> Option<i64
     Some(result as i64)
 }
 
-/// `executor.py::execute_nonspec_const` delegates to `_execute_arglist`,
-/// which raises `NotImplementedError` when no helper is registered
-/// for the opnum. RPython's `Optimizer.constant_fold` does not catch
-/// that exception; it propagates to the caller. Pyre encodes the same
-/// dispatch distinction at the type level:
-///   * `Err(NoConstExecutor)` — no helper claimed the opnum (terminal
-///     fall-through below), mirroring the upstream raise.
-///   * `Ok(None)` — a helper claimed the opnum but declined to fold
-///     (null gcref, unsupported field size, etc.); pyre keeps these
-///     as `Ok(None)` so the caller can still see "helper ran, fold
-///     skipped" distinctly from "no helper".
-///   * `Ok(Some(value))` — successful fold.
+/// Constant-fold dispatch corresponding to `executor.execute_nonspec_const`
+/// and `executor._execute_arglist`. RPython raises `NotImplementedError` when
+/// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` has no helper; Pyre preserves
+/// that distinction without using an exception:
 ///
-///     `executor.py::execute_nonspec_const` free function — the
-///     generic opnum dispatch invoked by `Optimizer.constant_fold`
-///     once every arg has been resolved to a `Const*` via
-///     `get_constant_box`. Mirrors the RPython structure:
-///
-/// ```python
-/// def execute_nonspec_const(cpu, metainterp, opnum, argboxes,
-///                           descr=None, type='i'):
-///     for num in unrolled_range:
-///         if num == opnum:
-///             return wrap_constant(_execute_arglist(cpu, metainterp, num,
-///                                                    argboxes, descr))
-///     assert False
-/// ```
-///
-/// `_execute_arglist` (executor.py:563-610) selects
-/// `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` and raises
-/// `NotImplementedError` (`:610`) only when no function is registered
-/// for the opnum. Pyre returns `Err(NoConstExecutor)` for that case and `Ok(None)`
-/// for helper-internal "decline to fold" outcomes (e.g. null gcref,
-/// unsupported field size).
+/// - `Err(NoConstExecutor)` means no helper is registered for the opcode.
+/// - `Ok(None)` means a registered helper declined to fold its operands.
+/// - `Ok(Some(value))` contains the folded constant.
 ///
 /// `_type` is accepted for signature parity with RPython's `type`
 /// parameter; it is not consulted because the Value variant in
@@ -747,10 +718,8 @@ pub fn execute_nonspec_const(
         }
     }
 
-    // `executor.py::_execute_arglist` raises `NotImplementedError`
-    // when `EXECUTE_BY_NUM_ARGS[arity, withdescr][opnum]` is None.
-    // RPython's `Optimizer.constant_fold` lets that propagate; Pyre
-    // encodes the same missing-helper signal as `Err(NoConstExecutor)`.
+    // Preserve `_execute_arglist`'s missing-helper outcome separately from the
+    // `Ok(None)` outcome returned by a registered helper.
     Err(NoConstExecutor)
 }
 

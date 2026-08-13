@@ -1062,23 +1062,18 @@ fn derive_pc_live_indices_from_sparse(
         .collect()
 }
 
-/// Per-`py_pc` pre-merge index of the post-`residual_call` `-live-` that
-/// immediately precedes a `catch_exception`, derived from a SPLICED
-/// (canonical) SSARepr.  These after-residual-call resume anchors feed the
-/// runtime's post-call catch-marker twin once
-/// `compute_liveness_with_pc_anchors` remaps them (`liveness.rs:78-81`) into
-/// the spliced bytes.  For each `catch_exception`, the bare `-live-` directly
-/// before it is the anchor, keyed to the canraise opcode that owns the call
-/// (the py_pc whose `pc_first_insn_pos` range contains the marker).
+/// Derive the pre-merge `-live-` anchor that immediately precedes each
+/// `catch_exception` in the canonical SSA representation. The anchor is keyed
+/// by the Python PC whose `pc_first_insn_pos` range owns it, then
+/// `compute_liveness_with_pc_anchors` remaps it into the spliced instruction
+/// stream used by the runtime's post-call catch marker.
 ///
 /// `derive_after_call_indices_from_sparse` stores one anchor per Python PC.
-/// Multiple `catch_exception` sites owned by one PC would overwrite that entry,
-/// causing `catch_target_extra_ref_colors` to widen from only the final site's
-/// landing. The representation is sound because `catch_exception` is emitted
+/// Multiple `catch_exception` sites owned by one PC would overwrite that entry.
+/// The representation is sound because `catch_exception` is emitted
 /// once for each can-raise block exit, while additional catch links from a
 /// multi-exit block lower through `make_exception_link`, which emits no
-/// `catch_exception`. Enabling `PYRE_CATCH_LIVE_CENSUS` reports `multi_site_pcs`
-/// so this one-site-per-PC invariant can be checked against any input corpus.
+/// `catch_exception`.
 fn derive_after_call_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,

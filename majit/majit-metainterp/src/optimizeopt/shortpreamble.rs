@@ -2095,16 +2095,15 @@ impl AbstractShortPreambleBuilderState {
         preamble_op
     }
 
-    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
-    /// Non-recursive: iterates preamble_op's args (adding non-input deps
-    /// + guards to short), then appends preamble_op + result guards.
+    /// Non-recursive port of `AbstractShortPreambleBuilderState.use_box`: adds
+    /// non-input dependencies and guards for `preamble_op`, then appends the
+    /// operation and its result guards.
     /// Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// Dependency args carry the dep's replay op object (produce_arg
     /// object-carry); a non-input, non-const arg whose bound op still
     /// holds the builder's `set_forwarded` marker IS a short-box replay
-    /// op — append it and consume the marker (upstream
-    /// `arg.set_forwarded(None)`, shortpreamble.py:391-396).
+    /// op; append it and consume its marker with `arg.set_forwarded(None)`.
     fn use_box(
         &mut self,
         preamble_op: &majit_ir::OpRc,
@@ -2337,20 +2336,20 @@ impl ShortPreambleBuilder {
         Some(self.state.append_to_short(result.to_opref(), &produced))
     }
 
-    /// shortpreamble.py:310: add_op_to_short — recursive, used during
+    /// Recursive `ShortPreambleBuilder.add_op_to_short`, used during
     /// export-time create_short_boxes to resolve transitive dependencies.
     pub fn add_op_to_short(&mut self, result: &majit_ir::operand::Operand) -> Option<Op> {
         self.use_box_recursive(result, &mut IndexSet::new())
             .map(|op| (*op).clone())
     }
 
-    /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
+    /// Port of `AbstractShortPreambleBuilderState.use_box`.
     /// Non-recursive. Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// RPython passes `preamble_op.preamble_op` directly — the replay op
     /// IS the carried object, so there is no entry-selection lookup. The
     /// pop's replay Rc is the builder's own object (threaded by the
-    /// produce_op family), verified by the debug probe below.
+    /// `produce_op` family), verified against the builder entry.
     pub fn use_box(
         &mut self,
         source: OpRef,
@@ -3115,7 +3114,8 @@ impl ExtendedShortPreambleBuilder {
         remapped
     }
 
-    /// shortpreamble.py:478-481: use_box — pop JUMP, add deps, re-append JUMP.
+    /// Port of `ExtendedShortPreambleBuilder.use_box`: pop `JUMP`, add its
+    /// dependencies, and append `JUMP` again.
     /// Called by `OptUnroll.force_op_from_preamble`.
     ///
     /// RPython passes `preamble_op.preamble_op` directly — the pop's

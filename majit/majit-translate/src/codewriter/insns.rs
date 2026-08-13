@@ -1174,20 +1174,12 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
 ///    JIT machine from a single function definition. RPython's
 ///    metaprogramming is runtime / annotator-driven and has no
 ///    proc-macro counterpart. The generated machine carries a
-///    `JitCodeSym` whose state-field slots are accessed by flat slot
-///    index (`d` argcode) without an explicit virtualizable-pointer
-///    register — the canonical `setfield_vable_*` shape (`r` vable-ptr
-///    + `d` FieldDescr) does not apply because the entire machine IS
-///      the vable, accessed via the implicit `self` of the proc-macro-
-///      generated handler functions.  Migration to canonical `*_vable_*`
-///      is feasible (see `epic_e_task94b_prereq_audit_2026_05_04.md`) but
-///      requires materializing `state` as a vable-ptr register +
-///      synthesizing FieldDescr/ArrayDescr/LenDescr objects for every
-///      state slot — a 4-6 session proc-macro refactor with non-obvious
-///      failure modes. Per CLAUDE.md, the proc-macro bridge is itself
-///      a permitted Rust adaptation, so quarantining the 6 keys is the
-///      orthodox shape: keep `wellknown_bh_insns()` strictly canonical and
-///      keep proc-macro state addressing in `pyre_local_bh_insns()`.
+///    `JitCodeSym` whose state fields use flat slot indices (`d` argcode)
+///    without an explicit virtualizable-pointer register. The canonical
+///    `setfield_vable_*` shape requires an `r` vable pointer plus a `d`
+///    `FieldDescr`, so it cannot address these proc-macro-owned slots. Keeping
+///    the six state opcodes in `pyre_local_bh_insns()` isolates that adaptation
+///    while `wellknown_bh_insns()` remains canonical.
 ///
 /// All extension keys retain their fixed `BC_*` byte values in the same
 /// number-space as the canonical opcodes; only the catalogue is split

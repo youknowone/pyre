@@ -393,11 +393,10 @@ impl RegAllocator {
 ///   `FunctionGraph::new` with `Unknown` placeholders; this helper
 ///   stamps the canonical Signed / GcRef kinds whenever the rtyper
 ///   hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
-///   did not. `augment_canonical_exceptblock_on_graph` replaces the retired
-///   `augment_value_kinds_*` helper by writing directly to each backing
-///   `Variable.concretetype` cell via
-///   `FunctionGraph::set_concretetype_of_inline` instead of returning
-///   a transitional HashMap.
+///   did not. This function writes directly to each backing
+///   `Variable.concretetype` cell through
+///   `FunctionGraph::set_concretetype_of_inline`, preserving the graph as the
+///   sole kind owner.
 pub(crate) fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
     let except_args = &graph.block(graph.exceptblock).inputargs;
     if except_args.len() == 2 {

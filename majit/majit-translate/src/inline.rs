@@ -1212,7 +1212,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // pure.
         | OpKind::LoadStatic { .. } => true,
         // Per-opname classification for `OpKind::BinOp` mirrors
-        // `simplify.CanRemove` (`simplify.py:405-417`) +
+        // `simplify.CanRemove` and
         // `enum_ops_without_sideeffects()` for binary ops.  Pyre's
         // `OpKind::BinOp` carries the opname as a string field, so
         // the parity-correct classification is opname-keyed rather
@@ -1230,9 +1230,9 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::UnaryOp { op, .. } => is_pure_unary_opname(op),
         // Side-effecting writes / calls / guards / markers / aborts.
         // `direct_call`-family ops are routed here even when the
-        // callee is elidable: `simplify.py:441-445`'s `canremove`
+        // callee is elidable: `simplify.transform_dead_op_vars`'s `canremove`
         // split treats `direct_call` as side-effecting (args go
-        // straight to `read_vars`), and `simplify.py:500` performs a
+        // straight to `read_vars`), and the same function performs a
         // separate elidable-graph removal that requires `translator`
         // to be supplied (pyre's call site passes `translator=None`,
         // so the removal arm is unreachable).  The post-jtransform
@@ -1272,7 +1272,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
 
         // `LoweredBlackholeOp` carries register-shaped blackhole insns whose
         // side-effect class is opname-dependent — the same split `op_can_raise`
-        // (`call.rs`) and upstream `lloperation.py:382-383` (sideeffects /
+        // (`call.rs`) and upstream `lloperation.LL_OPERATIONS` (sideeffects /
         // canfold) make.  The read family
         // (`strlen`/`unicodelen`/`strgetitem`/`unicodegetitem`) is
         // pure/removable; the alloc/store/copy family
@@ -1306,37 +1306,34 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
 
 /// Whitelist of `OpKind::UnaryOp` opnames that are side-effect-free
 /// upstream — direct port of the unary entries in
-/// `simplify.CanRemove` (`rpython/translator/simplify.py:405-417`)
+/// `simplify.CanRemove`
 /// + `enum_ops_without_sideeffects()`
 ///   (`lloperation.enum_ops_without_sideeffects`).
 ///
 /// Any opname not in this list is treated as side-effecting so the
 /// dead-op DCE pass does not silently remove it.  Notably absent:
-/// `not` — Python's `not` is control flow, `operation.py:465-474`
-/// does not register it; pyre's adapter
-/// (`translator/rtyper/flowspace_adapter.rs:344-353`) requires the
+/// `not` — Python's `not` is control flow and `flowspace.operation` does not
+/// register it; pyre's `flowspace_adapter` requires the
 /// frontend to desugar `!x` away before reaching the rtyper, so DCE
 /// must surface a live `not` op to the rtyper rather than silently
 /// dropping a dead one.  `front::mir` collapses Rust deref `*x`
 /// (no flowspace peer) when it lowers `UnaryOp`/`Deref`, so the
-/// frontend never emits it; when the frontend stops emitting `not`,
-/// this whitelist will only retain post-jtransform / rtyper-emitted
-/// opnames.
+/// frontend never emits it.
 /// Whitelist of `OpKind::BinOp` opnames that are side-effect-free
 /// upstream — direct port of the binary entries in
-/// `simplify.CanRemove` (`simplify.py:405-417`) +
+/// `simplify.CanRemove` plus
 /// `enum_ops_without_sideeffects()`.
 ///
 /// Notable omissions:
 ///   - `and` / `or` (no trailing underscore): Rust `&&` / `||`
-///     short-circuit operators; `operation.py:475-510` does not
+///     short-circuit operators; `flowspace.operation` does not
 ///     register them as binary operators (they are control flow),
 ///     and `translator/rtyper/flowspace_adapter.rs:392-400` requires
 ///     the frontend to desugar them before reaching the rtyper.  DCE
 ///     must keep dead occurrences alive so the rtyper surfaces the
 ///     fail-loud TyperError instead of silently dropping them.  The
-///     trailing-underscore canonical names `and_` / `or_` (PyPy's
-///     bitwise AND/OR registered at `operation.py:485-486`) ARE
+///     trailing-underscore canonical names `and_` / `or_` are PyPy's
+///     registered bitwise AND/OR operations and are
 ///     pure and listed below.
 ///   - `*_assign` (Rust compound assignments): `inplace_*` upstream;
 ///     `simplify.py:CanRemove` does not include `inplace_*`, and
@@ -1351,14 +1348,13 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
 ///     surfaced by frontend lowering passes, not via BinOp/UnaryOp.
 ///   - `getattr` — variable arity (`getattr(o, name [, default])`),
 ///     pyre lowers as `OpKind::FieldRead` / Call rather than BinOp.
-///   - `get` (`operation.py:514`) — 3-arg descriptor `__get__`; pyre
+///   - `get` — three-argument descriptor `__get__`; pyre
 ///     has no TernaryOp surface.  Drop is the call-DCE's concern.
 fn is_pure_binop_opname(opname: &str) -> bool {
     if matches!(
         opname,
-        // `simplify.py:405-417` CanRemove — every entry registered as
-        // a 2-arg `add_operator(...)` at `flowspace/operation.py`.
-        // Arithmetic — `operation.py:475-484`.
+        // `simplify.CanRemove` entries registered through
+        // `flowspace.operation.add_operator`.
         "add"
         | "sub"
         | "mul"
@@ -1370,8 +1366,7 @@ fn is_pure_binop_opname(opname: &str) -> bool {
         | "pow"
         | "lshift"
         | "rshift"
-        // Canonical PyPy bitwise binops — `simplify.py:410-411`
-        // `and_ or_ xor` (`operation.py:485-487`).  These are the
+        // Canonical PyPy bitwise binops `and_`, `or_`, and `xor`. These are the
         // trailing-underscore forms that surface after
         // `flowspace_adapter.rs:379-381 normalize_binop_name` rewrites
         // pyre's `bitand`/`bitor`/`bitxor`; both forms are pure so the
@@ -1382,21 +1377,15 @@ fn is_pure_binop_opname(opname: &str) -> bool {
         | "bitand"
         | "bitor"
         | "bitxor"
-        // Comparisons — `simplify.py:411 lt le eq ne gt ge`.
+        // Comparisons from `simplify.CanRemove`.
         | "lt"
         | "le"
         | "eq"
         | "ne"
         | "gt"
         | "ge"
-        // Remaining 2-arg CanRemove entries:
-        //   is_       operation.py:445  (identity test)
-        //   issubtype operation.py:448  (issubclass for new-style classes)
-        //   isinstance operation.py:449
-        //   getitem   operation.py:457
-        //   cmp       operation.py:511  (`simplify.py:411`)
-        //   coerce    operation.py:512  (`simplify.py:411`)
-        //   contains  operation.py:513  (`simplify.py:411`)
+        // Remaining two-argument `CanRemove` entries: identity/type tests,
+        // indexing, comparison, coercion, and containment.
         | "is_"
         | "issubtype"
         | "isinstance"

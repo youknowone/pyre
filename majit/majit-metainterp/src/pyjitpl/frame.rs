@@ -305,9 +305,9 @@ impl MIFrame {
     /// `(vable_reg, field_idx, dest_reg)` per
     /// `assembler.py::Assembler.write_insn` and `Assembler.write_op_live`.
     /// Canonical layout: 1B vable_reg + 2B descr_pool_idx
-    /// + 1B dest_reg. The leading `r` operand carries the live struct
-    ///   register consumed as the `struct` argument by RPython
-    ///   the `_opimpl_setfield_vable_*` family in `pyjitpl.py`.
+    /// + 1B dest_reg. The leading `r` operand carries the live struct register
+    /// consumed as the `struct` argument by the `_opimpl_setfield_vable_*`
+    /// family in `pyjitpl.py`.
     pub fn read_vable_getfield(&mut self) -> (usize, usize, usize) {
         let field_idx = self.vable_field_index_at(self.code_cursor + 1);
         let base = self.next_u8() as usize;

@@ -5029,21 +5029,20 @@ fn bhimpl_int_add(a: i64, b: i64) -> i64 {
     a.wrapping_add(b)
 }
 
-/// blackhole.py:462-464 `bhimpl_int_sub(a, b): return intmask(a - b)`.
+/// Port of `blackhole.bhimpl_int_sub`: `return intmask(a - b)`.
 fn bhimpl_int_sub(a: i64, b: i64) -> i64 {
     a.wrapping_sub(b)
 }
 
-/// blackhole.py:466-468 `bhimpl_int_mul(a, b): return intmask(a * b)`.
+/// Port of `blackhole.bhimpl_int_mul`: `return intmask(a * b)`.
 fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
     a.wrapping_mul(b)
 }
 
-/// RPython `rint.py:399-408 ll_int_py_div` (oopspec `int.py_div`).
+/// Port of `rint.ll_int_py_div` (oopspec `int.py_div`).
 /// The OS_INT_PY_DIV residual call lands here at runtime. The JIT
 /// trace contains two explicit guards upstream of this call,
-/// produced by the inlined `_ovf_zer` wrapper (`rint.py:429
-/// ll_int_py_div_ovf_zer`):
+/// produced by the inlined `rint.ll_int_py_div_ovf_zer` wrapper:
 ///   * `int_eq(rhs, 0) -> guard_false` (zero divisor),
 ///   * `int_and(int_eq(lhs, INT_MIN), int_eq(rhs, -1)) ->
 ///     guard_false` (overflow corner — `INT_MIN // -1` would
@@ -5064,8 +5063,8 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// path: the `_ovf_zer` wrapper's `int_eq(rhs, 0) -> guard_false` and
 /// `(lhs == INT_MIN) & (rhs == -1) -> guard_false` runtime guards
 /// (emitted at `codegen.rs::generated_binary_int_value`) bail out the
-/// trace before this helper is invoked, matching RPython's
-/// `rint.py:429 ll_int_py_div_ovf_zer` shape.  Direct (non-traced)
+/// trace before this helper is invoked, matching
+/// `rint.ll_int_py_div_ovf_zer`. Direct non-traced
 /// callers must respect the same precondition.
 ///
 /// `extern "C"`: the residual-call path
@@ -5085,7 +5084,7 @@ pub extern "C" fn ll_int_py_div(a: i64, b: i64) -> i64 {
     }
 }
 
-/// RPython `rint.py:496-500 ll_int_py_mod` (oopspec `int.py_mod`).
+/// Port of `rint.ll_int_py_mod` (oopspec `int.py_mod`).
 /// See [`ll_int_py_div`] for the JIT-side runtime guard
 /// rationale (`int_eq(rhs, 0)` + `(lhs == INT_MIN) & (rhs == -1)`).
 /// Uses `wrapping_rem` for the C-style remainder step, then applies
