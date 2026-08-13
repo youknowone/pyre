@@ -676,17 +676,6 @@ impl wire::MarshalBag for PyreMarshalBag {
         Rooted::new(crate::pycode::box_code_constant(&code))
     }
 
-    fn make_code_with_constants(
-        &self,
-        code: CodeObject<ConstantData>,
-        constants: Vec<Rooted>,
-    ) -> Rooted {
-        let result = Rooted::new(crate::pycode::box_code_constant(&code));
-        let constants: Vec<PyObjectRef> = constants.iter().map(|value| value.get()).collect();
-        unsafe { crate::pycode::w_code_fill_consts_from_objects(result.get(), &constants) };
-        result
-    }
-
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
         crate::builtins::lookup_exc_class("StopIteration")
             .map(Rooted::new)
@@ -813,35 +802,6 @@ impl wire::MarshalBag for PyreMarshalBag {
 
     fn constant_ref_from_value(&self, value: &Rooted) -> Option<ConstantData> {
         unsafe { crate::pycode::obj_to_constant_data(value.get()).ok() }
-    }
-
-    fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
-        Ok(self
-            .constant_ref_from_value(value)
-            .unwrap_or(ConstantData::None))
-    }
-
-    fn bytes_from_value(&self, value: &Rooted) -> Option<Vec<u8>> {
-        unsafe {
-            bytesobject::is_bytes_like(value.get())
-                .then(|| bytesobject::bytes_like_data(value.get()).to_vec())
-        }
-    }
-
-    fn str_from_value(&self, value: &Rooted) -> Option<String> {
-        unsafe { is_str(value.get()).then(|| w_str_get_value_opt(value.get()).map(str::to_owned))? }
-    }
-
-    fn tuple_elements_from_value(&self, value: &Rooted) -> Option<Vec<Rooted>> {
-        unsafe {
-            if !is_tuple(value.get()) {
-                return None;
-            }
-            let len = w_tuple_len(value.get());
-            (0..len)
-                .map(|index| w_tuple_getitem(value.get(), index as i64).map(Rooted::new))
-                .collect()
-        }
     }
 }
 

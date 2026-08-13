@@ -99,13 +99,6 @@ class MarshalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             marshal.dumps([orig], allow_code=False)
 
-    def test_code_roundtrip_retains_runtime_constants(self):
-        code = compile("None", "<marshal>", "eval")
-        for value in ([], {}, {1}, (1, [2])):
-            replaced = code.replace(co_consts=(value,))
-            loaded = marshal.loads(marshal.dumps(replaced))
-            self.assertEqual(loaded.co_consts, (value,))
-
     def test_file_readinto_error_is_not_treated_as_absent(self):
         class BrokenReadInto:
             def readinto(self, buffer):
