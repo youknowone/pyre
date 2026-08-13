@@ -19883,6 +19883,10 @@ fn init_object_type(ns: PyObjectRef) {
                         unsafe { pyre_object::w_tuple_len(args[0]) as i64 }
                     } else if unsafe { pyre_object::is_bytes(args[0]) } {
                         unsafe { pyre_object::w_bytes_len(args[0]) as i64 }
+                    } else if unsafe { pyre_object::is_type(args[0]) } {
+                        // A type's variable tail is its `__slots__` member
+                        // table, so `Py_SIZE` is the slot count.
+                        unsafe { pyre_object::w_type_get_nslots(args[0]) as i64 }
                     } else if std::ptr::eq(
                         unsafe { pyre_object::w_type_get_layout(w_type) },
                         &pyre_object::memoryview::MEMORYVIEW_TYPE,
