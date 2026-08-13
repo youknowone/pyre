@@ -2106,8 +2106,11 @@ impl Optimizer {
     /// failing a guard has no back edge and runs zero iterations while
     /// reporting a healthy-looking op total.
     ///
-    /// `label` names which of the three compile paths produced the trace, since
-    /// they differ in whether the body was unrolled.
+    /// `label` names which compile path produced the trace, since they differ
+    /// in whether the body was unrolled and whether it is a bridge. Bridges
+    /// must be logged too: they take trace ids from the same counter the loops
+    /// draw from, so omitting them leaves gaps that make a dumped trace
+    /// impossible to line up with the `trace=` field of a guard-failure log.
     pub fn log_optimized_trace<V, T, C>(label: &str, ops: &[T], constants: &C)
     where
         V: std::fmt::Debug,

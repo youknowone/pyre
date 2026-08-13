@@ -12790,6 +12790,11 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("--- bridge trace (after opt) ---");
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
+        crate::optimizeopt::optimizer::Optimizer::log_optimized_trace(
+            "compile_bridge",
+            &optimized_ops,
+            &constants,
+        );
 
         // compile.py:27-29 giveup() parity: a bridge whose terminal JUMP
         // targets an already-compiled loop must supply exactly as many args
