@@ -1370,12 +1370,27 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
     }
 }
 
+/// Resolve a recorded box to the concrete ref it stands for.
+///
+/// A NULL `Ref` is an UNRESOLVED box, not a slot whose value is null: a box
+/// carries a concrete only once the walk materialized one, and an operand the
+/// walk still holds symbolically — a deferred `LOAD_ATTR name + NULL|self`
+/// pair is the shape that reaches here — reads back `Ref(0)`.  Answer
+/// unresolved, as [`concrete_ref_for_color`] and the virtualizable-shadow
+/// fallback in [`collect_call_stack_overrides`] already do, so the slot stays
+/// ABSENT and the outer-call flush declines to the legacy replay.  Publishing
+/// it instead writes a null into a live operand-stack slot, and the
+/// interpreter resumed there dispatches through it: `out.append(f(i))` in an
+/// `except` handler faulted in `classify_callable` on the method-load slot
+/// this used to hand back as a resolved value.  The one operand whose correct
+/// value IS null — a `CALL`'s own `null_or_self` — is named and supplied
+/// separately by that function.
 pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(Value::Ref(r)) => Some(r.as_usize() as pyre_object::PyObjectRef),
+        Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
         _ => None,
     }
 }

@@ -5233,6 +5233,15 @@ fn flush_walk_end_state_to_frame_inner(
     let have_overrides = full_stack.is_some() || !stack_overrides.is_empty();
     for abs in 0..live {
         if abs >= nlocals && have_overrides {
+            // An override is taken as authoritative, INCLUDING a null one — the
+            // NULL-operand-slot refusal below cannot run here, because a
+            // `CALL`'s `null_or_self` is a live slot whose correct value is
+            // exactly null.  Keeping a null out of every OTHER slot is
+            // therefore the producer's obligation:
+            // `collect_call_stack_overrides` resolves each slot through
+            // sources that report a null as UNRESOLVED and injects the one
+            // sentinel by name, so a slot it could not resolve arrives absent
+            // and declines here rather than arriving as a null.
             if stack_override_at(abs).is_none() {
                 return decline("stack override missing for a live slot");
             }
