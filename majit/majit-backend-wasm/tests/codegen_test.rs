@@ -25,6 +25,17 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The wasm-host module these runtime tests measure.
+///
+/// Only the snapshot path, never the raw `pyre_wasm.wasm` cargo output: the
+/// `web` and `wasm-host` features of `pyre-wasm` build to that one filename and
+/// overwrite each other, so a tree that last built `web` leaves a module there
+/// which loads and runs but is not the one whose counters these tests pin.
+/// `check.py` copies the wasm-host build here for exactly that reason.
+fn wasm_host_module(root: &Path) -> PathBuf {
+    root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm")
+}
+
 fn run_runtime_program(
     binary: &Path,
     script: &Path,
@@ -56,13 +67,7 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
         assert!(
@@ -118,13 +123,7 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/raise_catch_loop.py");
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -170,13 +169,7 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/fib_recursive.py");
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -209,8 +202,14 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
         wasm_run.stdout, dynasm_run.stdout,
         "wasm recursive fib output diverged from dynasm:\n{stderr}"
     );
-    assert_eq!(stat_value(&stderr, "compiles"), 4);
-    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 3);
+    // `compiles` is the host's module-compile tally, one per loop and one per
+    // bridge, and `BRIDGE_OK` counts the bridges the backend accepted — the
+    // same event `bridges_compiled` counts, since both are bumped only on the
+    // `Ok` side of `compile_bridge`. So both follow from the committed
+    // `pyre/bench/fib_recursive.wasm.jitstats`: `loops_compiled=1` +
+    // `bridges_compiled=8`. Re-record these two alongside that baseline.
+    assert_eq!(stat_value(&stderr, "compiles"), 9);
+    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 8);
     assert!(
         !stderr.contains("memory.fill"),
         "recursive CA still refills a nursery that is already zeroed:\n{stderr}"
@@ -224,13 +223,7 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/fannkuch.py");
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
         assert!(
@@ -272,13 +265,7 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/ca_terminal_decline.py");
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -329,13 +316,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     let root = workspace_root();
     let dynasm = root.join("target/release/pyre-dynasm");
     let wasm_runner = root.join("target/release/pyre-wasm-runner");
-    let host_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm");
-    let plain_module = root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm");
-    let wasm_module = if host_module.exists() {
-        host_module
-    } else {
-        plain_module
-    };
+    let wasm_module = wasm_host_module(&root);
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
         assert!(
