@@ -157,13 +157,17 @@ def test_backward_jump_has_lineno():
 
 
 def test_inlined_comprehension_private_name_reuse():
+    # The first comprehension makes x a local of f.  Restoring its initially
+    # unbound value means that the second comprehension must not capture x
+    # from the enclosing function (matching CPython 3.12).
     x = 3
 
     def f():
         [x for x in [1]]
         return [x for _ in [1]]
 
-    assert f() == [3]
+    with pytest.raises(UnboundLocalError):
+        f()
 
 
 def test_inlined_comprehension_iterator_position():

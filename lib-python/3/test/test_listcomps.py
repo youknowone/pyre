@@ -187,7 +187,10 @@ class ListComprehensionTest(unittest.TestCase):
                 res = [__class__ for x in [1]]
             res = C.res
         """
-        self._check_in_scopes(code, raises=NameError)
+        # Module: __class__ resolves as a global (value 2).
+        # Function/class wrappers: NameError (no free __class__ through class).
+        self._check_in_scopes(code, outputs={"res": [2]}, scopes=["module"])
+        self._check_in_scopes(code, raises=NameError, scopes=["function", "class"])
 
     def test_super_and_class_cell_in_sibling_comps(self):
         code = """
