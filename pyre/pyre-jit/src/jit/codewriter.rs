@@ -5682,13 +5682,20 @@ impl CodeWriter {
         // the opname-tail-derived `ResKind` at dispatch time
         // (`assembler.rs:1370`).
         let key = (effect_info, arg_kinds, result_kind);
+        // `jit_list_append` is recorded as a void LIST_APPEND operation, but
+        // its registered fallback has the uniform `(i64, i64) -> i64` helper
+        // ABI. Preserve that physical result exactly as the other ignored-word
+        // residual producers do; the tag is part of `EffectInfo` and therefore
+        // already separates this entry in the cache key.
+        let void_word_abi =
+            key.2.is_none() && key.0.pyre_helper == majit_ir::PyreHelperKind::ListAppendValue;
         let mut cache = self.call_descr_stub_cache.lock().unwrap();
         let arc = cache.entry(key.clone()).or_insert_with(|| {
             Arc::new(CallDescrStub {
                 effect_info: key.0.clone(),
                 arg_kinds: key.1.clone(),
                 result_kind: key.2,
-                void_word_abi: false,
+                void_word_abi,
             })
         });
         arc.clone() as Arc<dyn majit_ir::Descr>
@@ -15912,6 +15919,20 @@ mod tests {
     use pyre_interpreter::bytecode::{CodeObject, ConstantData};
     use pyre_interpreter::compile_exec;
     use std::sync::Arc;
+
+    #[test]
+    fn list_append_void_stub_records_ignored_word_abi() {
+        let writer = CodeWriter::new();
+        let mut effect_info = super::super::flatten::effect_info_for_call_flavor(CallFlavor::Plain);
+        effect_info.pyre_helper = majit_ir::PyreHelperKind::ListAppendValue;
+        let descr = writer.intern_call_descr_stub(effect_info, vec![Kind::Ref, Kind::Ref], None);
+        let stub = descr
+            .as_any()
+            .and_then(|descr| descr.downcast_ref::<CallDescrStub>())
+            .expect("interned call descr must remain a CallDescrStub");
+
+        assert!(stub.void_word_abi);
+    }
 
     #[test]
     fn frame_layout_slot_places_operand_stack_after_non_argument_deref_slots() {

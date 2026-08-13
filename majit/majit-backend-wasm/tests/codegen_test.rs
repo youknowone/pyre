@@ -9,7 +9,7 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, ExtraEffect, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
+use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRef, PyreHelperKind, Type};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store};
 
@@ -968,13 +968,29 @@ fn test_call_generates_import() {
     assert!(has_jit_call, "module should import jit_call_compact");
 }
 
-fn true_void_call(helper: PyreHelperKind) -> Op {
+fn void_call(arg_types: Vec<Type>, args: &[OpRef], result_size: usize) -> Op {
+    void_call_with_helper(arg_types, args, result_size, PyreHelperKind::None)
+}
+
+fn void_call_with_helper(
+    arg_types: Vec<Type>,
+    args: &[OpRef],
+    result_size: usize,
+    helper: PyreHelperKind,
+) -> Op {
+    let mut operands = vec![rb(OpRef::const_int(42))];
+    operands.extend(args.iter().copied().map(rb));
+    let op = Op::new(OpCode::CallN, &operands);
     let mut effect = EffectInfo::default();
-    effect.extraeffect = ExtraEffect::CannotRaise;
-    effect.can_collect = false;
     effect.pyre_helper = helper;
-    let op = Op::new(OpCode::CallN, &[rb(OpRef::const_int(42))]);
-    op.setdescr(majit_ir::make_call_descr(vec![], Type::Void, effect));
+    op.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        arg_types,
+        Type::Void,
+        false,
+        result_size,
+        effect,
+    ));
     op
 }
 
@@ -1028,11 +1044,28 @@ fn indirect_call_types_and_drop_count(bytes: &[u8]) -> (Vec<(u32, u32)>, usize) 
     (indirect_calls, drops)
 }
 
+fn function_type(
+    bytes: &[u8],
+    type_index: usize,
+) -> (Vec<wasmparser::ValType>, Vec<wasmparser::ValType>) {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::TypeSection(types) = payload.unwrap() {
+            let ty = types
+                .into_iter_err_on_gc_types()
+                .nth(type_index)
+                .unwrap_or_else(|| panic!("missing function type {type_index}"))
+                .unwrap();
+            return (ty.params().to_vec(), ty.results().to_vec());
+        }
+    }
+    panic!("module has no type section");
+}
+
 #[test]
-fn test_clear_in_flight_exception_uses_true_void_indirect_call() {
+fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![
-        true_void_call(PyreHelperKind::ClearInFlightException),
+        void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
@@ -1047,11 +1080,137 @@ fn test_clear_in_flight_exception_uses_true_void_indirect_call() {
 }
 
 #[test]
-fn test_untagged_size_zero_void_call_keeps_trampoline() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Ref, 1),
+    ];
     let ops = vec![
-        true_void_call(PyreHelperKind::None),
+        void_call(
+            vec![Type::Int, Type::Ref],
+            &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
+            0,
+        ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(3, 0)]);
+    assert_eq!(
+        function_type(&bytes, 3),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![]
+        )
+    );
+    assert_eq!(drops, 0, "a genuine void call has no result to drop");
+}
+
+#[test]
+fn test_true_void_family_does_not_shift_new_call_type() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        void_call(
+            vec![Type::Ref, Type::Ref],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            0,
+        ),
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(6, 0), (1, 0), (3, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, 6),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![]
+        )
+    );
+    assert_eq!(
+        function_type(&bytes, 3),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 0);
+}
+
+#[test]
+fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type(Type::Int, 2),
+    ];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        void_call_with_helper(
+            vec![Type::Ref, Type::Ref],
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+            8,
+            PyreHelperKind::ListAppendValue,
+        ),
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
+    ];
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 1);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(3, 0), (1, 0), (3, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, indirect_calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        ),
+        "jit_list_append returns an ignored machine word"
+    );
+    assert_eq!(
+        function_type(&bytes, indirect_calls[2].0 as usize),
+        (
+            vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        ),
+        "New must reference its declared (i64, i64) -> i64 type"
+    );
+    assert_eq!(drops, 1, "only jit_list_append's result is discarded");
+}
+
+#[test]
+fn test_true_void_float_arg_call_keeps_trampoline() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
 
@@ -1063,32 +1222,28 @@ fn test_untagged_size_zero_void_call_keeps_trampoline() {
 }
 
 #[test]
-fn test_malformed_tagged_void_call_keeps_trampoline() {
+fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let mut effect = EffectInfo::default();
-    effect.extraeffect = ExtraEffect::CannotRaise;
-    effect.can_collect = false;
-    effect.pyre_helper = PyreHelperKind::ClearInFlightException;
-    let call = Op::new(
-        OpCode::CallN,
-        &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
-    );
-    call.setdescr(majit_ir::make_call_descr(
-        vec![Type::Int],
-        Type::Void,
-        effect,
-    ));
     let ops = vec![
-        call,
+        void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
-    assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
-    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
-    assert!(indirect_calls.is_empty());
+    assert!(has_table_import(&bytes));
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls, vec![(2, 0), (1, 0)]);
+    assert_eq!(
+        function_type(&bytes, 2),
+        (
+            vec![wasmparser::ValType::I64],
+            vec![wasmparser::ValType::I64]
+        )
+    );
+    assert_eq!(drops, 1, "the ignored word result must be dropped");
 }
 
 #[test]
@@ -1100,7 +1255,7 @@ fn test_true_void_type_index_accounts_for_trampoline_type() {
             &[OpRef::const_int(43), OpRef::input_arg_int(0)],
             OpRef::int_op(1),
         ),
-        true_void_call(PyreHelperKind::ClearInFlightException),
+        void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
     ];
     let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
