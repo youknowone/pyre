@@ -4804,16 +4804,16 @@ impl<'a> Lowering<'a> {
                 for op in operands {
                     arg_vars.push(self.resolve_operand(mir_bb, op)?);
                 }
-                // Resolve the user-defined owner + field names from the
+                // Resolve the user-defined owner + field names and types from the
                 // Adt kind's `type_id` when possible.  Charon encodes
                 // `AggregateKind::Adt(type_id, variant_idx, ..)` as
                 // `{"Adt": [type_id, variant_idx, ..]}`; struct variants
                 // use `variant_idx = null`, enum variants index into the
                 // `TypeDeclKind::Enum` variant list.
                 let resolved = self.resolve_aggregate_adt(&kind);
-                let (owner_path, ctor_name, field_names, aggregate_owner_id) = match resolved {
-                    Some((owner_path, ctor_name, field_names, owner_id)) => {
-                        (owner_path, ctor_name, field_names, Some(owner_id))
+                let (owner_path, ctor_name, field_rows, aggregate_owner_id) = match resolved {
+                    Some((owner_path, ctor_name, field_rows, owner_id)) => {
+                        (owner_path, ctor_name, field_rows, Some(owner_id))
                     }
                     None => {
                         // Synthetic placeholders for non-Adt aggregates
@@ -4837,8 +4837,9 @@ impl<'a> Lowering<'a> {
                             aggregate_ctor_name(&kind),
                             tyref_tuple_suffix(dest_ty, self.llbc)
                         );
-                        let positional =
-                            (0..arg_vars.len()).map(|i| format!("__pos_{i}")).collect();
+                        let positional = (0..arg_vars.len())
+                            .map(|i| (format!("__pos_{i}"), String::new()))
+                            .collect();
                         (Vec::new(), leaf, positional, None)
                     }
                 };
@@ -4916,10 +4917,18 @@ impl<'a> Lowering<'a> {
                 // schema entry (tuple aggregates, deduplicated types
                 // not in the LLBC's local table).
                 for (i, value) in arg_vars.into_iter().enumerate() {
-                    let name = field_names
+                    let (name, field_ty) = field_rows
                         .get(i)
                         .cloned()
-                        .unwrap_or_else(|| format!("__pos_{i}"));
+                        .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
+                    // `_names_without_voids()` / `heaptracker.py:104-105`: a
+                    // zero-sized field occupies no storage and gets no slot,
+                    // so no write is generated for it.
+                    if crate::codewriter::call::get_type_flag(&field_ty).1
+                        == majit_ir::value::Type::Void
+                    {
+                        continue;
+                    }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::FieldWrite {
@@ -5844,14 +5853,18 @@ impl<'a> Lowering<'a> {
     /// - the field index is out of range for the resolved variant.
     ///
     /// Resolve a Charon `AggregateKind::Adt` payload to the
-    /// `(owner_path, ctor_leaf, field_names)` triple suitable for a
-    /// transparent-ctor + FieldWrite chain emission.
+    /// `(owner_path, ctor_leaf, field_rows)` triple suitable for a
+    /// transparent-ctor + FieldWrite chain emission.  Each row carries the
+    /// field's name and its rendered type, so the emission site can tell a
+    /// zero-sized field (which gets no slot and therefore no write) from a
+    /// stored one.
     ///
     /// Charon encodes `Aggregate(AggregateKind::Adt(type_id,
     /// variant_idx, ..), operands)` as `{"Adt": [type_id, variant_idx,
     /// ..]}`.  Struct aggregates use `variant_idx = null` and pull
-    /// field names straight from the `TypeDeclKind::Struct(fields)`
-    /// list; enum aggregates use a non-null `variant_idx` to select
+    /// field names and types straight from the
+    /// `TypeDeclKind::Struct(fields)` list; enum aggregates use a
+    /// non-null `variant_idx` to select
     /// the right `VariantDecl` and emit the qualified ctor leaf
     /// (`Variant`) under the enum's `owner_path` (everything up to but
     /// not including the leaf in the resolved `name_path()`).
@@ -5953,7 +5966,12 @@ impl<'a> Lowering<'a> {
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
-    ) -> Option<(Vec<String>, String, Vec<String>, majit_ir::descr::StructId)> {
+    ) -> Option<(
+        Vec<String>,
+        String,
+        Vec<(String, String)>,
+        majit_ir::descr::StructId,
+    )> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
         // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
         // full `TypeDeclRef` object `{"generics": …, "id": {"Adt":
@@ -5979,17 +5997,22 @@ impl<'a> Lowering<'a> {
         let owner_path = segments;
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
-                let field_names: Vec<String> = fields
+                let field_rows: Vec<(String, String)> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
+                    .map(|(i, f)| {
+                        (
+                            f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
+                            tyref_to_ast_string(&f.ty, self.llbc),
+                        )
+                    })
                     .collect();
                 let template =
                     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
                 Some((
                     owner_path,
                     type_leaf,
-                    field_names,
+                    field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                 ))
             }
@@ -6011,11 +6034,16 @@ impl<'a> Lowering<'a> {
                     None => type_leaf,
                 };
                 variant_owner.push(leaf);
-                let field_names: Vec<String> = v
+                let field_rows: Vec<(String, String)> = v
                     .fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
+                    .map(|(i, f)| {
+                        (
+                            f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
+                            tyref_to_ast_string(&f.ty, self.llbc),
+                        )
+                    })
                     .collect();
                 let template = majit_ir::descr::StructId::from_canonical(&format!(
                     "{}::{}",
@@ -6025,7 +6053,7 @@ impl<'a> Lowering<'a> {
                 Some((
                     variant_owner,
                     v.name.clone(),
-                    field_names,
+                    field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
                 ))
             }

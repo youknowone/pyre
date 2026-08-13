@@ -8347,8 +8347,11 @@ pub(crate) fn get_type_flag(
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
-        // RPython: Void fields are skipped
-        "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
+        // Zero-sized types occupy no storage and contribute no field slot
+        // (heaptracker.py:60-62; lltype.py:334 `_names_without_voids()`).
+        s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
+            (ArrayFlag::Void, majit_ir::value::Type::Void, 0)
+        }
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,

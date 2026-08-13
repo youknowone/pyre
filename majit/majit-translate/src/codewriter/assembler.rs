@@ -10,7 +10,11 @@
 //! subset. Descriptor operands are deduplicated through the RPython
 //! `_descr_dict` shape before bytecode emission.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::Mutex,
+};
 
 use vecset::VecSet;
 
@@ -3560,6 +3564,33 @@ fn bh_size_spec_from_callcontrol(
         for (index, field) in all_fielddescrs.iter_mut().enumerate() {
             field.index = index as u32;
             field.index_in_parent = index;
+        }
+    }
+    let violating_fields = all_fielddescrs
+        .iter()
+        .filter(|field| field.offset + field.field_size > size)
+        .collect::<Vec<_>>();
+    if !violating_fields.is_empty() {
+        static WARNED_LAYOUT_OWNERS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+        let mut warned = WARNED_LAYOUT_OWNERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.insert(layout_owner.to_string()) {
+            let count = warned.len();
+            let rows = violating_fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "{:?} (offset {}, field_size {})",
+                        field.name, field.offset, field.field_size
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[majit-translate] struct layout warning #{count}: owner {layout_owner:?} has \
+                 parent size {size}; out-of-bounds field rows: {rows}"
+            );
         }
     }
     Some(crate::jitcode::BhSizeSpec {
