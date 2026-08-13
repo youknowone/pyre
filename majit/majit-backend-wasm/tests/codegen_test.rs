@@ -477,6 +477,52 @@ fn build_module_default(
     )
 }
 
+fn emitted_local_count(bytes: &[u8]) -> u32 {
+    wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .find_map(|payload| match payload.unwrap() {
+            wasmparser::Payload::CodeSectionEntry(body) => Some(
+                body.get_locals_reader()
+                    .unwrap()
+                    .into_iter()
+                    .map(|local| local.unwrap().0)
+                    .sum(),
+            ),
+            _ => None,
+        })
+        .expect("generated module must contain its trace function")
+}
+
+#[test]
+fn sparse_value_ids_declare_only_addressable_value_locals() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(40),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(40), OpRef::const_int(1)],
+            OpRef::int_op(900),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(900))]),
+    ];
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(emitted_local_count(&bytes), 12);
+}
+
 /// Count the direct `wasm_jit_write_barrier` table calls by their unique table
 /// target immediate.  The direct lowering places that `i32.const` immediately
 /// before its `call_indirect`.
