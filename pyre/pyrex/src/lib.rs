@@ -1503,22 +1503,30 @@ fn path_hook_accepts(
     let path_hooks = pyre_interpreter::baseobjspace::getattr_str(sys, "path_hooks")?;
     // `for hook in sys.path_hooks` is a plain iteration, so a `sitecustomize`
     // that replaces the list with a tuple or any other iterable still gets its
-    // hooks called.
-    let hooks = pyre_interpreter::baseobjspace::unpackiterable(path_hooks, -1)?;
+    // hooks called — one step at a time.  Draining the iterable up front
+    // instead would surface an error the loop never reaches: a generator that
+    // yields an accepting hook and raises on the step after it breaks out at
+    // `app_main.py:1056` before that step is ever taken.
+    let iterator = pyre_interpreter::baseobjspace::iter(path_hooks)?;
 
     let _roots = push_roots();
     let filename_slot = shadow_stack_len();
     pin_root(pyre_object::w_str_new(filename));
     // A hook call runs arbitrary Python and can drive a collection, which moves
-    // the hooks themselves. A Rust vector is not walked, so publish each hook in
-    // a shadow-stack slot and read it back after the previous call.
-    let hooks_base = shadow_stack_len();
-    for hook in &hooks {
-        pin_root(*hook);
-    }
-    for i in 0..hooks.len() {
+    // the iterator that has to survive it. A Rust local is not walked, so
+    // publish it in a shadow-stack slot and read it back for the next step.
+    let iterator_slot = shadow_stack_len();
+    pin_root(iterator);
+    loop {
+        let hook = match pyre_interpreter::baseobjspace::next(shadow_stack_get(iterator_slot)) {
+            Ok(hook) => hook,
+            // `else: importer = None` — the loop ran to exhaustion, so no hook
+            // claimed the path.
+            Err(error) if error.kind == PyErrorKind::StopIteration => return Ok(false),
+            Err(error) => return Err(error),
+        };
         match pyre_interpreter::call::call_function_impl_result(
-            shadow_stack_get(hooks_base + i),
+            hook,
             &[shadow_stack_get(filename_slot)],
         ) {
             // `importer = hook(filename); break` — the first hook that does not
@@ -1529,7 +1537,6 @@ fn path_hook_accepts(
             Err(error) => return Err(error),
         }
     }
-    Ok(false)
 }
 
 fn runpy_run_module_as_main(
