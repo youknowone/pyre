@@ -13133,13 +13133,13 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // when the name resolves there.  Requires the live frame operand.
     // The builtins fallback needs the module `pick_builtin(w_globals)` picks
     // (`frame.get_builtin()`).  A live frame supplies it directly and also lets
-    // us double-check the name is absent from the frame's AUTHORITATIVE globals
+    // us double-check the operand against the frame's AUTHORITATIVE globals
     // — `bh_load_global_fn` re-resolves the globals it consults from the LIVE
     // frame (`frame.get_w_globals()` when the frame owns `w_code`, else the
     // code's bound globals) and IGNORES the `namespace_ptr` operand.  The
-    // `ns_ptr` hint usually equals that live dict, but a present name there must
-    // resolve from globals (residual), not the builtin, or the fold would be
-    // wrong.  An INLINED callee has no materialised frame (`frame_ptr == 0`, its
+    // `ns_ptr` hint usually equals that live dict; when it does not, nothing
+    // here can prove what the residual would read, so decline.
+    // An INLINED callee has no materialised frame (`frame_ptr == 0`, its
     // `portal_frame_reg` unseeded); derive the builtin module from the concrete
     // globals' `__builtins__` cell instead — the same object `pick_builtin`
     // resolves (baseobjspace.rs:9716) and the one the interpreter fallback would
@@ -13157,10 +13157,15 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
                 pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)
             }
         };
-        if !live_globals.is_null()
-            && live_globals as usize != w_globals as usize
-            && crate::state::module_dict_cell_slot_direct(live_globals, &name).is_some()
-        {
+        // Only the SAME dict makes the absence provable.  `module_dict_cell_slot_direct`
+        // answers `None` both for a name that is absent and for a dict it cannot
+        // read at all — a plain dict, or a module dict that ran
+        // `switch_to_object_strategy` — so on a different dict its `None` says
+        // nothing.  Guard (a) below pins `w_globals`' version, which watches the
+        // wrong dict in that case, and the residual it replaces resolves
+        // `live_globals`; a name present there would read the builtin instead of
+        // the global.
+        if live_globals.is_null() || live_globals as usize != w_globals as usize {
             return Ok(false);
         }
         frame.get_builtin()

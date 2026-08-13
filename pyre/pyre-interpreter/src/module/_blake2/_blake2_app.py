@@ -26,6 +26,19 @@ class _Immutable(type):
 _MISSING = object()
 
 
+def _buffer_size(value):
+    """Byte length of a buffer parameter, the `Py_buffer.len` the clinic
+    converter measures.
+
+    Not `len()`: a memoryview over a wider itemsize counts items, so
+    `array('I', [0] * 5)` is 5 there and 20 bytes here, and only the byte
+    count decides whether the salt fits.
+    """
+    if type(value) is bytes:
+        return len(value)
+    return memoryview(value).nbytes
+
+
 def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                      _digest_size, max_offset, _block_size):
     class _Blake(metaclass=_Immutable):
@@ -99,6 +112,17 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                     "digest_size must be between 1 and %d bytes" %
                     cls.MAX_DIGEST_SIZE
                 )
+            # Salt and person are rejected before the tree parameters and the
+            # key after them, the order lib_pypy/_blake2 sets each field in.
+            # `blake2b(salt=b'x' * 17, fanout=256)` reports the salt.
+            if _buffer_size(salt) > cls.SALT_SIZE:
+                raise ValueError(
+                    "maximum salt length is %d bytes" % cls.SALT_SIZE
+                )
+            if _buffer_size(person) > cls.PERSON_SIZE:
+                raise ValueError(
+                    "maximum person length is %d bytes" % cls.PERSON_SIZE
+                )
             if not 0 <= fanout <= 255:
                 raise ValueError("fanout must be between 0 and 255")
             if not 1 <= depth <= 255:
@@ -117,6 +141,10 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                 raise ValueError(
                     "inner_size must be between 0 and %d" %
                     cls.MAX_DIGEST_SIZE
+                )
+            if _buffer_size(key) > cls.MAX_KEY_SIZE:
+                raise ValueError(
+                    "maximum key length is %d bytes" % cls.MAX_KEY_SIZE
                 )
 
             # Both clinic bool converters are observable through __bool__.
