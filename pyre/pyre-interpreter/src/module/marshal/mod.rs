@@ -819,6 +819,31 @@ impl wire::MarshalBag for PyreMarshalBag {
         unsafe { crate::pycode::obj_to_constant_data(value.get()).ok() }
     }
 
+    /// A `co_consts` entry the compiler enum cannot describe — a list, a dict,
+    /// a set — is legal in a code object and marshals fine; it takes a shape
+    /// placeholder here and reaches its slot through
+    /// `make_code_with_constants`, which is what `read_code_consts` does for
+    /// `code.replace(co_consts=...)`.
+    fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
+        Ok(unsafe { crate::pycode::obj_to_constant_data(value.get()) }
+            .unwrap_or(ConstantData::None))
+    }
+
+    fn make_code_with_constants(
+        &self,
+        code: CodeObject<ConstantData>,
+        constants: Vec<Rooted>,
+    ) -> Rooted {
+        let code = Rooted::new(crate::pycode::box_code_constant(&code));
+        // `box_code_constant` allocates, so read each constant out of its
+        // shadow-stack slot only now.  Only the slots the compiler
+        // representation cannot reproduce are stored; the rest realize
+        // lazily like a fresh compile's.
+        let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
+        unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
+        code
+    }
+
     // `deserialize_code_value_inner` reads a code object's fields as bag
     // values, so the three shapes `write_code` writes them in — bytes for
     // co_code/co_localspluskinds/co_linetable/co_exceptiontable, tuples for

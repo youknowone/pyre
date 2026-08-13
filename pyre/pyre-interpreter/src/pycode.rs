@@ -813,6 +813,93 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
     }
 }
 
+/// Whether any `co_consts_w` slot is realized.  On a code object the marshal
+/// reader just decoded, a realized slot is a wrapped constant the compiler
+/// representation cannot reproduce, so a parent decode must store this object
+/// itself rather than realize a fresh one from the compiler clone.
+unsafe fn w_code_has_wrapped_consts(obj: PyObjectRef) -> bool {
+    let code = unsafe { &*(obj as *const PyCode) };
+    if code.co_consts_w.is_null() {
+        return false;
+    }
+    unsafe { &*code.co_consts_w }
+        .iter()
+        .any(|slot| !slot.load(std::sync::atomic::Ordering::Acquire).is_null())
+}
+
+/// Whether realizing `data` would lose what `value` carries.
+///
+/// `ConstantData::None` is the placeholder `code_constant_from_value` falls
+/// back to for a value it cannot serialize at all — a list, a dict, a set — so
+/// it stands for a wrapped constant whenever the decoded value is not itself
+/// `None`. A nested code object serializes fine but its clone realizes its own
+/// constants from the same lossy representation, so it is reproducible only
+/// while it carries no wrapped slot; a tuple and a slice, only while every
+/// element is. The remaining variants describe their value exactly. A
+/// frozenset needs no case either: every wrapped constant is unhashable, so no
+/// frozenset can hold one.
+unsafe fn is_wrapped_constant(data: &crate::bytecode::ConstantData, value: PyObjectRef) -> bool {
+    use crate::bytecode::ConstantData;
+    unsafe {
+        match data {
+            ConstantData::None => !is_none(value),
+            ConstantData::Code { .. } => is_code(value) && w_code_has_wrapped_consts(value),
+            ConstantData::Tuple { elements } => {
+                is_tuple(value)
+                    && elements.iter().enumerate().any(|(index, element)| {
+                        pyre_object::w_tuple_getitem(value, index as i64)
+                            .is_some_and(|item| is_wrapped_constant(element, item))
+                    })
+            }
+            ConstantData::Slice { elements } => {
+                pyre_object::sliceobject::is_slice(value)
+                    && elements
+                        .iter()
+                        .zip([
+                            pyre_object::sliceobject::w_slice_get_start(value),
+                            pyre_object::sliceobject::w_slice_get_stop(value),
+                            pyre_object::sliceobject::w_slice_get_step(value),
+                        ])
+                        .any(|(element, item)| is_wrapped_constant(element, item))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `w_code_fill_consts_from_tuple` for the marshal reader, whose `co_consts`
+/// arrive as decoded objects rather than as a tuple — but selective: only the
+/// slots the compiler representation cannot stand in for are stored, as
+/// `is_wrapped_constant` decides. Every other slot stays unrealized: code
+/// wrappers are immortal, so storing every decoded constant would retain the
+/// whole constant graph of every unmarshalled code object for the process
+/// lifetime, where a compiled equivalent realizes on demand.
+pub(crate) unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[PyObjectRef]) {
+    let code = unsafe { &*(obj as *const PyCode) };
+    if code.co_consts_w.is_null() {
+        return;
+    }
+    let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
+    if code.code_ptr.is_null() || (code.code_ptr as i64) & align_mask != 0 {
+        return;
+    }
+    let consts =
+        crate::pyframe::code_constants(unsafe { &*(code.code_ptr as *const crate::CodeObject) });
+    let slots = unsafe { &*code.co_consts_w };
+    let count = slots.len().min(constants.len()).min(consts.len());
+    let mut filled = false;
+    for index in 0..count {
+        let value = constants[index];
+        if unsafe { is_wrapped_constant(&consts[index], value) } {
+            slots[index].store(value, std::sync::atomic::Ordering::Release);
+            filled = true;
+        }
+    }
+    if filled {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
+}
+
 /// Preserve the existing wrapped constant array when `code.replace()` changes
 /// fields other than `co_consts`. PyPy copies an already-wrapped list; pyre
 /// must therefore copy only source slots that have already been realized,
@@ -1807,6 +1894,15 @@ pub(crate) unsafe fn obj_to_constant_data(
                 elements.push(obj_to_constant_data(e)?);
             }
             return Ok(ConstantData::Tuple { elements });
+        }
+        if pyre_object::sliceobject::is_slice(obj) {
+            return Ok(ConstantData::Slice {
+                elements: Box::new([
+                    obj_to_constant_data(pyre_object::sliceobject::w_slice_get_start(obj))?,
+                    obj_to_constant_data(pyre_object::sliceobject::w_slice_get_stop(obj))?,
+                    obj_to_constant_data(pyre_object::sliceobject::w_slice_get_step(obj))?,
+                ]),
+            });
         }
         if pyre_object::setobject::is_frozenset(obj) {
             let elements = pyre_object::w_set_items(obj)
