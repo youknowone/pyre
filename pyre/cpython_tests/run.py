@@ -317,12 +317,16 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         detail = f"signal/abort {death_signal(rc)} rc={rc} {last_stderr_line(err)}"
         return "CRASH", detail.strip()[:200]
     if rc == 0:
-        skipped = next(
-            (line for line in out.splitlines() if line.startswith("skipped: ")),
+        denied = next(
+            (
+                line[len(RESOURCE_DENIED_MARKER):]
+                for line in out.splitlines()
+                if line.startswith(RESOURCE_DENIED_MARKER)
+            ),
             None,
         )
-        if skipped:
-            return "SKIP", skipped[:120]
+        if denied is not None:
+            return "SKIP", denied[:120]
         return "PASS", ""
     last = last_stderr_line(err)
     ran = "Ran " in out or "Ran " in err or "FAILED (" in out or "FAILED (" in err
@@ -391,6 +395,11 @@ _DOTTED_DRIVER = (
     "    unittest.main(module=sys.modules[mod], argv=['pyre'], verbosity=2)\n"
 )
 
+# Only the resource drivers below write this line, and `classify` honours it
+# only from them. A test module that prints its own "skipped: ..." says nothing
+# about the run's outcome, so the marker has to be one nothing else emits.
+RESOURCE_DENIED_MARKER = "pyre-cpython-suite: ResourceDenied: "
+
 # Same `__mp_main__` guard as _DOTTED_DRIVER.
 _RESOURCE_DRIVER = (
     "import runpy\n"
@@ -400,7 +409,7 @@ _RESOURCE_DRIVER = (
     "    try:\n"
     "        runpy.run_path({path!r}, run_name='__main__')\n"
     "    except support.ResourceDenied as exc:\n"
-    "        print('skipped: %s' % exc)\n"
+    "        print({marker!r} + str(exc))\n"
 )
 
 _RESOURCE_MODULE_DRIVER = (
@@ -412,7 +421,7 @@ _RESOURCE_MODULE_DRIVER = (
     "    try:\n"
     "        runpy.run_module(mod, run_name='__main__', alter_sys=True)\n"
     "    except support.ResourceDenied as exc:\n"
-    "        print('skipped: %s' % exc)\n"
+    "        print({marker!r} + str(exc))\n"
 )
 
 # test_descr and test_enum assert fully qualified class/enum names. Running
@@ -488,7 +497,10 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             # retaining direct-file __main__ semantics.
             driver = Path(cwd) / "_pyre_script_main.py"
             driver.write_text(
-                _RESOURCE_DRIVER.format(path=str(module_path(module))),
+                _RESOURCE_DRIVER.format(
+                    path=str(module_path(module)),
+                    marker=RESOURCE_DENIED_MARKER,
+                ),
                 encoding="utf-8",
             )
             cmd = [str(binary), str(driver)]
@@ -498,7 +510,10 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             # semantics while applying libregrtest's empty default resource set.
             driver = Path(cwd) / "_pyre_resource_module_main.py"
             driver.write_text(
-                _RESOURCE_MODULE_DRIVER.format(module=module),
+                _RESOURCE_MODULE_DRIVER.format(
+                    module=module,
+                    marker=RESOURCE_DENIED_MARKER,
+                ),
                 encoding="utf-8",
             )
             cmd = [str(binary), str(driver)]
