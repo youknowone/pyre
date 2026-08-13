@@ -16157,13 +16157,15 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// target-neutral so the seek-back behavior Windows relies on is covered by
 /// the ordinary test build too.
 fn file_write_at(data: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> Result<usize, crate::PyError> {
-    if pos > data.len() {
-        data.resize(pos, 0);
-    }
     let end = pos
         .checked_add(bytes.len())
         .ok_or_else(|| crate::PyError::overflow_error("write position out of range"))?;
     if end > data.len() {
+        // Seeking far past the end and writing one byte asks for the whole hole
+        // at once, which an infallible growth would abort the process over;
+        // reserve first so the request surfaces as MemoryError.
+        data.try_reserve(end - data.len())
+            .map_err(|_| crate::PyError::memory_error("cannot grow file buffer"))?;
         data.resize(end, 0);
     }
     data[pos..end].copy_from_slice(bytes);
