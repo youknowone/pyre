@@ -2498,7 +2498,7 @@ pub(crate) fn assert_block_pure_besides(
         if recognized.contains(&i) {
             continue;
         }
-        if !crate::inline::is_pure_op(&op.kind) {
+        if !crate::inline::can_remove_op(&op.kind) {
             return Err(format!(
                 "{name}: {role} block {block} carries a side-effecting operation \
                  the `?`-diamond rewrite would silently bypass — unsupported shape"

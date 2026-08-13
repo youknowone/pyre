@@ -1141,7 +1141,11 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::New { .. }
         | OpKind::NewWithVtable { .. }
         | OpKind::NewArrayClear { .. }
-        | OpKind::NewListClear { .. } => false,
+        | OpKind::NewListClear { .. }
+        // `newlist` subclasses `HLOperation` (`operation.py:551-557`), not
+        // `PureOperation`; its DCE authorization comes from the high-level
+        // `simplify.py:411-418 CanRemove` list alone.
+        | OpKind::NewList { .. } => false,
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
         // is NO upstream `int_constant` op — RPython's `Constant` is
@@ -1194,10 +1198,6 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py:542-548`).
         | OpKind::NewTuple { .. }
-        // `newlist` subclasses `HLOperation` (`operation.py:551-557`), not
-        // `PureOperation`; its DCE authorization comes from the high-level
-        // `simplify.py:411-418 CanRemove` list alone.
-        | OpKind::NewList { .. }
         // `getslice` is registered `pure=True` for flowspace folding/CSE
         // (`operation.py:461`), but its possible exception excludes it from
         // dead-op removal; see `can_remove_op`.
@@ -1291,10 +1291,11 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
 /// Models RPython `simplify.py:411-423 CanRemove`, including the default
 /// `raising_is_ok=False` used by `enum_ops_without_sideeffects()`.
 ///
-/// This is deliberately a restriction of [`is_pure_op`], so switching the
-/// dead-op pass to this predicate cannot authorize any new removal.
 pub fn can_remove_op(kind: &OpKind) -> bool {
     match kind {
+        // `newlist` is explicitly listed in `simplify.py:413` even though it
+        // is not a flowspace `PureOperation` (`operation.py:551-557`).
+        OpKind::NewList { .. } => true,
         // `getslice` is absent from `simplify.py:411-418 CanRemove` and is
         // raising at `lloperation.py:578`, so
         // `enum_ops_without_sideeffects()` does not add it either.
@@ -1563,6 +1564,10 @@ mod tests {
 
     #[test]
     fn dead_op_removal_and_float_purity_use_their_rpython_tables() {
+        let newlist = OpKind::NewList { args: vec![] };
+        assert!(!is_pure_op(&newlist));
+        assert!(can_remove_op(&newlist));
+
         let getslice = OpKind::GetSlice { args: vec![] };
         assert!(is_pure_op(&getslice));
         assert!(!can_remove_op(&getslice));
