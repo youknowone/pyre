@@ -31,10 +31,32 @@ fn workspace_root() -> PathBuf {
     p
 }
 
-/// Build the sandbox `pyre` binary once and return its path.  Cargo skips the
-/// work when the binary is already current, so repeated runs are cheap.
-fn build_sandbox_pyre() -> PathBuf {
+/// Build a trusted, non-sandbox controller and the sandbox child, then return
+/// both paths.  A sandbox-linked `pyre` cannot act as its own controller: even
+/// its startup environment reads are protocol trampolines.  The dedicated
+/// dynasm binary stays linked to the real host while the plain `pyre` binary is
+/// rebuilt as the untrusted child.
+fn build_sandbox_pyre() -> (PathBuf, PathBuf) {
     let root = workspace_root();
+    let controller_status = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "pyrex",
+            "--bin",
+            "pyre-dynasm",
+            "--no-default-features",
+            "--features",
+            "dynasm",
+        ])
+        .status()
+        .expect("spawn cargo build for sandbox controller");
+    assert!(
+        controller_status.success(),
+        "building sandbox controller failed"
+    );
     let status = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([
@@ -50,16 +72,27 @@ fn build_sandbox_pyre() -> PathBuf {
         .status()
         .expect("spawn cargo build");
     assert!(status.success(), "building sandbox pyre failed");
+    let controller = root.join("target/release/pyre-dynasm");
     let bin = root.join("target/release/pyre");
+    assert!(
+        controller.is_file(),
+        "sandbox controller missing at {}",
+        controller.display()
+    );
     assert!(bin.is_file(), "sandbox pyre missing at {}", bin.display());
-    bin
+    (controller, bin)
 }
 
 /// Run `pyre interact --tmp <root> <pyre> -c <script>` and return
 /// `(stdout, exit_code)`.  The controller relays the child's mediated stdout to
 /// its own, so `stdout` is the program output seen through the protocol.
-fn interact(pyre: &PathBuf, tmp: &std::path::Path, script: &str) -> (String, i32) {
-    let out = Command::new(pyre)
+fn interact(
+    controller: &PathBuf,
+    pyre: &PathBuf,
+    tmp: &std::path::Path,
+    script: &str,
+) -> (String, i32) {
+    let out = Command::new(controller)
         .args([
             "interact",
             "--tmp",
@@ -94,7 +127,7 @@ fn interact(pyre: &PathBuf, tmp: &std::path::Path, script: &str) -> (String, i32
 #[test]
 #[ignore = "builds a release sandbox binary; run with --ignored"]
 fn sandbox_reads_virtual_file_and_blocks_escapes() {
-    let pyre = build_sandbox_pyre();
+    let (controller, pyre) = build_sandbox_pyre();
     let tmp = tempfile::tempdir().expect("tempdir");
     std::fs::write(tmp.path().join("hello.txt"), b"sandbox-ok").unwrap();
 
@@ -102,6 +135,7 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
     // Keep this VFS/seam probe binary: the controller intentionally mounts no
     // stdlib, so text-mode open would additionally require `encodings`.
     let (out, code) = interact(
+        &controller,
         &pyre,
         tmp.path(),
         r#"print(open("/tmp/hello.txt", "rb").read())"#,
@@ -111,6 +145,7 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
 
     // 2. The virtual cwd is `/tmp`, not the controller's real directory.
     let (out, code) = interact(
+        &controller,
         &pyre,
         tmp.path(),
         "import posix\nprint('cwd:', posix.getcwd())",
@@ -120,6 +155,7 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
 
     // 3. Reading outside the virtual root is denied (the node is absent).
     let (out, _) = interact(
+        &controller,
         &pyre,
         tmp.path(),
         "try:\n    open('/etc/passwd').read()\n    print('LEAK')\nexcept OSError:\n    print('BLOCKED')",
@@ -137,7 +173,7 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
     let script = format!(
         "try:\n    open('/tmp/{sentinel}', 'w').write('x')\n    print('WROTE')\nexcept OSError:\n    print('BLOCKED')"
     );
-    let (out, _) = interact(&pyre, tmp.path(), &script);
+    let (out, _) = interact(&controller, &pyre, tmp.path(), &script);
     assert!(out.contains("BLOCKED"), "write attempt produced: {out:?}");
     assert!(!out.contains("WROTE"), "write attempt succeeded: {out:?}");
     // The controller created the file nowhere: neither in the virtual root's
@@ -161,7 +197,7 @@ fn sandbox_reads_virtual_file_and_blocks_escapes() {
 #[test]
 #[ignore = "builds a release sandbox binary; run with --ignored"]
 fn sandbox_blocks_known_escapes() {
-    let pyre = build_sandbox_pyre();
+    let (controller, pyre) = build_sandbox_pyre();
     let tmp = tempfile::tempdir().expect("tempdir");
 
     // Each `blocked` entry must raise (the function is stubbed/unavailable); a
@@ -231,10 +267,47 @@ for m in ("_socket", "_ctypes", "_posixsubprocess", "_multiprocessing",
 print("FAILS:" + ",".join(fails) if fails else "ALL-BLOCKED")
 "#;
 
-    let (out, code) = interact(&pyre, tmp.path(), script);
+    let (out, code) = interact(&controller, &pyre, tmp.path(), script);
     assert_eq!(code, 0, "escape-probe exited non-zero: {out:?}");
     assert!(
         out.contains("ALL-BLOCKED"),
         "escape regression detected: {out:?}"
+    );
+}
+
+/// `inspector.py:89 raw_os_write` is `_nowrapper=True`: heap-dump writes keep
+/// the GIL because the dumper owns the collector and a stop-the-world window.
+/// Releasing it for the sandbox controller round trip lets this waiting worker
+/// acquire the GIL and park at the active STW safepoint while still holding
+/// it; the dump owner then deadlocks trying to reacquire it.
+#[test]
+#[ignore = "builds a release sandbox binary; run with --ignored"]
+fn sandbox_heap_dump_keeps_gil_while_world_is_stopped() {
+    let (controller, pyre) = build_sandbox_pyre();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let script = r#"
+import _thread, gc
+ready = _thread.allocate_lock()
+ready.acquire()
+stop = False
+
+def worker():
+    global stop
+    ready.release()
+    while not stop:
+        pass
+
+_thread.start_new_thread(worker, ())
+ready.acquire()
+for _ in range(3):
+    gc._dump_rpy_heap(2)
+stop = True
+print("HEAP_DUMP_DONE")
+"#;
+    let (out, code) = interact(&controller, &pyre, tmp.path(), script);
+    assert_eq!(code, 0, "sandbox heap dump timed out or failed");
+    assert!(
+        out.contains("HEAP_DUMP_DONE"),
+        "sandbox heap dump did not complete: {out:?}"
     );
 }
