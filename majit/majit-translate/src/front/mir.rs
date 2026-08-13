@@ -411,6 +411,27 @@ struct RefEnumInst {
     suffix: String,
 }
 
+/// Physical layout identity for a concrete ADT use. The defining path supplies
+/// the template identity; all rendered type arguments supply the
+/// monomorphization identity. This is deliberately broader than
+/// `adt_head_instantiation_suffix`, whose reference-payload predicate controls
+/// annotator class splitting rather than Rust memory layout.
+fn concrete_adt_struct_id(
+    template: majit_ir::descr::StructId,
+    adt: Option<&serde_json::Map<String, serde_json::Value>>,
+    llbc: &Llbc,
+) -> majit_ir::descr::StructId {
+    let Some(adt) = adt else {
+        return template;
+    };
+    let args = render_adt_type_args(adt, llbc, 0);
+    if args.is_empty() {
+        template
+    } else {
+        template.instantiate(&format!("<{}>", args.join(",")))
+    }
+}
+
 /// The [`RefEnumInst`] for the ADT descriptor `adt` (`{"id": …,
 /// "generics": …}`) when it names a split-eligible reference-payload
 /// generic enum, else `None`.  Shared by both instantiation scans below so
@@ -4783,9 +4804,9 @@ impl<'a> Lowering<'a> {
                 // use `variant_idx = null`, enum variants index into the
                 // `TypeDeclKind::Enum` variant list.
                 let resolved = self.resolve_aggregate_adt(&kind);
-                let (owner_path, ctor_name, field_names) = match resolved {
-                    Some((owner_path, ctor_name, field_names)) => {
-                        (owner_path, ctor_name, field_names)
+                let (owner_path, ctor_name, field_names, aggregate_owner_id) = match resolved {
+                    Some((owner_path, ctor_name, field_names, owner_id)) => {
+                        (owner_path, ctor_name, field_names, Some(owner_id))
                     }
                     None => {
                         // Synthetic placeholders for non-Adt aggregates
@@ -4811,7 +4832,7 @@ impl<'a> Lowering<'a> {
                         );
                         let positional =
                             (0..arg_vars.len()).map(|i| format!("__pos_{i}")).collect();
-                        (Vec::new(), leaf, positional)
+                        (Vec::new(), leaf, positional, None)
                     }
                 };
                 let result_ty_owner = if owner_path.is_empty() {
@@ -4899,7 +4920,7 @@ impl<'a> Lowering<'a> {
                             field: crate::model::FieldDescriptor {
                                 name,
                                 owner_root: Some(result_ty_owner.clone()),
-                                owner_id: None,
+                                owner_id: aggregate_owner_id,
                                 base_is_deref: None,
                                 taken_by_address: false,
                             },
@@ -4931,15 +4952,16 @@ impl<'a> Lowering<'a> {
                 // sites project, so the `__discriminant` read and the
                 // constructor's `setattr` land on ONE classdef per
                 // instantiation (`enum_variant_narrowing_knowntypedata`
-                // then mints matching variant subclasses).  `owner_id` (the
-                // layout-side `StructId`) stays on the bare template name so
-                // every instantiation shares the one template tag layout —
-                // `from_canonical` keys the un-suffixed path.
+                // then mints matching variant subclasses). `owner_id` is the
+                // independent physical-layout identity and preserves every
+                // concrete generic argument.
                 let (owner_root, owner_id) = match self.tyref_adt_class_root(&place.ty) {
                     Some(class_root) => {
                         let canon = strip_crate_prefix(&class_root);
-                        let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
-                        let sid = majit_ir::descr::StructId::from_canonical(bare);
+                        let sid = self.tyref_adt_layout_id(&place.ty).unwrap_or_else(|| {
+                            let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
+                            majit_ir::descr::StructId::from_canonical(bare)
+                        });
                         (Some(canon), Some(sid))
                     }
                     None => (None, None),
@@ -5924,7 +5946,7 @@ impl<'a> Lowering<'a> {
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
-    ) -> Option<(Vec<String>, String, Vec<String>)> {
+    ) -> Option<(Vec<String>, String, Vec<String>, majit_ir::descr::StructId)> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
         // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
         // full `TypeDeclRef` object `{"generics": …, "id": {"Adt":
@@ -5944,6 +5966,7 @@ impl<'a> Lowering<'a> {
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
         let name_path = td.item_meta.name_path();
+        let head_adt = head.as_object();
         let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
         let type_leaf = segments.pop().unwrap_or_default();
         let owner_path = segments;
@@ -5954,7 +5977,14 @@ impl<'a> Lowering<'a> {
                     .enumerate()
                     .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
                     .collect();
-                Some((owner_path, type_leaf, field_names))
+                let template =
+                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                Some((
+                    owner_path,
+                    type_leaf,
+                    field_names,
+                    concrete_adt_struct_id(template, head_adt, self.llbc),
+                ))
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
                 let v = variants.get(idx as usize)?;
@@ -5980,7 +6010,17 @@ impl<'a> Lowering<'a> {
                     .enumerate()
                     .map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
                     .collect();
-                Some((variant_owner, v.name.clone(), field_names))
+                let template = majit_ir::descr::StructId::from_canonical(&format!(
+                    "{}::{}",
+                    strip_crate_prefix(&name_path),
+                    v.name
+                ));
+                Some((
+                    variant_owner,
+                    v.name.clone(),
+                    field_names,
+                    concrete_adt_struct_id(template, head_adt, self.llbc),
+                ))
             }
             _ => None,
         }
@@ -6058,6 +6098,7 @@ impl<'a> Lowering<'a> {
         // variant field read, so the per-instantiation variant class the
         // constructor and receiver project had no matching field read.
         let head = adt.first()?;
+        let head_adt = head.as_object();
         let type_id = match head.as_u64() {
             Some(id) => id,
             None => head.get("id")?.get("Adt")?.as_u64()?,
@@ -6075,11 +6116,10 @@ impl<'a> Lowering<'a> {
         // `owner_root` is the annotation-side classdef key: a
         // reference-payload workspace enum instantiation reads its field
         // off the per-instantiation variant class (`Result<Tuple>::Ok`),
-        // matching the receiver / constructor projection.  `owner_id`
-        // (the layout-side `StructId` minted below) stays on the bare
-        // template name so every instantiation shares the one template
-        // variant layout — sound because the split is scoped to
-        // reference payloads, which all share that word-slot layout.
+        // matching the receiver / constructor projection. `owner_id` is the
+        // independent layout-side identity and preserves every concrete type
+        // argument, including primitive payloads for which the annotator does
+        // not split classdefs.
         let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
         let owner_root = match head
             .as_object()
@@ -6096,9 +6136,9 @@ impl<'a> Lowering<'a> {
                     .clone()
                     .unwrap_or_else(|| format!("__pos_{field_idx}"));
                 let ty = clone_tyref(&f.ty);
-                let owner_id = Some(majit_ir::descr::StructId::from_canonical(
-                    &strip_crate_prefix(&name_path),
-                ));
+                let template =
+                    majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
                 Some((owner_root, name, ty, owner_id))
             }
             (TypeDeclKind::Enum(variants), Some(vidx)) => {
@@ -6115,11 +6155,12 @@ impl<'a> Lowering<'a> {
                 // registered under this key).  The downcast statically fixes
                 // the variant.
                 let variant_owner = format!("{owner_root}::{}", variant.name);
-                let owner_id = Some(majit_ir::descr::StructId::from_canonical(&format!(
+                let template = majit_ir::descr::StructId::from_canonical(&format!(
                     "{}::{}",
                     strip_crate_prefix(&name_path),
                     variant.name
-                )));
+                ));
+                let owner_id = Some(concrete_adt_struct_id(template, head_adt, self.llbc));
                 Some((variant_owner, name, ty, owner_id))
             }
             _ => None,
@@ -12881,6 +12922,19 @@ impl<'a> Lowering<'a> {
             Some(suffix) => Some(format!("{name_path}{suffix}")),
             None => Some(name_path),
         }
+    }
+
+    /// Concrete physical-layout identity of an ADT type. Unlike
+    /// [`Self::tyref_adt_class_root`], this always preserves generic arguments:
+    /// annotator class splitting is selective, while Rust monomorphization is
+    /// not.
+    fn tyref_adt_layout_id(&self, ty: &TyRef) -> Option<majit_ir::descr::StructId> {
+        let value = self.tyref_adt_body(ty)?;
+        let def_id = inline_adt_def_id(value)?;
+        let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
+        let template = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
+        let adt = value.as_object()?.get("Adt")?.as_object();
+        Some(concrete_adt_struct_id(template, adt, self.llbc))
     }
 
     /// `true` when `ty` resolves to a FIELDLESS enum whose discriminant

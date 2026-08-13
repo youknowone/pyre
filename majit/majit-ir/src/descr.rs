@@ -357,6 +357,22 @@ impl StructId {
         StructId(path_hash(canonical_path))
     }
 
+    /// Derive the identity of one concrete generic instantiation from the
+    /// defining type's identity and its balanced `<...>` argument spelling.
+    ///
+    /// Rust monomorphizations do not share a physical layout: `Option<bool>`
+    /// and `Option<i64>` may differ in both size and field representation.
+    /// RPython's analogue is one distinct low-level `Struct` object per
+    /// specialized representation.  Folding the argument list away therefore
+    /// collapses distinct layout/descr identities.  The template id keeps path
+    /// aliases converged; the argument suffix keeps monomorphizations apart.
+    pub fn instantiate(self, generic_args: &str) -> Self {
+        StructId(path_hash(&format!(
+            "__majit_generic_struct__::{:016x}{generic_args}",
+            self.0
+        )))
+    }
+
     /// The underlying path-stable `u64`, identical to the descr layer's
     /// `LLType::Struct(_)` key for the same canonical path.
     pub fn as_u64(self) -> u64 {
@@ -408,17 +424,66 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches("&mut ")
         .trim_start_matches('&')
         .trim();
-    // Generic nominal ADT instantiations share the defining TypeDecl's one
-    // physical layout. Tuples are the exception (see [`is_shaped_tuple_name`]):
-    // preserve the full tuple shape while continuing to collapse
-    // `Result<T>::Ok` and other nominal generics to their template.
-    let s = if is_shaped_tuple_name(s) {
+    let guard = STRUCT_ID_BY_NAME.lock().unwrap();
+    if let Some(id) = guard.get(s).copied().flatten() {
+        return Some(id);
+    }
+    if is_shaped_tuple_name(s) {
+        return None;
+    }
+    let generic_args = generic_args_span(s)?;
+    let template = strip_generic_args(s);
+    guard
+        .get(template.as_ref())
+        .copied()
+        .flatten()
+        .map(|id| id.instantiate(generic_args))
+}
+
+/// Resolve the defining/template identity of a name, intentionally erasing a
+/// concrete generic argument list while retaining an enum-variant tail.
+/// Annotation metadata such as `_immutable_fields_` belongs to the declared
+/// class/template and uses this lookup; physical layouts use
+/// [`struct_id_for_name`] instead.
+pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
+    let s = raw
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim_start_matches("&mut ")
+        .trim_start_matches('&')
+        .trim();
+    let template = if is_shaped_tuple_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
         strip_generic_args(s)
     };
-    let guard = STRUCT_ID_BY_NAME.lock().unwrap();
-    guard.get(s.as_ref()).copied().flatten()
+    STRUCT_ID_BY_NAME
+        .lock()
+        .unwrap()
+        .get(template.as_ref())
+        .copied()
+        .flatten()
+}
+
+/// The first balanced generic argument group in `name`, including brackets.
+/// A trailing enum variant (`Result<T>::Ok`) is deliberately excluded: the
+/// template [`StructId`] already distinguishes the base and each variant.
+fn generic_args_span(name: &str) -> Option<&str> {
+    let start = name.find('<')?;
+    let mut depth = 0usize;
+    for (offset, byte) in name.as_bytes()[start..].iter().copied().enumerate() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&name[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Use-import resolver / module-aware canonicalisation table.
@@ -689,6 +754,202 @@ static FIELD_INDEX_REDERIVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static FIELD_INDEX_UNRESOLVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_DISAGREE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_OFFSET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_TYPE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_IMMUTABILITY: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_VIRTUALIZABLE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_CACHE_HIT_INDEX_IN_PARENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static FIELD_OFFSET_LAYOUT_HIT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_OFFSET_ACCUMULATOR_FALLBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static COMPUTE_STRUCT_SIZE_LAYOUT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static COMPUTE_STRUCT_SIZE_HEURISTIC: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static COMPUTE_STRUCT_SIZE_FIELDS_MISSING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELD_OWNER_ID_REGISTRY_MISS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static FIELDLESS_SIZE_SHELL_MINTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static FIELDLESS_SIZE_SHELL_UPGRADES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static EI_DESCR_MINT_DIFFERING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_IDENTICAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_STRUCT_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_OFFSET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_FIELD_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_FIELD_TYPE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_FLAG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_INDEX_IN_PARENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_IMMUTABLE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static EI_DESCR_MINT_QUASI_IMMUTABLE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static FIELD_MINT_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static FIELD_MINT_BACKTRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Which exit supplied one `compute_struct_size` result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructSizePath {
+    Layout,
+    Heuristic,
+    FieldsMissing,
+}
+
+/// Release-safe field-mint census snapshotted across the build/runtime process
+/// boundary by `pyre-jit-trace`'s build script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldMintCensus {
+    pub cache_hit_disagree: usize,
+    pub cache_hit_offset: usize,
+    pub cache_hit_size: usize,
+    pub cache_hit_type: usize,
+    pub cache_hit_immutability: usize,
+    pub cache_hit_virtualizable: usize,
+    pub cache_hit_index_in_parent: usize,
+    pub offset_layout_hit: usize,
+    pub offset_accumulator_fallback: usize,
+    pub struct_size_layout: usize,
+    pub struct_size_heuristic: usize,
+    pub struct_size_fields_missing: usize,
+    pub owner_id_registry_miss: usize,
+    pub fieldless_size_shell_mints: usize,
+    pub fieldless_size_shell_upgrades: usize,
+    pub ei_differing: usize,
+    pub ei_identical: usize,
+    pub ei_struct_size: usize,
+    pub ei_offset: usize,
+    pub ei_field_size: usize,
+    pub ei_field_type: usize,
+    pub ei_flag: usize,
+    pub ei_index_in_parent: usize,
+    pub ei_immutable: usize,
+    pub ei_quasi_immutable: usize,
+}
+
+impl std::ops::Add for FieldMintCensus {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            cache_hit_disagree: self.cache_hit_disagree + rhs.cache_hit_disagree,
+            cache_hit_offset: self.cache_hit_offset + rhs.cache_hit_offset,
+            cache_hit_size: self.cache_hit_size + rhs.cache_hit_size,
+            cache_hit_type: self.cache_hit_type + rhs.cache_hit_type,
+            cache_hit_immutability: self.cache_hit_immutability + rhs.cache_hit_immutability,
+            cache_hit_virtualizable: self.cache_hit_virtualizable + rhs.cache_hit_virtualizable,
+            cache_hit_index_in_parent: self.cache_hit_index_in_parent
+                + rhs.cache_hit_index_in_parent,
+            offset_layout_hit: self.offset_layout_hit + rhs.offset_layout_hit,
+            offset_accumulator_fallback: self.offset_accumulator_fallback
+                + rhs.offset_accumulator_fallback,
+            struct_size_layout: self.struct_size_layout + rhs.struct_size_layout,
+            struct_size_heuristic: self.struct_size_heuristic + rhs.struct_size_heuristic,
+            struct_size_fields_missing: self.struct_size_fields_missing
+                + rhs.struct_size_fields_missing,
+            owner_id_registry_miss: self.owner_id_registry_miss + rhs.owner_id_registry_miss,
+            fieldless_size_shell_mints: self.fieldless_size_shell_mints
+                + rhs.fieldless_size_shell_mints,
+            fieldless_size_shell_upgrades: self.fieldless_size_shell_upgrades
+                + rhs.fieldless_size_shell_upgrades,
+            ei_differing: self.ei_differing + rhs.ei_differing,
+            ei_identical: self.ei_identical + rhs.ei_identical,
+            ei_struct_size: self.ei_struct_size + rhs.ei_struct_size,
+            ei_offset: self.ei_offset + rhs.ei_offset,
+            ei_field_size: self.ei_field_size + rhs.ei_field_size,
+            ei_field_type: self.ei_field_type + rhs.ei_field_type,
+            ei_flag: self.ei_flag + rhs.ei_flag,
+            ei_index_in_parent: self.ei_index_in_parent + rhs.ei_index_in_parent,
+            ei_immutable: self.ei_immutable + rhs.ei_immutable,
+            ei_quasi_immutable: self.ei_quasi_immutable + rhs.ei_quasi_immutable,
+        }
+    }
+}
+
+pub fn field_mint_trace_enabled() -> bool {
+    *FIELD_MINT_TRACE_ENABLED.get_or_init(|| {
+        std::env::var_os("MAJIT_FIELD_MINT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+fn field_mint_backtrace_enabled() -> bool {
+    *FIELD_MINT_BACKTRACE_ENABLED.get_or_init(|| std::env::var_os("RUST_BACKTRACE").is_some())
+}
+
+pub fn record_field_offset_source(layout_hit: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if layout_hit {
+        FIELD_OFFSET_LAYOUT_HIT.fetch_add(1, Relaxed);
+    } else {
+        FIELD_OFFSET_ACCUMULATOR_FALLBACK.fetch_add(1, Relaxed);
+    }
+}
+
+pub fn record_compute_struct_size_path(path: StructSizePath) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match path {
+        StructSizePath::Layout => COMPUTE_STRUCT_SIZE_LAYOUT.fetch_add(1, Relaxed),
+        StructSizePath::Heuristic => COMPUTE_STRUCT_SIZE_HEURISTIC.fetch_add(1, Relaxed),
+        StructSizePath::FieldsMissing => COMPUTE_STRUCT_SIZE_FIELDS_MISSING.fetch_add(1, Relaxed),
+    };
+}
+
+pub fn record_field_owner_id_registry_miss() {
+    FIELD_OWNER_ID_REGISTRY_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn field_mint_census_snapshot() -> FieldMintCensus {
+    use std::sync::atomic::Ordering::Relaxed;
+    FieldMintCensus {
+        cache_hit_disagree: FIELD_CACHE_HIT_DISAGREE.load(Relaxed),
+        cache_hit_offset: FIELD_CACHE_HIT_OFFSET.load(Relaxed),
+        cache_hit_size: FIELD_CACHE_HIT_SIZE.load(Relaxed),
+        cache_hit_type: FIELD_CACHE_HIT_TYPE.load(Relaxed),
+        cache_hit_immutability: FIELD_CACHE_HIT_IMMUTABILITY.load(Relaxed),
+        cache_hit_virtualizable: FIELD_CACHE_HIT_VIRTUALIZABLE.load(Relaxed),
+        cache_hit_index_in_parent: FIELD_CACHE_HIT_INDEX_IN_PARENT.load(Relaxed),
+        offset_layout_hit: FIELD_OFFSET_LAYOUT_HIT.load(Relaxed),
+        offset_accumulator_fallback: FIELD_OFFSET_ACCUMULATOR_FALLBACK.load(Relaxed),
+        struct_size_layout: COMPUTE_STRUCT_SIZE_LAYOUT.load(Relaxed),
+        struct_size_heuristic: COMPUTE_STRUCT_SIZE_HEURISTIC.load(Relaxed),
+        struct_size_fields_missing: COMPUTE_STRUCT_SIZE_FIELDS_MISSING.load(Relaxed),
+        owner_id_registry_miss: FIELD_OWNER_ID_REGISTRY_MISS.load(Relaxed),
+        fieldless_size_shell_mints: FIELDLESS_SIZE_SHELL_MINTS.load(Relaxed),
+        fieldless_size_shell_upgrades: FIELDLESS_SIZE_SHELL_UPGRADES.load(Relaxed),
+        ei_differing: EI_DESCR_MINT_DIFFERING.load(Relaxed),
+        ei_identical: EI_DESCR_MINT_IDENTICAL.load(Relaxed),
+        ei_struct_size: EI_DESCR_MINT_STRUCT_SIZE.load(Relaxed),
+        ei_offset: EI_DESCR_MINT_OFFSET.load(Relaxed),
+        ei_field_size: EI_DESCR_MINT_FIELD_SIZE.load(Relaxed),
+        ei_field_type: EI_DESCR_MINT_FIELD_TYPE.load(Relaxed),
+        ei_flag: EI_DESCR_MINT_FLAG.load(Relaxed),
+        ei_index_in_parent: EI_DESCR_MINT_INDEX_IN_PARENT.load(Relaxed),
+        ei_immutable: EI_DESCR_MINT_IMMUTABLE.load(Relaxed),
+        ei_quasi_immutable: EI_DESCR_MINT_QUASI_IMMUTABLE.load(Relaxed),
+    }
+}
 
 /// One `FIELD_INDEX_UNRESOLVED` event, named, keyed so identical mints fold
 /// into one row with a count.
@@ -1139,6 +1400,8 @@ impl GcCache {
         if let LLType::Struct(k) = &key {
             sd.set_cache_key(*k);
         }
+        sd.mark_fieldless_shell_mint();
+        FIELDLESS_SIZE_SHELL_MINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // descr.py:119: gccache.init_size_descr(STRUCT, sizedescr)
         // gc.py:536-542: sets descr.tid — must happen BEFORE Arc wrap.
         self.init_size_descr(&key, &mut sd);
@@ -1811,6 +2074,75 @@ impl GcCache {
             } else {
                 descr.index_in_parent
             };
+            let offset_disagrees = descr.offset != offset;
+            let size_disagrees = descr.field_size != field_size;
+            let type_disagrees = descr.field_type != field_type;
+            let immutability_disagrees = descr.is_immutable != expected_immutable
+                || descr.is_quasi_immutable() != expected_quasi_immutable;
+            let virtualizable_disagrees = descr.virtualizable != virtualizable;
+            let index_disagrees = descr.index_in_parent != expected_index_in_parent;
+            let disagrees = offset_disagrees
+                || size_disagrees
+                || type_disagrees
+                || immutability_disagrees
+                || virtualizable_disagrees
+                || index_disagrees;
+            if disagrees {
+                use std::sync::atomic::Ordering::Relaxed;
+                FIELD_CACHE_HIT_DISAGREE.fetch_add(1, Relaxed);
+                if offset_disagrees {
+                    FIELD_CACHE_HIT_OFFSET.fetch_add(1, Relaxed);
+                }
+                if size_disagrees {
+                    FIELD_CACHE_HIT_SIZE.fetch_add(1, Relaxed);
+                }
+                if type_disagrees {
+                    FIELD_CACHE_HIT_TYPE.fetch_add(1, Relaxed);
+                }
+                if immutability_disagrees {
+                    FIELD_CACHE_HIT_IMMUTABILITY.fetch_add(1, Relaxed);
+                }
+                if virtualizable_disagrees {
+                    FIELD_CACHE_HIT_VIRTUALIZABLE.fetch_add(1, Relaxed);
+                }
+                if index_disagrees {
+                    FIELD_CACHE_HIT_INDEX_IN_PARENT.fetch_add(1, Relaxed);
+                }
+                if field_mint_trace_enabled() {
+                    let cached_parent_has_positional_list = descr
+                        .get_parent_descr()
+                        .and_then(|p| p.as_size_descr().map(|sd| !sd.all_fielddescrs().is_empty()))
+                        .unwrap_or(false);
+                    eprintln!(
+                        "MAJIT_FIELD_MINT_TRACE cache_hit_disagree field_key={field_name:?} \
+                         display_name={display_name:?} cached_display_name={:?} \
+                         struct_key={struct_key:?} cached_offset={} requested_offset={offset} \
+                         cached_size={} requested_size={field_size} cached_type={:?} \
+                         requested_type={field_type:?} cached_flag={:?} requested_flag={flag:?} \
+                         cached_immutable={} requested_immutable={is_immutable} \
+                         effective_requested_immutable={expected_immutable} \
+                         cached_quasi_immutable={} \
+                         requested_quasi_immutable={is_quasi_immutable} \
+                         effective_requested_quasi_immutable={expected_quasi_immutable} \
+                         cached_virtualizable={} requested_virtualizable={virtualizable} \
+                         cached_index_in_parent={} caller_index_in_parent={index_in_parent:?} \
+                         expected_index_in_parent={expected_index_in_parent} \
+                         cached_parent_has_positional_list={cached_parent_has_positional_list}",
+                        descr.name,
+                        descr.offset,
+                        descr.field_size,
+                        descr.field_type,
+                        descr.flag,
+                        descr.is_immutable,
+                        descr.is_quasi_immutable(),
+                        descr.virtualizable,
+                        descr.index_in_parent,
+                    );
+                    if field_mint_backtrace_enabled() {
+                        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                    }
+                }
+            }
             debug_assert!(
                 descr.describes_same_field(
                     offset,
@@ -2213,6 +2545,18 @@ impl GcCache {
             }
         };
         if should_insert {
+            let upgrades_fieldless_shell = self
+                ._cache_size
+                .get(&key)
+                .and_then(|old| old.as_any())
+                .and_then(|old| old.downcast_ref::<SimpleSizeDescr>())
+                .is_some_and(|old| old.fieldless_shell_mint)
+                && descr
+                    .as_size_descr()
+                    .is_some_and(|sd| !sd.all_fielddescrs().is_empty());
+            if upgrades_fieldless_shell {
+                FIELDLESS_SIZE_SHELL_UPGRADES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(old) = self._cache_size.get(&key)
                 && !arc_in_vec(&self._size_keepalive, old)
             {
@@ -2546,11 +2890,97 @@ fn ei_descr_mints() -> &'static Mutex<indexmap::IndexMap<DescrSetMember, DescrMi
 /// layout is in scope. First writer wins, matching the cache-or-mint order in
 /// `descr.py:220-233`.
 pub fn record_ei_descr_mint(member: DescrSetMember, spec: DescrMintSpec) {
-    ei_descr_mints()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(member)
-        .or_insert(spec);
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn count_field_axes(stored: &DescrMintSpec, rejected: &DescrMintSpec) {
+        let (stored, rejected) = match (stored, rejected) {
+            (
+                DescrMintSpec::InteriorField { field: stored, .. },
+                DescrMintSpec::InteriorField {
+                    field: rejected, ..
+                },
+            ) => (stored.as_ref(), rejected.as_ref()),
+            (stored @ DescrMintSpec::Field { .. }, rejected @ DescrMintSpec::Field { .. }) => {
+                (stored, rejected)
+            }
+            _ => return,
+        };
+        let (
+            DescrMintSpec::Field {
+                struct_size: stored_struct_size,
+                offset: stored_offset,
+                field_size: stored_field_size,
+                field_type: stored_field_type,
+                flag: stored_flag,
+                is_immutable: stored_immutable,
+                is_quasi_immutable: stored_quasi_immutable,
+                index_in_parent: stored_index_in_parent,
+            },
+            DescrMintSpec::Field {
+                struct_size: rejected_struct_size,
+                offset: rejected_offset,
+                field_size: rejected_field_size,
+                field_type: rejected_field_type,
+                flag: rejected_flag,
+                is_immutable: rejected_immutable,
+                is_quasi_immutable: rejected_quasi_immutable,
+                index_in_parent: rejected_index_in_parent,
+            },
+        ) = (stored, rejected)
+        else {
+            return;
+        };
+        if stored_struct_size != rejected_struct_size {
+            EI_DESCR_MINT_STRUCT_SIZE.fetch_add(1, Relaxed);
+        }
+        if stored_offset != rejected_offset {
+            EI_DESCR_MINT_OFFSET.fetch_add(1, Relaxed);
+        }
+        if stored_field_size != rejected_field_size {
+            EI_DESCR_MINT_FIELD_SIZE.fetch_add(1, Relaxed);
+        }
+        if stored_field_type != rejected_field_type {
+            EI_DESCR_MINT_FIELD_TYPE.fetch_add(1, Relaxed);
+        }
+        if stored_flag != rejected_flag {
+            EI_DESCR_MINT_FLAG.fetch_add(1, Relaxed);
+        }
+        if stored_index_in_parent != rejected_index_in_parent {
+            EI_DESCR_MINT_INDEX_IN_PARENT.fetch_add(1, Relaxed);
+        }
+        if stored_immutable != rejected_immutable {
+            EI_DESCR_MINT_IMMUTABLE.fetch_add(1, Relaxed);
+        }
+        if stored_quasi_immutable != rejected_quasi_immutable {
+            EI_DESCR_MINT_QUASI_IMMUTABLE.fetch_add(1, Relaxed);
+        }
+    }
+
+    let mut guard = ei_descr_mints().lock().unwrap_or_else(|e| e.into_inner());
+    match guard.entry(member) {
+        indexmap::map::Entry::Vacant(entry) => {
+            entry.insert(spec);
+        }
+        indexmap::map::Entry::Occupied(entry) => {
+            let stored = entry.get();
+            if stored == &spec {
+                EI_DESCR_MINT_IDENTICAL.fetch_add(1, Relaxed);
+            } else {
+                EI_DESCR_MINT_DIFFERING.fetch_add(1, Relaxed);
+                count_field_axes(stored, &spec);
+                if field_mint_trace_enabled() {
+                    eprintln!(
+                        "MAJIT_FIELD_MINT_TRACE ei_descr_mint_disagree member={:?} \
+                         stored_spec={stored:?} rejected_spec={spec:?}",
+                        entry.key(),
+                    );
+                    if field_mint_backtrace_enabled() {
+                        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Every recorded `(member, mint spec)` pair, in mint order.
@@ -5118,6 +5548,9 @@ pub struct SimpleSizeDescr {
     /// landing on a different cache slot and breaking round-trip
     /// identity).
     cache_key: u64,
+    /// Census marker for a fieldless shell minted by `get_size_descr` before
+    /// any producer published the struct's positional field list.
+    fieldless_shell_mint: bool,
     /// descr.py:64,112: SizeDescr.immutable_flag
     pub is_immutable: bool,
     vtable: usize,
@@ -5156,6 +5589,7 @@ impl Clone for SimpleSizeDescr {
             size: self.size,
             type_id: self.type_id,
             cache_key: self.cache_key,
+            fieldless_shell_mint: self.fieldless_shell_mint,
             is_immutable: self.is_immutable,
             vtable: self.vtable,
             is_gc_managed: self.is_gc_managed,
@@ -5175,6 +5609,7 @@ impl SimpleSizeDescr {
             size,
             type_id,
             cache_key: 0,
+            fieldless_shell_mint: false,
             is_immutable: false,
             vtable: 0,
             is_gc_managed: true,
@@ -5192,6 +5627,7 @@ impl SimpleSizeDescr {
             size,
             type_id,
             cache_key: 0,
+            fieldless_shell_mint: false,
             is_immutable: false,
             vtable,
             is_gc_managed: true,
@@ -5207,6 +5643,10 @@ impl SimpleSizeDescr {
     /// path after `init_size_descr` allocates the dense GC `type_id`.
     pub fn set_cache_key(&mut self, key: u64) {
         self.cache_key = key;
+    }
+
+    fn mark_fieldless_shell_mint(&mut self) {
+        self.fieldless_shell_mint = true;
     }
 
     /// Override the GC-header flag (default `true` from the constructors).
@@ -6877,6 +7317,31 @@ mod tests {
             strip_generic_args("Result::Ok"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn generic_struct_identity_keeps_monomorphizations_distinct() {
+        let template = StructId::from_canonical("option::Option::Some");
+        assert_eq!(template.instantiate("<i64>"), template.instantiate("<i64>"));
+        assert_ne!(
+            template.instantiate("<i64>"),
+            template.instantiate("<bool>")
+        );
+        assert_ne!(template.instantiate("<i64>"), template);
+    }
+
+    #[test]
+    fn generic_args_span_is_balanced_and_excludes_variant_tail() {
+        assert_eq!(
+            generic_args_span("Result<i64,PyError>::Ok"),
+            Some("<i64,PyError>")
+        );
+        assert_eq!(
+            generic_args_span("Option<Result<i32,E>>::Some"),
+            Some("<Result<i32,E>>")
+        );
+        assert_eq!(generic_args_span("Result::Ok"), None);
+        assert_eq!(generic_args_span("Result<i64"), None);
     }
 
     #[test]

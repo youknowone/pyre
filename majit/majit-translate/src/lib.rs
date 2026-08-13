@@ -842,7 +842,7 @@ fn expand_immutable_fields_to_all_spellings(
     let mut declared_names: Vec<&String> = declared.keys().collect();
     declared_names.sort();
     for name in declared_names {
-        if let Some(sid) = majit_ir::descr::struct_id_for_name(name) {
+        if let Some(sid) = majit_ir::descr::struct_template_id_for_name(name) {
             by_struct_id.entry(sid).or_insert(&declared[name]);
         }
     }
@@ -851,14 +851,31 @@ fn expand_immutable_fields_to_all_spellings(
         if out.contains_key(name) {
             continue;
         }
-        let Some(entries) =
-            majit_ir::descr::struct_id_for_name(name).and_then(|sid| by_struct_id.get(&sid))
+        let Some(entries) = majit_ir::descr::struct_template_id_for_name(name)
+            .and_then(|sid| by_struct_id.get(&sid))
         else {
             continue;
         };
         out.insert(name.clone(), (*entries).clone());
     }
     out
+}
+
+fn struct_layout_fields_equal(left: &[StructFieldLayout], right: &[StructFieldLayout]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name
+                && left.offset == right.offset
+                && left.size == right.size
+                && left.flag == right.flag
+                && left.field_type == right.field_type
+                && left.rank == right.rank
+        })
+}
+
+fn struct_layout_census_enabled() -> bool {
+    std::env::var_os("MAJIT_STRUCT_LAYOUT_CENSUS")
+        .is_some_and(|value| value == std::ffi::OsStr::new("1"))
 }
 
 #[expect(
@@ -1249,6 +1266,18 @@ fn analyze_pipeline_from_module_paths(
     // registers each as an opaque external so the residual `FunctionPath`
     // form resolves; see `cutover::register_foreign_opaque_method_externals`.
     call_control.foreign_opaque_method_externals = program.foreign_opaque_method_externals.clone();
+    // Diagnostic-only spelling census. Do not sort the production loop or
+    // alter its last-writer-wins behaviour: this pass measures whether two
+    // registry spellings that resolve to one StructId produce different
+    // layouts before choosing the canonical producer. The side table groups
+    // equal layouts instead of comparing every spelling pair, keeping the
+    // census linear in the number of spellings times the (small) number of
+    // distinct layouts.
+    let census_struct_layouts = struct_layout_census_enabled();
+    let mut struct_layout_variants: std::collections::HashMap<
+        majit_ir::descr::StructId,
+        Vec<(StructLayout, Vec<String>)>,
+    > = std::collections::HashMap::new();
     // Populate CallControl with layouts from the provider.  Where Charon
     // resolved an exact layout (`program.exact_layouts`), use the true Rust
     // offsets and total size — `#[repr(Rust)]` reorders/repacks fields, so
@@ -1265,15 +1294,89 @@ fn analyze_pipeline_from_module_paths(
         let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
             continue;
         };
-        let layout = match program.exact_layouts.get(&sid) {
+        // `exact_layouts` originates on Charon's defining TypeDecl. Concrete
+        // generic identities are derived later from use-site type arguments,
+        // so inherit the declaration's exact offsets when it has no concrete
+        // entry (notably the explicit translated `Result` shell).
+        let exact = program.exact_layouts.get(&sid).or_else(|| {
+            majit_ir::descr::struct_template_id_for_name(struct_name)
+                .and_then(|template| program.exact_layouts.get(&template))
+        });
+        // An opaque/shadow declaration can share the runtime identity of its
+        // defining type (e.g. pyre-interpreter's zero-field GetSetProperty
+        // marker versus pyre-object's real definition).  If Charon's exact
+        // definition carries fields but this spelling has no rows, it is an
+        // alias consumer, not a layout producer; letting it write would erase
+        // the real field layout according to HashMap iteration order.
+        let incomplete_shadow = exact.is_some_and(|layout| !layout.field_offsets.is_empty())
+            && program
+                .struct_fields
+                .fields
+                .get(struct_name)
+                .is_some_and(Vec::is_empty);
+        if incomplete_shadow {
+            continue;
+        }
+        let layout = match exact {
             Some(exact) => {
                 provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
             }
             None => provider.get_struct_layout(struct_name),
         };
         if let Some(layout) = layout {
+            if census_struct_layouts {
+                let variants = struct_layout_variants.entry(sid).or_default();
+                if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
+                    observed.size == layout.size
+                        && struct_layout_fields_equal(&observed.fields, &layout.fields)
+                }) {
+                    spellings.push(struct_name.clone());
+                } else {
+                    variants.push((layout.clone(), vec![struct_name.clone()]));
+                }
+            }
             call_control.set_struct_layout(sid, layout);
         }
+    }
+    if census_struct_layouts {
+        let struct_id_count = struct_layout_variants.len();
+        let aliased_struct_ids = struct_layout_variants
+            .values()
+            .filter(|variants| variants.iter().map(|(_, names)| names.len()).sum::<usize>() > 1)
+            .count();
+        let mut conflicts: Vec<_> = struct_layout_variants
+            .iter_mut()
+            .filter(|(_, variants)| variants.len() > 1)
+            .collect();
+        conflicts.sort_by_key(|(sid, _)| **sid);
+        for (sid, variants) in &mut conflicts {
+            for (_, spellings) in variants.iter_mut() {
+                spellings.sort();
+            }
+            variants.sort_by(|(_, left), (_, right)| left[0].cmp(&right[0]));
+            let spelling_count = variants
+                .iter()
+                .map(|(_, spellings)| spellings.len())
+                .sum::<usize>();
+            eprintln!(
+                "MAJIT_STRUCT_LAYOUT_CENSUS conflict sid={sid:?} \
+                 spellings={spelling_count} layout_variants={}",
+                variants.len(),
+            );
+            for (index, (layout, spellings)) in variants.iter().enumerate() {
+                eprintln!(
+                    "MAJIT_STRUCT_LAYOUT_CENSUS variant sid={sid:?} index={index} \
+                     spelling_count={} spellings={spellings:?} layout={layout:?}",
+                    spellings.len(),
+                );
+            }
+        }
+        eprintln!(
+            "MAJIT_STRUCT_LAYOUT_CENSUS summary struct_ids={} \
+             aliased_struct_ids={aliased_struct_ids} conflicting_struct_ids={}",
+            struct_id_count,
+            conflicts.len(),
+        );
     }
     // Register graphs collected above (free functions only — trait
     // methods are handled separately via register_trait_method).

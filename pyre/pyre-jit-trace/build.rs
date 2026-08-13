@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v5";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v6";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -29,6 +29,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "ei_descr_mints.bin",
+    "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
@@ -237,6 +238,11 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(
         format!("{out_dir}/ei_descr_mints.bin"),
         bincode::serialize(&Vec::<majit_ir::effectinfo::DescrMintEntry>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/field_mint_census.bin"),
+        bincode::serialize(&majit_ir::descr::FieldMintCensus::default()).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -895,8 +901,15 @@ fn real_main() {
     // Restoring the outputs leaves the self-check nothing to compare, so it
     // bypasses the cache for the same reason the verbose prepass does.
     let determinism_check = DeterminismCheck::from_env();
+    // These diagnostics are emitted while the analyzer is running. A cache
+    // restore would make an enabled census look empty.
+    let field_mint_trace = majit_ir::descr::field_mint_trace_enabled();
+    let struct_layout_census =
+        std::env::var_os("MAJIT_STRUCT_LAYOUT_CENSUS").is_some_and(|value| value == "1");
     if !verbose_prepass
         && !callee_census
+        && !field_mint_trace
+        && !struct_layout_census
         && determinism_check == DeterminismCheck::Off
         && restore_codegen_cache(&cache_dir, &out_dir)
     {
@@ -1019,6 +1032,17 @@ fn real_main() {
         // `descr.py:224-238` miss branch this one did.
         let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
         std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
+
+        // Analyzer-side descriptor producers run in this build-script process,
+        // while the runtime formats the field-position report. Persist the
+        // producer census beside the mint ledger.
+        let field_mint_census_bin =
+            bincode::serialize(&majit_ir::descr::field_mint_census_snapshot()).unwrap();
+        std::fs::write(
+            format!("{out_dir}/field_mint_census.bin"),
+            &field_mint_census_bin,
+        )
+        .unwrap();
 
         // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
         // Persist the build-time assembler's shared `all_liveness` byte stream so a
@@ -1252,6 +1276,8 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-env-changed=PYRE_RTYPER_VERBOSE");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS");
     println!("cargo::rerun-if-env-changed=PYRE_CALLEE_CENSUS_ROWS");
+    println!("cargo::rerun-if-env-changed=MAJIT_FIELD_MINT_TRACE");
+    println!("cargo::rerun-if-env-changed=MAJIT_STRUCT_LAYOUT_CENSUS");
     println!("cargo::rerun-if-env-changed={DETERMINISM_CHECK_ENV}");
     // Re-runs this script without changing anything it hashes. That is the
     // only way to exercise `DeterminismCheck::AgainstCache`, which needs two

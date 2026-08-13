@@ -5277,7 +5277,8 @@ mod tests {
             );
         }
         cc.set_struct_fields(struct_fields);
-        let owner_id = majit_ir::descr::StructId::from_canonical("result::Result");
+        let template_id = majit_ir::descr::StructId::from_canonical("result::Result");
+        let owner_id = template_id.instantiate("<i64,PyError>");
         let parent_type_id = |owner: &str| {
             let field = FieldDescriptor::new("__discriminant", Some(owner.to_string()))
                 .with_owner_id(Some(owner_id));

@@ -2487,13 +2487,19 @@ impl CallControl {
                 // publish under the same `struct_key` carries the real
                 // vtable on its PyreSizeDescr — cache-hit returns
                 // *that* Arc here unchanged).
-                let struct_size = compute_struct_size(self, owner_root);
-                let field_offset = owner_id
-                    .or_else(|| majit_ir::descr::struct_id_for_name(owner_root))
+                let registry_struct_id = majit_ir::descr::struct_id_for_name(owner_root);
+                if owner_id.is_some() && registry_struct_id.is_none() {
+                    majit_ir::descr::record_field_owner_id_registry_miss();
+                }
+                let (struct_size, struct_size_path) =
+                    compute_struct_size_with_path(self, owner_root);
+                let exact_field_offset = owner_id
+                    .or(registry_struct_id)
                     .and_then(|sid| self.struct_layouts.get(&sid))
                     .and_then(|l| l.fields.iter().find(|f| f.name.as_str() == field_name))
-                    .map(|f| f.offset)
-                    .unwrap_or(offset);
+                    .map(|f| f.offset);
+                majit_ir::descr::record_field_offset_source(exact_field_offset.is_some());
+                let field_offset = exact_field_offset.unwrap_or(offset);
                 let rank = self.field_immutability(Some(owner_root), field_name);
                 let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
                 let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
@@ -2529,6 +2535,13 @@ impl CallControl {
                             // layout still has to travel. Read it back off the
                             // descr rather than off the locals below, which
                             // describe the mint that did not happen.
+                            trace_field_ei_descr_mint(
+                                "parent_field",
+                                owner_root,
+                                owner_id.is_some(),
+                                registry_struct_id,
+                                struct_size_path,
+                            );
                             majit_ir::descr::record_ei_descr_mint(
                                 member.clone(),
                                 majit_ir::effectinfo::DescrMintSpec::Field {
@@ -2585,6 +2598,13 @@ impl CallControl {
                 // Same arguments this `get_field_descr` miss just used, kept so
                 // the runtime's own cache can take the same miss branch
                 // (`descr.py:224-238`) instead of finding an empty slot.
+                trace_field_ei_descr_mint(
+                    "analyzer_field",
+                    owner_root,
+                    owner_id.is_some(),
+                    registry_struct_id,
+                    struct_size_path,
+                );
                 majit_ir::descr::record_ei_descr_mint(
                     member.clone(),
                     majit_ir::effectinfo::DescrMintSpec::Field {
@@ -8065,16 +8085,29 @@ fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
 /// 1. `cc.struct_layouts[struct_name].size` — actual layout
 /// 2. Type-string heuristic fallback
 fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
+    compute_struct_size_with_path(cc, struct_name).0
+}
+
+fn compute_struct_size_with_path(
+    cc: &CallControl,
+    struct_name: &str,
+) -> (usize, majit_ir::descr::StructSizePath) {
     // Path 1: actual layout from runtime (RPython: symbolic.get_size(STRUCT))
     if let Some(layout) = cc.struct_layout_for(struct_name) {
-        return layout.size;
+        let path = majit_ir::descr::StructSizePath::Layout;
+        majit_ir::descr::record_compute_struct_size_path(path);
+        return (layout.size, path);
     }
     // Path 2: heuristic fallback — RPython: symbolic always computes the full
     // struct size, even with nested structs. Nested struct sizes are looked up
     // recursively from struct_layouts.
     let fields = match cc.struct_fields.fields.get(struct_name) {
         Some(f) => f,
-        None => return 0,
+        None => {
+            let path = majit_ir::descr::StructSizePath::FieldsMissing;
+            majit_ir::descr::record_compute_struct_size_path(path);
+            return (0, path);
+        }
     };
     let mut offset: usize = 0;
     for (_, field_type_str) in fields.iter() {
@@ -8109,10 +8142,30 @@ fn compute_struct_size(cc: &CallControl, struct_name: &str) -> usize {
         .filter(|s| *s > 0)
         .max()
         .unwrap_or_else(crate::layout::target_word_size);
-    if offset > 0 {
+    let size = if offset > 0 {
         (offset + max_align - 1) & !(max_align - 1)
     } else {
         0
+    };
+    let path = majit_ir::descr::StructSizePath::Heuristic;
+    majit_ir::descr::record_compute_struct_size_path(path);
+    (size, path)
+}
+
+fn trace_field_ei_descr_mint(
+    site: &str,
+    owner_root: &str,
+    owner_id_is_some: bool,
+    registry_struct_id: Option<majit_ir::descr::StructId>,
+    struct_size_path: majit_ir::descr::StructSizePath,
+) {
+    if majit_ir::descr::field_mint_trace_enabled() {
+        eprintln!(
+            "MAJIT_FIELD_MINT_TRACE ei_descr_mint site={site} owner_root={owner_root:?} \
+             owner_id_is_some={owner_id_is_some} \
+             struct_id_for_name={registry_struct_id:?} \
+             compute_struct_size_path={struct_size_path:?}"
+        );
     }
 }
 
