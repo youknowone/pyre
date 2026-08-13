@@ -15985,7 +15985,13 @@ impl majit_backend::Backend for CraneliftBackend {
         // between codegen and metainterp.  The stamp here lands on the
         // same `op.descr` Arc that `pyjitpl.rs::record_loop_or_bridge`
         // touches; the two writes converge on a single identity per fail.
-        if let Some(clt) = token.compiled_loop_token() {
+        // `JitCellToken::new` fills the CLT eagerly and nothing ever clears it,
+        // so an absent one is a bug rather than a state to skip. Skipping would
+        // drop `asm_memory_blocks` below, returning the arena range this loop
+        // was just written into to the free list while the loop still runs from
+        // it; `compiled_loop_token_expect` fails loudly instead.
+        {
+            let clt = token.compiled_loop_token_expect();
             for descr in &compiled.fail_descrs {
                 // `compile.py:185` `isinstance(descr, ResumeDescr)`
                 // covers both `ResumeGuardDescr` and
@@ -16147,7 +16153,10 @@ impl majit_backend::Backend for CraneliftBackend {
             caller_layout.as_ref(),
         );
         let mut compiled = compiled?;
-        if let Some(clt) = original_token.compiled_loop_token() {
+        // Same invariant as the loop path above: skipping would free the arena
+        // range the bridge was just written into.
+        {
+            let clt = original_token.compiled_loop_token_expect();
             clt.asmmemmgr_blocks.lock().extend(
                 compiled
                     .asm_memory_blocks
