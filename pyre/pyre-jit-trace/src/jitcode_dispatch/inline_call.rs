@@ -1381,14 +1381,29 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
             _ => return None,
         }
     }
-    for c in fresh {
+    // Only `null_or_self@1` may be null, and the layout above names it by
+    // index, so it is checked by position rather than by admitting a null
+    // anywhere.  Everything else here is a Python value the rewound `CALL`
+    // pops — an argument, or `kwnames` in the `call_kw` layout — and a null in
+    // one of those slots is an UNRESOLVED register, not a value: the concrete
+    // Ref bank holds `Ref(null)` for a box the walk never materialized, which
+    // is why `concrete_ref_for_color` tests for it and why the prefix loop
+    // above declines on it.  Publishing one lets the resumed interpreter pop a
+    // null where an object belongs.
+    for (index, c) in fresh.into_iter().enumerate() {
         match c {
-            ConcreteValue::Ref(r) => stack.push(r),
+            ConcreteValue::Ref(r) if index == NULL_OR_SELF_ARG_INDEX || !r.is_null() => {
+                stack.push(r)
+            }
             _ => return None,
         }
     }
     Some(stack)
 }
+
+/// `r_args` index of the `null_or_self` operand — the one slot of a residual
+/// call's Ref list whose correct value can be null.
+const NULL_OR_SELF_ARG_INDEX: usize = 1;
 
 /// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
 /// `call_kw` reuses the positional inline path.  The constant `kwnames` tuple
@@ -3175,12 +3190,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // that window resumes a frame whose callable slot was never
                 // written — `names(traceback)` in
                 // `synth/exception_reentry_guard_finally_residual` SIGSEGVs in
-                // `classify_callable` on a null callable.  No other deferred
-                // helper's result outlives the next op, so the loop header is
-                // only disqualifying together with that one residual.  The test
-                // is a superset of the failing shape: `names` also needs an
-                // in-window guard that actually fails, which a plain `self.attr`
-                // read folds away.
+                // `classify_callable` on a null callable.  The test is a
+                // superset of the failing shape: `names` also needs an in-window
+                // guard that actually fails, which a plain `self.attr` read
+                // folds away.
+                //
+                // ⚠️This pair is what disqualifies a CALLEE, and that is the
+                // whole of its licence — it is NOT that a method-load is the
+                // only deferred result outliving the next op, which this clause
+                // used to claim.  Measured counterexample: in
+                // `parity_tests/exception_handler_method_load_resume.py` the
+                // CALLER's `out.append(...)` leaves its `LOAD_ATTR name +
+                // NULL|self` pair on the stack across four opcodes, and the
+                // deopt did resume over the unwritten slot — the same SIGSEGV,
+                // through a caller this gate never examines.  What prevents it
+                // is the producer of the flush's operand image refusing to
+                // publish an unresolved null (`collect_call_stack_overrides`),
+                // not any admission test here.
                 let loop_header_admitted = !body_facts.owns_loop_header
                     || !fbw_callee_body_has_load_method_self_residual(body.code, callee_descr_refs);
                 foriter_deferred_admit = entry_is_call_boundary
