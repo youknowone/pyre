@@ -1578,35 +1578,40 @@ class Check:
         # and all three backends, and the band this gate replaced is exactly
         # what let eight baselines go stale unnoticed.
         #
-        # Measured, not assumed, and read back from the runner jobs rather than
-        # predicted. ubuntu-24.04 reports str_fstring guard_failures 658/659 on
-        # dynasm/cranelift. macos-latest reports the inverse 659/658, and
-        # windows-latest reports 658/658. Every other gated counter is identical
-        # (six loops and three bridges), and each mismatch reproduced in both
-        # stability reruns.
+        # No fixture uses this today. The mechanism is kept because a genuine
+        # host disagreement is worth recording exactly rather than widening the
+        # gate for everyone, but the four overlays that existed -- all of them
+        # `str_fstring`'s -- were removed once the disagreement they recorded
+        # was traced to its cause, and that trace is the reason to be slow about
+        # writing another.
         #
-        # A local arm64 macOS build observes the macos-latest pair rather than
-        # ubuntu's: two full local gates pass against plain `.darwin` overlays
-        # holding dynasm 659 and cranelift 658. Darwin is therefore carried
-        # platform-wide, and the darwin GitHub-runner overlay that once held the
-        # same cranelift value was dropped as unreachable.
+        # `str_fstring` read `guard_failures` 657 or 658 with every other gated
+        # counter identical (six loops, three bridges), and which one it read
+        # differed by backend and by runner. The cause was not the backend. At
+        # the trip counts it used, its old-gen use crossed the major-collection
+        # threshold pinned above; the crossing arms the eval-breaker, a back-edge
+        # poll guard fails, and re-entry after that bailout lands in a bridge
+        # whose own guard then fails once -- one extra `guard_failures` that is a
+        # real deopt, not a poll, so the `back_edge_polls` split cannot absorb
+        # it. Whether re-entry trips that bridge guard depends on where the
+        # crossing falls, and walking `PYPY_GC_MIN` in 8MB steps puts *both*
+        # backends on the extra failure at thresholds one step apart (cranelift
+        # at 256MB, dynasm at 264MB, neither at 272MB). The runners were not
+        # disagreeing about a fact; each sat at a different point of one curve.
         #
-        # This is a collection-schedule boundary, not a compile-shape change.
-        # On a local arm64 macOS cranelift build, adding check.py's two wasm
-        # environment keys (ignored semantically by the native backend) moves
-        # 658 -> 659 while the number of major collections stays at 11. The
-        # guard sequence gains one trace-6 fail-5 exit; the compiled-trace log
-        # maps it to the GuardFalse on the eval-breaker poll. Thus the knife edge
-        # is where a collection-triggered breaker lands, not how many loops or
-        # bridges compile. The runner did not enable either census, so exactly
-        # which host input moves that placement remains unidentified; the
-        # observed counter and stable runner split are direct measurements.
+        # Anything that moves total allocation volume moves that point --
+        # including the byte length of the environment, since the child inherits
+        # the parent's. So an overlay written against such a value records a
+        # phase, not a property, and re-rolls under an unrelated change. The fix
+        # was to take the fixture off the threshold rather than to record which
+        # side of it each runner landed on; see its header.
         #
-        # An overlay shadows the shared baseline permanently, so one written
+        # An overlay also shadows the shared baseline permanently, so one written
         # against a value that later converges becomes a failure main does not
         # have: `recursive_call_frame_relocation` was given one for 637, and
         # windows later converged on its shared value. Read all three runners
-        # back before adding or retaining another.
+        # back before adding one, and prefer removing the fixture's dependence on
+        # the host input to recording the host.
         source = Path(script)
         if os.environ.get("GITHUB_ACTIONS") == "true":
             github_runner = source.with_name(
