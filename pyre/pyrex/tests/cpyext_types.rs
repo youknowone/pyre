@@ -306,6 +306,84 @@ assert h.field == 0
 # A class access hands the descriptor back.
 assert type(Holder.field) is m.Doubler
 
+# ── the buffer table ───────────────────────────────────────────────────
+blob = m.Blob(b'abcdef')
+assert blob.exports() == 0
+view = memoryview(blob)
+assert blob.exports() == 1
+assert view.obj is blob
+assert len(view) == 6
+assert view.readonly is False
+assert view.itemsize == 1
+assert view.format == 'B'
+assert bytes(view) == b'abcdef'
+assert view[0] == ord('a')
+assert list(view[1:3]) == [ord('b'), ord('c')]
+view.release()
+assert blob.exports() == 0
+
+with memoryview(blob) as inner:
+    assert inner[5] == ord('f')
+    assert blob.exports() == 1
+assert blob.exports() == 0
+
+# The window is the exporter's own storage, not a copy of it.
+live = m.Blob(b'abc')
+with memoryview(live) as writable:
+    writable[0] = ord('z')
+assert live.read(live) == b'zbc'
+
+# The bytes-like conversions reach `bf_getbuffer` too.
+assert bytes(m.Blob(b'xy')) == b'xy'
+assert bytearray(m.Blob(b'xy')) == bytearray(b'xy')
+
+# PyObject_GetBuffer driven from C, over a C exporter and over a pyre object.
+assert m.Blob(b'').read(m.Blob(b'held')) == b'held'
+assert m.Blob(b'').read(b'plain bytes') == b'plain bytes'
+assert m.Blob(b'').read(bytearray(b'mutable')) == b'mutable'
+try:
+    m.Blob(b'').read(42)
+except TypeError:
+    pass
+else:
+    raise AssertionError('a non-exporter was accepted')
+
+# ── the async table ────────────────────────────────────────────────────
+ticker = m.Ticker(3)
+assert list(ticker.__await__()) == [3, 2, 1]
+assert ticker.__aiter__() is ticker
+assert ticker.__anext__() == 2
+assert ticker.__anext__() == 1
+assert ticker.__anext__() == 0
+try:
+    ticker.__anext__()
+except StopAsyncIteration:
+    pass
+else:
+    raise AssertionError('the exhausted async iterator kept going')
+
+# `await` goes through `am_await`, whose iterator's yields reach the caller.
+async def use(source):
+    return await source
+
+coroutine = use(m.Ticker(2))
+assert coroutine.send(None) == 2
+assert coroutine.send(None) == 1
+try:
+    coroutine.send(None)
+except StopIteration as stop:
+    assert stop.value is None, stop.value
+else:
+    raise AssertionError('the coroutine did not finish')
+
+# `am_send`, which has no dunder of its own, is reached through PyIter_Send.
+stepper = m.Ticker(2)
+assert m.send(stepper) == ('next', 1)
+assert m.send(stepper) == ('next', 0)
+assert m.send(stepper) == ('return', -1)
+# A pyre iterator goes through `__next__` / `send` instead.
+assert m.send(iter([7, 8])) == ('next', 7)
+
 # ── capsules ───────────────────────────────────────────────────────────
 capsule = m.PAYLOAD
 assert repr(capsule).startswith('<capsule object "cpyext_types.PAYLOAD" at 0x')

@@ -1060,6 +1060,271 @@ static PyTypeObject DoublerType = {
     doubler_new,                                /* tp_new */
 };
 
+/* ── Blob: the buffer table ─────────────────────────────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    char bytes[8];
+    Py_ssize_t length;
+    long exports;
+} BlobObject;
+
+static PyObject *blob_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    const char *text = "";
+    Py_ssize_t size = 0;
+    if (!PyArg_ParseTuple(args, "|y#", &text, &size)) {
+        return NULL;
+    }
+    if (size > (Py_ssize_t)sizeof(((BlobObject *)0)->bytes)) {
+        PyErr_SetString(PyExc_ValueError, "a Blob holds at most eight bytes");
+        return NULL;
+    }
+    BlobObject *self = (BlobObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    memcpy(self->bytes, text, (size_t)size);
+    self->length = size;
+    self->exports = 0;
+    return (PyObject *)self;
+}
+
+static int blob_getbuffer(PyObject *self, Py_buffer *view, int flags)
+{
+    BlobObject *blob = (BlobObject *)self;
+    if (PyBuffer_FillInfo(view, self, blob->bytes, blob->length, 0, flags) < 0) {
+        return -1;
+    }
+    /* `internal` is the exporter's own state: it has to survive until the
+       paired release, which is what proves the structure is handed back. */
+    view->internal = (void *)blob;
+    blob->exports += 1;
+    return 0;
+}
+
+static void blob_releasebuffer(PyObject *self, Py_buffer *view)
+{
+    BlobObject *blob = (BlobObject *)view->internal;
+    if (blob != NULL) {
+        blob->exports -= 1;
+    }
+}
+
+static PyObject *blob_exports(PyObject *self, PyObject *unused)
+{
+    return PyLong_FromLong(((BlobObject *)self)->exports);
+}
+
+/* PyObject_GetBuffer over whatever object is handed in, from C. */
+static PyObject *blob_read(PyObject *self, PyObject *source)
+{
+    Py_buffer view;
+    if (PyObject_GetBuffer(source, &view, PyBUF_SIMPLE) < 0) {
+        return NULL;
+    }
+    PyObject *copy = PyBytes_FromStringAndSize((const char *)view.buf, view.len);
+    PyBuffer_Release(&view);
+    return copy;
+}
+
+static PyMethodDef blob_methods[] = {
+    {"exports", blob_exports, METH_NOARGS, "live export count"},
+    {"read", blob_read, METH_O, "PyObject_GetBuffer over any exporter"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyBufferProcs blob_as_buffer = {
+    blob_getbuffer,                             /* bf_getbuffer */
+    blob_releasebuffer,                         /* bf_releasebuffer */
+};
+
+static PyTypeObject BlobType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Blob",                        /* tp_name */
+    sizeof(BlobObject),                         /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    &blob_as_buffer,                            /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a byte exporter defined in C",             /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    blob_methods,                               /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    blob_new,                                   /* tp_new */
+};
+
+/* ── Ticker: the async table ────────────────────────────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long remaining;
+} TickerObject;
+
+static PyTypeObject TickerType;
+
+static PyObject *ticker_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    long count = 0;
+    if (!PyArg_ParseTuple(args, "|l", &count)) {
+        return NULL;
+    }
+    TickerObject *self = (TickerObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->remaining = count;
+    return (PyObject *)self;
+}
+
+/* `__await__` answers with an ordinary iterator over the remaining ticks. */
+static PyObject *ticker_await(PyObject *self)
+{
+    PyObject *countdown = PyList_New(0);
+    if (countdown == NULL) {
+        return NULL;
+    }
+    for (long i = ((TickerObject *)self)->remaining; i > 0; i--) {
+        PyObject *item = PyLong_FromLong(i);
+        if (item == NULL || PyList_Append(countdown, item) < 0) {
+            Py_XDECREF(item);
+            Py_DECREF(countdown);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    PyObject *iterator = PyObject_GetIter(countdown);
+    Py_DECREF(countdown);
+    return iterator;
+}
+
+static PyObject *ticker_aiter(PyObject *self)
+{
+    Py_INCREF(self);
+    return self;
+}
+
+/* NULL with no exception set is the end, as it is for `tp_iternext`. */
+static PyObject *ticker_anext(PyObject *self)
+{
+    TickerObject *ticker = (TickerObject *)self;
+    if (ticker->remaining <= 0) {
+        return NULL;
+    }
+    ticker->remaining -= 1;
+    return PyLong_FromLong(ticker->remaining);
+}
+
+static PySendResult ticker_send(PyObject *self, PyObject *value, PyObject **result)
+{
+    TickerObject *ticker = (TickerObject *)self;
+    if (ticker->remaining <= 0) {
+        *result = PyLong_FromLong(-1);
+        return *result == NULL ? PYGEN_ERROR : PYGEN_RETURN;
+    }
+    ticker->remaining -= 1;
+    *result = PyLong_FromLong(ticker->remaining);
+    return *result == NULL ? PYGEN_ERROR : PYGEN_NEXT;
+}
+
+static PyAsyncMethods ticker_as_async = {
+    ticker_await,                               /* am_await */
+    ticker_aiter,                               /* am_aiter */
+    ticker_anext,                               /* am_anext */
+    ticker_send,                                /* am_send */
+};
+
+/* Drive `PyIter_Send` from C so `am_send` is reached. */
+static PyObject *m_send(PyObject *self, PyObject *args)
+{
+    PyObject *iterator = NULL;
+    PyObject *value = Py_None;
+    if (!PyArg_ParseTuple(args, "O|O", &iterator, &value)) {
+        return NULL;
+    }
+    PyObject *stepped = NULL;
+    PySendResult status = PyIter_Send(iterator, value, &stepped);
+    if (status == PYGEN_ERROR) {
+        return NULL;
+    }
+    PyObject *label = PyUnicode_FromString(status == PYGEN_RETURN ? "return" : "next");
+    if (label == NULL) {
+        Py_XDECREF(stepped);
+        return NULL;
+    }
+    PyObject *pair = Py_BuildValue("(OO)", label, stepped);
+    Py_DECREF(label);
+    Py_XDECREF(stepped);
+    return pair;
+}
+
+static PyTypeObject TickerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Ticker",                      /* tp_name */
+    sizeof(TickerObject),                       /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    &ticker_as_async,                           /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "an async iterator defined in C",           /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    0,                                          /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    ticker_new,                                 /* tp_new */
+};
+
 /* ── Spec: a heap type built with PyType_FromSpec ───────────────────── */
 
 typedef struct {
@@ -1209,6 +1474,7 @@ static PyMethodDef methods[] = {
     {"import_attr", m_import, METH_VARARGS, "PyImport_ImportModule then getattr"},
     {"add_module_ref", m_import_ref, METH_VARARGS, "PyImport_AddModuleRef"},
     {"protocol", m_protocol, METH_VARARGS, "drive one abstract protocol call"},
+    {"send", m_send, METH_VARARGS, "PyIter_Send one step"},
     {"make", m_make, METH_VARARGS, "build a Point without calling the class"},
     {"is_point", m_is_point, METH_O, "PyObject_TypeCheck"},
     {"sum_x", m_sum_x, METH_O, "read x, raising the module exception otherwise"},
@@ -1241,6 +1507,12 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &DoublerType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &BlobType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &TickerType) < 0) {
         return -1;
     }
     if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {

@@ -15,11 +15,13 @@
     any(target_os = "macos", target_os = "linux")
 ))]
 
+pub mod buffer;
 pub mod bytesobject;
 pub mod capsule;
 pub mod dictobject;
 pub mod floatobject;
 pub mod import_;
+pub mod iterator;
 pub mod listobject;
 pub mod longobject;
 pub mod mapping;
@@ -728,4 +730,6 @@ pub fn ensure_linked() {
     number::ensure_linked();
     sequence::ensure_linked();
     mapping::ensure_linked();
+    iterator::ensure_linked();
+    buffer::ensure_linked();
 }

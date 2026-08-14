@@ -8778,7 +8778,21 @@ fn buffer_bytes(
     // `__release_buffer__` callback with the exact returned memoryview.
     unsafe {
         let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        if lookup(r_obj, "__buffer__").is_none() {
+        // A C exporter has no `__buffer__` descriptor: its `bf_getbuffer` is
+        // reached through the memoryview acquisition itself.
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        let c_exporter = crate::cpyext::buffer::exports_buffer(r_obj);
+        #[cfg(not(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        )))]
+        let c_exporter = false;
+        if lookup(r_obj, "__buffer__").is_none() && !c_exporter {
             return Ok(None);
         }
         let w_view = crate::builtins::w_memoryview_new_with_flags(r_obj, flags)?;

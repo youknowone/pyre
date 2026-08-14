@@ -708,6 +708,14 @@ fn w_memoryview_new_with_flags_impl(
             pyre_object::memoryview::w_memoryview_set_view(mv, view_ptr);
             return Ok(mv);
         }
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        if let Some(view) = crate::cpyext::buffer::buffer_view(w_obj, flags) {
+            return view;
+        }
         let (fmt, itemsize, readonly, byte_len) = match memoryview_buffer_params(w_obj) {
             Some(p) => p,
             None => {
@@ -1779,19 +1787,25 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     )))
 }
 
-/// Drop an mmap-backed view's export directly, bypassing any Python-callable
-/// release.  Returns `true` when it handled an mmap backing.
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-unsafe fn release_external_backing(backing: PyObjectRef) -> bool {
+/// Drop a foreign-memory view's export directly, bypassing any Python-callable
+/// release.  Returns `true` when it handled the backing.
+unsafe fn release_external_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool {
+    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
     if crate::module::mmap::interp_mmap::is_mmap(backing) {
         unsafe { crate::module::mmap::interp_mmap::mmap_exports_decref(backing) };
         return true;
     }
-    false
-}
-
-#[cfg(not(all(any(unix, windows), not(feature = "sandbox"))))]
-unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
+    // A C exporter's `bf_releasebuffer` is handed back the exact `Py_buffer`
+    // its `bf_getbuffer` filled in, which is keyed by the exported address.
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    if unsafe { crate::cpyext::buffer::release_view(mv, backing) } {
+        return true;
+    }
+    let _ = (mv, backing);
     false
 }
 
@@ -1799,7 +1813,7 @@ unsafe fn release_external_backing(_backing: PyObjectRef) -> bool {
 /// acquisition.  Python-visible `__release_buffer__` is a slot wrapper in
 /// CPython 3.14: it calls `memoryview.release()`, which in turn reaches this
 /// native slot.  Calling the Python wrapper again here would recurse.
-unsafe fn release_native_backing(backing: PyObjectRef) -> bool {
+unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(backing) {
             pyre_object::bytearrayobject::w_bytearray_exports_decref(backing);
@@ -1814,7 +1828,7 @@ unsafe fn release_native_backing(backing: PyObjectRef) -> bool {
             // accounting and has no Python-visible release wrapper.
             return true;
         }
-        release_external_backing(backing)
+        release_external_backing(mv, backing)
     }
 }
 
@@ -1962,7 +1976,7 @@ unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
         } else if !w_memoryview_released(r_mv) {
             memoryview_release_native_python_slot(r_obj, r_mv);
             let backing = w_memoryview_backing(r_mv);
-            let _ = release_native_backing(backing);
+            let _ = release_native_backing(r_mv, backing);
             w_memoryview_set_released(r_mv);
         }
         w_buffer_wrapper_clear(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -2010,7 +2024,7 @@ pub(crate) fn memoryview_release(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
                     // restricted snapshot, then unconditionally invoke the
                     // first native base release slot.
                     memoryview_release_native_python_slot(owner, mv);
-                    if release_native_backing(backing) {
+                    if release_native_backing(mv, backing) {
                         Ok(())
                     } else {
                         match crate::baseobjspace::lookup(backing, "__release_buffer__") {

@@ -83,6 +83,19 @@ the header below.
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
   `cpyext/sequence.rs`, `cpyext/mapping.rs`), which go through the
   interpreter's own operators so either operand may be a pyre object;
+- the `tp_as_async` table as `__await__` / `__aiter__` / `__anext__`, with
+  `am_send` reached through `PyIter_Send`, and the iterator entry points
+  `PyObject_GetIter`, `PyObject_SelfIter`, `PyIter_Check`, `PyIter_Next`,
+  `PyObject_GetAIter` and `PyAiter_Check` (`cpyext/iterator.rs`);
+- the `tp_as_buffer` table (`cpyext/buffer.rs`): a C exporter's `bf_getbuffer`
+  becomes a `memoryview` over the exported memory and its `bf_releasebuffer`
+  runs when that view is released, so `memoryview(x)`, `bytes(x)` and the
+  element writes all reach the exporter's own storage; in the other direction
+  `PyObject_GetBuffer` / `PyBuffer_Release` / `PyBuffer_FillInfo` /
+  `PyBuffer_IsContiguous` / `PyBuffer_SizeFromFormat` / `PyBuffer_GetPointer` /
+  `PyBuffer_ToContiguous` / `PyBuffer_FromContiguous` / `PyObject_CopyData`, the
+  legacy `PyObject_As*Buffer` family, and `PyMemoryView_FromObject` /
+  `FromMemory` / `FromBuffer`;
 - `PyErr_NewException` and `PyErr_NewExceptionWithDoc`, which build the class
   through the interpreter's own `type` so it gets the exception layout;
 - capsules (`cpyext/capsule.rs`) and the strong-reference import entry points
@@ -115,6 +128,17 @@ Known divergences, each documented at its definition:
   leaving them NULL as CPython does;
 - a type is built on a single base, so a `PyType_Spec` naming more than one is
   rejected rather than silently losing the rest;
+- `PyObject_GetBuffer` of an *interpreter* object hands C a read-only snapshot,
+  the collector being free to move the storage a `Py_buffer` would otherwise
+  name; a `PyBUF_WRITABLE` request for one is refused rather than answered with
+  a copy whose writes go nowhere;
+- a C exporter's view must be C-contiguous and free of suboffsets: a strided or
+  indirect export is refused. The `Py_buffer` a `bf_getbuffer` filled in is kept
+  and handed back to `bf_releasebuffer` unchanged -- `internal` is the
+  exporter's own state -- keyed by the exported address, since the interpreter
+  object it belongs to moves and the foreign memory does not;
+- a `memoryview` that is never released never ends its export, pyre having no
+  reference counting to end it at the last drop;
 - an instance of a C-defined type is immortal, because its mirror block *is* its
   storage: freeing the block when C drops its last reference would destroy
   fields the interpreter object still exposes. Such an instance is therefore
@@ -125,8 +149,7 @@ Known divergences, each documented at its definition:
 ## What remains
 
 5. `tp_dealloc`, `tp_traverse` and `tp_clear` on top of a `rawrefcount` dead
-   queue; `tp_as_async` and `tp_as_buffer`, which are declared but not read;
-   and the remaining generated API;
+   queue; and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
@@ -157,6 +180,9 @@ are ABI-compatible with pyre.
   `PyNumber_*`, `PySequence_*` and `PyMapping_*` entry points.
 - `pypy/module/cpyext/pycapsule.py` and `import_.py`: capsules and the import
   entry points.
+- `pypy/module/cpyext/buffer.py` and `memoryobject.py`: `Py_buffer`, the
+  `PyBuffer_*` entry points and `PyMemoryView_*`.
+- `pypy/module/cpyext/iterator.py`: the iterator entry points.
 - `pypy/module/cpyext/src/getargs.c`: `PyArg_ParseTuple` and `Py_BuildValue`,
   which are C there too.
 - `pypy/module/imp/interp_imp.py`: `_imp` entry points.

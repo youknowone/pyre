@@ -210,17 +210,66 @@ typedef struct {
     objobjargproc mp_ass_subscript;
 } PyMappingMethods;
 
-/* Declared for their offsets; nothing reads these yet. */
+typedef enum {
+    PYGEN_RETURN = 0,
+    PYGEN_ERROR = -1,
+    PYGEN_NEXT = 1
+} PySendResult;
+
+typedef PySendResult (*sendfunc)(PyObject *, PyObject *, PyObject **);
+
 typedef struct {
     unaryfunc am_await;
     unaryfunc am_aiter;
     unaryfunc am_anext;
-    void *am_send;
+    sendfunc am_send;
 } PyAsyncMethods;
 
 typedef struct {
-    void *bf_getbuffer;
-    void *bf_releasebuffer;
+    void *buf;
+    PyObject *obj;
+    Py_ssize_t len;
+    Py_ssize_t itemsize;
+    int readonly;
+    int ndim;
+    char *format;
+    Py_ssize_t *shape;
+    Py_ssize_t *strides;
+    Py_ssize_t *suboffsets;
+    void *internal;
+} Py_buffer;
+
+#define PyBUF_MAX_NDIM 64
+
+#define PyBUF_SIMPLE 0
+#define PyBUF_WRITABLE 0x0001
+#define PyBUF_WRITEABLE PyBUF_WRITABLE
+#define PyBUF_FORMAT 0x0004
+#define PyBUF_ND 0x0008
+#define PyBUF_STRIDES (0x0010 | PyBUF_ND)
+#define PyBUF_C_CONTIGUOUS (0x0020 | PyBUF_STRIDES)
+#define PyBUF_F_CONTIGUOUS (0x0040 | PyBUF_STRIDES)
+#define PyBUF_ANY_CONTIGUOUS (0x0080 | PyBUF_STRIDES)
+#define PyBUF_INDIRECT (0x0100 | PyBUF_STRIDES)
+
+#define PyBUF_CONTIG (PyBUF_ND | PyBUF_WRITABLE)
+#define PyBUF_CONTIG_RO (PyBUF_ND)
+#define PyBUF_STRIDED (PyBUF_STRIDES | PyBUF_WRITABLE)
+#define PyBUF_STRIDED_RO (PyBUF_STRIDES)
+#define PyBUF_RECORDS (PyBUF_STRIDES | PyBUF_WRITABLE | PyBUF_FORMAT)
+#define PyBUF_RECORDS_RO (PyBUF_STRIDES | PyBUF_FORMAT)
+#define PyBUF_FULL (PyBUF_INDIRECT | PyBUF_WRITABLE | PyBUF_FORMAT)
+#define PyBUF_FULL_RO (PyBUF_INDIRECT | PyBUF_FORMAT)
+
+#define PyBUF_READ 0x100
+#define PyBUF_WRITE 0x200
+
+typedef int (*getbufferproc)(PyObject *, Py_buffer *, int);
+typedef void (*releasebufferproc)(PyObject *, Py_buffer *);
+
+typedef struct {
+    getbufferproc bf_getbuffer;
+    releasebufferproc bf_releasebuffer;
 } PyBufferProcs;
 
 typedef struct PyMemberDef {
@@ -686,6 +735,35 @@ PyAPI_FUNC(int) PyMapping_HasKeyString(PyObject *object, const char *key);
 PyAPI_FUNC(PyObject *) PyMapping_Keys(PyObject *object);
 PyAPI_FUNC(PyObject *) PyMapping_Values(PyObject *object);
 PyAPI_FUNC(PyObject *) PyMapping_Items(PyObject *object);
+
+/* The iterator protocol. */
+PyAPI_FUNC(PyObject *) PyObject_GetIter(PyObject *object);
+PyAPI_FUNC(PyObject *) PyObject_SelfIter(PyObject *object);
+PyAPI_FUNC(int) PyIter_Check(PyObject *object);
+PyAPI_FUNC(PyObject *) PyIter_Next(PyObject *object);
+PyAPI_FUNC(PySendResult) PyIter_Send(PyObject *iterator, PyObject *value, PyObject **result);
+PyAPI_FUNC(PyObject *) PyObject_GetAIter(PyObject *object);
+PyAPI_FUNC(int) PyAiter_Check(PyObject *object);
+
+/* The buffer protocol. */
+PyAPI_FUNC(int) PyObject_CheckBuffer(PyObject *object);
+PyAPI_FUNC(int) PyObject_GetBuffer(PyObject *object, Py_buffer *view, int flags);
+PyAPI_FUNC(void) PyBuffer_Release(Py_buffer *view);
+PyAPI_FUNC(int) PyBuffer_FillInfo(Py_buffer *view, PyObject *object, void *buf,
+                                  Py_ssize_t length, int readonly, int flags);
+PyAPI_FUNC(int) PyBuffer_IsContiguous(const Py_buffer *view, char order);
+PyAPI_FUNC(Py_ssize_t) PyBuffer_SizeFromFormat(const char *format);
+PyAPI_FUNC(int) PyObject_CopyData(PyObject *destination, PyObject *source);
+PyAPI_FUNC(int) PyBuffer_ToContiguous(void *buf, const Py_buffer *view,
+                                      Py_ssize_t length, char order);
+PyAPI_FUNC(int) PyBuffer_FromContiguous(const Py_buffer *view, const void *buf,
+                                        Py_ssize_t length, char order);
+
+/* memoryview. */
+PyAPI_FUNC(int) PyMemoryView_Check(PyObject *object);
+PyAPI_FUNC(PyObject *) PyMemoryView_FromObject(PyObject *object);
+PyAPI_FUNC(PyObject *) PyMemoryView_FromMemory(char *memory, Py_ssize_t size, int flags);
+PyAPI_FUNC(PyObject *) PyMemoryView_FromBuffer(const Py_buffer *view);
 
 /* int / bool. */
 PyAPI_FUNC(PyObject *) PyLong_FromLong(long value);

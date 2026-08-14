@@ -322,7 +322,10 @@ fn find_slot(w_type: PyObjectRef, pick: fn(*mut CPyTypeObject) -> *const c_void)
     std::ptr::null()
 }
 
-fn slot_of(w_obj: PyObjectRef, pick: fn(*mut CPyTypeObject) -> *const c_void) -> *const c_void {
+pub(super) fn slot_of(
+    w_obj: PyObjectRef,
+    pick: fn(*mut CPyTypeObject) -> *const c_void,
+) -> *const c_void {
     match crate::typedef::r#type(w_obj) {
         Some(w_type) => find_slot(w_type.as_ptr(), pick),
         None => std::ptr::null(),
@@ -1058,6 +1061,56 @@ fn slot_iternext(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     super::from_c_result(result)
 }
 
+// ── the `tp_as_async` table ─────────────────────────────────────────────
+
+/// One `PyAsyncMethods` slot, picked off a type that may declare no table.
+macro_rules! async_slot {
+    ($field:ident) => {
+        (|tp: *mut CPyTypeObject| unsafe {
+            let table = (*tp).tp_as_async;
+            if table.is_null() {
+                std::ptr::null()
+            } else {
+                (*table).$field
+            }
+        }) as fn(*mut CPyTypeObject) -> *const c_void
+    };
+}
+
+fn slot_await(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unary_slot(args[0], async_slot!(am_await), "am_await")
+}
+
+fn slot_aiter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    unary_slot(args[0], async_slot!(am_aiter), "am_aiter")
+}
+
+/// `am_anext` ends an async iteration the way `tp_iternext` ends a synchronous
+/// one, with `StopAsyncIteration` in place of `StopIteration`.
+fn slot_anext(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = args[0];
+    let slot = slot_of(w_self, async_slot!(am_anext));
+    if slot.is_null() {
+        return Err(crate::PyError::type_error(
+            "cpyext object is not an async iterator",
+        ));
+    }
+    let receiver = pyobject::make_ref(w_self);
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject) -> *mut CPyObject =
+            std::mem::transmute(slot);
+        call(receiver)
+    };
+    unsafe { pyobject::decref(receiver) };
+    if result.is_null() && !super::pyerrors::has_pending_error() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::StopAsyncIteration,
+            String::new(),
+        ));
+    }
+    super::from_c_result(result)
+}
+
 fn slot_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args[0];
     let slot = slot_of(w_self, |tp| unsafe { (*tp).tp_hash });
@@ -1448,7 +1501,7 @@ fn call_ternary(
 
 /// The pending C exception, or a `SystemError` naming the slot that returned
 /// its failure indicator without setting one.
-fn pending_or(message: &str) -> crate::PyError {
+pub(super) fn pending_or(message: &str) -> crate::PyError {
     super::pyerrors::take_pending_error()
         .unwrap_or_else(|| crate::PyError::new(crate::PyErrorKind::SystemError, message))
 }
@@ -2021,6 +2074,24 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             "__delete__",
             crate::make_builtin_function_with_arity("__delete__", slot_descr_delete, 2),
         );
+    }
+    let asynchronous: [(
+        &'static str,
+        fn(*mut CPyTypeObject) -> *const c_void,
+        crate::gateway::BuiltinCodeFn,
+    ); 3] = [
+        ("__await__", async_slot!(am_await), slot_await),
+        ("__aiter__", async_slot!(am_aiter), slot_aiter),
+        ("__anext__", async_slot!(am_anext), slot_anext),
+    ];
+    for (dunder, pick, wrapper) in asynchronous {
+        if !pick(tp).is_null() {
+            store(
+                ns,
+                dunder,
+                crate::make_builtin_function_with_arity(dunder, wrapper, 1),
+            );
+        }
     }
     install_protocols(ns, tp);
 }
