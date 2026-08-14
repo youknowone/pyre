@@ -151,12 +151,20 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
         .expect("wrapper first op");
     // `getrandbits` registers with a `Signature`, so the call path resolves
     // keywords into positional PY_NULL-padded slots before the wrapper runs.
-    // There is no `split_builtin_kwargs(args)` peel at the entry, so the
-    // wrapper does not open with the splitter's `inline_call_*`; it reads its
-    // argument array directly.
-    assert!(
-        !first.opname.starts_with("inline_call_"),
-        "signature-bound wrapper does not open with a keyword-split call, got {}",
+    // The entry counts the leading non-null slots of the wrapper's own
+    // argument array; it does not peel a `split_builtin_kwargs(args)` result
+    // and read that instead.
+    //
+    // Spelled as the entry callee rather than as "op 0 is not an
+    // `inline_call_*`": no `__pyre_wrap_*` jitcode inline-calls the splitter
+    // anywhere, so the negative form holds of every wrapper and separates
+    // nothing, while the opcode form of op 0 only tracks which helpers the
+    // codewriter is currently allowed to descend into.
+    assert_eq!(
+        inline_call_callee_name(&wrapper.code, &first),
+        Some("leading_non_null_count"),
+        "signature-bound wrapper opens by counting its leading non-null \
+         argument slots, got {}",
         first.key
     );
 
@@ -199,6 +207,27 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
 fn item_pool_descr_index(code: &[u8], at: usize) -> u32 {
     let pool_index = code[at] as usize | ((code[at + 1] as usize) << 8);
     crate::jitcode_runtime::all_descr_refs()[pool_index].index()
+}
+
+/// Name of the jitcode an `inline_call_*` enters, `None` for any other op.
+/// Every `inline_call_*` key opens with its `d` operand, so the descr-pool
+/// index is the two bytes after the opcode.
+fn inline_call_callee_name(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+) -> Option<&'static str> {
+    if !op.opname.starts_with("inline_call_") {
+        return None;
+    }
+    let pool_index = code[op.pc + 1] as usize | ((code[op.pc + 2] as usize) << 8);
+    match crate::jitcode_runtime::all_descrs().get(pool_index)? {
+        majit_translate::codewriter::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
+            crate::jitcode_runtime::all_jitcodes()
+                .get(*jitcode_index)
+                .map(|jitcode| jitcode.name.as_str())
+        }
+        _ => None,
+    }
 }
 
 #[test]
