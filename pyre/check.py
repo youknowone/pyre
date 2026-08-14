@@ -1107,6 +1107,52 @@ def synth_perf_gate(path):
     return ratio
 
 
+def wasm_ratio_gate(path):
+    """Read an optional per-fixture ceiling on wasm's ratio to dynasm:
+        # pyre-check: max-wasm-ratio=6
+
+    Absence means `WASM_MAX_DYNASM_RATIO`, not "no ceiling" -- the opposite of
+    `synth_perf_gate` and `synth_rss_gate`, whose absence exempts a fixture
+    entirely. A directive here is therefore an allowance carved out of a gate
+    that already applies, so a run names every fixture that used one: an
+    allowance that is quietly the reason a suite is green is worse than no gate.
+
+    Read for every bench rather than synthetic ones alone, because the fixtures
+    that need an allowance are not all synthetic.
+
+    What the fixtures carrying one have in common: the wasm backend reaches
+    CPython-level objects through interpreter round-trips and allocates each on
+    a Rust heap the wasm path does not yet collect, so a loop dominated by that
+    work runs several times dynasm's execution time for a reason that is
+    structural rather than a regression. The allowances are set at the highest
+    ratio observed plus 15%, and each fixture records the ratios it was fitted
+    to. ubuntu-24.04 is the only runner that builds wasm, so it supplies most of
+    them; a fixture sitting on the gate locally is fitted here instead.
+
+    15% rather than the ~3% ubuntu shows between runs because the ratio moves
+    with host load even though both sides are user-CPU and measured in the same
+    invocation: fannkuch reads 2.9x on an idle machine here and 3.1x on the same
+    machine under a load average of 41. An allowance fitted to an idle reading
+    would be a gate that fails on a busy runner.
+    """
+    prefix = "# pyre-check: max-wasm-ratio="
+    ratio = None
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix) or ratio is not None:
+                continue
+            try:
+                ratio = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid wasm ratio gate in {path}: {line.strip()}") from e
+            if ratio <= 0:
+                raise ValueError(f"wasm ratio gate must be positive in {path}")
+    return ratio
+
+
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
@@ -1394,6 +1440,13 @@ class Check:
         # applied. Reported in the summary: an unevaluated gate otherwise
         # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
+        # (bench name, ceiling) for fixtures whose header raised the ratio
+        # above WASM_MAX_DYNASM_RATIO, for the same reason as the line above: a
+        # gate widened for a fixture and a gate the fixture satisfied both print
+        # green. Reported from `print_summary` rather than beside that line,
+        # because three of the fixtures carrying an allowance are regular
+        # benches and a `--no-synthetic` run would otherwise not name them.
+        self.wasm_ratio_allowed = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
         self.jitstats_diffs = []
@@ -2301,6 +2354,9 @@ class Check:
             # would only reject one already pinned to EXEC_TIME_FLOOR_S, which
             # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
             # something the same size as its own error.
+            ceiling = wasm_ratio_gate(script) or WASM_MAX_DYNASM_RATIO
+            if ceiling > WASM_MAX_DYNASM_RATIO:
+                self.wasm_ratio_allowed.append((name, ceiling))
             if dynasm_exec in (None, "-") or (
                 float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
             ):
@@ -2309,14 +2365,14 @@ class Check:
                 passed, bound, checked_elapsed, checked_baseline, retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
-                        WASM_MAX_DYNASM_RATIO, dynasm_elapsed,
+                        ceiling, dynasm_elapsed,
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
                     )
                 )
                 if not passed:
                     detail = self._gate_fail_detail(
                         backend, "dynasm", checked_elapsed, checked_baseline,
-                        WASM_MAX_DYNASM_RATIO, bound,
+                        ceiling, bound,
                     )
                     suffix = f" ({retry_note})" if retry_note else ""
                     failures.append(
@@ -2781,6 +2837,18 @@ class Check:
         print()
         self.print_comparison_table()
         print()
+
+        if self.wasm_ratio_allowed:
+            names = ", ".join(
+                f"{name} {ceiling:g}x"
+                for name, ceiling in sorted(set(self.wasm_ratio_allowed))
+            )
+            print(
+                dim(
+                    f"wasm/dynasm ratio raised above {WASM_MAX_DYNASM_RATIO:g}x by "
+                    f"`# pyre-check: max-wasm-ratio` for: {names}"
+                )
+            )
 
         if self.results:
             print("─" * 53)
