@@ -803,6 +803,40 @@ impl wire::MarshalBag for PyreMarshalBag {
     fn constant_ref_from_value(&self, value: &Rooted) -> Option<ConstantData> {
         unsafe { crate::pycode::obj_to_constant_data(value.get()).ok() }
     }
+
+    // `deserialize_code_value_inner` reads a code object's fields as bag
+    // values, so the three shapes `write_code` writes them in — bytes for
+    // co_code/co_localspluskinds/co_linetable/co_exceptiontable, tuples for
+    // co_consts/co_names/co_localsplusnames, and str for the three names —
+    // have to be readable back out of the wrapped objects.  Without them the
+    // reader has no way to reach the bytes and every code object it decodes
+    // fails as `BadType`.
+    fn bytes_from_value(&self, value: &Rooted) -> Option<Vec<u8>> {
+        let obj = value.get();
+        unsafe { bytesobject::is_bytes(obj) }
+            .then(|| unsafe { bytesobject::w_bytes_data(obj) }.to_vec())
+    }
+
+    fn str_from_value(&self, value: &Rooted) -> Option<String> {
+        let obj = value.get();
+        unsafe { unicodeobject::is_str(obj) }.then(|| {
+            unsafe { unicodeobject::w_str_get_wtf8(obj) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    fn tuple_elements_from_value(&self, value: &Rooted) -> Option<Vec<Rooted>> {
+        let tuple = Rooted::new(value.get());
+        if !unsafe { is_tuple(tuple.get()) } {
+            return None;
+        }
+        // Each element is rooted as it is read: nothing here allocates, but
+        // the caller holds these across the reads for the remaining fields.
+        (0..unsafe { w_tuple_len(tuple.get()) })
+            .map(|index| unsafe { w_tuple_getitem(tuple.get(), index as i64) }.map(Rooted::new))
+            .collect()
+    }
 }
 
 /// Resolve the optional `version` slot: an omitted slot uses the current
