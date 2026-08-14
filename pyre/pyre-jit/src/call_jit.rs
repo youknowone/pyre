@@ -3226,6 +3226,34 @@ pub fn trace_and_compile_from_bridge(
     // blackhole re-run on a path that would ignore the concrete result.
     allow_finish_direct_return: bool,
 ) -> BridgeResolution {
+    /// Publish the live callee frame's address to the handshake cells the CA
+    /// slow path's back-to-back blackhole hook reads
+    /// (`jit_blackhole_resume_from_guard`). Always re-read through
+    /// `FrameRoot::frame`, i.e. off the shadow stack, and always at a return
+    /// site: the walk that decides these flags runs before the bridge is
+    /// optimised and compiled, and that work allocates, so an address copied
+    /// while the walk was still running can name a frame the collector has
+    /// since moved. The blackhole compares the adopted cell against the
+    /// deadframe's slot 0, which IS forwarded across the same region, so a
+    /// stale copy here misses the handshake and lets the guard-state resume
+    /// re-run a region the walk already executed.
+    fn stamp_ca_walk_frames(
+        bridge_frame_root: &mut FrameRoot,
+        stamp_resume_frame: bool,
+        stamp_adopted_frame: bool,
+    ) {
+        if !stamp_resume_frame && !stamp_adopted_frame {
+            return;
+        }
+        let frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+        if stamp_resume_frame {
+            CA_WALK_RESUME_FRAME.with(|c| c.set(frame));
+        }
+        if stamp_adopted_frame {
+            CA_WALK_ADOPTED_FRAME.with(|c| c.set(frame));
+        }
+    }
+
     {
         let (driver, _) = crate::eval::driver_pair();
         driver.clear_last_compiled_artifact_invalidation_flag();
@@ -3676,10 +3704,6 @@ pub fn trace_and_compile_from_bridge(
                     let frame = bridge_frame_root.frame();
                     frame.restore_resume_state_from(&executed);
                     adopted_walk_end_state = true;
-                    if !allow_finish_direct_return {
-                        let adopted_frame = frame as *mut PyFrame as usize;
-                        CA_WALK_ADOPTED_FRAME.with(|c| c.set(adopted_frame));
-                    }
                 }
                 action
             },
@@ -3724,6 +3748,12 @@ pub fn trace_and_compile_from_bridge(
         if pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_peek().is_some() {
             let finished_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
             CA_WALK_FINISHED_FRAME.with(|c| c.set(finished_frame));
+            // This return site predates the four below, so it needs the
+            // adopted stamp too: the finished cell only answers the hook's
+            // first question, and a walk that both committed its end state and
+            // kept a finish-concrete stash still has to answer the second one
+            // if the first handshake does not match.
+            stamp_ca_walk_frames(&mut bridge_frame_root, false, adopted_walk_end_state);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] ca-finish-noreplay at resume_pc={} key={}",
@@ -3793,10 +3823,11 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, resume_via_blackhole
             );
         }
-        if !allow_finish_direct_return && resume_via_blackhole {
-            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
-        }
+        stamp_ca_walk_frames(
+            &mut bridge_frame_root,
+            !allow_finish_direct_return && resume_via_blackhole,
+            !allow_finish_direct_return && adopted_walk_end_state,
+        );
         return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
@@ -3822,10 +3853,11 @@ pub fn trace_and_compile_from_bridge(
                 resume_pc, green_key, resume_via_blackhole
             );
         }
-        if !allow_finish_direct_return && resume_via_blackhole {
-            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
-        }
+        stamp_ca_walk_frames(
+            &mut bridge_frame_root,
+            !allow_finish_direct_return && resume_via_blackhole,
+            !allow_finish_direct_return && adopted_walk_end_state,
+        );
         return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
@@ -3854,10 +3886,11 @@ pub fn trace_and_compile_from_bridge(
             );
         }
         let continue_compiled = compiled || adopted_walk_end_state;
-        if !allow_finish_direct_return && !continue_compiled {
-            let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-            CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
-        }
+        stamp_ca_walk_frames(
+            &mut bridge_frame_root,
+            !allow_finish_direct_return && !continue_compiled,
+            !allow_finish_direct_return && adopted_walk_end_state,
+        );
         return bridge_resolution_from_bool(continue_compiled);
     }
 
@@ -3875,10 +3908,11 @@ pub fn trace_and_compile_from_bridge(
     }
     // A committed walk has already executed the region into the live
     // frame; the blackhole replay must not run even on this abort path.
-    if !allow_finish_direct_return && !adopted_walk_end_state {
-        let resume_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
-        CA_WALK_RESUME_FRAME.with(|c| c.set(resume_frame));
-    }
+    stamp_ca_walk_frames(
+        &mut bridge_frame_root,
+        !allow_finish_direct_return && !adopted_walk_end_state,
+        !allow_finish_direct_return && adopted_walk_end_state,
+    );
     bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
@@ -4045,11 +4079,13 @@ fn jit_ca_handle_guard_failure(
     }
 
     drop(_raw_values_roots);
-    if !compiled {
-        CA_WALK_RESUME_DEADFRAME.with(|c| {
-            *c.borrow_mut() = Some(raw_values_vec);
-        });
-    }
+    // compile.py:701-717 is an exclusive bridge/blackhole branch, but pyre's
+    // handle_fail_resume_guard in majit-backend-dynasm always runs the
+    // blackhole hook after this bridge hook. Its caller buffer is not rooted,
+    // so the blackhole must read the values rooted here on both outcomes.
+    CA_WALK_RESUME_DEADFRAME.with(|c| {
+        *c.borrow_mut() = Some(raw_values_vec);
+    });
 
     compiled
 }
