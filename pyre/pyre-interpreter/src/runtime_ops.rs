@@ -223,17 +223,34 @@ pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
     }
 }
 
+/// Widest `jit_call_known_builtin_N` published by [`known_builtin_call_helper`],
+/// plus the leading code slot.
+const MAX_KNOWN_BUILTIN_ARGS: usize = 9;
+
 fn call_builtin_with_args(callable: i64, args: &[i64]) -> i64 {
+    debug_assert!(args.len() <= MAX_KNOWN_BUILTIN_ARGS);
     let callable = callable as PyObjectRef;
-    unsafe {
-        let code = crate::getcode(callable);
-        let arg_slice = std::slice::from_raw_parts(args.as_ptr() as *const PyObjectRef, args.len());
-        match crate::builtin_code_call(code as PyObjectRef, arg_slice) {
-            Ok(result) => result as i64,
-            Err(mut e) => {
-                jit_publish_exception(e.to_exc_object());
-                0 // garbage — GuardNoException will fire
-            }
+    let code = unsafe { crate::getcode(callable) } as PyObjectRef;
+    // `args` is the compiled call's own argument array; no root walker updates
+    // it, and `builtin_code_call` roots nothing of its own — the direct call
+    // sites hand it an already-live slice.  Publish `[code, args...]` for the
+    // duration of the body and read the call arguments back from it, the same
+    // frame `call_builtin_code_positional` builds for the interpreter entry.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.base();
+    _roots.pin_root(code);
+    for &arg in args {
+        _roots.pin_root(arg as PyObjectRef);
+    }
+    let mut rooted = [PY_NULL; MAX_KNOWN_BUILTIN_ARGS];
+    for (index, slot) in rooted[..args.len()].iter_mut().enumerate() {
+        *slot = _roots.get(root_base + 1 + index);
+    }
+    match unsafe { crate::builtin_code_call(_roots.get(root_base), &rooted[..args.len()]) } {
+        Ok(result) => result as i64,
+        Err(mut e) => {
+            jit_publish_exception(e.to_exc_object());
+            0 // garbage — GuardNoException will fire
         }
     }
 }

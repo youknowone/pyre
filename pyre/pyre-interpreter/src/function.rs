@@ -3516,11 +3516,22 @@ pub fn funccall_valuestack(
     if fast_natural_arity == crate::PASSTHROUGHARGS1 as usize && nargs >= 1 {
         let w_obj = frame.peekvalue(nargs - 1);
         let rest = frame.make_arguments(nargs - 1, false, func);
-        let mut args_w = Vec::with_capacity(nargs);
-        args_w.push(w_obj);
-        args_w.extend_from_slice(&rest);
+        // Same live-variable set as the fixed-arity arm above, for the same
+        // two reasons: `dropvalues()` retires the frame slots that root these
+        // values, and `args_w` is a native Vec no root walker updates.
+        // `builtin_code_call` roots nothing of its own, so the whole
+        // `[code, w_obj, ...rest]` set has to be published here and read back
+        // for the call.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.base();
+        _roots.pin_root(code as PyObjectRef);
+        _roots.pin_root(w_obj);
+        for &w_arg in &rest {
+            _roots.pin_root(w_arg);
+        }
         frame.dropvalues(dropvalues);
-        return match unsafe { crate::builtin_code_call(code as PyObjectRef, &args_w) } {
+        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

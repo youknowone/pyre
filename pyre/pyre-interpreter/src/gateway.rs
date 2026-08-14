@@ -829,6 +829,14 @@ pub unsafe fn builtin_code_set_owner(obj: PyObjectRef, owner: &'static MethodOwn
 /// here, so a call can never reach the implementation with an unchecked
 /// receiver or a slice the implementation is not written for.
 ///
+/// Roots nothing of its own: `args` is a native slice the collector does not
+/// update, and the implementation it dispatches to runs Python.  Every caller
+/// therefore has to publish `[obj, args...]` on the shadow stack and read the
+/// slice back from it, so the set stays live for the whole body and the slice
+/// is current at entry.  `dropvalues()` retires the frame slots that would
+/// otherwise root a peeked argument, so a frame dispatch has to publish before
+/// it drops, not after.
+///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
 #[inline]
