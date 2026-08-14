@@ -419,6 +419,12 @@ class EnvBuilder:
 
             if do_copies:
                 for dest, src in copy_sources.items():
+                    if not os.path.isfile(src):
+                        # No launcher stub is shipped with this interpreter.
+                        # It locates its own stdlib and honours pyvenv.cfg, so
+                        # a plain copy of the running executable behaves like
+                        # the launcher would.
+                        src = context.executable
                     dest = os.path.join(binpath, dest)
                     try:
                         shutil.copy2(src, dest)
