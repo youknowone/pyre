@@ -5985,12 +5985,28 @@ macro_rules! exc_constructor {
             // `self.args_w = args_w`.  The string form of the exception
             // is derived from `args_w` on demand (`descr_str`), so the
             // constructor only captures the args — no eager message copy.
-            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
-            let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-            unsafe {
-                pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let args_base = pyre_object::gc_roots::shadow_stack_len();
+            for &arg in args {
+                pyre_object::gc_roots::pin_root(arg);
             }
-            Ok(exc)
+            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(exc);
+            // The allocation above may collect and move the arguments without
+            // updating the raw slice, so rebuild them from their rooted slots.
+            let mut rooted_args = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                rooted_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + i));
+            }
+            let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted_args);
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_args(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    args_list,
+                );
+            }
+            Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
         }
     };
 }
