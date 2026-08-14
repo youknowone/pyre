@@ -872,7 +872,16 @@ The hand audits above enumerated what they were looking at. Measured against the
 tree instead, **66 of the 105 live gates had no entry anywhere in this file** —
 the table was 63% empty, because nothing failed when a new gate skipped it.
 `pyre/pyrex/tests/gate_triage_complete.rs` is now that failure: a `PYRE_*` read
-with no entry here fails `cargo test`. The counts to quote, distinguished:
+with no entry here fails `cargo test`.
+
+⚠ That reader is line-based, and one rule bites anyone adding prose: a line
+whose text contains the past participle of "retire" marks **its first** `PYRE_*`
+token as a closed subject, wherever in the file the line sits — so a sentence
+that names a live gate and that word together silently un-documents the gate,
+and the test then reports it as missing rather than as mis-parsed. Keep the
+word and the name on separate lines.
+
+The counts to quote, distinguished:
 
 | count | value |
 |---|---|
@@ -941,16 +950,25 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 
-### §6b — VALUE knobs (11): config, not gates
+### §6b — VALUE knobs (12): config, not gates
 
-`PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_JD1_THRESHOLD`,
+`PYRE_FBW_MULTIFRAME_DEPTH`, `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_DTRACE_CONST_FROM`, `PYRE_DTRACE_CONST_TO`,
 `PYRE_TRACE_CALL_DIAG`, `PYRE_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
-### §6c — Default-OFF diagnostics, censuses and probes (55): keep, cost nothing
+`PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
+than reporting it: its comma-separated selectors (or the reserved `all`) turn
+off that many of the 56 hand-written trace-time specialization rows, and an
+unset variable suppresses none. It is a measurement instrument — suppressing a
+fold is how the descent wall behind it is made to print — so it retires with
+the folds it selects, not before them.
+`PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
+consulted/fired tallies.
+
+### §6c — Default-OFF diagnostics, censuses and probes (58): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -961,7 +979,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
 `PYRE_DYNASM_EXEC_DIAG`, `PYRE_FBW_CENSUS`, `PYRE_FBW_INLINE_DIAG`,
 `PYRE_FBW_LOOPBODY_SCAN_FULL`, `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY`,
-`PYRE_FBW_MF_DIAG`, `PYRE_FBW_STRICT_DIAG`, `PYRE_FIELD_IDENTITY_CENSUS`,
+`PYRE_FBW_MF_DIAG`, `PYRE_FBW_SPEC_CENSUS`, `PYRE_FBW_STRICT_DIAG`,
+`PYRE_FIELD_IDENTITY_CENSUS`,
 `PYRE_FORITER_INFLIGHT_CENSUS`, `PYRE_FOR_ITER_GATE_DIAG`,
 `PYRE_GC_DIAG`, `PYRE_GC_FREELIST_DIAG`, `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
 `PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
