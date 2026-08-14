@@ -15219,8 +15219,15 @@ fn fileio_clear_stat_atopen(self_obj: PyObjectRef) {
     );
 }
 
+/// What the open-time fstat yields, where there is a seam that performs one.
+/// Only the descriptor checks run elsewhere, so the answer carries nothing.
 #[cfg(unix)]
-fn fileio_store_stat_atopen(self_obj: PyObjectRef, stat: &crate::host_seam::StatBuf) {
+type FileioStatAtOpen = crate::host_seam::StatBuf;
+#[cfg(not(unix))]
+type FileioStatAtOpen = ();
+
+#[cfg(unix)]
+fn fileio_store_stat_atopen(self_obj: PyObjectRef, stat: &FileioStatAtOpen) {
     for (name, value) in [
         ("__file_stat_mode__", stat.mode as i64),
         ("__file_stat_size__", stat.size as i64),
@@ -15229,6 +15236,11 @@ fn fileio_store_stat_atopen(self_obj: PyObjectRef, stat: &crate::host_seam::Stat
         crate::baseobjspace::setdictvalue_native(self_obj, name, w_int_new(value));
     }
 }
+
+/// The slots keep whatever `fileio_clear_stat_atopen` left them, so a reader
+/// falls back to the per-call stat it would have taken anyway.
+#[cfg(not(unix))]
+fn fileio_store_stat_atopen(_self_obj: PyObjectRef, _stat: &FileioStatAtOpen) {}
 
 fn fileio_copy_stat_atopen(self_obj: PyObjectRef, opened: PyObjectRef) {
     for name in FILEIO_STAT_SLOTS {
@@ -16569,22 +16581,68 @@ fn open_flags_for_mode(_mode: &str) -> i32 {
 /// PyPy `W_FileIO.descr_init`: immediately fstat every supplied/opened fd and
 /// reject directory descriptors before publishing the FileIO object.
 #[cfg(unix)]
-fn fileio_validate_fd(
-    fd: i32,
-    w_name: PyObjectRef,
-) -> Result<crate::host_seam::StatBuf, crate::PyError> {
+fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
     let st = crate::host_seam::ops::fstat(fd)
         .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
-    #[cfg(unix)]
     if st.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
         return Err(crate::PyError::os_error_syscall(libc::EISDIR, w_name));
     }
     Ok(st)
 }
 
-#[cfg(unix)]
+/// The same check where the descriptor is a CRT one. `fileutils::fstat`
+/// resolves the handle behind the descriptor, so a descriptor number nothing
+/// has opened reports `ERROR_INVALID_HANDLE` — the error `_io.open(999, 'wb')`
+/// owes its caller instead of a stream over a descriptor that does not exist.
+/// The buffer it fills has no block size, so nothing is published from it and
+/// the stat slots stay empty.
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
+    let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+    let st = rustpython_host_env::fileutils::fstat(borrowed).map_err(|error| {
+        crate::PyError::os_error_win32_syscall2(
+            error
+                .raw_os_error()
+                .unwrap_or(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    })?;
+    if i32::from(st.st_mode) & libc::S_IFMT == libc::S_IFDIR {
+        return Err(crate::PyError::os_error_syscall(libc::EISDIR, w_name));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, all(windows, feature = "host_env", not(feature = "sandbox")))))]
+fn fileio_validate_fd(_fd: i32, _w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
+    Ok(())
+}
+
+/// A CRT descriptor starts in text mode, where a written `\n` leaves as
+/// `\r\n` and a read `\r\n` collapses back. `W_FileIO` is a binary raw stream
+/// whose buffered/text layers own every translation, so each descriptor it
+/// adopts is switched to binary before any I/O reaches it. A pathname the
+/// stream opens itself already carries `O_BINARY` from [`open_flags_for_mode`];
+/// a caller-supplied descriptor and an opener's return value do not.
+fn fileio_set_binary_mode(fd: i32) {
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    if let Ok(borrowed) = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) } {
+        rustpython_host_env::msvcrt::setmode_binary(borrowed);
+    }
+    #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+    let _ = fd;
+}
+
 fn fileio_close_owned_fd(fd: i32) {
+    #[cfg(unix)]
     let _ = crate::host_seam::ops::close(fd);
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    let _ = rustpython_host_env::crt_fd::close(unsafe {
+        rustpython_host_env::crt_fd::Owned::from_raw(fd)
+    });
+    #[cfg(not(any(unix, all(windows, feature = "host_env", not(feature = "sandbox")))))]
+    let _ = fd;
 }
 
 /// PyPy `_open_inhcache.set_non_inheritable(fd)` / `rposix.set_inheritable`.
@@ -16918,8 +16976,8 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if fd < 0 {
             return Err(crate::PyError::value_error("negative file descriptor"));
         }
-        #[cfg(unix)]
         let stat_atopen = fileio_validate_fd(fd, path_obj)?;
+        fileio_set_binary_mode(fd);
         let closefd = match closefd_obj {
             Some(value) => crate::baseobjspace::is_true(value)?,
             None => true,
@@ -16935,7 +16993,6 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
         let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(closefd));
         let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        #[cfg(unix)]
         fileio_store_stat_atopen(wrapper, &stat_atopen);
         return Ok(wrapper);
     }
@@ -16984,7 +17041,6 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             fileio_close_owned_fd(fd);
             return Err(error);
         }
-        #[cfg(unix)]
         let stat_atopen = match fileio_validate_fd(fd, resolved_path.w_path()) {
             Ok(stat) => stat,
             Err(error) => {
@@ -16992,6 +17048,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(error);
             }
         };
+        // An opener is free to ignore the flags it was handed, so the binary
+        // mode `open_flags_for_mode` asked for is only guaranteed here.
+        fileio_set_binary_mode(fd);
         let wrapper = pyre_object::w_instance_new(file_wrapper_type());
         let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
         let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
@@ -17001,7 +17060,6 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
         let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
         let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        #[cfg(unix)]
         fileio_store_stat_atopen(wrapper, &stat_atopen);
         return Ok(wrapper);
     }
