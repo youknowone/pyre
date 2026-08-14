@@ -270,6 +270,33 @@ impl W_BufferedReader {
             self.pos += current_size as i64;
         }
         self.reader_reset_buf();
+
+        // CPython 3.14 `_bufferedreader_read_all` prefers the raw stream's
+        // `readall` protocol and invokes it once.  A raw implementation that
+        // does not provide `readall` retains the chunked `read()` fallback.
+        if let Some(readall) = crate::baseobjspace::findattr_result(self.w_raw, "readall")? {
+            let data = crate::call::call_function_impl_result(readall, &[])?;
+            if unsafe { pyre_object::is_none(data) } {
+                return if output.is_empty() {
+                    Ok(data)
+                } else {
+                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&output))
+                };
+            }
+            if !unsafe { crate::baseobjspace::isinstance_bytes_w(data) } {
+                return Err(crate::PyError::type_error(format!(
+                    "expected bytes, got {} object",
+                    crate::type_methods::arg_type_name(data)
+                )));
+            }
+            let chunk = unsafe { pyre_object::bytesobject::bytes_like_data(data) };
+            output.extend_from_slice(chunk);
+            if self.abs_pos != -1 {
+                self.abs_pos += chunk.len() as i64;
+            }
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&output));
+        }
+
         loop {
             let data = super::call_method_result(self.w_raw, "read", &[])?;
             if unsafe { pyre_object::is_none(data) } {
@@ -583,8 +610,10 @@ impl W_BufferedReader {
         self.write_pos = 0;
         self.write_end = -1;
         self.locked = false;
-        self.abs_pos = 0;
-        let _ = self.raw_tell();
+        // Where the raw stream sits is left unknown rather than asked for:
+        // `seek` refreshes it before its fast path reads it and `tell` always
+        // asks, which is every use, so construction owes no `lseek`.
+        self.abs_pos = -1;
         self.state = STATE_OK;
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         Ok(())

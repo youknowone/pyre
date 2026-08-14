@@ -705,8 +705,10 @@ impl W_BufferedRandom {
         self.reader_reset_buf();
         self.writer_reset_buf();
         self.locked = false;
-        self.abs_pos = 0;
-        let _ = self.raw_tell();
+        // Unknown rather than asked for, as in `buffered.rs`: `seek` refreshes
+        // it before its fast path reads it and `tell` always asks, so
+        // construction owes no `lseek`.
+        self.abs_pos = -1;
         self.state = STATE_OK;
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
         Ok(())

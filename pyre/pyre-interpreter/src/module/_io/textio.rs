@@ -796,20 +796,19 @@ impl W_TextIOWrapper {
         Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(result))
     }
 
-    /// PyPy `W_TextIOWrapper._fix_encoder_state`.
+    /// PyPy `W_TextIOWrapper._fix_encoder_state` — `if self.seekable and
+    /// self.w_encoder:`.  The encoder is half of that condition: a stream with
+    /// nothing to encode has no start-of-stream state to fix, and asking the
+    /// buffer where it is would cost an `lseek` for an answer nobody reads.
     fn reset_encoder_state(&mut self) {
         self.encoding_start_of_stream = false;
-        if let Ok(w_seekable) = super::call_method_result(self.w_buffer, "seekable", &[])
-            && crate::baseobjspace::is_true(w_seekable).unwrap_or(false)
-        {
+        if self.seekable_flag && !self.w_encoder.is_null() {
             self.encoding_start_of_stream = true;
             if let Ok(w_position) = super::call_method_result(self.w_buffer, "tell", &[])
                 && crate::builtins::space_index_w(w_position).unwrap_or(0) != 0
             {
                 self.encoding_start_of_stream = false;
-                if !self.w_encoder.is_null() {
-                    let _ = super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)]);
-                }
+                let _ = super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)]);
             }
         }
     }
