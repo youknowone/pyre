@@ -1110,7 +1110,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "exec_dynamic",
         crate::make_builtin_function_with_arity(
             "exec_dynamic",
-            |_| Ok(pyre_object::w_none()),
+            |_args| {
+                #[cfg(all(
+                    feature = "cpyext",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                ))]
+                {
+                    return crate::cpyext::exec_dynamic(_args[0]);
+                }
+                #[cfg(not(all(
+                    feature = "cpyext",
+                    not(feature = "sandbox"),
+                    any(target_os = "macos", target_os = "linux")
+                )))]
+                Ok(pyre_object::w_none())
+            },
             1,
         ),
     );

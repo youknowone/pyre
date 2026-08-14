@@ -1,9 +1,13 @@
 //! CPython C-API compatibility layer -- PyPy `pypy/module/cpyext/`.
 //!
-//! This first vertical slice implements the object bridge and the single-phase
-//! `PyModule_Create` import path.  The C-visible object is deliberately *not*
-//! pyre's internal [`pyre_object::PyObject`]: PyPy likewise uses a separate raw
-//! refcounted mirror (`cpyext/pyobject.py`) and links it to the moving GC object.
+//! The C-visible object is deliberately *not* pyre's internal
+//! [`pyre_object::PyObject`]: PyPy likewise uses a separate raw refcounted
+//! mirror (`cpyext/pyobject.py`) and links it to the moving GC object.
+//!
+//! The file layout follows upstream's: [`pyobject`] is the mirror and its
+//! links, [`pyerrors`] the C exception indicator, [`methodobject`] the
+//! `PyCFunction` carrier, [`modsupport`] module creation and method-table
+//! conversion, and the per-type modules the object constructors and accessors.
 
 #![cfg(all(
     feature = "cpyext",
@@ -11,76 +15,29 @@
     any(target_os = "macos", target_os = "linux")
 ))]
 
+pub mod bytesobject;
+pub mod dictobject;
+pub mod floatobject;
+pub mod listobject;
+pub mod longobject;
+pub mod methodobject;
+pub mod modsupport;
+pub mod object;
+pub mod pyerrors;
+pub mod pyobject;
+pub mod tupleobject;
+pub mod unicodeobject;
+
 use parking_lot::ReentrantMutex;
-use pyre_object::{PY_NULL, PyObjectRef};
+use pyre_object::PyObjectRef;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::c_int;
 use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-/// The large ownership contribution held by the linked pyre object.
-///
-/// PyPy calls this `rawrefcount.REFCNT_FROM_PYPY`.  Ordinary C references are
-/// added above it by the public `Py_INCREF`/`Py_DECREF` inline functions.
-pub const REFCNT_FROM_PYRE: isize = 1 << (isize::BITS - 3);
-
-/// C-visible `PyObject`, matching PyPy's `parse/cpyext_object.h` shape.
-#[repr(C)]
-pub struct CPyObject {
-    pub ob_refcnt: isize,
-    pub ob_pyre_link: PyObjectRef,
-    pub ob_type: *mut CPyTypeObject,
-}
-
-/// Opaque in the initial public header.  A real mirror, rather than the
-/// internal RPython-vtable-like `pyre_object::PyType`, is nevertheless used so
-/// the two ABIs can never be confused accidentally.
-#[repr(C)]
-pub struct CPyTypeObject {
-    _opaque: usize,
-}
-
-// Process-global immortal type mirrors, matching PyPy's static API objects.
-static mut CPY_MODULE_TYPE: CPyTypeObject = CPyTypeObject { _opaque: 0 };
-static mut CPY_MODULE_DEF_TYPE: CPyTypeObject = CPyTypeObject { _opaque: 0 };
-static NEXT_MODULE_INDEX: AtomicIsize = AtomicIsize::new(1);
-
-#[repr(C)]
-pub struct CPyModuleDefBase {
-    pub ob_base: CPyObject,
-    pub m_init: Option<unsafe extern "C" fn() -> *mut CPyObject>,
-    pub m_index: isize,
-    pub m_copy: *mut CPyObject,
-}
-
-#[repr(C)]
-pub struct CPyMethodDef {
-    pub ml_name: *const c_char,
-    pub ml_meth: *const c_void,
-    pub ml_flags: c_int,
-    pub ml_doc: *const c_char,
-}
-
-#[repr(C)]
-pub struct CPyModuleDefSlot {
-    pub slot: c_int,
-    pub value: *mut c_void,
-}
-
-#[repr(C)]
-pub struct CPyModuleDef {
-    pub m_base: CPyModuleDefBase,
-    pub m_name: *const c_char,
-    pub m_doc: *const c_char,
-    pub m_size: isize,
-    pub m_methods: *mut CPyMethodDef,
-    pub m_slots: *mut CPyModuleDefSlot,
-    pub m_traverse: *const c_void,
-    pub m_clear: *const c_void,
-    pub m_free: *const c_void,
-}
+use pyobject::CPyObject;
 
 struct ExtensionCacheEntry {
     /// Copy of the module dict, exactly PyPy `State.extensions[path]`.
@@ -132,12 +89,7 @@ type ExtensionCache =
 /// optimization metadata.
 static EXTENSIONS: ForkMutex<ExtensionCache> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
-
-/// PyPy/rawrefcount's P-list analogue.  The relationship itself lives on the
-/// raw object (`ob_pyre_link`); this Vec is only the collector's census of
-/// mirrors whose inline link must be visited.
-static RAW_OBJECTS: ForkMutex<Vec<usize>> = ForkMutex::new(Vec::new());
-static CPYEXT_GC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EXTENSIONS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// `State.package_context`, consumed by `PyModule_Create2` while `PyInit_*`
 /// runs. Imports are serialized by the import lock, as in PyPy.
@@ -222,8 +174,8 @@ pub fn after_fork_child() {
     // collection in the child would otherwise block forever.
     unsafe {
         EXTENSIONS.reinit_after_fork();
-        RAW_OBJECTS.reinit_after_fork();
         PACKAGE_CONTEXT.reinit_after_fork();
+        pyobject::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
     // half-finished import must not name the next module created here.
@@ -254,50 +206,14 @@ pub const fn extension_suffix() -> &'static str {
     }
 }
 
-fn attach_module(module: PyObjectRef) -> *mut CPyObject {
-    let raw = Box::into_raw(Box::new(CPyObject {
-        // New reference returned by PyModule_Create, plus PyPy's link share.
-        ob_refcnt: REFCNT_FROM_PYRE + 1,
-        ob_pyre_link: module,
-        ob_type: (&raw mut CPY_MODULE_TYPE),
-    }));
-    RAW_OBJECTS.lock().push(raw as usize);
-    CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
-    raw
-}
-
-unsafe fn detach_unowned_module_mirror(raw: *mut CPyObject) {
-    if raw.is_null()
-        || unsafe { (*raw).ob_refcnt != REFCNT_FROM_PYRE }
-        || unsafe { !std::ptr::eq((*raw).ob_type, &raw mut CPY_MODULE_TYPE) }
-    {
-        return;
-    }
-    let address = raw as usize;
-    RAW_OBJECTS.lock().retain(|&candidate| candidate != address);
-    unsafe {
-        (*raw).ob_pyre_link = PY_NULL;
-        (*raw).ob_refcnt -= REFCNT_FROM_PYRE;
-        drop(Box::from_raw(raw));
-    }
-}
-
 /// Forward/mark C-mirror links and cached module dictionaries.
 ///
-/// External C ownership (`refcnt > REFCNT_FROM_PYRE`) keeps the linked object
-/// alive, which is the essential P-link rule from `rawrefcount.rst`. Cached
-/// dicts are interpreter-state roots just like PyPy's `State.extensions`.
+/// Cached dicts are interpreter-state roots just like PyPy's
+/// `State.extensions`; the mirror links are [`pyobject::walk_gc_roots`].
 pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    if !CPYEXT_GC_ACTIVE.load(Ordering::Acquire) {
+    pyobject::walk_gc_roots(visitor);
+    if !EXTENSIONS_ACTIVE.load(Ordering::Acquire) {
         return;
-    }
-    for &address in RAW_OBJECTS.lock().iter() {
-        let raw = address as *mut CPyObject;
-        unsafe {
-            if (*raw).ob_refcnt > REFCNT_FROM_PYRE && !(*raw).ob_pyre_link.is_null() {
-                visitor(&mut (*raw).ob_pyre_link);
-            }
-        }
     }
     for entry in EXTENSIONS.lock().values_mut() {
         let mut dict = entry.dict as PyObjectRef;
@@ -359,7 +275,7 @@ fn fixup_extension(module: PyObjectRef, name: &str, path: &Path, handle: usize) 
             _handle: handle,
         },
     );
-    CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
+    EXTENSIONS_ACTIVE.store(true, Ordering::Release);
 }
 
 fn init_symbol(name: &str) -> Result<String, crate::PyError> {
@@ -400,9 +316,14 @@ fn lookup_init_address(handle: usize, symbol: &str) -> Option<usize> {
 }
 
 /// PyPy `cpyext.api.create_extension_module`, single-phase branch.
-pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, crate::PyError> {
+pub fn load_extension_module(
+    name: &str,
+    path: &Path,
+    spec: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let _load_guard = extension_load_lock();
     ensure_linked();
+    initialize();
     // `host_env::ctypes` deduplicates libraries by the native handle without
     // maintaining an open count. A second open followed by drop would unload
     // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
@@ -469,36 +390,103 @@ pub fn load_extension_module(name: &str, path: &Path) -> Result<PyObjectRef, cra
     let result = unsafe { init() };
     *PACKAGE_CONTEXT.lock() = old_context;
 
-    if result.is_null() {
-        rustpython_host_env::ctypes::drop_library(handle);
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::SystemError,
-            format!("initialization of {name} failed without raising an exception"),
-        ));
+    let init_result = match finish_init(name, path, spec, result) {
+        Ok(module) => module,
+        Err(error) => {
+            rustpython_host_env::ctypes::drop_library(handle);
+            return Err(error);
+        }
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(init_result.module());
+    match init_result {
+        // `create_cpyext_module` returns straight from the multi-phase branch:
+        // the definition, not a copied dictionary, is what a later import
+        // rebuilds the module from.
+        InitResult::MultiPhase(_) => crate::importing::set_sys_module(
+            name,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+        ),
+        InitResult::SinglePhase(_) => fixup_extension(
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            name,
+            path,
+            handle,
+        ),
     }
-    let module = unsafe { (*result).ob_pyre_link };
+    Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
+}
+
+/// Which of the two initialization protocols `PyInit_*` used.
+enum InitResult {
+    SinglePhase(PyObjectRef),
+    MultiPhase(PyObjectRef),
+}
+
+impl InitResult {
+    fn module(&self) -> PyObjectRef {
+        match *self {
+            InitResult::SinglePhase(module) | InitResult::MultiPhase(module) => module,
+        }
+    }
+}
+
+/// Take the init function's result apart, single-phase branch.
+///
+/// A NULL result means the init function raised; the pending C exception is
+/// the error to report, and its absence is upstream's
+/// "failed without raising an exception" `SystemError`
+/// (`cpyext/api.py:create_extension_module`).
+fn finish_init(
+    name: &str,
+    path: &Path,
+    spec: PyObjectRef,
+    result: *mut CPyObject,
+) -> Result<InitResult, crate::PyError> {
+    if result.is_null() {
+        return Err(pyerrors::take_pending_error().unwrap_or_else(|| {
+            crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("initialization of {name} failed without raising an exception"),
+            )
+        }));
+    }
     if unsafe { (*result).ob_type.is_null() } {
-        rustpython_host_env::ctypes::drop_library(handle);
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             format!("init function of {name} returned an uninitialized object"),
         ));
     }
+    // PEP 489: `PyModuleDef_Init` hands back the definition itself, and the
+    // module is created from it against the import spec instead.
+    if modsupport::is_module_def(result) {
+        // `PACKAGE_CONTEXT` is only consumed by the single-phase path; the
+        // multi-phase one names the module from the spec, so clear it here.
+        *PACKAGE_CONTEXT.lock() = None;
+        // Upstream leaves `__file__` to importlib, which always runs for a
+        // multi-phase module there. Pyre's own importer reaches this without
+        // importlib, so the path the module was loaded from is recorded here.
+        return Ok(InitResult::MultiPhase(
+            modsupport::create_module_from_def_and_spec(
+                unsafe { modsupport::module_def_of(result) },
+                spec,
+                name,
+                Some(path),
+            )?,
+        ));
+    }
+    let module = unsafe { pyobject::from_ref(result) };
     if module.is_null() {
-        rustpython_host_env::ctypes::drop_library(handle);
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             format!("init function of {name} returned an unsupported object"),
         ));
     }
-    unsafe {
-        // Transfer the init function's owned result to the interpreter object,
-        // exactly `get_w_obj_and_decref` in PyPy.
-        (*result).ob_refcnt -= 1;
-        detach_unowned_module_mirror(result);
-    }
-    fixup_extension(module, name, path, handle);
-    Ok(module)
+    // Transfer the init function's owned result to the interpreter object,
+    // exactly `get_w_obj_and_decref` in PyPy.
+    unsafe { pyobject::decref(result) };
+    Ok(InitResult::SinglePhase(module))
 }
 
 pub fn create_dynamic(spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -529,125 +517,203 @@ pub fn create_dynamic(spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
     } else {
         path
     };
-    load_extension_module(&name, &path)
+    load_extension_module(
+        &name,
+        &path,
+        pyre_object::gc_roots::shadow_stack_get(spec_slot),
+    )
 }
 
-/// `PyModuleDef_Init` -- also the marker returned by PEP 489 init functions.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyModuleDef_Init(def: *mut CPyModuleDef) -> *mut CPyObject {
-    if def.is_null() {
-        return std::ptr::null_mut();
+/// Call a C function through one of the `PyMethodDef` calling conventions --
+/// PyPy `cpyext/api.py:generic_cpy_call`.
+///
+/// `dont_look_inside` for the same reason upstream marks it: the callee is
+/// opaque native code, so the tracer has nothing to record past this boundary.
+#[majit_macros::dont_look_inside]
+pub(super) fn call_cfunction(
+    function: *const std::ffi::c_void,
+    flags: c_int,
+    w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
+    use methodobject::{METH_FASTCALL, METH_KEYWORDS, METH_NOARGS, METH_O};
+
+    if function.is_null() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "cpyext method definition has no implementation",
+        ));
     }
-    unsafe {
-        if (*def).m_base.m_index == 0 {
-            (*def).m_base.ob_base.ob_refcnt = 1;
-            (*def).m_base.ob_base.ob_pyre_link = PY_NULL;
-            (*def).m_base.ob_base.ob_type = &raw mut CPY_MODULE_DEF_TYPE;
-            (*def).m_base.m_index = NEXT_MODULE_INDEX.fetch_add(1, Ordering::Relaxed);
+    // Everything the call needs is pinned before the first allocation below:
+    // the argument tuple, the keyword dict and the key strings all collect.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    for &argument in positional {
+        roots.pin_root(argument);
+    }
+    for (_, value) in keywords {
+        roots.pin_root(*value);
+    }
+    let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + 1 + index);
+
+    let fastcall = flags & METH_FASTCALL != 0;
+    let mut arguments = std::ptr::null_mut();
+    let mut keywords_arg = std::ptr::null_mut();
+    let mut fastcall_slots: Vec<*mut CPyObject> = Vec::new();
+    if fastcall {
+        for index in 0..positional.len() + keywords.len() {
+            fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
-        &mut (*def).m_base.ob_base
+        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+            let names: Vec<PyObjectRef> = keywords
+                .iter()
+                .map(|(name, _)| pyre_object::w_str_new(name))
+                .collect();
+            keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
+        }
+    } else if flags & (METH_NOARGS | METH_O) == 0 {
+        let items: Vec<PyObjectRef> = (0..positional.len()).map(value_slot).collect();
+        let tuple = pyre_object::tupleobject::w_tuple_new(items);
+        let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(tuple);
+        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+            let dict = pyre_object::dictmultiobject::w_dict_new();
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(dict);
+            for (index, (name, _)) in keywords.iter().enumerate() {
+                unsafe {
+                    pyre_object::dictmultiobject::w_dict_setitem_str(
+                        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                        name,
+                        value_slot(positional.len() + index),
+                    )
+                };
+            }
+            keywords_arg = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        }
+        arguments = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
+    } else if flags & METH_O != 0 {
+        arguments = pyobject::make_ref(value_slot(0));
     }
+
+    let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base));
+    let result = unsafe {
+        if fastcall && flags & METH_KEYWORDS != 0 {
+            let call: unsafe extern "C" fn(
+                *mut CPyObject,
+                *const *mut CPyObject,
+                isize,
+                *mut CPyObject,
+            ) -> *mut CPyObject = std::mem::transmute(function);
+            call(
+                receiver,
+                fastcall_slots.as_ptr(),
+                positional.len() as isize,
+                keywords_arg,
+            )
+        } else if fastcall {
+            let call: unsafe extern "C" fn(
+                *mut CPyObject,
+                *const *mut CPyObject,
+                isize,
+            ) -> *mut CPyObject = std::mem::transmute(function);
+            call(receiver, fastcall_slots.as_ptr(), positional.len() as isize)
+        } else if flags & METH_KEYWORDS != 0 {
+            let call: unsafe extern "C" fn(
+                *mut CPyObject,
+                *mut CPyObject,
+                *mut CPyObject,
+            ) -> *mut CPyObject = std::mem::transmute(function);
+            call(receiver, arguments, keywords_arg)
+        } else {
+            let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> *mut CPyObject =
+                std::mem::transmute(function);
+            call(receiver, arguments)
+        }
+    };
+    unsafe {
+        pyobject::decref(receiver);
+        pyobject::decref(arguments);
+        pyobject::decref(keywords_arg);
+        for slot in fastcall_slots {
+            pyobject::decref(slot);
+        }
+    }
+    from_c_result(result)
 }
 
-/// `PyModule_Create2` -- PyPy `modsupport.py:PyModule_Create2`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyModule_Create2(
-    def: *mut CPyModuleDef,
-    _api_version: c_int,
-) -> *mut CPyObject {
-    if def.is_null() || unsafe { (*def).m_name.is_null() } {
-        return std::ptr::null_mut();
+/// `_Py_CheckFunctionResult`: a NULL result must come with an exception, and a
+/// non-NULL one must not.
+pub(super) fn from_c_result(result: *mut CPyObject) -> Result<PyObjectRef, crate::PyError> {
+    if result.is_null() {
+        return Err(pyerrors::take_pending_error().unwrap_or_else(|| {
+            crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "cpyext function returned NULL without setting an exception",
+            )
+        }));
     }
-    // Method conversion is the next cpyext slice. Reject rather than silently
-    // constructing a module that drops a non-empty PyMethodDef table.
-    if unsafe { !(*def).m_methods.is_null() && !(*(*def).m_methods).ml_name.is_null() } {
-        return std::ptr::null_mut();
+    if pyerrors::has_pending_error() {
+        let _ = pyerrors::take_pending_error();
+        unsafe { pyobject::decref(result) };
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "cpyext function returned a result with an exception set",
+        ));
     }
-    // `m_size == 0` is a stateless single-phase module, `-1` keeps its state in
-    // C globals: neither needs `md_state`, so both are in this slice.  A
-    // positive size asks for per-module storage, which is not built yet.
-    if unsafe {
-        !(*def).m_slots.is_null()
-            || !matches!((*def).m_size, -1 | 0)
-            || !(*def).m_traverse.is_null()
-            || !(*def).m_clear.is_null()
-            || !(*def).m_free.is_null()
-    } {
-        return std::ptr::null_mut();
-    }
+    let value = unsafe { pyobject::from_ref(result) };
+    unsafe { pyobject::decref(result) };
+    Ok(value)
+}
 
-    let declared_name = unsafe { CStr::from_ptr((*def).m_name) }.to_string_lossy();
-    // PyPy `PyModule_Create2` consumes package_context before allocating the
-    // module. Releasing the mutex here also avoids holding it across GC.
-    let context = PACKAGE_CONTEXT.lock().take();
-    let (name, path) = context
-        .as_ref()
-        .map(|(name, path)| (name.as_str(), Some(path.as_path())))
-        .unwrap_or((&declared_name, None));
-    let module = pyre_object::w_module_new_managed(name);
+/// `_imp.exec_dynamic` — PyPy `cpyext/api.py:exec_extension_module`.
+///
+/// A module that already owns a state block has run its slots, so the second
+/// call is the no-op that lets pyre's own importer and a later
+/// `_imp.exec_dynamic` both name this entry point.
+pub fn exec_dynamic(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _load_guard = extension_load_lock();
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(module);
-
-    if unsafe { !(*def).m_doc.is_null() } {
-        let doc = unsafe { CStr::from_ptr((*def).m_doc) }.to_string_lossy();
-        if !doc.is_empty() {
-            let value = pyre_object::w_str_new(&doc);
-            let value_slot = pyre_object::gc_roots::shadow_stack_len();
-            roots.pin_root(value);
-            let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
-            crate::module_ns_store(
-                unsafe { pyre_object::w_module_get_w_dict(module) },
-                "__doc__",
-                pyre_object::gc_roots::shadow_stack_get(value_slot),
-            );
-        }
+    if unsafe { pyre_object::module::is_module(module) }
+        && !modsupport::has_module_state(pyre_object::gc_roots::shadow_stack_get(module_slot))
+    {
+        modsupport::exec_def(pyre_object::gc_roots::shadow_stack_get(module_slot))?;
     }
-    if let Some(path) = path {
-        let value = crate::gateway::fsdecode_os_str(path.as_os_str());
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(value);
-        let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
-        crate::module_ns_store(
-            unsafe { pyre_object::w_module_get_w_dict(module) },
-            "__file__",
-            pyre_object::gc_roots::shadow_stack_get(value_slot),
-        );
-    }
-    attach_module(pyre_object::gc_roots::shadow_stack_get(module_slot))
+    Ok(pyre_object::w_none())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Py_IncRef(object: *mut CPyObject) {
-    if !object.is_null() {
-        unsafe { (*object).ob_refcnt += 1 };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn Py_DecRef(object: *mut CPyObject) {
-    if object.is_null() {
-        return;
-    }
-    unsafe { (*object).ob_refcnt -= 1 };
-    if unsafe { (*object).ob_refcnt } == REFCNT_FROM_PYRE {
-        unsafe { detach_unowned_module_mirror(object) };
-        return;
-    }
-    if unsafe { (*object).ob_refcnt } != 0 {
-        return;
-    }
-    // Type-specific `_Py_Dealloc` is introduced with C-defined types. The
-    // first slice never exposes a heap mirror whose zero path is not handled
-    // by `detach_unowned_module_mirror` above.
+/// Bind the process-global mirrors an extension resolves against.
+///
+/// Upstream splits this over `State.build_api` and the `@bootstrap_function`
+/// hooks each module registers; pyre has one call because the mirrors it
+/// prepares are the singletons and the exception types.
+fn initialize() {
+    pyobject::init_singletons();
+    pyerrors::init_exception_mirrors();
 }
 
 /// Force the linker to retain the public C entry points in every native pyre
 /// executable. `pyrex/build.rs` additionally exports these names from the main
 /// program so a bundle/shared object can resolve them at `dlopen` time.
 pub fn ensure_linked() {
-    std::hint::black_box(PyModuleDef_Init as *const ());
-    std::hint::black_box(PyModule_Create2 as *const ());
-    std::hint::black_box(Py_IncRef as *const ());
-    std::hint::black_box(Py_DecRef as *const ());
+    std::hint::black_box(&raw const pyobject::_Py_NoneStruct);
+    std::hint::black_box(&raw const pyobject::_Py_TrueStruct);
+    std::hint::black_box(&raw const pyobject::_Py_FalseStruct);
+    std::hint::black_box(&raw const pyobject::_Py_NotImplementedStruct);
+    std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
+    pyobject::ensure_linked();
+    pyerrors::ensure_linked();
+    modsupport::ensure_linked();
+    object::ensure_linked();
+    longobject::ensure_linked();
+    floatobject::ensure_linked();
+    unicodeobject::ensure_linked();
+    bytesobject::ensure_linked();
+    tupleobject::ensure_linked();
+    listobject::ensure_linked();
+    dictobject::ensure_linked();
 }

@@ -1,8 +1,11 @@
 #ifndef PYRE_PYTHON_H
 #define PYRE_PYTHON_H
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,17 +22,27 @@ extern "C" {
 
 #if defined(_WIN32)
 #  define PyAPI_FUNC(RTYPE) __declspec(dllimport) RTYPE
+#  define PyAPI_DATA(RTYPE) extern __declspec(dllimport) RTYPE
 #  define PyMODINIT_FUNC __declspec(dllexport) PyObject *
 #elif defined(__cplusplus)
 #  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
+#  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE
 #  define PyMODINIT_FUNC extern "C" __attribute__((visibility("default"))) PyObject *
 #else
 #  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
+#  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE
 #  define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
 #endif
 
 typedef intptr_t Py_ssize_t;
+#define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
+#define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
+
 typedef struct _typeobject PyTypeObject;
+
+/* `ob_pyre_link` is the interpreter object this mirror stands for.  It is
+   opaque to C: the interpreter moves its objects, and only the runtime may
+   read or write the slot. */
 typedef struct _object {
     Py_ssize_t ob_refcnt;
     Py_ssize_t ob_pyre_link;
@@ -37,6 +50,7 @@ typedef struct _object {
 } PyObject;
 
 #define PyObject_HEAD PyObject ob_base;
+#define PyObject_HEAD_INIT(type) { 0, 0, type },
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
 PyAPI_FUNC(void) Py_IncRef(PyObject *ob);
@@ -45,12 +59,43 @@ PyAPI_FUNC(void) Py_DecRef(PyObject *ob);
 #define Py_DECREF(ob) Py_DecRef((PyObject *)(ob))
 #define Py_XINCREF(ob) do { if ((ob) != NULL) Py_INCREF(ob); } while (0)
 #define Py_XDECREF(ob) do { if ((ob) != NULL) Py_DECREF(ob); } while (0)
+#define Py_CLEAR(ob) do { PyObject *_tmp = (PyObject *)(ob); (ob) = NULL; Py_XDECREF(_tmp); } while (0)
+#define Py_SETREF(ob, value) do { PyObject *_old = (PyObject *)(ob); (ob) = (value); Py_XDECREF(_old); } while (0)
+
+/* The singletons.  Each is a mirror the runtime binds to its interpreter
+   object before the first `PyInit_*` runs, so pointer comparison against them
+   is the identity test C code expects it to be. */
+PyAPI_DATA(PyObject) _Py_NoneStruct;
+PyAPI_DATA(PyObject) _Py_TrueStruct;
+PyAPI_DATA(PyObject) _Py_FalseStruct;
+PyAPI_DATA(PyObject) _Py_NotImplementedStruct;
+PyAPI_DATA(PyObject) _Py_EllipsisObject;
+#define Py_None (&_Py_NoneStruct)
+#define Py_True (&_Py_TrueStruct)
+#define Py_False (&_Py_FalseStruct)
+#define Py_NotImplemented (&_Py_NotImplementedStruct)
+#define Py_Ellipsis (&_Py_EllipsisObject)
+#define Py_RETURN_NONE do { Py_INCREF(Py_None); return Py_None; } while (0)
+#define Py_RETURN_TRUE do { Py_INCREF(Py_True); return Py_True; } while (0)
+#define Py_RETURN_FALSE do { Py_INCREF(Py_False); return Py_False; } while (0)
+#define Py_RETURN_NOTIMPLEMENTED \
+    do { Py_INCREF(Py_NotImplemented); return Py_NotImplemented; } while (0)
+#define Py_Is(x, y) ((x) == (y))
+#define Py_IsNone(x) Py_Is((x), Py_None)
+#define Py_IsTrue(x) Py_Is((x), Py_True)
+#define Py_IsFalse(x) Py_Is((x), Py_False)
 
 typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*_PyCFunctionFast)(PyObject *, PyObject *const *, Py_ssize_t);
+typedef PyObject *(*_PyCFunctionFastWithKeywords)(PyObject *, PyObject *const *,
+                                                  Py_ssize_t, PyObject *);
 typedef int (*visitproc)(PyObject *, void *);
 typedef int (*traverseproc)(PyObject *, visitproc, void *);
 typedef int (*inquiry)(PyObject *);
 typedef void (*freefunc)(void *);
+typedef int (*converter)(PyObject *, void *);
+
 typedef struct PyMethodDef {
     const char *ml_name;
     PyCFunction ml_meth;
@@ -62,6 +107,10 @@ typedef struct PyMethodDef {
 #define METH_KEYWORDS 0x0002
 #define METH_NOARGS 0x0004
 #define METH_O 0x0008
+#define METH_CLASS 0x0010
+#define METH_STATIC 0x0020
+#define METH_COEXIST 0x0040
+#define METH_FASTCALL 0x0080
 
 typedef struct PyModuleDef_Base {
     PyObject ob_base;
@@ -74,6 +123,9 @@ typedef struct PyModuleDef_Slot {
     int slot;
     void *value;
 } PyModuleDef_Slot;
+
+#define Py_mod_create 1
+#define Py_mod_exec 2
 
 typedef struct PyModuleDef {
     PyModuleDef_Base m_base;
@@ -93,8 +145,785 @@ typedef struct PyModuleDef {
 PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *def);
 PyAPI_FUNC(PyObject *) PyModule_Create2(PyModuleDef *def, int api_version);
 #define PyModule_Create(module) PyModule_Create2((module), PYTHON_API_VERSION)
+PyAPI_FUNC(PyObject *) PyModule_GetDict(PyObject *module);
+PyAPI_FUNC(void *) PyModule_GetState(PyObject *module);
+PyAPI_FUNC(PyModuleDef *) PyModule_GetDef(PyObject *module);
+PyAPI_FUNC(int) PyModule_AddObject(PyObject *module, const char *name, PyObject *value);
+PyAPI_FUNC(int) PyModule_AddObjectRef(PyObject *module, const char *name, PyObject *value);
+PyAPI_FUNC(int) PyModule_AddIntConstant(PyObject *module, const char *name, Py_ssize_t value);
+PyAPI_FUNC(int) PyModule_AddStringConstant(PyObject *module, const char *name, const char *value);
+#define PyModule_AddIntMacro(module, macro) \
+    PyModule_AddIntConstant((module), #macro, (Py_ssize_t)(macro))
+#define PyModule_AddStringMacro(module, macro) \
+    PyModule_AddStringConstant((module), #macro, (macro))
+
+/* Exceptions. */
+PyAPI_DATA(PyObject *) PyExc_BaseException;
+PyAPI_DATA(PyObject *) PyExc_Exception;
+PyAPI_DATA(PyObject *) PyExc_ArithmeticError;
+PyAPI_DATA(PyObject *) PyExc_AssertionError;
+PyAPI_DATA(PyObject *) PyExc_AttributeError;
+PyAPI_DATA(PyObject *) PyExc_BufferError;
+PyAPI_DATA(PyObject *) PyExc_EOFError;
+PyAPI_DATA(PyObject *) PyExc_FileNotFoundError;
+PyAPI_DATA(PyObject *) PyExc_FloatingPointError;
+PyAPI_DATA(PyObject *) PyExc_GeneratorExit;
+PyAPI_DATA(PyObject *) PyExc_ImportError;
+PyAPI_DATA(PyObject *) PyExc_IndexError;
+PyAPI_DATA(PyObject *) PyExc_KeyError;
+PyAPI_DATA(PyObject *) PyExc_KeyboardInterrupt;
+PyAPI_DATA(PyObject *) PyExc_LookupError;
+PyAPI_DATA(PyObject *) PyExc_MemoryError;
+PyAPI_DATA(PyObject *) PyExc_ModuleNotFoundError;
+PyAPI_DATA(PyObject *) PyExc_NameError;
+PyAPI_DATA(PyObject *) PyExc_NotImplementedError;
+PyAPI_DATA(PyObject *) PyExc_OSError;
+PyAPI_DATA(PyObject *) PyExc_OverflowError;
+PyAPI_DATA(PyObject *) PyExc_RecursionError;
+PyAPI_DATA(PyObject *) PyExc_ReferenceError;
+PyAPI_DATA(PyObject *) PyExc_RuntimeError;
+PyAPI_DATA(PyObject *) PyExc_StopAsyncIteration;
+PyAPI_DATA(PyObject *) PyExc_StopIteration;
+PyAPI_DATA(PyObject *) PyExc_SyntaxError;
+PyAPI_DATA(PyObject *) PyExc_SystemError;
+PyAPI_DATA(PyObject *) PyExc_SystemExit;
+PyAPI_DATA(PyObject *) PyExc_TypeError;
+PyAPI_DATA(PyObject *) PyExc_UnboundLocalError;
+PyAPI_DATA(PyObject *) PyExc_UnicodeDecodeError;
+PyAPI_DATA(PyObject *) PyExc_UnicodeEncodeError;
+PyAPI_DATA(PyObject *) PyExc_UnicodeError;
+PyAPI_DATA(PyObject *) PyExc_UnicodeTranslateError;
+PyAPI_DATA(PyObject *) PyExc_ValueError;
+PyAPI_DATA(PyObject *) PyExc_ZeroDivisionError;
+
+PyAPI_FUNC(void) PyErr_SetObject(PyObject *type, PyObject *value);
+PyAPI_FUNC(void) PyErr_SetString(PyObject *type, const char *message);
+PyAPI_FUNC(void) PyErr_SetNone(PyObject *type);
+PyAPI_FUNC(PyObject *) PyErr_Occurred(void);
+PyAPI_FUNC(void) PyErr_Clear(void);
+PyAPI_FUNC(PyObject *) PyErr_NoMemory(void);
+PyAPI_FUNC(int) PyErr_BadArgument(void);
+PyAPI_FUNC(void) PyErr_BadInternalCall(void);
+PyAPI_FUNC(int) PyErr_ExceptionMatches(PyObject *expected);
+PyAPI_FUNC(int) PyErr_GivenExceptionMatches(PyObject *given, PyObject *expected);
+PyAPI_FUNC(void) PyErr_Fetch(PyObject **type, PyObject **value, PyObject **traceback);
+PyAPI_FUNC(void) PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback);
+PyAPI_FUNC(void) PyErr_NormalizeException(PyObject **type, PyObject **value, PyObject **traceback);
+PyAPI_FUNC(PyObject *) _PyPyre_ErrFormatted(PyObject *type, const char *message);
+
+/* Objects. */
+PyAPI_FUNC(PyObject *) PyObject_GetAttrString(PyObject *object, const char *name);
+PyAPI_FUNC(int) PyObject_SetAttrString(PyObject *object, const char *name, PyObject *value);
+PyAPI_FUNC(int) PyObject_HasAttrString(PyObject *object, const char *name);
+PyAPI_FUNC(PyObject *) PyObject_GetAttr(PyObject *object, PyObject *name);
+PyAPI_FUNC(int) PyObject_SetAttr(PyObject *object, PyObject *name, PyObject *value);
+PyAPI_FUNC(PyObject *) PyObject_Str(PyObject *object);
+PyAPI_FUNC(PyObject *) PyObject_Repr(PyObject *object);
+PyAPI_FUNC(int) PyObject_IsTrue(PyObject *object);
+PyAPI_FUNC(int) PyObject_Not(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PyObject_Size(PyObject *object);
+#define PyObject_Length PyObject_Size
+PyAPI_FUNC(PyObject *) PyObject_GetItem(PyObject *object, PyObject *key);
+PyAPI_FUNC(int) PyObject_SetItem(PyObject *object, PyObject *key, PyObject *value);
+PyAPI_FUNC(PyObject *) PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+PyAPI_FUNC(PyObject *) PyObject_CallObject(PyObject *callable, PyObject *args);
+PyAPI_FUNC(int) PyCallable_Check(PyObject *object);
+PyAPI_FUNC(int) PyObject_IsInstance(PyObject *object, PyObject *class_);
+PyAPI_FUNC(PyObject *) PyObject_Type(PyObject *object);
+
+/* int / bool. */
+PyAPI_FUNC(PyObject *) PyLong_FromLong(long value);
+PyAPI_FUNC(PyObject *) PyLong_FromLongLong(long long value);
+PyAPI_FUNC(PyObject *) PyLong_FromSsize_t(Py_ssize_t value);
+PyAPI_FUNC(PyObject *) PyLong_FromUnsignedLong(unsigned long value);
+PyAPI_FUNC(PyObject *) PyLong_FromUnsignedLongLong(unsigned long long value);
+PyAPI_FUNC(PyObject *) PyLong_FromSize_t(size_t value);
+PyAPI_FUNC(PyObject *) PyLong_FromDouble(double value);
+PyAPI_FUNC(PyObject *) PyLong_FromString(const char *text, char **end, int base);
+PyAPI_FUNC(long) PyLong_AsLong(PyObject *object);
+PyAPI_FUNC(long long) PyLong_AsLongLong(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PyLong_AsSsize_t(PyObject *object);
+PyAPI_FUNC(unsigned long) PyLong_AsUnsignedLong(PyObject *object);
+PyAPI_FUNC(unsigned long long) PyLong_AsUnsignedLongLong(PyObject *object);
+PyAPI_FUNC(size_t) PyLong_AsSize_t(PyObject *object);
+PyAPI_FUNC(double) PyLong_AsDouble(PyObject *object);
+PyAPI_FUNC(int) PyLong_Check(PyObject *object);
+PyAPI_FUNC(int) PyLong_CheckExact(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Long(PyObject *object);
+PyAPI_FUNC(PyObject *) PyBool_FromLong(long value);
+
+/* float. */
+PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double value);
+PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *object);
+PyAPI_FUNC(int) PyFloat_Check(PyObject *object);
+PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *object);
+
+/* str. */
+PyAPI_FUNC(PyObject *) PyUnicode_FromString(const char *text);
+PyAPI_FUNC(PyObject *) PyUnicode_FromStringAndSize(const char *text, Py_ssize_t size);
+PyAPI_FUNC(const char *) PyUnicode_AsUTF8(PyObject *object);
+PyAPI_FUNC(const char *) PyUnicode_AsUTF8AndSize(PyObject *object, Py_ssize_t *size);
+PyAPI_FUNC(Py_ssize_t) PyUnicode_GetLength(PyObject *object);
+PyAPI_FUNC(int) PyUnicode_Check(PyObject *object);
+PyAPI_FUNC(int) PyUnicode_CheckExact(PyObject *object);
+
+/* bytes. */
+PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *text);
+PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *text, Py_ssize_t size);
+PyAPI_FUNC(char *) PyBytes_AsString(PyObject *object);
+PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *object, char **buffer, Py_ssize_t *size);
+PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *object);
+PyAPI_FUNC(int) PyBytes_Check(PyObject *object);
+PyAPI_FUNC(int) PyBytes_CheckExact(PyObject *object);
+
+/* tuple. */
+PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t size);
+PyAPI_FUNC(Py_ssize_t) PyTuple_Size(PyObject *object);
+PyAPI_FUNC(PyObject *) PyTuple_GetItem(PyObject *object, Py_ssize_t index);
+PyAPI_FUNC(int) PyTuple_SetItem(PyObject *object, Py_ssize_t index, PyObject *item);
+PyAPI_FUNC(int) PyTuple_Check(PyObject *object);
+PyAPI_FUNC(int) PyTuple_CheckExact(PyObject *object);
+#define PyTuple_GET_SIZE(ob) PyTuple_Size((PyObject *)(ob))
+#define PyTuple_GET_ITEM(ob, i) PyTuple_GetItem((PyObject *)(ob), (i))
+#define PyTuple_SET_ITEM(ob, i, v) ((void)PyTuple_SetItem((PyObject *)(ob), (i), (v)))
+
+/* list. */
+PyAPI_FUNC(PyObject *) PyList_New(Py_ssize_t size);
+PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *object);
+PyAPI_FUNC(PyObject *) PyList_GetItem(PyObject *object, Py_ssize_t index);
+PyAPI_FUNC(int) PyList_SetItem(PyObject *object, Py_ssize_t index, PyObject *item);
+PyAPI_FUNC(int) PyList_Append(PyObject *object, PyObject *item);
+PyAPI_FUNC(int) PyList_Check(PyObject *object);
+PyAPI_FUNC(int) PyList_CheckExact(PyObject *object);
+#define PyList_GET_SIZE(ob) PyList_Size((PyObject *)(ob))
+#define PyList_GET_ITEM(ob, i) PyList_GetItem((PyObject *)(ob), (i))
+#define PyList_SET_ITEM(ob, i, v) ((void)PyList_SetItem((PyObject *)(ob), (i), (v)))
+
+/* dict. */
+PyAPI_FUNC(PyObject *) PyDict_New(void);
+PyAPI_FUNC(int) PyDict_SetItem(PyObject *object, PyObject *key, PyObject *value);
+PyAPI_FUNC(int) PyDict_SetItemString(PyObject *object, const char *key, PyObject *value);
+PyAPI_FUNC(PyObject *) PyDict_GetItem(PyObject *object, PyObject *key);
+PyAPI_FUNC(PyObject *) PyDict_GetItemString(PyObject *object, const char *key);
+PyAPI_FUNC(int) PyDict_DelItem(PyObject *object, PyObject *key);
+PyAPI_FUNC(Py_ssize_t) PyDict_Size(PyObject *object);
+PyAPI_FUNC(int) PyDict_Contains(PyObject *object, PyObject *key);
+PyAPI_FUNC(int) PyDict_Check(PyObject *object);
+PyAPI_FUNC(int) PyDict_CheckExact(PyObject *object);
 
 #define PyDoc_STRVAR(name, str) static const char name[] = str
+#define PyDoc_STR(str) str
+
+/* ── The variadic entry points ─────────────────────────────────────────
+ *
+ * `PyArg_ParseTuple`, `Py_BuildValue` and `PyErr_Format` are C functions with
+ * C bodies, as they are upstream (`pypy/module/cpyext/src/getargs.c`).  Pyre
+ * ships no companion library, so they are `static inline` here and every
+ * extension compiles its own copy; each one is built entirely out of the
+ * non-variadic entry points declared above.
+ */
+
+static inline void _PyPyre_ArgError(const char *fname, const char *message)
+{
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "%s() %s", fname ? fname : "function", message);
+    PyErr_SetString(PyExc_TypeError, buffer);
+}
+
+/* Convert one argument according to *format, advancing it past the unit. */
+static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
+                                     va_list *va, const char *fname)
+{
+    char code = **format;
+    (*format)++;
+    switch (code) {
+    case 'b': case 'B': case 'h': case 'H': case 'i': case 'I':
+    case 'l': case 'k': case 'L': case 'K': case 'n': case 'p': {
+        long long value;
+        if (code == 'p') {
+            int truth = PyObject_IsTrue(arg);
+            if (truth < 0) {
+                return 0;
+            }
+            value = truth;
+        } else {
+            value = PyLong_AsLongLong(arg);
+            if (value == -1 && PyErr_Occurred()) {
+                return 0;
+            }
+        }
+        switch (code) {
+        case 'b': *va_arg(*va, char *) = (char)value; break;
+        case 'B': *va_arg(*va, unsigned char *) = (unsigned char)value; break;
+        case 'h': *va_arg(*va, short *) = (short)value; break;
+        case 'H': *va_arg(*va, unsigned short *) = (unsigned short)value; break;
+        case 'i': case 'p': *va_arg(*va, int *) = (int)value; break;
+        case 'I': *va_arg(*va, unsigned int *) = (unsigned int)value; break;
+        case 'l': *va_arg(*va, long *) = (long)value; break;
+        case 'k': *va_arg(*va, unsigned long *) = (unsigned long)value; break;
+        case 'L': *va_arg(*va, long long *) = value; break;
+        case 'K': *va_arg(*va, unsigned long long *) = (unsigned long long)value; break;
+        case 'n': *va_arg(*va, Py_ssize_t *) = (Py_ssize_t)value; break;
+        default: break;
+        }
+        return 1;
+    }
+    case 'f': case 'd': {
+        double value = PyFloat_AsDouble(arg);
+        if (value == -1.0 && PyErr_Occurred()) {
+            return 0;
+        }
+        if (code == 'f') {
+            *va_arg(*va, float *) = (float)value;
+        } else {
+            *va_arg(*va, double *) = value;
+        }
+        return 1;
+    }
+    case 's': case 'z': case 'y': {
+        int with_size = (**format == '#');
+        if (with_size) {
+            (*format)++;
+        }
+        const char *text = NULL;
+        Py_ssize_t length = 0;
+        if (code == 'z' && Py_IsNone(arg)) {
+            text = NULL;
+        } else if (code == 'y') {
+            char *buffer = NULL;
+            if (PyBytes_AsStringAndSize(arg, &buffer, &length) < 0) {
+                return 0;
+            }
+            text = buffer;
+        } else {
+            text = PyUnicode_AsUTF8AndSize(arg, &length);
+            if (text == NULL) {
+                return 0;
+            }
+        }
+        *va_arg(*va, const char **) = text;
+        if (with_size) {
+            *va_arg(*va, Py_ssize_t *) = length;
+        }
+        return 1;
+    }
+    case 'c': {
+        char *buffer = NULL;
+        Py_ssize_t length = 0;
+        if (PyBytes_AsStringAndSize(arg, &buffer, &length) < 0) {
+            return 0;
+        }
+        if (length != 1) {
+            _PyPyre_ArgError(fname, "argument must be a byte string of length 1");
+            return 0;
+        }
+        *va_arg(*va, char *) = buffer[0];
+        return 1;
+    }
+    case 'C': {
+        Py_ssize_t length = PyUnicode_GetLength(arg);
+        const char *text = PyUnicode_AsUTF8(arg);
+        if (text == NULL) {
+            return 0;
+        }
+        if (length != 1) {
+            _PyPyre_ArgError(fname, "argument must be a string of length 1");
+            return 0;
+        }
+        *va_arg(*va, int *) = (unsigned char)text[0];
+        return 1;
+    }
+    case 'S': {
+        if (!PyBytes_Check(arg)) {
+            _PyPyre_ArgError(fname, "argument must be bytes");
+            return 0;
+        }
+        *va_arg(*va, PyObject **) = arg;
+        return 1;
+    }
+    case 'U': {
+        if (!PyUnicode_Check(arg)) {
+            _PyPyre_ArgError(fname, "argument must be str");
+            return 0;
+        }
+        *va_arg(*va, PyObject **) = arg;
+        return 1;
+    }
+    case 'O': {
+        if (**format == '!') {
+            (*format)++;
+            PyObject *expected = (PyObject *)va_arg(*va, PyTypeObject *);
+            int matched = PyObject_IsInstance(arg, expected);
+            if (matched < 0) {
+                return 0;
+            }
+            if (!matched) {
+                _PyPyre_ArgError(fname, "argument has the wrong type");
+                return 0;
+            }
+            *va_arg(*va, PyObject **) = arg;
+            return 1;
+        }
+        if (**format == '&') {
+            (*format)++;
+            converter convert = (converter)va_arg(*va, converter);
+            void *target = va_arg(*va, void *);
+            return convert(arg, target) != 0;
+        }
+        *va_arg(*va, PyObject **) = arg;
+        return 1;
+    }
+    default:
+        _PyPyre_ArgError(fname, "uses an argument format this build does not support");
+        return 0;
+    }
+}
+
+/* How many argument units the format string describes, and where the optional
+   tail begins.  `|`, `$`, `:` and `;` are markers rather than units. */
+static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
+                                    Py_ssize_t *required, const char **fname)
+{
+    Py_ssize_t count = 0;
+    Py_ssize_t minimum = -1;
+    for (const char *cursor = format; *cursor; cursor++) {
+        switch (*cursor) {
+        case '|': case '$':
+            if (minimum < 0) {
+                minimum = count;
+            }
+            break;
+        case ':': case ';':
+            if (*cursor == ':' && fname != NULL) {
+                *fname = cursor + 1;
+            }
+            goto done;
+        case '#': case '!': case '&':
+            break;
+        default:
+            count++;
+            break;
+        }
+    }
+done:
+    *total = count;
+    *required = minimum < 0 ? count : minimum;
+}
+
+static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
+                                  const char *format, char **keywords,
+                                  va_list *va, const char *fname)
+{
+    Py_ssize_t total = 0;
+    Py_ssize_t required = 0;
+    _PyPyre_ArgCount(format, &total, &required, &fname);
+    Py_ssize_t given = args == NULL ? 0 : PyTuple_Size(args);
+    if (given < 0) {
+        return 0;
+    }
+    if (given > total) {
+        char buffer[128];
+        snprintf(buffer, sizeof(buffer),
+                 "takes at most %zd arguments (%zd given)", total, given);
+        _PyPyre_ArgError(fname, buffer);
+        return 0;
+    }
+    const char *cursor = format;
+    for (Py_ssize_t index = 0; index < total; index++) {
+        while (*cursor == '|' || *cursor == '$') {
+            cursor++;
+        }
+        if (*cursor == '\0' || *cursor == ':' || *cursor == ';') {
+            break;
+        }
+        PyObject *arg = NULL;
+        if (index < given) {
+            arg = PyTuple_GetItem(args, index);
+            if (arg == NULL) {
+                return 0;
+            }
+        } else if (kwargs != NULL && keywords != NULL && keywords[index] != NULL) {
+            arg = PyDict_GetItemString(kwargs, keywords[index]);
+        }
+        if (arg == NULL) {
+            if (index < required) {
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer),
+                         "requires at least %zd arguments (%zd given)", required, given);
+                _PyPyre_ArgError(fname, buffer);
+                return 0;
+            }
+            /* Absent optional: step over its format unit without consuming a
+               destination, which the caller left untouched. */
+            char code = *cursor++;
+            if ((code == 's' || code == 'z' || code == 'y') && *cursor == '#') {
+                cursor++;
+            } else if (code == 'O' && (*cursor == '!' || *cursor == '&')) {
+                cursor++;
+            }
+            continue;
+        }
+        if (!_PyPyre_ArgConvert(arg, &cursor, va, fname)) {
+            return 0;
+        }
+    }
+    if (kwargs != NULL && keywords != NULL) {
+        /* An unexpected keyword is an error, which is the only reason
+           `PyArg_ParseTupleAndKeywords` needs the name list at all once the
+           positional mapping above is done. */
+        Py_ssize_t size = PyDict_Size(kwargs);
+        Py_ssize_t matched = 0;
+        for (Py_ssize_t index = 0; index < total && keywords[index] != NULL; index++) {
+            if (index >= given && PyDict_GetItemString(kwargs, keywords[index]) != NULL) {
+                matched++;
+            }
+        }
+        if (matched != size) {
+            _PyPyre_ArgError(fname, "got an unexpected keyword argument");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static inline int PyArg_ParseTuple(PyObject *args, const char *format, ...)
+{
+    va_list va;
+    va_start(va, format);
+    int parsed = _PyPyre_VaParse(args, NULL, format, NULL, &va, NULL);
+    va_end(va);
+    return parsed;
+}
+
+static inline int PyArg_ParseTupleAndKeywords(PyObject *args, PyObject *kwargs,
+                                              const char *format, char **keywords, ...)
+{
+    va_list va;
+    va_start(va, keywords);
+    int parsed = _PyPyre_VaParse(args, kwargs, format, keywords, &va, NULL);
+    va_end(va);
+    return parsed;
+}
+
+static inline int PyArg_UnpackTuple(PyObject *args, const char *name,
+                                    Py_ssize_t least, Py_ssize_t most, ...)
+{
+    Py_ssize_t given = PyTuple_Size(args);
+    if (given < 0) {
+        return 0;
+    }
+    if (given < least || given > most) {
+        char buffer[128];
+        snprintf(buffer, sizeof(buffer),
+                 "expected %zd-%zd arguments (%zd given)", least, most, given);
+        _PyPyre_ArgError(name, buffer);
+        return 0;
+    }
+    va_list va;
+    va_start(va, most);
+    for (Py_ssize_t index = 0; index < most; index++) {
+        PyObject **target = va_arg(va, PyObject **);
+        *target = index < given ? PyTuple_GetItem(args, index) : NULL;
+    }
+    va_end(va);
+    return 1;
+}
+
+static inline PyObject *_PyPyre_BuildValue(const char **format, va_list *va);
+
+/* One `Py_BuildValue` unit.  Containers recurse until their closing bracket. */
+static inline PyObject *_PyPyre_BuildOne(const char **format, va_list *va)
+{
+    char code = **format;
+    (*format)++;
+    switch (code) {
+    case 'i': case 'b': case 'h':
+        return PyLong_FromLong((long)va_arg(*va, int));
+    case 'B': case 'H': case 'I':
+        return PyLong_FromUnsignedLong((unsigned long)va_arg(*va, unsigned int));
+    case 'l':
+        return PyLong_FromLong(va_arg(*va, long));
+    case 'k':
+        return PyLong_FromUnsignedLong(va_arg(*va, unsigned long));
+    case 'L':
+        return PyLong_FromLongLong(va_arg(*va, long long));
+    case 'K':
+        return PyLong_FromUnsignedLongLong(va_arg(*va, unsigned long long));
+    case 'n':
+        return PyLong_FromSsize_t(va_arg(*va, Py_ssize_t));
+    case 'f': case 'd':
+        return PyFloat_FromDouble(va_arg(*va, double));
+    case 'c': {
+        char value = (char)va_arg(*va, int);
+        return PyBytes_FromStringAndSize(&value, 1);
+    }
+    case 'C': {
+        char value = (char)va_arg(*va, int);
+        return PyUnicode_FromStringAndSize(&value, 1);
+    }
+    case 's': case 'z': {
+        const char *text = va_arg(*va, const char *);
+        Py_ssize_t length = -1;
+        if (**format == '#') {
+            (*format)++;
+            length = va_arg(*va, Py_ssize_t);
+        }
+        if (text == NULL) {
+            Py_INCREF(Py_None);
+            return Py_None;
+        }
+        return length < 0 ? PyUnicode_FromString(text)
+                          : PyUnicode_FromStringAndSize(text, length);
+    }
+    case 'y': {
+        const char *text = va_arg(*va, const char *);
+        Py_ssize_t length = -1;
+        if (**format == '#') {
+            (*format)++;
+            length = va_arg(*va, Py_ssize_t);
+        }
+        if (text == NULL) {
+            Py_INCREF(Py_None);
+            return Py_None;
+        }
+        return length < 0 ? PyBytes_FromString(text)
+                          : PyBytes_FromStringAndSize(text, length);
+    }
+    case 'O': case 'S': case 'N': {
+        PyObject *value = va_arg(*va, PyObject *);
+        if (value == NULL) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_SystemError,
+                                "Py_BuildValue: NULL object passed to O format");
+            }
+            return NULL;
+        }
+        if (code != 'N') {
+            Py_INCREF(value);
+        }
+        return value;
+    }
+    case '(': case '[': {
+        char closing = code == '(' ? ')' : ']';
+        PyObject *items = PyList_New(0);
+        if (items == NULL) {
+            return NULL;
+        }
+        while (**format && **format != closing) {
+            if (**format == ',' || **format == ' ') {
+                (*format)++;
+                continue;
+            }
+            PyObject *item = _PyPyre_BuildOne(format, va);
+            if (item == NULL || PyList_Append(items, item) < 0) {
+                Py_XDECREF(item);
+                Py_DECREF(items);
+                return NULL;
+            }
+            Py_DECREF(item);
+        }
+        if (**format == closing) {
+            (*format)++;
+        }
+        if (closing == ']') {
+            return items;
+        }
+        Py_ssize_t size = PyList_Size(items);
+        PyObject *tuple = PyTuple_New(size);
+        if (tuple == NULL) {
+            Py_DECREF(items);
+            return NULL;
+        }
+        for (Py_ssize_t index = 0; index < size; index++) {
+            PyObject *item = PyList_GetItem(items, index);
+            Py_INCREF(item);
+            PyTuple_SetItem(tuple, index, item);
+        }
+        Py_DECREF(items);
+        return tuple;
+    }
+    case '{': {
+        PyObject *mapping = PyDict_New();
+        if (mapping == NULL) {
+            return NULL;
+        }
+        while (**format && **format != '}') {
+            if (**format == ',' || **format == ' ' || **format == ':') {
+                (*format)++;
+                continue;
+            }
+            PyObject *key = _PyPyre_BuildOne(format, va);
+            if (key == NULL) {
+                Py_DECREF(mapping);
+                return NULL;
+            }
+            while (**format == ',' || **format == ' ' || **format == ':') {
+                (*format)++;
+            }
+            PyObject *value = _PyPyre_BuildOne(format, va);
+            if (value == NULL || PyDict_SetItem(mapping, key, value) < 0) {
+                Py_DECREF(key);
+                Py_XDECREF(value);
+                Py_DECREF(mapping);
+                return NULL;
+            }
+            Py_DECREF(key);
+            Py_DECREF(value);
+        }
+        if (**format == '}') {
+            (*format)++;
+        }
+        return mapping;
+    }
+    default:
+        PyErr_SetString(PyExc_SystemError, "Py_BuildValue: unsupported format");
+        return NULL;
+    }
+}
+
+static inline PyObject *_PyPyre_BuildValue(const char **format, va_list *va)
+{
+    while (**format == ' ' || **format == ',') {
+        (*format)++;
+    }
+    if (**format == '\0') {
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+    const char *lookahead = *format;
+    PyObject *first = _PyPyre_BuildOne(format, va);
+    if (first == NULL) {
+        return NULL;
+    }
+    while (**format == ' ' || **format == ',') {
+        (*format)++;
+    }
+    if (**format == '\0') {
+        return first;
+    }
+    (void)lookahead;
+    /* More than one unit builds a tuple, exactly as `Py_BuildValue`
+       documents. */
+    PyObject *items = PyList_New(0);
+    if (items == NULL || PyList_Append(items, first) < 0) {
+        Py_DECREF(first);
+        Py_XDECREF(items);
+        return NULL;
+    }
+    Py_DECREF(first);
+    while (**format) {
+        if (**format == ' ' || **format == ',') {
+            (*format)++;
+            continue;
+        }
+        PyObject *item = _PyPyre_BuildOne(format, va);
+        if (item == NULL || PyList_Append(items, item) < 0) {
+            Py_XDECREF(item);
+            Py_DECREF(items);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    Py_ssize_t size = PyList_Size(items);
+    PyObject *tuple = PyTuple_New(size);
+    if (tuple == NULL) {
+        Py_DECREF(items);
+        return NULL;
+    }
+    for (Py_ssize_t index = 0; index < size; index++) {
+        PyObject *item = PyList_GetItem(items, index);
+        Py_INCREF(item);
+        PyTuple_SetItem(tuple, index, item);
+    }
+    Py_DECREF(items);
+    return tuple;
+}
+
+static inline PyObject *Py_BuildValue(const char *format, ...)
+{
+    va_list va;
+    va_start(va, format);
+    const char *cursor = format;
+    PyObject *value = _PyPyre_BuildValue(&cursor, &va);
+    va_end(va);
+    return value;
+}
+
+/* `%S`, `%R`, `%U` and `%A` take a `PyObject *`; everything else is handed to
+   `snprintf` one conversion at a time. */
+static inline PyObject *PyErr_Format(PyObject *type, const char *format, ...)
+{
+    char message[1024];
+    size_t filled = 0;
+    va_list va;
+    va_start(va, format);
+    for (const char *cursor = format; *cursor && filled + 1 < sizeof(message);) {
+        if (*cursor != '%') {
+            message[filled++] = *cursor++;
+            continue;
+        }
+        const char *start = cursor++;
+        while (*cursor && strchr("0123456789.-+ #lzhj", *cursor) != NULL) {
+            cursor++;
+        }
+        char code = *cursor;
+        if (code == '\0') {
+            break;
+        }
+        cursor++;
+        char spec[32];
+        size_t spec_length = (size_t)(cursor - start);
+        if (spec_length >= sizeof(spec)) {
+            spec_length = sizeof(spec) - 1;
+        }
+        memcpy(spec, start, spec_length);
+        spec[spec_length] = '\0';
+        size_t room = sizeof(message) - filled;
+        int written = 0;
+        switch (code) {
+        case '%':
+            message[filled++] = '%';
+            continue;
+        case 'S': case 'R': case 'A': case 'U': case 'V': {
+            PyObject *object = va_arg(va, PyObject *);
+            PyObject *text = (code == 'R' || code == 'A') ? PyObject_Repr(object)
+                                                          : PyObject_Str(object);
+            const char *utf8 = text == NULL ? "<unprintable>" : PyUnicode_AsUTF8(text);
+            written = snprintf(message + filled, room, "%s", utf8 ? utf8 : "<unprintable>");
+            Py_XDECREF(text);
+            break;
+        }
+        case 's':
+            written = snprintf(message + filled, room, spec, va_arg(va, const char *));
+            break;
+        case 'p':
+            written = snprintf(message + filled, room, spec, va_arg(va, void *));
+            break;
+        case 'f': case 'g': case 'e':
+            written = snprintf(message + filled, room, spec, va_arg(va, double));
+            break;
+        case 'c':
+            written = snprintf(message + filled, room, spec, va_arg(va, int));
+            break;
+        default:
+            if (strstr(spec, "ll") != NULL) {
+                written = snprintf(message + filled, room, spec, va_arg(va, long long));
+            } else if (strchr(spec, 'l') != NULL || strchr(spec, 'z') != NULL) {
+                written = snprintf(message + filled, room, spec, va_arg(va, long));
+            } else {
+                written = snprintf(message + filled, room, spec, va_arg(va, int));
+            }
+            break;
+        }
+        if (written < 0) {
+            break;
+        }
+        filled += (size_t)written < room ? (size_t)written : room - 1;
+    }
+    va_end(va);
+    message[filled < sizeof(message) ? filled : sizeof(message) - 1] = '\0';
+    return _PyPyre_ErrFormatted(type, message);
+}
 
 #ifdef __cplusplus
 }

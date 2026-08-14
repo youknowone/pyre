@@ -3933,11 +3933,16 @@ fn load_part(
             any(target_os = "macos", target_os = "linux")
         ))]
         FindInfo::ExtensionFile { pathname } => {
-            let module = crate::cpyext::load_extension_module(modulename, &pathname)?;
+            let module =
+                crate::cpyext::load_extension_module(modulename, &pathname, pyre_object::PY_NULL)?;
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(module);
             set_extension_module_spec(modulename, &pathname, module)?;
+            // `_imp.create_dynamic` leaves the second PEP 489 phase to
+            // importlib's `_imp.exec_dynamic`; this importer runs both, so the
+            // exec slots run here, after `__spec__` is in place.
+            crate::cpyext::exec_dynamic(pyre_object::gc_roots::shadow_stack_get(module_slot))?;
             pyre_object::gc_roots::shadow_stack_get(module_slot)
         }
         #[cfg(all(
@@ -3946,7 +3951,8 @@ fn load_part(
             any(target_os = "macos", target_os = "linux")
         ))]
         FindInfo::ExtensionPackage { dirpath, pathname } => {
-            let module = crate::cpyext::load_extension_module(modulename, &pathname)?;
+            let module =
+                crate::cpyext::load_extension_module(modulename, &pathname, pyre_object::PY_NULL)?;
             let roots = pyre_object::gc_roots::push_roots();
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(module);
@@ -3973,7 +3979,10 @@ fn load_part(
                 "__path__",
                 pyre_object::gc_roots::shadow_stack_get(list_slot),
             );
-            module
+            // The exec phase runs after `__spec__` and `__path__`, for the same
+            // reason it does in the file branch above.
+            crate::cpyext::exec_dynamic(pyre_object::gc_roots::shadow_stack_get(module_slot))?;
+            pyre_object::gc_roots::shadow_stack_get(module_slot)
         }
         #[cfg(feature = "host_env")]
         FindInfo::SourceFile { pathname } => {

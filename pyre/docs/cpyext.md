@@ -31,33 +31,66 @@ The consequence is why the feature is off rather than on:
 `test_importlib/extension` skips its whole suite while the list is empty. A
 non-empty list un-skips 39 tests that load CPython's `_testsinglephase` and
 `_testmultiphase`; the ABI header below builds neither yet. Turn the feature on
-by default once slices 1–5 below land and both modules build (slice 6 is
-Windows packaging, which the os gates make irrelevant to the default).
+by default once slice 5 below lands and both modules build (slice 6 is Windows
+packaging, which the os gates make irrelevant to the default).
 
-The initial macOS/Linux supported slice is deliberately narrow but end-to-end:
+## What is implemented
+
+The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
+single-phase extension and `pyrex/tests/cpyext_methods.rs` a multi-phase one,
+both compiled from C against the header below.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
   `_imp.exec_dynamic()`;
 - `dlopen`/`dlsym` of `PyInit_<name>` with the library handle retained;
-- `PyModuleDef_Init` and single-phase `PyModule_Create2`;
-- PyPy-style path-to-module-dictionary extension caching;
+- the raw mirror layer (`cpyext/pyobject.rs`): the identity table, borrowed
+  references owned by their container, the per-mirror byte cache behind
+  `PyUnicode_AsUTF8` / `PyBytes_AsString`, and the immortal singletons
+  `Py_None` / `Py_True` / `Py_False` / `Py_Ellipsis` / `Py_NotImplemented`;
+- the C exception indicator (`cpyext/pyerrors.rs`): 37 `PyExc_*` class mirrors
+  and `PyErr_SetString` / `SetObject` / `SetNone` / `Occurred` / `Clear` /
+  `Fetch` / `Restore` / `ExceptionMatches` / `NoMemory` / `BadArgument` /
+  `BadInternalCall`, plus the `PyErr_Format` half the header cannot do;
+- the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
+  `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
+  `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
+- single-phase `PyModule_Create2`, PEP 489 `PyModuleDef_Init` with
+  `Py_mod_create` / `Py_mod_exec`, module state (`m_size`) and the
+  `PyModule_Add*` family;
+- the object protocol (`cpyext/object.rs`) and the primitive constructors and
+  accessors for `int`, `bool`, `float`, `str`, `bytes`, `tuple`, `list` and
+  `dict`;
+- `PyArg_ParseTuple`, `PyArg_ParseTupleAndKeywords`, `PyArg_UnpackTuple`,
+  `Py_BuildValue` and `PyErr_Format`, which are `static inline` C in the header
+  because pyre ships no companion library and rustc's `c_variadic` is unstable;
+- PyPy-style path-to-module-dictionary extension caching for single-phase
+  modules — a multi-phase module is rebuilt from its definition on each import,
+  as upstream's `create_cpyext_module` does;
 - GC forwarding for C mirror links and cached dictionaries.
 
 The loader serializes extension initialization in the current import path;
 the complete port must move that ownership into interpreter/execution-context
 state before subinterpreters or parallel no-GIL imports are enabled.
 
-This imports a single-phase, method-less, stateless `PyModuleDef` extension. A
-non-empty `PyMethodDef` table, module state/finalizer fields, and PEP 489 slots
-are rejected rather than silently ignored. The following slices remain, in
-upstream dependency order:
+Known divergences, each documented at its definition:
 
-1. execution-context-owned C exception indicator and `PyErr_*`;
-2. a dedicated `PyCFunction` carrier with `METH_NOARGS`, `METH_O`, then
-   `METH_VARARGS`/keywords;
-3. primitive object mirrors and APIs (`long`, Unicode, bytes, tuple/list);
-4. PEP 489 create/exec slots and module state;
+- a mirror is freed as soon as C releases its last reference, so a reference
+  cycle running through C leaks; upstream's `rawrefcount` dead queue is what
+  removes that (`cpyext/pyobject.rs`);
+- `md_def` and `md_state` ride reserved module-dictionary keys, and the
+  `PyMethodDef` pointer rides a reserved carrier-dictionary key, because pyre
+  has no typed payload for either yet;
+- the module state block is never released, pyre having no module deallocation
+  path;
+- `PyBytes_FromStringAndSize(NULL, n)` is rejected: pyre's `bytes` is immutable
+  from construction and its storage is not the address `PyBytes_AsString`
+  returns;
+- `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
+  leaving them NULL as CPython does.
+
+## What remains
+
 5. C-defined types, slots, buffers, capsules and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
@@ -77,4 +110,9 @@ are ABI-compatible with pyre.
   queue.
 - `pypy/module/cpyext/modsupport.py`: module definitions, method conversion and
   PEP 489 slots.
+- `pypy/module/cpyext/methodobject.py`: the `PyCFunction` carrier and its
+  calling conventions.
+- `pypy/module/cpyext/pyerrors.py`: the `PyErr_*` entry points.
+- `pypy/module/cpyext/src/getargs.c`: `PyArg_ParseTuple` and `Py_BuildValue`,
+  which are C there too.
 - `pypy/module/imp/interp_imp.py`: `_imp` entry points.
