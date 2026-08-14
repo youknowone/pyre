@@ -4481,6 +4481,13 @@ impl<S: JitState> JitDriver<S> {
                     format_rca_live_values(labels.as_deref(), &live_values)
                 );
             }
+            // Same point the RCA line above reports, but unconditional and
+            // counted: every decline has already returned, and the compiled
+            // body runs on the next statement, so one call here is one entry.
+            // Scoped so the borrow ends before `self.meta` is taken mutably.
+            if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
+                hook(green_key, target_pc);
+            }
 
             let result = if let Some(dispatch_key) = dispatch_key {
                 self.meta.run_compiled_detailed_with_values_at_dispatch_key(
@@ -5522,6 +5529,18 @@ impl<S: JitState> JitDriver<S> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);
+    }
+
+    /// Set a callback fired immediately before a call enters compiled code.
+    /// `f` receives `(green_key, target_pc)`.
+    ///
+    /// Scope: this driver reaches compiled code through `back_edge_internal`,
+    /// which is the site the hook is installed at.  The sibling entry paths in
+    /// this file serve other front ends and do not fire it yet, so a zero count
+    /// is evidence only for a consumer whose entries all go through the back
+    /// edge.
+    pub fn set_on_compiled_entry(&mut self, f: impl Fn(u64, usize) + Send + 'static) {
+        self.meta.set_on_compiled_entry(f);
     }
 
     /// Set a callback for trace abort events. `f` receives `(green_key, permanent)`

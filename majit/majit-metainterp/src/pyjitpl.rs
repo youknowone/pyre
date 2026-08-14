@@ -1887,6 +1887,22 @@ pub struct JitHooks {
     pub on_trace_abort: Option<Box<dyn Fn(u64, bool) + Send>>,
     /// Called when compilation (loop or bridge) fails. Args: (green_key, error_message).
     pub on_compile_error: Option<Box<dyn Fn(u64, &str) + Send>>,
+    /// Called when a call is about to ENTER compiled code. Args: (green_key, target_pc).
+    ///
+    /// The other hooks all describe the artifact POPULATION — what was traced,
+    /// compiled, or thrown away.  None of them says a call ran any of it, and
+    /// the two come apart: a loop that compiled and is then never entered
+    /// leaves `on_compile_loop` fired and every artifact assertion satisfied.
+    /// A consumer asking "did this run in compiled code?" had no answer but a
+    /// proxy, and each available proxy is unsound in one direction —
+    /// `guard_failures` stops being recorded once a bridge covers the exit
+    /// guard, so it reads zero on a loop that is still entered every call.
+    ///
+    /// Fires after every decline has passed and immediately before the
+    /// compiled body runs, so a count of these is a count of entries, not of
+    /// attempts.  It is a callback tally like the compile hooks, not a
+    /// population: it only rises.
+    pub on_compiled_entry: Option<Box<dyn Fn(u64, usize) + Send>>,
 }
 
 /// Runtime callback used to attach an application traceback while the
@@ -4401,6 +4417,12 @@ impl<M: Clone> MetaInterp<M> {
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
+    }
+
+    /// Set a callback fired immediately before a call enters compiled code.
+    /// `f` receives `(green_key, target_pc)`.
+    pub fn set_on_compiled_entry(&mut self, f: impl Fn(u64, usize) + Send + 'static) {
+        self.hooks.on_compiled_entry = Some(Box::new(f));
     }
 
     /// Set a callback for trace start events.
@@ -24626,6 +24648,7 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+        assert!(hooks.on_compiled_entry.is_none());
     }
 }
 
