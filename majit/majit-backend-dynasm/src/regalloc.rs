@@ -257,7 +257,7 @@ pub struct LifetimeManager {
     // (`RegisterManager::loc`/`_sync_var_to_stack`/`spill_*`,
     // `FrameManager::get`/`bind`/`get_new_loc`) resolves a variable through
     // `lifetimes.get(v)`, and a Vec-backed `get` is O(n) — making regalloc
-    // O(n^2) on very large traces (aheui's logo whole-program loop spends
+    // O(n^2) on very large traces (a whole-program loop spends
     // ~all its backend time in `IndexMap::get_index_of` here). regalloc.py:1054
     // keys longevity by a dict (O(1)); `IndexMap` restores that O(1) lookup
     // while keeping the insertion-ordered iteration `IndexMap` provided.

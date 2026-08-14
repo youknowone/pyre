@@ -476,8 +476,8 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// Build a `CanRaise` [`majit_ir::effectinfo::EffectInfo`] whose field write-set names `write_field`
 /// of struct `type_id`, sharing the exact keyed `Arc<SimpleFieldDescr>` that a
 /// `getfield_gc_i` on the same `(type_id, write_field)` resolves to.  A
-/// residual helper that mutates a struct field through opaque host code — e.g.
-/// aheui's `jit_storage_*` changing selected `Stack` fields — declares them so
+/// residual helper that mutates a struct field through opaque host code —
+/// changing a field of the currently selected struct, say — declares them so
 /// `OptHeap::force_from_effectinfo` invalidates cached getfields after the
 /// call.  Without it the residual call carries an empty write-set and the
 /// optimizer can CSE-fold a mutable field load across the call.  This is the
@@ -4348,8 +4348,8 @@ where
             }
             // ── BC_GETARRAYITEM_GC_R ──
             //
-            // Ref-result element read for a raw-pointer array (aheui
-            // `pools[selected]` → `*mut Stack`).  Mirrors BC_GETARRAYITEM_GC_I
+            // Ref-result element read for a raw-pointer array (a
+            // `pools[selected]`-shaped read).  Mirrors BC_GETARRAYITEM_GC_I
             // but loads an 8-byte GC pointer and writes the ref bank.  Unlike
             // the int arm there is NO all-constant fold: the array base is a
             // live state pointer and the result must stay a `GetarrayitemGcR`
@@ -5267,7 +5267,7 @@ where
                 // trace time (verify_green_args, asserted below).
                 let mut mp_green_pc: Option<i64> = None;
                 // MAJIT_PCSEQ diagnostic: all int-green constants at this merge
-                // point (pc plus any scalar greens like aheui's stackok/is_queue).
+                // point (pc plus any scalar greens the consumer declares).
                 let mut mp_green_ints: Vec<i64> = Vec::new();
                 // pyjitpl.py:3912 same_greenkey compares EVERY green, not just
                 // the int slot.  Capture the ref (slot 1) and float (slot 2)
@@ -5804,8 +5804,8 @@ where
                     };
                     let pc_matches = mp_green_pc.is_none_or(|pc| pc == close_target_pc as i64);
                     // pyjitpl.py:3021/3912 same_greenkey: beyond the pc, close
-                    // only when EVERY green (aheui's stackok / is_queue, the
-                    // `program` ref, …) equals the trace-start header's.  Compare
+                    // only when EVERY green — the scalars and the ref the
+                    // consumer declares — equals the trace-start header's.  Compare
                     // element-wise against the header greens captured on the first
                     // visit (`header_greens`) — the SAME merge-point green
                     // vocabulary — which is `Box.same_constant` per Const type

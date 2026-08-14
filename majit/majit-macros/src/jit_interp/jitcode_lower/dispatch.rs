@@ -57,8 +57,8 @@ mod find_dispatch_loop_body_tests {
 /// jitcode sees them via its portal-input bindings.  Pyre's dispatch
 /// arm lowerer emits `__builder.inline_call(__sub_idx)` with no args,
 /// leaving the sub-frame without `pc` / `program` / `op` etc. — any
-/// arm body that references these (e.g. `program.get_operand(pc - 1)`
-/// in aheui-jit) lowers to raw Rust that fails to compile inside
+/// arm body that references these (`program.get_operand(pc - 1)`, say)
+/// lowers to raw Rust that fails to compile inside
 /// `__dispatch_jitcode_<fn>` where the names are out of scope.
 ///
 /// This collector is the first slice (of three) closing that gap:
@@ -1455,8 +1455,7 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
                 // opcode-result name so `lower_dispatch_chain`
                 // can find the binding regardless of whether the
                 // consumer named it `opcode` (PyPy convention,
-                // `pyopcode.py:171`) or `op` (aheui-jit
-                // `aheui.py:255`) or anything else.
+                // `pyopcode.py:171`) or `op` or anything else.
                 lowerer.opcode_var_name = Some(name);
             }
             return true;
@@ -1629,8 +1628,8 @@ fn expr_int_literal_value(expr: &Expr) -> Option<i64> {
 /// Find the body block of the unique top-level loop in `func_block` whose
 /// body contains `target_match`.
 ///
-/// Recognises both `while cond { ... }` (e.g. `aheui.py:251 while pc <
-/// program.size`) and `loop { ... }` (e.g. `rpython/jit/tl/tinyframe/tinyframe.py` and
+/// Recognises both `while cond { ... }` (e.g. `while pc < program.size`)
+/// and `loop { ... }` (e.g. `rpython/jit/tl/tinyframe/tinyframe.py` and
 /// other tinyframe-family interpreters whose dispatch loop is unconditional
 /// with a `break`-driven exit).  Mirrors `codegen_trace.rs:520
 /// expr_inner_match_block`'s recognition set.
@@ -3657,8 +3656,8 @@ pub(crate) fn lower_dispatch_body(
 
     // A.3.6.1 (jtransform.py:1693): bind body-local `let` stmts that
     // appear BEFORE `jit_merge_point!()` in the dispatch while-body, so
-    // that consumer-declared `greens = [<body-local>]` (e.g. aheui-jit's
-    // `greens = [stackok]`) resolve via `lowerer.bindings` when
+    // that consumer-declared `greens = [<body-local>]` (say
+    // `greens = [ok]`) resolve via `lowerer.bindings` when
     // `emit_promote_greens` and `resolve_greens` consult it below.
     let _ = bind_pre_merge_point_stmts(&mut lowerer, func_block);
     if lowerer.dispatch_tainted_reason.is_some() {
@@ -3774,8 +3773,7 @@ pub(crate) fn lower_dispatch_body(
     // then iterate stmts before the match-containing stmt.
     //
     // Pin pc-writes to i0 for the whole pre-dispatch walk. The branch-op
-    // match that precedes the dispatch match (aheui-jit lib.rs:520-545
-    // OP_BRPOP/OP_JMP/OP_BRZ, rpaheui aheui.py:294-311) carries
+    // match that precedes the dispatch match (the branch opcodes) carries
     // `pc = program.get_label(pc - 1); ...; continue;` arms. Without the
     // pin, the assignment SSA-rebinds `pc` to a fresh register that dies
     // at the `continue` back-edge, so the next merge point reads the

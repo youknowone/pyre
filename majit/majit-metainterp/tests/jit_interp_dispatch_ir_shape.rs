@@ -2090,14 +2090,12 @@ mod oparg_with_body_local_state_le_green {
     }
 }
 
-/// A.3.6.3: pin the method-call body-local lowering shape against
-/// aheui-jit's `let mut stackok = program.get_req_size(pc) as i32 <=
-/// state.stacksize;` chain. The fixture exercises:
+/// A.3.6.3: pin the method-call body-local lowering shape for a green
+/// derived as `let g = program.get_req_size(pc) as i32 <= state.f1 as i32;`.
+/// The fixture exercises:
 ///   - body-local `let g = program.get_req_size(pc) as i32 <= state.f1
 ///     as i32;` placed before `jit_merge_point!()`,
-///   - `MockProgram::get_req_size => elidable_int` policy registration
-///     (the same canonical path used by aheui-jit at `aheui-jit/src/lib.
-///     rs:302`),
+///   - `MockProgram::get_req_size => elidable_int` policy registration,
 ///   - `greens = [g]` so the merge-point's `greens_i` payload + the
 ///     A.3.5 promote-greens pair both reference `g`'s int register.
 ///
@@ -2105,9 +2103,8 @@ mod oparg_with_body_local_state_le_green {
 /// emission (`BC_RESIDUAL_CALL_IR_I` because receiver=Ref + pc=Int) to
 /// land BEFORE `BC_JIT_MERGE_POINT(_C)` and threads its result reg
 /// forward through `BC_INT_LE` and finally A.3.5's `BC_INT_GUARD_VALUE`
-/// + greens_i payload byte. Locks aheui-jit's `stackok` lowering chain
-///   so future refactors of `lower_method_call_value` (A.3.6.2) cannot
-///   silently regress it.
+/// + greens_i payload byte, so future refactors of
+///   `lower_method_call_value` (A.3.6.2) cannot silently regress the chain.
 ///
 /// RPython parity: `jtransform.py:456 handle_residual_call`
 /// (graph-identity-keyed; pyre keys on canonical path so
@@ -2165,10 +2162,10 @@ mod oparg_with_body_local_method_call_green {
         state = MethodCallGreenState,
         env = MockProgram,
         state_fields = { f1: int, a: int },
-        // `program.get_req_size(pc) as i32 <= state.f1 as i32` is the
-        // body-local computation aheui-jit's main loop uses to derive
-        // `stackok`; lower_method_call_value (A.3.6.2) routes the
-        // method-call RHS through the call-policy table.
+        // `program.get_req_size(pc) as i32 <= state.f1 as i32` is a
+        // body-local computation a dispatch loop derives a green from;
+        // lower_method_call_value (A.3.6.2) routes the method-call RHS
+        // through the call-policy table.
         calls = {
             MockProgram::get_req_size => elidable_int,
         },
@@ -2186,9 +2183,8 @@ mod oparg_with_body_local_method_call_green {
                 .install_canonical_liveness(&mut driver);
         }
         while pc < program.len() {
-            // Mirrors `aheui-jit/src/lib.rs:456`:
-            //   let mut stackok = program.get_req_size(pc) as i32
-            //                       <= state.stacksize;
+            // A body-local green computed from a method call on the env
+            // and a state field.
             let g = program.get_req_size(pc) as i32 <= state.f1 as i32;
             jit_merge_point!();
             let opcode = program[pc];
@@ -2399,16 +2395,14 @@ mod oparg_with_body_local_method_call_green {
     }
 }
 
-/// A.3.7: pin the full rpaheui 4-green parity merge-point shape.
-/// rpaheui aheui.py:29 declares `greens=['pc', 'stackok', 'is_queue',
-/// 'program']`; aheui-jit/src/lib.rs:354 mirrors it as
-/// `greens=[pc, stackok, is_queue, program]` after A.3.6.1's body-local
-/// walker landed and accepted the `let stackok = ...; let is_queue = ...;`
-/// pre-merge-point chain.
+/// A.3.7: pin the merge-point shape for a 4-green declaration whose two
+/// middle greens are body-locals — `greens = [pc, a, b, program]`, with
+/// `let a = ...; let b = ...;` ahead of the merge point, which A.3.6.1's
+/// body-local walker accepts.
 ///
 /// Layout pinned here:
-///   - greens_i_len = 3 (pc=Int/i0, stackok=Int from BinOp::Le,
-///     is_queue=Int from BinOp::Eq).
+///   - greens_i_len = 3 (pc=Int/i0, one Int from BinOp::Le, one Int from
+///     BinOp::Eq).
 ///   - greens_r_len = 1 (program=Ref/r0).
 ///   - greens_f_len = 0.
 ///   - reds_i_len = reds_r_len = reds_f_len = 0 (both portal-input
@@ -2416,7 +2410,7 @@ mod oparg_with_body_local_method_call_green {
 ///
 /// Locks the byte order so a future macro change that re-buckets greens
 /// or shifts the merge-point payload trips this fixture rather than
-/// silently regressing rpaheui parity.
+/// silently regressing the shape.
 mod oparg_with_full_4_green_parity {
 
     use majit_metainterp::{Assembler, JitDriver};
@@ -2454,10 +2448,8 @@ mod oparg_with_full_4_green_parity {
                 .install_canonical_liveness(&mut driver);
         }
         while pc < program.len() {
-            // rpaheui aheui.py:252 stackok recompute.
+            // Two body-local greens recomputed before the merge point.
             let stackok = state.f1 <= state.f2;
-            // rpaheui aheui.py:284 is_queue (recomputed pre-merge-point
-            // here from `state.sel == 21` per A.3.7's pyre adaptation).
             let is_queue = state.sel == 21i64;
             jit_merge_point!();
             let opcode = program[pc];

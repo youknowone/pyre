@@ -1843,8 +1843,8 @@ impl DynasmBackend {
             // `next_const_idx` seeding in `with_constants`), never overwriting
             // a pre-existing key, so a move-replace is equivalent to re-merging
             // every key. The old `entry`/`or_insert` merge rescanned the whole
-            // Vec-backed pool per fresh key (O(n^2), quadratic on large traces
-            // like aheui's logo).
+            // Vec-backed pool per fresh key (O(n^2), quadratic on large
+            // traces).
             self.constants = new_constants;
             (result, gcrefs)
         }
@@ -1867,7 +1867,7 @@ impl DynasmBackend {
     /// cranelift backend already routes `New` through the active GC when
     /// one is installed (`cranelift_gc_active`), but dynasm has always used
     /// a `malloc` stub. A consumer whose `New` objects belong to the GC's
-    /// own pool (e.g. aheui's nursery-backed linked-list nodes) sets this so
+    /// own pool (nursery-backed nodes, say) sets this so
     /// compiled allocations share the same pool as the interpreter path.
     pub fn set_new_via_gc(&mut self, enabled: bool) {
         NEW_VIA_GC.store(enabled, std::sync::atomic::Ordering::Relaxed);

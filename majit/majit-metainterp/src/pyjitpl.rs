@@ -22181,7 +22181,7 @@ mod tests {
 
     /// The LABEL's argument order is its own, not the frontend's state-field
     /// order, and the two can agree in length while disagreeing in position.
-    /// `aheui`'s `pi/pi.jinseo` under the cranelift backend hit exactly that:
+    /// A downstream interpreter under the cranelift backend hit exactly that:
     /// four state values `(Int, Int, Ref, Ref)` entered a four-argument
     /// `(Int, Ref, Ref, Ref)` LABEL, and compiled code dereferenced the second
     /// `Int` as a pointer.

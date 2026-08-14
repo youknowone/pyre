@@ -641,8 +641,8 @@ fn try_generate_jitcode_body_inner(
 /// A.3.6.1 (jtransform.py:1693-1714): bind body-local `let` stmts that
 /// appear in the dispatch while-body BEFORE the `jit_merge_point!()`
 /// macro stmt, so that consumer-declared
-/// `#[jit_interp(greens = [<body-local>])]` (e.g. aheui-jit's
-/// `greens = [stackok]` with `let stackok = program.get_req_size(pc) <= ...`)
+/// `#[jit_interp(greens = [<body-local>])]` (say `greens = [ok]` with
+/// `let ok = program.get_req_size(pc) <= ...`)
 /// flow through `resolve_greens` / `emit_promote_greens` without panic.
 ///
 /// TODO: RPython has no equivalent two-pass walker.

@@ -532,7 +532,8 @@ pub struct OptContext {
     /// op's result position. `find_producer_op`'s highest-priority lookup
     /// otherwise scans `new_operations` with `iter().rfind(...)`, which is
     /// O(n) per call and O(n²) over a whole trace — the dominant cost when
-    /// optimizing a large loop (e.g. aheui's ~64k-op whole-program trace).
+    /// optimizing a large loop — a whole-program trace can reach tens of
+    /// thousands of ops.
     /// Maintained incrementally by `push_new_operation` (insert overwrites,
     /// so the last push at a position wins, matching the `rfind`
     /// last-occurrence semantics); rebuilt by `rebuild_new_operations_index`
@@ -796,7 +797,7 @@ pub struct OptContext {
     // `IndexMap`: `find_producer_op` does `resop_refs.get(&opref)` once per
     // live box of every guard inside `store_final_boxes_in_guard`, and a
     // Vec-backed `get` is O(n), making the box-numbering O(n^2) on very
-    // large traces (aheui's logo loop spends ~all its compile time there).
+    // large traces, where it can dominate the whole compile time.
     // `IndexMap` keeps the same insertion-ordered `values()` semantics the
     // earlier container guaranteed but resolves `get` in O(1).  Same O(1)
     // acceleration rationale as `input_ops_index`; no PyPy counterpart
@@ -820,7 +821,8 @@ pub struct OptContext {
     /// exists per position (the emit invariant asserted throughout this file),
     /// so the map is unambiguous. Maintained via `live_synthetics_push` /
     /// `live_synthetics_swap_remove_pos`; without it the scan is O(n^2) over a
-    /// vector that grows to the whole trace length (~44k on aheui's logo loop),
+    /// vector that grows to the whole trace length (tens of thousands of ops
+    /// on a whole-program loop),
     /// the same producer-resolution cost `phase1_emit_ops_index` removes.
     pub(crate) live_synthetics_index: FxHashMap<OpRef, usize>,
     /// Phase 1 emit ops carried into Phase 2's lookup surface.
@@ -840,7 +842,8 @@ pub struct OptContext {
     /// (`ctx.phase1_emit_ops = mem::take(...)` in `optimizer.rs`) — and never
     /// mutated afterwards, so the index is rebuilt in lockstep there via
     /// `rebuild_phase1_emit_ops_index`. Without it, `find_producer_op` scans
-    /// the full cross-phase carry (~60k ops on aheui's logo loop) per live
+    /// the full cross-phase carry (tens of thousands of ops on a
+    /// whole-program loop) per live
     /// box of every Phase 2 guard, the dominant O(n^2) compile cost. Same
     /// derived-index rationale as `input_ops_index` (no PyPy counterpart:
     /// upstream keys producers on `box._forwarded`, not a positional map).
@@ -862,7 +865,7 @@ pub struct OptContext {
     /// `rebuild_input_ops_index`. Eliminates the O(n) scan of the full
     /// recorder trace that `find_producer_op` otherwise performs on every
     /// miss of the higher-priority stores (the dominant O(n^2) cost on very
-    /// large traces, e.g. aheui's logo loop).
+    /// large traces).
     ///
     /// No PyPy counterpart: upstream keys producer information on the box
     /// itself (`box._forwarded` / `PtrInfo`, `optimizer.py`), so a

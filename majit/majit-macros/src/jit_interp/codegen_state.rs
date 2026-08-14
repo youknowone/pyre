@@ -1043,8 +1043,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `initialize_sym_scalar_parts`. `values[idx]` is the scalar at
     // state-field index `idx` (the order `collect_scalar_values_parts`
     // produced). recover runs afterwards and overwrites the storage-derived
-    // caches, so only scalars recover cannot re-derive (e.g. aheui `selected`)
-    // meaningfully carry through.
+    // caches, so only scalars recover cannot re-derive (a `selected`-style
+    // storage index, say) meaningfully carry through.
     let writeback_from_values_parts: Vec<TokenStream> = scalars
         .iter()
         .enumerate()
@@ -1780,7 +1780,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
     // Emit the virt-array write-back override only for consumers that declare a
-    // `[.. ; virt]` array; 0-array interps (aheui, tlr, tinyframe, i64env) keep
+    // `[.. ; virt]` array; 0-array interps (tlr, tinyframe, i64env) keep
     // the trait default no-op, leaving their generated impl byte-identical.
     let writeback_virt_array_override: TokenStream = if num_virt_arrays > 0 {
         quote! {
@@ -2652,14 +2652,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // bridge ever forms — a failing loop guard re-enters via
             // ContinueRunningNormally instead of forming a bridge.  Adding it
             // flips `start_bridge_tracing` ok=false→ok=true and bridges form;
-            // aheui hello/99bottles/fib stay byte-identical.
+            // existing consumers stay byte-identical.
             //
             // NOTE: this is general guard-exit bridge-formation infrastructure.
-            // It does NOT address the logo `--jit` hang: that was root-caused
-            // to a separate optimizer issue (a sel=4 peeled loop constant-folds
-            // the stacksize red and drops the stack-size exit guard, looping on
-            // a stack-mutating residual) — not a missing or unseeded bridge.
-            // See `aheui-logo-spin-observer-replay-rootcause.md`.
+            // A trace that spins is not by itself evidence of a missing or
+            // unseeded bridge: one such spin was instead a peeled loop that
+            // constant-folded a red and dropped the matching exit guard,
+            // leaving a state-mutating residual to loop forever.
             fn rebuild_from_resumedata(
                 _meta: &mut #meta_ty,
                 fail_arg_types: &[majit_ir::Type],
@@ -2727,10 +2726,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             //    loop state (without this a guard-exit bridge re-traces
             //    un-seeded). ──
             //
-            // STATUS: this seeds int/ref SCALAR slots only.  No available aheui
+            // STATUS: this seeds int/ref SCALAR slots only.  No available
             // workload has been observed to reach this path (setup_bridge_sym
-            // emits no MAJIT_BRIDGE_DEBUG lines for 99bottles/fibonacci/
-            // factorial), so part B is present-but-unexercised; treat the
+            // emits no MAJIT_BRIDGE_DEBUG lines for any of them), so part B is
+            // present-but-unexercised; treat the
             // seeding as unverified on real traces.  Latent gaps once it IS
             // exercised by a consumer:
             //   * flattened `[int]` arrays + virt-array ptr/len slots are NOT
@@ -2741,7 +2740,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             //   * a multi-frame resume (inlined sub-frames) is decoded as a
             //     single frame by `rebuild_from_resumedata` (None
             //     frame_value_count) — later frame headers would be read as
-            //     values.  Both bite only for non-aheui macro states.
+            //     values.  Both bite only for macro states that declare
+            //     arrays or inline sub-frames.
             //
             // `frame.values` is laid out by liveness bank: [int-bank, then
             // ref-bank, then float], greens/loop-invariants decoded as `Const`,

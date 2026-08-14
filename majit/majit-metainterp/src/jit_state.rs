@@ -465,8 +465,8 @@ pub trait JitState: Sized {
     /// values (captured at close time by `collect_scalar_state_field_values`)
     /// into native state. `values[idx]` is the scalar at state-field index
     /// `idx`, written in the same order the sym read them. A scalar the walk
-    /// mutates but `recover` cannot re-derive from shared storage (e.g. aheui's
-    /// `selected` storage index, set by SEL from a program operand) would
+    /// mutates but `recover` cannot re-derive from shared storage (a
+    /// `selected` storage index set from a program operand, say) would
     /// otherwise stay frozen at its trace-start value. Applied before
     /// `recover_after_compiled_run` so recover then refines the storage-derived
     /// caches (stacksize / list refs) from the now-current scalars. Default

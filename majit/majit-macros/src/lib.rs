@@ -2638,7 +2638,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// This is the Rust equivalent of RPython's meta-tracing: the proc macro analyzes
 /// the interpreter's opcode dispatch match and generates the tracing code automatically.
 ///
-/// The interpreter author writes ONLY the dispatch loop (like RPython's rpaheui).
+/// The interpreter author writes ONLY the dispatch loop.
 /// The macro generates:
 /// - `trace_instruction()` function (IR recording for each opcode)
 /// - `JitState` impl with Meta/Sym types
@@ -2648,7 +2648,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// ```ignore
 /// #[jit_interp(
-///     state = AheuiState,
+///     state = InterpState,
 ///     env = Program,
 ///     storage = {
 ///         pool: state.storage,
@@ -2657,8 +2657,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         scan: find_used_storages,
 ///     },
 ///     io_shims = {
-///         aheui_io::write_number => jit_write_number,
-///         aheui_io::write_utf8 => jit_write_utf8,
+///         interp_io::write_number => jit_write_number,
+///         interp_io::write_utf8 => jit_write_utf8,
 ///     },
 ///     // optional: infer direct helper calls from sidecar metadata
 ///     // non-int result helpers still need explicit `calls = { ... => ... }`

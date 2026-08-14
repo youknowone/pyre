@@ -240,8 +240,8 @@ fn build_semantic_program_via_active_frontend(
             // Seed the local-crate alias roots from the loaded set so
             // `free_function_alias_paths` and the registry's canonical
             // dedup treat every extracted crate name as an alias root
-            // (`local_crates.rs`); non-pyre consumers (aheui) resolve
-            // their crate-qualified cross-crate callsites through this.
+            // (`local_crates.rs`); a non-pyre consumer resolves its
+            // crate-qualified cross-crate callsites through this.
             crate::local_crates::register_local_crate_roots(
                 llbcs.iter().map(|l| l.crate_name().to_string()),
             );
@@ -1668,7 +1668,7 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     // Opt-in receiver-driven dispatch families (receiver-dispatch configuration): a consumer
-    // (e.g. the aheui census) names `>=2`-impl trait qualified paths
+    // names `>=2`-impl trait qualified paths
     // whose `dyn Trait` receivers should annotate to a base ClassDef
     // linking the impl subclasses, so a method getattr on the receiver
     // resolves the impl MethodDesc family.  Built from `trait_impl_owners`
@@ -1737,8 +1737,8 @@ fn analyze_pipeline_from_module_paths(
     // Auto-population (receiver-dispatch configuration): register EVERY `>=2`-impl trait so its
     // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
     // to the family base ClassDef.  Union with the config list (dedup by
-    // base_root), never replacing it, to stay forward-safe with the aheui
-    // census. Minting base/impl subclass classdefs and lowering the indirect
+    // base_root), never replacing it, so an existing configuration stays
+    // valid. Minting base/impl subclass classdefs and lowering the indirect
     // call are one decision. Applies the same within-family
     // `dup_leaf` guard as the config path plus the cross-registry
     // `struct_leaf_counts` bail: an impl leaf that also names a DIFFERENT
@@ -2407,8 +2407,7 @@ pub fn generate_trace_code_from_pipeline(result: &pipeline::ProgramPipelineResul
 /// Like [`generate_trace_code_from_pipeline`] but takes a
 /// [`codegen::CodegenFlavor`]. The flavor is currently a no-op (the
 /// pyre-specific helpers it used to gate now live in
-/// `pyre-jit-trace/src/trace_helpers.rs`); retained for external callers
-/// such as `aheui-jit`.
+/// `pyre-jit-trace/src/trace_helpers.rs`); retained for external callers.
 pub fn generate_trace_code_from_pipeline_with_flavor(
     result: &pipeline::ProgramPipelineResult,
     flavor: codegen::CodegenFlavor,

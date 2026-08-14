@@ -1604,8 +1604,8 @@ impl JitCodeBuilder {
     /// Ref-result array read: `dst = array[index]` where the element is a
     /// GC pointer (8 bytes). Mirrors [`Self::getarrayitem_gc_i`] but routes
     /// `dst` through the ref register bank and uses the `/rid>r` mnemonic.
-    /// Used to re-derive a pointer-array element (aheui `pools[selected]`)
-    /// as a re-producible heap read instead of an opaque residual call.
+    /// Used to re-derive a pointer-array element (a `pools[selected]`-shaped
+    /// read) as a re-producible heap read instead of an opaque residual call.
     pub fn getarrayitem_gc_r(&mut self, dst: u16, array_reg: u16, index_reg: u16, descr_idx: u16) {
         self.touch_ref_reg(array_reg);
         self.touch_reg(index_reg);
@@ -1797,8 +1797,9 @@ impl JitCodeBuilder {
     /// getlenbound().make_gt_const(index)`) and the short preamble re-emits
     /// `ARRAYLEN_GC` to re-establish the `len > index` guard each loop entry
     /// — without a lendescr the GC rewrite of that `ARRAYLEN_GC` panics.
-    /// The aheui `Storage` carries this header as `pools_len` (offset 0,
-    /// `pools` at offset 8).  Deduped structurally by `add_bh_descr`.
+    /// An interpreter supplies that header itself — a length word at offset
+    /// 0 with the pointer array at offset 8.  Deduped structurally by
+    /// `add_bh_descr`.
     pub fn add_ptr_array_descr(&mut self) -> u16 {
         self.add_array_descr(CanonicalBhDescr::Array {
             base_size: std::mem::size_of::<usize>(),

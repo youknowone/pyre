@@ -64,7 +64,7 @@ pub struct PipelineConfig {
     /// subclasses (so a method getattr resolves the impl `MethodDesc`
     /// family via the attrfamily merge).  Empty for pyre production — its
     /// multi-impl traits keep their classdef-less / fail-loud
-    /// disposition; the aheui census opts `LinkedList` in.
+    /// disposition; a consumer opts its own traits in by name.
     #[serde(default)]
     pub register_trait_families: Vec<String>,
 }

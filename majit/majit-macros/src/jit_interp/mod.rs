@@ -52,7 +52,7 @@ use syn::{
 /// `__MAJIT_HELPER_POLICIES`). Alternatively, use `helpers` or `calls`
 /// to explicitly list the functions that need JIT integration.
 pub struct JitInterpConfig {
-    /// The interpreter state type (e.g., `AheuiState`).
+    /// The interpreter state type (e.g., `InterpState`).
     pub state_type: Ident,
     /// The environment type (e.g., `Program`).
     pub env_type: Ident,
@@ -313,7 +313,7 @@ pub enum StateFieldKind {
     /// but the user-visible struct field carries the declared type. The
     /// macro emits `as i64` / `as <type>` casts at the JIT boundary so
     /// IR sees a uniform i64 while the interpreter keeps natural Rust
-    /// types (e.g. aheui's `selected: usize`, `stacksize: i32`).
+    /// types (e.g. `selected: usize`, `stacksize: i32`).
     Scalar {
         ir_type: Ident,
         /// `None` ⇒ Rust storage type matches `ir_type` (default i64
@@ -511,7 +511,8 @@ pub(crate) enum CallPolicyKind {
     ElidableIntOrMemerrorWrapped,
     ResidualRef,
     /// Like `ResidualRef` but stamps the descr EffectInfo with
-    /// `PyreHelperKind::NurseryAlloc` (aheui inline nursery bump). Result is a
+    /// `PyreHelperKind::NurseryAlloc`, which the backend lowers to an inline
+    /// nursery bump. Result is a
     /// real escaping Ref — no virtualization.
     NurseryAllocRef,
     ResidualRefWrapped,

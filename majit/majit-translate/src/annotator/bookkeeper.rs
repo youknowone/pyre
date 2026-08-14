@@ -6559,7 +6559,7 @@ mod tests {
     }
 
     /// Fixture for the methods-on-classdef capability that `dyn Trait`
-    /// receiver-driven dispatch (receiver-dispatch configuration, aheui LinkedList) needs.
+    /// receiver-driven dispatch (receiver-dispatch configuration) needs.
     ///
     /// A ≥2-impl trait family registered through `register_trait_family`
     /// must (a) link a base ClassDef to its impl subclasses, (b) carry the

@@ -303,7 +303,8 @@ pub struct AssemblerARM64<'a> {
     /// Vec-backed `IndexMap`: `resolve_opref` reads this per emitted op during
     /// codegen and the sync loop inserts one entry per live var, so a Vec-`get`
     /// is O(n) and makes `_assemble` O(n^2) on large traces — `get_index_of`
-    /// inlines into `_assemble` and dominated aheui's logo compile. The box→
+    /// inlines into `_assemble` and dominated compile time on a trace of tens
+    /// of thousands of ops. The box→
     /// location map is a dict in the reference assembler; insertion order is
     /// preserved (no semantic change, only the lookup cost).
     opref_to_slot: indexmap::IndexMap<OpRef, usize>,
@@ -6012,18 +6013,24 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// Inline aheui's headerless `jit_alloc_node(value, next)` nursery bump.
+    /// Inline nursery bump for a call tagged
+    /// [`majit_ir::PyreHelperKind::NurseryAlloc`].
     ///
-    /// The fast path only advances `nursery_free` and initializes the
-    /// 16-byte Node payload, so it cannot collect and emits no gcmap. The
-    /// slow path is the ordinary residual call wrapper, which may collect
-    /// inside `jit_alloc_node` / `Nursery::alloc` and passes `next` (the old
-    /// head) as the keep-root. This is sound because the op is still a call:
-    /// the optimizer's residual-call emission fences pending head/size
-    /// setfields before this allocation, matching the storage collector's
-    /// root-currentness requirement.
+    /// The tag declares a two-word headerless node taken from the
+    /// interpreter's own nursery, whose payload is the call's two arguments:
+    /// the value at offset 0 and the successor link at offset 8.
+    ///
+    /// The fast path only advances `nursery_free` and stores those two words,
+    /// so it cannot collect and emits no gcmap. The slow path is the ordinary
+    /// residual call wrapper, which may collect inside the callee; the callee
+    /// is free to treat the second argument as a keep-root, since that is the
+    /// object the new node links to. This is sound because the op is still a
+    /// call: the optimizer's residual-call emission fences pending setfields
+    /// before the allocation, so a collector that walks the interpreter's own
+    /// structures finds roots that are current.
     fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
-        const NURSERY_ALLOC_NODE_SIZE: u32 = 16; // aheui headerless Node = 16B (value@0,next@8)
+        // Two-word headerless node: value@0, link@8.
+        const NURSERY_ALLOC_NODE_SIZE: u32 = 16;
 
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
         if nf_addr == 0 || nt_addr == 0 {
@@ -6662,9 +6669,9 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// The fast path raw-bumps `dynasm_nursery_addrs()`, so it is correct only
     /// when the active dynasm GC is headerless-aware — its nursery must yield a
-    /// raw base carrying no `GcHeader` (aheui's `NurseryGcAllocator`, whose
-    /// nursery is the aheui node arena collected by aheui's own copying node
-    /// GC).  A headered collector such as MiniMarkGC must never back this op:
+    /// raw base carrying no `GcHeader` — what an interpreter that runs its own
+    /// collector over its own object arena supplies.  A headered collector such
+    /// as MiniMarkGC must never back this op:
     /// its nursery walk reads a `GcHeader` at `base - GcHeader::SIZE`, which a
     /// raw base lacks.  The overflow slowpath enforces this via
     /// `alloc_nursery_headerless`'s panicking default; the fast path relies on
@@ -6703,10 +6710,9 @@ impl<'a> AssemblerARM64<'a> {
             dynasm!(self.mc ; .arch aarch64 ; add x1, x0, x1);
         }
 
-        // Aheui's live nursery places the top slot immediately after the free
-        // slot. Reuse x16 as the address base when the allocator reports that
-        // layout; custom allocators with independent slots retain the general
-        // path.
+        // When the allocator reports the top slot immediately after the free
+        // slot, reuse x16 as the address base; allocators that keep the two
+        // slots independent retain the general path.
         if nt_addr == nf_addr.wrapping_add(std::mem::size_of::<usize>()) {
             dynasm!(self.mc ; .arch aarch64 ; ldr x17, [x16, 8]);
         } else {

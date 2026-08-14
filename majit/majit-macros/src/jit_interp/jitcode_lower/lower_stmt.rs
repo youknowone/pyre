@@ -593,8 +593,8 @@ impl<'c> Lowerer<'c> {
         // arm-pattern bound names) which are not in scope at the
         // surrounding Rust scope.  Without this guard, dispatch arm
         // sub-JitCode bodies that contain unrecognised method calls on
-        // a parent binding (e.g. aheui-jit's `program.get_operand(pc - 1)`
-        // when no `Program::get_operand` call policy is registered) would
+        // a parent binding (`program.get_operand(pc - 1)` with no
+        // `Program::get_operand` call policy registered, say) would
         // emit verbatim Rust referencing `program`/`pc` in the
         // `__sub_builder` block — failing to compile.  Returning `None`
         // here triggers the dispatch arm's `None` branch which substitutes
@@ -1564,9 +1564,9 @@ impl<'c> Lowerer<'c> {
                 }
                 // Stmt-form variants of result-returning policies discard
                 // the value but still need the IR call op recorded so the
-                // compiled trace runs the side effect (e.g. aheui OP_POP's
-                // `lj::stack_pop(state.selected_ref);` discards the popped
-                // value but the pop side effect must reach compiled code).
+                // compiled trace runs the side effect (a `stack_pop(...)`
+                // whose result is discarded still has to pop in compiled
+                // code).
                 // Allocate a throwaway destination register; never read it.
                 //
                 // RPython jtransform.py:456 `handle_residual_call` lowers
@@ -2212,7 +2212,7 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// Lower I/O call: aheui_io::write_number(r, writer) → residual_call_void(shim, r)
+    /// Lower I/O call: `<io>::write_number(r, writer)` → `residual_call_void(shim, r)`
     fn lower_io_call_stmt(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Call(call) = expr else {
             return None;

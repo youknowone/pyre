@@ -908,11 +908,11 @@ pub enum PyreHelperKind {
     /// storage write.  Every unsupported shape keeps the original generic
     /// setattr residual.
     StoreAttr,
-    /// aheui headerless-Node nursery allocation (`jit_alloc_node(value,next)`).
-    /// The dynasm backend recognises this tag on the CallR descr to emit an
-    /// inline nursery bump (RPython malloc_cond shape) instead of a full
-    /// residual `blr`; the node stays a real escaping alloc result (NOT a
-    /// virtualized New), so the following `selected_ref.head = new_node`
+    /// Headerless two-word node allocation, `(value, link)`, from the
+    /// interpreter's own nursery.  The dynasm backend recognises this tag on
+    /// the CallR descr to emit an inline nursery bump (RPython malloc_cond
+    /// shape) instead of a full residual call; the node stays a real escaping
+    /// alloc result (NOT a virtualized New), so the setfield that links it in
     /// remains a normal committed setfield. has_oopspec stays false.
     NurseryAlloc,
     /// `bh_load_method_self_fn(obj, attr, code, name_idx)` — the LOAD_METHOD

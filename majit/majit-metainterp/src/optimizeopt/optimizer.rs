@@ -3278,8 +3278,8 @@ impl Optimizer {
                         // with five virtual-carrying fixtures (escaping tuple,
                         // escaping instance, aliased list, varying-length
                         // array, nested virtual), two of which do compile
-                        // bridges — zero hits, as with the aheui corpus and
-                        // pyre/bench + pyre/extra_tests. Upstream matches
+                        // bridges — zero hits, as with pyre/bench and
+                        // pyre/extra_tests. Upstream matches
                         // against a *different* loop's stored state in
                         // `jump_to_existing_trace` (unroll.py:207);
                         // `export_state_re_matched_against_its_own_args_cannot_fail`

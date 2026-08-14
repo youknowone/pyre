@@ -315,8 +315,8 @@ pub struct TraceCtx {
     /// header's concrete green constants, grouped by IR register slot
     /// (`(ints, refs, floats)`).  Captured on the first merge-point visit of a
     /// primary trace (the header), then compared element-wise against every
-    /// later visit's greens to decline closing when a scalar green (aheui's
-    /// `stackok` / `is_queue`) differs from the header.  `None` until captured;
+    /// later visit's greens to decline closing when a scalar green differs
+    /// from the header.  `None` until captured;
     /// bridges never populate it (they close through the compiled-loop
     /// registry).  This is the merge-point green vocabulary — distinct from
     /// `green_key_values`, the back-edge/can_enter_jit key, which carries a

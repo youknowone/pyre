@@ -187,7 +187,7 @@ impl<'c> Lowerer<'c> {
                     return Some(binding.clone());
                 }
                 // Otherwise a path whose final segment is a SCREAMING_CASE
-                // symbolic constant (`VAL_QUEUE`, `aheui::VAL_PORT`) lowers to
+                // symbolic constant (`VAL_QUEUE`, `consts::VAL_PORT`) lowers to
                 // a runtime int const — the same `#path as i64` form match-arm
                 // patterns use (`extract_pat_value_tokens`); the Rust compiler
                 // resolves the const value while building the JitCode, and a

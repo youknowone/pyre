@@ -2883,8 +2883,8 @@ mod tests {
 
     #[test]
     fn state_field_layout_total_live_values_includes_ref_scalars() {
-        // aheui: selected/stacksize/pool_ptr (3 int scalars) + selected_ref
-        // (1 ref scalar past the `program` ref arg at r0 → base 1).
+        // Three int scalars plus one ref scalar, the latter past a ref arg
+        // at r0 → base 1.
         // total_slots() counts only int-bank slots; the ref scalar lives in
         // the ref bank and is appended by extract_live, so
         // total_live_values() = total_slots() + num_ref_scalars. The
@@ -8349,10 +8349,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // in `wire_bhimpl_handlers` and the canonical bytes exist in
     // `wellknown_bh_insns`, but the whole family was absent from this
     // builder's insns map — so a deopt replaying a struct field access
-    // (e.g. an aheui Stack/Queue `size` store, `setfield_gc_i/rid` =
-    // BC_SETFIELD_GC_I 0xac) landed on the unwired-opcode placeholder.
-    // Canonical `rd`/`r{i,r,f}d` argcodes only (aheui accesses fields off
-    // a ref base); intbase (`id`/`iid`/`ird`) forms have no canonical byte
+    // (an int field store, `setfield_gc_i/rid` = BC_SETFIELD_GC_I 0xac)
+    // landed on the unwired-opcode placeholder.
+    // Canonical `rd`/`r{i,r,f}d` argcodes only (these access fields off a
+    // ref base); intbase (`id`/`iid`/`ird`) forms have no canonical byte
     // and are not emitted here.  Additive: every byte is currently unwired.
     for (key, byte) in [
         (

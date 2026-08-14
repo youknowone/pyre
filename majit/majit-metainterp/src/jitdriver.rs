@@ -1276,7 +1276,7 @@ pub struct JitDriver<S: JitState> {
     ///
     /// The Mutex serialises factory invocations from blackhole resume
     /// callers; in practice tracing/resume run single-threaded for the
-    /// state-field JIT consumer (aheui), so contention is negligible.
+    /// state-field JIT consumer, so contention is negligible.
     ///
     /// Snapshot contract: factory calls that can append distinct
     /// liveness entries must run before tracing starts, followed by
@@ -1285,7 +1285,8 @@ pub struct JitDriver<S: JitState> {
     /// `MetaInterpStaticData.liveness_info` immutable during tracing.
     shared_asm: std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>>,
     /// resume.py:1367 — CPU allocation backend for virtual materialization
-    /// during blackhole resume. Registered by pyre/aheui at startup.
+    /// during blackhole resume. Registered by the embedding interpreter at
+    /// startup.
     blackhole_allocator: Option<Box<dyn crate::resume::BlackholeAllocator + Send>>,
     /// warmspot.py:961 handle_jitexception parity: portal runner callback.
     /// Called when ContinueRunningNormally is raised at a recursive portal
@@ -3013,7 +3014,7 @@ impl<S: JitState> JitDriver<S> {
                                 //
                                 // What the widened arm produces, at the op level: the
                                 // declined close returns here, the walk runs on and closes a
-                                // second time one aheui instruction later, and the bridge it
+                                // second time one interpreter instruction later, and the bridge it
                                 // compiles carries that instruction's pop (`IntAdd -1`, two
                                 // `GcLoadR`, two `GcStore`) ahead of a `Jump` into a
                                 // four-input label, where the close that was declined jumped
@@ -3444,7 +3445,7 @@ impl<S: JitState> JitDriver<S> {
                         //
                         // The slot is here because nothing available reaches
                         // this branch: it fires on no test in this crate, no
-                        // majit example, and no aheui corpus program at
+                        // majit example, and no downstream corpus program at
                         // thresholds 2/8/32/128. A zero says "still unreached";
                         // the first non-zero is the first evidence this
                         // resumption is exercised at all.
@@ -7905,7 +7906,7 @@ mod tests {
     }
 
     /// State whose walk advances a scalar state field the recover hook cannot
-    /// re-derive (an aheui `selected`-style storage index). The Sym carries the
+    /// re-derive (a `selected`-style storage index). The Sym carries the
     /// scalar; `collect_scalar_state_field_values` reads it (at close time,
     /// while the sym is live) and `writeback_scalar_state_fields_from_values`
     /// pushes the captured value into native `state`.
@@ -7980,9 +7981,9 @@ mod tests {
     /// `writeback_scalar_state_fields` applies that stash to native `state`
     /// afterward. Previously the write-back read `self.sym` directly, but the
     /// CloseLoop arm had already set `self.sym = None`, so the write-back was
-    /// always a silent no-op — a program whose walk advanced a scalar (e.g. an
-    /// aheui SEL changing `selected`) would seed native state from the stale
-    /// trace-start value.
+    /// always a silent no-op — a program whose walk advanced a scalar (an
+    /// instruction switching the selected storage, say) would seed native
+    /// state from the stale trace-start value.
     #[test]
     fn single_pass_close_writes_back_walk_final_scalar() {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);

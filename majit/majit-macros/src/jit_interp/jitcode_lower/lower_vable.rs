@@ -893,7 +893,7 @@ impl<'c> Lowerer<'c> {
     /// `setfield_gc` on the same `(struct_type_id, field)` — mirroring an
     /// RPython `len(obj)`/`obj.field` getfield_gc_i on a mutable field.
     ///
-    /// Only int fields are lowered here (the aheui length read); a ref field
+    /// Only int fields are lowered here (the length read); a ref field
     /// read would route through `getfield_gc_r` and is left unimplemented
     /// until a caller needs it.
     pub(super) fn lower_state_ref_field_getfield(&mut self, expr: &Expr) -> Option<Binding> {
@@ -1302,7 +1302,7 @@ impl<'c> Lowerer<'c> {
     /// Recognizes a pool-array element read through the registered getter call
     /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
     /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
-    /// at — the aheui `pools[selected]` read.  Unlike the residual-call form (an
+    /// at — the `pools[selected]` read.  Unlike the residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`

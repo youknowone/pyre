@@ -1329,8 +1329,8 @@ pub struct CallControl {
     /// Opt-in receiver-driven method-dispatch families (see
     /// [`TraitFamilyRegistration`]).  Empty for pyre production — its
     /// multi-impl traits keep their classdef-less / fail-loud
-    /// disposition; a consumer (e.g. the aheui census) opts specific
-    /// traits in through [`Self::set_trait_family_registrations`].
+    /// disposition; a consumer opts specific traits in through
+    /// [`Self::set_trait_family_registrations`].
     trait_family_registrations: Vec<TraitFamilyRegistration>,
 
     /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.

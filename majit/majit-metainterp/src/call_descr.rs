@@ -201,7 +201,7 @@ pub fn can_raise_effect_info() -> EffectInfo {
     EffectInfo::const_new(ExtraEffect::CanRaise, OopSpecIndex::None)
 }
 
-/// aheui nursery-alloc residual: `EF_CAN_RAISE` with empty write sets —
+/// Nursery-alloc residual: `EF_CAN_RAISE` with empty write sets —
 /// an allocation publishes a fresh object and writes no field of any
 /// object the trace already cached, so `graphanalyze.py:60
 /// analyze_external_call`'s `bottom_result()` is the honest answer.
