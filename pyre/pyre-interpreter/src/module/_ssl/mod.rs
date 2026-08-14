@@ -2364,6 +2364,26 @@ fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     ]))
 }
 
+/// `enum_certificates(store_name)` and `enum_crls(store_name)` report the
+/// contents of a Windows system certificate store: the first as
+/// (cert_bytes, encoding_type, trust) triples, where `encoding_type` is
+/// `"x509_asn"` or `"pkcs_7_asn"` and `trust` is either a frozenset of
+/// enhanced-key-usage OIDs or `True` for "valid for every purpose"; the second
+/// as (crl_bytes, encoding_type) pairs.
+///
+/// Both stores always read as empty.  Walking one means CertOpenStore plus
+/// CertEnumCertificatesInStore/CertEnumCRLsInStore, and this build links no
+/// wincrypt binding to reach them.  Verification does not depend on it —
+/// `set_default_verify_paths` loads the Windows roots through the platform
+/// certificate provider — but callers that mine the store themselves
+/// (`ssl.enum_certificates`, `wincertstore`) see nothing.  `ssl.py` imports
+/// both names unconditionally on win32, which is why they exist at all.
+#[cfg(windows)]
+fn enum_windows_cert_store(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::baseobjspace::str_utf8_w(args[0])?;
+    Ok(w_list_new(Vec::new()))
+}
+
 fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let path = path_string(args[0])?;
     let cert = native_result(pyre_native::ssl::certificate_decode_file(&path))?;
@@ -2495,6 +2515,22 @@ crate::py_module! {
         "_test_decode_cert" / 1 = test_decode_cert
     },
     extra_init: |ns| {
+        // The Windows-only store readers. They live here rather than in
+        // `functions:` because that table has no per-entry platform guard, and
+        // `ssl.py:257-258` imports both names behind `sys.platform == "win32"`.
+        #[cfg(windows)]
+        for (name, func) in [
+            (
+                "enum_certificates",
+                crate::py_module_fn!("enum_certificates", 1, enum_windows_cert_store),
+            ),
+            (
+                "enum_crls",
+                crate::py_module_fn!("enum_crls", 1, enum_windows_cert_store),
+            ),
+        ] {
+            crate::module_ns_store(ns, name, crate::gateway::with_module("_ssl", func));
+        }
         let ssl_error = crate::builtins::lookup_exc_class("_ssl.SSLError")
             .expect("SSLError installed");
         let ssl_error_dict =
