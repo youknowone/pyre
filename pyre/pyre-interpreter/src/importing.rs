@@ -846,16 +846,21 @@ fn init_string_module(ns: PyObjectRef) {
 /// first `get_config_var` call rather than the `None` the `.get()` readers
 /// take. Pyre runs its mutators without a global interpreter lock, so
 /// `Py_GIL_DISABLED` is 1 and the derived `ABIFLAGS` is `t`; `Py_DEBUG` is 0.
-/// `EXT_SUFFIX` and `SOABI` name pyre's own cpyext ABI (never CPython's ABI
-/// tag) and track `_imp.extension_suffixes()`: a `cpyext` build names one, and
-/// without the feature there is no extension ABI to name, so both keys stay
-/// absent for the `.get()` readers.
+///
+/// `EXT_SUFFIX` and `SOABI` name pyre's own cpyext ABI, never CPython's ABI
+/// tag. They are build metadata rather than a claim that an extension loader
+/// exists: `packaging.tags` derives a wheel's ABI tag from `EXT_SUFFIX` and
+/// fails outright when the key is absent, so every `pip install` needs it.
+/// `_sysconfigdata` publishes the same pair for `_init_posix`, and both read
+/// it from `extension_abi_suffix`, so one interpreter never spells its own
+/// ABI two ways.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
         "config_vars",
         crate::make_builtin_function("config_vars", |_| {
             let vars = pyre_object::w_dict_new();
+            let so_ext = extension_abi_suffix();
             unsafe {
                 for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
                     pyre_object::w_dict_store(
@@ -864,27 +869,36 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
                         pyre_object::w_int_new(value),
                     );
                 }
-                #[cfg(all(
-                    feature = "cpyext",
-                    not(feature = "sandbox"),
-                    any(target_os = "macos", target_os = "linux")
-                ))]
-                {
+                for (name, value) in [
+                    ("SOABI", soabi_tag(&so_ext)),
+                    ("EXT_SUFFIX", so_ext.clone()),
+                ] {
                     pyre_object::w_dict_store(
                         vars,
-                        pyre_object::w_str_new("SOABI"),
-                        pyre_object::w_str_new(crate::cpyext::soabi()),
-                    );
-                    pyre_object::w_dict_store(
-                        vars,
-                        pyre_object::w_str_new("EXT_SUFFIX"),
-                        pyre_object::w_str_new(crate::cpyext::extension_suffix()),
+                        pyre_object::w_str_new(name),
+                        pyre_object::w_str_new(&value),
                     );
                 }
             }
             Ok(vars)
         }),
     );
+}
+
+/// The `SOABI` tag: the ABI half of the extension suffix.
+///
+/// PEP 3149 spells the middle component "ABI tag"-"platform tag"; this is the
+/// ABI tag alone. wheel 0.34.2 depends on the shorter form, so do not widen it
+/// without checking wheel — `pep425tags.get_abi_tag` special-cases CPython.
+fn soabi_tag(so_ext: &str) -> String {
+    so_ext
+        .split('.')
+        .nth(1)
+        .unwrap_or_default()
+        .split('-')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The platform half of the extension ABI, empty where there is none.
@@ -1007,19 +1021,7 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     }
 
     let so_ext = extension_abi_suffix();
-    // SOABI is PEP 3149 compliant, but CPython3 has `so_ext.split('.')[1]`
-    // ("ABI tag"-"platform tag") where this is the ABI tag only.  wheel 0.34.2
-    // depends on this value, so don't make it CPython compliant without
-    // checking wheel: it uses `pep425tags.get_abi_tag` with special handling
-    // for CPython.
-    let soabi = so_ext
-        .split('.')
-        .nth(1)
-        .unwrap_or_default()
-        .split('-')
-        .take(2)
-        .collect::<Vec<_>>()
-        .join("-");
+    let soabi = soabi_tag(&so_ext);
 
     let gnuld = on_path("gcc");
     // Darwin names the architecture in CC and CXX, and `platform.machine()`
