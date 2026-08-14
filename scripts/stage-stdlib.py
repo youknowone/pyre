@@ -30,8 +30,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# package.py:221 `IMPLEMENTATION = 'pypy{}'.format(python_ver)`.
-IMPLEMENTATION = "pyre3.14"
+# package.py:221 `IMPLEMENTATION = 'pypy{}'.format(python_ver)`.  The trailing
+# `t` is the free-threaded ABI flag: `sysconfig` derives `abi_thread` from
+# `Py_GIL_DISABLED` and the posix schemes put it in the directory name.
+IMPLEMENTATION = "pyre3.14t"
 
 
 def ignored(_directory: str, names: list[str]) -> set[str]:

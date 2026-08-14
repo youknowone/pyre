@@ -1216,9 +1216,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // sys.winver — the "major.minor" tag Windows uses for the per-user site
     // directory and the PythonCore registry keys. site.getusersitepackages
-    // reads it to build USER_SITE.
+    // reads it to build USER_SITE.  A build without a global interpreter lock
+    // carries the `t` here, which is how Windows spells what `sys.abiflags`
+    // spells elsewhere.
     #[cfg(windows)]
-    module_ns_store(ns, "winver", w_str_new("3.14"));
+    module_ns_store(ns, "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py:562` builds `pythonapi` out of it with no
@@ -2023,8 +2025,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );
-    // sys.abiflags
-    module_ns_store(ns, "abiflags", w_str_new(""));
+    // sys.abiflags — `t` for a build without a global interpreter lock.  The
+    // attribute is absent on Windows, where the flag is spelled in
+    // `sys.winver` and neither the `nt` scheme nor `site._get_path` reads it;
+    // every reader guards with `hasattr`, so an empty string answers the same.
+    module_ns_store(ns, "abiflags", w_str_new(if cfg!(windows) { "" } else { "t" }));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {

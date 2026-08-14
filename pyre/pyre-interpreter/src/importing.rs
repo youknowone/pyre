@@ -844,11 +844,12 @@ fn init_string_module(ns: PyObjectRef) {
 /// `sysconfig._init_non_posix` SUBSCRIPTS `Py_GIL_DISABLED` and `Py_DEBUG` to
 /// spell `ABIFLAGS`, so on Windows a missing key is a `KeyError` out of the
 /// first `get_config_var` call rather than the `None` the `.get()` readers
-/// take. Both are 0 here — pyre is neither build, which is what an empty
-/// `sys.abiflags` already says. `EXT_SUFFIX` and `SOABI` name pyre's own
-/// cpyext ABI (never CPython's ABI tag) and track `_imp.extension_suffixes()`:
-/// a `cpyext` build names one, and without the feature there is no extension
-/// ABI to name, so both keys stay absent for the `.get()` readers.
+/// take. Pyre runs its mutators without a global interpreter lock, so
+/// `Py_GIL_DISABLED` is 1 and the derived `ABIFLAGS` is `t`; `Py_DEBUG` is 0.
+/// `EXT_SUFFIX` and `SOABI` name pyre's own cpyext ABI (never CPython's ABI
+/// tag) and track `_imp.extension_suffixes()`: a `cpyext` build names one, and
+/// without the feature there is no extension ABI to name, so both keys stay
+/// absent for the `.get()` readers.
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -856,11 +857,11 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
         crate::make_builtin_function("config_vars", |_| {
             let vars = pyre_object::w_dict_new();
             unsafe {
-                for name in ["Py_DEBUG", "Py_GIL_DISABLED"] {
+                for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
                     pyre_object::w_dict_store(
                         vars,
                         pyre_object::w_str_new(name),
-                        pyre_object::w_int_new(0),
+                        pyre_object::w_int_new(value),
                     );
                 }
                 #[cfg(all(
@@ -1070,7 +1071,12 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()));
 
     let vars = pyre_object::w_dict_new();
-    store_str(vars, "ABIFLAGS", "");
+    // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
+    // The lower-case `abiflags` that forms the include and site-packages
+    // directory names is a separate variable, read from `sys.abiflags`
+    // (`sysconfig:545`), and stays empty: the release tree has no `t` suffix
+    // on its stdlib directory for `site.py:409` to find.
+    store_str(vars, "ABIFLAGS", "t");
     store_str(vars, "SOABI", &soabi);
     // Deprecated in Python 3, kept for backward compatibility.
     store_str(vars, "SO", &so_ext);
@@ -1090,11 +1096,11 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_str(vars, "EXE", "");
     store_str(vars, "VERSION", "3.14");
     store_str(vars, "LDVERSION", "3.14");
-    // cpyext never uses Py_DEBUG, and pyre is neither a debug nor a
-    // free-threaded build.  Py_ENABLE_SHARED at 1 would add a python shared
+    // cpyext never uses Py_DEBUG.  Pyre runs its mutators without a global
+    // interpreter lock.  Py_ENABLE_SHARED at 1 would add a python shared
     // object to link lines as `-lpython3.x`.
     store_int(vars, "Py_DEBUG", 0);
-    store_int(vars, "Py_GIL_DISABLED", 0);
+    store_int(vars, "Py_GIL_DISABLED", 1);
     store_int(vars, "Py_ENABLE_SHARED", 0);
     // Pyre currently has neither a CPython-compatible C API nor a separately
     // linkable runtime library.  Keep the build ABI metadata above for wheel
@@ -1755,7 +1761,7 @@ pub(crate) struct StartupPathConfig {
     pub base_prefix: PathBuf,
     /// Bootstrap search entries in PyPy's order.  A source checkout keeps
     /// `lib_pypy` before `lib-python/3`; an installed tree has one merged
-    /// `lib/pyre3.14` entry.
+    /// `lib/pyre3.14t` entry.
     pub stdlib_paths: Vec<PathBuf>,
     /// The language stdlib root (the entry containing `os.py` / `site.py`).
     /// This is exposed as `sys._stdlib_dir` and is deliberately distinct from
@@ -1887,7 +1893,7 @@ fn find_invoked_executable() -> PathBuf {
 }
 
 /// Recognize both PyPy-style source trees (`lib-python/3`) and the packaged
-/// Pyre layout (`lib/pyre3.14`).  The latter is the installation shape pip and
+/// Pyre layout (`lib/pyre3.14t`).  The latter is the installation shape pip and
 /// venv will consume; accepting the former keeps the repository executable as
 /// the untranslated/development oracle, matching PyPy's two
 /// `compute_stdlib_path_*` arms.
@@ -1924,7 +1930,7 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
     // `compute_stdlib_path`: release packaging merges the two source trees
     // into one implementation-version directory.
     for packaged in [
-        prefix.join("lib").join("pyre3.14"),
+        prefix.join("lib").join("pyre3.14t"),
         // cargo-dist's Homebrew formula installs non-binary archive contents
         // into `pkgshare` (`<keg>/share/pyrex`).  This is still a single
         // interpreter-owned prefix, analogous to PyPy's macOS bundle search
@@ -1933,7 +1939,7 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
             .join("share")
             .join("pyrex")
             .join("lib")
-            .join("pyre3.14"),
+            .join("pyre3.14t"),
     ] {
         if packaged.join("site.py").is_file() {
             let mut paths = vec![packaged.clone()];
@@ -2055,7 +2061,7 @@ fn prefix_from_stdlib(stdlib: &Path) -> PathBuf {
         .is_some_and(|name| name == "lib")
     {
         // cargo-dist Homebrew data lives at
-        // `<keg>/share/pyrex/lib/pyre3.14`, while the executable still lives
+        // `<keg>/share/pyrex/lib/pyre3.14t`, while the executable still lives
         // at `<keg>/bin/pyre`.  An explicit PYRE_STDLIB pointing at that data
         // must recover the keg, not claim `<keg>/share/pyrex` as sys.prefix.
         if let Some(pyre_share) = parent.and_then(Path::parent)
@@ -5273,12 +5279,12 @@ mod tests {
             PathBuf::from("/src/pyre")
         );
         assert_eq!(
-            prefix_from_stdlib(Path::new("/opt/pyre/lib/pyre3.14")),
+            prefix_from_stdlib(Path::new("/opt/pyre/lib/pyre3.14t")),
             PathBuf::from("/opt/pyre")
         );
         assert_eq!(
             prefix_from_stdlib(Path::new(
-                "/opt/homebrew/Cellar/pyrex/0.0.2/share/pyrex/lib/pyre3.14"
+                "/opt/homebrew/Cellar/pyrex/0.0.2/share/pyrex/lib/pyre3.14t"
             )),
             PathBuf::from("/opt/homebrew/Cellar/pyrex/0.0.2")
         );
@@ -5296,7 +5302,7 @@ mod tests {
     #[test]
     fn stdlib_layout_prefers_the_versioned_zip_without_claiming_a_directory() {
         let tree = tempfile::tempdir().unwrap();
-        let packaged = tree.path().join("lib/pyre3.14");
+        let packaged = tree.path().join("lib/pyre3.14t");
         std::fs::create_dir_all(&packaged).unwrap();
         std::fs::write(packaged.join("site.py"), "").unwrap();
         let zip = tree.path().join("python314.zip");
@@ -5317,7 +5323,7 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         let base = tree.path().join("base");
         let base_executable = base.join("bin/pyre");
-        let base_stdlib = base.join("lib/pyre3.14");
+        let base_stdlib = base.join("lib/pyre3.14t");
         std::fs::create_dir_all(base_executable.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&base_stdlib).unwrap();
         std::fs::write(&base_executable, "").unwrap();
