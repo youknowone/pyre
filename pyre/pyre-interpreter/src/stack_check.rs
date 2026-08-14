@@ -101,14 +101,14 @@ pub const MAX_STACK_SIZE: usize = 48 << 18;
 /// ceiling.  That covers the measured guard-resume cost at the default limit
 /// (and the 90% lower bound at 2000 used by the parity fixture) without making
 /// `support.infinite_recursion(20_000)` consume the much larger interpreter
-/// thread before its native guard fires.  At 8 MiB the clamp cut a thread's
+/// stack before its native guard fires.  At 8 MiB the clamp cut a thread's
 /// budget below what the *default* limit is worth, so the guard, not the limit,
 /// decided how deep a thread could recurse; at 64 MiB highly nested pure-Python
 /// decoders spent minutes below the clamp and every default worker reserved an
 /// excessive amount of address space.
 ///
-/// The interpreter thread announces this too, though its own stack is much
-/// larger (`pyrex::INTERPRETER_THREAD_STACK_SIZE`).  `stack_length` is
+/// The thread the interpreter starts on announces this too, though the stack
+/// it runs on is much larger (`pyrex::main_entry`).  `stack_length` is
 /// process-global — the JIT's inline probe reads its address as an immediate
 /// (`pyre_stack_get_length_adr`) — so whatever a thread stores there is what
 /// every other thread's fast path reads until one of them takes the slow
@@ -293,6 +293,45 @@ fn platform_stack_size() -> usize {
 
 #[cfg(not(unix))]
 fn platform_stack_size() -> usize {
+    0
+}
+
+/// Raise the soft `RLIMIT_STACK` towards `size`, returning the stack the
+/// thread that started the process can now grow to.
+///
+/// That thread's stack is not sized once at exec: the kernel grows it on
+/// demand up to the current soft limit, so raising the limit is what makes
+/// room for the interpreter.  The request is clamped to the hard limit rather
+/// than abandoned when it does not fit — darwin's stops at 65520 KiB, a
+/// hair under 64 MiB, and refusing there would leave the interpreter on the
+/// default 8 MiB.  `usize::MAX` reports an unlimited stack, which is what
+/// [`platform_stack_size`] declines to describe.
+#[cfg(unix)]
+pub fn raise_main_thread_stack_limit(size: usize) -> usize {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return usize::MAX;
+    }
+    let mut wanted = size as libc::rlim_t;
+    if limit.rlim_max != libc::RLIM_INFINITY {
+        wanted = wanted.min(limit.rlim_max);
+    }
+    if wanted > limit.rlim_cur {
+        limit.rlim_cur = wanted;
+        if unsafe { libc::setrlimit(libc::RLIMIT_STACK, &limit) } != 0 {
+            // Keep describing what the process already had.
+            unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) };
+        }
+    }
+    usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX)
+}
+
+#[cfg(not(unix))]
+pub fn raise_main_thread_stack_limit(_size: usize) -> usize {
     0
 }
 

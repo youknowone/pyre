@@ -382,12 +382,23 @@ fn read_stdin_source() -> std::io::Result<String> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin not utf-8"))
 }
 
-/// Native stack for the interpreter thread spawned by [`main_entry`].
-///
-/// Well above the byte budget `sys.setrecursionlimit` can buy
-/// (`stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE`): `stack_check` gates
-/// Python call levels, and the native recursion it does not gate — nested
-/// container `repr`, the parser, GC tracing — draws on the rest.
+// Native stack the interpreter runs on. Both figures sit well above the byte
+// budget `sys.setrecursionlimit` can buy
+// (`stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE`): `stack_check` gates
+// Python call levels, and the native recursion it does not gate — nested
+// container `repr`, the parser, GC tracing — draws on the rest. The two entry
+// shapes below want it in different currencies.
+
+/// Soft `RLIMIT_STACK` the interpreter asks for when it runs on the thread
+/// that started the process, whose stack the kernel grows on demand rather
+/// than reserving up front.  64 MiB is as far as that goes: linux keeps the
+/// mmap region a minimum of 128 MiB below the stack however high the limit is
+/// set, so a larger request would only push the stack into it.
+#[cfg(all(target_os = "linux", not(feature = "sandbox")))]
+const INTERPRETER_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Stack reserved outright for a spawned interpreter thread.
+#[cfg(not(any(target_os = "linux", feature = "sandbox")))]
 const INTERPRETER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 pub fn main_entry(binary_name: &'static str) {
@@ -408,36 +419,63 @@ pub fn main_entry(binary_name: &'static str) {
         post_run_diagnostics();
     }
 
+    // `pypy_main_function` runs the interpreter on the thread that started the
+    // process, and a tracer attached to that process follows that thread alone
+    // unless it is asked to follow clones — so an interpreter on a thread of
+    // its own makes the program's whole syscall stream invisible to `strace`.
+    // Staying there needs a stack far past the ~8 MiB a process starts with,
+    // and linux is where that is available: the kernel grows that stack on
+    // demand against the soft `RLIMIT_STACK`, so raising the limit here is
+    // enough. Raising it on darwin moves the limit without moving the guard
+    // the runtime installed from the size the process started with, and the
+    // stack still faults at 8 MiB, so darwin takes a thread of its own below.
+    #[cfg(all(target_os = "linux", not(feature = "sandbox")))]
+    {
+        // Announce the stack this thread is budgeted against, and capture the
+        // base here at the outermost interpreter entry — the same first
+        // statement `_thread`'s worker runs (`module/thread/mod.rs`).
+        //
+        // The announced figure is the shared one, not the stack actually
+        // granted: the budget it sizes lives in a process-global word every
+        // thread's inline probe reads, so one figure has to describe every
+        // Python-running thread. Announcing it takes a stack at least that
+        // large — against a smaller one the guard would sit past the guard
+        // page and the interpreter would fault where it should raise
+        // RecursionError — so a host that grants less hands the question back
+        // to `getrlimit`.
+        let granted =
+            pyre_interpreter::stack_check::raise_main_thread_stack_limit(INTERPRETER_STACK_SIZE);
+        let budget = if granted >= pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
+        {
+            pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
+        } else {
+            0
+        };
+        pyre_interpreter::stack_check::configure_current_thread_stack_size(budget);
+        real_main(binary_name);
+        post_run_diagnostics();
+    }
+
     // Block async signals on this (the process's original) thread so the
     // kernel delivers process-directed signals to the interpreter thread
     // spawned below, where they can interrupt blocking syscalls.  The
     // interpreter thread inherits this mask and unblocks them at the top of
     // `real_main`.
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(not(any(target_os = "linux", feature = "sandbox")))]
     {
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         std::thread::Builder::new()
             .stack_size(INTERPRETER_THREAD_STACK_SIZE)
             .spawn(|| {
-                // Same first statement `_thread`'s worker runs
-                // (`module/thread/mod.rs`): announce the stack this thread is
-                // budgeted against, and capture the base here at the outermost
-                // interpreter entry. Left out, `effective_stack_length` falls
-                // back to `getrlimit(RLIMIT_STACK)`, which describes the
-                // process's original thread and not this one, and the byte
-                // guard — not the recursion limit — ends up deciding how deep
-                // Python can recurse.
-                //
-                // The announced figure is the shared one, not
-                // INTERPRETER_THREAD_STACK_SIZE: the budget it sizes is stored
-                // in a process-global word every thread's inline probe reads.
+                // See the announcement note above; the same reasoning applies
+                // to this thread, whose own stack is larger still.
                 pyre_interpreter::stack_check::configure_current_thread_stack_size(
                     pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
                 );
                 real_main(binary_name);
                 post_run_diagnostics();
             })
-            .expect("spawn main thread")
+            .expect("spawn interpreter thread")
             .join()
             .unwrap();
     }
@@ -462,8 +500,8 @@ fn configure_root_only_jit_stats() {
         .set(print_here)
         .expect("JIT stats process policy configured twice");
     if root_only && !descendant {
-        // main_entry runs before pyre starts its interpreter thread, so no
-        // other thread can concurrently read or mutate the process environment.
+        // main_entry runs before pyre starts any thread, so no other thread
+        // can concurrently read or mutate the process environment.
         unsafe { std::env::set_var("PYRE_MAJIT_STATS_ANCESTOR", "1") };
     }
 }
@@ -494,8 +532,11 @@ fn real_main(binary_name: &str) {
     }
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
-    // alarms.  The sandboxed child does not touch the signal mask.
-    #[cfg(not(feature = "sandbox"))]
+    // alarms.  Only the hosts that spawn an interpreter thread route them;
+    // where the interpreter is the process's original thread the kernel
+    // already delivers them here, and the sandboxed child does not touch the
+    // signal mask at all.
+    #[cfg(not(any(target_os = "linux", feature = "sandbox")))]
     pyre_interpreter::module::signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for the optimizer's silent control-flow panics
     // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in

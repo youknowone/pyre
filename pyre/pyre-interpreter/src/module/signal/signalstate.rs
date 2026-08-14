@@ -303,8 +303,10 @@ mod tests {
 
 // ── interpreter-thread signal routing ──
 //
-// pyre runs the interpreter on a thread spawned by `pyrex::main_entry`
-// (for a large stack), not the process's original thread.  Process-directed
+// On the hosts where `pyrex::main_entry` runs the interpreter on a thread it
+// spawns (for a large stack) rather than the process's original thread —
+// everywhere the original thread's stack cannot be grown — the kernel needs
+// telling which thread the signals belong to.  Process-directed
 // async signals (Ctrl-C `SIGINT`, `alarm` `SIGALRM`, `SIGTERM`, …) are
 // delivered by the kernel to an arbitrary thread that has them unblocked —
 // usually the original thread, which is parked in `join` — so a blocking
