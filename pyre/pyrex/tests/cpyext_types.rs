@@ -17,6 +17,8 @@ import cpyext_types as m
 
 # ── the type itself ────────────────────────────────────────────────────
 assert m.Point.__name__ == 'Point'
+assert m.Point.__module__ == 'cpyext_types'
+assert repr(m.Point.__dict__['norm']) == "<method 'norm' of 'cpyext_types.Point' objects>"
 assert m.Point.__doc__ == 'a two-dimensional point defined in C'
 assert isinstance(m.Point, type)
 assert m.flags() == (1, 1)
@@ -58,7 +60,7 @@ else:
     raise AssertionError('a READONLY member was written')
 
 assert type(m.Point.__dict__['x']).__name__ == 'member_descriptor'
-assert repr(m.Point.__dict__['x']) == "<attribute 'x' of 'Point' objects>"
+assert repr(m.Point.__dict__['x']) == "<member 'x' of 'cpyext_types.Point' objects>"
 assert m.Point.__dict__['x'].__doc__ == 'the abscissa'
 assert m.Point.__dict__['x'].__name__ == 'x'
 assert m.Point.__dict__['x'].__objclass__ is m.Point
@@ -77,7 +79,7 @@ else:
     raise AssertionError('a get-only property was written')
 
 assert type(m.Point.__dict__['total']).__name__ == 'getset_descriptor'
-assert repr(m.Point.__dict__['total']) == "<attribute 'total' of 'Point' objects>"
+assert repr(m.Point.__dict__['total']) == "<attribute 'total' of 'cpyext_types.Point' objects>"
 assert m.Point.__dict__['total'].__doc__ == 'x + y + closure'
 assert m.Point.__dict__['total'].__objclass__ is m.Point
 
@@ -278,6 +280,31 @@ assert p('items', {'a': 1}) == [('a', 1)]
 assert p('getstring', {'a': 1}, 'a') == 1
 assert p('haskey', {'a': 1}, 'a') is True
 assert p('haskey', {'a': 1}, 'z') is False
+
+# ── PyType_FromSpec ────────────────────────────────────────────────────
+assert m.Spec.__name__ == 'Spec'
+assert m.Spec.__doc__ == 'a heap type built from a spec'
+assert m.Spec.__module__ == 'cpyext_types'
+s = m.Spec(21)
+assert repr(s) == 'Spec(21)'
+assert s.code == 21
+assert s.double() == 42
+assert len(s) == 21
+s.code = 4
+assert s.double() == 8
+
+# ── tp_descr_get and tp_descr_set ──────────────────────────────────────
+class Holder:
+    field = m.Doubler()
+
+h = Holder()
+assert h.field == 0
+h.field = 5
+assert h.field == 10
+del h.field
+assert h.field == 0
+# A class access hands the descriptor back.
+assert type(Holder.field) is m.Doubler
 
 # ── capsules ───────────────────────────────────────────────────────────
 capsule = m.PAYLOAD

@@ -359,6 +359,111 @@ PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *type);
 PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 PyAPI_FUNC(PyObject *) PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
 PyAPI_FUNC(PyObject *) PyObject_Init(PyObject *object, PyTypeObject *type);
+
+/* Heap types.  Only single inheritance is supported: a spec naming more than
+   one base is rejected rather than silently losing the rest. */
+typedef struct PyType_Slot {
+    int slot;
+    void *pfunc;
+} PyType_Slot;
+
+typedef struct PyType_Spec {
+    const char *name;
+    int basicsize;
+    int itemsize;
+    unsigned int flags;
+    PyType_Slot *slots;
+} PyType_Spec;
+
+PyAPI_FUNC(PyObject *) PyType_FromSpec(PyType_Spec *spec);
+PyAPI_FUNC(PyObject *) PyType_FromSpecWithBases(PyType_Spec *spec, PyObject *bases);
+PyAPI_FUNC(PyObject *) PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *spec,
+                                                PyObject *bases);
+PyAPI_FUNC(void *) PyType_GetSlot(PyTypeObject *type, int slot);
+PyAPI_FUNC(PyObject *) PyType_GetName(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *type);
+
+#define Py_bf_getbuffer 1
+#define Py_bf_releasebuffer 2
+#define Py_mp_ass_subscript 3
+#define Py_mp_length 4
+#define Py_mp_subscript 5
+#define Py_nb_absolute 6
+#define Py_nb_add 7
+#define Py_nb_and 8
+#define Py_nb_bool 9
+#define Py_nb_divmod 10
+#define Py_nb_float 11
+#define Py_nb_floor_divide 12
+#define Py_nb_index 13
+#define Py_nb_inplace_add 14
+#define Py_nb_inplace_and 15
+#define Py_nb_inplace_floor_divide 16
+#define Py_nb_inplace_lshift 17
+#define Py_nb_inplace_multiply 18
+#define Py_nb_inplace_or 19
+#define Py_nb_inplace_power 20
+#define Py_nb_inplace_remainder 21
+#define Py_nb_inplace_rshift 22
+#define Py_nb_inplace_subtract 23
+#define Py_nb_inplace_true_divide 24
+#define Py_nb_inplace_xor 25
+#define Py_nb_int 26
+#define Py_nb_invert 27
+#define Py_nb_lshift 28
+#define Py_nb_multiply 29
+#define Py_nb_negative 30
+#define Py_nb_or 31
+#define Py_nb_positive 32
+#define Py_nb_power 33
+#define Py_nb_remainder 34
+#define Py_nb_rshift 35
+#define Py_nb_subtract 36
+#define Py_nb_true_divide 37
+#define Py_nb_xor 38
+#define Py_sq_ass_item 39
+#define Py_sq_concat 40
+#define Py_sq_contains 41
+#define Py_sq_inplace_concat 42
+#define Py_sq_inplace_repeat 43
+#define Py_sq_item 44
+#define Py_sq_length 45
+#define Py_sq_repeat 46
+#define Py_tp_alloc 47
+#define Py_tp_base 48
+#define Py_tp_bases 49
+#define Py_tp_call 50
+#define Py_tp_clear 51
+#define Py_tp_dealloc 52
+#define Py_tp_del 53
+#define Py_tp_descr_get 54
+#define Py_tp_descr_set 55
+#define Py_tp_doc 56
+#define Py_tp_getattr 57
+#define Py_tp_getattro 58
+#define Py_tp_getset 59
+#define Py_tp_hash 60
+#define Py_tp_init 61
+#define Py_tp_is_gc 62
+#define Py_tp_iter 63
+#define Py_tp_iternext 64
+#define Py_tp_methods 65
+#define Py_tp_new 66
+#define Py_tp_repr 67
+#define Py_tp_richcompare 68
+#define Py_tp_setattr 69
+#define Py_tp_setattro 70
+#define Py_tp_str 71
+#define Py_tp_traverse 72
+#define Py_tp_members 73
+#define Py_tp_free 74
+#define Py_nb_matrix_multiply 75
+#define Py_nb_inplace_matrix_multiply 76
+#define Py_am_await 77
+#define Py_am_aiter 78
+#define Py_am_anext 79
+#define Py_tp_finalize 80
+#define Py_am_send 81
 #define PyObject_TypeCheck(ob, type) \
     (Py_TYPE(ob) == (type) || PyType_IsSubtype(Py_TYPE(ob), (type)))
 #define PyObject_New(type, tp) ((type *)PyType_GenericAlloc((tp), 0))

@@ -73,7 +73,11 @@ the header below.
   `PyObject_Init`, `PyType_IsSubtype` / `PyType_GetFlags` / `PyObject_TypeCheck`,
   the `tp_methods` / `tp_members` / `tp_getset` descriptors with `__objclass__`,
   and wrappers for `tp_new`, `tp_init`, `tp_repr`, `tp_str`, `tp_hash`,
-  `tp_call`, `tp_iter`, `tp_iternext` and `tp_richcompare`;
+  `tp_call`, `tp_iter`, `tp_iternext`, `tp_richcompare`, `tp_getattro`,
+  `tp_setattro`, `tp_descr_get` and `tp_descr_set`;
+- heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
+  `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
+  `PyType_GetQualName`, with the whole `typeslots.h` identifier set;
 - the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
   becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
@@ -109,6 +113,8 @@ Known divergences, each documented at its definition:
   returns;
 - `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
   leaving them NULL as CPython does;
+- a type is built on a single base, so a `PyType_Spec` naming more than one is
+  rejected rather than silently losing the rest;
 - an instance of a C-defined type is immortal, because its mirror block *is* its
   storage: freeing the block when C drops its last reference would destroy
   fields the interpreter object still exposes. Such an instance is therefore
@@ -120,7 +126,7 @@ Known divergences, each documented at its definition:
 
 5. `tp_dealloc`, `tp_traverse` and `tp_clear` on top of a `rawrefcount` dead
    queue; `tp_as_async` and `tp_as_buffer`, which are declared but not read;
-   heap types (`PyType_FromSpec`); and the remaining generated API;
+   and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged

@@ -446,7 +446,7 @@ fn method_descriptor_type() -> PyObjectRef {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            crate::make_builtin_function_with_arity("__repr__", descr_repr, 1),
+            crate::make_builtin_function_with_arity("__repr__", method_descr_repr, 1),
         );
     })
 }
@@ -466,7 +466,7 @@ fn member_descriptor_type() -> PyObjectRef {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            crate::make_builtin_function_with_arity("__repr__", descr_repr, 1),
+            crate::make_builtin_function_with_arity("__repr__", member_descr_repr, 1),
         );
     })
 }
@@ -486,7 +486,7 @@ fn getset_descriptor_type() -> PyObjectRef {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            crate::make_builtin_function_with_arity("__repr__", descr_repr, 1),
+            crate::make_builtin_function_with_arity("__repr__", getset_descr_repr, 1),
         );
     })
 }
@@ -498,16 +498,30 @@ fn descriptor_name(carrier: PyObjectRef) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-fn descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `descrobject.c` spells each kind differently: `method`, `member` and
+/// `attribute` for the getset.
+fn descr_repr(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
     let owner = carrier_get(carrier, OBJCLASS_KEY)
         .filter(|&owner| !owner.is_null())
         .map(|owner| unsafe { pyre_object::typeobject::w_type_get_name(owner) }.to_string())
         .unwrap_or_else(|| "?".to_string());
     Ok(pyre_object::w_str_new(&format!(
-        "<attribute '{}' of '{owner}' objects>",
+        "<{kind} '{}' of '{owner}' objects>",
         descriptor_name(carrier)
     )))
+}
+
+fn method_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    descr_repr(args, "method")
+}
+
+fn member_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    descr_repr(args, "member")
+}
+
+fn getset_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    descr_repr(args, "attribute")
 }
 
 /// The receiver a `__get__(self, instance, owner)` call names, or `None` when
@@ -1970,7 +1984,197 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     if unsafe { !(*tp).tp_richcompare.is_null() } {
         install_comparisons(ns);
     }
+    if unsafe { !(*tp).tp_getattro.is_null() } {
+        store(
+            ns,
+            "__getattribute__",
+            crate::make_builtin_function_with_arity("__getattribute__", slot_getattro, 2),
+        );
+    }
+    if unsafe { !(*tp).tp_setattro.is_null() } {
+        store(
+            ns,
+            "__setattr__",
+            crate::make_builtin_function_with_arity("__setattr__", slot_setattro, 3),
+        );
+        store(
+            ns,
+            "__delattr__",
+            crate::make_builtin_function_with_arity("__delattr__", slot_delattro, 2),
+        );
+    }
+    if unsafe { !(*tp).tp_descr_get.is_null() } {
+        store(
+            ns,
+            "__get__",
+            crate::make_builtin_function_with_arity("__get__", slot_descr_get, 3),
+        );
+    }
+    if unsafe { !(*tp).tp_descr_set.is_null() } {
+        store(
+            ns,
+            "__set__",
+            crate::make_builtin_function_with_arity("__set__", slot_descr_set, 3),
+        );
+        store(
+            ns,
+            "__delete__",
+            crate::make_builtin_function_with_arity("__delete__", slot_descr_delete, 2),
+        );
+    }
     install_protocols(ns, tp);
+}
+
+// ── `tp_getattro`, `tp_setattro` and the descriptor slots ───────────────
+
+fn slot_getattro(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], |tp| unsafe { (*tp).tp_getattro });
+    if slot.is_null() {
+        return Err(crate::PyError::type_error(
+            "cpyext object has no attribute access",
+        ));
+    }
+    call_binary(slot, args[0], args[1])
+}
+
+/// `tp_setattro` with a NULL value is the deletion, as it is for item
+/// assignment.
+fn set_attribute(
+    w_self: PyObjectRef,
+    name: PyObjectRef,
+    value: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(w_self, |tp| unsafe { (*tp).tp_setattro });
+    if slot.is_null() {
+        return Err(crate::PyError::type_error(
+            "cpyext object does not support attribute assignment",
+        ));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    roots.pin_root(name);
+    roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    let receiver = pyobject::make_ref(reload(0));
+    let key = pyobject::make_ref(reload(1));
+    let item = match value {
+        Some(_) => pyobject::make_ref(reload(2)),
+        None => std::ptr::null_mut(),
+    };
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject, *mut CPyObject) -> c_int =
+            std::mem::transmute(slot);
+        call(receiver, key, item)
+    };
+    unsafe {
+        pyobject::decref(receiver);
+        pyobject::decref(key);
+        pyobject::decref(item);
+    }
+    if result != 0 {
+        return Err(pending_or(
+            "a cpyext attribute assignment failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn slot_setattro(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    set_attribute(args[0], args[1], Some(args[2]))
+}
+
+fn slot_delattro(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    set_attribute(args[0], args[1], None)
+}
+
+/// `tp_descr_get(self, obj, type)` — `obj` is NULL for a class access.
+fn slot_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], |tp| unsafe { (*tp).tp_descr_get });
+    if slot.is_null() {
+        return Ok(args[0]);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(args[0]);
+    roots.pin_root(args[1]);
+    roots.pin_root(args[2]);
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    let none = |value: PyObjectRef| unsafe { pyre_object::is_none(value) };
+    let descriptor = pyobject::make_ref(reload(0));
+    let instance = if none(reload(1)) {
+        std::ptr::null_mut()
+    } else {
+        pyobject::make_ref(reload(1))
+    };
+    let owner = if none(reload(2)) {
+        std::ptr::null_mut()
+    } else {
+        pyobject::make_ref(reload(2))
+    };
+    let result = unsafe {
+        let call: unsafe extern "C" fn(
+            *mut CPyObject,
+            *mut CPyObject,
+            *mut CPyObject,
+        ) -> *mut CPyObject = std::mem::transmute(slot);
+        call(descriptor, instance, owner)
+    };
+    unsafe {
+        pyobject::decref(descriptor);
+        pyobject::decref(instance);
+        pyobject::decref(owner);
+    }
+    super::from_c_result(result)
+}
+
+fn descr_assign(
+    descriptor: PyObjectRef,
+    instance: PyObjectRef,
+    value: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(descriptor, |tp| unsafe { (*tp).tp_descr_set });
+    if slot.is_null() {
+        return Err(crate::PyError::attribute_error(
+            "cpyext descriptor does not support assignment",
+        ));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(descriptor);
+    roots.pin_root(instance);
+    roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    let owner = pyobject::make_ref(reload(0));
+    let target = pyobject::make_ref(reload(1));
+    let item = match value {
+        Some(_) => pyobject::make_ref(reload(2)),
+        None => std::ptr::null_mut(),
+    };
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject, *mut CPyObject) -> c_int =
+            std::mem::transmute(slot);
+        call(owner, target, item)
+    };
+    unsafe {
+        pyobject::decref(owner);
+        pyobject::decref(target);
+        pyobject::decref(item);
+    }
+    if result != 0 {
+        return Err(pending_or(
+            "a cpyext descriptor assignment failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn slot_descr_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    descr_assign(args[0], args[1], Some(args[2]))
+}
+
+fn slot_descr_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    descr_assign(args[0], args[1], None)
 }
 
 /// Give every descriptor the class it was defined on.
@@ -2083,17 +2287,15 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
             "PyType_Ready(): the type has no tp_name",
         ));
     }
-    let short = qualified
-        .rsplit('.')
-        .next()
-        .unwrap_or(&qualified)
-        .to_string();
+    // The qualified name is handed on whole: `make_builtin_type_with_base`
+    // publishes the leading component as the type's `__module__`, which is
+    // where `tp_name`'s prefix is meant to end up.
 
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(w_base);
     let w_type = crate::typedef::make_builtin_type_with_base(
-        &short,
+        &qualified,
         |ns| install_namespace(ns, tp),
         pyre_object::gc_roots::shadow_stack_get(base_slot),
     );
@@ -2135,6 +2337,439 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut CPyTypeObject) -> c_int {
             -1
         }
     }
+}
+
+// ── heap types: `PyType_FromSpec` ───────────────────────────────────────
+
+/// One `(slot id, function)` pair of a [`CPyTypeSpec`].
+#[repr(C)]
+pub struct CPyTypeSlot {
+    pub slot: c_int,
+    pub pfunc: *mut c_void,
+}
+
+/// `PyType_Spec`.
+#[repr(C)]
+pub struct CPyTypeSpec {
+    pub name: *const c_char,
+    pub basicsize: c_int,
+    pub itemsize: c_int,
+    pub flags: c_uint,
+    pub slots: *mut CPyTypeSlot,
+}
+
+/// The `typeslots.h` identifiers.
+mod slot_id {
+    use std::ffi::c_int;
+
+    pub const BF_GETBUFFER: c_int = 1;
+    pub const BF_RELEASEBUFFER: c_int = 2;
+    pub const MP_ASS_SUBSCRIPT: c_int = 3;
+    pub const MP_LENGTH: c_int = 4;
+    pub const MP_SUBSCRIPT: c_int = 5;
+    pub const NB_ABSOLUTE: c_int = 6;
+    pub const NB_ADD: c_int = 7;
+    pub const NB_AND: c_int = 8;
+    pub const NB_BOOL: c_int = 9;
+    pub const NB_DIVMOD: c_int = 10;
+    pub const NB_FLOAT: c_int = 11;
+    pub const NB_FLOOR_DIVIDE: c_int = 12;
+    pub const NB_INDEX: c_int = 13;
+    pub const NB_INPLACE_ADD: c_int = 14;
+    pub const NB_INPLACE_AND: c_int = 15;
+    pub const NB_INPLACE_FLOOR_DIVIDE: c_int = 16;
+    pub const NB_INPLACE_LSHIFT: c_int = 17;
+    pub const NB_INPLACE_MULTIPLY: c_int = 18;
+    pub const NB_INPLACE_OR: c_int = 19;
+    pub const NB_INPLACE_POWER: c_int = 20;
+    pub const NB_INPLACE_REMAINDER: c_int = 21;
+    pub const NB_INPLACE_RSHIFT: c_int = 22;
+    pub const NB_INPLACE_SUBTRACT: c_int = 23;
+    pub const NB_INPLACE_TRUE_DIVIDE: c_int = 24;
+    pub const NB_INPLACE_XOR: c_int = 25;
+    pub const NB_INT: c_int = 26;
+    pub const NB_INVERT: c_int = 27;
+    pub const NB_LSHIFT: c_int = 28;
+    pub const NB_MULTIPLY: c_int = 29;
+    pub const NB_NEGATIVE: c_int = 30;
+    pub const NB_OR: c_int = 31;
+    pub const NB_POSITIVE: c_int = 32;
+    pub const NB_POWER: c_int = 33;
+    pub const NB_REMAINDER: c_int = 34;
+    pub const NB_RSHIFT: c_int = 35;
+    pub const NB_SUBTRACT: c_int = 36;
+    pub const NB_TRUE_DIVIDE: c_int = 37;
+    pub const NB_XOR: c_int = 38;
+    pub const SQ_ASS_ITEM: c_int = 39;
+    pub const SQ_CONCAT: c_int = 40;
+    pub const SQ_CONTAINS: c_int = 41;
+    pub const SQ_INPLACE_CONCAT: c_int = 42;
+    pub const SQ_INPLACE_REPEAT: c_int = 43;
+    pub const SQ_ITEM: c_int = 44;
+    pub const SQ_LENGTH: c_int = 45;
+    pub const SQ_REPEAT: c_int = 46;
+    pub const TP_ALLOC: c_int = 47;
+    pub const TP_BASE: c_int = 48;
+    pub const TP_BASES: c_int = 49;
+    pub const TP_CALL: c_int = 50;
+    pub const TP_CLEAR: c_int = 51;
+    pub const TP_DEALLOC: c_int = 52;
+    pub const TP_DEL: c_int = 53;
+    pub const TP_DESCR_GET: c_int = 54;
+    pub const TP_DESCR_SET: c_int = 55;
+    pub const TP_DOC: c_int = 56;
+    pub const TP_GETATTR: c_int = 57;
+    pub const TP_GETATTRO: c_int = 58;
+    pub const TP_GETSET: c_int = 59;
+    pub const TP_HASH: c_int = 60;
+    pub const TP_INIT: c_int = 61;
+    pub const TP_IS_GC: c_int = 62;
+    pub const TP_ITER: c_int = 63;
+    pub const TP_ITERNEXT: c_int = 64;
+    pub const TP_METHODS: c_int = 65;
+    pub const TP_NEW: c_int = 66;
+    pub const TP_REPR: c_int = 67;
+    pub const TP_RICHCOMPARE: c_int = 68;
+    pub const TP_SETATTR: c_int = 69;
+    pub const TP_SETATTRO: c_int = 70;
+    pub const TP_STR: c_int = 71;
+    pub const TP_TRAVERSE: c_int = 72;
+    pub const TP_MEMBERS: c_int = 73;
+    pub const TP_FREE: c_int = 74;
+    pub const NB_MATRIX_MULTIPLY: c_int = 75;
+    pub const NB_INPLACE_MATRIX_MULTIPLY: c_int = 76;
+    pub const AM_AWAIT: c_int = 77;
+    pub const AM_AITER: c_int = 78;
+    pub const AM_ANEXT: c_int = 79;
+    pub const TP_FINALIZE: c_int = 80;
+    pub const AM_SEND: c_int = 81;
+}
+
+/// Allocate a zeroed sub-table on first use.  A heap type is immortal for the
+/// same reason its instances are, so the leak is the intended lifetime.
+macro_rules! table_of {
+    ($tp:expr, $field:ident, $shape:ty) => {{
+        unsafe {
+            if (*$tp).$field.is_null() {
+                (*$tp).$field = Box::leak(Box::new(std::mem::zeroed::<$shape>()));
+            }
+            (*$tp).$field
+        }
+    }};
+}
+
+fn apply_slot(tp: *mut CPyTypeObject, id: c_int, value: *mut c_void) -> Result<(), crate::PyError> {
+    use slot_id::*;
+    let function = value as *const c_void;
+    macro_rules! number {
+        ($field:ident) => {{
+            let table = table_of!(tp, tp_as_number, CPyNumberMethods);
+            unsafe { (*table).$field = function };
+        }};
+    }
+    macro_rules! sequence {
+        ($field:ident) => {{
+            let table = table_of!(tp, tp_as_sequence, CPySequenceMethods);
+            unsafe { (*table).$field = function };
+        }};
+    }
+    macro_rules! mapping {
+        ($field:ident) => {{
+            let table = table_of!(tp, tp_as_mapping, CPyMappingMethods);
+            unsafe { (*table).$field = function };
+        }};
+    }
+    macro_rules! asynchronous {
+        ($field:ident) => {{
+            let table = table_of!(tp, tp_as_async, CPyAsyncMethods);
+            unsafe { (*table).$field = function };
+        }};
+    }
+    macro_rules! buffer {
+        ($field:ident) => {{
+            let table = table_of!(tp, tp_as_buffer, CPyBufferProcs);
+            unsafe { (*table).$field = function };
+        }};
+    }
+    macro_rules! own {
+        ($field:ident, $shape:ty) => {
+            unsafe { (*tp).$field = value as $shape }
+        };
+    }
+
+    match id {
+        BF_GETBUFFER => buffer!(bf_getbuffer),
+        BF_RELEASEBUFFER => buffer!(bf_releasebuffer),
+        MP_ASS_SUBSCRIPT => mapping!(mp_ass_subscript),
+        MP_LENGTH => mapping!(mp_length),
+        MP_SUBSCRIPT => mapping!(mp_subscript),
+        NB_ABSOLUTE => number!(nb_absolute),
+        NB_ADD => number!(nb_add),
+        NB_AND => number!(nb_and),
+        NB_BOOL => number!(nb_bool),
+        NB_DIVMOD => number!(nb_divmod),
+        NB_FLOAT => number!(nb_float),
+        NB_FLOOR_DIVIDE => number!(nb_floor_divide),
+        NB_INDEX => number!(nb_index),
+        NB_INPLACE_ADD => number!(nb_inplace_add),
+        NB_INPLACE_AND => number!(nb_inplace_and),
+        NB_INPLACE_FLOOR_DIVIDE => number!(nb_inplace_floor_divide),
+        NB_INPLACE_LSHIFT => number!(nb_inplace_lshift),
+        NB_INPLACE_MULTIPLY => number!(nb_inplace_multiply),
+        NB_INPLACE_OR => number!(nb_inplace_or),
+        NB_INPLACE_POWER => number!(nb_inplace_power),
+        NB_INPLACE_REMAINDER => number!(nb_inplace_remainder),
+        NB_INPLACE_RSHIFT => number!(nb_inplace_rshift),
+        NB_INPLACE_SUBTRACT => number!(nb_inplace_subtract),
+        NB_INPLACE_TRUE_DIVIDE => number!(nb_inplace_true_divide),
+        NB_INPLACE_XOR => number!(nb_inplace_xor),
+        NB_INT => number!(nb_int),
+        NB_INVERT => number!(nb_invert),
+        NB_LSHIFT => number!(nb_lshift),
+        NB_MULTIPLY => number!(nb_multiply),
+        NB_NEGATIVE => number!(nb_negative),
+        NB_OR => number!(nb_or),
+        NB_POSITIVE => number!(nb_positive),
+        NB_POWER => number!(nb_power),
+        NB_REMAINDER => number!(nb_remainder),
+        NB_RSHIFT => number!(nb_rshift),
+        NB_SUBTRACT => number!(nb_subtract),
+        NB_TRUE_DIVIDE => number!(nb_true_divide),
+        NB_XOR => number!(nb_xor),
+        NB_MATRIX_MULTIPLY => number!(nb_matrix_multiply),
+        NB_INPLACE_MATRIX_MULTIPLY => number!(nb_inplace_matrix_multiply),
+        SQ_ASS_ITEM => sequence!(sq_ass_item),
+        SQ_CONCAT => sequence!(sq_concat),
+        SQ_CONTAINS => sequence!(sq_contains),
+        SQ_INPLACE_CONCAT => sequence!(sq_inplace_concat),
+        SQ_INPLACE_REPEAT => sequence!(sq_inplace_repeat),
+        SQ_ITEM => sequence!(sq_item),
+        SQ_LENGTH => sequence!(sq_length),
+        SQ_REPEAT => sequence!(sq_repeat),
+        AM_AWAIT => asynchronous!(am_await),
+        AM_AITER => asynchronous!(am_aiter),
+        AM_ANEXT => asynchronous!(am_anext),
+        AM_SEND => asynchronous!(am_send),
+        TP_ALLOC => own!(tp_alloc, *const c_void),
+        TP_BASE => own!(tp_base, *mut CPyTypeObject),
+        TP_CALL => own!(tp_call, *const c_void),
+        TP_CLEAR => own!(tp_clear, *const c_void),
+        TP_DEALLOC => own!(tp_dealloc, *const c_void),
+        TP_DEL => own!(tp_del, *const c_void),
+        TP_DESCR_GET => own!(tp_descr_get, *const c_void),
+        TP_DESCR_SET => own!(tp_descr_set, *const c_void),
+        TP_DOC => own!(tp_doc, *const c_char),
+        TP_GETATTR => own!(tp_getattr, *const c_void),
+        TP_GETATTRO => own!(tp_getattro, *const c_void),
+        TP_GETSET => own!(tp_getset, *mut CPyGetSetDef),
+        TP_HASH => own!(tp_hash, *const c_void),
+        TP_INIT => own!(tp_init, *const c_void),
+        TP_IS_GC => own!(tp_is_gc, *const c_void),
+        TP_ITER => own!(tp_iter, *const c_void),
+        TP_ITERNEXT => own!(tp_iternext, *const c_void),
+        TP_METHODS => own!(tp_methods, *mut super::methodobject::CPyMethodDef),
+        TP_MEMBERS => own!(tp_members, *mut CPyMemberDef),
+        TP_NEW => own!(tp_new, *const c_void),
+        TP_REPR => own!(tp_repr, *const c_void),
+        TP_RICHCOMPARE => own!(tp_richcompare, *const c_void),
+        TP_SETATTR => own!(tp_setattr, *const c_void),
+        TP_SETATTRO => own!(tp_setattro, *const c_void),
+        TP_STR => own!(tp_str, *const c_void),
+        TP_TRAVERSE => own!(tp_traverse, *const c_void),
+        TP_FINALIZE => own!(tp_finalize, *const c_void),
+        TP_FREE => own!(tp_free, *const c_void),
+        // `Py_tp_bases` is a tuple, which the caller may also pass through
+        // `PyType_FromSpecWithBases`; both land in `single_base`.
+        TP_BASES => {
+            let bases = unsafe { pyobject::from_ref(value as *mut CPyObject) };
+            unsafe { (*tp).tp_base = single_base(bases)? };
+        }
+        other => {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("PyType_FromSpec() does not support slot {other}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The one base pyre can build a type on.
+///
+/// `make_builtin_type_with_base` takes a single base, so a spec naming more
+/// than one is rejected rather than silently losing the rest.
+fn single_base(bases: PyObjectRef) -> Result<*mut CPyTypeObject, crate::PyError> {
+    if bases.is_null() {
+        return Ok(std::ptr::null_mut());
+    }
+    let items: Vec<PyObjectRef> = if unsafe { pyre_object::is_tuple(bases) } {
+        unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(bases) }
+    } else {
+        vec![bases]
+    };
+    match items.len() {
+        0 => Ok(std::ptr::null_mut()),
+        1 => Ok(pyobject::make_ref(items[0]) as *mut CPyTypeObject),
+        _ => Err(crate::PyError::type_error(
+            "PyType_FromSpec() with more than one base is not supported yet",
+        )),
+    }
+}
+
+fn from_spec(
+    spec: *mut CPyTypeSpec,
+    bases: *mut CPyObject,
+    module: *mut CPyObject,
+) -> Result<PyObjectRef, crate::PyError> {
+    if spec.is_null() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyType_FromSpec(): NULL spec",
+        ));
+    }
+    // The type object and its tables outlive the call for good: a type is
+    // immortal here, so the allocation is deliberately leaked.
+    let tp: *mut CPyTypeObject = Box::leak(Box::new(immortal_type()));
+    unsafe {
+        (*tp).tp_name = (*spec).name;
+        (*tp).tp_basicsize = (*spec).basicsize as isize;
+        (*tp).tp_itemsize = (*spec).itemsize as isize;
+        (*tp).tp_flags = (*spec).flags as std::ffi::c_ulong | PY_TPFLAGS_HEAPTYPE;
+        (*tp).tp_base = single_base(pyobject::from_ref(bases))?;
+    }
+    let mut index = 0isize;
+    loop {
+        let entry = unsafe { (*spec).slots.offset(index) };
+        if unsafe { (*spec).slots.is_null() } || unsafe { (*entry).slot } == 0 {
+            break;
+        }
+        apply_slot(tp, unsafe { (*entry).slot }, unsafe { (*entry).pfunc })?;
+        index += 1;
+    }
+    ready(tp)?;
+    // `module` is the owner `PyType_GetModuleState` would report; nothing
+    // reads it yet, and `__module__` comes from the spec's qualified name.
+    let _ = module;
+    let w_type = interpreter_type(tp);
+    Ok(w_type)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromSpec(spec: *mut CPyTypeSpec) -> *mut CPyObject {
+    super::object::result(from_spec(spec, std::ptr::null_mut(), std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromSpecWithBases(
+    spec: *mut CPyTypeSpec,
+    bases: *mut CPyObject,
+) -> *mut CPyObject {
+    super::object::result(from_spec(spec, bases, std::ptr::null_mut()))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromModuleAndSpec(
+    module: *mut CPyObject,
+    spec: *mut CPyTypeSpec,
+    bases: *mut CPyObject,
+) -> *mut CPyObject {
+    super::object::result(from_spec(spec, bases, module))
+}
+
+/// `PyType_GetSlot` — read one slot back off a ready type.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *mut c_void {
+    use slot_id::*;
+    if tp.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    macro_rules! number {
+        ($field:ident) => {
+            (number_slot!($field))(tp)
+        };
+    }
+    macro_rules! sequence {
+        ($field:ident) => {
+            (sequence_slot!($field))(tp)
+        };
+    }
+    macro_rules! mapping {
+        ($field:ident) => {
+            (mapping_slot!($field))(tp)
+        };
+    }
+    let value: *const c_void = match id {
+        MP_ASS_SUBSCRIPT => mapping!(mp_ass_subscript),
+        MP_LENGTH => mapping!(mp_length),
+        MP_SUBSCRIPT => mapping!(mp_subscript),
+        NB_ABSOLUTE => number!(nb_absolute),
+        NB_ADD => number!(nb_add),
+        NB_AND => number!(nb_and),
+        NB_BOOL => number!(nb_bool),
+        NB_DIVMOD => number!(nb_divmod),
+        NB_FLOAT => number!(nb_float),
+        NB_FLOOR_DIVIDE => number!(nb_floor_divide),
+        NB_INDEX => number!(nb_index),
+        NB_INT => number!(nb_int),
+        NB_INVERT => number!(nb_invert),
+        NB_LSHIFT => number!(nb_lshift),
+        NB_MULTIPLY => number!(nb_multiply),
+        NB_NEGATIVE => number!(nb_negative),
+        NB_OR => number!(nb_or),
+        NB_POSITIVE => number!(nb_positive),
+        NB_POWER => number!(nb_power),
+        NB_REMAINDER => number!(nb_remainder),
+        NB_RSHIFT => number!(nb_rshift),
+        NB_SUBTRACT => number!(nb_subtract),
+        NB_TRUE_DIVIDE => number!(nb_true_divide),
+        NB_XOR => number!(nb_xor),
+        SQ_ASS_ITEM => sequence!(sq_ass_item),
+        SQ_CONCAT => sequence!(sq_concat),
+        SQ_CONTAINS => sequence!(sq_contains),
+        SQ_ITEM => sequence!(sq_item),
+        SQ_LENGTH => sequence!(sq_length),
+        SQ_REPEAT => sequence!(sq_repeat),
+        TP_ALLOC => unsafe { (*tp).tp_alloc },
+        TP_CALL => unsafe { (*tp).tp_call },
+        TP_DEALLOC => unsafe { (*tp).tp_dealloc },
+        TP_DESCR_GET => unsafe { (*tp).tp_descr_get },
+        TP_DESCR_SET => unsafe { (*tp).tp_descr_set },
+        TP_DOC => unsafe { (*tp).tp_doc as *const c_void },
+        TP_GETATTRO => unsafe { (*tp).tp_getattro },
+        TP_GETSET => unsafe { (*tp).tp_getset as *const c_void },
+        TP_HASH => unsafe { (*tp).tp_hash },
+        TP_INIT => unsafe { (*tp).tp_init },
+        TP_ITER => unsafe { (*tp).tp_iter },
+        TP_ITERNEXT => unsafe { (*tp).tp_iternext },
+        TP_METHODS => unsafe { (*tp).tp_methods as *const c_void },
+        TP_MEMBERS => unsafe { (*tp).tp_members as *const c_void },
+        TP_NEW => unsafe { (*tp).tp_new },
+        TP_REPR => unsafe { (*tp).tp_repr },
+        TP_RICHCOMPARE => unsafe { (*tp).tp_richcompare },
+        TP_SETATTRO => unsafe { (*tp).tp_setattro },
+        TP_STR => unsafe { (*tp).tp_str },
+        _ => std::ptr::null(),
+    };
+    value as *mut c_void
+}
+
+/// `PyType_GetName` and `PyType_GetQualName` — the part of `tp_name` after the
+/// last dot, which is the name the interpreter type carries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetName(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let name = unsafe { pyre_object::typeobject::w_type_get_name(w_type) };
+    pyobject::make_ref(pyre_object::w_str_new(&name))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetQualName(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    unsafe { PyType_GetName(tp) }
 }
 
 /// `PyType_GenericAlloc` — build the interpreter object and its C block.
@@ -2312,6 +2947,12 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyType_Check as *const ());
     std::hint::black_box(PyType_IsSubtype as *const ());
     std::hint::black_box(PyType_GetFlags as *const ());
+    std::hint::black_box(PyType_FromSpec as *const ());
+    std::hint::black_box(PyType_FromSpecWithBases as *const ());
+    std::hint::black_box(PyType_FromModuleAndSpec as *const ());
+    std::hint::black_box(PyType_GetSlot as *const ());
+    std::hint::black_box(PyType_GetName as *const ());
+    std::hint::black_box(PyType_GetQualName as *const ());
     std::hint::black_box(PyType_GenericAlloc as *const ());
     std::hint::black_box(PyType_GenericNew as *const ());
     std::hint::black_box(PyObject_Init as *const ());

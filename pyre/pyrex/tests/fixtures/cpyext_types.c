@@ -979,6 +979,153 @@ static PyObject *m_protocol(PyObject *self, PyObject *args)
     return NULL;
 }
 
+/* ── Doubler: tp_descr_get and tp_descr_set ─────────────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long held;
+} DoublerObject;
+
+static PyObject *doubler_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    DoublerObject *self = (DoublerObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->held = 0;
+    return (PyObject *)self;
+}
+
+static PyObject *doubler_get(PyObject *self, PyObject *instance, PyObject *owner)
+{
+    if (instance == NULL) {
+        Py_INCREF(self);
+        return self;
+    }
+    return PyLong_FromLong(((DoublerObject *)self)->held);
+}
+
+static int doubler_set(PyObject *self, PyObject *instance, PyObject *value)
+{
+    if (value == NULL) {
+        ((DoublerObject *)self)->held = 0;
+        return 0;
+    }
+    long given = PyLong_AsLong(value);
+    if (given == -1 && PyErr_Occurred()) {
+        return -1;
+    }
+    ((DoublerObject *)self)->held = given * 2;
+    return 0;
+}
+
+static PyTypeObject DoublerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Doubler",                     /* tp_name */
+    sizeof(DoublerObject),                      /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a data descriptor defined in C",           /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    0,                                          /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    doubler_get,                                /* tp_descr_get */
+    doubler_set,                                /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    doubler_new,                                /* tp_new */
+};
+
+/* ── Spec: a heap type built with PyType_FromSpec ───────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long code;
+} SpecObject;
+
+static PyObject *spec_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    long code = 0;
+    if (!PyArg_ParseTuple(args, "|l", &code)) {
+        return NULL;
+    }
+    SpecObject *self = (SpecObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->code = code;
+    return (PyObject *)self;
+}
+
+static PyObject *spec_repr(PyObject *self)
+{
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Spec(%ld)", ((SpecObject *)self)->code);
+    return PyUnicode_FromString(buffer);
+}
+
+static PyObject *spec_double(PyObject *self, PyObject *unused)
+{
+    return PyLong_FromLong(((SpecObject *)self)->code * 2);
+}
+
+static Py_ssize_t spec_length(PyObject *self)
+{
+    return ((SpecObject *)self)->code;
+}
+
+static PyMethodDef spec_methods[] = {
+    {"double", spec_double, METH_NOARGS, "twice the code"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyMemberDef spec_members[] = {
+    {"code", Py_T_LONG, offsetof(SpecObject, code), 0, "the code"},
+    {NULL, 0, 0, 0, NULL},
+};
+
+static PyType_Slot spec_slots[] = {
+    {Py_tp_new, spec_new},
+    {Py_tp_repr, spec_repr},
+    {Py_tp_methods, spec_methods},
+    {Py_tp_members, spec_members},
+    {Py_tp_doc, (void *)"a heap type built from a spec"},
+    {Py_sq_length, spec_length},
+    {0, NULL},
+};
+
+static PyType_Spec spec_spec = {
+    "cpyext_types.Spec",
+    sizeof(SpecObject),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    spec_slots,
+};
+
 /* ── capsules and imports ───────────────────────────────────────────── */
 
 static long capsule_payload = 4242;
@@ -1093,7 +1240,24 @@ static int types_exec(PyObject *module)
     if (PyModule_AddType(module, &TableType) < 0) {
         return -1;
     }
+    if (PyModule_AddType(module, &DoublerType) < 0) {
+        return -1;
+    }
     if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {
+        return -1;
+    }
+    PyObject *spec_type = PyType_FromModuleAndSpec(module, &spec_spec, NULL);
+    if (spec_type == NULL) {
+        return -1;
+    }
+    if (PyType_GetSlot((PyTypeObject *)spec_type, Py_tp_repr) != (void *)spec_repr) {
+        PyErr_SetString(PyExc_SystemError, "PyType_GetSlot did not answer with tp_repr");
+        Py_DECREF(spec_type);
+        return -1;
+    }
+    int added = PyModule_AddObjectRef(module, "Spec", spec_type);
+    Py_DECREF(spec_type);
+    if (added < 0) {
         return -1;
     }
     TypesError = PyErr_NewExceptionWithDoc("cpyext_types.TypesError",
