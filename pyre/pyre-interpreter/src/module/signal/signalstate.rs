@@ -45,9 +45,11 @@ pub fn get_wakeup_fd_write_errno() -> i32 {
     WAKEUP_FD_WRITE_ERRNO.swap(0, Ordering::SeqCst)
 }
 
-/// Register the address of the `ActionFlag` ticker so the OS handler can
-/// force it negative.  Called once at startup from
-/// `install_signal_handling`.
+/// Register the address of the `ActionFlag` ticker.  The OS handler never
+/// writes this cell — it arms the eval-breaker's async bit and lets
+/// `sync_async_ticker` make the ticker negative under the GIL — so the address
+/// serves to identify which ticker the shared breaker drives.  Called once at
+/// startup from `install_signal_handling`.
 pub fn register_ticker(ptr: *mut isize) {
     TICKER_PTR.store(ptr, Ordering::SeqCst);
 }
@@ -69,9 +71,11 @@ pub(crate) fn rearm_ticker() {
 
 // ── pending-signal bitmask (signals.c pypysig_pushback / pypysig_poll) ──
 
-/// `signals.c:98-114 pypysig_pushback` — set the pending bit for
-/// `signum` and force the ticker to -1.  Both the OS handler and
-/// `set_interrupt` reach signal delivery through here.
+/// `signals.c:98-114 pypysig_pushback` — set the pending bit for `signum` and
+/// arm the eval-breaker's async bit.  Upstream's handler drives the ticker
+/// negative here; this defers that write to `sync_async_ticker` under the GIL
+/// so the whole path stays two lock-free atomics, which is what lets the OS
+/// handler call it.  `set_interrupt` reaches signal delivery through here too.
 pub fn signal_pushback(signum: i32) {
     if (0..NSIG).contains(&signum) {
         let bitmask = 1i64 << signum;

@@ -484,8 +484,12 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
             Box::leak(CheckSignalAction::new(ec.space));
         action.register_periodic_action(ec.actionflag.shared_mut(), false);
 
-        // Hand the ticker cell address to the OS handler so it can force the
-        // ticker negative (rsignal.py:31-32 `pypysig_getaddr_occurred`).
+        // Hand the ticker cell address to the OS handler (rsignal.py:31-32
+        // `pypysig_getaddr_occurred`).  The handler itself only arms the
+        // eval-breaker's async bit, which is a lock-free atomic RMW and so
+        // async-signal-safe; `ExecutionContext::bytecode_trace` is what turns
+        // that request into a negative ticker, under the GIL.  Writing this
+        // cell from the handler would not be signal-safe.
         let ticker_addr = ec.actionflag.ticker_addr();
         signalstate::register_ticker(ticker_addr);
 
