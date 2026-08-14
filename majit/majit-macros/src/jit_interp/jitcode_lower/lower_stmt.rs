@@ -123,13 +123,20 @@ impl<'c> Lowerer<'c> {
         let arrays: Vec<_> = arrays
             .iter()
             .map(|(_, element_path)| {
-                // `is_item_signed = true` mirrors the literal the READ side
-                // passes (`add_gc_int_array_descr(size_of::<Elem>(), true)` in
-                // `lower_ref_binding_array_read`).  It is not derived from the
-                // element type on purpose: the write descr has to match what
-                // the reads intern, and deriving it here would make an unsigned
-                // element type produce a shape no read ever mints.
-                quote! { (::core::mem::size_of::<#element_path>(), true) }
+                // `writes_array_descr_by_shape` keys on `is_item_signed`, so
+                // this has to derive it exactly as the element read and write
+                // do (`add_raw_int_array_descr_signed` in
+                // `lower_ref_binding_array_read` / `_write`).  A literal here
+                // mints a shape no unsigned-element read ever produces, and
+                // the declaration then silently stops invalidating the load it
+                // names — the optimizer keeps serving the element it cached
+                // from before the mutating call.
+                quote! {
+                    (
+                        ::core::mem::size_of::<#element_path>(),
+                        (<#element_path>::MIN as i128) < 0,
+                    )
+                }
             })
             .collect();
         Some(quote! {

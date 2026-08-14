@@ -1184,9 +1184,14 @@ impl<'c> Lowerer<'c> {
             base_reg,
             struct_path,
             member,
-            ..
+            element_type,
         } = shape;
-        let (base_reg, struct_path, member) = (*base_reg, struct_path.clone(), member.clone());
+        let (base_reg, struct_path, member, element_type) = (
+            *base_reg,
+            struct_path.clone(),
+            member.clone(),
+            element_type.clone(),
+        );
         let tid = struct_type_id_tokens(&struct_path, false);
         let buffer_reg = self.alloc_reg();
         self.emit_op(
@@ -1196,6 +1201,18 @@ impl<'c> Lowerer<'c> {
                 vec![Register::ref_(buffer_reg)],
             ),
             quote! {
+                // The `int_fields` twin of this check lives in
+                // `field_scalar_tokens`.  Nothing else ties the declared
+                // element type to the field: the concrete rewrite indexes the
+                // real pointer while the emitted descr takes its stride and
+                // signedness from the declaration, so a declaration that
+                // drifted from the struct (`Stack::data => u16` over a
+                // `*mut u8`) would compile and read past the buffer.  Naming
+                // the pointee rather than the pointer accepts `*const T` as
+                // well as `*mut T`; the closure body is type-checked but never
+                // evaluated.
+                const _: fn(&#struct_path) -> #element_type =
+                    |__s| unsafe { *__s.#member };
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
@@ -1259,7 +1276,7 @@ impl<'c> Lowerer<'c> {
                 vec![Register::int(result_reg)],
             ),
             quote! {
-                let __descr_idx = __builder.add_gc_int_array_descr(
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
                     ::core::mem::size_of::<#element_type>(),
                     // descr.py:240-254 get_type_flag reads signedness off the
                     // declared element type.  Hard-coding signed would
@@ -1290,7 +1307,7 @@ impl<'c> Lowerer<'c> {
     /// for the buffer base followed by `setarrayitem_gc_i`.
     ///
     /// Store counterpart of [`Self::lower_ref_binding_array_read`]; both take
-    /// the element descr from `add_gc_int_array_descr`, so the store
+    /// the element descr from `add_raw_int_array_descr_signed`, so the store
     /// invalidates the heapcache entry the matching load populated.
     pub(super) fn lower_ref_binding_array_write(&mut self, expr: &Expr) -> Option<()> {
         let Expr::Assign(assign) = expr else {
@@ -1330,7 +1347,7 @@ impl<'c> Lowerer<'c> {
                 vec![],
             ),
             quote! {
-                let __descr_idx = __builder.add_gc_int_array_descr(
+                let __descr_idx = __builder.add_raw_int_array_descr_signed(
                     ::core::mem::size_of::<#element_type>(),
                     // descr.py:240-254 get_type_flag reads signedness off the
                     // declared element type.  Hard-coding signed would

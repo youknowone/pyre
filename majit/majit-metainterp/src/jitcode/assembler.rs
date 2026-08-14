@@ -1654,6 +1654,18 @@ impl JitCodeBuilder {
 
     /// Add a descriptor for a raw native integer array, selecting sign- vs
     /// zero-extension for sub-word `raw_load_i` results.
+    ///
+    /// Also the descr for a header-less buffer reached through a bare `*mut T`
+    /// field, even though those elements are read with `getarrayitem_gc_i`
+    /// rather than `raw_load_i`: what the flag governs is the object header,
+    /// and such a buffer has none.  `ArrayPtrInfo::make_guards`
+    /// (`optimizeopt/info.rs:668`, mirroring `info.py:632-639`) emits
+    /// `GUARD_GC_TYPE` for a GC-managed array descr, reading a type-id word at
+    /// `ptr - GcHeader::SIZE`; ahead of such a buffer that word belongs to
+    /// whatever precedes the allocation, so once the base is red the guard
+    /// fails or faults on short-preamble re-entry.  The `&[u8]` `env` array
+    /// keeps `add_gc_int_array_descr` because its base is a green constant and
+    /// the optimizer therefore gives it `PtrInfo::Constant`, never this arm.
     pub fn add_raw_int_array_descr_signed(
         &mut self,
         item_size: usize,
@@ -1782,7 +1794,9 @@ impl JitCodeBuilder {
             interior_fields: Vec::new(),
             // Preserve existing GUARD_GC_TYPE behavior for the `&[u8]`
             // program-array path (only the `pool_arrays` base flips to
-            // raw via `add_ptr_array_descr`).
+            // raw via `add_ptr_array_descr`).  A header-less buffer reached
+            // through a `*mut T` field takes `add_raw_int_array_descr_signed`
+            // instead — see the note there.
             is_gc_managed: true,
         })
     }

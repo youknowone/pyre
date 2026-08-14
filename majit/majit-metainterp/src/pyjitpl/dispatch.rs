@@ -599,7 +599,14 @@ pub fn residual_write_effect_info(
                 /* is_array_of_pointers */ false,
                 /* is_array_of_structs */ false,
                 is_item_signed,
-                /* is_gc_managed */ true,
+                // The only arrays reachable here are the header-less buffers
+                // an `array_fields` declaration names, which the reads intern
+                // through `Assembler::add_raw_int_array_descr_signed`.  The shape
+                // predicate ignores this flag, but a descr that disagreed with
+                // the read it is meant to match would be a trap for the next
+                // reader of either side.
+                /* is_gc_managed */
+                false,
                 /* lendescr */ None,
                 /* is_pure */ false,
                 /* ei_index */ u32::MAX,

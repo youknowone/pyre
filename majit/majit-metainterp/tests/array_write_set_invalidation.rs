@@ -22,25 +22,30 @@ use majit_ir::Type;
 use majit_ir::descr::make_array_descr_from_lltype_shape;
 use majit_ir::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 
-/// The shape `Assembler::add_gc_int_array_descr(8, true)` interns for an
-/// `array_fields` element access: a raw slice data pointer (`base_size = 0`,
-/// no length header) over signed 8-byte items.
-fn mint_element_array_descr() -> DescrRef {
+/// The shape `Assembler::add_raw_int_array_descr(item_size, is_item_signed)`
+/// interns for an `array_fields` element access: a header-less buffer pointer
+/// (`base_size = 0`, no length word, not GC-managed) over `item_size` items.
+fn mint_element_array_descr_of(item_size: usize, is_item_signed: bool) -> DescrRef {
     make_array_descr_from_lltype_shape(
         /* type_id */ 0,
         /* base_size */ 0,
-        /* item_size */ 8,
+        item_size,
         /* len_offset */ None,
         Type::Int,
         /* is_array_of_pointers */ false,
         /* is_array_of_structs */ false,
-        /* is_item_signed */ true,
-        /* is_gc_managed */ true,
+        is_item_signed,
+        /* is_gc_managed */ false,
         /* lendescr */ None,
         /* is_pure */ false,
         /* ei_index */ u32::MAX,
         /* interior_field_descrs */ Vec::new(),
     )
+}
+
+/// The signed 8-byte element array the node-chain storage reads.
+fn mint_element_array_descr() -> DescrRef {
+    mint_element_array_descr_of(8, true)
 }
 
 /// An `EffectInfo` shaped the way a `residual_writes`-declared residual's would
@@ -190,6 +195,33 @@ fn the_emitted_array_spec_mints_the_shape_the_reads_intern() {
     assert!(
         !ei.writes_array_descr_by_shape(&mint_program_byte_array_descr()),
         "and must not reach an array of a different element shape"
+    );
+}
+
+/// Signedness is part of the shape key, so a `u8` element declaration has to
+/// mint an UNSIGNED write descr — the same value the read derives from
+/// `(<u8>::MIN as i128) < 0`. The write spec used to be a hard-coded `true`,
+/// which matched only because the read hard-coded `true` as well; deriving the
+/// read alone leaves the two halves disagreeing and the declaration inert.
+///
+/// The second assertion is what makes this test able to fail: it evaluates the
+/// old spelling on the same input and requires it to miss.
+#[test]
+fn an_unsigned_element_declaration_mints_an_unsigned_write_descr() {
+    let unsigned_read = mint_element_array_descr_of(1, false);
+
+    let derived = majit_metainterp::residual_write_effect_info(&[], &[(1, false)], true);
+    assert!(
+        derived.writes_array_descr_by_shape(&unsigned_read),
+        "a `u8` element write declaration must invalidate the `u8` element \
+         load the same declaration's reads intern"
+    );
+
+    let hard_coded_signed = majit_metainterp::residual_write_effect_info(&[], &[(1, true)], true);
+    assert!(
+        !hard_coded_signed.writes_array_descr_by_shape(&unsigned_read),
+        "control: a signed write spec must NOT reach the unsigned read, or \
+         this test could not have caught the mismatch it exists for"
     );
 }
 
