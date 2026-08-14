@@ -25,8 +25,12 @@ publish-jobs = ["homebrew"]
 # Whether to install an updater program
 install-updater = false
 # The release archive is a Python installation, not a standalone binary.
-# This directory is generated immediately before `dist build`; its `lib`
-# subtree is included beside the executable in every archive and installer.
+# `stage-stdlib.py` generates this directory immediately before `dist build`
+# and it is included beside the executable in every archive and installer.
+# `include` keeps each item's own name and has no per-target form, so the one
+# entry names the stdlib directory on every platform: `lib` holding
+# `pyre3.14`, except on Windows where the stdlib is `Lib` itself and the two
+# spellings are the same path.
 include = ["dist-assets/lib"]
 github-build-setup = "../pyre-dist-build-setup.yml"
 # A prefix git tags must include for dist to care about them

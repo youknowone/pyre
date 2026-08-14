@@ -1,16 +1,37 @@
 #!/usr/bin/env python3
-"""Stage Pyre's merged release stdlib, following PyPy's package.py layout."""
+"""Stage Pyre's release stdlib.
+
+This is the stdlib half of `pypy/tool/release/package.py:192-390 create_package`,
+ported here rather than invoked: every function below has a counterpart there and
+is cited by line.  Read that file before changing the layout.
+
+The rest of `create_package` has no counterpart here.  `:233-240` runs the
+`lib_pypy` cffi build scripts for `_ssl`, `sqlite3`, `_blake2`, `_sha3`,
+`_tkinter` and the rest, which Pyre implements natively; `smartstrip` and
+`make_portable` post-process a translated binary; and `:449-486` writes the zip
+or tarball itself, which `dist` does for us out of the `include` entry in
+`dist-workspace.toml`.  What is left of it would not run unmodified anyway:
+`:221` spells the implementation directory `pypy{ver}`, so it would stage where
+`sysconfig._get_implementation` does not look.
+
+Two deliberate departures, both noted at the site: `lib_pypy` is not overlaid,
+and the bundled pip wheel is verified against `ensurepip`.
+"""
 
 from __future__ import annotations
 
 import argparse
 import ast
+import os
 import shutil
 import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# package.py:221 `IMPLEMENTATION = 'pypy{}'.format(python_ver)`.
+IMPLEMENTATION = "pyre3.14"
 
 
 def ignored(_directory: str, names: list[str]) -> set[str]:
@@ -33,6 +54,12 @@ def ensurepip_version(ensurepip: Path) -> str:
 
 
 def verify_bundled_pip(destination: Path) -> None:
+    """No package.py counterpart.
+
+    `ensurepip` derives the wheel it installs from `_PIP_VERSION`, so a wheel
+    that does not match the name it builds fails when a user bootstraps pip
+    rather than when the release is built.
+    """
     version = ensurepip_version(destination / "ensurepip" / "__init__.py")
     wheel_dir = destination / "ensurepip" / "_bundled"
     expected = wheel_dir / f"pip-{version}-py3-none-any.whl"
@@ -53,8 +80,22 @@ def verify_bundled_pip(destination: Path) -> None:
         raise SystemExit(f"invalid bundled pip wheel {expected}: {error}") from error
 
 
-def stage(destination: Path) -> None:
-    destination = destination.resolve()
+def stdlib_destination(assets_root: Path) -> Path:
+    """package.py:222-227 — where the release keeps the stdlib on this platform.
+
+    Windows holds the whole thing in `Lib`: that is where `sysconfig`'s `nt`
+    scheme puts `stdlib` (`{installed_base}/Lib`) and where
+    `site.getsitepackages` looks for `site-packages` (`<prefix>/Lib`).  Every
+    other platform uses `<platlibdir>/<implementation><version>`, and
+    `sys.platlibdir` is `lib`.
+    """
+    if os.name == "nt":
+        return assets_root / "Lib"
+    return assets_root / "lib" / IMPLEMENTATION
+
+
+def stage(assets_root: Path) -> None:
+    destination = stdlib_destination(assets_root).resolve()
     allowed_root = (ROOT / "dist-assets").resolve()
     if destination == allowed_root or allowed_root not in destination.parents:
         raise SystemExit(f"destination must be below {allowed_root}: {destination}")
@@ -78,9 +119,13 @@ def stage(destination: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("destination", type=Path)
+    parser.add_argument(
+        "assets_root",
+        type=Path,
+        help="directory whose contents dist copies into the archive root",
+    )
     args = parser.parse_args()
-    stage(args.destination)
+    stage(args.assets_root)
 
 
 if __name__ == "__main__":
