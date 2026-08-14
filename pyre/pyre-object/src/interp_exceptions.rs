@@ -521,6 +521,55 @@ pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
 pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dict);
 pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
 
+/// The pointer slots a traced construction emit must reproduce itself.
+///
+/// Values are read through their exported byte offsets so this census cannot
+/// drift from the flattened `W_BaseException` layout.
+pub unsafe fn w_exception_traced_construction_slots(
+    obj: PyObjectRef,
+) -> [(usize, PyObjectRef); 33] {
+    const OFFSETS: [usize; 33] = [
+        EXC_W_CAUSE_OFFSET,
+        EXC_W_TRACEBACK_OFFSET,
+        EXC_W_OBJECT_OFFSET,
+        EXC_W_START_OFFSET,
+        EXC_W_END_OFFSET,
+        EXC_W_REASON_OFFSET,
+        EXC_W_ENCODING_OFFSET,
+        EXC_W_ERRNO_OFFSET,
+        EXC_W_WINERROR_OFFSET,
+        EXC_W_STRERROR_OFFSET,
+        EXC_W_FILENAME_OFFSET,
+        EXC_W_FILENAME2_OFFSET,
+        EXC_W_CODE_OFFSET,
+        EXC_W_VALUE_OFFSET,
+        EXC_W_NAME_OFFSET,
+        EXC_W_ATTR_OBJ_OFFSET,
+        EXC_W_IMPORT_PATH_OFFSET,
+        EXC_W_IMPORT_NAME_FROM_OFFSET,
+        EXC_W_IMPORT_MSG_OFFSET,
+        EXC_W_SYNTAX_MSG_OFFSET,
+        EXC_W_SYNTAX_FILENAME_OFFSET,
+        EXC_W_SYNTAX_LINENO_OFFSET,
+        EXC_W_SYNTAX_OFFSET_OFFSET,
+        EXC_W_SYNTAX_TEXT_OFFSET,
+        EXC_W_SYNTAX_END_LINENO_OFFSET,
+        EXC_W_SYNTAX_END_OFFSET_OFFSET,
+        EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
+        EXC_W_SYNTAX_METADATA_OFFSET,
+        EXC_W_GROUP_MESSAGE_OFFSET,
+        EXC_W_GROUP_EXCEPTIONS_OFFSET,
+        EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET,
+        EXC_W_DICT_OFFSET,
+        EXC_W_WEAKREF_OFFSET,
+    ];
+    let base = obj.cast::<u8>();
+    OFFSETS.map(|offset| {
+        let value = unsafe { base.add(offset).cast::<PyObjectRef>().read() };
+        (offset, value)
+    })
+}
+
 /// GC trace offsets for `W_BaseException` — `args_w` plus the three
 /// `PyObjectRef`-shaped chained-exception slots per
 /// `interp_exceptions.py:113-117 W_BaseException` class defaults,

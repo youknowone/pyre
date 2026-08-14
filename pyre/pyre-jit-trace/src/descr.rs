@@ -4179,7 +4179,7 @@ pub fn pytraceback_lineno_descr() -> DescrRef {
 /// exception attribute fold.  The field is located by its `W_BaseException`
 /// offset, so a slot added to `build_w_exception_group` cannot silently
 /// renumber the ones after it; no parallel descriptor is constructed.
-pub fn w_exception_slot_descr(
+pub fn w_exception_attr_slot_descr(
     kind: ExcKind,
     slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
 ) -> DescrRef {
@@ -4214,6 +4214,23 @@ pub fn w_exception_slot_descr(
         .position(|d| d.offset() == offset)
         .expect("W_BaseException descr group has no field at the selected slot offset");
     field_descr_from_group(group, field_index)
+}
+
+/// Cached field descriptor for a flattened `W_BaseException` slot selected
+/// by byte offset.  Returns `None` when the per-kind group does not carry the
+/// requested offset.
+pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
+    let idx = kind as u8 as usize;
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    if cache[idx].is_none() {
+        cache[idx] = Some(build_w_exception_group(kind));
+    }
+    let group = cache[idx].as_ref().unwrap();
+    group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .map(|field| field_descr_from_group(group, field))
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT

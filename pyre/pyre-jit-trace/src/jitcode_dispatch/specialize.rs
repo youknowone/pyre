@@ -3090,7 +3090,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let raw_value = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             obj,
-            crate::descr::w_exception_slot_descr(kind, slot),
+            crate::descr::w_exception_attr_slot_descr(kind, slot),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
         ctx.trace_ctx.set_opref_concrete(
@@ -4161,7 +4161,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             } else {
                 (value, concrete_value)
             };
-        let field_descr = crate::descr::w_exception_slot_descr(kind, slot);
+        let field_descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
         let field_index = field_descr.index();
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, stored_value], field_descr);
@@ -11168,7 +11168,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         } else {
             direct_code.expect("SystemExit code has neither direct nor tuple value")
         };
-        let descr = crate::descr::w_exception_slot_descr(
+        let descr = crate::descr::w_exception_attr_slot_descr(
             kind,
             pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code,
         );
@@ -11194,7 +11194,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
         }
         for (slot, value) in stores {
-            let descr = crate::descr::w_exception_slot_descr(kind, slot);
+            let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
             let descr_index = descr.index();
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
@@ -11365,12 +11365,12 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
 ///
 /// `do_raise` instantiates a raised class with no arguments, so a bare
 /// `raise ValueError` is `raise ValueError()`.  When the operand is a
-/// canonical builtin exception class with a trivial-args constructor and no
-/// explicit `from` cause, build the zero-argument instance inline (the
-/// `try_walker_trace_exception_new` Empty-args shape) and chain
+/// canonical builtin exception class whose concrete zero-argument instance
+/// can be reproduced exactly and with no explicit `from` cause, build it
+/// inline using the `try_walker_trace_exception_new` Empty-args shape and chain
 /// `__context__` (the `try_walker_trace_raise_builtin` tail), so the whole
-/// exception virtualizes and DCEs when it never escapes.  A subclass or a
-/// non-trivial-args kind (OSError / Unicode) declines to the residual.
+/// exception virtualizes and DCEs when it never escapes.  A subclass or an
+/// instance carrying any other pointer-slot value declines to the residual.
 ///
 /// Returns `None` (fall through to the generic residual) for any
 /// non-matching shape.
@@ -11439,9 +11439,6 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
         return Ok(None);
     }
-    if !kind.has_trivial_args_constructor() {
-        return Ok(None);
-    }
     let exc_type_ptr = unsafe {
         (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -11452,6 +11449,23 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
     ) {
         return Ok(None);
+    }
+
+    let w_none = pyre_object::w_none();
+    let mut w_none_slot_descrs = Vec::new();
+    for (offset, value) in
+        unsafe { pyre_object::interp_exceptions::w_exception_traced_construction_slots(exc) }
+    {
+        if value.is_null() {
+            continue;
+        }
+        if !std::ptr::eq(value, w_none) {
+            return Ok(None);
+        }
+        let Some(descr) = crate::descr::w_exception_slot_descr(kind, offset) else {
+            return Ok(None);
+        };
+        w_none_slot_descrs.push(descr);
     }
 
     // Resolve the EC while declining is still free.  `walker_ensure_execution_
@@ -11495,6 +11509,14 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
 
     let new_op =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_op, args_list);
+    let w_none_const = ctx.trace_ctx.const_ref(w_none as i64);
+    for descr in w_none_slot_descrs {
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_none_const], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(new_op, descr_index, w_none_const);
+    }
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(new_op, exc_type_ptr as usize as i64);
