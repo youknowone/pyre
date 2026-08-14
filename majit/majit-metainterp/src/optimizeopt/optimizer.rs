@@ -4313,7 +4313,9 @@ impl Optimizer {
                     result.append(&mut ctx.new_operations);
                     return Ok((result, false));
                 }
-                return Ok((optimized_ops, false));
+                let mut result = optimized_ops;
+                result.append(&mut ctx.new_operations);
+                return Ok((result, false));
             }
         };
 
@@ -4345,7 +4347,16 @@ impl Optimizer {
             if let Some(ref mut state) = self.exported_loop_state {
                 state.runtime_boxes = runtime_boxes.to_vec();
             }
-            return Ok((optimized_ops, true));
+            // unroll.py:234-236 returns `self._newoperations` whole, so the
+            // retrace is built on the flush + end-of-preamble force + failed
+            // match guards above, not on the body alone. `retarget_close_jump`
+            // set `self.skip_flush`, which suppressed the in-body flush, so
+            // OptHeap's deferred setfield_gc stores are exactly what the
+            // `self.flush` above emitted — dropping this buffer would erase a
+            // heap store the bridge body performed.
+            let mut result = optimized_ops;
+            result.append(&mut ctx.new_operations);
+            return Ok((result, true));
         }
 
         // unroll.py:220-227: retrace limit reached, try force_boxes=True.
@@ -4400,7 +4411,9 @@ impl Optimizer {
             result.append(&mut ctx.new_operations);
             Ok((result, false))
         } else {
-            Ok((optimized_ops, false))
+            let mut result = optimized_ops;
+            result.append(&mut ctx.new_operations);
+            Ok((result, false))
         }
     }
 
