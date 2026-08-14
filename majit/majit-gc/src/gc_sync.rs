@@ -271,6 +271,28 @@ pub fn register_thread() {
     crate::rgil::acquire_maybe_in_new_thread();
 }
 
+/// Register the current thread as a GC mutator without taking the GIL and
+/// without joining the RUNNING census.
+///
+/// A foreign thread delivering a callback needs the two separable, because the
+/// `CallbackGuard` gives back exactly what it took. Arriving through
+/// [`register_thread`] leaves that guard recording neither `took_gil` nor
+/// `rejoined`, so the foreign worker returns to C still holding the GIL and
+/// still counted RUNNING — no other Python thread runs again and no collection
+/// reaches quiescence. Parked, the guard acquires and releases per callback,
+/// which is what `rffi`'s callback wrapper does around each entry.
+pub fn register_thread_parked() {
+    assert!(
+        !GC_THREAD.with(|t| t.registered.get()),
+        "GC mutator thread registered twice"
+    );
+    let old = REGISTERED_THREADS.fetch_add(1, Ordering::SeqCst);
+    if old > 0 {
+        FOREIGN_MUTATOR_SEEN.store(true, Ordering::Release);
+    }
+    GC_THREAD.with(|t| t.registered.set(true));
+}
+
 /// Unregister the current thread. It stops running pyre code, so it gives the
 /// GIL back and no longer participates in STW quiescence.
 pub fn unregister_thread() {
@@ -284,14 +306,14 @@ pub fn unregister_thread() {
         crate::rgil::release();
     }
     let mut state = GC_SYNC.quiesce.lock().unwrap();
-    assert!(
-        GC_THREAD.with(|t| t.running.replace(false)),
-        "unregistering a parked GC mutator thread"
-    );
-    state.running = state
-        .running
-        .checked_sub(1)
-        .expect("RUNNING underflow during unregister_thread");
+    // A thread that came in through `register_thread_parked` sits outside the
+    // census between callbacks, so there is nothing to subtract for it.
+    if GC_THREAD.with(|t| t.running.replace(false)) {
+        state.running = state
+            .running
+            .checked_sub(1)
+            .expect("RUNNING underflow during unregister_thread");
+    }
     GC_THREAD.with(|t| t.registered.set(false));
     let old = REGISTERED_THREADS.fetch_sub(1, Ordering::SeqCst);
     assert!(old > 0, "REGISTERED_THREADS underflow");

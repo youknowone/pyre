@@ -36,10 +36,16 @@ const ATTR_W_HASH: &str = "w_hash";
 /// appends these names to the subclass Layout (`call.rs` `create_all_slots`)
 /// and they carry no Member, being interpreter storage rather than attributes
 /// the class exposes.
+///
+/// Each name holds a space, so no class can declare one: `__slots__` entries
+/// are rejected unless they are identifiers. A spellable name would collide —
+/// `__slots__ = ('__weakref_obj__',)` installs the user's member first and the
+/// reserved name is appended after it, so `field_slot` would answer with the
+/// user's index and weakref construction would overwrite their slot.
 pub const RESERVED_FIELD_SLOTS: [&str; 3] = [
-    "__weakref_obj__",
-    "__weakref_callback__",
-    "__weakref_hash__",
+    "weakref ref w_obj_weak",
+    "weakref ref w_callable",
+    "weakref ref w_hash",
 ];
 
 /// Layout-slot index reserved for the field `name` on `obj`, walking the

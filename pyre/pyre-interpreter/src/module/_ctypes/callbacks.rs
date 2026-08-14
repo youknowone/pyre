@@ -76,10 +76,21 @@ mod imp {
         if funcptr::argtype_is_pointer_kind(at) {
             return host_ctypes::ffi_pointer_type();
         }
-        let Some(tc) = cdata::type_code_of(at) else {
-            return host_ctypes::ffi_pointer_type();
-        };
-        host_ctypes::ffi_type_from_code(&tc).unwrap_or_else(host_ctypes::ffi_pointer_type)
+        if let Some(tc) = cdata::type_code_of(at)
+            && let Some(ty) = host_ctypes::ffi_type_from_code(&tc)
+        {
+            return ty;
+        }
+        // A `Structure`/`Union` argument has no type code and is passed by
+        // value, so the cif has to describe an aggregate of its size —
+        // declaring a pointer disagrees with the ABI and hands `decode_arg` a
+        // slot that is neither the struct nor a pointer to it. `decode_arg`
+        // already builds the instance from `size` bytes at the argument
+        // address, which is what libffi supplies for an aggregate.
+        match cdata::ctype_size_of(at) {
+            Some(size) => host_ctypes::ffi_byte_struct(size),
+            None => host_ctypes::ffi_pointer_type(),
+        }
     }
 
     fn ffi_type_for_ret(ret: &funcptr::Ret) -> Result<host_ctypes::FfiType, crate::PyError> {
@@ -114,8 +125,7 @@ mod imp {
         args: *const *const c_void,
         userdata: &ThunkUserdata,
     ) {
-        crate::module::thread::ensure_runtime_thread();
-        let _callback = crate::module::thread::enter_external_callback();
+        let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
         let obj = unsafe { *userdata.slot } as PyObjectRef;
         let use_errno = funcptr::funcptr_flags(obj) & funcptr::FUNCFLAG_USE_ERRNO != 0;
         let call_result = match decode_args(obj, args) {

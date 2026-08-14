@@ -60,6 +60,30 @@ pub fn enter_external_callback() -> majit_gc::gc_sync::CallbackGuard {
     majit_gc::gc_sync::enter_external_callback()
 }
 
+/// Enter the runtime to deliver a callback on a thread foreign code owns.
+///
+/// A first-time thread is registered *parked* — no GIL, not in the RUNNING
+/// census — so the guard returned here is what acquires both and what gives
+/// them back when the callback returns. `ensure_runtime_thread` would take the
+/// GIL as part of registering, leaving the guard nothing to release and the
+/// foreign worker holding it for the rest of its life.
+///
+/// The mutator registration still happens under the GIL, as it does for a
+/// thread that enters through `enter_runtime_thread`.
+pub fn enter_external_callback_from_foreign_thread() -> majit_gc::gc_sync::CallbackGuard {
+    let first_entry = !RUNTIME_THREAD_ENTERED.with(|entered| entered.get());
+    if first_entry {
+        RUNTIME_THREAD_ENTERED.with(|entered| entered.set(true));
+        majit_gc::gc_sync::register_thread_parked();
+    }
+    let guard = majit_gc::gc_sync::enter_external_callback();
+    if first_entry {
+        majit_gc::shadow_stack::register_mutator();
+        RUNTIME_THREAD.with(|_| {});
+    }
+    guard
+}
+
 thread_local! {
     /// Set once this thread owns a mutator registration, so the entry below
     /// stays a single thread-local read on every later entry.
