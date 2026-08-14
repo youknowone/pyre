@@ -2452,6 +2452,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         let mut fmt_collapsed = collapse_fmt_chains(&mut lo.graph);
+        // Constant `format!("literal")` — a zero-placeholder format charon has
+        // already folded to the fully-rendered constant string, so the format
+        // op's argument is a bare `__str_const` with no pieces/args chain.
+        // Replace the op with that constant string in place.
+        fmt_collapsed += collapse_const_fmt(&mut lo.graph);
         // Multi-argument `format!("{a}…{b}", …)` chains build an N-field
         // argument tuple and N `Argument::new_display` ctors across several
         // blocks — a shape the single-argument collapser above does not
@@ -19404,6 +19409,76 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
             .splice(idx..idx + 1, expansion);
     }
     sites.len()
+}
+
+/// Collapse a constant `format!("literal")` — a zero-placeholder format whose
+/// `format_args!` charon has already folded to the fully-rendered constant
+/// string, so `alloc::fmt::format`'s single argument resolves to a
+/// `__str_const` rather than to an `Arguments::new(pieces, args)` chain.  The
+/// format of a constant string IS that string, so replace the `fmt::format` op
+/// in place with the same `__str_const`, keeping the result var; the now-unread
+/// producer is reclaimed by the dead-op sweep.  No pieces/args arrays exist
+/// (unlike the single/multi-arg Display collapsers), so no link re-threading is
+/// needed.  Retires the graph-less `alloc::fmt::format` extern with only the
+/// `__str_const` op the rtyper natively types `SomeString`.
+fn collapse_const_fmt(graph: &mut FunctionGraph) -> usize {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    // `__str_const` carries its text as the second path segment (see
+    // `emit_str_const`), so a zero-arg `["__str_const", text]` producer is the
+    // whole rendered message.
+    let mut rewrites: Vec<(BlockId, usize, String)> = Vec::new();
+    for block in &graph.blocks {
+        for (fi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !fmt_path_ends_with(segments, &["fmt", "format"]) || op.result.is_none() {
+                continue;
+            }
+            let Some(arg) = args.first() else {
+                continue;
+            };
+            let Some((pbid, pidx)) = resolve_to_producer_op(graph, arg) else {
+                continue;
+            };
+            let text = match graph
+                .blocks
+                .iter()
+                .find(|b| b.id == pbid)
+                .and_then(|b| b.operations.get(pidx))
+                .map(|o| &o.kind)
+            {
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments: pseg },
+                    args: pargs,
+                    ..
+                }) if pargs.is_empty() && pseg.len() == 2 && pseg[0] == "__str_const" => {
+                    pseg[1].clone()
+                }
+                _ => continue,
+            };
+            rewrites.push((block.id, fi, text));
+        }
+    }
+    let n = rewrites.len();
+    // In-place kind replacement keeps every op index valid across the batch.
+    for (bid, fi, text) in rewrites {
+        if let Some(op) = graph.block_mut(bid).operations.get_mut(fi) {
+            op.kind = OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), text],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            };
+        }
+    }
+    n
 }
 
 /// A recognized multi-argument `format!` chain ready to collapse.  Unlike
