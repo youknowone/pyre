@@ -1226,6 +1226,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "pidfd_send_signal() requires at least 2 arguments",
                         ));
                     }
+                    // The syscall's `siginfo` argument is not exposed, so the
+                    // only value that can be honoured is None.  Ignoring
+                    // anything else would deliver the very signal the caller
+                    // asked to have rejected.
+                    if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
+                        return Err(crate::PyError::type_error("siginfo must be None"));
+                    }
                     let pidfd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
                     let sig = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     let flags = if args.len() >= 4 {
