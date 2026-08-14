@@ -665,6 +665,10 @@ pub struct CompiledWasmLoop {
     /// module lives as long as the source loop it attaches to, so its cells are
     /// freed when this loop drops. Appended by `compile_bridge`.
     pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
+    /// `(descr identity, table slot)` for every label published by a bridge
+    /// chained onto this loop. The bridge module lives as long as its source
+    /// loop, so `Drop` retracts entries that still name that bridge's slot.
+    pub bridge_owned_label_targets: RefCell<Vec<(usize, u32)>>,
     /// Set when `compile_bridge` accepts a self-recursive `CallAssemblerR`
     /// bridge (`PYRE_WASM_CA`) for this loop. While set, `compile_bridge`
     /// declines chaining any FURTHER bridge into this recursion (the guard
@@ -733,10 +737,16 @@ impl Drop for CompiledWasmLoop {
         // survive the old loop's drop.
         let mut reg = LABEL_TARGETS.lock().unwrap();
         if let Some(map) = reg.as_mut() {
-            for &id in &self.label_descrs {
+            for (id, func_handle) in self
+                .label_descrs
+                .iter()
+                .copied()
+                .map(|id| (id, self.func_handle.get()))
+                .chain(self.bridge_owned_label_targets.get_mut().iter().copied())
+            {
                 if id != 0
                     && let Some(t) = map.get(&id)
-                    && t.func_handle == self.func_handle.get()
+                    && t.func_handle == func_handle
                 {
                     map.remove(&id);
                     crate::BRIDGE_DIAG[22].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

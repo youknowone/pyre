@@ -37,10 +37,13 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// index-8 unresolved-target decline: 17 = the terminal JUMP carries no descr
 /// at all, 18 = the descr is present but `LABEL_TARGETS` holds no entry for it.
 /// Publish-side counterpart, so an unresolved lookup can be told from a label
-/// that was never offered: 19 = labels published off a peeled loop, 20 =
-/// published off a non-peeled loop, 21 = a non-peeled loop's first label left
+/// that was never offered: 19 = labels published off a peeled trace, 20 =
+/// published off a non-peeled trace, 21 = a non-peeled trace's first label left
 /// unpublished (no descr, or its arity is not the inputarg count), 22 = a
-/// dropped loop retracted a published entry. `compile_loop`'s own outcome
+/// dropped loop retracted a published entry. 19-21 count loops and
+/// LABEL-bearing bridges alike, since both go through the same publish step
+/// (`x86/assembler.py:990 fixup_target_tokens` runs on either path); a bridge
+/// with no LABEL is not tallied by 21. `compile_loop`'s own outcome
 /// split — every `Err` it returns is a `loops_aborted` bump in the metainterp,
 /// and the reason string never reaches the host from inside the guest, so the
 /// classification has to be a counter: 23 = compile_loop entered, 24 =
@@ -212,6 +215,143 @@ use failguard::{
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
+
+/// `x86/assembler.py:990 fixup_target_tokens`, called from BOTH `assemble_loop`
+/// (:612) and `assemble_bridge` (:706) — a LABEL assembled inside a bridge is a
+/// jump target for later traces exactly like a loop's, and `compile_retrace`
+/// (compile.py:341-393) reaches the backend through `send_bridge_to_backend`,
+/// so a retrace IS a bridge that defines its own LABEL.
+///
+/// Returns `(label_descrs, published_descrs)`: the descr identity of every
+/// LABEL in ordinal order, and the subset actually entered into
+/// `LABEL_TARGETS`. `compile_loop` keeps the first for its own JUMP
+/// resolution; `compile_bridge` hands the second to the source loop so its
+/// `Drop` retracts them.
+fn stamp_and_publish_label_targets(
+    func_handle: u32,
+    frame: codegen::FrameGeometry,
+    inputargs: &[InputArg],
+    ops: &[Op],
+) -> (Vec<usize>, Vec<usize>) {
+    // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
+    // loop-closing bridge can recover which label its terminal JUMP targets:
+    // the JUMP and the LABEL share the descr by Arc identity, so the ordinal
+    // written here is readable from the bridge's JUMP in `compile_bridge`.
+    // Pure metadata — emits no wasm bytes, so the module shape is unchanged.
+    // Skip a LABEL whose descr is not loop-target-backed (`set_label_block_id`
+    // would panic on a non-`AtomicU32` slot).
+    let mut label_block_id: u32 = 0;
+    let mut label_descrs: Vec<usize> = Vec::new();
+    for op in ops.iter() {
+        if op.opcode != majit_ir::OpCode::Label {
+            continue;
+        }
+        // Descr identity of each label, in ordinal order, so
+        // `compile_bridge` can resolve which of THIS loop's labels a
+        // closing JUMP targets by Arc identity (the JUMP and the LABEL
+        // share the descr). The stamped `label_block_id` alone cannot: a
+        // loop retraced into several specializations re-stamps a shared
+        // descr, and every specialization's start label carries ordinal
+        // 0 — a bridge targeting ANOTHER specialization's label would
+        // otherwise be mis-chained into this one.
+        label_descrs.push(
+            op.getdescr()
+                .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
+                .unwrap_or(0),
+        );
+        if let Some(descr) = op.getdescr()
+            && let Some(target) = descr.as_loop_target_descr()
+        {
+            target.set_label_block_id(label_block_id);
+        }
+        label_block_id += 1;
+    }
+    // Per-label resume metadata (ordinal order) for `compile_bridge`'s
+    // accept condition: a loop-closing bridge may resume at ANY label via
+    // the entry `br_table`, provided its JUMP arity matches that label's
+    // arg count and the label's args are the complete live set of the
+    // trace remainder.
+    let label_num_args = codegen::label_arg_counts(ops);
+    let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
+    let mut published_descrs = Vec::new();
+
+    // Publish this loop's enterable labels so a loop-closing bridge from
+    // ANY loop can chain into them in-module (jump-to-existing-trace). A
+    // peeled loop's labels are each enterable through the entry br_table
+    // (key = ordinal + 1). A non-peeled loop has no dispatch: only its
+    // FIRST label is enterable — through the plain entry (key 0), whose
+    // input loader reads `num_inputs` positional slots — and only when
+    // the label's arity equals that (the standard loop shape, whose
+    // first label's args ARE the inputargs).
+    if codegen::is_resumable_peeled(ops) {
+        // Only labels at or before the loop header have a resume loader
+        // (`codegen::resumable_label_count`); the header is the last of
+        // them, and a bridge landing there re-runs no advancing segment.
+        let resumable = codegen::resumable_label_count(ops);
+        let header = resumable.saturating_sub(1);
+        for (j, &id) in label_descrs.iter().enumerate().take(resumable) {
+            if id == 0 {
+                continue;
+            }
+            diag_bump(19);
+            publish_label_target(
+                id,
+                LabelTarget {
+                    func_handle,
+                    key: j as u32 + 1,
+                    num_args: label_num_args[j],
+                    resume_safe: label_resume_info[j].0,
+                    requires_own_frame: label_resume_info[j].1,
+                    is_last_label: j == header,
+                    frame,
+                },
+            );
+            published_descrs.push(id);
+        }
+    } else {
+        // A LABEL with real work before it is not reachable through the plain
+        // entry: key 0 runs the function from its first op, so a bridge chaining
+        // there would re-run that work. Before the descr-strict dispatch every
+        // such trace was `is_resumable_peeled` and never reached this branch; a
+        // `jump_to_preamble` retrace (own LABEL, foreign closing JUMP) is not, so
+        // state the assumption the comment below already relies on.
+        let first_label_at_entry = ops
+            .iter()
+            .position(|op| op.opcode == majit_ir::OpCode::Label)
+            == Some(0);
+        let publishable = first_label_at_entry
+            && label_descrs.first().is_some_and(|&id| id != 0)
+            && label_num_args.first() == Some(&inputargs.len());
+        // Counter 21 answers "this trace HAS a first label and it was left
+        // unpublished". A trace with no LABEL at all — every ordinary bridge —
+        // has nothing to publish and nothing withheld, so it is not a tally.
+        if !publishable && !label_descrs.is_empty() {
+            diag_bump(21);
+        }
+        if publishable {
+            let id = label_descrs[0];
+            diag_bump(20);
+            publish_label_target(
+                id,
+                LabelTarget {
+                    func_handle,
+                    key: 0,
+                    num_args: inputargs.len(),
+                    resume_safe: true,
+                    requires_own_frame: false,
+                    // No real ops precede a non-peeled loop's header, so
+                    // an entry re-run lands at the header without any
+                    // advancing segment — the livelock check applies.
+                    is_last_label: true,
+                    frame,
+                },
+            );
+            published_descrs.push(id);
+        }
+    }
+
+    (label_descrs, published_descrs)
+}
 
 /// JIT exception state, mirroring the native backends' `JIT_EXC_VALUE` /
 /// `JIT_EXC_TYPE` globals. A can-raise helper publishes the pending exception
@@ -2306,119 +2446,10 @@ impl majit_backend::Backend for WasmBackend {
         // the last LABEL. Computed through the same predicate codegen's wrapper
         // gates on, so the recorded field and the emitted wrapper cannot drift.
         let has_preamble = codegen::is_resumable_peeled(ops);
-        // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
-        // loop-closing bridge can recover which label its terminal JUMP targets:
-        // the JUMP and the LABEL share the descr by Arc identity, so the ordinal
-        // written here is readable from the bridge's JUMP in `compile_bridge`.
-        // Pure metadata — emits no wasm bytes, so the module shape is unchanged.
-        // Skip a LABEL whose descr is not loop-target-backed (`set_label_block_id`
-        // would panic on a non-`AtomicU32` slot).
-        let mut label_block_id: u32 = 0;
-        let mut label_descrs: Vec<usize> = Vec::new();
-        for op in ops.iter() {
-            if op.opcode != majit_ir::OpCode::Label {
-                continue;
-            }
-            // Descr identity of each label, in ordinal order, so
-            // `compile_bridge` can resolve which of THIS loop's labels a
-            // closing JUMP targets by Arc identity (the JUMP and the LABEL
-            // share the descr). The stamped `label_block_id` alone cannot: a
-            // loop retraced into several specializations re-stamps a shared
-            // descr, and every specialization's start label carries ordinal
-            // 0 — a bridge targeting ANOTHER specialization's label would
-            // otherwise be mis-chained into this one.
-            label_descrs.push(
-                op.getdescr()
-                    .map(|d| std::sync::Arc::as_ptr(&d) as *const () as usize)
-                    .unwrap_or(0),
-            );
-            if let Some(descr) = op.getdescr()
-                && let Some(target) = descr.as_loop_target_descr()
-            {
-                target.set_label_block_id(label_block_id);
-            }
-            label_block_id += 1;
-        }
-        // Per-label resume metadata (ordinal order) for `compile_bridge`'s
-        // accept condition: a loop-closing bridge may resume at ANY label via
-        // the entry `br_table`, provided its JUMP arity matches that label's
-        // arg count and the label's args are the complete live set of the
-        // trace remainder.
-        let label_num_args = codegen::label_arg_counts(ops);
-        let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
+        let (label_descrs, _) = stamp_and_publish_label_targets(func_handle, frame, inputargs, ops);
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
-
-        // Publish this loop's enterable labels so a loop-closing bridge from
-        // ANY loop can chain into them in-module (jump-to-existing-trace). A
-        // peeled loop's labels are each enterable through the entry br_table
-        // (key = ordinal + 1). A non-peeled loop has no dispatch: only its
-        // FIRST label is enterable — through the plain entry (key 0), whose
-        // input loader reads `num_inputs` positional slots — and only when
-        // the label's arity equals that (the standard loop shape, whose
-        // first label's args ARE the inputargs).
-        if has_preamble {
-            // Only labels at or before the loop header have a resume loader
-            // (`codegen::resumable_label_count`); the header is the last of
-            // them, and a bridge landing there re-runs no advancing segment.
-            let resumable = codegen::resumable_label_count(ops);
-            let header = resumable.saturating_sub(1);
-            for (j, &id) in label_descrs.iter().enumerate().take(resumable) {
-                if id == 0 {
-                    continue;
-                }
-                diag_bump(19);
-                publish_label_target(
-                    id,
-                    LabelTarget {
-                        func_handle,
-                        key: j as u32 + 1,
-                        num_args: label_num_args[j],
-                        resume_safe: label_resume_info[j].0,
-                        requires_own_frame: label_resume_info[j].1,
-                        is_last_label: j == header,
-                        frame,
-                    },
-                );
-            }
-        } else {
-            // A LABEL with real work before it is not reachable through the plain
-            // entry: key 0 runs the function from its first op, so a bridge chaining
-            // there would re-run that work. Before the descr-strict dispatch every
-            // such trace was `is_resumable_peeled` and never reached this branch; a
-            // `jump_to_preamble` retrace (own LABEL, foreign closing JUMP) is not, so
-            // state the assumption the comment below already relies on.
-            let first_label_at_entry = ops
-                .iter()
-                .position(|op| op.opcode == majit_ir::OpCode::Label)
-                == Some(0);
-            let publishable = first_label_at_entry
-                && label_descrs.first().is_some_and(|&id| id != 0)
-                && label_num_args.first() == Some(&inputargs.len());
-            if !publishable {
-                diag_bump(21);
-            }
-            if publishable {
-                let id = label_descrs[0];
-                diag_bump(20);
-                publish_label_target(
-                    id,
-                    LabelTarget {
-                        func_handle,
-                        key: 0,
-                        num_args: inputargs.len(),
-                        resume_safe: true,
-                        requires_own_frame: false,
-                        // No real ops precede a non-peeled loop's header, so
-                        // an entry re-run lands at the header without any
-                        // advancing segment — the livelock check applies.
-                        is_last_label: true,
-                        frame,
-                    },
-                );
-            }
-        }
 
         let compiled = CompiledWasmLoop {
             token_number: token.number,
@@ -2440,6 +2471,7 @@ impl majit_backend::Backend for WasmBackend {
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_cells_owner: bridge_cells_owner,
             _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
+            bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
             ca_terminal_declined: std::cell::Cell::new(false),
             ca_callers: std::cell::RefCell::new(Vec::new()),
@@ -2911,6 +2943,20 @@ impl majit_backend::Backend for WasmBackend {
         }
         diag_bump(5); // bridge compiled — chained in-module
 
+        // x86/assembler.py:706 publishes the target tokens defined by an
+        // accepted bridge. `codegen::is_resumable_peeled` and
+        // `codegen::resumable_label_count` both use `find_loop_label_index`. A
+        // retrace closing onto its OWN new target token resolves the terminal
+        // JUMP among this trace's LABELs and is peeled: codegen emitted the
+        // resume `br_table`, and every resumable label is published at key
+        // ordinal + 1. A `jump_to_preamble` retrace closes onto the ORIGINAL
+        // loop's start descr, so it is not peeled and its first op is not a
+        // LABEL; the
+        // existing `first_label_at_entry` / arity guard correctly leaves that
+        // label unpublished, because key 0 would re-run the work before it.
+        let (_, published_label_descrs) =
+            stamp_and_publish_label_targets(bridge_slot, source_frame, inputargs, ops);
+
         {
             let source_loop = original_token
                 .compiled
@@ -2953,6 +2999,11 @@ impl majit_backend::Backend for WasmBackend {
             if let Some(owner) = bridge_cells_owner {
                 source_loop._bridge_owned_cells.borrow_mut().push(owner);
             }
+            source_loop.bridge_owned_label_targets.borrow_mut().extend(
+                published_label_descrs
+                    .into_iter()
+                    .map(|descr_id| (descr_id, bridge_slot)),
+            );
             if let Some(targets) = ca_targets.as_ref().filter(|_| allow_ca) {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
