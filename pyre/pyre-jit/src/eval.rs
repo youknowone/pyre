@@ -9053,8 +9053,19 @@ fn handle_fail(
     // before `should_bridge` can spend another retrace-limit cycle trying to
     // close a bridge at the same failing loop header; blackhole resumes this
     // invocation without the invalidated compiled loop.
-    if descr_arc.range_foriter_green_key().is_some()
-        && pyre_jit_trace::trace::range_foriter_demote_once(green_key)
+    //
+    // The demotion registry is keyed on the FOR_ITER SITE, which is what the
+    // marker carries and what `walker_foriter_green_key` reads back before
+    // specializing again — `make_green_key(w_code, foriter_start_pc)` for the
+    // FOR_ITER the guard protects, not for the loop this trace was entered at.
+    // Those differ whenever the specialized FOR_ITER is not the entry header
+    // itself (an inner loop inside a trace entered at an outer one), and
+    // demoting under the entry key would leave the polymorphic site
+    // specialized — re-failing forever — while retiring an innocent one.  The
+    // token surgery below stays on `green_key`: the trace to discard is the
+    // one that just failed.
+    if let Some(site_key) = descr_arc.range_foriter_green_key()
+        && pyre_jit_trace::trace::range_foriter_demote_once(site_key)
     {
         let (driver, _) = driver_pair();
         driver.invalidate_loop(green_key);
