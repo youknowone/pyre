@@ -2470,7 +2470,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     let saved_fbw_mode = ctx.fbw_mode;
-    let journal_before = fbw_store_journal_len();
+    // The odometer counts every journaled effect — a store, a list append/pop,
+    // a cell store — where the store journal counts only the first.  The
+    // rewind arm below reads it to decide whether this descent already applied
+    // something, the same question `latch_abort_call_resume` answers with it.
+    let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
@@ -4269,7 +4273,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // prologue's side effects a second time at trace time.  RPython's
     // `do_residual_call` runs the call exactly once (`pyjitpl.py`), so a
     // side-effecting prologue must decline the CA inline (see the arm).
-    let prologue_journal_before = fbw_store_journal_len();
+    //
+    // The odometer, not the store journal alone: a store, a list append/pop
+    // and a cell store each bump it, and the store journal counts only the
+    // first.  `latch_abort_call_resume` — the sibling that decides the same
+    // "did this sub-walk already run an effect" question for the abort latch —
+    // reads it for that reason.
+    let prologue_effects_before = fbw_executed_effect_count();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
     // initializes `outer_active_boxes: Vec::new()`; it is computed
@@ -5046,12 +5056,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // CODEX1 parity: decline the CA inline when the prologue sub-walk
-            // mutated the heap (a journaled list store, or an unjournaled
+            // mutated the heap (any journaled effect the odometer counts — a
+            // store, a list append/pop, a cell store — or an unjournaled
             // effect newly set during the sub-walk).  Emitting the CA here
             // would re-run the whole call via the residual executor, applying
             // those side effects twice at trace time.  A side-effect-free
             // prologue (the common loop-setup-only case) still inlines.
-            if fbw_store_journal_len() > prologue_journal_before
+            if fbw_executed_effect_count() != prologue_effects_before
                 || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
             {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
