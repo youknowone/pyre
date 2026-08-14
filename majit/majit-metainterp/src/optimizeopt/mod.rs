@@ -3418,14 +3418,21 @@ impl OptContext {
                         None => continue,
                     };
                     let object_arg = produced_op.preamble_op.arg(0);
-                    let Some(obj) = resolve_arg(
+                    // The receiver must still be bindable in this namespace —
+                    // a miss means the replay cannot be reconstructed and the
+                    // whole short preamble is declined. The emitted op keeps
+                    // `preamble_op`'s own receiver rather than this resolution;
+                    // see the comment on `obj_b` below.
+                    if resolve_arg(
                         object_arg.to_opref(),
                         self,
                         &produced_results,
                         imported_constants,
-                    ) else {
+                    )
+                    .is_none()
+                    {
                         return false;
-                    };
+                    }
                     let new_pop = match produced_op.preamble_op.opcode {
                         OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
                             let opcode = match result_type {
@@ -3434,7 +3441,15 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetfieldGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            let obj_b = dep_or_materialize(self, &produced, obj);
+                            // shortpreamble.py:416-426 keeps the exported
+                            // `preamble_op` object on the builder. Its receiver
+                            // is the renamed short-inputarg (or replay result),
+                            // while `source_op` separately carries the original
+                            // receiver used by HeapOp.produce_op for PtrInfo.
+                            // Resolving this arg through `short_args` collapses
+                            // those identities and emits guards on an exporting-
+                            // phase box that a retrace cannot bind.
+                            let obj_b = produced_op.preamble_op.arg(0);
                             let mut op = Op::new(opcode, &[obj_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);
@@ -3462,18 +3477,21 @@ impl OptContext {
                             // pull the integer VALUE through the shared
                             // `classify_short_arg` rule. `OpRef::raw()` is a
                             // tagged trace position — not the constant value.
+                            // As with the receiver, this only decides whether
+                            // the index is bindable at all.
                             let index_arg = produced_op.preamble_op.arg(1);
-                            let index_opref = match resolve_arg(
+                            if resolve_arg(
                                 index_arg.to_opref(),
                                 self,
                                 &produced_results,
                                 imported_constants,
-                            ) {
-                                Some(r) => r,
-                                None => return false,
-                            };
-                            let obj_b = dep_or_materialize(self, &produced, obj);
-                            let index_b = dep_or_materialize(self, &produced, index_opref);
+                            )
+                            .is_none()
+                            {
+                                return false;
+                            }
+                            let obj_b = produced_op.preamble_op.arg(0);
+                            let index_b = produced_op.preamble_op.arg(1);
                             let mut op = Op::new(opcode, &[obj_b, index_b]);
                             op.pos.set(replay_pos(*source, produced_op));
                             op.setdescr(descr);

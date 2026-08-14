@@ -2663,10 +2663,29 @@ impl ExtendedShortPreambleBuilder {
         label_args: &[OpRef],
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> bool {
-        // Build Phase 1 → current inputarg remap from arg_mapping. The
-        // values bind to their current-namespace producers here, where the
-        // ctx is available — the remap reads below are `&self`.
+        // Bind every serialized inputarg domain to the current Label. The
+        // values carry their current-namespace producers here, where the ctx
+        // is available; remap reads below are `&self`.
         self.phase1_to_inputarg.clear();
+        for (&source, &current_inputarg) in short_preamble.inputargs.iter().zip(label_args.iter()) {
+            if source != current_inputarg {
+                self.phase1_to_inputarg
+                    .insert(source, ctx.materialize_operand_at(current_inputarg));
+            }
+        }
+        // An active builder keeps the renamed short-inputargs as its Label,
+        // but setup remaps its ops into the current label namespace. A short
+        // preamble rebuilt by that builder records the remapped namespace in
+        // `phase1_inputargs`; seed it positionally just like the primary Label
+        // domain so a later retrace can resolve those operands.
+        if let Some(phase1_inputargs) = short_preamble.phase1_inputargs.as_ref() {
+            for (&source, &current_inputarg) in phase1_inputargs.iter().zip(label_args.iter()) {
+                if source != current_inputarg {
+                    self.phase1_to_inputarg
+                        .insert(source, ctx.materialize_operand_at(current_inputarg));
+                }
+            }
+        }
         for entry in &short_preamble.ops {
             for &(arg_pos, label_idx) in &entry.arg_mapping {
                 if let Some(phase1_ref) = entry.op.getarglist().get(arg_pos) {
@@ -3190,12 +3209,31 @@ impl ExtendedShortPreambleBuilder {
             .iter()
             .map(|op| std::rc::Rc::new(op.clone()))
             .collect();
-        build_short_preamble_struct_from_ops(
+        let mut short_preamble = build_short_preamble_struct_from_ops(
             &self.short_inputargs,
             &ops,
             &self.used_boxes,
             &self.short_jump_args,
-        )
+        );
+        // `self.short_inputargs` stays in the exported renamed namespace, but
+        // setup() rewrites the replay ops through `phase1_to_inputarg`. Preserve
+        // that positional pairing so the next Extended builder can remap the
+        // rewritten operands. Upstream needs no side channel because both are
+        // the same stable Box objects.
+        let phase1_inputargs: Vec<OpRef> = short_preamble
+            .inputargs
+            .iter()
+            .map(|source| {
+                self.phase1_to_inputarg
+                    .get(source)
+                    .map(|target| target.to_opref())
+                    .unwrap_or(*source)
+            })
+            .collect();
+        if phase1_inputargs != short_preamble.inputargs {
+            short_preamble.phase1_inputargs = Some(phase1_inputargs);
+        }
+        short_preamble
     }
 
     pub fn extra_same_as(&self) -> &[Op] {
@@ -4467,6 +4505,49 @@ mod tests {
                 .map(|a| a.to_opref())
                 .collect::<Vec<_>>(),
             vec![OpRef::int_op(14)]
+        );
+    }
+
+    #[test]
+    fn extended_builder_preserves_remapped_inputarg_domain() {
+        let renamed = OpRef::input_arg_typed(51, Type::Ref);
+        let original = OpRef::input_arg_typed(8, Type::Ref);
+        let current = OpRef::ref_op(80);
+        let sb = ShortPreambleBuilder::new(&[original], &[], &[renamed]);
+        let mut builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        let initial = ShortPreamble {
+            ops: vec![ShortPreambleOp {
+                op: Op::new(OpCode::GetfieldGcR, &[Operand::bound_from_opref(renamed)]),
+                arg_mapping: vec![(0, 0)],
+                fail_arg_mapping: Vec::new(),
+            }],
+            inputargs: vec![renamed],
+            used_boxes: Vec::new(),
+            jump_args: Vec::new(),
+            exported_state: None,
+            constants: majit_ir::ConstMap::new(),
+            inputarg_infos: Vec::new(),
+            phase1_inputargs: None,
+        };
+        let mut ctx = crate::optimizeopt::OptContext::new(128);
+
+        assert!(builder.setup(&initial, &[original], &mut ctx));
+        let rebuilt = builder.build_short_preamble_struct();
+        assert_eq!(rebuilt.phase1_inputargs, Some(vec![original]));
+        assert_eq!(rebuilt.ops[0].op.arg(0).to_opref(), original);
+        assert!(rebuilt.ops[0].arg_mapping.is_empty());
+
+        let mut retrace_builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        assert!(retrace_builder.setup(&rebuilt, &[current], &mut ctx));
+        assert_eq!(
+            retrace_builder.short_op(0).unwrap().arg(0).to_opref(),
+            current
+        );
+        assert_eq!(
+            retrace_builder
+                .build_short_preamble_struct()
+                .phase1_inputargs,
+            Some(vec![current])
         );
     }
 }

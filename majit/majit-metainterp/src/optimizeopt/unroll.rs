@@ -3819,6 +3819,17 @@ impl OptUnroll {
                 }
             }
         }
+        // When setup() activates an Extended builder, replay reads its live
+        // remapped ops below rather than `short_preamble.ops`. Those operands
+        // are in the builder's current Label domain, so seed that domain from
+        // the same positional jump args. RPython needs only the primary seed:
+        // its setup stores and replays the same Box objects without pyre's
+        // serialized-OpRef remap between the stored target and live builder.
+        if let Some(builder) = ctx.active_short_preamble_producer.as_ref() {
+            for (&label_arg, &jump_arg) in builder.label_args().iter().zip(jump_args.iter()) {
+                mapping.entry(label_arg).or_insert(jump_arg);
+            }
+        }
 
         // RPython keys `mapping` by Box identity: the seeding loops above bind
         // each short-preamble INPUT box to its jump arg, and the replay loop
@@ -7157,6 +7168,11 @@ mod tests {
         assert!(pop.is_some(), "PreambleOp must be in PtrInfo._fields");
         let pop = pop.unwrap();
         assert_eq!(pop.op.to_opref(), OpRef::int_op(11)); // Phase 1 source — pop.op
+        assert_eq!(
+            pop.preamble_op.arg(0).to_opref(),
+            si0.to_opref(),
+            "heap replay must retain the renamed short-inputarg receiver"
+        );
         drop(parent);
     }
 
