@@ -737,6 +737,24 @@ mod win_nt {
         }
     }
 
+    /// ntpath.realpath helper — the final component's on-disk name, read out of
+    /// the `cFileName` FindFirstFileW fills in. This is the only way to learn
+    /// the long name behind an 8.3 alias (`C:\PROGRA~1` → `Program Files`) when
+    /// the file cannot be opened, so `_getfinalpathname_nonstrict` falls back
+    /// to it on the winerrors that mean "found it, but no handle for you"
+    /// (`ntpath.py:648-655`). Only the leaf is returned; the caller splits the
+    /// parent off itself.
+    pub fn _findfirstfile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let (path, as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
+        if path.as_encoded_bytes().contains(&0) {
+            return Err(crate::PyError::value_error("embedded null character"));
+        }
+        match host_nt::find_first_file_name(Path::new(&path)) {
+            Ok(name) => Ok(wrap_path(&name, as_bytes)),
+            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
+        }
+    }
+
     /// os.stat helper for ntpath.samefile — (volume serial, file index high,
     /// file index low) uniquely identifies a file across handles. host_env has
     /// no wrapper for GetFileInformationByHandle, so call windows-sys directly.
@@ -3118,6 +3136,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 1u16,
             ),
             ("_getfinalpathname", win_nt::_getfinalpathname, 1),
+            ("_findfirstfile", win_nt::_findfirstfile, 1),
             ("_getfileinformation", win_nt::_getfileinformation, 1),
             ("_getdiskusage", win_nt::_getdiskusage, 1),
             ("get_handle_inheritable", win_nt::get_handle_inheritable, 1),
