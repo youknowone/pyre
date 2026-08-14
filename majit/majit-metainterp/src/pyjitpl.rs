@@ -6325,7 +6325,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
@@ -8000,7 +8000,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `compile.py:797-811` — a retrace grown from a guard failure is
         // installed under the source guard's own loop token, so a close onto
         // one of that token's target tokens stays inside a single live code

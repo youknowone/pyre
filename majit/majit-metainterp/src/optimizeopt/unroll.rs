@@ -385,6 +385,30 @@ pub struct UnrollOptimizer {
 }
 
 impl UnrollOptimizer {
+    /// Supply the target tokens an earlier compile of this green key left
+    /// behind, stripped of their short-preamble producers.
+    ///
+    /// unroll.py:250 declares `short_preamble_producer = None` on `OptUnroll`
+    /// and only `finalize_short_preamble` (unroll.py:298) ever sets it, so
+    /// upstream enters every compile with exactly one producer: the one for
+    /// the target token that compile is minting. That is what lets
+    /// `inline_short_preamble` decide by identity — `sb.target_token is
+    /// target_token` (unroll.py:376-385) — whether it may set the builder up
+    /// in place against the current label args.
+    ///
+    /// pyre parks the producer on the `TargetToken` instead, and the tokens
+    /// resupplied here are clones of a previous compile's. Left intact, the
+    /// first one whose virtual state matches would hand out that compile's
+    /// builder, which would then be set up against this trace's label args and
+    /// have its stored short preamble overwritten with one naming this
+    /// compile's boxes.
+    pub fn seed_prior_target_tokens(&mut self, mut tokens: Vec<TargetToken>) {
+        for token in &mut tokens {
+            token.short_preamble_producer = None;
+        }
+        self.target_tokens = tokens;
+    }
+
     pub fn new() -> Self {
         UnrollOptimizer {
             short_preamble: None,
@@ -3521,6 +3545,12 @@ impl OptUnroll {
             let mut extra = Vec::new();
             if let Some(sp) = target_token.short_preamble.clone() {
                 if let Some(mut builder) = target_token.short_preamble_producer.take() {
+                    // unroll.py:376-385 inline_short_preamble sets a builder up
+                    // in place only when `sb.target_token is target_token`.
+                    // pyre needs no such test here: a producer exists only on
+                    // the token this compile minted, because
+                    // `seed_prior_target_tokens` strips the ones an earlier
+                    // compile left behind.
                     if let Some(label_args) = current_label_args {
                         // shortpreamble.py:283-296 / 311-341 parity:
                         // setup() returns false when an op references an
