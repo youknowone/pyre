@@ -10701,7 +10701,14 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     if unsafe { pyre_object::w_list_len(inner_self) } == len_before
         && subwalk_guard_follows_store(ctx.trace_ctx, walk_start)
     {
-        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: op.pc });
+        // This decline is an ordering verdict on the receiver, not a descent
+        // that reached an unlowered helper, so there is no symbolic address to
+        // carry.  Zero is unambiguous: a real symbolic hash always carries the
+        // `SYMBOLIC_FNADDR_BASE` tag.
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op.pc,
+            symbolic: 0,
+        });
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
 
