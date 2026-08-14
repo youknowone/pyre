@@ -252,10 +252,9 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
         let mut by_fnaddr = indexmap::IndexMap::with_capacity(entries.len());
         for (index, build_fnaddr) in entries {
             let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
-            assert!(
-                by_fnaddr.insert(fnaddr, index).is_none(),
-                "duplicate fnaddr in frozen indirectcalltargets"
-            );
+            // Identical-code folding can map several build-time addresses to
+            // one runtime address; retain the first target for that address.
+            by_fnaddr.entry(fnaddr).or_insert(index);
         }
         by_fnaddr
     });
@@ -2204,6 +2203,11 @@ mod tests {
 
     #[test]
     fn indirect_target_lookup_decodes_only_the_matched_jitcode() {
+        // The spawn is the isolation, not a stack-size workaround: every cell
+        // table here is thread-local, and `load_jitcode_cells` leaks a fresh
+        // slice per thread, so a new thread starts with the whole table
+        // undecoded no matter what the rest of the harness already ran. That
+        // is what lets the counts below be absolute rather than a delta.
         std::thread::spawn(|| {
             assert!(jitcode_cells().iter().all(|cell| cell.get().is_none()));
             let (&fnaddr, &index) = INDIRECTCALLTARGET_BY_FNADDR
@@ -2213,7 +2217,12 @@ mod tests {
             assert_eq!(indirectcalltarget_index_for_address(fnaddr), Some(index));
             let jitcode = indirectcalltarget_by_index(index)
                 .expect("frozen indirect-call target index must resolve");
-            assert_eq!(jitcode.fnaddr as usize, fnaddr);
+            // The map is keyed by runtime address, while `JitCode.fnaddr`
+            // stays the build-time one; translate before comparing.
+            assert_eq!(
+                crate::runtime_fnaddr_patch::runtime_fnaddr(jitcode.fnaddr) as usize,
+                fnaddr
+            );
             assert_eq!(
                 jitcode_cells()
                     .iter()

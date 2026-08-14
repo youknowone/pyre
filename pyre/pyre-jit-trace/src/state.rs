@@ -145,6 +145,20 @@ struct MetaInterpStaticData {
     /// fnaddr to dense index without decoding bodies; this owner memoizes only
     /// bodies actually requested, preserving upstream's stable JitCode object
     /// identity within this interpreter/JIT state.
+    ///
+    /// This memo is load-bearing rather than a convenience cache:
+    /// `jitcode_runtime::indirectcalltarget_by_index` rebuilds a fresh
+    /// `Arc<JitCode>` from the canonical body on every call, so without a memo
+    /// two lookups of one fnaddr would hand out two distinct objects and
+    /// `indirectcall_dict`'s identity contract would be lost.
+    ///
+    /// It must also stay on the thread-local state and must not be hoisted to a
+    /// process-wide registry. The whole jitcode table it derives from is
+    /// deliberately per-thread — `load_jitcode_cells` leaks a fresh cell slice
+    /// per thread, on the stated ground that the runtime is single-threaded by
+    /// construction and a per-thread cache is what matches the module-level
+    /// dict semantics. A shared map over per-thread arenas would hand one
+    /// thread a body minted from another thread's family.
     frozen_indirectcall_dict:
         indexmap::IndexMap<usize, std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
 }
