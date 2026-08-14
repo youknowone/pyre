@@ -1067,8 +1067,9 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     );
 
     let base_prefix = sysconfigdata_base_prefix();
-    let base_prefix_str =
-        pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()));
+    let base_prefix_str = pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(
+        base_prefix.as_os_str(),
+    ));
 
     let vars = pyre_object::w_dict_new();
     // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
