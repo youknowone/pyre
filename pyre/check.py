@@ -558,31 +558,62 @@ def pyre_env():
     # and the `min_heap_size` floor is applied after it (:2452), so the floor
     # wins on every host.
     #
+    # "Every fixture's working set" is the criterion, but the value was chosen
+    # against the two fixtures that motivated it, and `str_fstring` sits above
+    # it. That fixture merges six hot loops into one run, and at 256MB it still
+    # crossed: it reads `guard_failures` 658 or 659 as a function of nothing but
+    # how much the process allocated before the loops got hot. Startup
+    # allocation is the whole input — a 49-variable environment reads 659 and a
+    # 9-variable one 658, with the same binary, the same nursery and the same
+    # fixture, non-monotonically in the variable count. That is the same
+    # preamble-vs-body knife edge described above, and it is what the three
+    # per-platform overlays were holding: each host has its own startup
+    # allocation volume, so each landed on its own side of the crossing.
+    #
+    # 512MB clears it. `str_fstring` then reads 657 at every nursery from 4MB to
+    # 32MB and under every perturbation of that startup volume — the same
+    # invariance that says "no crossing at all" for the two fixtures above.
+    # Eight other fixtures move with it, none of them a knife edge at either
+    # value: `arith_int_bool` 2214 -> 2212, `build_set_hashability` 4 -> 2,
+    # `bytes_split_whitespace_maxsplit` 3 -> 2,
+    # `delete_negative_open_slice_hot` 1405 -> 1404, `instance_dict_reassign`
+    # 2 -> 1, `newslice_step_hot` 5 -> 3 and `unpack_ex_hot` 3 -> 2 lose a
+    # crossing, and `inlined_helper_mutation` 3 -> 4 relocates one. No
+    # `loops_compiled` or `bridges_compiled` moves anywhere in the suite, which
+    # is the signature that says the collection schedule is the only thing that
+    # changed.
+    #
+    # The cost is memory, and it is paid by the one fixture that was over the
+    # old threshold: `str_fstring` peaks at 618MB against 519MB. Every other
+    # fixture is flat to within a megabyte (`closure_per_call` 179 -> 180MB,
+    # `recursive_call_frame_relocation` 159 -> 160MB), because a threshold only
+    # costs what a fixture actually retains.
+    #
     # Both pins reach the wasm backend only because `pyre-wasm-runner` hands
     # them to the guest explicitly (`pyre_set_gc_env`): a wasm32-unknown-unknown
     # module's `std::env` is permanently empty, so setting them here does
     # nothing on its own there.
     #
     # Reaching the guest is not the same as clearing the crossing there. 256MB
-    # removes it on both native backends and does not in the guest, which reads
-    # `recursive_call_frame_relocation` 638 and `closure_per_call` 420 against
-    # their 636 and 414 — the same knife edge described above, one step along
-    # it. Historically the two ran different interpreter allocation models:
-    # `PYRE_GC_INTERP` was off natively and on in the guest, so only the guest
-    # counted interpreter-created int/float boxes toward the old-gen threshold.
-    # The gate is now default-on everywhere and the allocation model is shared;
-    # this note remains because the recorded wasm memory/counter boundary below
-    # predates that convergence and still explains why the 256MB floor was
-    # chosen instead of tuning a platform-specific overlay.
+    # removed it on both native backends and did not in the guest, whose
+    # baselines held `recursive_call_frame_relocation` 638 and
+    # `closure_per_call` 415 against their 636 and 414 — the same knife edge
+    # described above, one step along it. Historically the two ran different
+    # interpreter allocation models: `PYRE_GC_INTERP` was off natively and on in
+    # the guest, so only the guest counted interpreter-created int/float boxes
+    # toward the old-gen threshold. The gate is now default-on everywhere and
+    # the allocation model is shared, but the recorded counter boundary outlived
+    # that convergence, because the threshold was still inside the guest's
+    # working set.
     #
-    # Left where it is deliberately. 384MB and above does land the guest exactly
-    # on the native counts, but it buys agreement with memory: `closure_per_call`
-    # peaks at 459MB there against 358MB here. The three baselines are recorded
-    # per backend and each is deterministic — five repeats of both fixtures
-    # under the guest report one number — so the difference costs nothing but
-    # the sensitivity this note is here to name: a change in interpreter-path
-    # allocation volume moves the wasm numbers while the native ones sit still.
-    env.setdefault("PYPY_GC_MIN", str(256 * 1024 * 1024))
+    # The value below is past it, so the guest now lands exactly on the native
+    # counts: both fixtures re-recorded to 636 and 414, identical across all
+    # three backends. It buys that agreement with memory — `closure_per_call`
+    # peaked at 459MB under the guest at 384MB against 358MB at 256MB. The
+    # sensitivity this note is here to name outlives the convergence: a change
+    # in interpreter-path allocation volume moves the wasm numbers while the
+    # native ones sit still.
+    env.setdefault("PYPY_GC_MIN", str(512 * 1024 * 1024))
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.
     #
@@ -1578,35 +1609,36 @@ class Check:
         # and all three backends, and the band this gate replaced is exactly
         # what let eight baselines go stale unnoticed.
         #
-        # Measured, not assumed, and read back from the runner jobs rather than
-        # predicted. ubuntu-24.04 reports str_fstring guard_failures 658/659 on
-        # dynasm/cranelift. macos-latest reports the inverse 659/658, and
-        # windows-latest reports 658/658. Every other gated counter is identical
-        # (six loops and three bridges), and each mismatch reproduced in both
-        # stability reruns.
+        # No fixture has one at present, and the last set to need them is worth
+        # recording because of how it ended. `str_fstring` was carried by three:
+        # the runners read guard_failures 658/659 on ubuntu dynasm/cranelift,
+        # the inverse 659/658 on macos, and 658/658 on windows, with every other
+        # gated counter identical (six loops, three bridges) and each mismatch
+        # reproducing in both stability reruns. The split was stable per host, so
+        # it read as a host disagreement.
         #
-        # A local arm64 macOS build observes the macos-latest pair rather than
-        # ubuntu's: two full local gates pass against plain `.darwin` overlays
-        # holding dynasm 659 and cranelift 658. Darwin is therefore carried
-        # platform-wide, and the darwin GitHub-runner overlay that once held the
-        # same cranelift value was dropped as unreachable.
+        # It was not one. The knife edge is a major-collection crossing landing
+        # either side of the peeled preamble (see `pyre_env`), and its input is
+        # how much the process allocated before the loops got hot — a quantity
+        # every host computes differently and nothing about the platform fixes.
+        # Adding check.py's two wasm environment keys, semantically ignored by
+        # the native backend, moves a local macOS cranelift build 658 -> 659
+        # while the number of major collections stays at 11; the guard sequence
+        # gains one trace-6 fail-5 exit that the compiled-trace log maps to the
+        # GuardFalse on the eval-breaker poll. Raising `PYPY_GC_MIN` past the
+        # fixture's working set removed the crossing, and all three overlays
+        # came out with it.
         #
-        # This is a collection-schedule boundary, not a compile-shape change.
-        # On a local arm64 macOS cranelift build, adding check.py's two wasm
-        # environment keys (ignored semantically by the native backend) moves
-        # 658 -> 659 while the number of major collections stays at 11. The
-        # guard sequence gains one trace-6 fail-5 exit; the compiled-trace log
-        # maps it to the GuardFalse on the eval-breaker poll. Thus the knife edge
-        # is where a collection-triggered breaker lands, not how many loops or
-        # bridges compile. The runner did not enable either census, so exactly
-        # which host input moves that placement remains unidentified; the
-        # observed counter and stable runner split are direct measurements.
+        # That is the shape to look for before writing one: a counter that
+        # splits per host and moves under a perturbation with no semantic
+        # content is not a host disagreement, it is a boundary the harness has
+        # not pinned yet. An overlay would have frozen it per platform instead.
         #
-        # An overlay shadows the shared baseline permanently, so one written
-        # against a value that later converges becomes a failure main does not
-        # have: `recursive_call_frame_relocation` was given one for 637, and
-        # windows later converged on its shared value. Read all three runners
-        # back before adding or retaining another.
+        # An overlay also shadows the shared baseline permanently, so one
+        # written against a value that later converges becomes a failure main
+        # does not have: `recursive_call_frame_relocation` was given one for
+        # 637, and windows later converged on its shared value. Read all three
+        # runners back before adding or retaining another.
         source = Path(script)
         if os.environ.get("GITHUB_ACTIONS") == "true":
             github_runner = source.with_name(
