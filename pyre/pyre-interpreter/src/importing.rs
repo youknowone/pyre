@@ -934,31 +934,30 @@ fn extension_abi_suffix() -> String {
 
 /// `shutil.which` for the compiler probe in `init_sysconfigdata`: the build
 /// variables name `gcc` only when one is on `PATH`.
-#[cfg(feature = "host_env")]
+///
+/// The entries are tested with [`exists_and_is_executable`], the same probe
+/// `find_invoked_executable` walks `PATH` with, so both answer X_OK the way
+/// `os.access` does rather than by reading mode bits.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|directory| {
-        if directory.as_os_str().is_empty() {
-            return false;
-        }
-        let candidate = directory.join(program);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            candidate
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            candidate.is_file()
-        }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| {
+            !directory.as_os_str().is_empty() && exists_and_is_executable(&directory.join(program))
+        })
     })
 }
 
-#[cfg(not(feature = "host_env"))]
+/// A sandboxed interpreter reaches no host `PATH` and a wasm guest has no host
+/// process at all, so neither names a compiler.
+#[cfg(not(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+)))]
 fn on_path(_program: &str) -> bool {
     false
 }
