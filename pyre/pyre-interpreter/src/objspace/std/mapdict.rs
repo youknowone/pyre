@@ -4447,12 +4447,29 @@ static INSTANCE_DICT_PENDING: LazyLock<Mutex<HashSet<usize>>> =
 static WEAKREF_TABLE_PENDING: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Keys that were a nursery address when the entry was made.  A nursery
+/// address is handed to the next allocation as soon as the collection that
+/// dropped its owner resets the nursery, so such a key must be resolved to
+/// where the owner moved — or dropped, if it died — before that happens.  See
+/// [`reconcile_young_owner_entries`].
+static INSTANCE_DICT_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static WEAKREF_TABLE_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn note_young_owner(young: &Mutex<HashSet<usize>>, key: PyObjectRef) {
+    if majit_gc::gc_is_nursery_object(key as usize) {
+        young.lock().unwrap().insert(key as usize);
+    }
+}
+
 fn instance_dict_insert(key: PyObjectRef, w_dict: PyObjectRef) {
     INSTANCE_DICT
         .lock()
         .unwrap()
         .insert(key as usize, w_dict as usize);
     INSTANCE_DICT_PENDING.lock().unwrap().insert(key as usize);
+    note_young_owner(&INSTANCE_DICT_YOUNG, key);
 }
 
 fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
@@ -4461,6 +4478,7 @@ fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
         .unwrap()
         .insert(key as usize, value as usize);
     WEAKREF_TABLE_PENDING.lock().unwrap().insert(key as usize);
+    note_young_owner(&WEAKREF_TABLE_YOUNG, key);
 }
 
 struct MapdictRootArea;
@@ -5207,6 +5225,62 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
         for key in dead {
             table.remove(&key);
             pending.remove(&key);
+        }
+    }
+}
+
+/// Resolve every entry whose owner was young when it was made: move it to
+/// where the owner went, or drop it if the owner died.
+///
+/// [`prune_dead_owner_entries`] answers the same question for old-gen owners,
+/// but a major is far too late for a young one. A nursery address is reused by
+/// the very next allocation after the collection resets the nursery, so a
+/// surviving entry does not just leak — the unrelated object that lands on
+/// that address inherits the dead owner's `__dict__`.
+///
+/// Registered with `majit_gc::shadow_stack::register_young_owner_reconciler`,
+/// which runs it from a minor collection once every survivor has been
+/// evacuated. `classify` returns the owner's current address, or `None` if it
+/// died. Only keys recorded as young are asked about, so the cost is
+/// proportional to the entries made since the previous minor.
+pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    for (table, pending, young) in [
+        (&INSTANCE_DICT, &INSTANCE_DICT_PENDING, &INSTANCE_DICT_YOUNG),
+        (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, &WEAKREF_TABLE_YOUNG),
+    ] {
+        let keys: Vec<usize> = {
+            let mut young = young.lock().unwrap();
+            std::mem::take(&mut *young).into_iter().collect()
+        };
+        if keys.is_empty() {
+            continue;
+        }
+        let mut table = table.lock().unwrap();
+        let mut pending = pending.lock().unwrap();
+        let mut still_young = Vec::new();
+        for key in keys {
+            match classify(key) {
+                // The owner stayed put, which for a nursery address means it
+                // was pinned: keep tracking it, the next minor asks again.
+                Some(new_key) if new_key == key => still_young.push(key),
+                Some(new_key) => {
+                    // The root walk may already have re-keyed this entry, in
+                    // which case there is nothing left at the old address.
+                    if let Some(value) = table.remove(&key) {
+                        table.insert(new_key, value);
+                    }
+                    if pending.remove(&key) {
+                        pending.insert(new_key);
+                    }
+                }
+                None => {
+                    table.remove(&key);
+                    pending.remove(&key);
+                }
+            }
+        }
+        if !still_young.is_empty() {
+            young.lock().unwrap().extend(still_young);
         }
     }
 }

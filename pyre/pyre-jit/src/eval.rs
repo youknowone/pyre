@@ -4264,6 +4264,12 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_ephemeron_marker(
         pyre_interpreter::objspace::std::mapdict::mark_live_weakref_entries,
     );
+    // An owner that dies in the nursery cannot wait for that major: the reset
+    // hands its address to the next allocation, which would then answer to its
+    // entry.
+    majit_gc::shadow_stack::register_young_owner_reconciler(
+        pyre_interpreter::objspace::std::mapdict::reconcile_young_owner_entries,
+    );
     // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
     // `JIT_DRIVER` rather than a global table, so it registers per mutator
     // instead — see `forced_virtuals_pruner_area`.

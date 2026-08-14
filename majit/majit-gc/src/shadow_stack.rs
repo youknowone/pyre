@@ -1416,6 +1416,63 @@ pub fn prune_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) 
     }
 }
 
+/// Signature expected by [`register_young_owner_reconciler`].
+///
+/// Same classifier contract as [`EphemeronPrunerFn`], asked at the end of a
+/// minor collection and only about the entries whose owner was young when the
+/// entry was made.
+pub type YoungOwnerReconcilerFn = fn(&mut dyn FnMut(usize) -> Option<usize>);
+
+static YOUNG_OWNER_RECONCILERS: std::sync::RwLock<
+    [Option<YoungOwnerReconcilerFn>; MAX_EPHEMERON_PRUNERS],
+> = std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+
+/// Register a side table that keys entries by the address of an owner that may
+/// still be in the nursery.
+///
+/// A nursery address is reused as soon as the collection that dropped it
+/// resets the nursery, so an entry whose owner dies young does not merely leak
+/// — the next object allocated at that address answers to it.  A major-only
+/// pruner cannot close that window, hence this second registration.
+///
+/// Duplicate registrations are tolerated — the reconciler is only appended if
+/// not already present.
+pub fn register_young_owner_reconciler(reconciler: YoungOwnerReconcilerFn) {
+    let mut guard = YOUNG_OWNER_RECONCILERS.write().unwrap();
+    for slot in guard.iter_mut() {
+        match slot {
+            Some(existing) if std::ptr::fn_addr_eq(*existing, reconciler) => return,
+            None => {
+                *slot = Some(reconciler);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "register_young_owner_reconciler: capacity exceeded ({MAX_EPHEMERON_PRUNERS} reconcilers \
+         already registered)"
+    );
+}
+
+/// Invoke every registered reconciler with a classifier that resolves a young
+/// owner address to where it moved, or reports that it died.
+///
+/// Called from a minor collection once every live nursery object has been
+/// forwarded out and while the forwarding headers are still readable — the
+/// same point `invalidate_young_weakrefs` settles the weakref slots.  Unlike
+/// [`prune_ephemeron_tables`] this costs O(entries made since the previous
+/// minor), not O(table).
+pub fn reconcile_young_owner_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    let reconcilers = {
+        let guard = YOUNG_OWNER_RECONCILERS.read().unwrap();
+        *guard
+    };
+    for slot in reconcilers.iter().flatten() {
+        slot(classify);
+    }
+}
+
 // ── Extern "C" interface for compiled code ──────────────────────
 
 /// Push a GC reference from compiled code.

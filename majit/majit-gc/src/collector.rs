@@ -2360,6 +2360,30 @@ impl MiniMarkGC {
             self.deal_with_young_objects_with_destructors();
         }
 
+        // An embedder side table keyed by owner address cannot be left holding
+        // a nursery key past this point: the reset below hands that address to
+        // the next allocation, which would then answer to the dead owner's
+        // entry.  Ask the same survival question `invalidate_young_weakrefs`
+        // just answered, while the forwarding headers still read.
+        let pinned = &self.pinned_objects;
+        let nursery = &self.nursery;
+        let mut classify_young_owner = |owner: usize| -> Option<usize> {
+            if owner == 0 || !nursery.contains(owner) {
+                return Some(owner);
+            }
+            // A pinned object is alive and stayed put, so it never forwarded.
+            if pinned.contains(&owner) {
+                return Some(owner);
+            }
+            let hdr = (owner - GcHeader::SIZE) as *const GcHeader;
+            if unsafe { (*hdr).is_forwarded() } {
+                Some(unsafe { GcHeader::forwarding_address(hdr) })
+            } else {
+                None
+            }
+        };
+        crate::shadow_stack::reconcile_young_owner_tables(&mut classify_young_owner);
+
         // incminimark.py:1876-1882,1900-1944: replace the pin set with exactly
         // the objects reached this collection, then preserve identity shadows
         // and nursery barriers only for those survivors. Clear their temporary

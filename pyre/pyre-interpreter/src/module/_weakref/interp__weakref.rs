@@ -76,8 +76,8 @@ fn field_slot(obj: PyObjectRef, name: &str) -> Option<u32> {
     }
 }
 
-/// Read a per-instance slot from the underlying `INSTANCE_DICT` directly,
-/// bypassing the public `getattr` path. The proxy fast-path in
+/// Read a per-instance field from its reserved layout slot, or from the
+/// underlying `INSTANCE_DICT` directly, bypassing the public `getattr` path. The proxy fast-path in
 /// `baseobjspace::getattr_str` would otherwise force the receiver and recurse
 /// indefinitely while the proxy is reading its OWN `w_obj_weak`/etc.
 fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
@@ -116,7 +116,7 @@ fn read_attr(obj: PyObjectRef, name: &str) -> PyObjectRef {
     value
 }
 
-/// Mirror of `read_attr` for writes — direct dict access keeps lifeline /
+/// Mirror of `read_attr` for writes — direct slot / dict access keeps lifeline /
 /// proxy / weakref bookkeeping out of the fast-path's force loop.
 fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
