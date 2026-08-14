@@ -4384,6 +4384,29 @@ pub trait SizeDescr: Descr {
         &[]
     }
 
+    /// The class word's slot position within `all_fielddescrs()`, or `None`
+    /// when this layout has no class word *in that list*.
+    ///
+    /// ⛔ Deliberately NOT answered from [`Self::class_word_field`].  That one
+    /// searches `gc_fielddescrs()` first, and `with_extra_gc_fielddescr`
+    /// appends header edges that are **absent from `all_fielddescrs()` on
+    /// purpose** — its doc says "kept out of `all_fielddescrs` so the
+    /// positional indexing above is unaffected".  `index_in_parent` is defined
+    /// against `all_fielddescrs()`, so reading it off a gc-only edge yields a
+    /// slot number that indexes an unrelated field: pyre seeds every object
+    /// group's `gc_edges` with the shared header descr at `index_in_parent
+    /// == 0`, which lands on the first value field and forwards `Ref <- Int`.
+    ///
+    /// Byte-offset consumers want `class_word_field()`; positional ones want
+    /// this.  The two lists genuinely differ, so one accessor cannot serve
+    /// both.
+    fn class_word_index_in_parent(&self) -> Option<usize> {
+        self.all_fielddescrs()
+            .iter()
+            .find(|fd| fd.is_w_class())
+            .map(|fd| fd.index_in_parent())
+    }
+
     /// The field slot of *this* layout that holds the class word, or `None`
     /// when this layout has no class word at all.
     ///
@@ -4417,29 +4440,13 @@ pub trait SizeDescr: Descr {
     /// descr that populates the two lists with different objects, and for
     /// that case the GC list is the answer every byte-offset consumer here
     /// was already using.
-    /// The class word's slot position within `all_fielddescrs()`, or `None`
-    /// when this layout has no class word *in that list*.
     ///
-    /// ⛔ Deliberately NOT answered from [`Self::class_word_field`].  That one
-    /// searches `gc_fielddescrs()` first, and `with_extra_gc_fielddescr`
-    /// appends header edges that are **absent from `all_fielddescrs()` on
-    /// purpose** — its doc says "kept out of `all_fielddescrs` so the
-    /// positional indexing above is unaffected".  `index_in_parent` is defined
-    /// against `all_fielddescrs()`, so reading it off a gc-only edge yields a
-    /// slot number that indexes an unrelated field: pyre seeds every object
-    /// group's `gc_edges` with the shared header descr at `index_in_parent
-    /// == 0`, which lands on the first value field and forwards `Ref <- Int`.
-    ///
-    /// Byte-offset consumers want `class_word_field()`; positional ones want
-    /// this.  The two lists genuinely differ, so one accessor cannot serve
-    /// both.
-    fn class_word_index_in_parent(&self) -> Option<usize> {
-        self.all_fielddescrs()
-            .iter()
-            .find(|fd| fd.is_w_class())
-            .map(|fd| fd.index_in_parent())
-    }
-
+    /// ⚠ It answers with the *first* declaring entry.  A layout that publishes
+    /// two — pyre's `Method` declares a payload field named `w_class` beside
+    /// the inherited header, and the legacy name inference accepts both — gets
+    /// the earlier one, which is not the header.  Pinned by
+    /// `every_groups_class_word_is_the_inherited_pyobject_header_slot` in
+    /// `pyre-jit-trace`.
     fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
         self.gc_fielddescrs()
             .iter()
