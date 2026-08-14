@@ -490,6 +490,32 @@ PyAPI_FUNC(int) PyCallable_Check(PyObject *object);
 PyAPI_FUNC(int) PyObject_IsInstance(PyObject *object, PyObject *class_);
 PyAPI_FUNC(PyObject *) PyObject_Type(PyObject *object);
 
+/* Capsules.  The destructor is recorded but never runs: pyre has no object
+   deallocation path to call it from. */
+typedef void (*PyCapsule_Destructor)(PyObject *);
+PyAPI_FUNC(PyObject *) PyCapsule_New(void *pointer, const char *name,
+                                     PyCapsule_Destructor destructor);
+PyAPI_FUNC(void *) PyCapsule_GetPointer(PyObject *capsule, const char *name);
+PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *capsule, void *pointer);
+PyAPI_FUNC(const char *) PyCapsule_GetName(PyObject *capsule);
+PyAPI_FUNC(int) PyCapsule_SetName(PyObject *capsule, const char *name);
+PyAPI_FUNC(void *) PyCapsule_GetContext(PyObject *capsule);
+PyAPI_FUNC(int) PyCapsule_SetContext(PyObject *capsule, void *context);
+PyAPI_FUNC(PyCapsule_Destructor) PyCapsule_GetDestructor(PyObject *capsule);
+PyAPI_FUNC(int) PyCapsule_SetDestructor(PyObject *capsule, PyCapsule_Destructor destructor);
+PyAPI_FUNC(int) PyCapsule_IsValid(PyObject *capsule, const char *name);
+PyAPI_FUNC(void *) PyCapsule_Import(const char *name, int no_block);
+PyAPI_FUNC(int) PyCapsule_CheckExact(PyObject *object);
+
+/* Imports.  The borrowed-reference `PyImport_AddModule` and
+   `PyImport_GetModuleDict` are absent: pyre has no container to hang the
+   borrow on, so only the strong-reference forms exist. */
+PyAPI_FUNC(PyObject *) PyImport_ImportModule(const char *name);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleNoBlock(const char *name);
+PyAPI_FUNC(PyObject *) PyImport_Import(PyObject *name);
+PyAPI_FUNC(PyObject *) PyImport_AddModuleRef(const char *name);
+PyAPI_FUNC(PyObject *) PyImport_GetModule(PyObject *name);
+
 /* The number protocol. */
 PyAPI_FUNC(PyObject *) PyNumber_Add(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_Subtract(PyObject *left, PyObject *right);

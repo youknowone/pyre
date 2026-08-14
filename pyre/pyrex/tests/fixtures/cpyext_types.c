@@ -979,7 +979,88 @@ static PyObject *m_protocol(PyObject *self, PyObject *args)
     return NULL;
 }
 
+/* ── capsules and imports ───────────────────────────────────────────── */
+
+static long capsule_payload = 4242;
+static PyObject *module_capsule;
+
+static void capsule_destructor(PyObject *capsule)
+{
+    (void)capsule;
+}
+
+static PyObject *m_capsule_read(PyObject *self, PyObject *capsule)
+{
+    void *pointer = PyCapsule_GetPointer(capsule, "cpyext_types.PAYLOAD");
+    if (pointer == NULL) {
+        return NULL;
+    }
+    return PyLong_FromLong(*(long *)pointer);
+}
+
+static PyObject *m_capsule_facts(PyObject *self, PyObject *capsule)
+{
+    const char *name = PyCapsule_GetName(capsule);
+    if (name == NULL && PyErr_Occurred()) {
+        return NULL;
+    }
+    int valid = PyCapsule_IsValid(capsule, "cpyext_types.PAYLOAD");
+    int mismatched = PyCapsule_IsValid(capsule, "other");
+    int exact = PyCapsule_CheckExact(capsule);
+    void *context = PyCapsule_GetContext(capsule);
+    return Py_BuildValue("(siiii)", name, valid, mismatched, exact, context != NULL);
+}
+
+static PyObject *m_capsule_wrong_name(PyObject *self, PyObject *capsule)
+{
+    void *pointer = PyCapsule_GetPointer(capsule, "cpyext_types.other");
+    if (pointer == NULL) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *m_capsule_import(PyObject *self, PyObject *unused)
+{
+    void *pointer = PyCapsule_Import("cpyext_types.PAYLOAD", 0);
+    if (pointer == NULL) {
+        return NULL;
+    }
+    return PyLong_FromLong(*(long *)pointer);
+}
+
+static PyObject *m_import(PyObject *self, PyObject *args)
+{
+    const char *name = NULL;
+    const char *attribute = NULL;
+    if (!PyArg_ParseTuple(args, "ss", &name, &attribute)) {
+        return NULL;
+    }
+    PyObject *module = PyImport_ImportModule(name);
+    if (module == NULL) {
+        return NULL;
+    }
+    PyObject *value = PyObject_GetAttrString(module, attribute);
+    Py_DECREF(module);
+    return value;
+}
+
+static PyObject *m_import_ref(PyObject *self, PyObject *args)
+{
+    const char *name = NULL;
+    if (!PyArg_ParseTuple(args, "s", &name)) {
+        return NULL;
+    }
+    return PyImport_AddModuleRef(name);
+}
+
 static PyMethodDef methods[] = {
+    {"capsule_read", m_capsule_read, METH_O, "read the capsule payload"},
+    {"capsule_facts", m_capsule_facts, METH_O, "name, validity and context"},
+    {"capsule_wrong_name", m_capsule_wrong_name, METH_O, "fetch under a wrong name"},
+    {"capsule_import", m_capsule_import, METH_NOARGS, "PyCapsule_Import round trip"},
+    {"import_attr", m_import, METH_VARARGS, "PyImport_ImportModule then getattr"},
+    {"add_module_ref", m_import_ref, METH_VARARGS, "PyImport_AddModuleRef"},
     {"protocol", m_protocol, METH_VARARGS, "drive one abstract protocol call"},
     {"make", m_make, METH_VARARGS, "build a Point without calling the class"},
     {"is_point", m_is_point, METH_O, "PyObject_TypeCheck"},
@@ -1012,12 +1093,26 @@ static int types_exec(PyObject *module)
     if (PyModule_AddType(module, &TableType) < 0) {
         return -1;
     }
+    if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {
+        return -1;
+    }
     TypesError = PyErr_NewExceptionWithDoc("cpyext_types.TypesError",
                                            "raised by the fixture", NULL, NULL);
     if (TypesError == NULL) {
         return -1;
     }
-    return PyModule_AddObjectRef(module, "TypesError", TypesError);
+    if (PyModule_AddObjectRef(module, "TypesError", TypesError) < 0) {
+        return -1;
+    }
+    module_capsule = PyCapsule_New(&capsule_payload, "cpyext_types.PAYLOAD",
+                                   capsule_destructor);
+    if (module_capsule == NULL) {
+        return -1;
+    }
+    if (PyCapsule_SetContext(module_capsule, &capsule_payload) < 0) {
+        return -1;
+    }
+    return PyModule_AddObjectRef(module, "PAYLOAD", module_capsule);
 }
 
 static PyModuleDef_Slot slots[] = {

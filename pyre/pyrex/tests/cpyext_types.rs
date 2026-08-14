@@ -279,6 +279,40 @@ assert p('getstring', {'a': 1}, 'a') == 1
 assert p('haskey', {'a': 1}, 'a') is True
 assert p('haskey', {'a': 1}, 'z') is False
 
+# ── capsules ───────────────────────────────────────────────────────────
+capsule = m.PAYLOAD
+assert repr(capsule).startswith('<capsule object "cpyext_types.PAYLOAD" at 0x')
+assert m.capsule_read(capsule) == 4242
+assert m.capsule_facts(capsule) == ('cpyext_types.PAYLOAD', 1, 0, 1, 1)
+assert m.capsule_import() == 4242
+try:
+    m.capsule_wrong_name(capsule)
+except ValueError as error:
+    assert 'incorrect name' in str(error), str(error)
+else:
+    raise AssertionError('a mismatched capsule name was accepted')
+try:
+    m.capsule_read(object())
+except ValueError as error:
+    assert 'invalid PyCapsule' in str(error), str(error)
+else:
+    raise AssertionError('a non-capsule was accepted')
+
+# ── imports ────────────────────────────────────────────────────────────
+import sys
+assert m.import_attr('sys', 'maxsize') == sys.maxsize
+assert m.import_attr('cpyext_types', 'ANSWER_TYPES') == 'types'
+assert m.add_module_ref('sys') is sys
+fresh = m.add_module_ref('cpyext_fresh_module')
+assert fresh.__name__ == 'cpyext_fresh_module'
+assert sys.modules['cpyext_fresh_module'] is fresh
+try:
+    m.import_attr('cpyext_no_such_module', 'x')
+except ImportError:
+    pass
+else:
+    raise AssertionError('a missing module imported')
+
 print('cpyext-types-ok')
 "#;
 

@@ -121,26 +121,41 @@ pub(super) unsafe fn after_fork_child() {
 /// static, entered by `PyType_Ready` — and every other type gets an immortal
 /// block of the same shape so that `Py_TYPE(x)->tp_name` reads something.
 pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
-    let Some(w_type) = crate::typedef::r#type(w_obj) else {
-        return std::ptr::null_mut();
-    };
-    let w_type = w_type.as_ptr();
-    if let Some(&existing) = linked().get(&(w_type as usize)) {
-        return existing as *mut CPyTypeObject;
+    match crate::typedef::r#type(w_obj) {
+        Some(w_type) => ensure_mirror(w_type.as_ptr()) as *mut CPyTypeObject,
+        None => std::ptr::null_mut(),
     }
-    // A type is an instance of its own metatype, so resolving `ob_type` before
-    // the mirror exists would recurse forever on `type`; the second call finds
-    // this mirror in the table and terminates.
-    let mirror = attach(
-        w_type,
-        REFCNT_IMMORTAL,
-        std::ptr::null_mut(),
-        size_of::<CPyTypeObject>(),
-    ) as *mut CPyTypeObject;
-    super::typeobject::describe_interpreter_type(mirror, w_type);
-    let of_type = type_mirror(w_type);
-    unsafe { (*mirror).ob_base.ob_base.ob_type = of_type };
-    mirror
+}
+
+/// `w_obj`'s mirror, allocated on first demand.
+///
+/// A type gets a `PyTypeObject`-shaped block by whichever route reaches it
+/// first: `Py_TYPE(x)->tp_basicsize` is read off any type mirror, so a type may
+/// never receive the plain `PyObject`-sized block a non-type receives — a
+/// `PyModule_AddObject` of a class would otherwise decide the shape.
+fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+    if let Some(&existing) = linked().get(&(w_obj as usize)) {
+        return existing as *mut CPyObject;
+    }
+    if unsafe { pyre_object::is_type(w_obj) } {
+        // A type is an instance of its own metatype, so resolving `ob_type`
+        // before the mirror is entered would recurse forever on `type`; the
+        // second call finds this mirror in the table and terminates.
+        let mirror = attach(
+            w_obj,
+            REFCNT_IMMORTAL,
+            std::ptr::null_mut(),
+            size_of::<CPyTypeObject>(),
+        ) as *mut CPyTypeObject;
+        super::typeobject::describe_interpreter_type(mirror, w_obj);
+        let of_type = type_mirror(w_obj);
+        unsafe { (*mirror).ob_base.ob_base.ob_type = of_type };
+        return mirror as *mut CPyObject;
+    }
+    // The type mirror is resolved before the object's own mirror is entered so
+    // the two `linked()` acquisitions never nest.
+    let ob_type = type_mirror(w_obj);
+    attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type))
 }
 
 /// Allocate a zero-filled mirror block of `size` bytes and enter it into the
@@ -200,15 +215,9 @@ pub fn make_ref(w_obj: PyObjectRef) -> *mut CPyObject {
     if w_obj.is_null() {
         return std::ptr::null_mut();
     }
-    if let Some(&existing) = linked().get(&(w_obj as usize)) {
-        let raw = existing as *mut CPyObject;
-        unsafe { (*raw).ob_refcnt += 1 };
-        return raw;
-    }
-    // The type mirror is resolved before the object's own mirror is entered so
-    // the two `linked()` acquisitions never nest.
-    let ob_type = type_mirror(w_obj);
-    attach(w_obj, REFCNT_FROM_PYRE + 1, ob_type, mirror_size(ob_type))
+    let raw = ensure_mirror(w_obj);
+    unsafe { (*raw).ob_refcnt += 1 };
+    raw
 }
 
 /// `pyobject.py:as_pyobj` — the mirror without taking a reference.

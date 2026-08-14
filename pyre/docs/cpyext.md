@@ -81,6 +81,9 @@ the header below.
   interpreter's own operators so either operand may be a pyre object;
 - `PyErr_NewException` and `PyErr_NewExceptionWithDoc`, which build the class
   through the interpreter's own `type` so it gets the exception layout;
+- capsules (`cpyext/capsule.rs`) and the strong-reference import entry points
+  `PyImport_ImportModule`, `PyImport_Import`, `PyImport_AddModuleRef` and
+  `PyImport_GetModule` (`cpyext/import_.rs`);
 - GC forwarding for C mirror links and cached dictionaries.
 
 The loader serializes extension initialization in the current import path;
@@ -93,8 +96,12 @@ Known divergences, each documented at its definition:
   cycle running through C leaks; upstream's `rawrefcount` dead queue is what
   removes that (`cpyext/pyobject.rs`);
 - `md_def` and `md_state` ride reserved module-dictionary keys, and the
-  `PyMethodDef` pointer rides a reserved carrier-dictionary key, because pyre
-  has no typed payload for either yet;
+  `PyMethodDef` pointer, the descriptor definitions and a capsule's four C
+  values ride reserved carrier-dictionary keys, because pyre has no typed
+  payload for any of them yet;
+- a capsule's destructor is recorded and never called, and the borrowed-
+  reference `PyImport_AddModule` / `PyImport_GetModuleDict` are absent: pyre has
+  no container for the borrow to belong to;
 - the module state block is never released, pyre having no module deallocation
   path;
 - `PyBytes_FromStringAndSize(NULL, n)` is rejected: pyre's `bytes` is immutable
@@ -113,7 +120,7 @@ Known divergences, each documented at its definition:
 
 5. `tp_dealloc`, `tp_traverse` and `tp_clear` on top of a `rawrefcount` dead
    queue; `tp_as_async` and `tp_as_buffer`, which are declared but not read;
-   heap types (`PyType_FromSpec`); capsules; and the remaining generated API;
+   heap types (`PyType_FromSpec`); and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
@@ -142,6 +149,8 @@ are ABI-compatible with pyre.
 - `pypy/module/cpyext/structmemberdefs.py`: the `T_*` member type codes.
 - `pypy/module/cpyext/number.py`, `sequence.py` and `mapping.py`: the
   `PyNumber_*`, `PySequence_*` and `PyMapping_*` entry points.
+- `pypy/module/cpyext/pycapsule.py` and `import_.py`: capsules and the import
+  entry points.
 - `pypy/module/cpyext/src/getargs.c`: `PyArg_ParseTuple` and `Py_BuildValue`,
   which are C there too.
 - `pypy/module/imp/interp_imp.py`: `_imp` entry points.
