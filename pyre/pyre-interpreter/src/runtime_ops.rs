@@ -425,12 +425,15 @@ pub fn classify_callable(callable: PyObjectRef) -> Result<CallableKind, PyError>
                 Ok(CallableKind::User)
             }
         } else {
-            let type_name = crate::typedef::r#type(callable)
-                .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-                .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
-            Err(PyError::type_error(format!(
-                "'{type_name}' object is not callable"
-            )))
+            let message = if callable.is_null() {
+                "<NULL> object is not callable (interpreter received a null callable)".to_string()
+            } else {
+                let type_name = crate::typedef::r#type(callable)
+                    .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+                    .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
+                format!("'{type_name}' object is not callable")
+            };
+            Err(PyError::type_error(message))
         }
     }
 }
