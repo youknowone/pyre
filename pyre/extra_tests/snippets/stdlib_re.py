@@ -91,3 +91,22 @@ assert re.fullmatch(r"([0-9]++(?:\.[0-9]+)*+)", "1.25.38").group(0) == "1.25.38"
 
 # Combining characters; issue #7518
 assert not re.match(r"\w", "\u0345"), r"\w should not match U+0345 (category Mn)"
+
+
+# A group selector is taken as a number when its type has `__index__`, and as a
+# name otherwise, so a duck-typed operand reaches every span accessor.
+class DuckIndex:
+    def __index__(self):
+        return 1
+
+
+mo = re.compile("(a+)(b+)").match("aabb")
+assert mo.group(DuckIndex()) == "aa"
+assert mo[DuckIndex()] == "aa"
+assert mo.start(DuckIndex()) == 0
+assert mo.end(DuckIndex()) == 2
+assert mo.span(DuckIndex()) == (0, 2)
+assert mo.group(DuckIndex(), DuckIndex()) == ("aa", "aa")
+
+mo = re.compile("(?P<first>a+)(?P<second>b+)").match("aabb")
+assert mo.group("second") == "bb"
