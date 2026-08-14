@@ -623,7 +623,18 @@ impl PtrInfoExt for PtrInfo {
                 // that word, so the guard would read payload bytes and fail
                 // spuriously.  RPython emits GUARD_GC_TYPE only when a header
                 // exists; headerless structs get GUARD_NONNULL only.
-                if sd.is_gc_managed() && !sd.headerless() {
+                //
+                // `type_id != 0` for the same reason the paragraph above gives
+                // for not inventing one: the allocator starts at 1, so a 0 here
+                // means the descr never received an identity, while 0 is a live
+                // runtime header value (the `rclass.OBJECT` root).  Emitting the
+                // guard anyway checks a tid the descr cannot name — it fails on
+                // every object with a real header, and passes on a plain
+                // `object`, certifying a layout that was never named.
+                // GUARD_GC_TYPE installs no info in the optimizer
+                // (`rewrite.rs` passes it through), so skipping it costs only
+                // the runtime re-check.
+                if sd.is_gc_managed() && !sd.headerless() && sd.type_id() != 0 {
                     let type_id = sd.type_id() as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
@@ -665,7 +676,15 @@ impl PtrInfoExt for PtrInfo {
                 // would read content-dependent memory before the array
                 // and fail on every short-preamble re-entry.  Gate it the
                 // same way the `PtrInfo::Struct` arm gates a raw struct.
-                if ad.is_gc_managed() {
+                //
+                // `type_id != 0` gates the same hazard the `PtrInfo::Struct`
+                // arm gates: a serialized `BhDescr::Array` that carries neither
+                // a `gc_type_id` nor a cache key resolves to 0
+                // (`BhDescr::resolve_gc_tid`), because the runtime array tids
+                // are handed out by `gc.register_type` at interpreter startup
+                // and the build-time analyzer cannot see them.  Guarding on 0
+                // pins a tid the descr does not name.
+                if ad.is_gc_managed() && ad.type_id() != 0 {
                     let type_id = ad.type_id() as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
