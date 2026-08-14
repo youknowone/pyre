@@ -2953,6 +2953,36 @@ impl TlsConnection {
             self.pending_tls.clear();
             self.pending_tls_start = 0;
         }
+        if self.inner.is_none() {
+            return Ok(());
+        }
+        loop {
+            self.write_pending_tls()?;
+            // `wants_read` is also false while an outgoing flight is still
+            // queued and application data cannot flow yet, which is the state
+            // a client is in between emitting its ChangeCipherSpec and its
+            // Finished.  A peer flight that arrives in a single read therefore
+            // leaves a tail in `pending_received_tls` that no later call comes
+            // back for: the transport goes straight to a blocking receive
+            // while the peer waits for the rest of our handshake, and both
+            // sides stop.  Emptying the queued flight above lifts the refusal,
+            // so re-offer the tail here and write out whatever it produces.
+            let remaining = self.pending_received_tls.len() - self.pending_received_tls_start;
+            if remaining == 0 {
+                break;
+            }
+            self.process_received_tls()?;
+            // Every extra pass must consume ciphertext, so the loop ends.
+            if self.pending_received_tls.len() - self.pending_received_tls_start >= remaining {
+                break;
+            }
+        }
+        self.capture_tls_unique();
+        Ok(())
+    }
+
+    /// Move every record rustls has queued for the peer into `pending_tls`.
+    fn write_pending_tls(&mut self) -> TlsResult<()> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
@@ -2971,7 +3001,6 @@ impl TlsConnection {
                 break;
             }
         }
-        self.capture_tls_unique();
         Ok(())
     }
 
@@ -2998,9 +3027,11 @@ impl TlsConnection {
             let Some(inner) = self.inner.as_mut() else {
                 return Ok(());
             };
-            // rustls signals plaintext backpressure through `wants_read`; the
-            // corresponding `read_tls` failure carries only an unstable
-            // message string.
+            // `wants_read` covers two refusals: plaintext backpressure, and an
+            // outgoing flight still queued before application data may flow.
+            // The corresponding `read_tls` failure carries only an unstable
+            // message string.  Either way the untouched tail stays queued, and
+            // `fill_pending_tls` re-offers it once the refusal lifts.
             if !inner.wants_read() {
                 return Ok(());
             }
