@@ -3826,6 +3826,16 @@ impl OptUnroll {
         // its setup stores and replays the same Box objects without pyre's
         // serialized-OpRef remap between the stored target and live builder.
         if let Some(builder) = ctx.active_short_preamble_producer.as_ref() {
+            // The two lists legitimately differ in length, and the `zip` is
+            // load-bearing rather than sloppy: upstream binds by Box identity
+            // and never asks how many there are, while here the builder's
+            // Label domain and the body's jump args agree only on their
+            // common prefix — the trailing jump args carry positions this
+            // Label never took. Binding that prefix is the whole point.
+            // Requiring equal arities instead was measured to take
+            // `retrace_outer_loop_type_flip` back to the failure this seed
+            // exists to fix: `loops_aborted` 0 -> 2, `retraces_compiled`
+            // 1 -> 0, `guard_failures` 201 -> 590 on both backends.
             for (&label_arg, &jump_arg) in builder.label_args().iter().zip(jump_args.iter()) {
                 mapping.entry(label_arg).or_insert(jump_arg);
             }
@@ -4181,10 +4191,6 @@ impl OptUnroll {
             let target = carried.to_opref();
             // source = targetargs[i]
             let source = targetargs[i];
-            // assert source is not target — see commit log for the
-            // disjoint-namespace invariant from Step 2 Commit D2 that
-            // makes this hold by construction in production callers.
-            debug_assert!(source != target, "import_state: source is target");
             // source.set_forwarded(target)
             // `source` is `targetargs[i]`, produced by the caller's
             // cross-slot resolution as either a materialized inputarg or a
@@ -4205,6 +4211,13 @@ impl OptUnroll {
             // a producerless position and guard resume numbering has no
             // producer to bind.
             let b_target = carried.clone();
+            // unroll.py:496 checks Box identity. `Operand` equality is Rc
+            // pointer identity, while raw OpRef positions may legitimately
+            // coincide across this phase boundary.
+            debug_assert!(
+                b_source != b_target,
+                "import_state: source is target (unroll.py:496 `assert source is not target`)"
+            );
             ctx.register_carried_host(&b_target);
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
