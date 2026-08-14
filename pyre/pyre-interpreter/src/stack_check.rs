@@ -320,14 +320,22 @@ pub fn raise_main_thread_stack_limit(size: usize) -> usize {
     if limit.rlim_max != libc::RLIM_INFINITY {
         wanted = wanted.min(limit.rlim_max);
     }
-    if wanted > limit.rlim_cur {
+    let granted = if wanted > limit.rlim_cur {
+        let previous = limit.rlim_cur;
         limit.rlim_cur = wanted;
-        if unsafe { libc::setrlimit(libc::RLIMIT_STACK, &limit) } != 0 {
-            // Keep describing what the process already had.
-            unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) };
+        // A refused `setrlimit` changes nothing, so the limit read above is
+        // still what the process has.  Reporting the request instead would
+        // buy a byte budget the stack cannot hold, and the guard would sit
+        // past the guard page.
+        if unsafe { libc::setrlimit(libc::RLIMIT_STACK, &limit) } == 0 {
+            wanted
+        } else {
+            previous
         }
-    }
-    usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX)
+    } else {
+        limit.rlim_cur
+    };
+    usize::try_from(granted).unwrap_or(usize::MAX)
 }
 
 #[cfg(not(unix))]

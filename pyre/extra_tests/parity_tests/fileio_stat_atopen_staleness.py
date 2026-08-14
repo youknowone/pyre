@@ -31,13 +31,15 @@ with open(path, "r+b") as stream:
     stream.seek(0)
     assert stream.read() == b"Hello"
 
-# An empty file records a size that says nothing about where its end is.
+# A file that is empty at the moment it is opened records a size that says
+# nothing about where its end will be, so the reader has to open first for the
+# zero to be the snapshot a later read works from.
 empty = os.path.join(directory, "empty")
 with open(empty, "wb"):
     pass
-with open(empty, "ab") as appender:
-    appender.write(b"x" * 5000)
 with open(empty, "rb") as stream:
+    with open(empty, "ab") as appender:
+        appender.write(b"x" * 5000)
     assert stream.read() == b"x" * 5000
 
 # A character device has no meaningful size at all, and reading one must still
