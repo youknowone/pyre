@@ -445,8 +445,12 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     }
     if !cfg_successor && ctx.vstack_reorder_ceiling == u32::MAX {
         ctx.vstack_reorder_ceiling = (new_pypc as usize).max(prev_pypc) as u32;
-        ctx.vstack_reorder_saved =
-            Some((prev_pypc as u32, ctx.vstack_depth, ctx.vstack_boxes.clone()));
+        ctx.vstack_reorder_saved = Some((
+            prev_pypc as u32,
+            ctx.vstack_depth,
+            ctx.vstack_boxes.clone(),
+            Vec::new(),
+        ));
     }
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     let (fallthrough_depth, branch_depth) =
@@ -502,15 +506,52 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // and nothing here to mirror.
     let returned_to_arm_point = matches!(
         &ctx.vstack_reorder_saved,
-        Some((pc, depth, _)) if *pc == new_pypc && *depth == new_depth
+        Some((pc, depth, _, _)) if *pc == new_pypc && *depth == new_depth
     );
     let restored = in_reorder_region && returned_to_arm_point;
     if restored {
-        let (_, _, boxes) = ctx
+        let (_, _, saved, mask) = ctx
             .vstack_reorder_saved
             .take()
             .expect("checked by returned_to_arm_point");
-        ctx.vstack_boxes = boxes;
+        // `vstack_boxes` has two producers: the executed
+        // `setarrayitem_vable_r` store, and this pc-derived reconstruction.
+        // `_opimpl_setarrayitem_vable` (`pyjitpl.py:1245`) is the only writer
+        // of `virtualizable_boxes` upstream and takes its index from the
+        // descr, never from a pc, so no precedence rule was ever needed there.
+        // Here one is: a slot the walk actually executed a store into is
+        // authoritative, and the snapshot — taken at a boundary that can be
+        // reported mid-opcode, so it can hold a state no opcode ever left
+        // behind — must not overwrite it.  Same-pc-and-same-depth cannot tell
+        // the two apart: `obj.m()` with the method-load fold suppressed saves
+        // `[NULL, method]` mid-`LOAD_ATTR` and returns to the same coordinate
+        // once the stores have produced `[method, NULL]`, so restoring the
+        // snapshot wholesale hands `CALL` a null callable.
+        //
+        // With no executed store in the window the mask is empty and the
+        // restore is unchanged, which keeps the slots it legitimately
+        // recovers: `ShadowReseed` clears the mirror at the arming boundary
+        // and the shadow-backed hole-fill declines any slot the virtualizable
+        // does not carry, and those holes are exactly what the snapshot
+        // restores.
+        if mask.iter().all(|&w| !w) {
+            ctx.vstack_boxes = saved;
+        } else {
+            // Merge per slot rather than keeping either side whole: one window
+            // can hold both an executed store and a slot the reseed dropped.
+            let cur = std::mem::replace(&mut ctx.vstack_boxes, saved);
+            if ctx.vstack_boxes.len() < new_depth {
+                ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
+            }
+            for s in 0..new_depth {
+                if mask.get(s).copied().unwrap_or(false)
+                    && let Some(&v) = cur.get(s)
+                {
+                    ctx.vstack_boxes[s] = v;
+                }
+            }
+            ctx.vstack_boxes.truncate(new_depth);
+        }
         ctx.vstack_reorder_ceiling = u32::MAX;
     }
 

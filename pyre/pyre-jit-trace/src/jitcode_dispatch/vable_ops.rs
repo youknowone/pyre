@@ -876,6 +876,16 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                     ctx.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
                 }
                 ctx.vstack_boxes[stack_slot] = value;
+                // Mark the slot as execution-derived while an out-of-order
+                // region is armed, so the boundary restore does not put its
+                // pc-derived snapshot back over it.  Outside a region the
+                // mask does not exist and this costs one `Option` test.
+                if let Some((_, _, _, mask)) = ctx.vstack_reorder_saved.as_mut() {
+                    if mask.len() <= stack_slot {
+                        mask.resize(stack_slot + 1, false);
+                    }
+                    mask[stack_slot] = true;
+                }
             }
             ctx.vstack_last_ref = value;
         }

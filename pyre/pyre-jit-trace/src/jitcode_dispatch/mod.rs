@@ -1677,7 +1677,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `MIFrame.run_one_step` steps a live frame whose `registers_r` survive
     /// the step.  This mirror is instead reconstructed from source pcs, and
     /// that reconstruction is exactly what an excursion can lose.
-    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>)>,
+    pub vstack_reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
     /// The py_pc the walk's floor lookup reports while it is inside an
     /// out-of-line exception LANDING block — the unwind bookkeeping the
     /// codewriter emits per catch site, after the whole body, which then jumps
