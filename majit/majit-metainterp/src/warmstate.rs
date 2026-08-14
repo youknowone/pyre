@@ -2322,7 +2322,11 @@ mod tests {
     fn an_empty_enable_opts_selects_no_passes() {
         let mut ws = WarmEnterState::new(1);
         let all = default_enable_opts();
-        assert_eq!(ws.get_enable_opts(), all.as_slice(), "default is the full set");
+        assert_eq!(
+            ws.get_enable_opts(),
+            all.as_slice(),
+            "default is the full set"
+        );
 
         ws.set_param_enable_opts("");
         assert!(
