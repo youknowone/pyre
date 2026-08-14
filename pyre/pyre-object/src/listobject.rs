@@ -1740,6 +1740,18 @@ pub unsafe fn drain_list_append(obj: PyObjectRef, value: PyObjectRef) {
     w_list_append(obj, value)
 }
 
+/// Uniform residual-call ABI adapter for [`drain_list_append`].
+///
+/// Wasm function-table entries retain their physical parameter types, so the
+/// raw pointer signature above is `(i32, i32) -> ()` on wasm32. JIT residual
+/// calls carry Int and Ref operands in i64 locals; registering this adapter
+/// gives the table target the same `(i64, i64) -> ()` signature emitted by the
+/// wasm backend.
+#[inline(never)]
+pub extern "C" fn jit_drain_list_append(obj: i64, value: i64) {
+    unsafe { drain_list_append(obj as PyObjectRef, value as PyObjectRef) }
+}
+
 /// Set the live length of an Integer-strategy list without reallocating
 /// or boxing — the undo of a spare-capacity append (`_ll_list_resize_ge`'s
 /// `l.length = newsize` run in reverse).  The backing array already has
