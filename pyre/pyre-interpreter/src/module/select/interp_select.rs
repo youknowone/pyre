@@ -2,7 +2,7 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
 /// `select.poll` object — PyPy: `interp_select.py:26 class Poll`.
@@ -26,7 +26,7 @@ fn default_poll_events() -> i16 {
 
 /// Resolve a Python fd argument (int or object with `fileno()`) to a
 /// raw descriptor — `space.c_filedescriptor_w`.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
     unsafe {
         // A real int (or int subclass / bignum) is taken directly; otherwise
@@ -227,12 +227,82 @@ impl Poll {
     }
 }
 
+/// Convert a descriptor resolved from one of the three sequences into what
+/// the platform's fd_set holds, rejecting one the set cannot represent —
+/// `seq2set`.  `index` is how many entries that sequence already contributed.
+///
+/// A POSIX fd_set is a bitmap indexed by the descriptor, so `FD_SET` on an fd
+/// at or above FD_SETSIZE writes outside it (`_PyIsSelectable_fd`).
+#[cfg(all(unix, feature = "host_env"))]
+fn selectable_fd(
+    fd: i32,
+    _index: usize,
+) -> Result<rustpython_host_env::select::RawFd, crate::PyError> {
+    if fd >= libc::FD_SETSIZE as i32 {
+        return Err(crate::PyError::value_error(
+            "file descriptor out of range in select()",
+        ));
+    }
+    Ok(fd)
+}
+
+/// `selectable_fd` for WinSock, whose fd_set is a count plus an array of
+/// SOCKETs instead of a bitmap: the handle value itself is unconstrained, but
+/// only FD_SETSIZE of them fit and `FD_SET` past that silently drops the
+/// socket.  The array is sized by the `windows-sys` declaration, so the limit
+/// is the stock 64 rather than the 512 a C build can ask for.
+#[cfg(all(windows, feature = "host_env"))]
+fn selectable_fd(
+    fd: i32,
+    index: usize,
+) -> Result<rustpython_host_env::select::RawFd, crate::PyError> {
+    if index >= rustpython_host_env::select::platform::FD_SETSIZE as usize {
+        return Err(crate::PyError::value_error(
+            "too many file descriptors in select()",
+        ));
+    }
+    // `select()` takes SOCKET handles here, never CRT file descriptors; a
+    // handle is 32-bit significant, which is what `fileno()` hands back.  A
+    // descriptor that is not a socket fails the call itself with WSAENOTSOCK.
+    Ok(fd as rustpython_host_env::select::RawFd)
+}
+
+/// Dispose of a failed `select()`.  `Ok` means the call was interrupted and
+/// the caller must retry it with the remaining timeout.
+///
+/// `interp_select.py:182` — an EINTR return delivers the pending signal first,
+/// so a handler that raises (KeyboardInterrupt) wins over the retry.
+#[cfg(all(unix, feature = "host_env"))]
+fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
+    if e.raw_os_error() == Some(libc::EINTR) {
+        return crate::module::signal::interp_signal::checksignals_now();
+    }
+    Err(crate::PyError::os_error_with_errno(
+        e.raw_os_error().unwrap_or(0),
+        format!("select: {e}"),
+    ))
+}
+
+/// `select_failure` for WinSock, which reports through `WSAGetLastError`: the
+/// code is a Win32 error kept in `.winerror`, not an errno
+/// (`PyErr_SetExcFromWindowsErr`).  A blocking WinSock call is not interrupted
+/// by a signal, so there is nothing to retry.
+#[cfg(all(windows, feature = "host_env"))]
+fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
+    Err(crate::PyError::os_error_win32_syscall2(
+        e.raw_os_error().unwrap_or(0),
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    ))
+}
+
 /// _select module — PyPy: pypy/module/select/.
 ///
 /// Implements `select.select(rlist, wlist, xlist, timeout=None)` via
-/// `rustpython_host_env::select::{FdSet, select, sec_to_timeval}` and the
-/// `select.poll()` polling object.  epoll / kqueue object types are not
-/// implemented yet.
+/// `rustpython_host_env::select::{FdSet, select, sec_to_timeval}` — on
+/// Windows over WinSock's `select`, which accepts sockets only — and the
+/// `select.poll()` polling object, which POSIX alone has.  epoll / kqueue
+/// object types are not implemented yet.
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -242,7 +312,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // descriptor-shaped builtin would bind the selector instance and
         // shift the three fd-set arguments.
         crate::make_module_builtin_function("select", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
+            #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 use rustpython_host_env::select as host_select;
 
@@ -257,21 +327,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // fd or an object exposing fileno().
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(pyre_object::PyObjectRef, i32)>, crate::PyError> {
+                ) -> Result<Vec<(pyre_object::PyObjectRef, host_select::RawFd)>, crate::PyError>
+                {
                     let items = crate::baseobjspace::unpackiterable(seq, -1)?;
                     let mut out = Vec::with_capacity(items.len());
                     for item in items {
                         // `interp_select.py:132 _build_fd_set` — each item is
-                        // resolved through `space.c_filedescriptor_w`.
+                        // resolved through `space.c_filedescriptor_w`, then
+                        // checked against what this platform's fd_set holds.
                         let fd = filedescriptor_w(item)?;
-                        // `fd >= FD_SETSIZE` is rejected: `FD_SET` on such an
-                        // fd writes outside the `fd_set` bitmap.
-                        if fd >= libc::FD_SETSIZE as i32 {
-                            return Err(crate::PyError::value_error(
-                                "file descriptor out of range in select()",
-                            ));
-                        }
-                        out.push((item, fd));
+                        out.push((item, selectable_fd(fd, out.len())?));
                     }
                     Ok(out)
                 }
@@ -280,14 +345,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let wfds = collect_fds(args[1])?;
                 let xfds = collect_fds(args[2])?;
 
-                let mut nfds: i32 = -1;
-                for fds in [&rfds, &wfds, &xfds] {
-                    for &(_, fd) in fds {
-                        if fd > nfds {
-                            nfds = fd;
+                // The first `select()` argument: POSIX scans descriptors
+                // `0..nfds`, so it must exceed the highest one.
+                #[cfg(unix)]
+                let nfds: i32 = {
+                    let mut highest: i32 = -1;
+                    for fds in [&rfds, &wfds, &xfds] {
+                        for &(_, fd) in fds {
+                            if fd > highest {
+                                highest = fd;
+                            }
                         }
                     }
-                }
+                    highest + 1
+                };
+                // WinSock ignores it: each fd_set carries its own count.
+                #[cfg(windows)]
+                let nfds: i32 = 0;
 
                 // `interp_select.py:230-235` — `None` blocks forever, else
                 // `space.float_w` (applies `__float__`); a negative count is
@@ -361,35 +435,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `io::Error`, so the guard only has to span the call.
                     let outcome = {
                         let _blocked = crate::module::thread::before_external_block();
-                        host_select::select(
-                            nfds + 1,
-                            &mut rset,
-                            &mut wset,
-                            &mut xset,
-                            timeout_ref,
-                        )
+                        host_select::select(nfds, &mut rset, &mut wset, &mut xset, timeout_ref)
                     };
                     match outcome {
                         Ok(_) => break,
-                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
-                            // `interp_select.py:182` — deliver a pending
-                            // signal, then retry with the remaining timeout
-                            // recomputed at the loop head.
-                            crate::module::signal::interp_signal::checksignals_now()?;
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(crate::PyError::os_error_with_errno(
-                                e.raw_os_error().unwrap_or(0),
-                                format!("select: {e}"),
-                            ));
-                        }
+                        // A retryable failure returns `Ok`, having delivered
+                        // any pending signal; the loop head then recomputes
+                        // the remaining timeout and rebuilds the fd sets.
+                        Err(e) => select_failure(e)?,
                     }
                 }
 
                 fn build_ready(
                     set: &mut host_select::FdSet,
-                    inputs: &[(pyre_object::PyObjectRef, i32)],
+                    inputs: &[(pyre_object::PyObjectRef, host_select::RawFd)],
                 ) -> pyre_object::PyObjectRef {
                     let items: Vec<_> = inputs
                         .iter()
@@ -403,11 +462,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let x_ready = build_ready(&mut xset, &xfds);
                 Ok(pyre_object::w_tuple_new(vec![r_ready, w_ready, x_ready]))
             }
-            #[cfg(not(all(unix, feature = "host_env")))]
+            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
             {
                 let _ = args;
                 Err(crate::PyError::not_implemented(
-                    "select.select requires host_env feature on a Unix platform",
+                    "select.select requires host_env feature on a Unix or Windows platform",
                 ))
             }
         }),
