@@ -4641,6 +4641,139 @@ mod tests {
         );
     }
 
+    /// Every layout's class word is the inherited `PyObject` header slot, and
+    /// both accessors must name that one field.
+    ///
+    /// `SimpleFieldDescr`'s legacy producer infers `is_w_class` from the field
+    /// name (`name_is_class_word`: `== "w_class"` or `ends_with(".w_class")`),
+    /// and `build_object_descr_group_with_extra_gc_edges` qualifies every name
+    /// with the group's simple name.  So a group that declares a payload field
+    /// literally called `w_class` publishes *two* descrs reporting
+    /// `is_w_class()`, and both accessors take the first — which is the payload
+    /// field, at the wrong offset and the wrong slot.
+    ///
+    /// Both halves are asserted because the two accessors read different lists:
+    /// `class_word_field` answers a byte offset off `gc_fielddescrs`, and
+    /// `class_word_index_in_parent` a slot position off `all_fielddescrs`.
+    #[test]
+    fn every_groups_class_word_is_the_inherited_pyobject_header_slot() {
+        let groups: &[(&str, DescrRef)] = &[
+            ("Function", w_function_size_descr()),
+            ("Method", w_method_size_descr()),
+            ("W_ListObject", w_list_size_descr()),
+            ("W_ObjectObject", w_object_object_size_descr()),
+            ("W_IntObject", w_int_size_descr()),
+            ("W_BoolObject", w_bool_size_descr()),
+            ("W_RangeIterObject", w_range_iter_size_descr()),
+            ("W_RangeObject", w_range_size_descr()),
+            ("W_FloatObject", w_float_size_descr()),
+            ("W_LongObject", w_long_size_descr()),
+            ("W_TupleObject", w_tuple_size_descr()),
+            ("W_TupleIter", tuple_iter_size_descr()),
+            ("W_ZipObject", w_zip_size_descr()),
+            ("SpecialisedTupleII", specialised_tuple_ii_size_descr()),
+            ("SpecialisedTupleFF", specialised_tuple_ff_size_descr()),
+            ("SpecialisedTupleOO", specialised_tuple_oo_size_descr()),
+            ("PyTraceback", pytraceback_size_descr()),
+            ("W_SliceObject", w_slice_size_descr()),
+            ("PyFrame", pyframe_size_descr()),
+        ];
+
+        // Violations are accumulated rather than asserted in place: a test that
+        // stops at the first bad group reports which one comes *first*, not
+        // which ones are wrong, and the population is the finding here.
+        let mut violations: Vec<String> = Vec::new();
+        let mut positional_answers = 0usize;
+        for (label, descr) in groups {
+            let size = descr
+                .as_size_descr()
+                .unwrap_or_else(|| panic!("{label} must be a SizeDescr"));
+
+            // (a) the byte-offset answer names the header slot
+            if let Some(fd) = size.class_word_field()
+                && fd.offset() != W_CLASS_OFFSET
+            {
+                violations.push(format!(
+                    "{label}: class_word_field() -> `{}` at offset {} (want the \
+                     inherited PyObject header at {W_CLASS_OFFSET})",
+                    fd.field_name(),
+                    fd.offset(),
+                ));
+            }
+
+            // (b) the positional answer indexes that same field
+            if let Some(idx) = size.class_word_index_in_parent() {
+                positional_answers += 1;
+                match size.all_fielddescrs().get(idx) {
+                    None => violations.push(format!(
+                        "{label}: class_word_index_in_parent() = {idx} is out of \
+                         range for all_fielddescrs() (len {})",
+                        size.all_fielddescrs().len(),
+                    )),
+                    Some(fd) if fd.offset() != W_CLASS_OFFSET => {
+                        violations.push(format!(
+                            "{label}: class_word_index_in_parent() = {idx} names \
+                             `{}` at offset {} (want the inherited PyObject \
+                             header at {W_CLASS_OFFSET})",
+                            fd.field_name(),
+                            fd.offset(),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // The accessor must not be able to degenerate to a constant `None`:
+        // that would silently disable OptVirtualize's class-word fold instead
+        // of correcting it, and every check above would still hold.
+        assert!(
+            positional_answers > 0,
+            "no group answered class_word_index_in_parent() — a fold that never \
+             fires is indistinguishable from a fold that is right"
+        );
+        // `Method` declares a payload field literally called `w_class` — the
+        // class the bound function was found on, which `method_w_class_descr`
+        // documents as "distinct from the inherited `PyObject.w_class` naming
+        // the Method's own type".  The group factory qualifies it to
+        // `Method.w_class`, `name_is_class_word` accepts the `.w_class`
+        // suffix, and it precedes the header row in both lists, so `find()`
+        // stops on it.  `genop_new_with_vtable` then writes the class object at
+        // `METHOD_W_CLASS_OFFSET` and leaves the real header word NULL.
+        //
+        // Pre-existing and independent of the accessor split: the inline
+        // `all_fielddescrs().find(..)` this replaced picked the same wrong
+        // field.  Fixing it needs a declaration channel into
+        // `SimpleFieldDescrSpec` so the host states which slot is its class
+        // word instead of majit-ir inferring it from a pyre field name — the
+        // same coupling `name_is_class_word` represents.
+        //
+        // Listed rather than skipped, and compared by equality rather than
+        // subset, so this exception RETIRES ITSELF: fixing `Method` makes the
+        // assertion below fail and forces the entry to be deleted.
+        let known: Vec<String> = vec![
+            format!(
+                "Method: class_word_field() -> `Method.w_class` at offset {} \
+                 (want the inherited PyObject header at {W_CLASS_OFFSET})",
+                pyre_object::function::METHOD_W_CLASS_OFFSET,
+            ),
+            format!(
+                "Method: class_word_index_in_parent() = 2 names `Method.w_class` \
+                 at offset {} (want the inherited PyObject header at \
+                 {W_CLASS_OFFSET})",
+                pyre_object::function::METHOD_W_CLASS_OFFSET,
+            ),
+        ];
+        assert_eq!(
+            violations,
+            known,
+            "the set of groups resolving a class word that is not the inherited \
+             PyObject header has changed. A NEW entry means some group's payload \
+             field shadows its header; a MISSING entry means the known `Method` \
+             defect is fixed and this exception list must be deleted."
+        );
+    }
+
     #[test]
     fn jit_emitted_tracebacks_are_movable_but_raw_pointer_objects_are_not() {
         let traceback_descr = pytraceback_size_descr();
