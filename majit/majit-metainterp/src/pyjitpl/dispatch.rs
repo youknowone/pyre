@@ -66,6 +66,7 @@ fn field_spec_from_bh(
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
         field_key: f.field_key().to_string(),
+        is_class_word: majit_ir::descr::class_word_inferred_from_name(&f.name),
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -240,6 +241,9 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
                                     field_key: name.clone(),
+                                    is_class_word: majit_ir::descr::class_word_inferred_from_name(
+                                        name,
+                                    ),
                                     name: name.clone(),
                                     offset: *offset,
                                     field_size: *field_size,
@@ -372,6 +376,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let spec = majit_ir::descr::SimpleFieldDescrSpec {
                             index: u32::MAX,
                             field_key: name.clone(),
+                            is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
                             name: name.clone(),
                             offset: *offset,
                             field_size: *field_size,
@@ -542,6 +547,7 @@ pub fn residual_write_effect_info(
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
                     field_key: name.to_string(),
+                    is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
                     name: name.to_string(),
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin

@@ -806,6 +806,14 @@ fn build_object_descr_group_with_extra_gc_edges(
                 is_quasi_immutable: quasi_immutable,
                 flag: runtime_array_flag(field_type, signed),
                 virtualizable: false,
+                // pyre's layout invariant, not a name rule: the inherited
+                // `PyObject` header sits at `W_CLASS_OFFSET` in every object
+                // group. A name rule cannot express this — `Method` has a
+                // *payload* field called `w_class` (the class the bound
+                // function was found on) whose qualified name
+                // `"Method.w_class"` matches the header spelling exactly, and
+                // it sits ahead of the real header in the field list.
+                is_class_word: offset == pyre_object::pyobject::W_CLASS_OFFSET,
                 index_in_parent,
             },
         )
@@ -4358,6 +4366,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_quasi_immutable: false,
         flag: ArrayFlag::Unsigned,
         virtualizable: false,
+        // `ExecutionContext` is not a `PyObject` layout; it carries no class
+        // word. Its offsets are `EC_*` and share no origin with
+        // `W_CLASS_OFFSET`, so matching on offset here would be a coincidence,
+        // not an invariant.
+        is_class_word: false,
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
@@ -4710,15 +4723,13 @@ mod tests {
                          range for all_fielddescrs() (len {})",
                         size.all_fielddescrs().len(),
                     )),
-                    Some(fd) if fd.offset() != W_CLASS_OFFSET => {
-                        violations.push(format!(
-                            "{label}: class_word_index_in_parent() = {idx} names \
+                    Some(fd) if fd.offset() != W_CLASS_OFFSET => violations.push(format!(
+                        "{label}: class_word_index_in_parent() = {idx} names \
                              `{}` at offset {} (want the inherited PyObject \
                              header at {W_CLASS_OFFSET})",
-                            fd.field_name(),
-                            fd.offset(),
-                        ))
-                    }
+                        fd.field_name(),
+                        fd.offset(),
+                    )),
                     Some(_) => {}
                 }
             }
@@ -4732,45 +4743,26 @@ mod tests {
             "no group answered class_word_index_in_parent() — a fold that never \
              fires is indistinguishable from a fold that is right"
         );
-        // `Method` declares a payload field literally called `w_class` — the
-        // class the bound function was found on, which `method_w_class_descr`
-        // documents as "distinct from the inherited `PyObject.w_class` naming
-        // the Method's own type".  The group factory qualifies it to
-        // `Method.w_class`, `name_is_class_word` accepts the `.w_class`
-        // suffix, and it precedes the header row in both lists, so `find()`
-        // stops on it.  `genop_new_with_vtable` then writes the class object at
-        // `METHOD_W_CLASS_OFFSET` and leaves the real header word NULL.
+        // This held two `Method` exceptions until the host gained a declaration
+        // channel.  `Method` carries a payload field literally called `w_class`
+        // — the class the bound function was found on, which
+        // `method_w_class_descr` documents as "distinct from the inherited
+        // `PyObject.w_class` naming the Method's own type" — and the group
+        // factory qualifies it to `Method.w_class`, which the name fallback
+        // accepts on the `.w_class` suffix.  It precedes the header row, so
+        // `find()` stopped on it in both lists.
         //
-        // Pre-existing and independent of the accessor split: the inline
-        // `all_fielddescrs().find(..)` this replaced picked the same wrong
-        // field.  Fixing it needs a declaration channel into
-        // `SimpleFieldDescrSpec` so the host states which slot is its class
-        // word instead of majit-ir inferring it from a pyre field name — the
-        // same coupling `name_is_class_word` represents.
-        //
-        // Listed rather than skipped, and compared by equality rather than
-        // subset, so this exception RETIRES ITSELF: fixing `Method` makes the
-        // assertion below fail and forces the entry to be deleted.
-        let known: Vec<String> = vec![
-            format!(
-                "Method: class_word_field() -> `Method.w_class` at offset {} \
-                 (want the inherited PyObject header at {W_CLASS_OFFSET})",
-                pyre_object::function::METHOD_W_CLASS_OFFSET,
-            ),
-            format!(
-                "Method: class_word_index_in_parent() = 2 names `Method.w_class` \
-                 at offset {} (want the inherited PyObject header at \
-                 {W_CLASS_OFFSET})",
-                pyre_object::function::METHOD_W_CLASS_OFFSET,
-            ),
-        ];
-        assert_eq!(
-            violations,
-            known,
-            "the set of groups resolving a class word that is not the inherited \
-             PyObject header has changed. A NEW entry means some group's payload \
-             field shadows its header; a MISSING entry means the known `Method` \
-             defect is fixed and this exception list must be deleted."
+        // Now `build_object_descr_group_with_extra_gc_edges` declares
+        // `is_class_word: offset == W_CLASS_OFFSET`, a layout invariant a name
+        // rule cannot express, and the exceptions retired.
+        assert!(
+            violations.is_empty(),
+            "{} of {} groups resolve a class word that is not the inherited \
+             PyObject header — a payload field is shadowing its layout's \
+             header row:\n  {}",
+            violations.len(),
+            groups.len(),
+            violations.join("\n  "),
         );
     }
 
@@ -5471,6 +5463,11 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
+        // `BhFieldSpec` carries no class-word flag, so a declaration does not
+        // survive the blackhole round trip and the name is all that is left.
+        // Inherits the fallback's limitation: a `Method.w_class` payload
+        // rebuilt from a blackhole spec still reads as a class word.
+        is_class_word: majit_ir::descr::class_word_inferred_from_name(&spec.name),
         index_in_parent: spec.index_in_parent,
     }
 }

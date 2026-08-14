@@ -4465,6 +4465,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index: 10,
                 field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),
@@ -6155,6 +6156,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index: 10,
                 field_key: "Node.value".to_string(),
                 name: "Node.value".to_string(),

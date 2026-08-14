@@ -1942,6 +1942,16 @@ impl GcCache {
         clippy::too_many_arguments,
         reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
     )]
+    /// The name-inferring entry point, for producers that have no spec to
+    /// declare on — chiefly the `BhDescr` path, which rebuilds a descr from a
+    /// serialized field name.  A producer that knows its own layout should
+    /// call [`Self::get_field_descr_declaring`] instead: a name rule cannot
+    /// separate a header row from a payload field a host happens to spell the
+    /// same way.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
     pub fn get_field_descr(
         &mut self,
         struct_key: LLType,
@@ -1956,6 +1966,45 @@ impl GcCache {
         index: u32,
         virtualizable: bool,
         index_in_parent: Option<usize>,
+    ) -> Arc<SimpleFieldDescr> {
+        self.get_field_descr_declaring(
+            struct_key,
+            field_name,
+            display_name,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_quasi_immutable,
+            flag,
+            index,
+            virtualizable,
+            index_in_parent,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The argument order is the stable JIT IR/descriptor or generated-interpreter ABI shape; grouping it into a Rust-only options object would obscure opcode-field correspondence and macro call-site parity"
+    )]
+    pub fn get_field_descr_declaring(
+        &mut self,
+        struct_key: LLType,
+        field_name: &str,
+        display_name: Option<&str>,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        flag: ArrayFlag,
+        index: u32,
+        virtualizable: bool,
+        index_in_parent: Option<usize>,
+        // `Some` when the producer declares whether this field is the class
+        // word.  `None` falls back to the display name.
+        declared_class_word: Option<bool>,
     ) -> Arc<SimpleFieldDescr> {
         // descr.py:234-238: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
@@ -2142,6 +2191,9 @@ impl GcCache {
             name,
             field_name.to_string(),
         );
+        if let Some(is_class_word) = declared_class_word {
+            fd = fd.with_class_word(is_class_word);
+        }
         fd.virtualizable = virtualizable;
         // descr.py:228: index_in_parent (from heaptracker).
         //
@@ -5349,16 +5401,20 @@ pub struct SimpleFieldDescr {
     pub vinfo: Option<Weak<dyn VinfoMarker>>,
 }
 
-/// Whether a `"STRUCT.fieldname"` (or bare `"fieldname"`) descr name names a
-/// class word.
+/// Guess from a descr's display name whether it is a class word.
 ///
-/// The single place in the tree that reads this spelling.  It exists because
-/// `SimpleFieldDescr` is minted by the codewriter from the name
-/// `descr.py:227` builds out of the struct and field being described, so for
-/// that producer the name *is* the declaration.  Every consumer asks the
-/// declared `FieldDescr::is_w_class()` instead, and a producer that knows its
-/// layout without a name uses `SimpleFieldDescr::with_class_word`.
-fn name_is_class_word(name: &str) -> bool {
+/// ⛔ **A fallback, not a rule.** It cannot separate a header row from a
+/// payload field a host happens to spell the same way — pyre's `Method`
+/// carries both an inherited header and a payload field named `w_class`, and
+/// this returns `true` for both. Any producer that knows its own layout must
+/// declare instead, through `SimpleFieldDescrSpec::is_class_word` or
+/// `SimpleFieldDescr::with_class_word`.
+///
+/// It survives for one caller: the serialized-`BhDescr` path, which rebuilds a
+/// descr from a field name with no layout in reach. ⚠ That also means a
+/// declaration does **not** survive a blackhole round trip — `BhFieldSpec`
+/// carries no flag, so a descr rebuilt from one falls back to this guess.
+pub fn class_word_inferred_from_name(name: &str) -> bool {
     name == "w_class" || name.ends_with(".w_class")
 }
 
@@ -5476,7 +5532,7 @@ impl SimpleFieldDescr {
         field_key: String,
     ) -> Self {
         let field_key_start = field_key_start(&name, &field_key);
-        let is_class_word = name_is_class_word(&name);
+        let is_class_word = class_word_inferred_from_name(&name);
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
@@ -5930,6 +5986,14 @@ pub struct SimpleFieldDescrSpec {
     pub flag: ArrayFlag,
     pub virtualizable: bool,
     pub index_in_parent: usize,
+    /// Whether this field is the owning layout's class word.
+    ///
+    /// Declared by the producer, which knows its own layout.  majit-ir cannot
+    /// derive it: a host may spell a *payload* field with the same tail as its
+    /// header row (pyre's `Method` has both `Method.w_class` at the method's
+    /// own class and the inherited header), so any name rule either misses a
+    /// header or claims a payload.
+    pub is_class_word: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -5996,7 +6060,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
         .iter()
         .map(|spec| {
-            gc.get_field_descr(
+            gc.get_field_descr_declaring(
                 struct_key.clone(),
                 &spec.field_key,
                 Some(spec.name.as_str()),
@@ -6017,6 +6081,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 // bound is exact only for callers that hand the `Option` in
                 // themselves — the deserialized-`BhDescr::Field` path.
                 Some(spec.index_in_parent),
+                Some(spec.is_class_word),
             )
         })
         .collect();
@@ -6091,7 +6156,7 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
-                    is_class_word: name_is_class_word(&spec.name),
+                    is_class_word: spec.is_class_word,
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
@@ -7641,6 +7706,8 @@ mod tests {
             flag: ArrayFlag::from_field_type(ty),
             virtualizable: false,
             index_in_parent: idx,
+            // A value field; the class word here arrives as a gc-only edge.
+            is_class_word: false,
         };
         let header: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
             0,

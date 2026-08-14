@@ -2285,6 +2285,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
+                is_class_word: false,
                 index,
                 field_key: format!("CseField{index}"),
                 name: format!("CseField{index}"),
