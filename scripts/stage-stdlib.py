@@ -109,7 +109,7 @@ def stage(assets_root: Path) -> None:
     # only `lib-python/3`: overlaying `lib_pypy` would put its cffi/pure-Python
     # shims (`_testcapi`, `_md5`, `_sha*`, `_sqlite3`, ...) on the release
     # import path, which is the same shadowing the source layout refuses.  What
-    # pyre still owns from `lib_pypy` lives in `lib-python/3` instead.
+    # pyre still owns from `lib_pypy` is a builtin module, so it needs no file.
     shutil.copytree(ROOT / "lib-python" / "3", destination, ignore=ignored)
 
     if not (destination / "site.py").is_file():

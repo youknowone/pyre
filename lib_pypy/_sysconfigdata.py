@@ -5,19 +5,7 @@ import sys
 import struct
 from shutil import which
 
-try:
-    so_ext = _imp.extension_suffixes()[0]
-except IndexError:
-    # EXT_SUFFIX is build ABI metadata, and remains useful to wheel tooling
-    # when this interpreter build has no native-extension loader.  CPython's
-    # sysconfig tests likewise distinguish an absent loader from an absent
-    # build suffix.  This must spell the suffix the extension loader itself
-    # builds its candidate filenames from (`cpyext::extension_suffix`), so a
-    # build that gains the loader keeps the metadata it already published.
-    multiarch = sys.implementation._multiarch
-    shared_ext = '.pyd' if sys.platform == 'win32' else '.so'
-    so_ext = '.pyre314%s%s' % (
-        ('-' + multiarch) if multiarch else '', shared_ext)
+so_ext = _imp.extension_suffixes()[0]
 
 pydot = '%d.%d' % sys.version_info[:2]
 
@@ -47,29 +35,26 @@ build_time_vars = {
     'VERSION': pydot,
     'LDVERSION': pydot,
     'Py_DEBUG': 0,  # cpyext never uses this
-    'Py_GIL_DISABLED': 0,
     'Py_ENABLE_SHARED': 0,  # if 1, will add python so to link like -lpython3.7
-    # Pyre currently has neither a CPython-compatible C API nor a separately
-    # linkable runtime library.  Keep build ABI metadata above for wheel tags,
-    # but never invent files that are absent from the installation.
-    'LIBRARY': '',
-    'LDLIBRARY': '',
-    'LIBPYTHON': '',
-    'INCLUDEPY': '',
-    'CONFINCLUDEPY': '',
-    'LIBDIR': '',
     'SIZEOF_VOID_P': struct.calcsize("P"),
-    # CPython 3.14's relocation check reads these from the generated data.
-    'prefix': sys.base_prefix,
-    'exec_prefix': sys.base_exec_prefix,
-    'srcdir': sys.base_prefix,
 }
 
-# Keep PyPy's relocatable zoneinfo search rooted at base_prefix.  The C-runtime
-# path block above intentionally differs: PyPy ships libpypy beside its binary,
-# whereas Pyre has no separate library to name.
+# LIBDIR should point to where the libpypy3.11-c.so file lives, on CPython
+# it points to "mybase/lib". But that would require rethinking the PyPy
+# packaging process which copies pypy3 and libpypy3.11-c.so to the
+# "mybase/bin" directory. Only when making a portable build (the default
+# for the linux buildbots) is there even a "mybase/lib" created, even so
+# the mybase/bin layout is left untouched.
 mybase = sys.base_prefix
-if sys.platform != 'win32':
+if sys.platform == 'win32':
+    build_time_vars['LDLIBRARY'] = 'libpypy3.11-c.dll'
+    build_time_vars['INCLUDEPY'] = os.path.join(mybase, 'include')
+    build_time_vars['LIBDIR'] = mybase
+else:
+    build_time_vars['LDLIBRARY'] = 'libpypy3.11-c.so'
+    build_time_vars['INCLUDEPY'] = os.path.join(mybase, 'include', 'pypy' + pydot)
+    build_time_vars['LIBDIR'] = os.path.join(mybase, 'bin')
+    build_time_vars['CONFINCLUDEPY'] = build_time_vars['INCLUDEPY']
     # try paths relative to sys.base_prefix first
     tzpaths = [
         os.path.join(mybase, 'share', 'zoneinfo'),
@@ -103,6 +88,7 @@ if sys.platform[:6] == "darwin":
     build_time_vars["LDFLAGS"] = "-undefined dynamic_lookup"
     build_time_vars["LDSHARED"] = "clang -bundle -undefined dynamic_lookup "
     build_time_vars["LDCXXSHARED"] = "clang++ -bundle -undefined dynamic_lookup "
+    build_time_vars['LDLIBRARY'] = 'libpypy3.11-c.dylib'
     # scikit-build checks this, it is left over from the NextStep rld linker
     build_time_vars['WITH_DYLD'] = 1
     if "CXX" in build_time_vars:
@@ -117,3 +103,4 @@ if sys.platform[:6] == "darwin":
         build_time_vars['MACOSX_DEPLOYMENT_TARGET'] = '11.0'
     else:
         build_time_vars['MACOSX_DEPLOYMENT_TARGET'] = '10.15'
+

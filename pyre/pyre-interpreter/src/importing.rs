@@ -734,6 +734,7 @@ pub fn install_builtin_modules() {
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
+    register_builtin_module("_sysconfigdata", init_sysconfigdata);
 }
 
 fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -883,6 +884,296 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
             Ok(vars)
         }),
     );
+}
+
+/// The platform half of the extension ABI, empty where there is none.
+/// `sys.implementation._multiarch` publishes the same string.
+pub(crate) fn multiarch() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-linux-gnu"
+    } else {
+        ""
+    }
+}
+
+/// The name `EXT_SUFFIX` and `SO` publish.
+///
+/// A `cpyext` build has an extension loader, and the suffix it builds its
+/// candidate filenames from is the authority. Without the loader there is no
+/// loaded ABI to read, so the same name is spelled from the pieces the loader
+/// would have used and a build that gains the loader keeps the metadata it
+/// already published.
+fn extension_abi_suffix() -> String {
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    {
+        crate::cpyext::extension_suffix().to_string()
+    }
+    #[cfg(not(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    )))]
+    {
+        let platform_tag = match multiarch() {
+            "" => String::new(),
+            tag => format!("-{tag}"),
+        };
+        let shared_ext = if cfg!(windows) { ".pyd" } else { ".so" };
+        format!(".pyre314{platform_tag}{shared_ext}")
+    }
+}
+
+/// `shutil.which` for the compiler probe in `init_sysconfigdata`: the build
+/// variables name `gcc` only when one is on `PATH`.
+#[cfg(feature = "host_env")]
+fn on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        if directory.as_os_str().is_empty() {
+            return false;
+        }
+        let candidate = directory.join(program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            candidate.is_file()
+        }
+    })
+}
+
+#[cfg(not(feature = "host_env"))]
+fn on_path(_program: &str) -> bool {
+    false
+}
+
+/// `sys.base_prefix` as a path, empty where the interpreter publishes `''`.
+fn sysconfigdata_base_prefix() -> PathBuf {
+    #[cfg(feature = "host_env")]
+    {
+        startup_path_config().base_prefix.clone()
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        PathBuf::new()
+    }
+}
+
+/// `_sysconfigdata` — `build_time_vars`, the mapping `sysconfig._init_posix`
+/// merges into the config vars.
+///
+/// CPython writes this module out of its `configure` run and installs it beside
+/// the stdlib. Pyre has no configure step, so the values come from the running
+/// build instead, and a builtin module keeps them where the rest of the build
+/// metadata already lives: `_sysconfig.config_vars()` answers `_init_non_posix`
+/// from the same source on Windows.
+///
+/// `sysconfig._get_sysconfigdata` reaches this module by name only after
+/// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
+/// turn, so a cross-compilation snapshot still overrides it.
+fn init_sysconfigdata(ns: PyObjectRef) {
+    fn store_str(vars: PyObjectRef, key: &str, value: &str) {
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new(key),
+                pyre_object::w_str_new(value),
+            );
+        }
+    }
+    fn store_int(vars: PyObjectRef, key: &str, value: i64) {
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new(key),
+                pyre_object::w_int_new(value),
+            );
+        }
+    }
+
+    let so_ext = extension_abi_suffix();
+    // SOABI is PEP 3149 compliant, but CPython3 has `so_ext.split('.')[1]`
+    // ("ABI tag"-"platform tag") where this is the ABI tag only.  wheel 0.34.2
+    // depends on this value, so don't make it CPython compliant without
+    // checking wheel: it uses `pep425tags.get_abi_tag` with special handling
+    // for CPython.
+    let soabi = so_ext
+        .split('.')
+        .nth(1)
+        .unwrap_or_default()
+        .split('-')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let gnuld = on_path("gcc");
+    // Darwin names the architecture in CC and CXX, and `platform.machine()`
+    // spells aarch64 `arm64` there.
+    #[cfg(target_os = "macos")]
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    #[cfg(target_os = "macos")]
+    let arch_flag = format!(" -arch {arch}");
+    #[cfg(not(target_os = "macos"))]
+    let arch_flag = "";
+
+    let cc = format!(
+        "{}{arch_flag}",
+        if gnuld { "gcc -pthread" } else { "cc -pthread" }
+    );
+    let cxx = format!(
+        "{}{arch_flag}",
+        if gnuld && on_path("g++") {
+            "g++ -pthread"
+        } else {
+            "c++ -pthread"
+        }
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    let (ldflags, ldshared, ldcxxshared) = {
+        let ldflags = String::from("-Wl,-Bsymbolic-functions");
+        let ldshared = format!("{cc} -shared {ldflags}");
+        (
+            ldflags,
+            ldshared,
+            String::from("c++ -shared -Wl,-O1 -Wl,-Bsymbolic-functions"),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let (ldflags, ldshared, ldcxxshared) = (
+        String::from("-undefined dynamic_lookup"),
+        String::from("clang -bundle -undefined dynamic_lookup "),
+        String::from("clang++ -bundle -undefined dynamic_lookup "),
+    );
+
+    let base_prefix = sysconfigdata_base_prefix();
+    let base_prefix_str =
+        pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(base_prefix.as_os_str()));
+
+    let vars = pyre_object::w_dict_new();
+    store_str(vars, "ABIFLAGS", "");
+    store_str(vars, "SOABI", &soabi);
+    // Deprecated in Python 3, kept for backward compatibility.
+    store_str(vars, "SO", &so_ext);
+    store_str(vars, "MULTIARCH", multiarch());
+    store_str(vars, "CC", &cc);
+    store_str(vars, "CXX", &cxx);
+    store_str(vars, "OPT", "-DNDEBUG -O2");
+    store_str(vars, "CFLAGS", "-DNDEBUG -O2");
+    store_str(vars, "CCSHARED", "-fPIC");
+    store_str(vars, "LDFLAGS", &ldflags);
+    store_str(vars, "LDSHARED", &ldshared);
+    store_str(vars, "LDCXXSHARED", &ldcxxshared);
+    store_str(vars, "EXT_SUFFIX", &so_ext);
+    store_str(vars, "SHLIB_SUFFIX", ".so");
+    store_str(vars, "AR", "ar");
+    store_str(vars, "ARFLAGS", "rc");
+    store_str(vars, "EXE", "");
+    store_str(vars, "VERSION", "3.14");
+    store_str(vars, "LDVERSION", "3.14");
+    // cpyext never uses Py_DEBUG, and pyre is neither a debug nor a
+    // free-threaded build.  Py_ENABLE_SHARED at 1 would add a python shared
+    // object to link lines as `-lpython3.x`.
+    store_int(vars, "Py_DEBUG", 0);
+    store_int(vars, "Py_GIL_DISABLED", 0);
+    store_int(vars, "Py_ENABLE_SHARED", 0);
+    // Pyre currently has neither a CPython-compatible C API nor a separately
+    // linkable runtime library.  Keep the build ABI metadata above for wheel
+    // tags, but never invent files that are absent from the installation.
+    for key in [
+        "LIBRARY",
+        "LDLIBRARY",
+        "LIBPYTHON",
+        "INCLUDEPY",
+        "CONFINCLUDEPY",
+        "LIBDIR",
+    ] {
+        store_str(vars, key, "");
+    }
+    store_int(vars, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
+    if gnuld {
+        store_str(vars, "GNULD", "yes");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // scikit-build checks WITH_DYLD; it is left over from the NextStep rld
+        // linker.  MACOSX_DEPLOYMENT_TARGET was added to solve problems that
+        // may have been solved elsewhere — see cibuildwheel PR 185 and
+        // pypa/wheel, and check the interaction with `build_cffi_imports.py`
+        // before removing it.  Keep it in sync with DARWIN_VERSION_MIN in
+        // `rpython/translator/platform/darwin.py` and `Lib/_osx_support.py`.
+        store_int(vars, "WITH_DYLD", 1);
+        store_str(
+            vars,
+            "MACOSX_DEPLOYMENT_TARGET",
+            if arch == "arm64" { "11.0" } else { "10.15" },
+        );
+    }
+    // Python 3.14's relocation check reads these from the generated data.
+    unsafe {
+        for key in ["prefix", "exec_prefix", "srcdir"] {
+            pyre_object::w_dict_store(vars, pyre_object::w_str_new(key), base_prefix_str);
+        }
+    }
+    // Keep PyPy's relocatable zoneinfo search rooted at `base_prefix`.  The
+    // C-runtime path block above intentionally differs: PyPy ships libpypy
+    // beside its binary, whereas pyre has no separate library to name.
+    #[cfg(not(windows))]
+    {
+        let mut tzpaths = vec![
+            base_prefix.join("share").join("zoneinfo"),
+            base_prefix.join("lib").join("zoneinfo"),
+            base_prefix.join("share").join("lib").join("zoneinfo"),
+            base_prefix.join("..").join("etc").join("zoneinfo"),
+        ];
+        // Absolute system paths, unless `base_prefix` is `/usr` and the four
+        // relative entries above already name them.
+        if base_prefix != Path::new("/usr") {
+            tzpaths.extend(
+                [
+                    "/usr/share/zoneinfo",
+                    "/usr/lib/zoneinfo",
+                    "/usr/share/lib/zoneinfo",
+                    "/etc/zoneinfo",
+                ]
+                .map(PathBuf::from),
+            );
+        }
+        let mut joined = std::ffi::OsString::new();
+        for (index, path) in tzpaths.iter().enumerate() {
+            if index > 0 {
+                joined.push(":");
+            }
+            joined.push(path);
+        }
+        unsafe {
+            pyre_object::w_dict_store(
+                vars,
+                pyre_object::w_str_new("TZPATH"),
+                pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined)),
+            );
+        }
+    }
+    crate::module_ns_store(ns, "build_time_vars", vars);
 }
 
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
@@ -1621,7 +1912,8 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
     // and the CPython suite branches on whether `import X` succeeds.  Exposing
     // a partial shim turns a clean skip into a run against a module that
     // cannot answer.  The supported surface is `lib-python/3` plus the builtin
-    // modules; anything `lib_pypy` still owns is staged into `lib-python/3`.
+    // modules: what `lib_pypy` still owns for PyPy is a builtin module here
+    // (`_sysconfigdata`, `_sysconfig`, ...) rather than a Python file.
     let lib_python = prefix.join("lib-python").join("3");
     if lib_python.join("site.py").is_file() {
         let mut paths = vec![lib_python.clone()];

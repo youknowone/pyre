@@ -1785,19 +1785,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             w_int_new(implementation_hexversion),
         );
         crate::baseobjspace::setdictvalue_native(impl_obj, "cache_tag", w_str_new("pyre314"));
-        let multiarch = if cfg!(target_os = "macos") {
-            "darwin"
-        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "x86_64-linux-gnu"
-        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            "aarch64-linux-gnu"
-        } else {
-            ""
-        };
         crate::baseobjspace::setdictvalue_native(
             impl_obj,
             "_multiarch",
-            w_str_new(multiarch),
+            w_str_new(crate::importing::multiarch()),
         );
         module_ns_store(ns, "implementation", impl_obj);
     }
