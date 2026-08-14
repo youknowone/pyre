@@ -30,6 +30,35 @@ fn cur_pickler(slot: usize) -> &'static mut W_Pickler {
     unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Pickler) }
 }
 
+/// A reference kept for the duration of `pickle_core_impl`. Movable values
+/// live in a shadow-stack slot and are re-read on every access so relocation
+/// is observed; `PY_NULL` and immovable singletons can be held verbatim.
+struct PinnedRef {
+    slot: Option<usize>,
+    immovable: PyObjectRef,
+}
+
+impl PinnedRef {
+    fn new(value: PyObjectRef, movable: bool) -> Self {
+        let slot = if movable {
+            pyre_object::gc_roots::pin_root(value);
+            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+        } else {
+            None
+        };
+        Self {
+            slot,
+            immovable: value,
+        }
+    }
+
+    fn get(&self) -> PyObjectRef {
+        self.slot.map_or(self.immovable, |slot| {
+            pyre_object::gc_roots::shadow_stack_get(slot)
+        })
+    }
+}
+
 /// Old-to-young / incremental-mark write barrier for a store into the
 /// pickler's own GC-pointer fields (`w_memo` / `w_dispatch_table` /
 /// `w_pers_func` / …). The GC transform emits `ll_writebarrier` after every
@@ -97,9 +126,9 @@ struct PickleCtx {
     index: HashMap<usize, Vec<usize>>,
     /// `persistent_id` callable resolved off the pickler (subclass override
     /// or set attribute), or `PY_NULL` when not defined.
-    pers_func: PyObjectRef,
+    pers_func: PinnedRef,
     /// `buffer_callback` for proto-5 out-of-band buffers, or `None`/`PY_NULL`.
-    buffer_callback: PyObjectRef,
+    buffer_callback: PinnedRef,
     /// `fast` mode — when set, memoization is skipped (no PUT/GET); a
     /// shallow cyclic-object guard (`fast_nesting` / `fast_memo`) still fires
     /// past `FAST_NESTING_LIMIT`.
@@ -116,10 +145,10 @@ struct PickleCtx {
     /// Effective `dispatch_table` (the pickler's, else `copyreg.dispatch_table`)
     /// consulted by `type` for the reduce of an otherwise-unhandled object;
     /// `None`/`PY_NULL` when unavailable.
-    dispatch_table: PyObjectRef,
+    dispatch_table: PinnedRef,
     /// `reducer_override` callable (a subclass hook) consulted for every
     /// object, or `PY_NULL` when not defined.
-    reducer_override: PyObjectRef,
+    reducer_override: PinnedRef,
 }
 
 impl PickleCtx {
@@ -1026,18 +1055,16 @@ fn pickle_core_impl(
 ) -> Result<PyObjectRef, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_obj);
-    if !pers_func.is_null() {
-        pyre_object::gc_roots::pin_root(pers_func);
-    }
-    if !buffer_callback.is_null() && !unsafe { pyre_object::is_none(buffer_callback) } {
-        pyre_object::gc_roots::pin_root(buffer_callback);
-    }
-    if !dispatch_table.is_null() && !unsafe { pyre_object::is_none(dispatch_table) } {
-        pyre_object::gc_roots::pin_root(dispatch_table);
-    }
-    if !reducer_override.is_null() {
-        pyre_object::gc_roots::pin_root(reducer_override);
-    }
+    let pers_func = PinnedRef::new(pers_func, !pers_func.is_null());
+    let buffer_callback = PinnedRef::new(
+        buffer_callback,
+        !buffer_callback.is_null() && !unsafe { pyre_object::is_none(buffer_callback) },
+    );
+    let dispatch_table = PinnedRef::new(
+        dispatch_table,
+        !dispatch_table.is_null() && !unsafe { pyre_object::is_none(dispatch_table) },
+    );
+    let reducer_override = PinnedRef::new(reducer_override, !reducer_override.is_null());
     // Pin the memo list and index its existing entries (a reused `Pickler`
     // carries memo state across `dump` calls until `clear_memo`).
     pyre_object::gc_roots::pin_root(w_memo);
@@ -1179,11 +1206,9 @@ fn save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(),
     pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     buf.commit_frame(false)?;
-    if !ctx.pers_func.is_null() {
-        let w_pid = call_fn(
-            ctx.pers_func,
-            &[pyre_object::gc_roots::shadow_stack_get(slot)],
-        )?;
+    let pers_func = ctx.pers_func.get();
+    if !pers_func.is_null() {
+        let w_pid = call_fn(pers_func, &[pyre_object::gc_roots::shadow_stack_get(slot)])?;
         if !unsafe { pyre_object::is_none(w_pid) } {
             save_pers(ctx, buf, w_pid)
         } else {
@@ -1306,12 +1331,13 @@ fn dispatch_save(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> R
     // default reduction. (interp_pickle.py:619-625 calls it earlier; CPython
     // 3.14 — the behaviour target — dispatches built-in types first, so the
     // hook never sees a list/dict/str and a repeated object hits the memo.)
-    if !ctx.reducer_override.is_null() {
+    let reducer_override = ctx.reducer_override.get();
+    if !reducer_override.is_null() {
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(w_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_rv = call_fn(
-            ctx.reducer_override,
+            reducer_override,
             &[pyre_object::gc_roots::shadow_stack_get(slot)],
         )?;
         if !unsafe { pyre_object::is_not_implemented(w_rv) } {
@@ -1482,7 +1508,7 @@ fn dispatch_table_reduce(
     ctx: &PickleCtx,
     w_obj: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let dt = ctx.dispatch_table;
+    let dt = ctx.dispatch_table.get();
     if dt.is_null() {
         return Ok(None);
     }
@@ -2056,8 +2082,9 @@ fn save_picklebuffer(
     }
     let (data, readonly) = crate::module::__pypy__::interp_buffer::buffer_view(wrapped)?;
     let mut in_band = true;
-    if !unsafe { pyre_object::is_none(ctx.buffer_callback) } {
-        let w_ret = call_fn(ctx.buffer_callback, &[w_obj])?;
+    let buffer_callback = ctx.buffer_callback.get();
+    if !unsafe { pyre_object::is_none(buffer_callback) } {
+        let w_ret = call_fn(buffer_callback, &[w_obj])?;
         in_band = crate::baseobjspace::is_true(w_ret)?;
     }
     if in_band {
