@@ -146,13 +146,82 @@ typedef PyObject *(*getter)(PyObject *, void *);
 typedef int (*setter)(PyObject *, PyObject *, void *);
 typedef PyObject *(*vectorcallfunc)(PyObject *, PyObject *const *, size_t, PyObject *);
 
-/* The protocol tables are declared but not yet consulted; a type may still
-   point at one, so the pointer fields have to exist. */
-typedef struct PyNumberMethods PyNumberMethods;
-typedef struct PySequenceMethods PySequenceMethods;
-typedef struct PyMappingMethods PyMappingMethods;
-typedef struct PyAsyncMethods PyAsyncMethods;
-typedef struct PyBufferProcs PyBufferProcs;
+typedef Py_ssize_t (*lenfunc)(PyObject *);
+typedef PyObject *(*ssizeargfunc)(PyObject *, Py_ssize_t);
+typedef int (*ssizeobjargproc)(PyObject *, Py_ssize_t, PyObject *);
+typedef int (*objobjproc)(PyObject *, PyObject *);
+typedef int (*objobjargproc)(PyObject *, PyObject *, PyObject *);
+
+typedef struct {
+    binaryfunc nb_add;
+    binaryfunc nb_subtract;
+    binaryfunc nb_multiply;
+    binaryfunc nb_remainder;
+    binaryfunc nb_divmod;
+    ternaryfunc nb_power;
+    unaryfunc nb_negative;
+    unaryfunc nb_positive;
+    unaryfunc nb_absolute;
+    inquiry nb_bool;
+    unaryfunc nb_invert;
+    binaryfunc nb_lshift;
+    binaryfunc nb_rshift;
+    binaryfunc nb_and;
+    binaryfunc nb_xor;
+    binaryfunc nb_or;
+    unaryfunc nb_int;
+    void *nb_reserved;
+    unaryfunc nb_float;
+    binaryfunc nb_inplace_add;
+    binaryfunc nb_inplace_subtract;
+    binaryfunc nb_inplace_multiply;
+    binaryfunc nb_inplace_remainder;
+    ternaryfunc nb_inplace_power;
+    binaryfunc nb_inplace_lshift;
+    binaryfunc nb_inplace_rshift;
+    binaryfunc nb_inplace_and;
+    binaryfunc nb_inplace_xor;
+    binaryfunc nb_inplace_or;
+    binaryfunc nb_floor_divide;
+    binaryfunc nb_true_divide;
+    binaryfunc nb_inplace_floor_divide;
+    binaryfunc nb_inplace_true_divide;
+    unaryfunc nb_index;
+    binaryfunc nb_matrix_multiply;
+    binaryfunc nb_inplace_matrix_multiply;
+} PyNumberMethods;
+
+typedef struct {
+    lenfunc sq_length;
+    binaryfunc sq_concat;
+    ssizeargfunc sq_repeat;
+    ssizeargfunc sq_item;
+    void *was_sq_slice;
+    ssizeobjargproc sq_ass_item;
+    void *was_sq_ass_slice;
+    objobjproc sq_contains;
+    binaryfunc sq_inplace_concat;
+    ssizeargfunc sq_inplace_repeat;
+} PySequenceMethods;
+
+typedef struct {
+    lenfunc mp_length;
+    binaryfunc mp_subscript;
+    objobjargproc mp_ass_subscript;
+} PyMappingMethods;
+
+/* Declared for their offsets; nothing reads these yet. */
+typedef struct {
+    unaryfunc am_await;
+    unaryfunc am_aiter;
+    unaryfunc am_anext;
+    void *am_send;
+} PyAsyncMethods;
+
+typedef struct {
+    void *bf_getbuffer;
+    void *bf_releasebuffer;
+} PyBufferProcs;
 
 typedef struct PyMemberDef {
     const char *name;
@@ -420,6 +489,72 @@ PyAPI_FUNC(PyObject *) PyObject_CallObject(PyObject *callable, PyObject *args);
 PyAPI_FUNC(int) PyCallable_Check(PyObject *object);
 PyAPI_FUNC(int) PyObject_IsInstance(PyObject *object, PyObject *class_);
 PyAPI_FUNC(PyObject *) PyObject_Type(PyObject *object);
+
+/* The number protocol. */
+PyAPI_FUNC(PyObject *) PyNumber_Add(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Subtract(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Multiply(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_MatrixMultiply(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_FloorDivide(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_TrueDivide(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Remainder(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Divmod(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Lshift(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Rshift(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_And(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Xor(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Or(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Power(PyObject *base, PyObject *exponent, PyObject *modulus);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceAdd(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceSubtract(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceMultiply(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceMatrixMultiply(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceFloorDivide(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceTrueDivide(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceRemainder(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceLshift(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceRshift(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceAnd(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceXor(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_InPlaceOr(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PyNumber_Negative(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Positive(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Absolute(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Invert(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Index(PyObject *object);
+PyAPI_FUNC(PyObject *) PyNumber_Float(PyObject *object);
+PyAPI_FUNC(int) PyNumber_Check(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PyNumber_AsSsize_t(PyObject *object, PyObject *exc);
+
+/* The sequence protocol. */
+PyAPI_FUNC(int) PySequence_Check(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PySequence_Size(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PySequence_Length(PyObject *object);
+PyAPI_FUNC(PyObject *) PySequence_Concat(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PySequence_InPlaceConcat(PyObject *left, PyObject *right);
+PyAPI_FUNC(PyObject *) PySequence_Repeat(PyObject *object, Py_ssize_t count);
+PyAPI_FUNC(PyObject *) PySequence_InPlaceRepeat(PyObject *object, Py_ssize_t count);
+PyAPI_FUNC(PyObject *) PySequence_GetItem(PyObject *object, Py_ssize_t index);
+PyAPI_FUNC(int) PySequence_SetItem(PyObject *object, Py_ssize_t index, PyObject *value);
+PyAPI_FUNC(int) PySequence_DelItem(PyObject *object, Py_ssize_t index);
+PyAPI_FUNC(int) PySequence_Contains(PyObject *object, PyObject *value);
+PyAPI_FUNC(Py_ssize_t) PySequence_Index(PyObject *object, PyObject *value);
+PyAPI_FUNC(PyObject *) PySequence_List(PyObject *object);
+PyAPI_FUNC(PyObject *) PySequence_Tuple(PyObject *object);
+PyAPI_FUNC(PyObject *) PySequence_GetSlice(PyObject *object, Py_ssize_t start, Py_ssize_t stop);
+
+/* The mapping protocol. */
+PyAPI_FUNC(int) PyMapping_Check(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PyMapping_Size(PyObject *object);
+PyAPI_FUNC(Py_ssize_t) PyMapping_Length(PyObject *object);
+PyAPI_FUNC(PyObject *) PyMapping_GetItemString(PyObject *object, const char *key);
+PyAPI_FUNC(int) PyMapping_SetItemString(PyObject *object, const char *key, PyObject *value);
+PyAPI_FUNC(int) PyMapping_DelItemString(PyObject *object, const char *key);
+PyAPI_FUNC(int) PyMapping_HasKey(PyObject *object, PyObject *key);
+PyAPI_FUNC(int) PyMapping_HasKeyString(PyObject *object, const char *key);
+PyAPI_FUNC(PyObject *) PyMapping_Keys(PyObject *object);
+PyAPI_FUNC(PyObject *) PyMapping_Values(PyObject *object);
+PyAPI_FUNC(PyObject *) PyMapping_Items(PyObject *object);
 
 /* int / bool. */
 PyAPI_FUNC(PyObject *) PyLong_FromLong(long value);

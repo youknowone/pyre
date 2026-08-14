@@ -171,6 +171,114 @@ except m.TypesError as error:
 else:
     raise AssertionError('the module exception did not propagate')
 
+# ── the number table ───────────────────────────────────────────────────
+v = m.Vec(3)
+assert repr(v) == 'Vec(3)'
+assert v.value == 3
+assert repr(v + m.Vec(4)) == 'Vec(7)'
+assert repr(v + 10) == 'Vec(13)'
+assert repr(10 + v) == 'Vec(13)'
+assert repr(v - 1) == 'Vec(2)'
+assert repr(1 - v) == 'Vec(-2)'
+assert repr(v * 4) == 'Vec(12)'
+assert repr(4 * v) == 'Vec(12)'
+assert repr(-v) == 'Vec(-3)'
+assert repr(abs(m.Vec(-9))) == 'Vec(9)'
+assert repr(v ** 3) == 'Vec(27)'
+assert repr(pow(m.Vec(2), 10, 1000)) == 'Vec(24)'
+assert int(v) == 3
+assert float(v) == 3.0
+assert bool(v) is True
+assert bool(m.Vec(0)) is False
+try:
+    v + 'text'
+except TypeError:
+    pass
+else:
+    raise AssertionError('an unsupported operand was accepted')
+
+acc = m.Vec(1)
+same = acc
+acc += 5
+assert acc is same
+assert acc.value == 6
+
+# ── the sequence table ─────────────────────────────────────────────────
+bag = m.Bag(4, 5, 6)
+assert len(bag) == 3
+assert bag[0] == 4
+assert bag[-1] == 6
+assert 5 in bag
+assert 9 not in bag
+bag[1] = 50
+assert bag[1] == 50
+del bag[0]
+assert len(bag) == 2
+assert bag[0] == 50
+try:
+    bag[9]
+except IndexError:
+    pass
+else:
+    raise AssertionError('an out-of-range index was accepted')
+assert bag * 2 == [50, 6, 50, 6]
+assert 2 * bag == [50, 6, 50, 6]
+assert list(bag) == [50, 6]
+
+# ── the mapping table ──────────────────────────────────────────────────
+table = m.Table()
+assert len(table) == 0
+table['a'] = 1
+table['b'] = 2
+assert len(table) == 2
+assert table['a'] == 1
+try:
+    table['missing']
+except KeyError:
+    pass
+else:
+    raise AssertionError('a missing key was accepted')
+del table['a']
+assert len(table) == 1
+assert sorted(table.keys()) == ['b']
+
+# ── the abstract protocols, driven from C ──────────────────────────────
+p = m.protocol
+assert p('add', 2, 3) == 5
+assert p('add', 'a', 'b') == 'ab'
+assert p('add', [1], [2]) == [1, 2]
+assert repr(p('add', m.Vec(1), m.Vec(2))) == 'Vec(3)'
+assert p('multiply', 3, 4) == 12
+assert p('power', 2, 8) == 256
+assert p('negative', 5) == -5
+assert p('index', 7) == 7
+assert p('float', 7) == 7.0
+assert p('number_check', 7) is True
+assert p('number_check', 'x') is False
+assert p('as_ssize', 12) == 12
+
+assert p('sequence_check', [1, 2]) is True
+assert p('sequence_check', 5) is False
+assert p('size', [1, 2, 3]) == 3
+assert p('size', bag) == 2
+assert p('getitem', [1, 2, 3], 1) == 2
+assert p('getitem', bag, 0) == 50
+assert p('contains', [1, 2, 3], 2) is True
+assert p('contains', bag, 6) is True
+assert p('list', (1, 2)) == [1, 2]
+assert p('tuple', [1, 2]) == (1, 2)
+assert p('seq_index', [7, 8, 9], 8) == 1
+assert p('repeat', [1, 2], 2) == [1, 2, 1, 2]
+
+assert p('mapping_check', {'a': 1}) is True
+assert p('mapping_check', [1]) is False
+assert p('keys', {'a': 1}) == ['a']
+assert p('values', {'a': 1}) == [1]
+assert p('items', {'a': 1}) == [('a', 1)]
+assert p('getstring', {'a': 1}, 'a') == 1
+assert p('haskey', {'a': 1}, 'a') is True
+assert p('haskey', {'a': 1}, 'z') is False
+
 print('cpyext-types-ok')
 "#;
 

@@ -20,11 +20,14 @@ pub mod dictobject;
 pub mod floatobject;
 pub mod listobject;
 pub mod longobject;
+pub mod mapping;
 pub mod methodobject;
 pub mod modsupport;
+pub mod number;
 pub mod object;
 pub mod pyerrors;
 pub mod pyobject;
+pub mod sequence;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
@@ -718,4 +721,7 @@ pub fn ensure_linked() {
     typeobject::ensure_linked();
     listobject::ensure_linked();
     dictobject::ensure_linked();
+    number::ensure_linked();
+    sequence::ensure_linked();
+    mapping::ensure_linked();
 }

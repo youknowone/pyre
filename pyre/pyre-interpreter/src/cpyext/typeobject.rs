@@ -18,31 +18,86 @@ pub struct CPyVarObject {
     pub ob_size: isize,
 }
 
-/// The protocol tables, opaque to this slice: they are pointers on
-/// [`CPyTypeObject`] and the slice that reads them fills these in.
+/// `PyNumberMethods`.  Every slot is a raw pointer for the reason
+/// [`CPyTypeObject`] gives.
 #[repr(C)]
 pub struct CPyNumberMethods {
-    _private: [u8; 0],
+    pub nb_add: *const c_void,
+    pub nb_subtract: *const c_void,
+    pub nb_multiply: *const c_void,
+    pub nb_remainder: *const c_void,
+    pub nb_divmod: *const c_void,
+    pub nb_power: *const c_void,
+    pub nb_negative: *const c_void,
+    pub nb_positive: *const c_void,
+    pub nb_absolute: *const c_void,
+    pub nb_bool: *const c_void,
+    pub nb_invert: *const c_void,
+    pub nb_lshift: *const c_void,
+    pub nb_rshift: *const c_void,
+    pub nb_and: *const c_void,
+    pub nb_xor: *const c_void,
+    pub nb_or: *const c_void,
+    pub nb_int: *const c_void,
+    pub nb_reserved: *const c_void,
+    pub nb_float: *const c_void,
+    pub nb_inplace_add: *const c_void,
+    pub nb_inplace_subtract: *const c_void,
+    pub nb_inplace_multiply: *const c_void,
+    pub nb_inplace_remainder: *const c_void,
+    pub nb_inplace_power: *const c_void,
+    pub nb_inplace_lshift: *const c_void,
+    pub nb_inplace_rshift: *const c_void,
+    pub nb_inplace_and: *const c_void,
+    pub nb_inplace_xor: *const c_void,
+    pub nb_inplace_or: *const c_void,
+    pub nb_floor_divide: *const c_void,
+    pub nb_true_divide: *const c_void,
+    pub nb_inplace_floor_divide: *const c_void,
+    pub nb_inplace_true_divide: *const c_void,
+    pub nb_index: *const c_void,
+    pub nb_matrix_multiply: *const c_void,
+    pub nb_inplace_matrix_multiply: *const c_void,
 }
 
+/// `PySequenceMethods`.  The two `was_sq_*` holes are the pre-2.x slice slots,
+/// which still occupy their offsets.
 #[repr(C)]
 pub struct CPySequenceMethods {
-    _private: [u8; 0],
+    pub sq_length: *const c_void,
+    pub sq_concat: *const c_void,
+    pub sq_repeat: *const c_void,
+    pub sq_item: *const c_void,
+    pub was_sq_slice: *const c_void,
+    pub sq_ass_item: *const c_void,
+    pub was_sq_ass_slice: *const c_void,
+    pub sq_contains: *const c_void,
+    pub sq_inplace_concat: *const c_void,
+    pub sq_inplace_repeat: *const c_void,
 }
 
+/// `PyMappingMethods`.
 #[repr(C)]
 pub struct CPyMappingMethods {
-    _private: [u8; 0],
+    pub mp_length: *const c_void,
+    pub mp_subscript: *const c_void,
+    pub mp_ass_subscript: *const c_void,
 }
 
+/// `PyAsyncMethods`, declared for its offsets: nothing reads these yet.
 #[repr(C)]
 pub struct CPyAsyncMethods {
-    _private: [u8; 0],
+    pub am_await: *const c_void,
+    pub am_aiter: *const c_void,
+    pub am_anext: *const c_void,
+    pub am_send: *const c_void,
 }
 
+/// `PyBufferProcs`, declared for its offsets: nothing reads these yet.
 #[repr(C)]
 pub struct CPyBufferProcs {
-    _private: [u8; 0],
+    pub bf_getbuffer: *const c_void,
+    pub bf_releasebuffer: *const c_void,
 }
 
 /// One row of a `PyMemberDef` table.
@@ -257,10 +312,7 @@ fn c_bases(w_type: PyObjectRef) -> Vec<*mut CPyTypeObject> {
 }
 
 /// The nearest non-null `pick`ed slot along `w_type`'s MRO.
-fn find_slot(
-    w_type: PyObjectRef,
-    pick: fn(*mut CPyTypeObject) -> *const c_void,
-) -> *const c_void {
+fn find_slot(w_type: PyObjectRef, pick: fn(*mut CPyTypeObject) -> *const c_void) -> *const c_void {
     for raw in c_bases(w_type) {
         let slot = pick(raw);
         if !slot.is_null() {
@@ -359,7 +411,11 @@ fn new_carrier(
     reload(carrier_slot)
 }
 
-fn descriptor_type(cell: &OnceLock<usize>, name: &'static str, init: fn(PyObjectRef)) -> PyObjectRef {
+fn descriptor_type(
+    cell: &OnceLock<usize>,
+    name: &'static str,
+    init: fn(PyObjectRef),
+) -> PyObjectRef {
     *cell.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type(name, init);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -547,9 +603,11 @@ fn read_member(
             "cpyext member read on an object with no C storage",
         ));
     }
-    let name = || unsafe { std::ffi::CStr::from_ptr((*member).name) }
-        .to_string_lossy()
-        .into_owned();
+    let name = || {
+        unsafe { std::ffi::CStr::from_ptr((*member).name) }
+            .to_string_lossy()
+            .into_owned()
+    };
     let value = unsafe {
         match (*member).type_code {
             T_BOOL => pyre_object::boolobject::w_bool_from(*(address as *const i8) != 0),
@@ -608,9 +666,11 @@ fn write_member(
     member: *mut CPyMemberDef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let name = || unsafe { std::ffi::CStr::from_ptr((*member).name) }
-        .to_string_lossy()
-        .into_owned();
+    let name = || {
+        unsafe { std::ffi::CStr::from_ptr((*member).name) }
+            .to_string_lossy()
+            .into_owned()
+    };
     if unsafe { (*member).flags } & MEMBER_READONLY != 0
         || matches!(unsafe { (*member).type_code }, T_STRING | T_NONE)
     {
@@ -892,11 +952,8 @@ fn slot_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let built = ternary_args(&positional, &keywords);
     let receiver = pyobject::make_ref(w_self);
     let result = unsafe {
-        let call: unsafe extern "C" fn(
-            *mut CPyObject,
-            *mut CPyObject,
-            *mut CPyObject,
-        ) -> c_int = std::mem::transmute(slot);
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject, *mut CPyObject) -> c_int =
+            std::mem::transmute(slot);
         call(receiver, built.arguments, built.keywords)
     };
     unsafe { pyobject::decref(receiver) };
@@ -967,7 +1024,9 @@ fn slot_iternext(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args[0];
     let slot = slot_of(w_self, |tp| unsafe { (*tp).tp_iternext });
     if slot.is_null() {
-        return Err(crate::PyError::type_error("cpyext object is not an iterator"));
+        return Err(crate::PyError::type_error(
+            "cpyext object is not an iterator",
+        ));
     }
     let receiver = pyobject::make_ref(w_self);
     let result = unsafe {
@@ -1004,10 +1063,7 @@ fn slot_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 /// `Py_LT` .. `Py_GE`.
-fn rich_compare(
-    args: &[PyObjectRef],
-    operation: c_int,
-) -> Result<PyObjectRef, crate::PyError> {
+fn rich_compare(args: &[PyObjectRef], operation: c_int) -> Result<PyObjectRef, crate::PyError> {
     let w_self = args[0];
     let slot = slot_of(w_self, |tp| unsafe { (*tp).tp_richcompare });
     if slot.is_null() {
@@ -1061,6 +1117,671 @@ comparison_slots! {
     slot_ne => "__ne__", 3;
     slot_gt => "__gt__", 4;
     slot_ge => "__ge__", 5;
+}
+
+// ── the protocol tables ─────────────────────────────────────────────────
+//
+// Each table slot becomes the dunder `slotdefs.py` names for it.  A wrapper
+// re-derives the slot from the receiver's MRO, so a Python subclass of a
+// C-defined type reaches the base's table through the namespace it inherits.
+
+macro_rules! number_slot {
+    ($field:ident) => {
+        (|tp| unsafe {
+            let table = (*tp).tp_as_number;
+            if table.is_null() {
+                std::ptr::null()
+            } else {
+                (*table).$field
+            }
+        }) as fn(*mut CPyTypeObject) -> *const c_void
+    };
+}
+
+macro_rules! sequence_slot {
+    ($field:ident) => {
+        (|tp| unsafe {
+            let table = (*tp).tp_as_sequence;
+            if table.is_null() {
+                std::ptr::null()
+            } else {
+                (*table).$field
+            }
+        }) as fn(*mut CPyTypeObject) -> *const c_void
+    };
+}
+
+macro_rules! mapping_slot {
+    ($field:ident) => {
+        (|tp| unsafe {
+            let table = (*tp).tp_as_mapping;
+            if table.is_null() {
+                std::ptr::null()
+            } else {
+                (*table).$field
+            }
+        }) as fn(*mut CPyTypeObject) -> *const c_void
+    };
+}
+
+/// Run a `(PyObject *, PyObject *) -> PyObject *` slot.
+fn call_binary(
+    slot: *const c_void,
+    first: PyObjectRef,
+    second: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(first);
+    let second_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(second);
+    let left = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(first_slot));
+    let right = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(second_slot));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> *mut CPyObject =
+            std::mem::transmute(slot);
+        call(left, right)
+    };
+    unsafe {
+        pyobject::decref(left);
+        pyobject::decref(right);
+    }
+    super::from_c_result(result)
+}
+
+/// `left op right` through `pick`, in the order the operands were written.
+///
+/// `nb_add` serves `__add__` and `__radd__` both, as `SLOT1BIN` does: the
+/// reflected form hands the C function the pair the other way round, and a
+/// table that does not handle it answers `NotImplemented` itself.
+fn binary(
+    args: &[PyObjectRef],
+    pick: fn(*mut CPyTypeObject) -> *const c_void,
+    reflected: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], pick);
+    if slot.is_null() {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let (first, second) = if reflected {
+        (args[1], args[0])
+    } else {
+        (args[0], args[1])
+    };
+    call_binary(slot, first, second)
+}
+
+macro_rules! number_binaries {
+    ($($field:ident, $direct_name:literal, $direct:ident, $reflected_name:literal, $reflected:ident;)*) => {
+        $(
+            fn $direct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                binary(args, number_slot!($field), false)
+            }
+
+            fn $reflected(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                binary(args, number_slot!($field), true)
+            }
+        )*
+
+        fn install_number_binaries(ns: PyObjectRef, tp: *mut CPyTypeObject) {
+            $(
+                if !(number_slot!($field))(tp).is_null() {
+                    store(
+                        ns,
+                        $direct_name,
+                        crate::make_builtin_function_with_arity($direct_name, $direct, 2),
+                    );
+                    store(
+                        ns,
+                        $reflected_name,
+                        crate::make_builtin_function_with_arity($reflected_name, $reflected, 2),
+                    );
+                }
+            )*
+        }
+    };
+}
+
+number_binaries! {
+    nb_add, "__add__", nb_add_direct, "__radd__", nb_add_reflected;
+    nb_subtract, "__sub__", nb_sub_direct, "__rsub__", nb_sub_reflected;
+    nb_multiply, "__mul__", nb_mul_direct, "__rmul__", nb_mul_reflected;
+    nb_remainder, "__mod__", nb_mod_direct, "__rmod__", nb_mod_reflected;
+    nb_divmod, "__divmod__", nb_divmod_direct, "__rdivmod__", nb_divmod_reflected;
+    nb_lshift, "__lshift__", nb_lshift_direct, "__rlshift__", nb_lshift_reflected;
+    nb_rshift, "__rshift__", nb_rshift_direct, "__rrshift__", nb_rshift_reflected;
+    nb_and, "__and__", nb_and_direct, "__rand__", nb_and_reflected;
+    nb_xor, "__xor__", nb_xor_direct, "__rxor__", nb_xor_reflected;
+    nb_or, "__or__", nb_or_direct, "__ror__", nb_or_reflected;
+    nb_floor_divide, "__floordiv__", nb_floordiv_direct, "__rfloordiv__", nb_floordiv_reflected;
+    nb_true_divide, "__truediv__", nb_truediv_direct, "__rtruediv__", nb_truediv_reflected;
+    nb_matrix_multiply, "__matmul__", nb_matmul_direct, "__rmatmul__", nb_matmul_reflected;
+}
+
+macro_rules! number_inplace {
+    ($($field:ident, $name:literal, $wrapper:ident;)*) => {
+        $(
+            fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                binary(args, number_slot!($field), false)
+            }
+        )*
+
+        fn install_number_inplace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
+            $(
+                if !(number_slot!($field))(tp).is_null() {
+                    store(
+                        ns,
+                        $name,
+                        crate::make_builtin_function_with_arity($name, $wrapper, 2),
+                    );
+                }
+            )*
+        }
+    };
+}
+
+number_inplace! {
+    nb_inplace_add, "__iadd__", nb_iadd;
+    nb_inplace_subtract, "__isub__", nb_isub;
+    nb_inplace_multiply, "__imul__", nb_imul;
+    nb_inplace_remainder, "__imod__", nb_imod;
+    nb_inplace_lshift, "__ilshift__", nb_ilshift;
+    nb_inplace_rshift, "__irshift__", nb_irshift;
+    nb_inplace_and, "__iand__", nb_iand;
+    nb_inplace_xor, "__ixor__", nb_ixor;
+    nb_inplace_or, "__ior__", nb_ior;
+    nb_inplace_floor_divide, "__ifloordiv__", nb_ifloordiv;
+    nb_inplace_true_divide, "__itruediv__", nb_itruediv;
+    nb_inplace_matrix_multiply, "__imatmul__", nb_imatmul;
+}
+
+macro_rules! number_unaries {
+    ($($field:ident, $name:literal, $wrapper:ident;)*) => {
+        $(
+            fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+                unary_slot(args[0], number_slot!($field), stringify!($field))
+            }
+        )*
+
+        fn install_number_unaries(ns: PyObjectRef, tp: *mut CPyTypeObject) {
+            $(
+                if !(number_slot!($field))(tp).is_null() {
+                    store(
+                        ns,
+                        $name,
+                        crate::make_builtin_function_with_arity($name, $wrapper, 1),
+                    );
+                }
+            )*
+        }
+    };
+}
+
+number_unaries! {
+    nb_negative, "__neg__", nb_neg;
+    nb_positive, "__pos__", nb_pos;
+    nb_absolute, "__abs__", nb_abs;
+    nb_invert, "__invert__", nb_invert_wrapper;
+    nb_int, "__int__", nb_int_wrapper;
+    nb_float, "__float__", nb_float_wrapper;
+    nb_index, "__index__", nb_index_wrapper;
+}
+
+/// `nb_bool` is an `inquiry`: a negative result is the error indicator.
+fn nb_bool_wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], number_slot!(nb_bool));
+    if slot.is_null() {
+        return Ok(pyre_object::boolobject::w_bool_from(true));
+    }
+    let receiver = pyobject::make_ref(args[0]);
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject) -> c_int = std::mem::transmute(slot);
+        call(receiver)
+    };
+    unsafe { pyobject::decref(receiver) };
+    if result < 0 {
+        return Err(pending_or(
+            "a cpyext truth test failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::boolobject::w_bool_from(result != 0))
+}
+
+/// `nb_power` is a `ternaryfunc`, the third operand being the modulus `pow`
+/// takes and every other route leaves as `None`.
+fn power(args: &[PyObjectRef], reflected: bool) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], number_slot!(nb_power));
+    if slot.is_null() {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let (first, second) = if reflected {
+        (args[1], args[0])
+    } else {
+        (args[0], args[1])
+    };
+    let modulus = args.get(2).copied().unwrap_or_else(pyre_object::w_none);
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(first);
+    roots.pin_root(second);
+    roots.pin_root(modulus);
+    let owned =
+        |index: usize| pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base + index));
+    let (left, right, third) = (owned(0), owned(1), owned(2));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(
+            *mut CPyObject,
+            *mut CPyObject,
+            *mut CPyObject,
+        ) -> *mut CPyObject = std::mem::transmute(slot);
+        call(left, right, third)
+    };
+    unsafe {
+        pyobject::decref(left);
+        pyobject::decref(right);
+        pyobject::decref(third);
+    }
+    super::from_c_result(result)
+}
+
+fn nb_pow_direct(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    power(args, false)
+}
+
+fn nb_pow_reflected(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    power(args, true)
+}
+
+fn nb_ipow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], number_slot!(nb_inplace_power));
+    if slot.is_null() {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    // The in-place slot has the same shape, so the direct path serves it once
+    // the lookup has been pointed at it.
+    call_ternary(slot, args[0], args[1], args.get(2).copied())
+}
+
+fn call_ternary(
+    slot: *const c_void,
+    first: PyObjectRef,
+    second: PyObjectRef,
+    third: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(first);
+    roots.pin_root(second);
+    roots.pin_root(third.unwrap_or_else(pyre_object::w_none));
+    let owned =
+        |index: usize| pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base + index));
+    let (left, right, modulus) = (owned(0), owned(1), owned(2));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(
+            *mut CPyObject,
+            *mut CPyObject,
+            *mut CPyObject,
+        ) -> *mut CPyObject = std::mem::transmute(slot);
+        call(left, right, modulus)
+    };
+    unsafe {
+        pyobject::decref(left);
+        pyobject::decref(right);
+        pyobject::decref(modulus);
+    }
+    super::from_c_result(result)
+}
+
+/// The pending C exception, or a `SystemError` naming the slot that returned
+/// its failure indicator without setting one.
+fn pending_or(message: &str) -> crate::PyError {
+    super::pyerrors::take_pending_error()
+        .unwrap_or_else(|| crate::PyError::new(crate::PyErrorKind::SystemError, message))
+}
+
+// ── the sequence and mapping tables ─────────────────────────────────────
+
+/// Run a `lenfunc`.
+fn call_length(slot: *const c_void, w_self: PyObjectRef) -> Result<isize, crate::PyError> {
+    let receiver = pyobject::make_ref(w_self);
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject) -> isize = std::mem::transmute(slot);
+        call(receiver)
+    };
+    unsafe { pyobject::decref(receiver) };
+    if result < 0 {
+        return Err(pending_or(
+            "a cpyext length slot failed without setting an exception",
+        ));
+    }
+    Ok(result)
+}
+
+/// `mp_length` first, `sq_length` second -- the order `PyObject_Size` uses.
+fn length_slot(w_self: PyObjectRef) -> *const c_void {
+    let slot = slot_of(w_self, mapping_slot!(mp_length));
+    if slot.is_null() {
+        slot_of(w_self, sequence_slot!(sq_length))
+    } else {
+        slot
+    }
+}
+
+fn slot_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = length_slot(args[0]);
+    if slot.is_null() {
+        return Err(crate::PyError::type_error("cpyext object has no length"));
+    }
+    Ok(pyre_object::w_int_new(call_length(slot, args[0])? as i64))
+}
+
+/// The index `sq_item` and `sq_ass_item` take: `__index__` of the key, with a
+/// negative value folded through the length as `wrap_sq_item` does.
+fn sequence_index(w_self: PyObjectRef, key: PyObjectRef) -> Result<isize, crate::PyError> {
+    let mut index = crate::baseobjspace::getindex_w(key)? as isize;
+    if index < 0 {
+        let slot = length_slot(w_self);
+        if !slot.is_null() {
+            index += call_length(slot, w_self)?;
+        }
+    }
+    Ok(index)
+}
+
+fn slot_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let w_self = args[0];
+    let subscript = slot_of(w_self, mapping_slot!(mp_subscript));
+    if !subscript.is_null() {
+        return call_binary(subscript, w_self, args[1]);
+    }
+    let item = slot_of(w_self, sequence_slot!(sq_item));
+    if item.is_null() {
+        return Err(crate::PyError::type_error(
+            "cpyext object is not subscriptable",
+        ));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(args[1]);
+    let index = sequence_index(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        pyre_object::gc_roots::shadow_stack_get(key_slot),
+    )?;
+    let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, isize) -> *mut CPyObject =
+            std::mem::transmute(item);
+        call(receiver, index)
+    };
+    unsafe { pyobject::decref(receiver) };
+    super::from_c_result(result)
+}
+
+/// `__setitem__` and `__delitem__` both, the deletion passing NULL.
+fn assign_item(
+    w_self: PyObjectRef,
+    key: PyObjectRef,
+    value: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(key);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(value.unwrap_or_else(pyre_object::w_none));
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+
+    let subscript = slot_of(reload(self_slot), mapping_slot!(mp_ass_subscript));
+    let failed = if !subscript.is_null() {
+        let receiver = pyobject::make_ref(reload(self_slot));
+        let index = pyobject::make_ref(reload(key_slot));
+        let item = match value {
+            Some(_) => pyobject::make_ref(reload(value_slot)),
+            None => std::ptr::null_mut(),
+        };
+        let result = unsafe {
+            let call: unsafe extern "C" fn(
+                *mut CPyObject,
+                *mut CPyObject,
+                *mut CPyObject,
+            ) -> c_int = std::mem::transmute(subscript);
+            call(receiver, index, item)
+        };
+        unsafe {
+            pyobject::decref(receiver);
+            pyobject::decref(index);
+            pyobject::decref(item);
+        }
+        result != 0
+    } else {
+        let assign = slot_of(reload(self_slot), sequence_slot!(sq_ass_item));
+        if assign.is_null() {
+            return Err(crate::PyError::type_error(
+                "cpyext object does not support item assignment",
+            ));
+        }
+        let index = sequence_index(reload(self_slot), reload(key_slot))?;
+        let receiver = pyobject::make_ref(reload(self_slot));
+        let item = match value {
+            Some(_) => pyobject::make_ref(reload(value_slot)),
+            None => std::ptr::null_mut(),
+        };
+        let result = unsafe {
+            let call: unsafe extern "C" fn(*mut CPyObject, isize, *mut CPyObject) -> c_int =
+                std::mem::transmute(assign);
+            call(receiver, index, item)
+        };
+        unsafe {
+            pyobject::decref(receiver);
+            pyobject::decref(item);
+        }
+        result != 0
+    };
+    if failed {
+        return Err(pending_or(
+            "a cpyext item assignment failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn slot_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assign_item(args[0], args[1], Some(args[2]))
+}
+
+fn slot_delitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    assign_item(args[0], args[1], None)
+}
+
+fn slot_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(args[0], sequence_slot!(sq_contains));
+    if slot.is_null() {
+        return Err(crate::PyError::type_error(
+            "cpyext object does not support membership tests",
+        ));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(args[0]);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(args[1]);
+    let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let value = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(value_slot));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> c_int =
+            std::mem::transmute(slot);
+        call(receiver, value)
+    };
+    unsafe {
+        pyobject::decref(receiver);
+        pyobject::decref(value);
+    }
+    if result < 0 {
+        return Err(pending_or(
+            "a cpyext membership test failed without setting an exception",
+        ));
+    }
+    Ok(pyre_object::boolobject::w_bool_from(result != 0))
+}
+
+/// `sq_concat` and `sq_inplace_concat` are `binaryfunc`s like `nb_add`.
+fn sq_concat_wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    binary(args, sequence_slot!(sq_concat), false)
+}
+
+fn sq_inplace_concat_wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    binary(args, sequence_slot!(sq_inplace_concat), false)
+}
+
+/// `sq_repeat` takes the count as a `Py_ssize_t`, so `n * seq` and `seq * n`
+/// reach it the same way.
+fn repeat(
+    w_self: PyObjectRef,
+    count: PyObjectRef,
+    pick: fn(*mut CPyTypeObject) -> *const c_void,
+) -> Result<PyObjectRef, crate::PyError> {
+    let slot = slot_of(w_self, pick);
+    if slot.is_null() {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    let count_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(count);
+    let times =
+        crate::baseobjspace::getindex_w(pyre_object::gc_roots::shadow_stack_get(count_slot))?;
+    let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(self_slot));
+    let result = unsafe {
+        let call: unsafe extern "C" fn(*mut CPyObject, isize) -> *mut CPyObject =
+            std::mem::transmute(slot);
+        call(receiver, times as isize)
+    };
+    unsafe { pyobject::decref(receiver) };
+    super::from_c_result(result)
+}
+
+/// `seq * n` and `n * seq` both repeat `seq`, so one wrapper serves both.
+fn sq_repeat_wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    repeat(args[0], args[1], sequence_slot!(sq_repeat))
+}
+
+fn sq_inplace_repeat_wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    repeat(args[0], args[1], sequence_slot!(sq_inplace_repeat))
+}
+
+/// Install everything the three tables contribute.
+///
+/// `__len__`, `__getitem__` and the item assignments are shared between the
+/// mapping and sequence tables, so each is installed once and the wrapper
+/// picks the slot; `__add__` and `__mul__` go to the number table when it has
+/// them and to the sequence table otherwise, as `slotdefs.py` orders them.
+fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
+    install_number_binaries(ns, tp);
+    install_number_inplace(ns, tp);
+    install_number_unaries(ns, tp);
+    if !(number_slot!(nb_bool))(tp).is_null() {
+        store(
+            ns,
+            "__bool__",
+            crate::make_builtin_function_with_arity("__bool__", nb_bool_wrapper, 1),
+        );
+    }
+    if !(number_slot!(nb_power))(tp).is_null() {
+        store(
+            ns,
+            "__pow__",
+            crate::make_builtin_function("__pow__", nb_pow_direct),
+        );
+        store(
+            ns,
+            "__rpow__",
+            crate::make_builtin_function("__rpow__", nb_pow_reflected),
+        );
+    }
+    if !(number_slot!(nb_inplace_power))(tp).is_null() {
+        store(
+            ns,
+            "__ipow__",
+            crate::make_builtin_function("__ipow__", nb_ipow),
+        );
+    }
+
+    if !(mapping_slot!(mp_length))(tp).is_null() || !(sequence_slot!(sq_length))(tp).is_null() {
+        store(
+            ns,
+            "__len__",
+            crate::make_builtin_function_with_arity("__len__", slot_len, 1),
+        );
+    }
+    if !(mapping_slot!(mp_subscript))(tp).is_null() || !(sequence_slot!(sq_item))(tp).is_null() {
+        store(
+            ns,
+            "__getitem__",
+            crate::make_builtin_function_with_arity("__getitem__", slot_getitem, 2),
+        );
+    }
+    if !(mapping_slot!(mp_ass_subscript))(tp).is_null()
+        || !(sequence_slot!(sq_ass_item))(tp).is_null()
+    {
+        store(
+            ns,
+            "__setitem__",
+            crate::make_builtin_function_with_arity("__setitem__", slot_setitem, 3),
+        );
+        store(
+            ns,
+            "__delitem__",
+            crate::make_builtin_function_with_arity("__delitem__", slot_delitem, 2),
+        );
+    }
+    if !(sequence_slot!(sq_contains))(tp).is_null() {
+        store(
+            ns,
+            "__contains__",
+            crate::make_builtin_function_with_arity("__contains__", slot_contains, 2),
+        );
+    }
+    if !(sequence_slot!(sq_concat))(tp).is_null() && (number_slot!(nb_add))(tp).is_null() {
+        store(
+            ns,
+            "__add__",
+            crate::make_builtin_function_with_arity("__add__", sq_concat_wrapper, 2),
+        );
+    }
+    if !(sequence_slot!(sq_inplace_concat))(tp).is_null()
+        && (number_slot!(nb_inplace_add))(tp).is_null()
+    {
+        store(
+            ns,
+            "__iadd__",
+            crate::make_builtin_function_with_arity("__iadd__", sq_inplace_concat_wrapper, 2),
+        );
+    }
+    if !(sequence_slot!(sq_repeat))(tp).is_null() && (number_slot!(nb_multiply))(tp).is_null() {
+        store(
+            ns,
+            "__mul__",
+            crate::make_builtin_function_with_arity("__mul__", sq_repeat_wrapper, 2),
+        );
+        store(
+            ns,
+            "__rmul__",
+            crate::make_builtin_function_with_arity("__rmul__", sq_repeat_wrapper, 2),
+        );
+    }
+    if !(sequence_slot!(sq_inplace_repeat))(tp).is_null()
+        && (number_slot!(nb_inplace_multiply))(tp).is_null()
+    {
+        store(
+            ns,
+            "__imul__",
+            crate::make_builtin_function_with_arity("__imul__", sq_inplace_repeat_wrapper, 2),
+        );
+    }
 }
 
 // ── `PyType_Ready` ──────────────────────────────────────────────────────
@@ -1129,8 +1850,9 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 
     let mut index = 0isize;
-    while unsafe { !(*tp).tp_methods.is_null() && !(*(*tp).tp_methods.offset(index)).ml_name.is_null() }
-    {
+    while unsafe {
+        !(*tp).tp_methods.is_null() && !(*(*tp).tp_methods.offset(index)).ml_name.is_null()
+    } {
         let method = unsafe { (*tp).tp_methods.offset(index) };
         index += 1;
         let name = unsafe { std::ffi::CStr::from_ptr((*method).ml_name) }
@@ -1153,8 +1875,9 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 
     let mut index = 0isize;
-    while unsafe { !(*tp).tp_members.is_null() && !(*(*tp).tp_members.offset(index)).name.is_null() }
-    {
+    while unsafe {
+        !(*tp).tp_members.is_null() && !(*(*tp).tp_members.offset(index)).name.is_null()
+    } {
         let member = unsafe { (*tp).tp_members.offset(index) };
         index += 1;
         let name = unsafe { std::ffi::CStr::from_ptr((*member).name) }
@@ -1177,7 +1900,8 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 
     let mut index = 0isize;
-    while unsafe { !(*tp).tp_getset.is_null() && !(*(*tp).tp_getset.offset(index)).name.is_null() } {
+    while unsafe { !(*tp).tp_getset.is_null() && !(*(*tp).tp_getset.offset(index)).name.is_null() }
+    {
         let getset = unsafe { (*tp).tp_getset.offset(index) };
         index += 1;
         let name = unsafe { std::ffi::CStr::from_ptr((*getset).name) }
@@ -1210,7 +1934,11 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         "__init__",
         crate::make_builtin_function("__init__", slot_init),
     );
-    let unary: [(&'static str, fn(*mut CPyTypeObject) -> *const c_void, crate::gateway::BuiltinCodeFn); 4] = [
+    let unary: [(
+        &'static str,
+        fn(*mut CPyTypeObject) -> *const c_void,
+        crate::gateway::BuiltinCodeFn,
+    ); 4] = [
         ("__repr__", |tp| unsafe { (*tp).tp_repr }, slot_repr),
         ("__str__", |tp| unsafe { (*tp).tp_str }, slot_str),
         ("__iter__", |tp| unsafe { (*tp).tp_iter }, slot_iter),
@@ -1233,11 +1961,16 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         );
     }
     if unsafe { !(*tp).tp_call.is_null() } {
-        store(ns, "__call__", crate::make_builtin_function("__call__", slot_call));
+        store(
+            ns,
+            "__call__",
+            crate::make_builtin_function("__call__", slot_call),
+        );
     }
     if unsafe { !(*tp).tp_richcompare.is_null() } {
         install_comparisons(ns);
     }
+    install_protocols(ns, tp);
 }
 
 /// Give every descriptor the class it was defined on.
@@ -1350,7 +2083,11 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
             "PyType_Ready(): the type has no tp_name",
         ));
     }
-    let short = qualified.rsplit('.').next().unwrap_or(&qualified).to_string();
+    let short = qualified
+        .rsplit('.')
+        .next()
+        .unwrap_or(&qualified)
+        .to_string();
 
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1379,7 +2116,8 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             &raw mut (*tp).ob_base.ob_base,
         );
-        (*tp).ob_base.ob_base.ob_type = pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
+        (*tp).ob_base.ob_base.ob_type =
+            pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
         (*tp).tp_flags = ((*tp).tp_flags & !PY_TPFLAGS_READYING) | PY_TPFLAGS_READY;
     }
     Ok(())

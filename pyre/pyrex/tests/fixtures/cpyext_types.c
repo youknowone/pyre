@@ -372,6 +372,466 @@ static PyTypeObject CounterType = {
     counter_new,                                /* tp_new */
 };
 
+/* ── Vec: the number table ──────────────────────────────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    long value;
+} VecObject;
+
+static PyTypeObject VecType;
+
+static PyObject *vec_from(long value)
+{
+    VecObject *self = (VecObject *)PyType_GenericAlloc(&VecType, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->value = value;
+    return (PyObject *)self;
+}
+
+/* -1 when the operand is neither a Vec nor an int. */
+static int vec_operand(PyObject *object, long *out)
+{
+    if (PyObject_TypeCheck(object, &VecType)) {
+        *out = ((VecObject *)object)->value;
+        return 0;
+    }
+    if (PyLong_Check(object)) {
+        *out = PyLong_AsLong(object);
+        return (*out == -1 && PyErr_Occurred()) ? -1 : 0;
+    }
+    return 1;
+}
+
+#define VEC_BINARY(name, expression)                                    \
+    static PyObject *name(PyObject *left, PyObject *right)              \
+    {                                                                   \
+        long a = 0;                                                     \
+        long b = 0;                                                     \
+        int first = vec_operand(left, &a);                              \
+        int second = vec_operand(right, &b);                            \
+        if (first < 0 || second < 0) {                                  \
+            return NULL;                                                \
+        }                                                               \
+        if (first > 0 || second > 0) {                                  \
+            Py_RETURN_NOTIMPLEMENTED;                                   \
+        }                                                               \
+        return vec_from(expression);                                    \
+    }
+
+VEC_BINARY(vec_add, a + b)
+VEC_BINARY(vec_sub, a - b)
+VEC_BINARY(vec_mul, a * b)
+
+static PyObject *vec_negative(PyObject *self)
+{
+    return vec_from(-((VecObject *)self)->value);
+}
+
+static PyObject *vec_absolute(PyObject *self)
+{
+    long value = ((VecObject *)self)->value;
+    return vec_from(value < 0 ? -value : value);
+}
+
+static int vec_bool(PyObject *self)
+{
+    return ((VecObject *)self)->value != 0;
+}
+
+static PyObject *vec_int(PyObject *self)
+{
+    return PyLong_FromLong(((VecObject *)self)->value);
+}
+
+static PyObject *vec_float(PyObject *self)
+{
+    return PyFloat_FromDouble((double)((VecObject *)self)->value);
+}
+
+static PyObject *vec_power(PyObject *left, PyObject *right, PyObject *modulus)
+{
+    long a = 0;
+    long b = 0;
+    if (vec_operand(left, &a) != 0 || vec_operand(right, &b) != 0) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+    long result = 1;
+    for (long i = 0; i < b; i++) {
+        result *= a;
+    }
+    if (modulus != NULL && !Py_IsNone(modulus)) {
+        long m = 0;
+        if (vec_operand(modulus, &m) != 0 || m == 0) {
+            Py_RETURN_NOTIMPLEMENTED;
+        }
+        result %= m;
+    }
+    return vec_from(result);
+}
+
+/* The in-place slot mutates and hands back the same object. */
+static PyObject *vec_inplace_add(PyObject *left, PyObject *right)
+{
+    long b = 0;
+    if (!PyObject_TypeCheck(left, &VecType) || vec_operand(right, &b) != 0) {
+        Py_RETURN_NOTIMPLEMENTED;
+    }
+    ((VecObject *)left)->value += b;
+    Py_INCREF(left);
+    return left;
+}
+
+static PyNumberMethods vec_as_number = {
+    vec_add,                                    /* nb_add */
+    vec_sub,                                    /* nb_subtract */
+    vec_mul,                                    /* nb_multiply */
+    0,                                          /* nb_remainder */
+    0,                                          /* nb_divmod */
+    vec_power,                                  /* nb_power */
+    vec_negative,                               /* nb_negative */
+    0,                                          /* nb_positive */
+    vec_absolute,                               /* nb_absolute */
+    vec_bool,                                   /* nb_bool */
+    0,                                          /* nb_invert */
+    0,                                          /* nb_lshift */
+    0,                                          /* nb_rshift */
+    0,                                          /* nb_and */
+    0,                                          /* nb_xor */
+    0,                                          /* nb_or */
+    vec_int,                                    /* nb_int */
+    0,                                          /* nb_reserved */
+    vec_float,                                  /* nb_float */
+    vec_inplace_add,                            /* nb_inplace_add */
+};
+
+static PyObject *vec_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    long value = 0;
+    if (!PyArg_ParseTuple(args, "l", &value)) {
+        return NULL;
+    }
+    return vec_from(value);
+}
+
+static PyObject *vec_repr(PyObject *self)
+{
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Vec(%ld)", ((VecObject *)self)->value);
+    return PyUnicode_FromString(buffer);
+}
+
+static PyMemberDef vec_members[] = {
+    {"value", Py_T_LONG, offsetof(VecObject, value), Py_READONLY, "the scalar"},
+    {NULL, 0, 0, 0, NULL},
+};
+
+static PyTypeObject VecType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Vec",                         /* tp_name */
+    sizeof(VecObject),                          /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    vec_repr,                                   /* tp_repr */
+    &vec_as_number,                             /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a scalar with a number table",             /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    0,                                          /* tp_methods */
+    vec_members,                                /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    vec_new,                                    /* tp_new */
+};
+
+/* ── Bag: the sequence table ────────────────────────────────────────── */
+
+#define BAG_CAPACITY 8
+
+typedef struct {
+    PyObject_HEAD
+    Py_ssize_t count;
+    long items[BAG_CAPACITY];
+} BagObject;
+
+static PyTypeObject BagType;
+
+static PyObject *bag_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    BagObject *self = (BagObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->count = 0;
+    Py_ssize_t given = PyTuple_Size(args);
+    if (given > BAG_CAPACITY) {
+        PyErr_SetString(PyExc_ValueError, "too many items");
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < given; i++) {
+        PyObject *item = PyTuple_GetItem(args, i);
+        if (item == NULL) {
+            return NULL;
+        }
+        long value = PyLong_AsLong(item);
+        if (value == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        self->items[self->count++] = value;
+    }
+    return (PyObject *)self;
+}
+
+static Py_ssize_t bag_length(PyObject *self)
+{
+    return ((BagObject *)self)->count;
+}
+
+static PyObject *bag_item(PyObject *self, Py_ssize_t index)
+{
+    BagObject *bag = (BagObject *)self;
+    if (index < 0 || index >= bag->count) {
+        PyErr_SetString(PyExc_IndexError, "bag index out of range");
+        return NULL;
+    }
+    return PyLong_FromLong(bag->items[index]);
+}
+
+static int bag_ass_item(PyObject *self, Py_ssize_t index, PyObject *value)
+{
+    BagObject *bag = (BagObject *)self;
+    if (index < 0 || index >= bag->count) {
+        PyErr_SetString(PyExc_IndexError, "bag index out of range");
+        return -1;
+    }
+    if (value == NULL) {
+        for (Py_ssize_t i = index; i + 1 < bag->count; i++) {
+            bag->items[i] = bag->items[i + 1];
+        }
+        bag->count--;
+        return 0;
+    }
+    long item = PyLong_AsLong(value);
+    if (item == -1 && PyErr_Occurred()) {
+        return -1;
+    }
+    bag->items[index] = item;
+    return 0;
+}
+
+static int bag_contains(PyObject *self, PyObject *value)
+{
+    BagObject *bag = (BagObject *)self;
+    long item = PyLong_AsLong(value);
+    if (item == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        return 0;
+    }
+    for (Py_ssize_t i = 0; i < bag->count; i++) {
+        if (bag->items[i] == item) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static PyObject *bag_repeat(PyObject *self, Py_ssize_t count)
+{
+    BagObject *bag = (BagObject *)self;
+    PyObject *out = PyList_New(0);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (Py_ssize_t round = 0; round < count; round++) {
+        for (Py_ssize_t i = 0; i < bag->count; i++) {
+            PyObject *item = PyLong_FromLong(bag->items[i]);
+            if (item == NULL || PyList_Append(out, item) < 0) {
+                Py_XDECREF(item);
+                Py_DECREF(out);
+                return NULL;
+            }
+            Py_DECREF(item);
+        }
+    }
+    return out;
+}
+
+static PySequenceMethods bag_as_sequence = {
+    bag_length,                                 /* sq_length */
+    0,                                          /* sq_concat */
+    bag_repeat,                                 /* sq_repeat */
+    bag_item,                                   /* sq_item */
+    0,                                          /* was_sq_slice */
+    bag_ass_item,                               /* sq_ass_item */
+    0,                                          /* was_sq_ass_slice */
+    bag_contains,                               /* sq_contains */
+};
+
+static PyTypeObject BagType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Bag",                         /* tp_name */
+    sizeof(BagObject),                          /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    &bag_as_sequence,                           /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a fixed-capacity sequence",                /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    0,                                          /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    bag_new,                                    /* tp_new */
+};
+
+/* ── Table: the mapping table ───────────────────────────────────────── */
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *store;
+} TableObject;
+
+static PyObject *table_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    TableObject *self = (TableObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->store = PyDict_New();
+    return self->store == NULL ? NULL : (PyObject *)self;
+}
+
+static Py_ssize_t table_length(PyObject *self)
+{
+    return PyDict_Size(((TableObject *)self)->store);
+}
+
+static PyObject *table_subscript(PyObject *self, PyObject *key)
+{
+    PyObject *value = PyDict_GetItem(((TableObject *)self)->store, key);
+    if (value == NULL) {
+        PyErr_SetObject(PyExc_KeyError, key);
+        return NULL;
+    }
+    Py_INCREF(value);
+    return value;
+}
+
+static int table_ass_subscript(PyObject *self, PyObject *key, PyObject *value)
+{
+    TableObject *table = (TableObject *)self;
+    if (value == NULL) {
+        return PyDict_DelItem(table->store, key);
+    }
+    return PyDict_SetItem(table->store, key, value);
+}
+
+static PyObject *table_keys(PyObject *self, PyObject *unused)
+{
+    return PyMapping_Keys(((TableObject *)self)->store);
+}
+
+static PyMethodDef table_methods[] = {
+    {"keys", table_keys, METH_NOARGS, "the stored keys"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyMappingMethods table_as_mapping = {
+    table_length,                               /* mp_length */
+    table_subscript,                            /* mp_subscript */
+    table_ass_subscript,                        /* mp_ass_subscript */
+};
+
+static PyTypeObject TableType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Table",                       /* tp_name */
+    sizeof(TableObject),                        /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    0,                                          /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    &table_as_mapping,                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "a dict-backed mapping",                    /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    table_methods,                              /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    table_new,                                  /* tp_new */
+};
+
 /* ── module ─────────────────────────────────────────────────────────── */
 
 static PyObject *TypesError;
@@ -424,7 +884,103 @@ static PyObject *m_is_subtype(PyObject *self, PyObject *unused)
                          PyType_IsSubtype(&PointType, &Point3Type));
 }
 
+/* The abstract protocols, driven from C over whatever object is handed in. */
+static PyObject *m_protocol(PyObject *self, PyObject *args)
+{
+    const char *what = NULL;
+    PyObject *first = NULL;
+    PyObject *second = NULL;
+    if (!PyArg_ParseTuple(args, "sO|O", &what, &first, &second)) {
+        return NULL;
+    }
+    if (strcmp(what, "add") == 0) {
+        return PyNumber_Add(first, second);
+    }
+    if (strcmp(what, "multiply") == 0) {
+        return PyNumber_Multiply(first, second);
+    }
+    if (strcmp(what, "power") == 0) {
+        return PyNumber_Power(first, second, Py_None);
+    }
+    if (strcmp(what, "negative") == 0) {
+        return PyNumber_Negative(first);
+    }
+    if (strcmp(what, "index") == 0) {
+        return PyNumber_Index(first);
+    }
+    if (strcmp(what, "float") == 0) {
+        return PyNumber_Float(first);
+    }
+    if (strcmp(what, "number_check") == 0) {
+        return PyBool_FromLong(PyNumber_Check(first));
+    }
+    if (strcmp(what, "as_ssize") == 0) {
+        Py_ssize_t value = PyNumber_AsSsize_t(first, PyExc_OverflowError);
+        if (value == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        return PyLong_FromSsize_t(value);
+    }
+    if (strcmp(what, "sequence_check") == 0) {
+        return PyBool_FromLong(PySequence_Check(first));
+    }
+    if (strcmp(what, "size") == 0) {
+        Py_ssize_t size = PySequence_Size(first);
+        return size < 0 ? NULL : PyLong_FromSsize_t(size);
+    }
+    if (strcmp(what, "getitem") == 0) {
+        Py_ssize_t index = PyNumber_AsSsize_t(second, NULL);
+        if (index == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        return PySequence_GetItem(first, index);
+    }
+    if (strcmp(what, "contains") == 0) {
+        int found = PySequence_Contains(first, second);
+        return found < 0 ? NULL : PyBool_FromLong(found);
+    }
+    if (strcmp(what, "list") == 0) {
+        return PySequence_List(first);
+    }
+    if (strcmp(what, "tuple") == 0) {
+        return PySequence_Tuple(first);
+    }
+    if (strcmp(what, "seq_index") == 0) {
+        Py_ssize_t index = PySequence_Index(first, second);
+        return index < 0 ? NULL : PyLong_FromSsize_t(index);
+    }
+    if (strcmp(what, "repeat") == 0) {
+        Py_ssize_t count = PyNumber_AsSsize_t(second, NULL);
+        if (count == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        return PySequence_Repeat(first, count);
+    }
+    if (strcmp(what, "mapping_check") == 0) {
+        return PyBool_FromLong(PyMapping_Check(first));
+    }
+    if (strcmp(what, "keys") == 0) {
+        return PyMapping_Keys(first);
+    }
+    if (strcmp(what, "values") == 0) {
+        return PyMapping_Values(first);
+    }
+    if (strcmp(what, "items") == 0) {
+        return PyMapping_Items(first);
+    }
+    if (strcmp(what, "getstring") == 0) {
+        const char *key = PyUnicode_AsUTF8(second);
+        return key == NULL ? NULL : PyMapping_GetItemString(first, key);
+    }
+    if (strcmp(what, "haskey") == 0) {
+        return PyBool_FromLong(PyMapping_HasKey(first, second));
+    }
+    PyErr_SetString(PyExc_ValueError, "unknown protocol operation");
+    return NULL;
+}
+
 static PyMethodDef methods[] = {
+    {"protocol", m_protocol, METH_VARARGS, "drive one abstract protocol call"},
     {"make", m_make, METH_VARARGS, "build a Point without calling the class"},
     {"is_point", m_is_point, METH_O, "PyObject_TypeCheck"},
     {"sum_x", m_sum_x, METH_O, "read x, raising the module exception otherwise"},
@@ -445,6 +1001,15 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &CounterType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &VecType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &BagType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &TableType) < 0) {
         return -1;
     }
     TypesError = PyErr_NewExceptionWithDoc("cpyext_types.TypesError",

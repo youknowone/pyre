@@ -74,6 +74,11 @@ the header below.
   the `tp_methods` / `tp_members` / `tp_getset` descriptors with `__objclass__`,
   and wrappers for `tp_new`, `tp_init`, `tp_repr`, `tp_str`, `tp_hash`,
   `tp_call`, `tp_iter`, `tp_iternext` and `tp_richcompare`;
+- the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
+  becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
+  `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
+  `cpyext/sequence.rs`, `cpyext/mapping.rs`), which go through the
+  interpreter's own operators so either operand may be a pyre object;
 - `PyErr_NewException` and `PyErr_NewExceptionWithDoc`, which build the class
   through the interpreter's own `type` so it gets the exception layout;
 - GC forwarding for C mirror links and cached dictionaries.
@@ -107,9 +112,8 @@ Known divergences, each documented at its definition:
 ## What remains
 
 5. `tp_dealloc`, `tp_traverse` and `tp_clear` on top of a `rawrefcount` dead
-   queue; the protocol tables (`tp_as_number`, `tp_as_sequence`, `tp_as_mapping`,
-   `tp_as_buffer`), which are declared but not read; heap types
-   (`PyType_FromSpec`); capsules; and the remaining generated API;
+   queue; `tp_as_async` and `tp_as_buffer`, which are declared but not read;
+   heap types (`PyType_FromSpec`); capsules; and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
@@ -136,6 +140,8 @@ are ABI-compatible with pyre.
 - `pypy/module/cpyext/slotdefs.py`: the wrappers that turn a C slot into an
   app-level method.
 - `pypy/module/cpyext/structmemberdefs.py`: the `T_*` member type codes.
+- `pypy/module/cpyext/number.py`, `sequence.py` and `mapping.py`: the
+  `PyNumber_*`, `PySequence_*` and `PyMapping_*` entry points.
 - `pypy/module/cpyext/src/getargs.c`: `PyArg_ParseTuple` and `Py_BuildValue`,
   which are C there too.
 - `pypy/module/imp/interp_imp.py`: `_imp` entry points.
