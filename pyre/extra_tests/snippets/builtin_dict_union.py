@@ -93,3 +93,29 @@ skip_if_unsupported(3, 9, test_dunion_or0)
 skip_if_unsupported(3, 9, test_dunion_or1)
 skip_if_unsupported(3, 9, test_dunion_ror0)
 skip_if_unsupported(3, 9, test_dunion_other_types)
+
+
+def test_dunion_preserves_left_hashes():
+    # `d | other` copies the left operand and updates the copy, so the left
+    # keys keep their stored hashes instead of being re-hashed one at a time.
+    calls = []
+
+    class Key:
+        def __init__(self, i):
+            self.i = i
+
+        def __hash__(self):
+            calls.append(self.i)
+            return self.i
+
+        def __eq__(self, other):
+            return isinstance(other, Key) and self.i == other.i
+
+    left = {Key(i): i for i in range(5)}
+    calls.clear()
+    merged = left | {}
+    assert calls == [], f"left operand was re-hashed: {calls=}"
+    assert len(merged) == 5, f"unexpected merge result {merged=}"
+
+
+skip_if_unsupported(3, 9, test_dunion_preserves_left_hashes)

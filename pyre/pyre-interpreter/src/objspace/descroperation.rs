@@ -4687,14 +4687,23 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // dict | dict — PEP 584 merge. PyPy: dictmultiobject.py descr_or.
         // Returns a new dict built from `a`'s items, then updated with `b`'s.
         if pyre_object::is_dict(a) && pyre_object::is_dict(b) {
-            let new_dict = pyre_object::w_dict_new();
-            for (k, v) in pyre_object::w_dict_items(a) {
-                pyre_object::w_dict_store(new_dict, k, v);
-            }
-            for (k, v) in pyre_object::w_dict_items(b) {
-                pyre_object::w_dict_store(new_dict, k, v);
-            }
-            return Ok(new_dict);
+            // `dictmultiobject.py:288-293 descr_or` — `copyself = self.copy()`
+            // then `update1(space, copyself, w_other)`.  Storing `a`'s items
+            // one at a time instead re-hashes every key through its `__hash__`,
+            // which the strategy copy does not do.  Each of those hashes also
+            // runs Python, and the merge target, both operands and the item
+            // snapshots are bare locals no root walker scans; `dict_update1`
+            // already brackets its own operands for that reason.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(a);
+            pyre_object::gc_roots::pin_root(b);
+            let src = || pyre_object::gc_roots::shadow_stack_get(root_base);
+            let other = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let merged = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            pyre_object::gc_roots::pin_root(crate::type_methods::dict_method_copy(&[src()])?);
+            crate::type_methods::dict_update1(merged(), other())?;
+            return Ok(merged());
         }
         // user-class + typedef (dict_view, …) dispatch: forward __or__ then reflected
         // __ror__, exactly once.  Skipped when a gated special above already ran, so a
