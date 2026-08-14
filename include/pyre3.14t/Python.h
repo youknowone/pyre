@@ -37,6 +37,8 @@ extern "C" {
 typedef intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
+typedef Py_ssize_t Py_hash_t;
+typedef size_t Py_uhash_t;
 
 typedef struct _typeobject PyTypeObject;
 
@@ -111,6 +113,191 @@ typedef struct PyMethodDef {
 #define METH_STATIC 0x0020
 #define METH_COEXIST 0x0040
 #define METH_FASTCALL 0x0080
+
+/* Types. */
+typedef struct {
+    PyObject ob_base;
+    Py_ssize_t ob_size;
+} PyVarObject;
+
+#define PyObject_VAR_HEAD PyVarObject ob_base;
+#define PyVarObject_HEAD_INIT(type, size) { PyObject_HEAD_INIT(type) size },
+#define Py_SIZE(ob) (((PyVarObject *)(ob))->ob_size)
+
+typedef void (*destructor)(PyObject *);
+typedef PyObject *(*unaryfunc)(PyObject *);
+typedef PyObject *(*binaryfunc)(PyObject *, PyObject *);
+typedef PyObject *(*ternaryfunc)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*reprfunc)(PyObject *);
+typedef Py_hash_t (*hashfunc)(PyObject *);
+typedef PyObject *(*getattrfunc)(PyObject *, char *);
+typedef int (*setattrfunc)(PyObject *, char *, PyObject *);
+typedef PyObject *(*getattrofunc)(PyObject *, PyObject *);
+typedef int (*setattrofunc)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*richcmpfunc)(PyObject *, PyObject *, int);
+typedef PyObject *(*getiterfunc)(PyObject *);
+typedef PyObject *(*iternextfunc)(PyObject *);
+typedef PyObject *(*descrgetfunc)(PyObject *, PyObject *, PyObject *);
+typedef int (*descrsetfunc)(PyObject *, PyObject *, PyObject *);
+typedef int (*initproc)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*newfunc)(PyTypeObject *, PyObject *, PyObject *);
+typedef PyObject *(*allocfunc)(PyTypeObject *, Py_ssize_t);
+typedef PyObject *(*getter)(PyObject *, void *);
+typedef int (*setter)(PyObject *, PyObject *, void *);
+typedef PyObject *(*vectorcallfunc)(PyObject *, PyObject *const *, size_t, PyObject *);
+
+/* The protocol tables are declared but not yet consulted; a type may still
+   point at one, so the pointer fields have to exist. */
+typedef struct PyNumberMethods PyNumberMethods;
+typedef struct PySequenceMethods PySequenceMethods;
+typedef struct PyMappingMethods PyMappingMethods;
+typedef struct PyAsyncMethods PyAsyncMethods;
+typedef struct PyBufferProcs PyBufferProcs;
+
+typedef struct PyMemberDef {
+    const char *name;
+    int type;
+    Py_ssize_t offset;
+    int flags;
+    const char *doc;
+} PyMemberDef;
+
+#define Py_T_SHORT 0
+#define Py_T_INT 1
+#define Py_T_LONG 2
+#define Py_T_FLOAT 3
+#define Py_T_DOUBLE 4
+#define Py_T_STRING 5
+#define Py_T_OBJECT_EX 16
+#define Py_T_CHAR 7
+#define Py_T_BYTE 8
+#define Py_T_UBYTE 9
+#define Py_T_USHORT 10
+#define Py_T_UINT 11
+#define Py_T_ULONG 12
+#define Py_T_BOOL 14
+#define Py_T_LONGLONG 17
+#define Py_T_ULONGLONG 18
+#define Py_T_PYSSIZET 19
+#define Py_READONLY 1
+/* The `structmember.h` spellings, which are what most sources still use. */
+#define T_SHORT Py_T_SHORT
+#define T_INT Py_T_INT
+#define T_LONG Py_T_LONG
+#define T_FLOAT Py_T_FLOAT
+#define T_DOUBLE Py_T_DOUBLE
+#define T_STRING Py_T_STRING
+#define T_OBJECT 6
+#define T_OBJECT_EX Py_T_OBJECT_EX
+#define T_CHAR Py_T_CHAR
+#define T_BYTE Py_T_BYTE
+#define T_UBYTE Py_T_UBYTE
+#define T_USHORT Py_T_USHORT
+#define T_UINT Py_T_UINT
+#define T_ULONG Py_T_ULONG
+#define T_BOOL Py_T_BOOL
+#define T_LONGLONG Py_T_LONGLONG
+#define T_ULONGLONG Py_T_ULONGLONG
+#define T_PYSSIZET Py_T_PYSSIZET
+#define T_NONE 20
+#define READONLY Py_READONLY
+
+typedef struct PyGetSetDef {
+    const char *name;
+    getter get;
+    setter set;
+    const char *doc;
+    void *closure;
+} PyGetSetDef;
+
+struct _typeobject {
+    PyObject_VAR_HEAD
+    const char *tp_name;
+    Py_ssize_t tp_basicsize;
+    Py_ssize_t tp_itemsize;
+    destructor tp_dealloc;
+    Py_ssize_t tp_vectorcall_offset;
+    getattrfunc tp_getattr;
+    setattrfunc tp_setattr;
+    PyAsyncMethods *tp_as_async;
+    reprfunc tp_repr;
+    PyNumberMethods *tp_as_number;
+    PySequenceMethods *tp_as_sequence;
+    PyMappingMethods *tp_as_mapping;
+    hashfunc tp_hash;
+    ternaryfunc tp_call;
+    reprfunc tp_str;
+    getattrofunc tp_getattro;
+    setattrofunc tp_setattro;
+    PyBufferProcs *tp_as_buffer;
+    unsigned long tp_flags;
+    const char *tp_doc;
+    traverseproc tp_traverse;
+    inquiry tp_clear;
+    richcmpfunc tp_richcompare;
+    Py_ssize_t tp_weaklistoffset;
+    getiterfunc tp_iter;
+    iternextfunc tp_iternext;
+    PyMethodDef *tp_methods;
+    PyMemberDef *tp_members;
+    PyGetSetDef *tp_getset;
+    PyTypeObject *tp_base;
+    PyObject *tp_dict;
+    descrgetfunc tp_descr_get;
+    descrsetfunc tp_descr_set;
+    Py_ssize_t tp_dictoffset;
+    initproc tp_init;
+    allocfunc tp_alloc;
+    newfunc tp_new;
+    freefunc tp_free;
+    inquiry tp_is_gc;
+    PyObject *tp_bases;
+    PyObject *tp_mro;
+    PyObject *tp_cache;
+    void *tp_subclasses;
+    PyObject *tp_weaklist;
+    destructor tp_del;
+    unsigned int tp_version_tag;
+    destructor tp_finalize;
+    vectorcallfunc tp_vectorcall;
+    unsigned char tp_watched;
+    uint16_t tp_versions_used;
+};
+
+#define Py_TPFLAGS_DEFAULT 0UL
+#define Py_TPFLAGS_MANAGED_WEAKREF (1UL << 3)
+#define Py_TPFLAGS_MANAGED_DICT (1UL << 4)
+#define Py_TPFLAGS_HEAPTYPE (1UL << 9)
+#define Py_TPFLAGS_BASETYPE (1UL << 10)
+#define Py_TPFLAGS_READY (1UL << 12)
+#define Py_TPFLAGS_READYING (1UL << 13)
+#define Py_TPFLAGS_HAVE_GC (1UL << 14)
+#define Py_TPFLAGS_DISALLOW_INSTANTIATION (1UL << 7)
+#define Py_TPFLAGS_IMMUTABLETYPE (1UL << 8)
+
+/* `tp_richcompare` operations. */
+#define Py_LT 0
+#define Py_LE 1
+#define Py_EQ 2
+#define Py_NE 3
+#define Py_GT 4
+#define Py_GE 5
+
+PyAPI_FUNC(int) PyType_Ready(PyTypeObject *type);
+PyAPI_FUNC(int) PyType_Check(PyObject *object);
+PyAPI_FUNC(int) PyType_IsSubtype(PyTypeObject *subtype, PyTypeObject *supertype);
+PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
+PyAPI_FUNC(PyObject *) PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
+PyAPI_FUNC(PyObject *) PyObject_Init(PyObject *object, PyTypeObject *type);
+#define PyObject_TypeCheck(ob, type) \
+    (Py_TYPE(ob) == (type) || PyType_IsSubtype(Py_TYPE(ob), (type)))
+#define PyObject_New(type, tp) ((type *)PyType_GenericAlloc((tp), 0))
+#define PyObject_GC_New(type, tp) PyObject_New(type, tp)
+#define PyObject_GC_Del(ob) ((void)(ob))
+#define PyObject_Del(ob) ((void)(ob))
+#define PyObject_GC_Track(ob) ((void)(ob))
+#define PyObject_GC_UnTrack(ob) ((void)(ob))
 
 typedef struct PyModuleDef_Base {
     PyObject ob_base;
@@ -209,6 +396,9 @@ PyAPI_FUNC(int) PyErr_GivenExceptionMatches(PyObject *given, PyObject *expected)
 PyAPI_FUNC(void) PyErr_Fetch(PyObject **type, PyObject **value, PyObject **traceback);
 PyAPI_FUNC(void) PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback);
 PyAPI_FUNC(void) PyErr_NormalizeException(PyObject **type, PyObject **value, PyObject **traceback);
+PyAPI_FUNC(PyObject *) PyErr_NewException(const char *name, PyObject *base, PyObject *dict);
+PyAPI_FUNC(PyObject *) PyErr_NewExceptionWithDoc(const char *name, const char *doc,
+                                                 PyObject *base, PyObject *dict);
 PyAPI_FUNC(PyObject *) _PyPyre_ErrFormatted(PyObject *type, const char *message);
 
 /* Objects. */
@@ -313,6 +503,28 @@ PyAPI_FUNC(int) PyDict_CheckExact(PyObject *object);
 
 #define PyDoc_STRVAR(name, str) static const char name[] = str
 #define PyDoc_STR(str) str
+
+/* `PyModule_AddType` readies the type and binds it under the part of
+   `tp_name` after the last dot. */
+static inline int PyModule_AddType(PyObject *module, PyTypeObject *type)
+{
+    const char *name;
+    const char *dot;
+    if (PyType_Ready(type) < 0) {
+        return -1;
+    }
+    name = type->tp_name;
+    dot = strrchr(name, '.');
+    if (dot != NULL) {
+        name = dot + 1;
+    }
+    Py_INCREF(type);
+    if (PyModule_AddObject(module, name, (PyObject *)type) < 0) {
+        Py_DECREF(type);
+        return -1;
+    }
+    return 0;
+}
 
 /* ── The variadic entry points ─────────────────────────────────────────
  *
@@ -479,6 +691,35 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
     }
 }
 
+/* Step over one format unit, consuming its destination pointers without
+   writing them -- `skipitem()` in getargs.c.  The pointers still have to leave
+   the `va_list`, or the unit after an absent optional reads the slot the
+   absent one would have written. */
+static inline void _PyPyre_ArgSkip(const char **format, va_list *va)
+{
+    char code = **format;
+    (*format)++;
+    switch (code) {
+    case 's': case 'z': case 'y':
+        (void)va_arg(*va, void *);
+        if (**format == '#') {
+            (*format)++;
+            (void)va_arg(*va, void *);
+        }
+        break;
+    case 'O':
+        if (**format == '!' || **format == '&') {
+            (*format)++;
+            (void)va_arg(*va, void *);
+        }
+        (void)va_arg(*va, void *);
+        break;
+    default:
+        (void)va_arg(*va, void *);
+        break;
+    }
+}
+
 /* How many argument units the format string describes, and where the optional
    tail begins.  `|`, `$`, `:` and `;` are markers rather than units. */
 static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
@@ -553,14 +794,9 @@ static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
                 _PyPyre_ArgError(fname, buffer);
                 return 0;
             }
-            /* Absent optional: step over its format unit without consuming a
-               destination, which the caller left untouched. */
-            char code = *cursor++;
-            if ((code == 's' || code == 'z' || code == 'y') && *cursor == '#') {
-                cursor++;
-            } else if (code == 'O' && (*cursor == '!' || *cursor == '&')) {
-                cursor++;
-            }
+            /* Absent optional: the destination keeps whatever the caller left
+               in it, but its pointer still leaves the `va_list`. */
+            _PyPyre_ArgSkip(&cursor, va);
             continue;
         }
         if (!_PyPyre_ArgConvert(arg, &cursor, va, fname)) {

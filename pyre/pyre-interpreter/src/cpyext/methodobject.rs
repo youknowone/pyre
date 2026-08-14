@@ -87,6 +87,15 @@ fn text_or_none(pointer: *const c_char) -> PyObjectRef {
     pyre_object::w_str_new(&unsafe { CStr::from_ptr(pointer) }.to_string_lossy())
 }
 
+fn text_or_empty(pointer: *const c_char) -> String {
+    if pointer.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `methodobject.py:W_PyCFunctionObject.__init__`.
 ///
 /// `w_self` is the bound receiver a module-level function is called with —
@@ -187,7 +196,20 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     };
     let w_self = carrier_get(carrier, SELF_KEY).unwrap_or_else(pyre_object::w_none);
-    let name = method_name(carrier);
+    call_method_def(method, w_self, positional, kwargs)
+}
+
+/// Validate one call against its `ml_flags` and hand it to the bridge.
+///
+/// Shared with the `tp_methods` descriptor, whose receiver is the instance the
+/// attribute was read through rather than a bound `__self__`.
+pub(super) fn call_method_def(
+    method: *mut CPyMethodDef,
+    w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let name = text_or_empty(unsafe { (*method).ml_name });
     let flags = unsafe { (*method).ml_flags } & !(METH_CLASS | METH_STATIC | METH_COEXIST);
     let keywords: Vec<(String, PyObjectRef)> = match kwargs {
         Some(dict) if crate::builtins::has_real_kwargs(kwargs) => unsafe {
