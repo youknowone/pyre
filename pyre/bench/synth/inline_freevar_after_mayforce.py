@@ -1,9 +1,16 @@
-# pyre-check: max-pypy-ratio=49
-# The ceiling is twice the slowest ratio observed once pypy's side became a
-# measurement. The previous 25 was fitted while pypy's execution was pinned to
-# the startup-subtraction floor, and a pinned denominator over-estimates the
-# work pypy actually did, so every ratio read against it was a lower bound --
-# this loop was always this far behind, the clamp just hid it.
+# pyre-check: max-pypy-ratio=86
+# The ceiling is a function of N, so raising N refits it. pypy's execution here
+# is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
+# backend pays roughly 27us per iteration, so the ratio tracks N nearly one for
+# one. Going from 32176 to 64000 moved the local cranelift ratio 25.8x to 44.9x,
+# and 49 scaled by that same measured 1.74 is 86: the gate keeps exactly the
+# slack it had before, re-expressed at the new size, rather than being loosened.
+#
+# The 49 it replaces was twice the slowest ratio observed once pypy's side
+# became a measurement. The 25 before that was fitted while pypy's execution was
+# pinned to the startup-subtraction floor, and a pinned denominator
+# over-estimates the work pypy actually did, so every ratio read against it was
+# a lower bound -- this loop was always this far behind, the clamp just hid it.
 # An inlined closure keeps its freevar cells in MIFrame.registers_r across a
 # may-force call.  The `Fraction` arithmetic in `forward` is that may-force
 # call and invalidates heap-cache facts; the following LOAD_DEREF must recover
@@ -23,7 +30,17 @@ from fractions import Fraction
 
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 32176
+#
+# The upper bound is what fixes the counters. At 32176 the loop ended while the
+# JIT was still converging, so the gated totals recorded how far that had got
+# and moved between two runs of one binary -- 923/6 loops against 925/7 here,
+# 923/6 against 938/8 on ubuntu and 922 against 923 on windows. Convergence
+# completes by 48000 on both native backends, and past it every gated counter is
+# independent of N: dynasm holds 1004 guard failures and cranelift 1010, with
+# six loops and five bridges, unchanged from 48000 through 96000. This sits far
+# enough above that point to keep the fixed point on a host that needs a few
+# more iterations to reach it.
+N = 64000
 
 
 def make_forwarder():
