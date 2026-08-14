@@ -14,6 +14,40 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
+/// The dense runtime type id a `GUARD_GC_TYPE` may be built against, or `None`
+/// when the descr cannot name one.
+///
+/// A stamped 0 is never a legitimate tid: the allocator hands out identities
+/// starting at 1 (`descr.rs` `next_type_id`, `gctypelayout.py:328-331`), so 0
+/// means this descr was rehydrated from a serialized form and never stamped.
+/// It is, however, a live value in a runtime header — the `rclass.OBJECT` root
+/// — which makes `GUARD_GC_TYPE(x, 0)` wrong in both directions: it fails on
+/// every object carrying a real header, and it *passes* on a plain `object`,
+/// certifying a layout nothing ever named. Emitting no guard at all is worse
+/// still, since it is the only layout check on the short-preamble entry. So the
+/// two admissible outcomes are the real tid or a decline, never 0 and never a
+/// silent skip.
+///
+/// The tid is recoverable because optimization runs inside the live interpreter,
+/// after `gc.register_type` has handed the runtime tids out — the build-time
+/// analyzer that wrote the serialized descr could not see them, but the
+/// structural `cache_key` still resolves to the dense tid through the same GC
+/// cache the backends use (`BhDescr::resolve_gc_tid`).
+///
+/// A poisoned cache lock degrades to "unresolved", which declines; it must not
+/// abort.
+fn resolve_gc_tid(
+    stamped_tid: u32,
+    cache_key: u64,
+    resolve: impl FnOnce(&majit_ir::descr::GcCache, u64) -> Option<u32>,
+) -> Option<u32> {
+    if stamped_tid != 0 {
+        return Some(stamped_tid);
+    }
+    let cache = majit_ir::descr::gc_cache().lock().ok()?;
+    resolve(&cache, cache_key).filter(|&tid| tid != 0)
+}
+
 /// Whether allocation lowering already writes exactly the `w_class` value
 /// represented by this virtual field.
 ///
@@ -360,8 +394,14 @@ pub trait PtrInfoExt {
     /// typeptr-at-offset-0 read (`gcremovetypeptr`) are honored.
     fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<i64>;
 
-    /// info.py:83 `make_guards(op, short, optimizer)`.
-    fn make_guards(&self, op: OpRef, short: &mut Vec<Op>, ctx: &mut crate::optimizeopt::OptContext);
+    /// info.py:83 `make_guards(op, short, optimizer)`. Returns false when a
+    /// required runtime layout guard cannot be expressed.
+    fn make_guards(
+        &self,
+        op: OpRef,
+        short: &mut Vec<Op>,
+        ctx: &mut crate::optimizeopt::OptContext,
+    ) -> bool;
 
     /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
     /// query across `ConstPtrInfo` and `StrPtrInfo`.
@@ -482,7 +522,7 @@ impl PtrInfoExt for PtrInfo {
         op: OpRef,
         short: &mut Vec<Op>,
         ctx: &mut crate::optimizeopt::OptContext,
-    ) {
+    ) -> bool {
         let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
             // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
             let pos = match value {
@@ -597,7 +637,6 @@ impl PtrInfoExt for PtrInfo {
                 //       c_typeid = ConstInt(self.descr.get_type_id())
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 // `StructPtrInfo.descr` is a plain `DescrRef`
                 // (ptr_info.rs:232-239), so info.py:361 `if self.descr is not
                 // None` is unconditionally true here and the `SizeDescr`
@@ -617,25 +656,25 @@ impl PtrInfoExt for PtrInfo {
                     "StructPtrInfo.descr must be a SizeDescr \
                      (optimizer.py:481 info.StructPtrInfo(parent_descr))",
                 );
-                // GUARD_GC_TYPE only for a real headered `GcStruct`: it
-                // reads a type-id word at `ref - 8` (the GC header).  A raw
-                // native struct and a headerless nursery allocation both lack
-                // that word, so the guard would read payload bytes and fail
-                // spuriously.  RPython emits GUARD_GC_TYPE only when a header
-                // exists; headerless structs get GUARD_NONNULL only.
-                //
-                // `type_id != 0` for the same reason the paragraph above gives
-                // for not inventing one: the allocator starts at 1, so a 0 here
-                // means the descr never received an identity, while 0 is a live
-                // runtime header value (the `rclass.OBJECT` root).  Emitting the
-                // guard anyway checks a tid the descr cannot name — it fails on
-                // every object with a real header, and passes on a plain
-                // `object`, certifying a layout that was never named.
-                // GUARD_GC_TYPE installs no info in the optimizer
-                // (`rewrite.rs` passes it through), so skipping it costs only
-                // the runtime re-check.
-                if sd.is_gc_managed() && !sd.headerless() && sd.type_id() != 0 {
-                    let type_id = sd.type_id() as i64;
+                // A serialized descr may carry only its structural cache key;
+                // recover the runtime tid from the live GC cache before
+                // constructing the layout guard. Headerless structs have no
+                // header word and require only GUARD_NONNULL.
+                let type_id = if sd.is_gc_managed() && !sd.headerless() {
+                    let Some(type_id) =
+                        resolve_gc_tid(sd.type_id(), sd.cache_key(), |cache, key| {
+                            cache.resolve_struct_tid(key)
+                        })
+                    else {
+                        return false;
+                    };
+                    Some(type_id)
+                } else {
+                    None
+                };
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                if let Some(type_id) = type_id {
+                    let type_id = type_id as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
                         OpCode::GuardGcType,
@@ -656,7 +695,6 @@ impl PtrInfoExt for PtrInfo {
                 //       lenop = ARRAYLEN_GC[op] (descr=self.descr)
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
-                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 // `ArrayPtrInfo.descr` is a plain `DescrRef`
                 // (ptr_info.rs:245-255) and info.py:634 reads
                 // `self.descr.get_type_id()` unconditionally.  Every producer
@@ -669,23 +707,28 @@ impl PtrInfoExt for PtrInfo {
                     "ArrayPtrInfo.descr must be an ArrayDescr \
                      (optimizer.py:487 info.ArrayPtrInfo(op.getdescr()))",
                 );
-                // GUARD_GC_TYPE reads a type-id word at `ptr -
-                // GcHeader::SIZE`; a header-less raw native pointer-array
-                // (a `pool_arrays` base minted by `add_ptr_array_descr`,
-                // `is_gc_managed = false`) has no such word, so the guard
-                // would read content-dependent memory before the array
-                // and fail on every short-preamble re-entry.  Gate it the
-                // same way the `PtrInfo::Struct` arm gates a raw struct.
-                //
-                // `type_id != 0` gates the same hazard the `PtrInfo::Struct`
-                // arm gates: a serialized `BhDescr::Array` that carries neither
-                // a `gc_type_id` nor a cache key resolves to 0
-                // (`BhDescr::resolve_gc_tid`), because the runtime array tids
-                // are handed out by `gc.register_type` at interpreter startup
-                // and the build-time analyzer cannot see them.  Guarding on 0
-                // pins a tid the descr does not name.
-                if ad.is_gc_managed() && ad.type_id() != 0 {
-                    let type_id = ad.type_id() as i64;
+                // Raw native arrays have no header word. For GC arrays, a
+                // missing stamped tid must be resolved from the structural
+                // cache key; otherwise this short-preamble entry is unsafe.
+                let stamped_tid = ad.type_id();
+                let type_id = if ad.is_gc_managed() {
+                    let Some(type_id) =
+                        resolve_gc_tid(stamped_tid, ad.cache_key(), |cache, key| {
+                            cache.resolve_array_tid(key)
+                        })
+                    else {
+                        return false;
+                    };
+                    if stamped_tid == 0 {
+                        ad.set_type_id(type_id);
+                    }
+                    Some(type_id)
+                } else {
+                    None
+                };
+                short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
+                if let Some(type_id) = type_id {
+                    let type_id = type_id as i64;
                     let type_id_const = alloc_const(ctx, Value::Int(type_id));
                     short.push(Op::new(
                         OpCode::GuardGcType,
@@ -788,6 +831,7 @@ impl PtrInfoExt for PtrInfo {
             // Virtuals/Virtualizable: no guards needed in short preamble
             _ => {}
         }
+        true
     }
 
     /// info.py:74-75 / vstring.py:103-105 / 249-258 — common string-length
@@ -1701,7 +1745,8 @@ pub use majit_ir::ptr_info::{
 mod tests {
     use super::*;
     use crate::optimizeopt::OptContext;
-    use majit_ir::{Descr, FieldDescr, OpCode, SizeDescr, Value};
+    use majit_ir::descr::{SimpleArrayDescr, SimpleSizeDescr, gc_cache};
+    use majit_ir::{ArrayDescr, Descr, FieldDescr, LLType, OpCode, SizeDescr, Value};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -1947,6 +1992,65 @@ mod tests {
 
         let virtual_struct = PtrInfo::virtual_struct(descr);
         assert!(virtual_struct.is_virtual());
+    }
+
+    #[test]
+    fn make_guards_resolves_zero_stamped_layout_tids() {
+        let key = 0xFFFF_FF00_0000_0042;
+        let struct_tid = 71;
+        let array_tid = 72;
+
+        let cached_struct: DescrRef = Arc::new(SimpleSizeDescr::new(0, 16, struct_tid));
+        let cached_array: DescrRef =
+            Arc::new(SimpleArrayDescr::new(0, 16, 8, array_tid, Type::Int));
+        {
+            let mut cache = gc_cache()
+                .lock()
+                .expect("test GC cache must not be poisoned");
+            cache._cache_size.insert(LLType::Struct(key), cached_struct);
+            cache._cache_array.insert(LLType::Array(key), cached_array);
+        }
+
+        let mut rehydrated_struct = SimpleSizeDescr::new(1, 16, 0);
+        rehydrated_struct.set_cache_key(key);
+        let struct_info = PtrInfo::struct_ptr(Arc::new(rehydrated_struct));
+        let mut rehydrated_array = SimpleArrayDescr::new(2, 16, 8, 0, Type::Int);
+        rehydrated_array.set_cache_key(key);
+        let rehydrated_array: DescrRef = Arc::new(rehydrated_array);
+        let array_info = PtrInfo::array(rehydrated_array.clone(), IntBound::unbounded());
+
+        let mut ctx = OptContext::new(8);
+        let mut struct_guards = Vec::new();
+        assert!(struct_info.make_guards(OpRef::ref_op(1), &mut struct_guards, &mut ctx));
+        assert_eq!(struct_guards[1].opcode, OpCode::GuardGcType);
+        assert_eq!(struct_guards[1].arg(1).const_value(), Some(Value::Int(71)));
+
+        let mut array_guards = Vec::new();
+        assert!(array_info.make_guards(OpRef::ref_op(2), &mut array_guards, &mut ctx));
+        assert_eq!(array_guards[1].opcode, OpCode::GuardGcType);
+        assert_eq!(array_guards[1].arg(1).const_value(), Some(Value::Int(72)));
+        assert_eq!(
+            rehydrated_array.as_array_descr().unwrap().type_id(),
+            array_tid
+        );
+
+        let mut cache = gc_cache()
+            .lock()
+            .expect("test GC cache must not be poisoned");
+        cache._cache_size.remove(&LLType::Struct(key));
+        cache._cache_array.remove(&LLType::Array(key));
+    }
+
+    #[test]
+    fn make_guards_declines_an_unresolved_gc_layout() {
+        let mut descr = SimpleArrayDescr::new(0, 16, 8, 0, Type::Int);
+        descr.set_cache_key(0xFFFF_FF00_0000_0043);
+        let info = PtrInfo::array(Arc::new(descr), IntBound::unbounded());
+        let mut guards = Vec::new();
+        let mut ctx = OptContext::new(4);
+
+        assert!(!info.make_guards(OpRef::ref_op(1), &mut guards, &mut ctx));
+        assert!(guards.is_empty());
     }
 
     #[test]

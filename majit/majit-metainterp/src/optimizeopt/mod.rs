@@ -3591,7 +3591,12 @@ impl OptContext {
             // RPython passes the preamble_op directly — no lookup miss possible.
             // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
             // with fallback to info::PreambleOp.preamble_op.
-            let (arg_guards, result_guards) = self.collect_use_box_guards(&preamble_op.preamble_op);
+            let Some((arg_guards, result_guards)) =
+                self.collect_use_box_guards(&preamble_op.preamble_op)
+            else {
+                self.signal_invalid_loop("short preamble GC layout tid is unresolved");
+                return preamble_source;
+            };
             // unroll.py:28: assert self.short_preamble_producer is not None
             if let Some(mut builder) = self.active_short_preamble_producer.take() {
                 builder.use_box(
@@ -3674,8 +3679,9 @@ impl OptContext {
     /// shortpreamble.py:383-396,401-406: collect guards from the forwarded
     /// info of preamble_op's args and result. RPython's `info = arg.get_forwarded()`
     /// returns whatever is stored — PtrInfo *or* IntBound — and calls
-    /// `info.make_guards(...)` uniformly.
-    fn collect_use_box_guards(&mut self, preamble_op: &Op) -> (Vec<Op>, Vec<Op>) {
+    /// `info.make_guards(...)` uniformly. None declines reconstruction when a
+    /// required pointer-layout guard cannot name its runtime tid.
+    fn collect_use_box_guards(&mut self, preamble_op: &Op) -> Option<(Vec<Op>, Vec<Op>)> {
         // shortpreamble.py:383-401 line-by-line:
         //
         //   for arg in preamble_op.getarglist():
@@ -3829,7 +3835,11 @@ impl OptContext {
         for entry in &arg_entries {
             match &entry.info {
                 ForwardedInfo::Empty => {}
-                ForwardedInfo::Ptr(p) => p.make_guards(entry.arg, &mut arg_guards, self),
+                ForwardedInfo::Ptr(p) => {
+                    if !p.make_guards(entry.arg, &mut arg_guards, self) {
+                        return None;
+                    }
+                }
                 ForwardedInfo::Int(b) => b.make_guards(entry.arg, &mut arg_guards, self),
                 ForwardedInfo::FloatConst(f) => {
                     emit_const_guard(entry.arg, &Value::Float(*f), &mut arg_guards, self)
@@ -3840,14 +3850,18 @@ impl OptContext {
         if let Some((result_ref, info)) = &result_info {
             match info {
                 ForwardedInfo::Empty => {}
-                ForwardedInfo::Ptr(p) => p.make_guards(*result_ref, &mut result_guards, self),
+                ForwardedInfo::Ptr(p) => {
+                    if !p.make_guards(*result_ref, &mut result_guards, self) {
+                        return None;
+                    }
+                }
                 ForwardedInfo::Int(b) => b.make_guards(*result_ref, &mut result_guards, self),
                 ForwardedInfo::FloatConst(f) => {
                     emit_const_guard(*result_ref, &Value::Float(*f), &mut result_guards, self)
                 }
             }
         }
-        (arg_guards, result_guards)
+        Some((arg_guards, result_guards))
     }
 
     /// shortpreamble.py:425 `preamble_op.set_forwarded(info)` for imported
