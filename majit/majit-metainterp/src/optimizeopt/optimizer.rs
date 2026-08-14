@@ -2533,6 +2533,17 @@ impl Optimizer {
         // unbound terminal that fails `write_forwarded`'s bound-
         // precondition assert.
         ctx.bind_input_resops(ops);
+        // unroll.py:188 — the bridge iterator's fresh inputargs must enter
+        // optimization without forwarding.  This is deliberately a
+        // debug-only invariant, matching the upstream assertion without
+        // adding release-build work.
+        debug_assert!(
+            !self.building_bridge
+                || crate::optimizeopt::unroll::UnrollOptimizer::check_no_forwarding(
+                    &ctx,
+                    &ctx.inputargs,
+                )
+        );
         // Phase 1 emit ops: single source of truth for cross-phase OpRef →
         // `op.type_` lookup (history.py:220 parity).
         ctx.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);

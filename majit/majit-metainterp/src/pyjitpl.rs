@@ -85,6 +85,7 @@ impl Drop for DebugSectionRollback {
 use crate::history::TreeLoop;
 use crate::warmstate::{HotResult, WarmEnterState};
 use majit_ir::descr::DescrRef;
+use majit_ir::forwarding::ForwardingHost;
 use majit_ir::{
     Const, FailDescr, GcRef, IndexMapExt, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
 };
@@ -112,6 +113,32 @@ use crate::virtualizable::VirtualizableInfo;
 fn guardlog_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
+}
+
+/// compile.py:496-502 `forget_optimization_info` — discard optimizer-only
+/// forwarding state before handing a trace to the backend.  The
+/// `reset_values` arm is unported because neither send-to-backend call site
+/// passes it.
+fn forget_optimization_info<T: OptimizationInfoItem>(items: &[T]) {
+    for item in items {
+        item.clear_optimization_info();
+    }
+}
+
+trait OptimizationInfoItem {
+    fn clear_optimization_info(&self);
+}
+
+impl OptimizationInfoItem for OpRc {
+    fn clear_optimization_info(&self) {
+        self.as_ref().clear_forwarded();
+    }
+}
+
+impl OptimizationInfoItem for InputArg {
+    fn clear_optimization_info(&self) {
+        self.clear_forwarded();
+    }
 }
 
 /// No direct RPython equivalent — Rust struct carrying data that RPython
@@ -6936,6 +6963,8 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         let compile_start = Instant::now();
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8220,6 +8249,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&combined_ops);
+        forget_optimization_info(&inputargs);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8546,6 +8577,8 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:589-599 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_bridge ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
+        forget_optimization_info(&combined_ops);
+        forget_optimization_info(&inputargs);
         let bridge_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9558,6 +9591,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&compiled_ops);
+        forget_optimization_info(&inputargs);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -12896,6 +12931,8 @@ impl<M: Clone> MetaInterp<M> {
             // profiler.start_backend() ... try: do_compile_bridge ...
             // finally: ... profiler.end_backend() +
             // debug_stop("jit-backend")`.
+            forget_optimization_info(&optimized_ops);
+            forget_optimization_info(bridge_inputargs);
             let bridge_result = {
                 let _backend_scope = self.staticdata.profiler.enter_backend();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
