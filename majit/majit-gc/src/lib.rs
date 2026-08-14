@@ -22,6 +22,7 @@ pub mod hook_cell;
 pub mod minimarkpage;
 pub mod nursery;
 pub mod oldgen;
+pub mod rawrefcount;
 pub mod rewrite;
 pub mod rgil;
 pub mod shadow_stack;
@@ -2986,6 +2987,66 @@ pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
         Some(f) => f(fq_index),
         None => gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index)),
     }
+}
+
+// ── rawrefcount ───────────────────────────────────────────────
+//
+// `rpython/rlib/rawrefcount.py`'s module-level surface.  Upstream's
+// `ExtRegistryEntry`s (`rawrefcount.py:237-322`) lower each public name to a
+// `gc_rawrefcount_*` operation, and `gctransform/framework.py:491-516` binds
+// those to the collector's method of the same name — and binds them only for a
+// collector that has one.  These wrappers are that binding, spelled directly.
+
+/// `rawrefcount.py:init` — hand the collector the callback it fires when the
+/// dead queue becomes non-empty.  Idempotent.
+pub fn gc_rawrefcount_init(dealloc_trigger: rawrefcount::DeallocTriggerFn) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_init(dealloc_trigger));
+}
+
+/// `rawrefcount.py:create_link_pypy` — `pyobject` is a mirror of `obj`, and
+/// `obj` owns it: the mirror lives as long as the interpreter object does, plus
+/// as long afterwards as the C side still holds a reference.
+///
+/// The caller must already have added [`rawrefcount::REFCNT_FROM_PYRE`] to the
+/// mirror's count; that share is what this link is worth.
+pub fn gc_rawrefcount_create_link_pyre(obj: GcRef, pyobject: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pyre(obj.0, pyobject));
+}
+
+/// `rawrefcount.py:create_link_pyobj` — the other direction: `pyobject` owns
+/// `obj`, so no trace pass roots `obj` on the mirror's behalf.
+pub fn gc_rawrefcount_create_link_pyobj(obj: GcRef, pyobject: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_create_link_pyobj(obj.0, pyobject));
+}
+
+/// `rawrefcount.py:mark_deallocating` — park `marker` in the link slot for the
+/// duration of a mirror's deallocator, so re-entrant C code asking for the
+/// interpreter object gets the sentinel rather than a freed address.
+pub fn gc_rawrefcount_mark_deallocating(marker: usize, pyobject: usize) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_mark_deallocating(marker, pyobject));
+}
+
+/// `rawrefcount.py:from_obj` — `obj`'s mirror, or 0.
+///
+/// The collector owns this table because it is keyed by an address the
+/// collector moves: a caller-side table would have to be rebuilt after every
+/// minor, and could not be, because a collection must not allocate.
+pub fn gc_rawrefcount_from_obj(obj: GcRef) -> usize {
+    gc_sync::gc_query_reentrant(|gc| gc.rawrefcount_from_obj(obj.0))
+}
+
+/// `rawrefcount.py:to_obj` — the interpreter object `pyobject` links to, null
+/// once the link has been cleared.
+pub fn gc_rawrefcount_to_obj(pyobject: usize) -> GcRef {
+    GcRef(gc_sync::gc_query_reentrant(|gc| {
+        gc.rawrefcount_to_obj(pyobject)
+    }))
+}
+
+/// `rawrefcount.py:next_dead` — pop one mirror whose linked object has died, or
+/// 0 when the queue is empty.
+pub fn gc_rawrefcount_next_dead() -> usize {
+    gc_sync::gc_op(|gc| gc.rawrefcount_next_dead())
 }
 
 /// rgc.enable / rgc.disable — toggle automatic major-collection progress

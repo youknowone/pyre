@@ -50,6 +50,7 @@ use crate::header::{GcHeader, header_of};
 use crate::hook::GcHooks;
 use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
+use crate::rawrefcount::{self, RrcList};
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
 use crate::{FinalizerTriggerFn, GcAllocator};
 
@@ -945,6 +946,10 @@ pub struct MiniMarkGC {
     /// (only populated while `oldgen_nonmoving_active`). Drained by the final
     /// VISITED-clear pass.
     oldgen_nonmoving_nursery_marks: Vec<usize>,
+    /// incminimark.py:3160,3175-3182 — the raw-refcount lists, identity tables
+    /// and dead queue, empty until the embedder calls
+    /// [`rawrefcount_init`](MiniMarkGC::rawrefcount_init).
+    rrc: rawrefcount::RawRefCount,
     /// Configuration.
     config: GcConfig,
     /// Count of minor collections performed.
@@ -1158,6 +1163,7 @@ impl MiniMarkGC {
             enabled: true,
             oldgen_nonmoving_active: false,
             oldgen_nonmoving_nursery_marks: Vec::new(),
+            rrc: rawrefcount::RawRefCount::default(),
             config,
             minor_collections: 0,
             major_collections: 0,
@@ -2374,6 +2380,13 @@ impl MiniMarkGC {
             }
         }
 
+        // incminimark.py:1834-1836: a mirror the C side still references roots
+        // its linked object, so the P list joins the root walk before anything
+        // decides which nursery objects die.
+        if self.rrc.enabled {
+            self.rrc_minor_collection_trace();
+        }
+
         // incminimark.py:1838-1841: registered young finalizers all survive
         // this minor and move to the old-registration deque.
         if !self.probably_young_objects_with_finalizers.is_empty() {
@@ -2504,6 +2517,14 @@ impl MiniMarkGC {
             }
         }
 
+        // incminimark.py:1886-1888 — every live nursery object has been
+        // forwarded by now, so each young mirror's link either follows its
+        // object out or reports that the object died.  Before the nursery reset
+        // below, which invalidates the addresses this reads.
+        if self.rrc.enabled {
+            self.rrc_minor_collection_free();
+        }
+
         if let Some((used_before, promoted_before)) = drain_sample {
             crate::drain_census_record(
                 used_before,
@@ -2548,6 +2569,10 @@ impl MiniMarkGC {
         // progress. Like incminimark, take one or more major steps until
         // promoted bytes are back under the current step credit.
         self.run_major_progress_after_minor();
+
+        // incminimark.py:862 — `minor_collection_with_major_progress` is where
+        // upstream schedules the drain of whatever this collection queued.
+        self.rrc_invoke_callback();
     }
 
     /// incminimark.py:3058-3105 `invalidate_young_weakrefs(self)`.
@@ -2639,6 +2664,345 @@ impl MiniMarkGC {
             } {
                 unsafe { (*weakptr_slot).0 = 0 };
             }
+        }
+    }
+
+    // ----------
+    // RawRefCount — incminimark.py:3157-3409
+
+    /// incminimark.py:3172-3183 `rawrefcount_init`.
+    ///
+    /// Idempotent, as upstream's `if not self.rrc_enabled` is: whichever of the
+    /// embedder's entry points runs first may call it.
+    pub fn rawrefcount_init(&mut self, dealloc_trigger: rawrefcount::DeallocTriggerFn) {
+        if !self.rrc.enabled {
+            self.rrc = rawrefcount::RawRefCount {
+                enabled: true,
+                dealloc_trigger: Some(dealloc_trigger),
+                ..Default::default()
+            };
+        }
+    }
+
+    /// `rrc_enabled` — whether [`rawrefcount_init`](Self::rawrefcount_init) has
+    /// run.  Every phase call site is guarded on it.
+    pub fn rawrefcount_enabled(&self) -> bool {
+        self.rrc.enabled
+    }
+
+    /// incminimark.py:3196-3210 `rawrefcount_create_link_pypy`.
+    ///
+    /// Upstream files a link by two independent questions — which list (young
+    /// or old), and which identity table (nursery-keyed or not).  They come
+    /// apart only for a young raw-malloced object, which is young but not in
+    /// the nursery; there is no young raw-malloc region here, so the two
+    /// questions collapse into one and the third combination cannot arise.
+    ///
+    /// The caller must already have added [`rawrefcount::REFCNT_FROM_PYRE`] to
+    /// the mirror's count: that share is what this link is worth, and what
+    /// [`Self::_rrc_free`] gives back when the object dies.
+    pub fn rawrefcount_create_link_pyre(&mut self, obj: usize, pyobject: usize) {
+        debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
+        if self.is_in_nursery(obj) {
+            self.rrc.p_list_young.push(pyobject);
+            self.rrc.p_dict_nurs.insert(obj, pyobject);
+        } else {
+            self.rrc.p_list_old.push(pyobject);
+            self.rrc.p_dict.insert(obj, pyobject);
+        }
+    }
+
+    /// incminimark.py:3212-3221 `rawrefcount_create_link_pyobj`.
+    ///
+    /// The mirror owns the interpreter object here, so no trace pass roots the
+    /// object on the mirror's behalf and there is no identity table to keep.
+    pub fn rawrefcount_create_link_pyobj(&mut self, obj: usize, pyobject: usize) {
+        debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
+        if self.is_in_nursery(obj) {
+            self.rrc.o_list_young.push(pyobject);
+        } else {
+            self.rrc.o_list_old.push(pyobject);
+        }
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = obj };
+        // there is no rrc_o_dict
+    }
+
+    /// incminimark.py:3223-3227 `rawrefcount_mark_deallocating`.
+    ///
+    /// `marker` is not a GC object: it is the sentinel
+    /// [`Self::rawrefcount_to_obj`] hands back while a mirror's deallocator
+    /// runs, so C code that re-enters and asks for the interpreter object gets
+    /// something it can recognise instead of a freed address.  A mirror is off
+    /// every list by the time this is called, so no trace pass can mistake the
+    /// sentinel for a reference.
+    pub fn rawrefcount_mark_deallocating(&mut self, marker: usize, pyobject: usize) {
+        debug_assert!(self.rrc.enabled, "rawrefcount.init not called");
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = marker };
+    }
+
+    /// incminimark.py:3229-3235 `rawrefcount_from_obj`.  Zero when unlinked.
+    pub fn rawrefcount_from_obj(&self, obj: usize) -> usize {
+        let dct = if self.is_in_nursery(obj) {
+            &self.rrc.p_dict_nurs
+        } else {
+            &self.rrc.p_dict
+        };
+        dct.get(&obj).copied().unwrap_or(0)
+    }
+
+    /// incminimark.py:3237-3239 `rawrefcount_to_obj`.
+    pub fn rawrefcount_to_obj(&self, pyobject: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    }
+
+    /// incminimark.py:3241-3245 `rawrefcount_next_dead`.  Zero when the queue
+    /// is empty.
+    pub fn rawrefcount_next_dead(&mut self) -> usize {
+        if self.rrc.enabled {
+            self.rrc.dealloc_pending.pop().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// incminimark.py:3248-3250 `rrc_invoke_callback`.
+    ///
+    /// Called from the public collection entry points (incminimark.py:808,
+    /// :821, :862), never from inside a phase: the collector is borrowed, so
+    /// the callback may only schedule the drain, not perform it.
+    fn rrc_invoke_callback(&mut self) {
+        if self.rrc.enabled
+            && !self.rrc.dealloc_pending.is_empty()
+            && let Some(trigger) = self.rrc.dealloc_trigger
+        {
+            trigger();
+        }
+    }
+
+    /// incminimark.py:3252-3257 `rrc_minor_collection_trace`.
+    ///
+    /// Every key in the nursery-keyed table is about to move, so the table is
+    /// emptied here and refilled with the survivors' new addresses by
+    /// [`Self::_rrc_minor_free`].
+    fn rrc_minor_collection_trace(&mut self) {
+        self.rrc.p_dict_nurs.clear();
+        let young = std::mem::take(&mut self.rrc.p_list_young);
+        for &pyobject in &young {
+            self._rrc_minor_trace(pyobject);
+        }
+        self.rrc.p_list_young = young;
+    }
+
+    /// incminimark.py:3259-3270 `_rrc_minor_trace`.
+    ///
+    /// The forwarded address is deliberately not written back to the link:
+    /// upstream drags the object out through a scratch cell, and
+    /// [`Self::_rrc_minor_free`] then reads the forwarding bit at the *old*
+    /// address to decide whether the mirror survives.
+    fn _rrc_minor_trace(&mut self, pyobject: usize) {
+        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
+        if rc == rawrefcount::REFCNT_FROM_PYRE {
+            // Nothing but the link references this mirror, so the linked
+            // object may die.
+            return;
+        }
+        let mut root = GcRef(unsafe { (*rawrefcount::pyobj(pyobject)).ob_link });
+        debug_assert!(!root.is_null(), "a mirror on the P list has a link");
+        self.drag_out_root(&mut root);
+    }
+
+    /// incminimark.py:3272-3282 `rrc_minor_collection_free`.
+    ///
+    /// `still_young` collects the entries that survived without leaving the
+    /// nursery, which upstream has no case for; see [`Self::_rrc_minor_free`].
+    fn rrc_minor_collection_free(&mut self) {
+        debug_assert!(self.rrc.p_dict_nurs.is_empty(), "p_dict_nurs not empty 1");
+        let mut young = std::mem::take(&mut self.rrc.p_list_young);
+        let mut still_young = Vec::new();
+        while let Some(pyobject) = young.pop() {
+            self._rrc_minor_free(pyobject, RrcList::P, &mut still_young);
+        }
+        self.rrc.p_list_young = still_young;
+        let mut young = std::mem::take(&mut self.rrc.o_list_young);
+        let mut still_young = Vec::new();
+        while let Some(pyobject) = young.pop() {
+            self._rrc_minor_free(pyobject, RrcList::O, &mut still_young);
+        }
+        self.rrc.o_list_young = still_young;
+    }
+
+    /// incminimark.py:3284-3318 `_rrc_minor_free`.
+    fn _rrc_minor_free(&mut self, pyobject: usize, list: RrcList, still_young: &mut Vec<usize>) {
+        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+        // incminimark.py:3300-3312 handles a young raw-malloced target, which
+        // survives without moving and is recognised by a flag rather than a
+        // forwarding pointer.  There is no young raw-malloc region here, so a
+        // young-list link that is not a nursery address is a filing error.
+        debug_assert!(
+            self.is_nursery_object_start(obj),
+            "a young rawrefcount list holds a non-nursery link"
+        );
+        let hdr = unsafe { header_of(obj) };
+        if unsafe { (*hdr).is_forwarded() } {
+            let moved = unsafe { GcHeader::forwarding_address(hdr) };
+            unsafe { (*rawrefcount::pyobj(pyobject)).ob_link = moved };
+            match list {
+                RrcList::P => {
+                    // It was keyed in `p_dict_nurs`, which this collection
+                    // emptied; at its new address it belongs in `p_dict`.
+                    self.rrc.p_dict.insert(moved, pyobject);
+                    self.rrc.p_list_old.push(pyobject);
+                }
+                RrcList::O => self.rrc.o_list_old.push(pyobject),
+            }
+        } else if self.pinned_objects.contains(&obj) {
+            // A pinned object that was reached survives *in place*
+            // (`copy_nursery_object` records it and returns the same address),
+            // so there is no forwarding pointer and the link already names its
+            // final address.  It is still a nursery address, so the entry stays
+            // on the young list and in the nursery-keyed table.
+            //
+            // incminimark.py:3287-3299 reads only the forwarding bit, so a
+            // pinned P-linked object reports there as dead.  `pin` refuses any
+            // type carrying GC pointers, which is why the combination is rare
+            // rather than impossible: a pinned byte buffer with a mirror is
+            // exactly what `PyBytes_AsString` over a pinned buffer produces.
+            // `pinned_objects` holds this collection's survivors by this point
+            // (it was swapped from `surviving_pinned_objects` above), so an
+            // unreached pinned object still falls through to the free below.
+            if list == RrcList::P {
+                self.rrc.p_dict_nurs.insert(obj, pyobject);
+            }
+            still_young.push(pyobject);
+        } else {
+            self._rrc_free(pyobject);
+        }
+    }
+
+    /// incminimark.py:3320-3354 `_rrc_free`.
+    ///
+    /// The linked object has died, so the interpreter's share of the count goes
+    /// away.  incminimark.py:3328-3335's `REFCNT_FROM_PYPY_LIGHT` branch has no
+    /// port — nothing here creates a light mirror — and the immortal branch
+    /// (:3326) is unreachable, because a count above the link share forces the
+    /// linked object alive in both trace passes.
+    fn _rrc_free(&mut self, pyobject: usize) {
+        let header = rawrefcount::pyobj(pyobject);
+        let mut rc = unsafe { (*header).ob_refcnt };
+        debug_assert!(
+            rc < rawrefcount::REFCNT_IMMORTAL,
+            "an immortal mirror reached the rawrefcount free pass"
+        );
+        debug_assert!(
+            rc >= rawrefcount::REFCNT_FROM_PYRE,
+            "rawrefcount refcount underflow"
+        );
+        rc -= rawrefcount::REFCNT_FROM_PYRE;
+        unsafe { (*header).ob_link = 0 };
+        if rc == 0 {
+            // incminimark.py:3343-3352 — a mirror at count 0 cannot sit and
+            // wait for its deallocator: some extensions read the raw pointer
+            // back and expect the deallocator to have run the moment the count
+            // reached 0.  Queue it and leave it at 1, so the drain's own
+            // release is what frees it.
+            self.rrc.dealloc_pending.push(pyobject);
+            rc = 1;
+        }
+        unsafe { (*header).ob_refcnt = rc };
+    }
+
+    /// incminimark.py:3356-3357 `rrc_major_collection_trace`.
+    fn rrc_major_collection_trace(&mut self) {
+        let old = std::mem::take(&mut self.rrc.p_list_old);
+        for &pyobject in &old {
+            self._rrc_major_trace(pyobject);
+        }
+        self.rrc.p_list_old = old;
+    }
+
+    /// incminimark.py:3359-3375 `_rrc_major_trace`.
+    fn _rrc_major_trace(&mut self, pyobject: usize) {
+        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
+        if rc == rawrefcount::REFCNT_FROM_PYRE {
+            return;
+        }
+        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+        self.seed_major_root(GcRef(obj), "rrc_major_trace");
+        self.drain_gray_stack();
+    }
+
+    /// A non-moving major runs with a live nursery and no leading minor
+    /// (`do_collect_oldgen_nonmoving`), so `rrc_minor_collection_trace` never
+    /// ran and the young P list still holds mirrors whose linked nursery object
+    /// is reachable from C alone.  Nothing sweeps the nursery here, but an old
+    /// object reachable only *through* such a nursery object would be, so seed
+    /// the same roots the moving trace would have.  Nothing moves and no entry
+    /// changes list: the young bookkeeping stays for the next moving minor.
+    ///
+    /// The counterpart for weak references is
+    /// [`Self::invalidate_young_weakrefs_for_nonmoving_major`].
+    fn rrc_nonmoving_major_trace_young(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        let young = std::mem::take(&mut self.rrc.p_list_young);
+        for &pyobject in &young {
+            let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
+            if rc == rawrefcount::REFCNT_FROM_PYRE {
+                continue;
+            }
+            let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+            self.seed_major_root(GcRef(obj), "rrc_nonmoving_major_young");
+            self.drain_gray_stack();
+        }
+        self.rrc.p_list_young = young;
+    }
+
+    /// incminimark.py:3377-3395 `rrc_major_collection_free`.
+    ///
+    /// Only the old half is rebuilt.  The nursery-keyed table belongs to the
+    /// minor that will next empty it, and every entry it holds names a mirror
+    /// still on the young list, which this pass does not walk.
+    fn rrc_major_collection_free(&mut self) {
+        // incminimark.py:3378 asserts the nursery-keyed table is empty here,
+        // which holds upstream because a minor precedes every major step.
+        // `do_collect_oldgen_nonmoving` is the one entry that deliberately runs
+        // without one — that is its contract — so there the table is legitimately
+        // populated.
+        debug_assert!(
+            self.oldgen_nonmoving_active || self.rrc.p_dict_nurs.is_empty(),
+            "p_dict_nurs not empty 2"
+        );
+        self.rrc.p_dict.clear();
+        let mut old = std::mem::take(&mut self.rrc.p_list_old);
+        let mut surviving = Vec::with_capacity(old.len());
+        while let Some(pyobject) = old.pop() {
+            self._rrc_major_free(pyobject, &mut surviving, RrcList::P);
+        }
+        self.rrc.p_list_old = surviving;
+        let mut old = std::mem::take(&mut self.rrc.o_list_old);
+        let mut surviving = Vec::with_capacity(old.len());
+        while let Some(pyobject) = old.pop() {
+            self._rrc_major_free(pyobject, &mut surviving, RrcList::O);
+        }
+        self.rrc.o_list_old = surviving;
+    }
+
+    /// incminimark.py:3397-3409 `_rrc_major_free`.
+    fn _rrc_major_free(&mut self, pyobject: usize, surviving: &mut Vec<usize>, list: RrcList) {
+        // incminimark.py:3398-3404 — the mirror survives exactly if its object
+        // did: VISITED means marking reached it, NO_HEAP_PTRS an immortal
+        // object marking never has to reach.
+        let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
+        let hdr = unsafe { header_of(obj) };
+        let alive =
+            unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) };
+        if alive {
+            surviving.push(pyobject);
+            if list == RrcList::P {
+                self.rrc.p_dict.insert(obj, pyobject);
+            }
+        } else {
+            self._rrc_free(pyobject);
         }
     }
 
@@ -4456,6 +4820,15 @@ impl MiniMarkGC {
     /// reference to a white object. Walk the root sets once more here and turn
     /// the black ones gray again; this can only add survivors, never free a
     /// reachable object.
+    /// incminimark.py:2761-2763 `visit_all_objects`: mark until the worklist is
+    /// empty.  Every caller that seeds a root outside the incremental budget
+    /// finishes it here rather than leaving work for the next step.
+    fn drain_gray_stack(&mut self) {
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
         for gcref in self.enumerate_root_walker_values() {
             if gcref.is_null() {
@@ -4532,6 +4905,15 @@ impl MiniMarkGC {
         // after the cycle's initial snapshot.  Rescan and trace them before
         // finalizers, weakrefs, and sweep inspect VISITED.
         self.rescan_major_nonstack_roots_and_drain();
+        // incminimark.py:2486-2487 — the P list is a root source like any
+        // other, and it is consulted here, after the ordinary roots and before
+        // anything reads VISITED to decide what dies.
+        if self.rrc.enabled {
+            self.rrc_major_collection_trace();
+            if self.oldgen_nonmoving_active {
+                self.rrc_nonmoving_major_trace_young();
+            }
+        }
         self.mark_ephemeron_values_to_fixed_point();
         // incminimark.py:2492: this counter belongs to one finalization-order
         // pass.  `_bump_finalization_state_from_0_to_1` below repopulates it
@@ -4608,7 +4990,11 @@ impl MiniMarkGC {
         // VISITED set at this point; the oldgen sweep clears it later.
         self.old_objects_pointing_to_pinned
             .retain(|&obj_addr| unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED) });
-        // incminimark.py:2528-2529 rawrefcount integration is absent.
+        // incminimark.py:2528-2529 — VISITED still distinguishes survivors, so
+        // this is where each mirror learns whether its object made it.
+        if self.rrc.enabled {
+            self.rrc_major_collection_free();
+        }
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();
@@ -5017,6 +5403,9 @@ impl MiniMarkGC {
             self.start_incremental_cycle();
         }
         self.gc_step_until_scanning_with_minors();
+
+        // incminimark.py:808.
+        self.rrc_invoke_callback();
     }
 
     /// incminimark.py:810-822 `collect_step`.
@@ -5036,6 +5425,9 @@ impl MiniMarkGC {
         self.do_collect_nursery();
         self.enabled = was_enabled;
         self.major_collection_step();
+
+        // incminimark.py:821.
+        self.rrc_invoke_callback();
 
         crate::GcStepTransition {
             old_state: old_state.encoded(),
@@ -5092,6 +5484,10 @@ impl MiniMarkGC {
             }
         }
         self.oldgen_nonmoving_active = false;
+
+        // This entry has no upstream counterpart, but it is a public collection
+        // entry point and it can queue mirrors, so it owes the same schedule.
+        self.rrc_invoke_callback();
     }
 
     fn gc_step_until_scanning(&mut self) {
@@ -11004,5 +11400,220 @@ cache size\t: 8192 kB\n";
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
         assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+    }
+
+    // ── rawrefcount (incminimark.py:3157-3409) ──────────────────────
+
+    /// A mirror block lives outside the GC heap at a fixed address, which is
+    /// the whole point of the link.  Leaked deliberately: the collector holds
+    /// the address in its lists for as long as the test's collector lives.
+    fn test_mirror(refcnt: isize) -> usize {
+        Box::into_raw(Box::new(rawrefcount::PyObjHeader {
+            ob_refcnt: refcnt,
+            ob_link: 0,
+        })) as usize
+    }
+
+    fn mirror_refcnt(pyobject: usize) -> isize {
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt }
+    }
+
+    fn mirror_link(pyobject: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    }
+
+    thread_local! {
+        /// Per-thread so the count belongs to one test: the trigger is a bare
+        /// `fn`, and a `static` would be shared with every test the harness
+        /// runs concurrently.  The collector calls it on the calling thread.
+        static RRC_TRIGGER_FIRED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn rrc_test_trigger() {
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(fired.get() + 1));
+    }
+
+    fn rrc_test_gc() -> MiniMarkGC {
+        let mut gc = test_gc(1 << 16);
+        gc.rawrefcount_init(rrc_test_trigger);
+        assert!(gc.rawrefcount_enabled());
+        gc
+    }
+
+    /// incminimark.py:3259-3270 and :3284-3318: a count above the link share is
+    /// a reference the C side holds, and it keeps the linked object alive
+    /// across a minor with no interpreter root at all.  The link then follows
+    /// the object to its new address, and the identity table is re-keyed there.
+    #[test]
+    fn a_c_referenced_mirror_roots_its_object_across_a_minor() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+        let object = gc.alloc_with_type(tid, 64);
+        assert!(gc.is_in_nursery(object.0), "premise: the object is young");
+
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
+        gc.rawrefcount_create_link_pyre(object.0, mirror);
+        assert_eq!(gc.rawrefcount_from_obj(object.0), mirror);
+
+        gc.do_collect_nursery();
+
+        let moved = mirror_link(mirror);
+        assert_ne!(moved, 0, "the mirror was unlinked");
+        assert_ne!(moved, object.0, "premise: a surviving nursery object moves");
+        assert!(!gc.is_in_nursery(moved));
+        assert_eq!(gc.rawrefcount_from_obj(moved), mirror);
+        assert_eq!(gc.rawrefcount_to_obj(mirror), moved);
+        assert_eq!(gc.rawrefcount_next_dead(), 0, "nothing died");
+    }
+
+    /// incminimark.py:3264-3265 and :3320-3354: a count of exactly the link
+    /// share means nothing but the link references the mirror, so the object
+    /// may die.  The mirror is then unlinked, queued, and left at 1 so the
+    /// drain's own release is what frees it.
+    #[test]
+    fn a_mirror_at_the_link_share_lets_its_object_die_and_is_queued() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+        let object = gc.alloc_with_type(tid, 64);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE);
+        gc.rawrefcount_create_link_pyre(object.0, mirror);
+
+        RRC_TRIGGER_FIRED.with(|fired| fired.set(0));
+        gc.do_collect_nursery();
+
+        assert_eq!(mirror_link(mirror), 0, "a dead mirror keeps no link");
+        assert_eq!(
+            mirror_refcnt(mirror),
+            1,
+            "incminimark.py:3352 leaves a queued mirror at 1"
+        );
+        assert_eq!(gc.rawrefcount_next_dead(), mirror);
+        assert_eq!(gc.rawrefcount_next_dead(), 0, "the queue drains once");
+        assert_eq!(
+            RRC_TRIGGER_FIRED.with(|fired| fired.get()),
+            1,
+            "incminimark.py:3248-3250 schedules the drain for a non-empty queue"
+        );
+    }
+
+    /// incminimark.py:3359-3375 and :3397-3409: the same two outcomes, decided
+    /// by a major collection over the old list.
+    #[test]
+    fn a_major_frees_only_the_mirrors_whose_object_died() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+
+        let mut kept = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64);
+        let dying = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64);
+        assert!(!gc.is_in_nursery(kept.0) && !gc.is_in_nursery(dying.0));
+
+        let kept_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
+        let dying_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE);
+        gc.rawrefcount_create_link_pyre(kept.0, kept_mirror);
+        gc.rawrefcount_create_link_pyre(dying.0, dying_mirror);
+        unsafe { gc.roots.add(&mut kept) };
+
+        gc.do_collect_full();
+
+        assert_eq!(mirror_link(kept_mirror), kept.0);
+        assert_eq!(gc.rawrefcount_from_obj(kept.0), kept_mirror);
+        assert_eq!(mirror_link(dying_mirror), 0);
+        assert_eq!(mirror_refcnt(dying_mirror), 1);
+        assert_eq!(gc.rawrefcount_next_dead(), dying_mirror);
+        assert_eq!(gc.rawrefcount_next_dead(), 0);
+
+        gc.roots.remove(&mut kept);
+    }
+
+    /// A pinned object survives a minor without moving, so there is no
+    /// forwarding pointer for its mirror's link to follow — and reading only
+    /// the forwarding bit, as incminimark.py:3287-3299 does, would report it
+    /// dead and free a mirror the C side still holds.
+    #[test]
+    fn a_pinned_object_keeps_its_mirror_across_a_minor() {
+        let mut gc = rrc_test_gc();
+        // `pin` refuses anything carrying GC pointers, so this is the shape a
+        // pinnable object has: a leaf byte block.
+        let tid = gc.register_type(TypeInfo::simple(64));
+        let mut object = gc.alloc_with_type(tid, 64);
+        assert!(gc.pin(object), "premise: this object can be pinned");
+        // Pinning does not root: something must still reach it this collection.
+        unsafe { gc.roots.add(&mut object) };
+
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
+        gc.rawrefcount_create_link_pyre(object.0, mirror);
+
+        gc.do_collect_nursery();
+
+        assert_eq!(
+            mirror_link(mirror),
+            object.0,
+            "a pinned object does not move, so the link must not change"
+        );
+        assert!(gc.is_in_nursery(mirror_link(mirror)));
+        assert_eq!(gc.rawrefcount_from_obj(object.0), mirror);
+        assert_eq!(gc.rawrefcount_next_dead(), 0, "the mirror was freed");
+
+        // Still tracked as young, so the next minor finds it again.
+        gc.do_collect_nursery();
+        assert_eq!(gc.rawrefcount_from_obj(object.0), mirror);
+        assert_eq!(gc.rawrefcount_next_dead(), 0);
+
+        gc.roots.remove(&mut object);
+    }
+
+    /// incminimark.py:3223-3227: the deallocating marker replaces the link, so
+    /// a re-entrant lookup during a deallocator cannot hand back an address the
+    /// collector has already reclaimed.
+    #[test]
+    fn mark_deallocating_replaces_the_link_with_the_sentinel() {
+        let mut gc = rrc_test_gc();
+        let tid = gc.register_type(TypeInfo::object(64));
+        let object = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64);
+        let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
+        gc.rawrefcount_create_link_pyre(object.0, mirror);
+
+        let marker = 0x0DEA_DFFF_usize;
+        gc.rawrefcount_mark_deallocating(marker, mirror);
+        assert_eq!(gc.rawrefcount_to_obj(mirror), marker);
+    }
+
+    /// A non-moving major runs no leading minor, so the young P list is the
+    /// only thing that can report a C-referenced nursery object — and an old
+    /// object reachable only through one would otherwise be swept.
+    ///
+    /// Differential, because "is this address still live?" has no sound direct
+    /// oracle once the arena has been swept: the same heap is built twice and
+    /// differs only in whether the mirror carries a C reference, so the
+    /// surviving bytes are attributable to nothing else.
+    #[test]
+    fn a_nonmoving_major_keeps_an_old_object_reachable_only_through_a_c_root() {
+        fn survivors_with(mirror_refcnt: isize) -> usize {
+            let word = std::mem::size_of::<usize>();
+            let mut gc = rrc_test_gc();
+            let leaf = gc.register_type(TypeInfo::object(word));
+            let holder = gc.register_type(TypeInfo::object_with_gc_ptrs(word, vec![0]));
+
+            let old = gc.alloc_in_oldgen(leaf, GcHeader::SIZE + word);
+            let young = gc.alloc_with_type(holder, word);
+            assert!(gc.is_in_nursery(young.0) && !gc.is_in_nursery(old.0));
+            // The old object is reachable from the nursery object and from
+            // nowhere else; the nursery object is reachable from the mirror
+            // and from nowhere else.
+            unsafe { *(young.0 as *mut GcRef) = old };
+            gc.rawrefcount_create_link_pyre(young.0, test_mirror(mirror_refcnt));
+
+            gc.do_collect_oldgen_nonmoving();
+            assert_eq!(gc.rawrefcount_next_dead(), 0, "the nursery is not swept");
+            gc.get_total_memory_used()
+        }
+
+        let referenced = survivors_with(rawrefcount::REFCNT_FROM_PYRE + 1);
+        let unreferenced = survivors_with(rawrefcount::REFCNT_FROM_PYRE);
+        assert!(
+            referenced > unreferenced,
+            "the old object was swept out from under a live C reference \
+             ({referenced} bytes held with a C reference, {unreferenced} without)"
+        );
     }
 }
