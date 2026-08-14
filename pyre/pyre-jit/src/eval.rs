@@ -7430,10 +7430,29 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
         UnsupportedJitShape::CurrentFrameOnly
         | UnsupportedJitShape::NestedBreakBridgeResume
         | UnsupportedJitShape::ConstEncodingOverflow => {
-            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
-                code as *const _ as usize,
-                unsupported_jit_shape(code).1,
-            );
+            let denial = unsupported_jit_shape(code).1;
+            let first_decline =
+                pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                    code as *const _ as usize,
+                    denial,
+                );
+            // Two of the `CurrentFrameOnly` predicates are FOR_ITER frame
+            // gates (`ForIterFinallyDuplicated`, `ForIterRaisingNamedHandler`).
+            // They belong to the same gate `PYRE_FOR_ITER_GATE_DIAG` measures,
+            // and its doc promises the per-opcode and whole-frame declines
+            // print under one flag — but they returned here, before the
+            // `FrameGate::ForIter/...` print below, so the flag showed only two
+            // of the gate's four decline paths and a census of the gate read as
+            // if these never fired.  Print them on the same line shape.
+            if first_decline
+                && denial.starts_with("FrameShape::CurrentFrameOnly/ForIter")
+                && for_iter_gate_diag_enabled()
+            {
+                eprintln!(
+                    "[for-iter-gate-decline] code={} source={} predicate={denial}",
+                    code.qualname, code.source_path
+                );
+            }
             return frame_root.frame().execute_frame(None, None);
         }
     }

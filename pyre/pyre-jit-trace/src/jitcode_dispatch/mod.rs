@@ -2630,11 +2630,15 @@ thread_local! {
 /// attribute the pre-trace frame-shape decline alongside the traced declines.
 /// `code_ptr` is the `CodeObject` pointer, used only to dedup repeated entries
 /// of the same declined frame; `kind` names the shape for the census line.
-pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) {
+/// Returns whether this was the first decline recorded for `code_ptr`, so a
+/// caller that also wants to print a once-per-frame diagnostic can share this
+/// dedup instead of keeping a second one.
+pub fn census_record_frame_shape_decline(code_ptr: usize, kind: &'static str) -> bool {
     let first = FRAME_SHAPE_DECLINE_SEEN.with(|s| s.borrow_mut().insert(code_ptr));
     if first {
         census_record(kind);
     }
+    first
 }
 
 /// Record a frame-level FOR_ITER admission denial once per code object.
