@@ -78,10 +78,9 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
     }
 }
 
-/// Field bridge for the exact typed `W_Weakref` and the still-generated
-/// mapdict layout of a Python `weakref.ref` subclass.  PyPy presents the same
-/// `W_WeakrefBase` fields on both translated classes; only their physical
-/// composition differs (`typedef.py:174-227`).
+/// Field bridge for typed `W_Weakref` and mapdict `W_AbstractProxy` objects.
+/// `W_WeakrefBase` (interp__weakref.py:160-202) supplies the same fields to
+/// both; only their physical composition differs.
 #[inline]
 fn weakref_obj_weak(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
@@ -128,12 +127,12 @@ fn weakref_set_hash(obj: PyObjectRef, value: PyObjectRef) {
 }
 
 /// Scoped GC root for a freshly-allocated instance still held only in a
-/// Rust local. The weakref / proxy constructors allocate the instance,
-/// then allocate a `GcWeakrefBox` (an `rweakref` `Weakref` via
-/// `try_gc_alloc`) and grow the instance dict — each is a nursery
-/// allocation that can drive a minor collection. Without a root the
-/// not-yet-reachable instance is swept (its header zeroed), and a later
-/// `write_attr` / `typedef::r#type` dereferences the dangling pointer.
+/// Rust local. The proxy constructors allocate the instance, then allocate a
+/// `GcWeakrefBox` (an `rweakref` `Weakref` via `try_gc_alloc`) and grow the
+/// instance dict — each is a nursery allocation that can drive a minor
+/// collection. Without a root the not-yet-reachable instance is swept (its
+/// header zeroed), and a later `write_attr` / `typedef::r#type` dereferences
+/// the dangling pointer.
 /// Registering the slot keeps the instance alive and relocates the local
 /// in place when the collector promotes it, mirroring `FrameLocalsRoot`.
 struct InstanceRoot {
@@ -647,67 +646,41 @@ pub fn W_Weakref_new(
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    use pyre_object::objectobject::w_instance_new;
     // typedef.py:519 generic_new_descr → space.allocate_instance(W_Type, w_subtype)
     let actual_type = if w_subtype.is_null() {
         weakref_type()
     } else {
         w_subtype
     };
-    // typeobject.py `allocate_instance`: a subclass whose Layout adds no
-    // storage keeps the builtin W_Weakref layout and changes only `w_class`.
-    // In particular `class R(ref): __slots__ = ()` has neither mapdict nor
-    // member slots in which the three interpreter-owned fields could live.
+    // `W_Weakref` (interp__weakref.py:195-257) / `descr__new__weakref`
+    // (interp__weakref.py:259-269): the three fields are interpreter-owned, so
+    // every subtype keeps the builtin payload. Its Python-level `__dict__` and
+    // slots use the same tagged carrier as other builtin subclasses.
     let exact_type = std::ptr::eq(actual_type, weakref_type());
-    let shares_base_layout = !exact_type
-        && unsafe {
-            !pyre_object::w_type_get_hasdict(actual_type)
-                && pyre_object::w_type_get_nslots(actual_type)
-                    == pyre_object::w_type_get_nslots(weakref_type())
-        };
-    if exact_type || shares_base_layout {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_obj);
-        pyre_object::gc_roots::pin_root(w_callable);
-        let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
-            pyre_object::gc_roots::shadow_stack_get(root_base),
-        );
-        pyre_object::gc_roots::pin_root(w_obj_weak);
-        let callable = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-        let callable = if !callable.is_null() && !unsafe { pyre_object::is_none(callable) } {
-            callable
-        } else {
-            pyre_object::PY_NULL
-        };
-        let weakref = pyre_object::weakref::w_weakref_object_new(
-            pyre_object::gc_roots::shadow_stack_get(root_base + 2),
-            callable,
-            pyre_object::PY_NULL,
-        );
-        return if exact_type {
-            weakref
-        } else {
-            crate::typedef::tag_subclass_instance(weakref, actual_type)
-        };
-    }
-
-    let mut obj = w_instance_new(actual_type);
-    let _root = InstanceRoot::new(&mut obj);
-    // W_WeakrefBase.__init__: self.w_obj_weak = weakref.ref(w_obj).
-    // Compute the box before `write_attr`: the allocation must not happen
-    // while a stale `obj` is captured as the call's receiver argument.
-    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj);
-    write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak);
-    let w_callable = if !w_callable.is_null() && !unsafe { pyre_object::is_none(w_callable) } {
-        w_callable
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
+    pyre_object::gc_roots::pin_root(w_callable);
+    let w_obj_weak = pyre_object::weakref::w_gc_weakref_box_new_or_strong(
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+    );
+    pyre_object::gc_roots::pin_root(w_obj_weak);
+    let callable = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let callable = if !callable.is_null() && !unsafe { pyre_object::is_none(callable) } {
+        callable
     } else {
-        pyre_object::w_none()
+        pyre_object::PY_NULL
     };
-    write_attr(obj, ATTR_W_CALLABLE, w_callable);
-    // W_Weakref.__init__: self.w_hash = None
-    write_attr(obj, ATTR_W_HASH, pyre_object::w_none());
-    obj
+    let weakref = pyre_object::weakref::w_weakref_object_new(
+        pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+        callable,
+        pyre_object::PY_NULL,
+    );
+    if exact_type {
+        weakref
+    } else {
+        crate::typedef::tag_subclass_instance(weakref, actual_type)
+    }
 }
 
 #[allow(non_snake_case)]

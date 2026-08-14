@@ -3906,8 +3906,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `interp__weakref.py:193-205 W_Weakref` exact builtin payload. Like the
     // lifeline above, its allocation is selected by its translated GC layout;
     // Python class identity remains in the header's `w_class`. Append it after
-    // the lifeline so the already-published lifeline tid stays stable. The
-    // separate generated user-subclass layout remains mapdict-backed.
+    // the lifeline so the already-published lifeline tid stays stable. Every
+    // `weakref.ref` subclass instance carries this same payload, so its
+    // `w_slots` tail is traced here too.
     let weakref_descr =
         <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(

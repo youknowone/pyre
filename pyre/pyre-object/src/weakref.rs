@@ -107,6 +107,8 @@ pub struct W_Weakref {
     pub w_callable: PyObjectRef,
     /// `W_Weakref.__init__: self.w_hash = None`.
     pub w_hash: PyObjectRef,
+    /// Native-subclass `__slots__` storage indexed by `Member.index`.
+    pub w_slots: PyObjectRef,
 }
 
 /// Allocate the exact builtin W_Weakref payload. The caller has already
@@ -122,6 +124,7 @@ pub fn w_weakref_object_new(
         w_obj_weak,
         w_callable,
         w_hash,
+        w_slots: PY_NULL,
     })
 }
 
@@ -155,6 +158,35 @@ pub unsafe fn w_weakref_object_hash(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_weakref_object_set_hash(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut W_Weakref)).w_hash = value };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// Address of `W_Weakref::w_slots` for the shared slot helpers.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Weakref`.
+unsafe fn weakref_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
+    unsafe { &mut (*(obj as *mut W_Weakref)).w_slots }
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_weakref_object_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe { crate::slots::slot_get(obj, index, weakref_slots_field) }
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_weakref_object_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    unsafe { crate::slots::slot_set(obj, index, value, weakref_slots_field) }
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_weakref_object_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    unsafe { crate::slots::slot_del(obj, index, weakref_slots_field) }
 }
 
 /// GC type id for the WEAKREF GcStruct. Registered by
@@ -550,6 +582,16 @@ mod tests {
         }
         assert_eq!(unsafe { w_weakref_object_hash(weakref) }, hash);
         assert!(unsafe { w_weakref_object_callable(weakref) }.is_null());
+
+        let slot_value = 0x7000_usize as PyObjectRef;
+        unsafe { w_weakref_object_slot_set(weakref, 2, slot_value) };
+        assert_eq!(
+            unsafe { w_weakref_object_slot_get(weakref, 2) },
+            Some(slot_value)
+        );
+        assert!(unsafe { w_weakref_object_slot_del(weakref, 2) });
+        assert_eq!(unsafe { w_weakref_object_slot_get(weakref, 2) }, None);
+
         assert_eq!(
             W_Weakref::DESCRIPTOR.ptr_offsets,
             &[
@@ -557,6 +599,7 @@ mod tests {
                 std::mem::offset_of!(W_Weakref, w_obj_weak),
                 std::mem::offset_of!(W_Weakref, w_callable),
                 std::mem::offset_of!(W_Weakref, w_hash),
+                std::mem::offset_of!(W_Weakref, w_slots),
             ]
         );
     }
