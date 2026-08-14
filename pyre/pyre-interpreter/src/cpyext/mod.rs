@@ -26,6 +26,7 @@ pub mod object;
 pub mod pyerrors;
 pub mod pyobject;
 pub mod tupleobject;
+pub mod typeobject;
 pub mod unicodeobject;
 
 use parking_lot::ReentrantMutex;
@@ -460,7 +461,7 @@ fn finish_init(
     }
     // PEP 489: `PyModuleDef_Init` hands back the definition itself, and the
     // module is created from it against the import spec instead.
-    if modsupport::is_module_def(result) {
+    if typeobject::is_module_def(result) {
         // `PACKAGE_CONTEXT` is only consumed by the single-phase path; the
         // multi-phase one names the module from the spec, so clear it here.
         *PACKAGE_CONTEXT.lock() = None;
@@ -714,6 +715,7 @@ pub fn ensure_linked() {
     unicodeobject::ensure_linked();
     bytesobject::ensure_linked();
     tupleobject::ensure_linked();
+    typeobject::ensure_linked();
     listobject::ensure_linked();
     dictobject::ensure_linked();
 }

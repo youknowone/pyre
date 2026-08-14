@@ -211,17 +211,11 @@ pub unsafe extern "C" fn PyModuleDef_Init(def: *mut CPyModuleDef) -> *mut CPyObj
         if (*def).m_base.m_index == 0 {
             (*def).m_base.ob_base.ob_refcnt = REFCNT_IMMORTAL;
             (*def).m_base.ob_base.ob_pyre_link = PY_NULL;
-            (*def).m_base.ob_base.ob_type = &raw mut pyobject::CPY_MODULE_DEF_TYPE;
+            (*def).m_base.ob_base.ob_type = &raw mut super::typeobject::CPY_MODULE_DEF_TYPE;
             (*def).m_base.m_index = NEXT_MODULE_INDEX.fetch_add(1, Ordering::Relaxed);
         }
         &mut (*def).m_base.ob_base
     }
-}
-
-/// `true` when a mirror is a `PyModuleDef` rather than a linked object.
-pub(super) fn is_module_def(raw: *mut CPyObject) -> bool {
-    !raw.is_null()
-        && unsafe { std::ptr::eq((*raw).ob_type, &raw mut pyobject::CPY_MODULE_DEF_TYPE) }
 }
 
 /// # Safety

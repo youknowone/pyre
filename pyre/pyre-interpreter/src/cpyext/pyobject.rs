@@ -5,6 +5,12 @@
 //! interpreter object, which is the `rawrefcount` P-link
 //! (`rpython/rlib/rawrefcount.py`).
 //!
+//! A mirror's block is as large as its type asks for: `sizeof(PyObject)` for an
+//! ordinary object, `sizeof(PyTypeObject)` for a type, `tp_basicsize` for an
+//! instance of a C-defined type.  That is upstream's `make_typedescr(basestruct
+//! =...)`, and it is why the allocation is a byte block rather than a Rust
+//! struct.
+//!
 //! # Ownership, and where it differs from upstream
 //!
 //! `rawrefcount` lets a mirror outlive the interpreter object: a mirror whose
@@ -16,11 +22,13 @@
 //! upstream dead-queue is what the later slice has to add.
 
 use super::ForkMutex;
+use super::typeobject::CPyTypeObject;
 use pyre_object::{PY_NULL, PyObjectRef};
+use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The large ownership contribution held by the linked pyre object.
 ///
@@ -45,63 +53,26 @@ pub struct CPyObject {
     pub ob_type: *mut CPyTypeObject,
 }
 
-/// A type mirror.
+/// The alignment every mirror block is allocated at.
 ///
-/// Opaque in the public header, but its first field is an ordinary mirror
-/// header so `Py_TYPE(x)` is usable as a `PyObject *` — the same relationship
-/// `PyTypeObject`'s leading `PyObject_HEAD` gives upstream.  The named
-/// `PyXxx_Type` statics that let C compare against a specific builtin type
-/// arrive with C-defined types; until then a type mirror is reachable only
-/// through `Py_TYPE`, which is enough to compare two objects' types.
-#[repr(C)]
-pub struct CPyTypeObject {
-    pub ob_base: CPyObject,
-}
+/// A C-defined type's `tp_basicsize` covers fields the extension declared, so
+/// the block has to satisfy the strictest alignment a C compiler would give a
+/// `malloc` result — `max_align_t`, which is 16 on every target this feature
+/// builds for.
+const BLOCK_ALIGN: usize = 16;
 
-/// What a mirror actually is.
-///
-/// C only ever sees the leading [`CPyObject`], which is why the two are
-/// separate types: everything past it is pyre-side bookkeeping.  The byte cache
-/// is the counterpart of the `c_utf8` field PyPy keeps on its `PyUnicodeObject`
-/// mirror — `PyUnicode_AsUTF8` and `PyBytes_AsString` must hand out a stable,
-/// NUL-terminated address, and the interpreter's own storage is neither
-/// NUL-terminated nor at a fixed address.
-#[repr(C)]
-pub struct Mirror {
-    pub base: CPyObject,
-    cached_bytes: AtomicPtr<u8>,
-    cached_len: AtomicUsize,
+fn block_layout(size: usize) -> Layout {
+    Layout::from_size_align(size, BLOCK_ALIGN).expect("a mirror block size is a small constant")
 }
-
-impl Mirror {
-    const fn immortal() -> Self {
-        Self {
-            base: CPyObject {
-                ob_refcnt: REFCNT_IMMORTAL,
-                ob_pyre_link: PY_NULL,
-                ob_type: std::ptr::null_mut(),
-            },
-            cached_bytes: AtomicPtr::new(std::ptr::null_mut()),
-            cached_len: AtomicUsize::new(0),
-        }
-    }
-}
-
-/// Sentinel type for a `PyModuleDef`, which is C static storage rather than a
-/// mirror of an interpreter object: its `ob_pyre_link` stays null and it is
-/// never entered in the census below.
-pub static mut CPY_MODULE_DEF_TYPE: CPyTypeObject = CPyTypeObject {
-    ob_base: CPyObject {
-        ob_refcnt: REFCNT_IMMORTAL,
-        ob_pyre_link: PY_NULL,
-        ob_type: std::ptr::null_mut(),
-    },
-};
 
 /// PyPy/rawrefcount's P-list analogue.  The relationship itself lives on the
-/// raw object (`ob_pyre_link`); this Vec is only the collector's census of
-/// mirrors whose inline link must be visited.
-static RAW_OBJECTS: ForkMutex<Vec<usize>> = ForkMutex::new(Vec::new());
+/// raw object (`ob_pyre_link`); this table is only the collector's census of
+/// mirrors whose inline link must be visited, and it records how each block was
+/// allocated: the byte size for one this layer owns, and 0 for a block it does
+/// not own — a `static` in this crate or in the loaded extension.
+type Census = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+static RAW_OBJECTS: ForkMutex<Census> =
+    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 static CPYEXT_GC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Interpreter object address -> mirror address, `rawrefcount`'s `w2r`
@@ -124,7 +95,7 @@ fn linked() -> parking_lot::MutexGuard<'static, LinkMap> {
     let mut map = LINKED.lock();
     if LINKED_STALE.swap(false, Ordering::Acquire) {
         map.clear();
-        for &address in RAW_OBJECTS.lock().iter() {
+        for &address in RAW_OBJECTS.lock().keys() {
             let raw = address as *mut CPyObject;
             let link = unsafe { (*raw).ob_pyre_link };
             if !link.is_null() {
@@ -140,11 +111,16 @@ pub(super) unsafe fn after_fork_child() {
         RAW_OBJECTS.reinit_after_fork();
         LINKED.reinit_after_fork();
         BORROWED.reinit_after_fork();
+        BYTE_CACHE.reinit_after_fork();
     }
 }
 
-/// The mirror of an interpreter object's type, allocated once and immortal.
-fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
+/// The mirror of an interpreter object's type.
+///
+/// A type a C extension defined already has one — its own `PyTypeObject`
+/// static, entered by `PyType_Ready` — and every other type gets an immortal
+/// block of the same shape so that `Py_TYPE(x)->tp_name` reads something.
+pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
     let Some(w_type) = crate::typedef::r#type(w_obj) else {
         return std::ptr::null_mut();
     };
@@ -155,28 +131,68 @@ fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
     // A type is an instance of its own metatype, so resolving `ob_type` before
     // the mirror exists would recurse forever on `type`; the second call finds
     // this mirror in the table and terminates.
-    let mirror = attach(w_type, REFCNT_IMMORTAL, std::ptr::null_mut());
+    let mirror = attach(
+        w_type,
+        REFCNT_IMMORTAL,
+        std::ptr::null_mut(),
+        size_of::<CPyTypeObject>(),
+    ) as *mut CPyTypeObject;
+    super::typeobject::describe_interpreter_type(mirror, w_type);
     let of_type = type_mirror(w_type);
-    unsafe { (*mirror).ob_type = of_type };
-    mirror as *mut CPyTypeObject
+    unsafe { (*mirror).ob_base.ob_base.ob_type = of_type };
+    mirror
 }
 
-/// Enter a fresh mirror for `w_obj` into the census and the identity table.
-fn attach(w_obj: PyObjectRef, refcnt: isize, ob_type: *mut CPyTypeObject) -> *mut CPyObject {
-    let raw = Box::into_raw(Box::new(Mirror {
-        base: CPyObject {
-            ob_refcnt: refcnt,
-            ob_pyre_link: w_obj,
-            ob_type,
-        },
-        cached_bytes: AtomicPtr::new(std::ptr::null_mut()),
-        cached_len: AtomicUsize::new(0),
-    })) as *mut CPyObject;
+/// Allocate a zero-filled mirror block of `size` bytes and enter it into the
+/// census and the identity table.
+pub(super) fn attach(
+    w_obj: PyObjectRef,
+    refcnt: isize,
+    ob_type: *mut CPyTypeObject,
+    size: usize,
+) -> *mut CPyObject {
+    let size = size.max(size_of::<CPyObject>());
+    let raw = unsafe { std::alloc::alloc_zeroed(block_layout(size)) } as *mut CPyObject;
+    if raw.is_null() {
+        std::alloc::handle_alloc_error(block_layout(size));
+    }
+    unsafe {
+        (*raw).ob_refcnt = refcnt;
+        (*raw).ob_pyre_link = w_obj;
+        (*raw).ob_type = ob_type;
+    }
+    enter(w_obj, raw, size);
+    raw
+}
+
+/// Enter a block this layer did not allocate — a `static` here or in the loaded
+/// extension — as `w_obj`'s mirror.  Its header must already be filled.
+pub(super) fn attach_foreign(w_obj: PyObjectRef, raw: *mut CPyObject) {
+    unsafe { (*raw).ob_pyre_link = w_obj };
+    enter(w_obj, raw, 0);
+}
+
+fn enter(w_obj: PyObjectRef, raw: *mut CPyObject, size: usize) {
     let mut map = linked();
-    RAW_OBJECTS.lock().push(raw as usize);
+    RAW_OBJECTS.lock().insert(raw as usize, size);
     map.insert(w_obj as usize, raw as usize);
     CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
-    raw
+}
+
+/// How large a mirror of `ob_type` has to be.
+///
+/// Everything pyre itself defines is exactly a `PyObject`, which is what
+/// [`super::typeobject::describe_interpreter_type`] leaves `tp_basicsize` as;
+/// an instance of a C-defined type carries that type's declared fields.
+fn mirror_size(ob_type: *mut CPyTypeObject) -> usize {
+    if ob_type.is_null() {
+        return size_of::<CPyObject>();
+    }
+    let declared = unsafe { (*ob_type).tp_basicsize };
+    if declared <= 0 {
+        return size_of::<CPyObject>();
+    }
+    (declared as usize).max(size_of::<CPyObject>())
 }
 
 /// `pyobject.py:make_ref` — a new reference to `w_obj`'s mirror.
@@ -192,7 +208,7 @@ pub fn make_ref(w_obj: PyObjectRef) -> *mut CPyObject {
     // The type mirror is resolved before the object's own mirror is entered so
     // the two `linked()` acquisitions never nest.
     let ob_type = type_mirror(w_obj);
-    attach(w_obj, REFCNT_FROM_PYRE + 1, ob_type)
+    attach(w_obj, REFCNT_FROM_PYRE + 1, ob_type, mirror_size(ob_type))
 }
 
 /// `pyobject.py:as_pyobj` — the mirror without taking a reference.
@@ -259,22 +275,19 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     release_borrowed(raw);
     let link = unsafe { (*raw).ob_pyre_link };
     let mut map = linked();
-    RAW_OBJECTS.lock().retain(|&candidate| candidate != address);
+    let size = RAW_OBJECTS.lock().remove(&address).unwrap_or(0);
     if map.get(&(link as usize)) == Some(&address) {
         map.remove(&(link as usize));
     }
     drop(map);
+    BYTE_CACHE.lock().remove(&address);
     unsafe {
         (*raw).ob_pyre_link = PY_NULL;
         (*raw).ob_refcnt = 0;
-        let mirror = Box::from_raw(raw as *mut Mirror);
-        let cached = mirror.cached_bytes.load(Ordering::Acquire);
-        if !cached.is_null() {
-            let len = mirror.cached_len.load(Ordering::Acquire);
-            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                cached, len,
-            )));
-        }
+    }
+    // A block this layer did not allocate is a `static` that outlives it.
+    if size != 0 {
+        unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(size)) };
     }
 }
 
@@ -322,7 +335,18 @@ fn release_borrowed(container: *mut CPyObject) {
     }
 }
 
-/// The mirror's NUL-terminated byte view, filled on first use.
+/// The NUL-terminated byte view of a mirror, filled on first use.
+///
+/// This is the counterpart of the `c_utf8` field PyPy fills on its
+/// `PyUnicodeObject` mirror: `PyUnicode_AsUTF8` and `PyBytes_AsString` must
+/// hand out a stable, NUL-terminated address, and the interpreter's own storage
+/// is neither NUL-terminated nor at a fixed address.  It is a side table rather
+/// than a field so that a mirror block is exactly what its type declares.
+type ByteCache = HashMap<usize, Box<[u8]>, BuildHasherDefault<std::hash::DefaultHasher>>;
+static BYTE_CACHE: ForkMutex<ByteCache> =
+    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+
+/// The mirror's cached bytes and their length, without the terminator.
 ///
 /// The `bytes` the producer returns is the payload; the terminator is appended
 /// here, so the address is usable as a C string whenever the payload has no
@@ -335,40 +359,14 @@ pub(super) unsafe fn cached_bytes(
     raw: *mut CPyObject,
     produce: impl FnOnce() -> Vec<u8>,
 ) -> (*const c_char, usize) {
-    let mirror = unsafe { &*(raw as *mut Mirror) };
-    let existing = mirror.cached_bytes.load(Ordering::Acquire);
-    if !existing.is_null() {
-        return (
-            existing as *const c_char,
-            mirror.cached_len.load(Ordering::Acquire) - 1,
-        );
-    }
-    let mut bytes = produce();
-    let payload = bytes.len();
-    bytes.push(0);
-    let buffer = bytes.into_boxed_slice();
-    let len = buffer.len();
-    let pointer = Box::into_raw(buffer) as *mut u8;
-    // The length is published before the pointer, so a reader that observes a
-    // non-null pointer observes the matching length.
-    mirror.cached_len.store(len, Ordering::Release);
-    match mirror.cached_bytes.compare_exchange(
-        std::ptr::null_mut(),
-        pointer,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => (pointer as *const c_char, payload),
-        Err(winner) => {
-            // Another thread filled the cache first; its buffer is the one
-            // every caller must share, so this one is dropped again.
-            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(pointer, len)) });
-            (
-                winner as *const c_char,
-                mirror.cached_len.load(Ordering::Acquire) - 1,
-            )
-        }
-    }
+    let mut cache = BYTE_CACHE.lock();
+    let entry = cache.entry(raw as usize).or_insert_with(|| {
+        let mut bytes = produce();
+        bytes.push(0);
+        bytes.into_boxed_slice()
+    });
+    // The box owns its bytes, so the address stays put as the map rehashes.
+    (entry.as_ptr() as *const c_char, entry.len() - 1)
 }
 
 /// Forward every mirror link.
@@ -381,7 +379,7 @@ pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     if !CPYEXT_GC_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    for &address in RAW_OBJECTS.lock().iter() {
+    for &address in RAW_OBJECTS.lock().keys() {
         let raw = address as *mut CPyObject;
         unsafe {
             if !(*raw).ob_pyre_link.is_null() {
@@ -397,26 +395,34 @@ pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 
 // ── the immortal singletons ─────────────────────────────────────────────
 
+const fn immortal() -> CPyObject {
+    CPyObject {
+        ob_refcnt: REFCNT_IMMORTAL,
+        ob_pyre_link: PY_NULL,
+        ob_type: std::ptr::null_mut(),
+    }
+}
+
 /// `Py_None`. C compares against this pointer, so the mirror has to be the one
 /// `make_ref(w_none())` returns; [`init_singletons`] enters it in the table.
 #[unsafe(no_mangle)]
-pub static mut _Py_NoneStruct: Mirror = Mirror::immortal();
+pub static mut _Py_NoneStruct: CPyObject = immortal();
 
 /// `Py_True`.
 #[unsafe(no_mangle)]
-pub static mut _Py_TrueStruct: Mirror = Mirror::immortal();
+pub static mut _Py_TrueStruct: CPyObject = immortal();
 
 /// `Py_False`.
 #[unsafe(no_mangle)]
-pub static mut _Py_FalseStruct: Mirror = Mirror::immortal();
+pub static mut _Py_FalseStruct: CPyObject = immortal();
 
 /// `Py_NotImplemented`.
 #[unsafe(no_mangle)]
-pub static mut _Py_NotImplementedStruct: Mirror = Mirror::immortal();
+pub static mut _Py_NotImplementedStruct: CPyObject = immortal();
 
 /// `Py_Ellipsis`.
 #[unsafe(no_mangle)]
-pub static mut _Py_EllipsisObject: Mirror = Mirror::immortal();
+pub static mut _Py_EllipsisObject: CPyObject = immortal();
 
 /// Bind each preallocated singleton mirror to its interpreter object.
 ///
@@ -424,38 +430,27 @@ pub static mut _Py_EllipsisObject: Mirror = Mirror::immortal();
 /// result against `Py_None` sees the same pointer `make_ref` hands out.
 pub fn init_singletons() {
     let bound: [(*mut CPyObject, PyObjectRef); 5] = [
+        (&raw mut _Py_NoneStruct, pyre_object::w_none()),
         (
-            &raw mut _Py_NoneStruct as *mut CPyObject,
-            pyre_object::w_none(),
-        ),
-        (
-            &raw mut _Py_TrueStruct as *mut CPyObject,
+            &raw mut _Py_TrueStruct,
             pyre_object::boolobject::w_bool_from(true),
         ),
         (
-            &raw mut _Py_FalseStruct as *mut CPyObject,
+            &raw mut _Py_FalseStruct,
             pyre_object::boolobject::w_bool_from(false),
         ),
         (
-            &raw mut _Py_NotImplementedStruct as *mut CPyObject,
+            &raw mut _Py_NotImplementedStruct,
             pyre_object::w_not_implemented(),
         ),
-        (
-            &raw mut _Py_EllipsisObject as *mut CPyObject,
-            pyre_object::w_ellipsis(),
-        ),
+        (&raw mut _Py_EllipsisObject, pyre_object::w_ellipsis()),
     ];
-    let mut map = linked();
     for (raw, w_obj) in bound {
         if unsafe { !(*raw).ob_pyre_link.is_null() } {
             continue;
         }
-        unsafe { (*raw).ob_pyre_link = w_obj };
-        RAW_OBJECTS.lock().push(raw as usize);
-        map.insert(w_obj as usize, raw as usize);
+        attach_foreign(w_obj, raw);
     }
-    CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
-    drop(map);
     // Deferred until the links are in the table: `type_mirror` takes the same
     // lock, and a singleton's type mirror is an ordinary immortal mirror.
     for (raw, _) in bound {
