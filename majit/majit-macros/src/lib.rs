@@ -263,11 +263,15 @@ fn rewrite_jit_inline_ref_param_fields(
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut idx);
                 self.visit_expr_mut(&mut rhs);
+                // The assigned value is evaluated before the assignee place,
+                // so an index or RHS with side effects must not be reordered:
+                // `base.data[next_index()] = compute_value()` runs
+                // `compute_value()` first.
                 *expr = syn::parse_quote! {
                     {
+                        let __majit_arr_val = #rhs;
                         let __majit_arr_obj = #base;
                         let __majit_arr_idx = #idx;
-                        let __majit_arr_val = #rhs;
                         unsafe {
                             *((*(__majit_arr_obj as *mut #struct_path))
                                 .#member

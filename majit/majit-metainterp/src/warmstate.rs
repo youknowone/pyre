@@ -1915,7 +1915,12 @@ impl WarmEnterState {
     /// Value is a colon-separated string like "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll".
     /// "all" enables all passes.
     pub fn set_param_enable_opts(&mut self, value: &str) {
-        self.enable_opts = if value == "all" || value.is_empty() {
+        // warmstate.py:284 substitutes the full list for `'all'` (and for
+        // `None`, which this `&str` surface cannot express) and for nothing
+        // else.  `''` therefore splits into no names and disables every pass;
+        // treating it as `'all'` would silently keep unrolling on for a caller
+        // that asked for the empty set.
+        self.enable_opts = if value == "all" {
             default_enable_opts()
         } else {
             value
@@ -2307,6 +2312,31 @@ impl WarmEnterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `warmstate.py:284` substitutes the full pass list for `'all'` alone.
+    /// The empty string splits into no names, so it selects nothing — the one
+    /// spelling a caller uses to turn every optimization off. Reading it as
+    /// `'all'` inverts that request completely and silently, since the driver
+    /// then keeps unrolling and every other pass.
+    #[test]
+    fn an_empty_enable_opts_selects_no_passes() {
+        let mut ws = WarmEnterState::new(1);
+        let all = default_enable_opts();
+        assert_eq!(ws.get_enable_opts(), all.as_slice(), "default is the full set");
+
+        ws.set_param_enable_opts("");
+        assert!(
+            ws.get_enable_opts().is_empty(),
+            "`\"\"` names no pass, so no pass is enabled; got {:?}",
+            ws.get_enable_opts()
+        );
+
+        ws.set_param_enable_opts("all");
+        assert_eq!(ws.get_enable_opts(), all.as_slice(), "`all` restores them");
+
+        ws.set_param_enable_opts("intbounds:heap");
+        assert_eq!(ws.get_enable_opts(), ["intbounds", "heap"]);
+    }
 
     #[test]
     fn test_not_hot_initially() {

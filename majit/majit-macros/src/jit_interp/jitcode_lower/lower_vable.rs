@@ -34,6 +34,15 @@ pub(super) fn field_scalar_tokens(
     }
 }
 
+/// A `<local ref binding>.<field>` access that `array_fields` declares, resolved
+/// but not yet emitted.  See [`JitCodeLowerer::match_array_field_base`].
+struct ArrayFieldBase {
+    base_reg: u16,
+    struct_path: syn::Path,
+    member: syn::Member,
+    element_type: syn::Path,
+}
+
 impl<'c> Lowerer<'c> {
     /// Read an immediate operand byte from the green bytecode array:
     /// `program[<index>]`.  Mirrors the dispatch-top opcode fetch
@@ -1126,15 +1135,16 @@ impl<'c> Lowerer<'c> {
         }
     }
 
-    /// Resolve `<local ref binding>.<field>` where `<field>` is declared in
-    /// `array_fields`, emitting the `getfield_gc_r` that loads the array's
-    /// base pointer and returning `(base_reg, element_type)`.
+    /// Match `<local ref binding>.<field>` against `array_fields` WITHOUT
+    /// emitting anything, so a caller can finish rejecting before it commits
+    /// any op to the trace.
     ///
-    /// Shared by the element read and the element write so both take the
-    /// buffer pointer through the SAME interned field descr — a store to the
-    /// base (a realloc on growth) then invalidates the load the heapcache
-    /// served, instead of leaving a stale buffer pointer live in the trace.
-    fn lower_array_field_base(&mut self, field: &syn::ExprField) -> Option<(u16, syn::Path)> {
+    /// Split from [`Self::emit_array_field_base`] because the element write
+    /// has to emit its right-hand side first: Rust evaluates the assigned
+    /// value before the assignee place, and a lowering that emitted the base
+    /// load first would run the two in the opposite order from the
+    /// interpreter.
+    fn match_array_field_base(&self, field: &syn::ExprField) -> Option<ArrayFieldBase> {
         let config = self.config?;
         let Expr::Path(path) = &*field.base else {
             return None;
@@ -1154,8 +1164,30 @@ impl<'c> Lowerer<'c> {
             .unwrap_or_default();
         let key = format!("{}::{}", struct_last, member_name);
         let element_type = config.array_fields.get(&key)?.2.clone();
+        Some(ArrayFieldBase {
+            base_reg: binding.reg,
+            struct_path,
+            member,
+            element_type,
+        })
+    }
+
+    /// Emit the `getfield_gc_r` that loads the array's base pointer for a
+    /// shape [`Self::match_array_field_base`] already accepted.
+    ///
+    /// Shared by the element read and the element write so both take the
+    /// buffer pointer through the SAME interned field descr — a store to the
+    /// base (a realloc on growth) then invalidates the load the heapcache
+    /// served, instead of leaving a stale buffer pointer live in the trace.
+    fn emit_array_field_base(&mut self, shape: &ArrayFieldBase) -> u16 {
+        let ArrayFieldBase {
+            base_reg,
+            struct_path,
+            member,
+            ..
+        } = shape;
+        let (base_reg, struct_path, member) = (*base_reg, struct_path.clone(), member.clone());
         let tid = struct_type_id_tokens(&struct_path, false);
-        let base_reg = binding.reg;
         let buffer_reg = self.alloc_reg();
         self.emit_op(
             OpMeta::linear(
@@ -1186,7 +1218,7 @@ impl<'c> Lowerer<'c> {
                 );
             },
         );
-        Some((buffer_reg, element_type))
+        buffer_reg
     }
 
     /// Recognizes an array element READ on a local ref binding:
@@ -1208,10 +1240,12 @@ impl<'c> Lowerer<'c> {
         let Expr::Field(field) = &*index_expr.expr else {
             return None;
         };
-        // Lower the index BEFORE the base load would be wasted work only if
-        // the shape does not match; `lower_array_field_base` is the last
-        // rejecting step, so run it first and emit nothing until it accepts.
-        let (buffer_reg, element_type) = self.lower_array_field_base(field)?;
+        // Match before emitting anything, so a shape this does not handle
+        // leaves the trace untouched.  A place expression evaluates its base
+        // before its index, which is the order emitted here.
+        let shape = self.match_array_field_base(field)?;
+        let element_type = shape.element_type.clone();
+        let buffer_reg = self.emit_array_field_base(&shape);
         let index = self.lower_value_expr(&index_expr.index)?;
         if !matches!(index.kind, BindingKind::Int) {
             return None;
@@ -1227,7 +1261,13 @@ impl<'c> Lowerer<'c> {
             quote! {
                 let __descr_idx = __builder.add_gc_int_array_descr(
                     ::core::mem::size_of::<#element_type>(),
-                    true,
+                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // declared element type.  Hard-coding signed would
+                    // sign-extend a `u8` element of 0x80 to -128 where the
+                    // concrete Rust read yields 128.  `MIN` resolves through a
+                    // type alias, and a non-integer element type fails to
+                    // compile here rather than loading as a signed word.
+                    (<#element_type>::MIN as i128) < 0,
                 );
                 __builder.getarrayitem_gc_i(
                     #result_reg as u16,
@@ -1262,13 +1302,19 @@ impl<'c> Lowerer<'c> {
         let Expr::Field(field) = &*index_expr.expr else {
             return None;
         };
-        let (buffer_reg, element_type) = self.lower_array_field_base(field)?;
-        let index = self.lower_value_expr(&index_expr.index)?;
-        if !matches!(index.kind, BindingKind::Int) {
-            return None;
-        }
+        // Match before emitting, then emit in Rust's evaluation order for an
+        // assignment: the assigned value first, then the assignee place (base,
+        // then index).  Emitting the base load first would run the array's
+        // side effects ahead of the right-hand side's.
+        let shape = self.match_array_field_base(field)?;
+        let element_type = shape.element_type.clone();
         let value = self.lower_value_expr(&assign.right)?;
         if !matches!(value.kind, BindingKind::Int) {
+            return None;
+        }
+        let buffer_reg = self.emit_array_field_base(&shape);
+        let index = self.lower_value_expr(&index_expr.index)?;
+        if !matches!(index.kind, BindingKind::Int) {
             return None;
         }
         let index_reg = index.reg;
@@ -1286,7 +1332,13 @@ impl<'c> Lowerer<'c> {
             quote! {
                 let __descr_idx = __builder.add_gc_int_array_descr(
                     ::core::mem::size_of::<#element_type>(),
-                    true,
+                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // declared element type.  Hard-coding signed would
+                    // sign-extend a `u8` element of 0x80 to -128 where the
+                    // concrete Rust read yields 128.  `MIN` resolves through a
+                    // type alias, and a non-integer element type fails to
+                    // compile here rather than loading as a signed word.
+                    (<#element_type>::MIN as i128) < 0,
                 );
                 __builder.setarrayitem_gc_i(
                     #buffer_reg as u16,
