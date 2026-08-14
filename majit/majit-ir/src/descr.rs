@@ -4417,6 +4417,29 @@ pub trait SizeDescr: Descr {
     /// descr that populates the two lists with different objects, and for
     /// that case the GC list is the answer every byte-offset consumer here
     /// was already using.
+    /// The class word's slot position within `all_fielddescrs()`, or `None`
+    /// when this layout has no class word *in that list*.
+    ///
+    /// ⛔ Deliberately NOT answered from [`Self::class_word_field`].  That one
+    /// searches `gc_fielddescrs()` first, and `with_extra_gc_fielddescr`
+    /// appends header edges that are **absent from `all_fielddescrs()` on
+    /// purpose** — its doc says "kept out of `all_fielddescrs` so the
+    /// positional indexing above is unaffected".  `index_in_parent` is defined
+    /// against `all_fielddescrs()`, so reading it off a gc-only edge yields a
+    /// slot number that indexes an unrelated field: pyre seeds every object
+    /// group's `gc_edges` with the shared header descr at `index_in_parent
+    /// == 0`, which lands on the first value field and forwards `Ref <- Int`.
+    ///
+    /// Byte-offset consumers want `class_word_field()`; positional ones want
+    /// this.  The two lists genuinely differ, so one accessor cannot serve
+    /// both.
+    fn class_word_index_in_parent(&self) -> Option<usize> {
+        self.all_fielddescrs()
+            .iter()
+            .find(|fd| fd.is_w_class())
+            .map(|fd| fd.index_in_parent())
+    }
+
     fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
         self.gc_fielddescrs()
             .iter()
@@ -7586,6 +7609,64 @@ mod tests {
         assert!(typeptr.is_typeptr());
         assert!(!typeptr.is_w_class());
         assert!(typeptr.is_header_field());
+    }
+
+    /// A gc-only header edge must never answer a POSITIONAL question.
+    ///
+    /// pyre seeds every object group's `gc_edges` with the shared header
+    /// descr, which `with_extra_gc_fielddescr` keeps out of
+    /// `all_fielddescrs()` precisely so positional indexing is unaffected.
+    /// Reading `index_in_parent` off that edge yields 0, which indexes the
+    /// first *value* field — an `Int` where the caller expects a `Ref` — and
+    /// `OptVirtualize` then forwards `Ref <- Int`, tripping the `make_equal_to`
+    /// Box.type invariant across most of the synth suite.
+    #[test]
+    fn a_gc_only_header_edge_never_answers_the_positional_question() {
+        let spec = |name: &str, offset: usize, ty: Type, idx: usize| SimpleFieldDescrSpec {
+            index: 0,
+            field_key: name.to_string(),
+            name: name.to_string(),
+            offset,
+            field_size: 8,
+            field_type: ty,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::from_field_type(ty),
+            virtualizable: false,
+            index_in_parent: idx,
+        };
+        let header: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            8,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "w_class".to_string(),
+            "w_class".to_string(),
+        ));
+        assert!(header.is_w_class());
+
+        // A layout that declares no class word of its own, with the shared
+        // header pushed as a gc-only edge — the common pyre object group.
+        let group = make_simple_descr_group_keyed_with_headerless(
+            0,
+            32,
+            7,
+            0x0C1A_0001,
+            0,
+            true,
+            false,
+            &[spec("W_IntObject.intval", 16, Type::Int, 0)],
+            &[header],
+        );
+        let sd = group.size_descr.as_size_descr().expect("a SizeDescr");
+
+        // The byte-offset answer legitimately sees the gc-only edge...
+        assert_eq!(sd.class_word_field().map(|fd| fd.offset()), Some(8));
+        // ...but the positional answer must not, or it returns slot 0 and
+        // collides with `intval`.
+        assert_eq!(sd.class_word_index_in_parent(), None);
     }
 
     #[test]
