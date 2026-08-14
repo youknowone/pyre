@@ -5523,7 +5523,7 @@ fn emit_guard_spill(
 
 // ── Binary ops ──
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum BinOp {
     I64Add,
     I64Sub,
@@ -5692,6 +5692,53 @@ fn emit_umulhi_to_local(
 
 /// Overflow binary op: stores the wrapping result in pos and the signed
 /// overflow flag in the dedicated scratch local.
+/// The overflow condition for `a + c` / `a - c` against a constant `c`, as
+/// `(limit, greater_than)`: the operation overflows exactly when `a > limit`
+/// (`greater_than`) or when `a < limit`. `None` means it cannot overflow.
+///
+/// The general form needs both operands and the result to compare sign bits.
+/// Against a constant the same predicate is one comparison against a bound
+/// folded here, which also drops the dependency on the result. Each bound is
+/// taken from the opposite extreme, so none of them can itself overflow:
+/// `MAX - c` only for `c > 0`, `MIN - c` only for `c < 0`, and so on.
+fn ovf_const_bound(binop: BinOp, c: i64) -> Option<(i64, bool)> {
+    use std::cmp::Ordering;
+    match binop {
+        BinOp::I64Add => match c.cmp(&0) {
+            Ordering::Greater => Some((i64::MAX - c, true)),
+            Ordering::Less => Some((i64::MIN - c, false)),
+            Ordering::Equal => None,
+        },
+        BinOp::I64Sub => match c.cmp(&0) {
+            Ordering::Greater => Some((i64::MIN + c, false)),
+            Ordering::Less => Some((i64::MAX + c, true)),
+            Ordering::Equal => None,
+        },
+        _ => None,
+    }
+}
+
+/// The variable operand and constant operand of an add/sub whose overflow can
+/// take the [`ovf_const_bound`] test. Addition is commutative, so either side
+/// may supply the constant; for subtraction only the subtrahend does, since
+/// `c - a` has a different bound shape and keeps the general form.
+fn ovf_const_operand(
+    constants: &indexmap::IndexMap<u32, i64>,
+    op: &Op,
+    binop: BinOp,
+) -> Option<(OpRef, i64)> {
+    let (a, b) = (op.arg(0).to_opref(), op.arg(1).to_opref());
+    match binop {
+        BinOp::I64Add if a.is_constant() && !b.is_constant() => {
+            Some((b, resolve_const_bits(constants, a)))
+        }
+        BinOp::I64Add | BinOp::I64Sub if !a.is_constant() && b.is_constant() => {
+            Some((a, resolve_const_bits(constants, b)))
+        }
+        _ => None,
+    }
+}
+
 fn emit_ovf_binop(
     sink: &mut InstructionSink<'_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -5721,6 +5768,28 @@ fn emit_ovf_binop(
     }
     apply_binop(sink, binop);
     sink.local_set(result_local);
+
+    if let Some((var, c)) = ovf_const_operand(constants, op, binop) {
+        match ovf_const_bound(binop, c) {
+            Some((limit, greater_than)) => {
+                emit_resolve(sink, constants, value_types, var);
+                sink.i64_const(limit);
+                if greater_than {
+                    sink.i64_gt_s();
+                } else {
+                    sink.i64_lt_s();
+                }
+                sink.i64_extend_i32_u();
+            }
+            // Adding or subtracting zero: the flag stays live so the paired
+            // guard still finds it, and folds against a constant zero.
+            None => {
+                sink.i64_const(0);
+            }
+        }
+        sink.local_set(ovf_flag_local);
+        return true;
+    }
 
     match binop {
         BinOp::I64Add => {
@@ -6053,5 +6122,39 @@ mod tests {
         assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
         assert_eq!(frame.call_args_ofs, 416);
         assert_eq!(frame.frame_bytes, 544);
+    }
+
+    /// The constant-operand bound must answer exactly what the wrapping
+    /// arithmetic does, including at the extremes where the bound itself is
+    /// closest to overflowing (`c` = `MIN` makes `MAX + c` and `MIN - c` the
+    /// interesting cases).
+    #[test]
+    fn ovf_const_bound_agrees_with_checked_arithmetic() {
+        let edges = [
+            i64::MIN,
+            i64::MIN + 1,
+            -3,
+            -1,
+            0,
+            1,
+            3,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for &c in &edges {
+            for &a in &edges {
+                for (binop, expected) in [
+                    (BinOp::I64Add, a.checked_add(c).is_none()),
+                    (BinOp::I64Sub, a.checked_sub(c).is_none()),
+                ] {
+                    let got = match ovf_const_bound(binop, c) {
+                        None => false,
+                        Some((limit, true)) => a > limit,
+                        Some((limit, false)) => a < limit,
+                    };
+                    assert_eq!(got, expected, "{binop:?}: a={a} c={c}");
+                }
+            }
+        }
     }
 }

@@ -691,6 +691,109 @@ fn execute_ovf_trace(opcode: OpCode, a: i64, b: i64) -> (i64, i64) {
     execute_ovf_trace_with_guard(opcode, OpCode::GuardNoOverflow, a, b)
 }
 
+/// Same trace as [`execute_ovf_trace`], but the constant `c` is an operand
+/// rather than a second input argument, so the overflow check takes the
+/// folded-bound form instead of the sign-comparison one. `const_first` puts
+/// it on the left, which only addition accepts.
+fn execute_ovf_trace_const(opcode: OpCode, a: i64, c: i64, const_first: bool) -> (i64, i64) {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let guard = Op::new(OpCode::GuardNoOverflow, &[]);
+    guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::int_op(1))]);
+    let args = if const_first {
+        [OpRef::const_int(c), OpRef::input_arg_int(0)]
+    } else {
+        [OpRef::input_arg_int(0), OpRef::const_int(c)]
+    };
+    let ops = vec![make_op(opcode, &args, OpRef::int_op(1)), guard, finish];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(1, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &a.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let mut fail_index = [0; 8];
+    let mut result = [0; 8];
+    memory.read(&store, 0, &mut fail_index).unwrap();
+    memory
+        .read(&store, codegen::FRAME_SLOT_BASE as usize, &mut result)
+        .unwrap();
+    (i64::from_le_bytes(fail_index), i64::from_le_bytes(result))
+}
+
+/// A constant operand takes the folded-bound overflow check, so it needs the
+/// same verdicts as the general form at the extremes — including the two
+/// bounds that sit closest to overflowing themselves, `a - i64::MIN` and
+/// `a + i64::MIN`.
+#[test]
+fn test_ovf_against_a_constant_matches_the_general_form() {
+    // (opcode, a, c, overflows)
+    let cases = [
+        (OpCode::IntAddOvf, 10, 20, false),
+        (OpCode::IntAddOvf, 5, 0, false),
+        (OpCode::IntAddOvf, i64::MAX, 1, true),
+        (OpCode::IntAddOvf, i64::MAX - 1, 1, false),
+        (OpCode::IntAddOvf, 10, -20, false),
+        (OpCode::IntAddOvf, i64::MIN, -1, true),
+        (OpCode::IntAddOvf, -1, i64::MIN, true),
+        (OpCode::IntAddOvf, 0, i64::MIN, false),
+        (OpCode::IntSubOvf, 100, 58, false),
+        (OpCode::IntSubOvf, 5, 0, false),
+        (OpCode::IntSubOvf, i64::MIN, 1, true),
+        (OpCode::IntSubOvf, i64::MIN + 1, 1, false),
+        (OpCode::IntSubOvf, 10, -5, false),
+        (OpCode::IntSubOvf, i64::MAX, -1, true),
+        (OpCode::IntSubOvf, 0, i64::MIN, true),
+        (OpCode::IntSubOvf, -1, i64::MIN, false),
+    ];
+    for (opcode, a, c, overflows) in cases {
+        let (fail_index, result) = execute_ovf_trace_const(opcode, a, c, false);
+        if overflows {
+            assert_eq!(fail_index, 0, "{opcode:?}: {a} op {c} should guard-exit");
+        } else {
+            let expected = match opcode {
+                OpCode::IntAddOvf => a.wrapping_add(c),
+                _ => a.wrapping_sub(c),
+            };
+            assert_eq!(
+                (fail_index, result),
+                (1, expected),
+                "{opcode:?}: {a} op {c}"
+            );
+        }
+    }
+
+    // Addition is commutative, so the constant is also accepted on the left.
+    assert_eq!(
+        execute_ovf_trace_const(OpCode::IntAddOvf, 10, 20, true),
+        (1, 30)
+    );
+    assert_eq!(
+        execute_ovf_trace_const(OpCode::IntAddOvf, i64::MAX, 1, true).0,
+        0
+    );
+}
+
 #[test]
 fn test_int_add_ovf_guards_overflow() {
     for (a, b, expected) in [(10, 20, 30), (i64::MIN, 1, i64::MIN + 1)] {
