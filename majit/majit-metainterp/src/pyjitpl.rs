@@ -9200,6 +9200,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&inputargs);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
@@ -12111,6 +12113,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&entry_inputargs);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
