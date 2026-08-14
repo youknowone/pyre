@@ -1897,7 +1897,7 @@ pub(super) fn env_array_descr_expr(config: Option<&LowererConfig>) -> proc_macro
             let __env_item = ::core::mem::size_of::<
                 <#env_ty as ::core::ops::Index<usize>>::Output,
             >();
-            __builder.add_gc_int_array_descr(__env_item, __env_item != 1)
+            __builder.add_env_int_array_descr(__env_item, __env_item != 1)
         }},
         None => quote::quote! { __builder.add_gc_byte_array_descr() },
     }

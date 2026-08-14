@@ -1192,7 +1192,7 @@ impl EffectInfo {
     /// minted per-`MetaInterpStaticData` in `dispatch_array_descr_cache` at
     /// trace time, while the write-EI is built during jitcode assembly, so the
     /// two are never the same `Arc`.  Structure is the right key regardless:
-    /// `Assembler::add_gc_int_array_descr` already dedups on exactly this
+    /// `Assembler::add_raw_int_array_descr_signed` already dedups on exactly this
     /// tuple, so for these arrays the shape IS the identity.
     ///
     /// Conflating two arrays that share a shape can only over-invalidate,

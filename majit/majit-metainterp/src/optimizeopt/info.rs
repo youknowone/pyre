@@ -673,11 +673,26 @@ impl PtrInfoExt for PtrInfo {
                         &[op_b.clone(), type_id_const.clone()],
                     ));
                 }
-                // Always emit ARRAYLEN_GC + bound guards: pyre's
-                // ArrayPtrInfo.lenbound is a plain `IntBound`, not an
-                // `Option`, so the parity check is on `is_unbounded()`
-                // rather than `is None`.
-                if !info.lenbound.is_unbounded() {
+                // Emit ARRAYLEN_GC + bound guards: pyre's ArrayPtrInfo.lenbound
+                // is a plain `IntBound`, not an `Option`, so the parity check
+                // is on `is_unbounded()` rather than `is None`.
+                //
+                // A length-less array descr (`len_offset = None`, the shape a
+                // header-less buffer takes) has no length word to read, and
+                // the mandatory GC rewrite unwraps the lendescr unconditionally
+                // (`majit-gc/src/rewrite.rs:2477`) — emitting the op there
+                // panics.  The bound itself is reachable on such an array: a
+                // constant-index element read narrows it through
+                // `getlenbound().make_gt_const(index)` (`heap.py:676-681`,
+                // ported at `optimizeopt/heap.rs:2873`) without ever consulting
+                // the descr.  Upstream cannot reach this because a raw array
+                // gets `getarrayitem_raw_*` and an `AbstractRawPtrInfo`, never
+                // `ArrayPtrInfo`; pyre routes both families through one info
+                // type, so the gate belongs here, alongside the `is_gc_managed`
+                // gate above.  Nothing is lost by skipping it — with no length
+                // in memory there is no length any guard could establish.
+                let has_length = ad.len_descr().is_some();
+                if has_length && !info.lenbound.is_unbounded() {
                     let mut lenop = Op::with_descr(
                         OpCode::ArraylenGc,
                         std::slice::from_ref(&op_b),
@@ -1803,6 +1818,83 @@ mod tests {
     /// the field-value analog of the old `from_opref` test stand-ins.
     fn field_op(tp: Type, pos: u32) -> Operand {
         crate::history::test_support::rooted_resop_operand(tp, pos)
+    }
+
+    /// A one-byte integer array descr, with or without a length word.
+    /// `lendescr: None` is the shape a header-less buffer takes — the `&[u8]`
+    /// `env` slice and every `array_fields` element array.
+    fn byte_array_descr(with_length: bool) -> DescrRef {
+        let lendescr = with_length.then(|| {
+            majit_ir::descr::make_field_descr(
+                /* offset */ 0,
+                /* field_size */ std::mem::size_of::<usize>(),
+                Type::Int,
+                majit_ir::descr::ArrayFlag::Unsigned,
+            )
+        });
+        majit_ir::descr::make_array_descr_from_lltype_shape(
+            /* type_id */ 0,
+            /* base_size */ if with_length { 8 } else { 0 },
+            /* item_size */ 1,
+            /* len_offset */ if with_length { Some(0) } else { None },
+            Type::Int,
+            /* is_array_of_pointers */ false,
+            /* is_array_of_structs */ false,
+            /* is_item_signed */ false,
+            /* is_gc_managed */ false,
+            lendescr,
+            /* is_pure */ false,
+            /* ei_index */ u32::MAX,
+            /* interior_field_descrs */ Vec::new(),
+        )
+    }
+
+    /// The short-preamble guards `ArrayPtrInfo::make_guards` emits for an array
+    /// whose length bound was narrowed.
+    fn array_short_preamble_opcodes(with_length: bool) -> Vec<OpCode> {
+        let info = PtrInfo::Array(majit_ir::ptr_info::ArrayPtrInfo {
+            descr: byte_array_descr(with_length),
+            // What a constant-index element read leaves behind:
+            // `getlenbound().make_gt_const(index)` (`heap.py:676-681`).
+            lenbound: IntBound::from_constant(8),
+            items: Vec::new(),
+            last_guard_pos: -1,
+        });
+        let mut ctx = OptContext::new(8);
+        let array_box = field_op(Type::Ref, 3);
+        let mut short = Vec::new();
+        info.make_guards(array_box.to_opref(), &mut short, &mut ctx);
+        short.iter().map(|op| op.opcode).collect()
+    }
+
+    /// A length-less array descr has no length word to read, and the mandatory
+    /// GC rewrite unwraps the lendescr unconditionally
+    /// (`majit-gc/src/rewrite.rs:2477`), so emitting `ARRAYLEN_GC` for one
+    /// panics the compile. The bound that triggers the emission is reachable —
+    /// a constant-index element read narrows it without ever consulting the
+    /// descr — which is why the gate has to be here rather than at the
+    /// narrowing site.
+    #[test]
+    fn a_lengthless_array_emits_no_arraylen_guard() {
+        let opcodes = array_short_preamble_opcodes(/* with_length */ false);
+        assert!(
+            !opcodes.contains(&OpCode::ArraylenGc),
+            "a length-less array descr must not get an ARRAYLEN_GC guard; \
+             emitted {opcodes:?}"
+        );
+    }
+
+    /// The control: with a length word the guard must still be emitted, or the
+    /// test above passes because `make_guards` stopped emitting it for
+    /// everything.
+    #[test]
+    fn an_array_with_a_length_word_still_gets_its_arraylen_guard() {
+        let opcodes = array_short_preamble_opcodes(/* with_length */ true);
+        assert!(
+            opcodes.contains(&OpCode::ArraylenGc),
+            "a length-carrying array must keep its ARRAYLEN_GC guard; \
+             emitted {opcodes:?}"
+        );
     }
 
     #[test]

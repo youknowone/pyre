@@ -22,7 +22,7 @@ use majit_ir::Type;
 use majit_ir::descr::make_array_descr_from_lltype_shape;
 use majit_ir::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 
-/// The shape `Assembler::add_raw_int_array_descr(item_size, is_item_signed)`
+/// The shape `Assembler::add_raw_int_array_descr_signed(item_size, signed)`
 /// interns for an `array_fields` element access: a header-less buffer pointer
 /// (`base_size = 0`, no length word, not GC-managed) over `item_size` items.
 fn mint_element_array_descr_of(item_size: usize, is_item_signed: bool) -> DescrRef {
@@ -118,24 +118,11 @@ fn array_write_set_is_visible_to_force_from_effectinfo() {
 }
 
 /// The shape the opcode-fetch path interns: `program: &[u8]`, one-byte
-/// unsigned items. Signedness matters — a signed byte descr makes the backend
-/// emit `movsx` and corrupt dispatch — so this is a genuinely distinct array.
+/// unsigned items.  A Rust slice data pointer is header-less too, so this is
+/// the same raw shape a one-byte `array_fields` element would take — the
+/// element-size difference below is what makes it a different array here.
 fn mint_program_byte_array_descr() -> DescrRef {
-    make_array_descr_from_lltype_shape(
-        0,
-        0,
-        1,
-        None,
-        Type::Int,
-        false,
-        false,
-        /* is_item_signed */ false,
-        true,
-        None,
-        false,
-        u32::MAX,
-        Vec::new(),
-    )
+    mint_element_array_descr_of(1, false)
 }
 
 /// The write set is built during jitcode assembly and the cached read descr is
@@ -190,7 +177,7 @@ fn the_emitted_array_spec_mints_the_shape_the_reads_intern() {
     assert!(
         ei.writes_array_descr_by_shape(&mint_element_array_descr()),
         "the descr minted from the emitted spec must match the one \
-         `add_gc_int_array_descr(8, true)` interns for the read"
+         `add_raw_int_array_descr_signed(8, true)` interns for the read"
     );
     assert!(
         !ei.writes_array_descr_by_shape(&mint_program_byte_array_descr()),

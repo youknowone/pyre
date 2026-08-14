@@ -500,7 +500,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
 /// one is minted during jitcode assembly, so the two are never the same `Arc`.
 /// The array descrs built here therefore only have to carry the right SHAPE;
 /// `EffectInfo::writes_array_descr_by_shape` is what reads them back, and the
-/// remaining fields are pinned to the `Assembler::add_gc_int_array_descr` shape
+/// remaining fields are pinned to the `Assembler::add_raw_int_array_descr_signed` shape
 /// the reads intern (`base_size = 0`, no length header, `Type::Int`).
 ///
 /// An empty `arrays` leaves the affirmative "writes no arrays" that

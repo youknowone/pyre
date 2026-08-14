@@ -1617,11 +1617,11 @@ impl JitCodeBuilder {
         self.push_reg_u8(dst, "getarrayitem_gc_r dst");
     }
 
-    /// Add a GC-array descriptor for a byte-element array to the descrs pool.
+    /// Add the array descriptor for a byte-element array to the descrs pool.
     ///
     /// Returns the descr index to pass as `descr_idx` to `getarrayitem_gc_i`.
-    /// The descriptor models a `u8`-element GC array — the `program: &[u8]`
-    /// bytecode slice used by the dispatch JitCode body.
+    /// The descriptor models the `program: &[u8]` bytecode slice used by the
+    /// dispatch JitCode body.
     ///
     /// Deduped: multiple calls with the same shape return the same index.
     ///
@@ -1631,11 +1631,27 @@ impl JitCodeBuilder {
     /// to `i64`, never sign-extend); the `u8` SUB-INTERVAL property must
     /// not be widened to a signed `i64` at the descr boundary or the
     /// backend would emit `movsx` on byte loads ≥ `0x80` and corrupt
-    /// opcode dispatch.  `base_size=0` because Rust `&[u8]` data pointers
-    /// (codegen_trace.rs:193 `*const #env_type as *const ()`) point
-    /// directly at the first element without any GC header.
+    /// opcode dispatch.
     pub fn add_gc_byte_array_descr(&mut self) -> u16 {
-        self.add_gc_int_array_descr(1, false)
+        self.add_env_int_array_descr(1, false)
+    }
+
+    /// Add the array descriptor for an integer-element `env` array whose items
+    /// are `item_size` bytes wide (`is_item_signed` selects sign- vs
+    /// zero-extension on sub-word loads).  Generalizes
+    /// [`Self::add_gc_byte_array_descr`] so a wider env element type (`&[i64]`,
+    /// `item_size = 8`) reads the element at byte offset `item_size * index`
+    /// instead of the raw byte at `index`.
+    ///
+    /// The array is NOT GC-managed and carries no length word: a Rust slice
+    /// (`&[T]`) data pointer (`codegen_trace.rs:193 *const #env_type as
+    /// *const ()`) points directly at `items[0]`, and the length travels in the
+    /// fat pointer's other half, which never reaches the trace.  This is the
+    /// `arraydescrof(rffi.CArray(T))` shape, so it is
+    /// [`Self::add_raw_int_array_descr_signed`] — see the note there for what
+    /// the GC-managed flag would cost.
+    pub fn add_env_int_array_descr(&mut self, item_size: usize, is_item_signed: bool) -> u16 {
+        self.add_raw_int_array_descr_signed(item_size, is_item_signed)
     }
 
     /// Add a descriptor for a `raw_store_i` / `raw_load_i` against raw
@@ -1664,7 +1680,7 @@ impl JitCodeBuilder {
     /// `ptr - GcHeader::SIZE`; ahead of such a buffer that word belongs to
     /// whatever precedes the allocation, so once the base is red the guard
     /// fails or faults on short-preamble re-entry.  The `&[u8]` `env` array
-    /// keeps `add_gc_int_array_descr` because its base is a green constant and
+    /// is the same descr: a Rust slice data pointer has no header either, and
     /// the optimizer therefore gives it `PtrInfo::Constant`, never this arm.
     pub fn add_raw_int_array_descr_signed(
         &mut self,
@@ -1761,44 +1777,6 @@ impl JitCodeBuilder {
         self.push_reg_u8(ea_reg, "raw_store_i ea");
         self.push_reg_u8(value_reg, "raw_store_i value");
         self.push_u16(descr_idx);
-    }
-
-    /// Add a GC-array descriptor for an integer-element `env` array whose
-    /// items are `item_size` bytes wide (`is_item_signed` selects sign- vs
-    /// zero-extension on sub-word loads).  Generalizes
-    /// `add_gc_byte_array_descr` so a wider env element type (`&[i64]`,
-    /// `item_size = 8`) reads the element at byte offset `item_size * index`
-    /// instead of the raw byte at `index`.  `base_size = 0` because Rust
-    /// slice (`&[T]`) data pointers point directly at `items[0]` with no GC
-    /// header; the structural tuple (base_size=0, itemsize, item_type=Int,
-    /// signedness) uniquely identifies the descr for `add_bh_descr` dedup.
-    /// For an 8-byte item signedness is moot (full-word load), but for `&[u8]`
-    /// it must stay unsigned: a signed byte descr makes the backend emit
-    /// `movsx` on bytes ≥ `0x80` and corrupt opcode dispatch.
-    pub fn add_gc_int_array_descr(&mut self, item_size: usize, is_item_signed: bool) -> u16 {
-        self.add_bh_descr(CanonicalBhDescr::Array {
-            base_size: 0,
-            itemsize: item_size,
-            // base_size=0 → no length header (raw slice data pointer points
-            // directly at items[0]); descr.py:359-362 nolength shape carries
-            // `lendescr=None`.
-            len_offset: None,
-            type_id: 0,
-            gc_type_id: 0,
-            item_type: majit_ir::value::Type::Int,
-            is_array_of_pointers: false,
-            is_array_of_structs: false,
-            is_item_signed,
-            ei_index: u32::MAX,
-            array_type_id: None,
-            interior_fields: Vec::new(),
-            // Preserve existing GUARD_GC_TYPE behavior for the `&[u8]`
-            // program-array path (only the `pool_arrays` base flips to
-            // raw via `add_ptr_array_descr`).  A header-less buffer reached
-            // through a `*mut T` field takes `add_raw_int_array_descr_signed`
-            // instead — see the note there.
-            is_gc_managed: true,
-        })
     }
 
     /// Add a GC-array descriptor for a raw-pointer-element array (one-word
@@ -1988,7 +1966,7 @@ impl JitCodeBuilder {
     ///             [value_reg u8][descr_idx lo u8][descr_idx hi u8]`.
     ///
     /// Store counterpart of [`Self::getarrayitem_gc_i`]. Both take the
-    /// element descr from [`Self::add_gc_int_array_descr`], so a store
+    /// element descr from [`Self::add_env_int_array_descr`], so a store
     /// invalidates the heapcache entry the matching load populated.
     pub fn setarrayitem_gc_i(
         &mut self,
@@ -7169,7 +7147,7 @@ mod tests {
         // argcode string it is registered under. Pin that order here so
         // the emit side cannot drift from the handler that decodes it.
         let mut builder = JitCodeBuilder::new();
-        let descr_idx = builder.add_gc_int_array_descr(8, true);
+        let descr_idx = builder.add_env_int_array_descr(8, true);
         builder.setarrayitem_gc_i(1, 2, 3, descr_idx);
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("setarrayitem_gc_i/riid");
@@ -7198,7 +7176,7 @@ mod tests {
         // reads `code[position + 1]` as an index REGISTER and
         // `code[position + 2]` as a signed inline byte.
         let mut builder = JitCodeBuilder::new();
-        let descr_idx = builder.add_gc_int_array_descr(8, true);
+        let descr_idx = builder.add_env_int_array_descr(8, true);
         builder.setarrayitem_gc_i_c(1, 2, -5, descr_idx);
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("setarrayitem_gc_i/ricd");
