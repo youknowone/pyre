@@ -510,6 +510,33 @@ declare_seam! {
     sleep(seconds: f64) -> unit = "ll_time.ll_time_sleep";
 }
 
+/// The sandbox trampoline for `inspector.py:89 raw_os_write`, whose
+/// `_nowrapper=True` declaration deliberately keeps the GIL held.  Heap
+/// dumping calls this while it owns the collector's `&mut MiniMarkGC` and,
+/// when another mutator exists, the stop-the-world guard.  The ordinary
+/// [`ops::write`] releases the GIL around the controller round trip; a waiting
+/// mutator can then acquire it and park at the active STW safepoint while still
+/// holding it, preventing the dump owner from reacquiring the GIL forever.
+///
+/// Keep this boundary private to the collector hook.  Every ordinary host
+/// operation must continue to use the release-GIL seam generated above.
+#[cfg(feature = "sandbox")]
+pub(crate) fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
+    let args = [
+        MarshalValue::Int(fd as i64),
+        MarshalValue::Str(data.to_vec()),
+    ];
+    let result = client::syscall(
+        "ll_os.ll_os_write",
+        &args,
+        pyre_sandbox::protocol::ResultKind::Int,
+    )?;
+    match result {
+        SyscallResult::Int(written) => Ok(written),
+        _ => Err(SeamError::Runtime),
+    }
+}
+
 /// Read one process-environment value through the host seam.
 ///
 /// Keep this target-independent entry point at the module root: Charon's

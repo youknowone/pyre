@@ -341,8 +341,8 @@ pub struct ExecutionContext {
     /// `pypy/interpreter/baseobjspace.py` `space.check_signal_action` —
     /// the `CheckSignalAction` registered when the `signal` module loads.
     /// `checksignals` calls its `perform` directly.  Stored as a trait
-    /// pointer into the leaked action owned by `module::_signal`
-    /// (`install_signal_handling`); `None` until installed.
+    /// pointer into the process object-space singleton owned by
+    /// `module::_signal` (`install_signal_handling`); `None` until installed.
     pub check_signal_action: Option<*mut dyn AsyncActionOps>,
     /// `executioncontext.py sys_exc_operror` — the active exception for
     /// `sys.exc_info()` / bare `raise`, saved/restored across handler
@@ -764,6 +764,10 @@ impl ExecutionContext {
                 let w_exc = crate::builtins::exc_exception_new(&[w_async_exception_type])?;
                 return Err(unsafe { crate::PyError::from_exc_object(w_exc) });
             }
+            // The OS signal handler may only touch atomics.  Copy its breaker
+            // request into the ordinary ActionFlag ticker here, under the GIL,
+            // before the upstream decrement-and-dispatch sequence below.
+            self.actionflag.sync_async_ticker();
         }
         // executioncontext.py:158-165 bytecode_trace:
         //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
@@ -954,6 +958,9 @@ impl ExecutionContext {
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
         self.bytecode_only_trace(frame)?;
+        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
+            self.actionflag.sync_async_ticker();
+        }
         if self.actionflag.get_ticker() < 0 {
             // executioncontext.py:207-208 — `if actionflag.get_ticker()
             // < 0: actionflag.action_dispatcher(self, frame)`.  Routed
@@ -1374,7 +1381,7 @@ impl ExecutionContext {
         if let Some(action) = self.check_signal_action {
             let self_ptr = self as *mut ExecutionContext;
             unsafe {
-                (*action).perform(&mut *self_ptr, std::ptr::null_mut())?;
+                perform_async_action(action, self_ptr, std::ptr::null_mut())?;
             }
         }
         Ok(())
@@ -1515,6 +1522,16 @@ pub fn disarm_async_eval_breaker() {
     majit_ir::eval_breaker_word::clear_async();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn has_pending_signal_action() -> bool {
+    crate::module::signal::signalstate::has_pending_signals()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn has_pending_signal_action() -> bool {
+    false
+}
+
 /// `dont_look_inside` so the tracer treats it as an opaque call and never
 /// follows the action machinery's trait-object virtual dispatch +
 /// `Result<(), PyError>` propagation (which the JIT codewriter cannot
@@ -1535,6 +1552,28 @@ pub extern "C" fn perform_pending_actions(ec_ptr: i64, frame_ptr: i64) -> i64 {
             1
         }
     }
+}
+
+/// Invoke one action, ending the action object's exclusive borrow before a
+/// requested GIL hand-off.  `GILReleaseAction` is process-owned, so the next
+/// thread can dispatch this same object as soon as it acquires the GIL.  A
+/// direct `perform()` implementation that yields would leave the first
+/// thread's `&mut dyn AsyncActionOps` live across that second mutable borrow.
+///
+/// # Safety
+///
+/// `action` and `ec` must point to live objects for the duration of the
+/// action call.  The caller must hold the GIL on entry.
+unsafe fn perform_async_action(
+    action: *mut dyn AsyncActionOps,
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> Result<(), crate::PyError> {
+    let control = unsafe { (*action).perform(&mut *ec, frame)? };
+    if control == AsyncActionControl::YieldGil {
+        majit_gc::rgil::yield_thread();
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1773,7 +1812,7 @@ pub trait ActionFlagOps {
                 continue;
             }
             unsafe {
-                (*action_ptr).perform(&mut *ec, frame)?;
+                perform_async_action(action_ptr, ec, frame)?;
             }
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
@@ -1788,7 +1827,7 @@ pub trait ActionFlagOps {
                     self.abstract_flag_mut()._fired_bitmask &= !mask;
                     if !action_ptr.is_null() && !ec.is_null() {
                         unsafe {
-                            (*action_ptr).perform(&mut *ec, frame)?;
+                            perform_async_action(action_ptr, ec, frame)?;
                         }
                     }
                 }
@@ -1809,16 +1848,12 @@ pub trait ActionFlagOps {
 ///
 /// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
 /// and, when the `signal` module loads, rebinds `space.actionflag` to a
-/// `SignalActionFlag` whose ticker IS the C `pypysig_counter` cell so the
-/// OS signal handler can force it negative.  pyre merges the two: the
-/// ticker stays a plain `_ticker` field (a plain field read is what the
-/// JIT codewriter can model in the per-bytecode hot path — an atomic /
-/// volatile global read is not), and the OS signal handler writes -1 into
-/// it through a pointer registered at startup
-/// (`signalstate::register_ticker` ← `ticker_addr`).  This is the same
-/// arrangement as upstream's volatile `pypysig_counter.value`: the
-/// handler stores through the cell's address while the interpreter reads
-/// the field directly.
+/// `SignalActionFlag` whose ticker is the C `pypysig_counter` cell.  pyre
+/// merges the two while respecting Rust's memory model: `_ticker` remains a
+/// plain field for the translated per-bytecode hot path, the OS handler arms
+/// the atomic process eval breaker, and `sync_async_ticker` makes the field
+/// negative at the next safe interpreter checkpoint.  No asynchronous code
+/// reads or writes `_ticker`.
 #[derive(Clone)]
 pub struct ActionFlag {
     base: AbstractActionFlag,
@@ -1843,12 +1878,21 @@ impl ActionFlag {
         let _ = (ec, frame);
     }
 
-    /// Address of the ticker cell, handed to `signalstate::register_ticker`
-    /// so the OS signal handler can force the ticker negative.  Stable for
-    /// the process lifetime — the `ExecutionContext` is created once and
-    /// never moved (held behind an `Rc` in pyrex).
+    /// Address used to identify this as the signal-driving ticker.  The OS
+    /// handler never dereferences it; it is stable for the process lifetime
+    /// because the owning process `ActionFlag` allocation never moves.
     pub fn ticker_addr(&mut self) -> *mut isize {
         &mut self._ticker
+    }
+
+    /// Transfer an asynchronous eval-breaker request into the registered
+    /// ticker.  Called only by the owning interpreter thread while it holds
+    /// the GIL and after observing `EB_ASYNC`; the OS signal handler never
+    /// accesses `_ticker` itself.
+    pub(crate) fn sync_async_ticker(&mut self) {
+        if self.is_registered_ticker() {
+            self._ticker = -1;
+        }
     }
 
     /// True when `self._ticker` is the signal-registered ticker cell — the
@@ -1887,8 +1931,8 @@ impl ActionFlagOps for ActionFlag {
     }
 
     /// interp_signal.py:30-32 `SignalActionFlag.get_ticker` — `p.c_value`.
-    /// The cell is the `_ticker` field; the OS handler writes it through
-    /// the registered pointer (`ticker_addr`).
+    /// The safe-checkpoint synchronization above is the Rust equivalent of
+    /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
         self._ticker
     }
@@ -1901,17 +1945,18 @@ impl ActionFlagOps for ActionFlag {
             if value < 0 {
                 arm_async_eval_breaker();
             } else {
-                if !crate::module::thread::has_pending_async_exception() {
+                let async_work_pending = crate::module::thread::has_pending_async_exception()
+                    || has_pending_signal_action();
+                if !async_work_pending {
                     disarm_async_eval_breaker();
                 }
-                // A signal delivered between the ticker store and this clear
-                // rearms the ticker to -1 and re-sets the async bit; the clear
-                // would then drop it, leaving a negative ticker with the bit
-                // clear so a non-allocating compiled loop misses the signal.
-                // Re-read the ticker — the handler writes it through the
-                // registered pointer, so force a fresh load — and restore the
-                // bit if it was rearmed.
-                if unsafe { std::ptr::read_volatile(&self._ticker) } < 0 {
+                // A signal/async exception published between the first
+                // pending check and the clear above must re-arm the bit.  If
+                // it arrives after this second check, its publisher runs
+                // after the clear and leaves the bit armed itself.
+                if crate::module::thread::has_pending_async_exception()
+                    || has_pending_signal_action()
+                {
                     arm_async_eval_breaker();
                 }
             }
@@ -1982,8 +2027,8 @@ impl SpaceActionFlag {
 
     fn inner(&self) -> &ActionFlag {
         // SAFETY: SPACE_ACTIONFLAG owns one leaked process-lifetime value.
-        // Interpreter calls are serialized by the GIL; shared signal writes
-        // touch only `_ticker` through its registered raw address.
+        // Interpreter calls are serialized by the GIL; the signal handler
+        // touches only process-global atomics, never this allocation.
         unsafe { &*self.ptr }
     }
 
@@ -2004,6 +2049,10 @@ impl SpaceActionFlag {
 
     pub fn ticker_addr(&mut self) -> *mut isize {
         self.inner_mut().ticker_addr()
+    }
+
+    pub(crate) fn sync_async_ticker(&mut self) {
+        self.inner_mut().sync_async_ticker()
     }
 }
 
@@ -2144,18 +2193,27 @@ impl AsyncAction {
 /// `*mut dyn AsyncActionOps` so the dispatcher reaches the override
 /// through the embedded vtable, and `fire` / `action_dispatcher` can
 /// reach the base bitmask through the accessor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncActionControl {
+    Continue,
+    /// Complete the action call first, then hand the GIL to a waiter.
+    YieldGil,
+}
+
 pub trait AsyncActionOps {
     /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`:
     /// `def perform(self, executioncontext, frame): "To be overridden."`
     ///
     /// Returns `Result` so an overriding action (e.g. `CheckSignalAction`)
     /// can raise — PyPy's `perform` propagates an `OperationError` up
-    /// through `action_dispatcher` to the eval loop.
+    /// through `action_dispatcher` to the eval loop.  The control value lets
+    /// the process-owned GIL action defer its hand-off until this method's
+    /// exclusive receiver has ended.
     fn perform(
         &mut self,
         executioncontext: &mut ExecutionContext,
         frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError>;
+    ) -> Result<AsyncActionControl, crate::PyError>;
 
     /// Composition accessor: shared `AsyncAction` state.
     fn async_action(&self) -> &AsyncAction;
@@ -2245,8 +2303,8 @@ impl AsyncActionOps for AsyncAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        Ok(())
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -2335,8 +2393,8 @@ impl AsyncActionOps for PeriodicAsyncAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        Ok(())
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -2557,13 +2615,13 @@ impl AsyncActionOps for UserDelAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<AsyncActionControl, crate::PyError> {
         if self.collect_oldgen_before_run {
             self.collect_oldgen_before_run = false;
             pyre_object::gc_hook::try_gc_collect_oldgen();
         }
         self._run_finalizers();
-        Ok(())
+        Ok(AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {

@@ -1,8 +1,9 @@
 //! The single process-global eval-breaker word polled by JIT-compiled loop
 //! back-edges. One `AtomicUsize` whose bits fold the two former back-edge
 //! polls into one load + one nonzero branch:
-//!   bit0 EB_ASYNC — mirrors a negative async ticker (`ActionFlag._ticker < 0`);
-//!                   OR'd in by the OS signal handler and the action dispatcher.
+//!   bit0 EB_ASYNC — an async ticker request; OR'd in by the OS signal handler
+//!                   and action dispatcher, then copied into
+//!                   `ActionFlag._ticker` at a safe interpreter checkpoint.
 //!   bit1 EB_STW   — mirrors `GC_SYNC.stw_requested`; OR'd in by the collector
 //!                   while it drains mutators to safepoints.
 //!   bit2 EB_FINALIZING — mirrors interpreter finalization; once armed,
@@ -136,6 +137,52 @@ pub fn take_gc() -> bool {
     EVAL_BREAKER_WORD.fetch_and(!EB_GC, Ordering::Relaxed) & EB_GC != 0
 }
 
+/// Depth of the operation chain between the poll's load and its guard.
+///
+/// The recorder emits `RawLoadI -> IntAnd -> IntIsTrue -> GuardFalse`, so two
+/// links separate the guard's condition from the load. The walk below allows
+/// a few more so that an optimizer pass inserting or splitting one link does
+/// not silently stop matching, and stops well before a long pure chain.
+const POLL_CHAIN_DEPTH: usize = 6;
+
+/// Whether `guard`'s condition is a back-edge poll of this word.
+///
+/// The poll is recorded as
+/// `GuardFalse(IntIsTrue(IntAnd(RawLoadI(addr, 0), JIT_BREAKER_MASK)))`. The
+/// match anchors on the `RawLoadI` of the published address rather than on the
+/// whole shape: that load is the one link the recorder cannot drop (it must
+/// stay non-pure and outside the always-pure range, or CSE forwards the
+/// preamble's guarded-zero value into the loop body), so walking back to it
+/// survives rewrites of the links in between.
+///
+/// An unpublished address reads `0` and no poll is recorded, so the walk
+/// declines rather than matching an unrelated load from a null constant.
+pub fn is_back_edge_poll_guard(guard: &crate::resoperation::Op) -> bool {
+    let addr = eval_breaker_word_addr();
+    if addr == 0 {
+        return false;
+    }
+    // Control-flow guards (`GUARD_NOT_FORCED`, `GUARD_NO_EXCEPTION`, ...) carry
+    // no condition operand at all.
+    if guard.num_args() == 0 {
+        return false;
+    }
+    let mut operand = guard.arg(0);
+    for _ in 0..POLL_CHAIN_DEPTH {
+        let Some(op) = operand.bound_op() else {
+            return false;
+        };
+        if op.num_args() == 0 {
+            return false;
+        }
+        if op.opcode == crate::resoperation::OpCode::RawLoadI {
+            return op.arg(0).const_int() == Some(addr as i64);
+        }
+        operand = op.arg(0);
+    }
+    false
+}
+
 /// Every flag must fit in the word the poll actually loads. Checked per target,
 /// so a flag too wide for a 32-bit `usize` fails the wasm32 build rather than
 /// silently reading as unarmed there.
@@ -151,6 +198,63 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resoperation::{Op, OpCode};
+    use crate::value::Const;
+    use std::rc::Rc;
+
+    fn bind(op: Op) -> crate::operand::Operand {
+        crate::operand::Operand::from_bound_op(&Rc::new(op))
+    }
+
+    fn int(value: i64) -> crate::operand::Operand {
+        crate::operand::Operand::const_(Const::Int(value))
+    }
+
+    /// Build the recorded back-edge poll over `load_addr`, which the caller
+    /// varies to separate "this word" from "some other raw load".
+    fn poll_guard(load_addr: usize) -> Op {
+        let load = bind(Op::new(OpCode::RawLoadI, &[int(load_addr as i64), int(0)]));
+        let masked = bind(Op::new(
+            OpCode::IntAnd,
+            &[load, int(JIT_BREAKER_MASK as i64)],
+        ));
+        let armed = bind(Op::new(OpCode::IntIsTrue, &[masked]));
+        Op::new(OpCode::GuardFalse, &[armed])
+    }
+
+    /// The counter split turns on this predicate alone, so it has to separate
+    /// the poll from every other guard the same trace records. Only the
+    /// address published for this word matches: a raw load of a neighbouring
+    /// address reaches the same opcode chain, and a data guard reaches none of
+    /// it.
+    ///
+    /// `publish_addr` is idempotent and writes only the address holder, not the
+    /// word, so this leaves the process-global flag state alone.
+    #[test]
+    fn only_a_poll_of_this_words_address_is_recognised() {
+        publish_addr();
+        let addr = eval_breaker_word_addr();
+        assert_ne!(addr, 0, "publish_addr must make the address readable");
+
+        assert!(is_back_edge_poll_guard(&poll_guard(addr)));
+        // Same shape, a different word: the JIT records other raw loads.
+        assert!(!is_back_edge_poll_guard(&poll_guard(
+            addr + EVAL_BREAKER_WORD_SIZE
+        )));
+        // A guard on traced values — the population whose failures the
+        // `guard_failures` total is meant to describe.
+        let value = bind(Op::new(OpCode::IntAdd, &[int(1), int(2)]));
+        let is_true = bind(Op::new(OpCode::IntIsTrue, &[value]));
+        assert!(!is_back_edge_poll_guard(&Op::new(
+            OpCode::GuardTrue,
+            &[is_true]
+        )));
+        // A control-flow guard carries no condition operand at all.
+        assert!(!is_back_edge_poll_guard(&Op::new(
+            OpCode::GuardNotForced,
+            &[]
+        )));
+    }
 
     /// One request arms the poll once: the taker reports it, clears it, and the
     /// next taker sees nothing. A taker that failed to clear would keep failing

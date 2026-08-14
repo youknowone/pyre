@@ -23,11 +23,11 @@ import sys
 import threading
 
 
-def deepest(limit_probe=None):
+def deepest():
     """Recurse until RecursionError and report the depth reached."""
     best = [0]
 
-    def plain(n):
+    def plain(n) -> None:
         best[0] = n
         plain(n + 1)
 
@@ -59,10 +59,6 @@ def check(where, values, limit):
 limit = sys.getrecursionlimit()
 check("default limit", readings(), limit)
 
-sys.setrecursionlimit(2000)
-check("raised limit", readings(rounds=6), 2000)
-sys.setrecursionlimit(limit)
-
 # A thread gets its own native stack, and its own chance to be sized too small
 # for the limit it is handed.
 failure = []
@@ -71,7 +67,7 @@ failure = []
 def in_thread():
     try:
         check("thread", readings(), sys.getrecursionlimit())
-    except AssertionError as exc:  # surface it on the main thread
+    except BaseException as exc:  # surface every worker failure on the main thread
         failure.append(exc)
 
 
@@ -79,5 +75,9 @@ t = threading.Thread(target=in_thread)
 t.start()
 t.join()
 assert not failure, failure[0]
+
+sys.setrecursionlimit(2000)
+check("raised limit", readings(rounds=6), 2000)
+sys.setrecursionlimit(limit)
 
 print("OK")

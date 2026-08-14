@@ -2,14 +2,10 @@
 //!
 //! The OS signal handler runs in an async context where almost nothing
 //! is safe to do, so it only flips atomic flags: it records the signal
-//! number in `SIG_PENDING`, forces `SIG_TICKER` to -1 (so the next
-//! `bytecode_trace` runs `action_dispatcher`), and writes one byte to
-//! the wakeup fd.  The actual app-level handler is invoked later, from
-//! `CheckSignalAction::perform`, at a safe interpreter checkpoint.
-//!
-//! `SIG_TICKER` is the analogue of C `pypysig_counter.inner.value`; the
-//! `ActionFlag` ticker methods (`SignalActionFlag` in upstream) read and
-//! write it directly so the handler and the eval loop share one cell.
+//! number in `SIG_PENDING`, arms the process eval breaker (so the next
+//! `bytecode_trace` runs `action_dispatcher`), and writes one byte to the
+//! wakeup fd.  The actual app-level handler and the ticker update happen
+//! later, from a safe interpreter checkpoint.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
@@ -17,13 +13,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 /// surface `NSIG` portably.  64 fits a single `i64` bitmask.
 pub const NSIG: i32 = 64;
 
-/// Address of the `ActionFlag` ticker cell (`signals.c:45-49
-/// pypysig_counter`).  The interpreter reads the cell directly as a
-/// plain field in the per-bytecode hot path (an atomic / volatile global
-/// read there is not modellable by the JIT codewriter); the OS handler
-/// stores -1 through this registered pointer, exactly like upstream
-/// writing the volatile `pypysig_counter.value` via its address.  Null
-/// until `register_ticker` runs at startup.
+/// Identity of the signal-driving `ActionFlag` ticker cell (`signals.c:45-49
+/// pypysig_counter`).  The pointer is compared by the interpreter but never
+/// dereferenced by the OS handler: Rust volatile access would still race the
+/// ordinary field reads and writes.  The handler arms the atomic eval breaker,
+/// and `ExecutionContext::bytecode_trace` copies that request into this cell
+/// while holding the GIL.  Null until `register_ticker` runs at startup.
 static TICKER_PTR: AtomicPtr<isize> = AtomicPtr::new(std::ptr::null_mut());
 
 /// `signals.c:51 pypysig_flags_bits` — one bit per pending signal.
@@ -65,16 +60,10 @@ pub fn registered_ticker_ptr() -> *mut isize {
     TICKER_PTR.load(Ordering::SeqCst)
 }
 
-/// Store -1 into the ticker cell so the next `decrement_ticker` runs
-/// `action_dispatcher`.  Async-signal-safe: a single aligned word store.
+/// Arm the process breaker so the next bytecode checkpoint makes the
+/// registered ticker negative and runs `action_dispatcher`.  This is a
+/// lock-free atomic RMW and is safe in the OS signal handler.
 pub(crate) fn rearm_ticker() {
-    let p = TICKER_PTR.load(Ordering::SeqCst);
-    if !p.is_null() {
-        unsafe { std::ptr::write_volatile(p, -1) };
-    }
-    // The signal handler also arms the JIT back-edge trigger. This runs even
-    // before a ticker address is registered because compiled loops poll the
-    // process-global word directly.
     majit_ir::eval_breaker_word::set_async();
 }
 
@@ -105,6 +94,14 @@ pub fn signal_poll() -> i32 {
         }
     }
     -1
+}
+
+/// Whether a signal bit remains for `CheckSignalAction` to consume.  The
+/// action dispatcher uses this authoritative state when clearing the async
+/// eval-breaker bit, closing the race where a signal arrives immediately
+/// before that clear.
+pub(crate) fn has_pending_signals() -> bool {
+    SIG_PENDING.load(Ordering::SeqCst) != 0
 }
 
 // ── wakeup fd (signals.c:246-272 pypysig_set_wakeup_fd) ──
@@ -264,13 +261,14 @@ mod tests {
     }
 
     /// Drives process-global signal state: installs a real SIGINT handler,
-    /// registers this `ActionFlag`'s ticker as *the* cell the handler writes
-    /// (`TICKER_PTR`), raises a real signal, and asserts on the shared
-    /// eval-breaker word. Nothing serializes that, so this must stay the only
-    /// test in the crate that touches those globals — a second one running in
-    /// parallel would race it. Tests that merely build an `ActionFlag` are safe
-    /// alongside it: the async-bit mirror is gated on the registered ticker, so
-    /// an unregistered flag's `reset_ticker` never reaches the shared word.
+    /// registers this `ActionFlag` as the signal-driving ticker, raises a real
+    /// signal, and asserts that the handler touches only atomic state until a
+    /// safe checkpoint synchronizes the ticker. Nothing serializes those
+    /// process globals, so this must stay the only test in the crate that
+    /// touches them — a second one running in parallel would race it. Tests
+    /// that merely build an `ActionFlag` are safe alongside it: the async-bit
+    /// mirror is gated on the registered ticker, so an unregistered flag's
+    /// `reset_ticker` never reaches the shared word.
     #[test]
     fn signal_during_warmup_sets_async_bit() {
         let _reset = ResetSignalState;
@@ -281,12 +279,30 @@ mod tests {
 
         assert!(pypysig_setflag(libc::SIGINT));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-        assert!(actionflag.get_ticker() < 0);
+        assert!(
+            actionflag.get_ticker() >= 0,
+            "the async handler must not write the plain Rust ticker field"
+        );
         assert_ne!(
             load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_ASYNC,
             0,
             "the real signal handler must arm bit0"
         );
+        actionflag.sync_async_ticker();
+        assert!(actionflag.get_ticker() < 0);
+
+        // `action_dispatcher` resets the ticker before CheckSignalAction polls.
+        // The still-pending signal bit must keep the shared breaker armed
+        // across that reset; the same reset can also happen independently via
+        // setcheckinterval, before any signal action has consumed the bit.
+        actionflag.reset_ticker(100);
+        assert_ne!(
+            load_eval_breaker_word() & majit_ir::eval_breaker_word::EB_ASYNC,
+            0,
+            "a positive ticker reset must not clear a pending signal"
+        );
+        actionflag.sync_async_ticker();
+        assert!(actionflag.get_ticker() < 0);
         assert_eq!(signal_poll(), libc::SIGINT);
 
         actionflag

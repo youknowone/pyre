@@ -11,7 +11,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::executioncontext::{
-    AsyncAction, AsyncActionOps, ExecutionContext, PeriodicAsyncAction, PeriodicAsyncActionOps,
+    AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext, PeriodicAsyncAction,
+    PeriodicAsyncActionOps,
 };
 use crate::pyframe::PyFrame;
 use pyre_object::PyObjectRef;
@@ -32,14 +33,18 @@ impl GilReleaseAction {
 }
 
 impl AsyncActionOps for GilReleaseAction {
-    /// gil.py:48-50 `perform`: `rgil.yield_thread()`.
+    /// gil.py:48-50 `perform`: request `rgil.yield_thread()`.
+    ///
+    /// The dispatcher performs the request after this method returns so its
+    /// `&mut GilReleaseAction` has ended before another thread dispatches the
+    /// same process-owned action.  This is the Rust ownership boundary around
+    /// the otherwise line-for-line upstream hand-off.
     fn perform(
         &mut self,
         _ec: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
-        majit_gc::rgil::yield_thread();
-        Ok(())
+    ) -> Result<AsyncActionControl, crate::PyError> {
+        Ok(AsyncActionControl::YieldGil)
     }
 
     fn async_action(&self) -> &AsyncAction {

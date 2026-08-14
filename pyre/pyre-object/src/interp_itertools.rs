@@ -1060,6 +1060,37 @@ pub unsafe fn is_pairwise(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &PAIRWISE_TYPE) }
 }
 
+/// Read the source iterator.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Pairwise`.
+#[inline]
+pub unsafe fn w_pairwise_get_iterator(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Pairwise)).w_iterator }
+}
+
+/// Read the previous item (`PY_NULL` before the first result).
+///
+/// # Safety
+/// `obj` must point to a valid `W_Pairwise`.
+#[inline]
+pub unsafe fn w_pairwise_get_prev(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const W_Pairwise)).w_prev }
+}
+
+/// Store the previous item. `W_Pairwise` is allocated in old-gen, while an
+/// iterator may return a nursery object, so this is an old-to-young store.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Pairwise`.
+#[inline]
+pub unsafe fn w_pairwise_set_prev(obj: PyObjectRef, w_prev: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_Pairwise)).w_prev = w_prev;
+        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    }
+}
+
 // ── W_Cycle — pypy/module/itertools/interp_itertools.py:class W_Cycle ──
 //
 // ```python
@@ -1523,8 +1554,15 @@ mod tests {
     }
 
     #[test]
-    fn w_pairwise_object_size_matches_descr() {
-        // Auto-id `allocate_stable` (GC-managed): tid assigned at JIT init.
+    fn w_pairwise_gc_descriptor_traces_iterator_and_previous_item() {
+        assert_eq!(
+            W_PAIRWISE_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(W_Pairwise, ob.w_class),
+                std::mem::offset_of!(W_Pairwise, w_iterator),
+                std::mem::offset_of!(W_Pairwise, w_prev),
+            ]
+        );
         assert_eq!(
             <W_Pairwise as crate::lltype::GcType>::SIZE,
             W_PAIRWISE_OBJECT_SIZE

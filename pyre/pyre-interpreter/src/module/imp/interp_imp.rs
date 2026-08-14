@@ -1116,14 +1116,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `_imp_create_dynamic_impl`. Raising ImportError (rather than being
         // absent) matches the meta-path `hasattr` probe while still letting
         // `except ImportError` fall back to a pure-Python module.
-        crate::make_builtin_function_with_arity(
+        crate::make_builtin_function_with_signature(
             "create_dynamic",
             |args| {
-                let Some(&spec) = args.first() else {
+                // `file` is bound and dropped: the loader opens the library by
+                // path, so the already-open stream has no use here. Declaring
+                // it is what keeps a two-argument call from being rejected.
+                let spec = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                if spec.is_null() {
                     return Err(crate::PyError::type_error(
                         "create_dynamic() missing required argument 'spec'",
                     ));
-                };
+                }
                 #[cfg(all(
                     feature = "cpyext",
                     not(feature = "sandbox"),
@@ -1150,7 +1154,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ))
                 }
             },
-            1,
+            crate::Signature::new(vec!["spec", "file"], None, None, 0, 0),
         ),
     );
     crate::module_ns_store(

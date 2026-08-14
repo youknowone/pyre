@@ -498,6 +498,17 @@ pub extern "C" fn pyre_jit_guard_failures() -> u64 {
     pyre_jit::eval::driver_pair().0.get_stats().guard_failures as u64
 }
 
+/// Unlike the four above, this one is exported to be *read*, not gated: it
+/// counts back-edge polls that found the eval-breaker word armed, which tracks
+/// the collection schedule rather than anything the compiler decided.
+/// `check.py` keeps it out of `JITSTATS_SNAPSHOT_FIELDS` for that reason, and
+/// the runner prints it so a `guard_failures` move can be read against it.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_back_edge_polls() -> u64 {
+    pyre_jit::eval::driver_pair().0.get_stats().back_edge_polls as u64
+}
+
 /// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The
 /// native backends print these from `descr_set_jit_stats`; the guest has no
 /// stderr, so it exports the counts and the runner prints the line. Without

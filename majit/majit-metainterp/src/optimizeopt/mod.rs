@@ -6529,6 +6529,16 @@ impl OptContext {
             fd.set_rd_consts(Some(rd_consts));
             fd.set_rd_virtuals(descr_rd_virtuals);
             fd.set_rd_pendingfields(descr_pending);
+            // The back-edge poll of the eval-breaker word reaches this
+            // function like any other guard, and this is the last point where
+            // its condition chain and its descr are both in hand — the
+            // backends see only the emitted guard.  Stamping here also covers
+            // every re-emission (unroll's preamble and body copies, and the
+            // poll a bridge records at its own back edge), because each mints
+            // a fresh descr through this same call.
+            if majit_ir::eval_breaker_word::is_back_edge_poll_guard(op) {
+                fd.set_back_edge_poll();
+            }
         }
         // resume.py: RPython does NOT carry frame sizes out-of-band.
         // The decoder reads jitcode liveness (jitcode.position_info) at

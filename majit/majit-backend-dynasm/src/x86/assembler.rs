@@ -4528,6 +4528,13 @@ impl<'a> Assembler386<'a> {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
                 };
+                // x86/assembler.py:254 `_push_all_regs_to_jitframe` — the
+                // helper below can collect, and unlike the fixed-size path it
+                // is called directly rather than through the trampoline that
+                // spills for it, so nothing else puts the live references
+                // where the gcmap can name them.  Must precede the argument
+                // setup, which clobbers the ABI argument registers.
+                self.push_all_regs_to_jitframe(&[], true);
                 self.emit_abi_int_arg_from_imm(0, base_size);
                 self.emit_abi_int_arg_from_imm(1, itemsize);
                 match arglocs.first() {
@@ -4541,8 +4548,17 @@ impl<'a> Assembler386<'a> {
                         self.emit_abi_int_arg_from_imm(2, 0);
                     }
                 }
+                // assembler.py:649-650 push_gcmap — a null gcmap tells the
+                // collector this frame holds no references, so every pointer
+                // spilled above would survive the collection unforwarded.
+                // `push_gcmap` marshals through the scratch register, which
+                // is not an ABI argument register.
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                    self.push_gcmap(gcmap as *mut usize);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                }
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64
                 );
@@ -4552,6 +4568,12 @@ impl<'a> Assembler386<'a> {
                 // gcmap, otherwise the clear would target the freed
                 // nursery copy.
                 self.reload_frame_if_necessary();
+                // assembler.py:283 `_pop_all_regs_from_jitframe` — the
+                // jitframe slots are what the collector rewrote, so reload
+                // from them rather than trusting the callee-save/volatile
+                // state around the call.  EAX is excluded because it carries
+                // the allocation result the null check and result store read.
+                self.pop_all_regs_from_jitframe(&[crate::regloc::EAX], true);
                 // assembler.py:300-322 OOM propagate parity — the
                 // varsize helper now returns NULL on `libc::calloc`
                 // / `gc.alloc_varsize` failure; route that through

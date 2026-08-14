@@ -518,12 +518,17 @@ def pyre_env():
     # 4MB nursery also sets a 32MB threshold, and where old-gen use crosses it
     # (:2437 `threshold_reached`) stayed free to move.
     #
-    # Crossing it is what reaches `guard_failures`. The major step's finalizer
-    # trigger arms the eval-breaker word, and every compiled loop's back edge
-    # polls that word through a real guard —
+    # Crossing it used to reach `guard_failures`, and no longer does. The major
+    # step's finalizer trigger arms the eval-breaker word, and every compiled
+    # loop's back edge polls that word through a real guard —
     # `RawLoadI(&EVAL_BREAKER_WORD) -> IntAnd(word, JIT_BREAKER_MASK) ->
-    # IntIsTrue -> GuardFalse` (trace_opcode.rs:2003-2015) — whose failure is
-    # counted like any other at pyjitpl.rs:2087. The trace is peeled, so that
+    # IntIsTrue -> GuardFalse` (trace_opcode.rs) — whose failure was counted
+    # like any other. It is now tallied separately as `back_edge_polls`
+    # (`is_back_edge_poll_guard` marks the guard, `record_guard_failure_event`
+    # splits the total), which is what removes the whole class rather than
+    # avoiding it; the rest of this note is kept because it describes the pins
+    # that are still in place and what they were measured to do. The trace is
+    # peeled, so that
     # poll appears twice, and which copy catches the armed bit sets the price:
     # the loop-body copy costs one bailout, the peeled-preamble copy costs two,
     # because resuming from it re-enters at the loop head and fails the
@@ -533,11 +538,22 @@ def pyre_env():
     # `bridges_compiled` identical across all three, and it is why the windows
     # runner disagreed with itself between jobs rather than against the tree.
     #
-    # Pushing the threshold past every fixture's working set removes the event
+    # Pushing the threshold past a fixture's working set removes the event
     # instead of relocating it. Measured: `recursive_call_frame_relocation`
     # reads 636 at every nursery from 3968KB to 8MB, and `closure_per_call`
     # reads 414 where it had alternated 415/416 — the pair a per-platform
-    # overlay could not hold. Host RAM cannot re-open it: `max_delta`
+    # overlay could not hold.
+    #
+    # "Past every fixture's working set" is what this pin was believed to do
+    # and is not what it does — the two fixtures above are not the suite.
+    # Measured across all 404 dynasm synthetic fixtures, comparing each one's
+    # count at this 256MB pin against the same fixture at 8GB (where no major
+    # collection happens at all): 11 of them still cross, for 21 poll failures
+    # in total. `bytes_split_whitespace_maxsplit` reads 4 here and 1 there,
+    # `build_set_hashability` 4 and 1, `str_fstring` 658 and 657. So the pin
+    # narrows the class and does not close it, which is why the counter split
+    # above exists — those 11 were the fixtures that flipped between hosts.
+    # Host RAM cannot re-open it: `max_delta`
     # (0.125 * total memory) enters only as an upper bound at collector.rs:3570
     # and the `min_heap_size` floor is applied after it (:2452), so the floor
     # wins on every host.
@@ -917,6 +933,14 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
 )
+
+# `back_edge_polls` is deliberately absent, and is the one counter that must
+# stay absent. It reports how many times a compiled loop left machine code
+# because the eval-breaker word was armed — a measure of when a collection
+# landed, not of anything the compiler decided. Recording it would move the
+# schedule-sensitivity this split was made to remove onto a new key instead of
+# removing it. It is printed on the `[jit-stats]` line either way, so a reader
+# diagnosing a `guard_failures` move can still see it.
 
 
 # Which way each counter has to move to be a regression rather than a gain.

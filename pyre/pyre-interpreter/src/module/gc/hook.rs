@@ -1,7 +1,9 @@
 //! App-level GC hooks — PyPy: `pypy/module/gc/hook.py`.
 
 use super::{new_collect_stats, new_collect_step_stats_full, new_minor_stats};
-use crate::executioncontext::{ActionFlagOps, AsyncAction, AsyncActionOps, ExecutionContext};
+use crate::executioncontext::{
+    ActionFlagOps, AsyncAction, AsyncActionControl, AsyncActionOps, ExecutionContext,
+};
 use crate::pyframe::PyFrame;
 use pyre_object::*;
 use std::sync::OnceLock;
@@ -78,14 +80,14 @@ impl AsyncActionOps for GcMinorHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<AsyncActionControl, crate::PyError> {
         if self.depth != 0 {
-            return Ok(());
+            return Ok(AsyncActionControl::Continue);
         }
         self.depth += 1;
         let result = self.do_perform();
         self.depth -= 1;
-        result
+        result.map(|()| AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -170,14 +172,14 @@ impl AsyncActionOps for GcCollectStepHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<AsyncActionControl, crate::PyError> {
         if self.depth != 0 {
-            return Ok(());
+            return Ok(AsyncActionControl::Continue);
         }
         self.depth += 1;
         let result = self.do_perform();
         self.depth -= 1;
-        result
+        result.map(|()| AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {
@@ -262,14 +264,14 @@ impl AsyncActionOps for GcCollectHookAction {
         &mut self,
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<AsyncActionControl, crate::PyError> {
         if self.depth != 0 {
-            return Ok(());
+            return Ok(AsyncActionControl::Continue);
         }
         self.depth += 1;
         let result = self.do_perform();
         self.depth -= 1;
-        result
+        result.map(|()| AsyncActionControl::Continue)
     }
 
     fn async_action(&self) -> &AsyncAction {

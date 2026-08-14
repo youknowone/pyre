@@ -857,18 +857,64 @@ pub fn fbw_foriter_any_body_effect_signal() -> bool {
 /// or that replay starts at the next iteration and drops this one.
 /// `for_mutate` aborts BEFORE the append's effect, so both signal classes are
 /// clear at the abort point — the clean continuation case.
+/// Which stash entry a take removes, given the indices that matched the parked
+/// frame.  `None` only for an empty stash.
+///
+/// `foriter_body_matches_frame` decides on the frame's CODE and body pc, not on
+/// the frame itself — a frame address cannot be the key, since a minor
+/// collection relocates the frame between the capture and the take.  Two
+/// activations of one code (a recursive call, or one function inlined at two
+/// levels under different JitCode identities) therefore answer that match
+/// identically, and reaching past the top for one of them would deliver another
+/// activation's item into this frame.  So the match decides only while it is
+/// UNAMBIGUOUS; a second candidate falls back to the legacy top entry, whose
+/// header check then refuses and drops exactly as it did before.  Wrong-frame
+/// delivery is a wrong VALUE and the drop is only a loss, so never trading one
+/// for the other is what makes reaching past the top safe at all.
+fn inflight_take_index(len: usize, mut matching: impl Iterator<Item = usize>) -> Option<usize> {
+    match (matching.next(), matching.next()) {
+        (Some(only), None) => Some(only),
+        _ => len.checked_sub(1),
+    }
+}
+
 pub fn fbw_foriter_inflight_take(
     fallback_code_ptr: usize,
+    frame: usize,
+    resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
-    // Take the MOST-RECENT (top) entry and drop the rest, matching the
-    // single-slot behaviour: one take delivers the innermost in-flight item
-    // and leaves nothing for a subsequent deliver call.  (S2 will instead
-    // deliver every entry at its true frame slot.)
+    // Take the entry that belongs to the header the live frame is PARKED at,
+    // then drop the rest: one take still delivers at most one item and leaves
+    // nothing for a subsequent deliver call.
+    //
+    // Selecting the most-recent entry instead loses an iteration whenever two
+    // FOR_ITERs of one frame are in flight at once, which needs no nesting of
+    // frames: an outer `list` loop captures through the residual leg
+    // (`residual_call.rs`, `ForIterNext`) while a `range` body inside it
+    // captures through the specialised leg (`specialize.rs`, `w_range_iter_next`).
+    // `deliver_inflight_foriter_item` can only push at the header the frame is
+    // parked on, so a most-recent entry naming the INNER body pc fails its
+    // header check and is refused — and the `clear` below has already destroyed
+    // the outer entry, which that same frame COULD have taken. Neither item is
+    // delivered and the outer iteration is lost. Matching the frame first
+    // delivers the deliverable one; the entries that no frame can accept keep
+    // the single-slot drop.
+    //
     let stash = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
-        let top = stack.pop();
+        let at = inflight_take_index(
+            stack.len(),
+            stack
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
+                })
+                .map(|(at, _)| at),
+        )?;
+        let picked = stack.remove(at);
         stack.clear();
-        top
+        Some(picked)
     });
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
@@ -930,9 +976,77 @@ mod foriter_delivery_tests {
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0), Some((item, 34)));
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
 
         fbw_store_journal_reset();
+    }
+
+    /// Two FOR_ITERs of one frame can be in flight at once (an outer `list`
+    /// loop through the residual leg, a `range` body inside it through the
+    /// specialised leg). The deliver site can only push at the header the
+    /// frame is parked on, so the take must select on that coordinate: taking
+    /// the most-recent entry returns a body pc this frame will refuse AND
+    /// discards the entry it could have delivered, losing the outer iteration.
+    #[test]
+    fn take_selects_the_entry_the_parked_frame_can_accept_not_the_most_recent() {
+        fbw_store_journal_reset();
+        let outer = 1usize as pyre_object::PyObjectRef;
+        let inner = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6));
+        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35));
+
+        // Parked at the OUTER header (pc 5), whose fallthrough body pc is 6.
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
+
+        fbw_store_journal_reset();
+    }
+
+    /// With no entry the parked frame can accept, the single-slot most-recent
+    /// behaviour stands: the deliver site refuses on its header check exactly
+    /// as before, so this change never widens what gets pushed.
+    #[test]
+    fn take_falls_back_to_the_most_recent_entry_when_none_matches_the_frame() {
+        fbw_store_journal_reset();
+        let older = 1usize as pyre_object::PyObjectRef;
+        let newer = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(older, InflightForiterBody::Py(6));
+        fbw_foriter_inflight_capture(newer, InflightForiterBody::Py(35));
+
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 99), Some((newer, 35)));
+
+        fbw_store_journal_reset();
+    }
+
+    /// The rule the take selects by. Driven directly because the ambiguous case
+    /// cannot be built through `fbw_foriter_inflight_capture`: it replaces an
+    /// entry carrying the same `body`, so two candidates need two distinct
+    /// JitCode identities over one `CodeObject` — reachable in a recursive
+    /// inline, not constructible here.
+    #[test]
+    fn an_ambiguous_frame_match_keeps_the_legacy_top_entry() {
+        assert_eq!(
+            inflight_take_index(3, [1usize].into_iter()),
+            Some(1),
+            "one candidate is the frame's entry"
+        );
+        // Both candidates sit BELOW the top on purpose: picking the last match
+        // (index 1) is what a select-by-recency rule does, so only the
+        // ambiguity refusal answers 2 here.
+        assert_eq!(
+            inflight_take_index(3, [0usize, 1].into_iter()),
+            Some(2),
+            "two candidates cannot be told apart, so the legacy top stands"
+        );
+        assert_eq!(
+            inflight_take_index(2, std::iter::empty()),
+            Some(1),
+            "no candidate keeps the legacy top"
+        );
+        assert_eq!(
+            inflight_take_index(0, std::iter::empty()),
+            None,
+            "an empty stash has nothing to take"
+        );
     }
 
     #[test]
@@ -943,7 +1057,7 @@ mod foriter_delivery_tests {
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0), None);
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
 
         fbw_store_journal_reset();
     }

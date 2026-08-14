@@ -2418,6 +2418,87 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
     }
 }
 
+/// Retarget each edge into a block that exists only to raise the implicit
+/// `AssertionError` so it names `exceptblock` directly, giving
+/// [`remove_assertion_errors`] the `exit.target is graph.exceptblock` shape
+/// its upstream counterpart is written against.
+///
+/// Upstream's flow space raises `assert` as a link straight to `exceptblock`
+/// (`flowcontext.py` `_implicit_`), so `simplify.remove_assertion_errors`
+/// never has a block in between and its predicate can be literal.
+/// `set_raise` / `set_raise_implicit` always install one, and the MIR front
+/// fills it with the operations that build the exception, so the same raise
+/// arrives here one block further out.
+///
+/// A block qualifies when it has a single exit, that exit is the
+/// `AssertionError` raise, and every operation it holds satisfies
+/// `can_remove_op` — `CanRemove` (`simplify.py:411-423`), the predicate the
+/// dead-op pass would apply to those operations once the raise is gone.  An
+/// operation outside it — anything that can raise or write — leaves the edge
+/// pointing at its block.
+///
+/// The bypassed block keeps its own exits and falls out as unreachable, the
+/// same way `eliminate_empty_blocks` (`simplify.py:52-69`) leaves the blocks
+/// it rewires past.
+///
+/// Returns the number of retargeted edges.
+pub fn retarget_assert_raise_blocks(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::HOST_ENV;
+
+    let assert_err_class = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock = graph.exceptblock;
+    let mut raise_args: std::collections::HashMap<BlockId, Vec<LinkArg>> =
+        std::collections::HashMap::new();
+    for block in &graph.blocks {
+        if block.id == exceptblock || block.exits.len() != 1 {
+            continue;
+        }
+        let exit = &block.exits[0];
+        let raises = exit.target == exceptblock
+            && matches!(
+                exit.args.first(),
+                Some(LinkArg::Const(c))
+                    if matches!(
+                        &c.value,
+                        ConstValue::HostObject(h) if *h == assert_err_class
+                    )
+            );
+        if !raises {
+            continue;
+        }
+        if !block
+            .operations
+            .iter()
+            .all(|op| crate::inline::can_remove_op(&op.kind))
+        {
+            continue;
+        }
+        raise_args.insert(block.id, exit.args.clone());
+    }
+    if raise_args.is_empty() {
+        return 0;
+    }
+    let mut retargeted = 0usize;
+    for block_idx in 0..graph.blocks.len() {
+        if raise_args.contains_key(&graph.blocks[block_idx].id) {
+            continue;
+        }
+        for exit_idx in 0..graph.blocks[block_idx].exits.len() {
+            let target = graph.blocks[block_idx].exits[exit_idx].target;
+            let Some(args) = raise_args.get(&target).cloned() else {
+                continue;
+            };
+            let exit = &mut graph.blocks[block_idx].exits[exit_idx];
+            exit.target = exceptblock;
+            exit.args = args;
+            retargeted += 1;
+        }
+    }
+    retargeted
+}
+
 /// RPython `remove_assertion_errors(graph)` (simplify.py:321-346) over
 /// the front model graph.
 ///
@@ -2463,56 +2544,28 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 /// Returns the number of removed exits so the caller can gate the
 /// follow-up dead-condition sweep (`removeassert.py:35-37` — "now melt
 /// away the (hopefully) dead operation that compute the condition").
-/// The front model does not run `join_blocks` over this graph type, so
-/// the assertion raise can remain behind a single-entry, single-exit block
-/// that upstream `simplify.py:271-319` would have collapsed.
+///
+/// The predicate here is upstream's literal `exit.target is
+/// graph.exceptblock`.  Graphs whose raise sits one block further out are
+/// brought into that shape by [`retarget_assert_raise_blocks`], which the
+/// caller runs first.
 pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::{HOST_ENV, HostObject};
 
     fn targets_assertion_error(
-        graph: &FunctionGraph,
         exit: &Link,
         exceptblock: BlockId,
         assert_err_class: &HostObject,
     ) -> bool {
-        let indirect = exit.target != exceptblock;
-        let assertion_exit = if indirect {
-            let target = graph.block(exit.target);
-            if target.exits.len() != 1 {
-                return false;
-            }
-            &target.exits[0]
-        } else {
-            exit
-        };
-
-        let raises_assertion_error = assertion_exit.target == exceptblock
+        exit.target == exceptblock
             && matches!(
-                assertion_exit.args.first(),
+                exit.args.first(),
                 Some(LinkArg::Const(c))
                     if matches!(
                         &c.value,
                         ConstValue::HostObject(h) if h == assert_err_class
                     )
-            );
-        if !raises_assertion_error {
-            return false;
-        }
-        if !indirect {
-            return true;
-        }
-        // Only `join_blocks` would collapse the intermediate block into this
-        // one, and only when this exit is its sole entry — otherwise removing
-        // the exit strands the other predecessors.  Counted last: it is the
-        // one whole-graph scan here, and the cheap shape tests above already
-        // reject every exit that is not a raise-block edge.
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| block.exits.iter())
-            .filter(|candidate| candidate.target == exit.target)
-            .count()
-            == 1
+            )
     }
 
     let assert_err_class = HOST_ENV
@@ -2531,7 +2584,7 @@ pub fn remove_assertion_errors(graph: &mut FunctionGraph) -> usize {
             };
             // upstream: `if not (exit.target is graph.exceptblock and
             // exit.args[0] == Constant(AssertionError)): continue`.
-            if !targets_assertion_error(graph, exit, exceptblock, &assert_err_class) {
+            if !targets_assertion_error(exit, exceptblock, &assert_err_class) {
                 continue;
             }
             // upstream: `if len(block.exits) < 2: break`.
@@ -6510,67 +6563,59 @@ mod tests {
         assert!(entry_block.exits[0].llexitcase.is_none());
     }
 
+    /// The MIR front raises through a block of its own, so the edge only
+    /// reaches the shape `remove_assertion_errors` matches after the
+    /// retarget.  A block holding operations the dead-op pass would reclaim
+    /// qualifies; one holding a `getslice` — outside `CanRemove` — does not.
     #[test]
-    fn remove_assertion_errors_prunes_through_single_entry_raise_block() {
-        let mut graph = FunctionGraph::new("indirect_assertion_error");
-        let entry = graph.startblock;
-        let live = graph.create_block();
-        let raise = graph.create_block();
-        let cond = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "cond".into(),
-                    ty: ValueType::Bool,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_branch(entry, cond, raise, vec![], live, vec![]);
-        graph.set_raise_implicit(raise, "ValueError");
+    fn retarget_assert_raise_blocks_judges_the_block_by_can_remove() {
+        let build = |unremovable: bool| {
+            let mut graph = FunctionGraph::new("indirect_assertion_error");
+            let entry = graph.startblock;
+            let live = graph.create_block();
+            let raise = graph.create_block();
+            let cond = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "cond".into(),
+                        ty: ValueType::Bool,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_branch(entry, cond, raise, vec![], live, vec![]);
+            let base = graph
+                .push_op_var(raise, OpKind::ConstInt(42), true)
+                .unwrap();
+            if unremovable {
+                graph
+                    .push_op_var(raise, OpKind::GetSlice { args: vec![base] }, true)
+                    .unwrap();
+            }
+            graph.set_raise_implicit(raise, "ValueError");
+            (graph, entry, live, raise)
+        };
 
-        assert_eq!(remove_assertion_errors(&mut graph), 1);
-        let entry_block = graph.block(entry);
+        let (mut removable, entry, live, _) = build(false);
+        assert_eq!(retarget_assert_raise_blocks(&mut removable), 1);
+        assert_eq!(remove_assertion_errors(&mut removable), 1);
+        let entry_block = removable.block(entry);
         assert_eq!(entry_block.exits.len(), 1);
         assert_eq!(entry_block.exits[0].target, live);
         assert!(entry_block.exitswitch.is_none());
         assert!(entry_block.exits[0].exitcase.is_none());
-        assert!(entry_block.exits[0].llexitcase.is_none());
-    }
 
-    #[test]
-    fn remove_assertion_errors_keeps_raise_block_with_multiple_entries() {
-        let mut graph = FunctionGraph::new("shared_assertion_error");
-        let entry = graph.startblock;
-        let other_predecessor = graph.create_block();
-        let live = graph.create_block();
-        let raise = graph.create_block();
-        let cond = graph
-            .push_op_var(
-                entry,
-                OpKind::Input {
-                    name: "cond".into(),
-                    ty: ValueType::Bool,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_branch(entry, cond, raise, vec![], live, vec![]);
-        graph.set_goto(other_predecessor, raise, vec![]);
-        graph.set_raise_implicit(raise, "ValueError");
-
-        assert_eq!(remove_assertion_errors(&mut graph), 0);
-        assert_eq!(graph.block(entry).exits.len(), 2);
+        let (mut kept, entry, _, raise) = build(true);
+        assert_eq!(retarget_assert_raise_blocks(&mut kept), 0);
+        assert_eq!(remove_assertion_errors(&mut kept), 0);
         assert!(
-            graph
-                .block(entry)
+            kept.block(entry)
                 .exits
                 .iter()
                 .any(|exit| exit.target == raise)
         );
-        assert_eq!(graph.block(other_predecessor).exits[0].target, raise);
     }
 
     #[test]

@@ -1306,7 +1306,8 @@
       "dynasm": "PASS"
     },
     "test.test_urllibnet": {
-      "dynasm": "PASS"
+      "dynasm": "SKIP",
+      "reason": "requires external network resource"
     },
     "test.test_urlparse": {
       "cranelift": "PASS",

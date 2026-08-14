@@ -62,6 +62,15 @@ assert re.compile("(a+)").match("aaa").groups() == ("aaa",)
 assert re.compile("(a)(bc)").match("abc")[1] == "a"
 assert re.compile("a(b)(?P<a>c)d").match("abcd").groupdict() == {"a": "c"}
 
+# Keep later dynamically-created selectors alive while each earlier group
+# slice allocates.  Repetition crosses the moving nursery boundary, exercising
+# the gateway argument-rooting path rather than only immortal integer indices.
+named_match = re.compile("(?P<left>a)(?P<right>bc)").match("abc")
+for i in range(4096):
+    left = ("left" + str(i))[:4]
+    right = ("right" + str(i))[:5]
+    assert named_match.group(left, right) == ("a", "bc")
+
 # test op branch
 assert re.compile(r"((?=\d|\.\d)(?P<int>\d*)|a)").match("123.2132").group() == "123"
 

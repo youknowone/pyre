@@ -157,17 +157,15 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     }
                     crate::baseobjspace::str_utf8_w(args[1])?.to_string()
                 };
-                let addr =
-                    rustpython_host_env::ctypes::lookup_function_symbol_addr(h, name.as_bytes())
-                        .map_err(|e| {
-                            use rustpython_host_env::ctypes::LookupSymbolError as L;
-                            let msg = match e {
-                                L::LibraryNotFound => "library not found".to_string(),
-                                L::LibraryClosed => "library closed".to_string(),
-                                L::Load(s) => s,
-                            };
-                            crate::PyError::os_error(format!("dlsym({name}): {msg}"))
-                        })?;
+                let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
+                    use rustpython_host_env::ctypes::LookupSymbolError as L;
+                    let msg = match e {
+                        L::LibraryNotFound => "library not found".to_string(),
+                        L::LibraryClosed => "library closed".to_string(),
+                        L::Load(s) => s,
+                    };
+                    crate::PyError::os_error(format!("dlsym({name}): {msg}"))
+                })?;
                 Ok(pyre_object::w_int_new(addr as i64))
             },
             2,
@@ -431,7 +429,18 @@ pub(super) fn lookup_symbol(
     handle: usize,
     symbol: &[u8],
 ) -> Result<usize, rustpython_host_env::ctypes::LookupSymbolError> {
-    rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol)
+    use rustpython_host_env::ctypes::LookupSymbolError as Error;
+    let address = rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol)?;
+    // `dlsym` reports a miss by returning NULL, and a resolver that itself
+    // returns NULL — an IFUNC — leaves `dlerror` unset, so the load succeeds
+    // with address 0. `rdynload.dlsym` rejects that: address 0 is not a symbol.
+    if address == 0 {
+        return Err(Error::Load(format!(
+            "symbol '{}' not found",
+            String::from_utf8_lossy(symbol)
+        )));
+    }
+    Ok(address)
 }
 
 #[cfg(all(windows, feature = "host_env"))]

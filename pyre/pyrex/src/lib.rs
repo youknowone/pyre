@@ -466,9 +466,19 @@ pub fn main_entry(binary_name: &'static str) {
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         std::thread::Builder::new()
             .stack_size(INTERPRETER_THREAD_STACK_SIZE)
-            .spawn(|| {
-                // See the announcement note above; the same reasoning applies
-                // to this thread, whose own stack is larger still.
+            .spawn(move || {
+                // Same first statement `_thread`'s worker runs
+                // (`module/thread/mod.rs`): announce the stack this thread is
+                // budgeted against, and capture the base here at the outermost
+                // interpreter entry. Left out, `effective_stack_length` falls
+                // back to `getrlimit(RLIMIT_STACK)`, which describes the
+                // process's original thread and not this one, and the byte
+                // guard — not the recursion limit — ends up deciding how deep
+                // Python can recurse.
+                //
+                // The announced figure is the shared one, not
+                // INTERPRETER_THREAD_STACK_SIZE: the budget it sizes is stored
+                // in a process-global word every thread's inline probe reads.
                 pyre_interpreter::stack_check::configure_current_thread_stack_size(
                     pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
                 );
@@ -879,12 +889,13 @@ fn maybe_print_jit_stats() {
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
         "[jit-stats] loops_compiled={} bridges_compiled={} retraces_compiled={} loops_aborted={} \
-         guard_failures={} internal_compile_panics={}",
+         guard_failures={} back_edge_polls={} internal_compile_panics={}",
         stats.loops_compiled,
         stats.bridges_compiled,
         stats.retraces_compiled,
         stats.loops_aborted,
         stats.guard_failures,
+        stats.back_edge_polls,
         stats.internal_compile_panics,
     );
     // How those `guard_failures` are distributed: a handful of guards eating
@@ -1873,7 +1884,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_heapsize;
+    use super::{parse_heapsize, set_last_exec_ctx, setup_exec_context};
 
     #[test]
     fn heapsize_suffixes_and_validation() {
@@ -1886,5 +1897,23 @@ mod tests {
         assert!(parse_heapsize("0").is_err());
         assert!(parse_heapsize("abc").is_err());
         assert!(parse_heapsize("").is_err());
+    }
+
+    #[test]
+    fn repeated_runtime_setup_reuses_space_signal_action() {
+        // pypy/module/signal/moduledef.py:64-66 owns this action on `space`,
+        // not on an ExecutionContext.  Embeddings may create more than one
+        // top-level EC in a process; each must cache the same action pointer
+        // without adding another process-lifetime Box/actionflag entry.
+        let first = setup_exec_context();
+        let first_action = first
+            .check_signal_action
+            .expect("runtime setup installs signal action");
+        let second = setup_exec_context();
+        let second_action = second
+            .check_signal_action
+            .expect("repeated runtime setup installs signal action");
+        assert!(std::ptr::addr_eq(first_action, second_action));
+        set_last_exec_ctx(std::ptr::null());
     }
 }

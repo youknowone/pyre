@@ -2438,6 +2438,23 @@ pub fn call_with_kwargs_in_ctx(
     let current_kwarg = |index: usize| {
         pyre_object::gc_roots::shadow_stack_get(call_root_base + 1 + pos_args.len() + index)
     };
+    // `Arguments` survives the whole dispatch upstream because its
+    // `arguments_w`/`keywords_w` lists are traced and updated in place. The
+    // builtin ABI passes a raw `&[PyObjectRef]` copy the collector cannot see,
+    // so every forward across an allocating call rebuilds the view from the
+    // roots pinned above rather than handing on the incoming slices.
+    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
+        for index in 0..pos_args.len() {
+            dst.push(current_pos_arg(index));
+        }
+    };
+    let current_kwargs = || -> Vec<(Wtf8Buf, PyObjectRef)> {
+        kwargs
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| (name.clone(), current_kwarg(index)))
+            .collect()
+    };
 
     // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
     // no implicit argument; forward the original positional and keyword
@@ -2995,10 +3012,10 @@ pub fn call_with_kwargs_in_ctx(
         // captured ordinary constructors such as
         // `_GenericAlias(origin, args, **kw)`.
         let w_metaclass = if pos_args.len() >= 3
-            && unsafe { pyre_object::is_str(pos_args[0]) }
-            && unsafe { pyre_object::is_tuple(pos_args[1]) }
+            && unsafe { pyre_object::is_str(current_pos_arg(0)) }
+            && unsafe { pyre_object::is_tuple(current_pos_arg(1)) }
         {
-            calculate_metaclass(current_type(), pos_args[1]).unwrap_or(current_type())
+            calculate_metaclass(current_type(), current_pos_arg(1)).unwrap_or(current_type())
         } else {
             current_type()
         };
@@ -3012,11 +3029,12 @@ pub fn call_with_kwargs_in_ctx(
             let new_fn = unsafe { unwrap_static_new(new_fn) };
             let mut new_args = Vec::with_capacity(1 + pos_args.len());
             // `lookup_in_type` interns its name and can collect; reload the
-            // winning metaclass rather than retaining its pre-lookup address.
+            // winning metaclass and the arguments rather than retaining their
+            // pre-lookup addresses.
             new_args.push(current_metaclass());
-            new_args.extend_from_slice(pos_args);
+            extend_current_args(&mut new_args);
             if unsafe { crate::is_function(new_fn) } && !kwargs.is_empty() {
-                call_with_kwargs_in_ctx(execution_context, new_fn, &new_args, kwargs)?
+                call_with_kwargs_in_ctx(execution_context, new_fn, &new_args, &current_kwargs())?
             } else {
                 call_callable_in_ctx(execution_context, new_fn, &new_args)?
             }
@@ -3045,13 +3063,19 @@ pub fn call_with_kwargs_in_ctx(
             // binds itself and receives only the original constructor args.
             let init_result = if unsafe { crate::is_function(init_descr) } {
                 let mut init_args = Vec::with_capacity(1 + pos_args.len());
-                // The `__new__` result is a movable nursery object. Reload
-                // the pointer rooted immediately above instead of retaining
-                // the pre-collection Rust local across argument binding and
-                // descriptor dispatch.
+                // The `__new__` result and the constructor arguments are
+                // movable nursery objects, and `__new__` has just run
+                // arbitrary allocating code. Reload every one of them from
+                // the roots instead of retaining the pre-collection locals
+                // across argument binding and descriptor dispatch.
                 init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
-                init_args.extend_from_slice(pos_args);
-                call_with_kwargs_in_ctx(execution_context, init_descr, &init_args, kwargs)?
+                extend_current_args(&mut init_args);
+                call_with_kwargs_in_ctx(
+                    execution_context,
+                    init_descr,
+                    &init_args,
+                    &current_kwargs(),
+                )?
             } else {
                 let init_fn = unsafe {
                     crate::baseobjspace::get(
@@ -3061,7 +3085,11 @@ pub fn call_with_kwargs_in_ctx(
                     )?
                 }
                 .unwrap_or(init_descr);
-                call_with_kwargs_in_ctx(execution_context, init_fn, pos_args, kwargs)?
+                // Binding the descriptor allocates, so the arguments are
+                // reloaded after it rather than before.
+                let mut init_args = Vec::with_capacity(pos_args.len());
+                extend_current_args(&mut init_args);
+                call_with_kwargs_in_ctx(execution_context, init_fn, &init_args, &current_kwargs())?
             };
             check_init_returned_none(init_result)?;
         }
@@ -3084,33 +3112,24 @@ pub fn call_with_kwargs_in_ctx(
         // `user_call_slot` may run a descriptor and collect.  Rebuild the
         // Arguments view from the roots installed at function entry instead
         // of forwarding the stale incoming slices.
-        let current_pos_args: Vec<PyObjectRef> = (0..pos_args.len()).map(current_pos_arg).collect();
-        let current_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = kwargs
-            .iter()
-            .enumerate()
-            .map(|(index, (name, _))| (name.clone(), current_kwarg(index)))
-            .collect();
         if prepend_receiver {
-            let mut call_args = Vec::with_capacity(1 + current_pos_args.len());
+            let mut call_args = Vec::with_capacity(1 + pos_args.len());
             call_args.push(current_callable());
-            call_args.extend_from_slice(&current_pos_args);
+            extend_current_args(&mut call_args);
             return call_with_kwargs_in_ctx(
                 execution_context,
                 call_fn,
                 &call_args,
-                &current_kwargs,
+                &current_kwargs(),
             );
         }
         // Depth guard: count this dispatch level and, dropping after the call,
         // keep it off the tail so a self-referential `A.__call__ = A()`
         // recurses natively for stack_check (see call_callable_with_mode).
         let _depth_guard = enter_native_dispatch();
-        return call_with_kwargs_in_ctx(
-            execution_context,
-            call_fn,
-            &current_pos_args,
-            &current_kwargs,
-        );
+        let mut call_args = Vec::with_capacity(pos_args.len());
+        extend_current_args(&mut call_args);
+        return call_with_kwargs_in_ctx(execution_context, call_fn, &call_args, &current_kwargs());
     }
 
     // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -4932,18 +4951,39 @@ fn type_descr_call_with_mode(
     if let Some(result) = type_call_special_case(w_type, args, false) {
         return result;
     }
-    check_type_instantiable(w_type)?;
+    // `typeobject.py:731,738-739` threads one `__args__` through `__new__` and
+    // then `__init__`; it needs no reload because `Arguments.arguments_w` is a
+    // traced list the moving GC updates in place. This slice is a raw copy the
+    // collector cannot see, so pin the type and every argument here and read
+    // them back from the shadow stack after `__new__` has run Python code.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_type);
+    for &arg in args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
+        for index in 0..args.len() {
+            dst.push(pyre_object::gc_roots::shadow_stack_get(
+                root_base + 1 + index,
+            ));
+        }
+    };
+
+    check_type_instantiable(current_type())?;
     // Step 1: Look up __new__ via type MRO → allocate instance.
     // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =
     // self.lookup_where('__new__')`; a missing descriptor (the pathological
     // mro-without-object case) raises, otherwise the descriptor is bound via
     // `space.get(w_newdescr, space.w_None, w_type=self)` and called with
     // w_type as the first arg.
-    let Some(new_descr) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") })
+    let Some(new_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(current_type(), "__new__") })
     else {
         // typeobject.py:715 — `raise oefmt(space.w_TypeError,
         // "cannot create '%N' instances", self)`.
-        let name = unsafe { pyre_object::w_type_get_name(w_type) };
+        let name = unsafe { pyre_object::w_type_get_name(current_type()) };
         return Err(crate::PyError::type_error(format!(
             "cannot create '{name}' instances"
         )));
@@ -4951,12 +4991,13 @@ fn type_descr_call_with_mode(
     // typeobject.py:726 — `w_newfunc = space.get(w_newdescr, space.w_None,
     // w_type=self)`.  A descriptor with no __get__ (`get` → None) is its own
     // bound value, matching `space.get`'s `if w_get is None: return w_descr`.
-    let new_fn = unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, w_type)? }
-        .unwrap_or(new_descr);
+    let new_fn =
+        unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, current_type())? }
+            .unwrap_or(new_descr);
     // typeobject.py:731 — `space.call_obj_args(w_newfunc, self, __args__)`.
     let mut new_args = Vec::with_capacity(1 + args.len());
-    new_args.push(w_type);
-    new_args.extend_from_slice(args);
+    new_args.push(current_type());
+    extend_current_args(&mut new_args);
     let instance = call_callable_with_mode(execution_context, new_fn, &new_args, mode)?;
     let _instance_roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4965,20 +5006,24 @@ fn type_descr_call_with_mode(
 
     // Step 2: __init__ — only if __new__ returned an instance of w_type.
     // PyPy: descr_call — skips __init__ when __new__ returns a foreign type.
-    if let Some(w_insttype) = type_call_init_type(current_instance(), w_type)
+    if let Some(w_insttype) = type_call_init_type(current_instance(), current_type())
         && let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
     {
         let init_result = if unsafe { crate::is_function(init_descr) } {
             let mut init_args = Vec::with_capacity(1 + args.len());
             init_args.push(current_instance());
-            init_args.extend_from_slice(args);
+            extend_current_args(&mut init_args);
             call_callable_with_mode(execution_context, init_descr, &init_args, mode)?
         } else {
             let init_fn =
                 unsafe { crate::baseobjspace::get(init_descr, current_instance(), w_insttype)? }
                     .unwrap_or(init_descr);
-            call_callable_with_mode(execution_context, init_fn, args, mode)?
+            // Binding the descriptor allocates, so the arguments are reloaded
+            // after it rather than before.
+            let mut init_args = Vec::with_capacity(args.len());
+            extend_current_args(&mut init_args);
+            call_callable_with_mode(execution_context, init_fn, &init_args, mode)?
         };
         check_init_returned_none(init_result)?;
     }

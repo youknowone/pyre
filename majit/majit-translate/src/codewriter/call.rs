@@ -5946,10 +5946,22 @@ impl CallControl {
                 // collectanalyze.py:27-33: analyze_simple_operation
                 // RPython checks: malloc/malloc_varsize with flavor='gc' → True
                 //                 LL_OPERATIONS[op.opname].canmallocgc → True
-                // majit codewriter graphs have no LL_OPERATIONS; the only
-                // operations that can trigger GC are transitive through calls.
-                // (All other OpKind variants are pure/field/array ops.)
                 match &op.kind {
+                    // collectanalyze.py:28-30 — `malloc` / `malloc_varsize`
+                    // with `flavor='gc'`. These four variants are that
+                    // operation on this side of jtransform: `New` and
+                    // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
+                    // (`rewrite_op_malloc`, jtransform.py:1012-1045),
+                    // `NewArrayClear` is `new_array_clear`
+                    // (jtransform.py:1858-1863), and `NewListClear` allocates
+                    // a GcStruct plus a cleared items array
+                    // (pyjitpl.py:792-798). This graph model carries no
+                    // `flavor='raw'` allocation, so there is no flavour test
+                    // to make — every allocation op here is a GC one.
+                    OpKind::New { .. }
+                    | OpKind::NewWithVtable { .. }
+                    | OpKind::NewArrayClear { .. }
+                    | OpKind::NewListClear { .. } => return true,
                     OpKind::Call { target, .. } => {
                         // graphanalyze.py:139-164: analyze_direct_call — recurse
                         let callee_path = match self.target_to_path(target) {
@@ -9318,6 +9330,69 @@ mod tests {
 
     fn register_int_result_graph(cc: &mut CallControl, path: CallPath, graph: FunctionGraph) {
         cc.register_function_graph(path, graph.with_return_type("i64"));
+    }
+
+    /// `collectanalyze.py:27-31 analyze_simple_operation` answers `True` for
+    /// `malloc` / `malloc_varsize` with `flavor='gc'`. This graph model spells
+    /// that operation four ways, and each has to answer on its own — a graph
+    /// reaching an allocation collects even when it calls nothing.
+    ///
+    /// The negative control is the point of the test as much as the positive
+    /// ones: before the allocation arms existed, `analyze_can_collect` could
+    /// only answer `true` through `close_stack` or `random_effects_on_gcobjs`,
+    /// and the latter is set by the `gc_effects` hint, which nothing in the
+    /// corpus carries. Every allocator therefore analysed as "cannot collect",
+    /// so an all-`false` verdict is exactly what the regression looks like and
+    /// a test that only checked the negative case would not have seen it.
+    #[test]
+    fn each_gc_allocation_op_collects_and_an_allocation_free_graph_does_not() {
+        let alloc_kinds = [
+            OpKind::New {
+                owner: "W_IntObject".to_string(),
+            },
+            OpKind::NewWithVtable {
+                owner: "W_FloatObject".to_string(),
+                vtable: 1,
+            },
+            OpKind::NewArrayClear {
+                length: crate::flowspace::model::Variable::new(),
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+            },
+            OpKind::NewListClear {
+                length: crate::flowspace::model::Variable::new(),
+                item_ty: ValueType::Ref(None),
+                array_type_id: None,
+            },
+        ];
+
+        for kind in alloc_kinds {
+            let label = format!("{kind:?}");
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("allocating");
+            let start = graph.startblock;
+            graph.blocks[start.0]
+                .operations
+                .push(SpaceOperation { result: None, kind });
+            graph.set_return(start, None);
+            let path = CallPath::from_segments(["allocating"]);
+            cc.register_function_graph(path.clone(), graph);
+
+            let mut seen = HashSet::new();
+            assert!(
+                cc.analyze_can_collect(&path, &mut seen),
+                "a graph whose only operation is {label} must analyse as collecting"
+            );
+        }
+
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["allocation_free"]);
+        cc.register_function_graph(path.clone(), simple_graph("allocation_free"));
+        let mut seen = HashSet::new();
+        assert!(
+            !cc.analyze_can_collect(&path, &mut seen),
+            "a graph with no allocation and no call must analyse as not collecting"
+        );
     }
 
     /// Helper: create a FunctionGraph whose entry block routes to the

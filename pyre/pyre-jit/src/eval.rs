@@ -720,15 +720,18 @@ unsafe fn ssl_socket_destructor(obj_addr: usize) {
 
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
-/// `W_Random`; instance `map`+`storage`,
-/// `mapdict.py:907-910`).  The `storage` list is an off-GC
-/// `Box<Vec<PyObjectRef>>`, so — exactly as `dict_object_custom_trace`
-/// reaches the off-GC dict entries — this forwards each boxed
-/// attribute-value slot in place via `instance_walk_boxed_storage`,
-/// which consults the map to skip erased unboxed (`Vec<i64>`) slots
-/// (`mapdict.py:438/447` boxed `erase_item` vs `:601/612`
-/// `erase_unboxed`).  The off-GC `Vec` stays put; only its
-/// `PyObjectRef` contents are relocated.
+/// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
+///
+/// `storage` is a GC-managed leaf block (`W_MAPDICT_STORAGE_GC_TYPE_ID`,
+/// allocated stable and non-moving by `alloc_mapdict_storage_block`), so the
+/// collector reaches its slots only through this trace:
+/// `instance_walk_boxed_storage` forwards the `storage` reference itself and
+/// then every slot in `0..capacity` in place.  It consults no map — an
+/// unboxed longlong attribute stores the erased `GC_INT_ARRAY` block
+/// (`erase_unboxed`, `mapdict.py:601/612`), which is an ordinary GC reference
+/// like every boxed slot (`mapdict.py:438/447` `erase_item`), so no slot has
+/// to be skipped.  The block itself never moves; only the slot contents are
+/// relocated.
 ///
 /// `ob_header.w_class` is the instance's class reachability edge — the
 /// equivalent of PyPy reaching the class through the traced
@@ -7092,14 +7095,47 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // call-bearing bodies to interpretation until the exit state stops
     // rooting what it no longer resumes.
     //
+    // The scan narrows how often the in-flight delivery gap is reached;
+    // it is not a boundary the gap stays behind. Before #1174 this body,
+    // which is call-free and which the scan admits, lost a whole OUTER
+    // iteration — 59 of 60 appends, twice in 400 runs, on dynasm and on
+    // cranelift, 60 with the JIT off:
+    //
+    //     for index in items:
+    //         out.append([index for _ in range(1)])
+    //
+    // The route was TWO in-flight entries and a take that selected on
+    // recency, not the R1 body-effect refusal and not a mislabelled
+    // coordinate: `inflight_foriter_body_pc` resolves the outer loop's
+    // `for_iter_next` (JitCode pc 153) to Python pc 5 and the inner one
+    // (631) to 34, both correct. The outer `list` loop captured through
+    // the residual leg and the inner `range` body through the specialised
+    // leg, so `fbw_foriter_inflight_take` popped the inner entry — whose
+    // body pc a frame parked at the outer header can never accept — and
+    // cleared the outer entry it could have delivered. Selecting the
+    // entry that matches the parked frame fixes that, and is what the
+    // take now does.
+    //
+    // The shape no longer reaches it here: #1174 made that walk raise
+    // `callee_inline_blackhole_required` where it raised
+    // `callee_inline_unsupported`, so it stops aborting — 0 in-flight
+    // takes and 0 divergences across the whole probe family — which also
+    // means this base cannot re-witness the fix end to end; the selection
+    // is pinned by `take_selects_the_entry_the_parked_frame_can_accept_…`
+    // instead. `SET_ADD` and `MAP_ADD` spell the same shape and carry no
+    // scan at all. Closing the rest is the in-flight delivery gap
+    // (single-executor tracing, gh#73/#34).
+    //
     // A value-producing but call-free body — arithmetic, subscript, or
     // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
-    // `[{i: i} …]`, `[f"{i}" …]`) — is admissible. Its append is
-    // exact-resume safe: the only residual an Object-strategy append
-    // leaves in the folded body is the idempotent `list_write_barrier`,
-    // now exempt from the FBW body-effect accounting (it is not a body
-    // effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl never
-    // executes and the optimizer never treats as a side effect).
+    // `[{i: i} …]`, `[f"{i}" …]`) — is admitted. The only residual an
+    // Object-strategy append leaves in the folded body is the idempotent
+    // `list_write_barrier`, now exempt from the FBW body-effect
+    // accounting (it is not a body effect, mirroring RPython's
+    // `COND_CALL_GC_WB`, which pyjitpl never executes and the optimizer
+    // never treats as a side effect). That exemption keeps the append
+    // itself out of the body-effect accounting; it does not make the
+    // enclosing loop exact-resume safe, per the shape above.
     //
     // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted
     // too: the fold virtualizes the inner list, whose separately
@@ -8451,9 +8487,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
 /// double-apply guard lives in `fbw_foriter_inflight_take`.
 fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     let code_ptr = unsafe { pyre_interpreter::pyframe_get_pycode(frame) } as usize;
-    let Some((item, body_pc)) =
-        pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take(code_ptr)
-    else {
+    // The stash can hold one entry per in-flight FOR_ITER of this frame, and
+    // only the one whose header the frame is parked at can be pushed here, so
+    // the take selects on those coordinates rather than on recency.
+    let frame_addr = &*frame as *const PyFrame as usize;
+    let resume_py_pc = frame.next_instr();
+    let Some((item, body_pc)) = pyre_jit_trace::jitcode_dispatch::fbw_foriter_inflight_take(
+        code_ptr,
+        frame_addr,
+        resume_py_pc,
+    ) else {
         return false;
     };
     // #57 Option C (Finding #3, loud-failure assert): the R1 guard in
