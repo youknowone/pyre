@@ -10488,7 +10488,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
 
@@ -10848,7 +10848,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = active;
-    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
 

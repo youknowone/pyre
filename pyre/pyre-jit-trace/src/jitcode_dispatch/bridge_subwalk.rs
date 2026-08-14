@@ -375,7 +375,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             registers_f: &mut top_regs_f,
             concrete_registers_r: &mut top_concrete_r,
             concrete_registers_i: &mut top_concrete_i,
-            descr_refs,
+            descr_refs: &descr_refs,
             raw_descrs,
             is_authoritative_executor,
             trace_ctx,

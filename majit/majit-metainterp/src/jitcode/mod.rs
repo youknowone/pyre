@@ -292,22 +292,15 @@ impl RuntimeBhDescr {
     }
 }
 
-/// Newtype so the write-once, read-only global descr pool can live in a
-/// `static`.  `RuntimeBhDescr` is `!Sync` only because its
-/// `Call(JitCallTarget)` variant carries raw function-address pointers; the
-/// pool this crate installs never holds that variant (build-time jitcodes'
-/// residual-call targets resolve from a funcptr register at dispatch time),
-/// and the pool is written once through the `OnceLock` and thereafter only
-/// read, so sharing it across threads is sound — the same `unsafe impl`
-/// rationale as [`JitCode`] itself above.
-struct GlobalDescrPool(Vec<RuntimeBhDescr>);
+/// Runtime view of the process-global build-time descriptor pool.
+pub trait RuntimeDescrTable: Sync {
+    fn get(&self, index: usize) -> Option<&'static RuntimeBhDescr>;
+    fn len(&self) -> usize;
 
-// SAFETY: `GlobalDescrPool` is written once (via `OnceLock::set`) and read-only
-// thereafter; the raw pointers `RuntimeBhDescr` can carry are stable code
-// addresses, and the pool this crate installs carries none. `OnceLock<T>: Sync`
-// additionally requires `T: Send`.
-unsafe impl Send for GlobalDescrPool {}
-unsafe impl Sync for GlobalDescrPool {}
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Process-global build-time descr pool — RPython's single shared
 /// `Assembler.descrs` (`assembler.py:23`).  Runtime-emitted jitcodes keep a
@@ -318,27 +311,22 @@ unsafe impl Sync for GlobalDescrPool {}
 /// crate (`pyre-jit-trace`) from its build-time `ALL_DESCRS` / `ALL_JITCODES`
 /// tables; `majit-metainterp` cannot build it because those tables live above
 /// it.
-static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<GlobalDescrPool> = std::sync::OnceLock::new();
+static GLOBAL_BUILD_DESCR_POOL: std::sync::OnceLock<&'static dyn RuntimeDescrTable> =
+    std::sync::OnceLock::new();
 
 /// Install the process-global build-time descr pool.  Idempotent: the first
 /// call wins and later calls are ignored (the pool is a frozen build artifact,
 /// identical across callers).  See `GLOBAL_BUILD_DESCR_POOL`.
 ///
-/// `build` runs only on the call that installs the pool.  It takes a closure
-/// rather than a built `Vec` because the callers sit on hot paths — the jd1
-/// driver installs before every `_unpackiterable_unknown_length` walk — and
-/// building the pool clones every `BhDescr` in the binary (including each call
-/// descr's `EffectInfo` raw descr sets).  Materializing that just to have
-/// `OnceLock::set` drop it is the whole cost of the call.
-pub fn init_global_build_descr_pool(build: impl FnOnce() -> Vec<RuntimeBhDescr>) {
-    GLOBAL_BUILD_DESCR_POOL.get_or_init(|| GlobalDescrPool(build()));
+pub fn init_global_build_descr_pool(table: &'static dyn RuntimeDescrTable) {
+    let _ = GLOBAL_BUILD_DESCR_POOL.set(table);
 }
 
 /// The installed global build-time descr pool, or `None` if the embedding
 /// crate has not installed one (e.g. a standalone metainterp unit test that
 /// only exercises runtime-built jitcodes).
-pub(crate) fn global_build_descr_pool() -> Option<&'static [RuntimeBhDescr]> {
-    GLOBAL_BUILD_DESCR_POOL.get().map(|pool| pool.0.as_slice())
+pub(crate) fn global_build_descr_pool() -> Option<&'static dyn RuntimeDescrTable> {
+    GLOBAL_BUILD_DESCR_POOL.get().copied()
 }
 
 /// Per-`JitCode` descrs.  Pyre's analog of

@@ -1703,6 +1703,54 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
     out
 }
 
+/// Shared assembler descriptor table installed on every blackhole frame.
+///
+/// `blackhole.py:102-103` stores the assembler's own list, and :154 only
+/// indexes it. The translated runtime can therefore preserve that interface
+/// while choosing whether an entry already exists or must be reconstituted
+/// from the build artefact on first access.
+/// The receiver is `&'static self`, not `&self`, so an entry borrowed out of
+/// the table carries the table's own lifetime. Every holder — the builder's
+/// `descrs` field and each blackhole frame's — is already `&'static dyn
+/// DescrTable`, so this costs no caller anything, and it is what lets the
+/// slice impl below hand back a `&'static BhDescr` without an unchecked
+/// lifetime widening. With a plain `&self` the `'static` on the return type
+/// would be a promise the type system never checks: a table borrowed for a
+/// shorter scope would mint dangling entries.
+pub trait DescrTable: Sync {
+    fn get(&'static self, index: usize) -> Option<&'static BhDescr>;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl DescrTable for [BhDescr] {
+    fn get(&'static self, index: usize) -> Option<&'static BhDescr> {
+        <[BhDescr]>::get(self, index)
+    }
+
+    fn len(&self) -> usize {
+        <[BhDescr]>::len(self)
+    }
+}
+
+impl<const N: usize> DescrTable for [BhDescr; N] {
+    fn get(&'static self, index: usize) -> Option<&'static BhDescr> {
+        self.as_slice().get(index)
+    }
+
+    fn len(&self) -> usize {
+        N
+    }
+}
+
+static EMPTY_DESCRS: [BhDescr; 0] = [];
+
+pub static EMPTY_DESCR_TABLE: &(dyn DescrTable + 'static) = &EMPTY_DESCRS;
+
 impl BhDescr {
     /// Extract byte offset for field/array operations (FieldDescr/ArrayDescr).
     /// Panics on VableField/VableArray — those must use `as_vable_field_index`.

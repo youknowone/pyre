@@ -128,7 +128,7 @@ pub enum BhReturnType {
 /// Re-export BhDescr from codewriter::jitcode — shared descriptor type
 /// between codewriter assembler and blackhole interpreter.
 /// RPython `history.py:AbstractDescr` parity.
-pub use majit_translate::jitcode::{BhCallDescr, BhDescr};
+pub use majit_translate::jitcode::{BhCallDescr, BhDescr, DescrTable, EMPTY_DESCR_TABLE};
 
 /// Per-jitdriver static data visible to the blackhole interpreter.
 ///
@@ -201,7 +201,7 @@ pub struct BlackholeInterpreter {
     /// stores the assembler list itself, so the table is shared and never
     /// copied; :154 is its only consumer and only reads. This has the same
     /// lifetime shape as the sibling `cpu: Option<&'static dyn Backend>`.
-    pub descrs: &'static [BhDescr],
+    pub descrs: &'static dyn DescrTable,
     /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:290` `self.op_rvmprof_code = builder.op_rvmprof_code`.
@@ -385,7 +385,7 @@ impl Default for BlackholeInterpreter {
         Self {
             cpu: None,
             // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
-            descrs: &[],
+            descrs: EMPTY_DESCR_TABLE,
             // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
             // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
             op_catch_exception: u8::MAX,
@@ -2043,7 +2043,7 @@ pub struct BlackholeInterpBuilder {
     pub op_rvmprof_code: u8,
     /// RPython `blackhole.py:103` `self.descrs`.
     /// Populated by `setup_descrs()` from the assembler's descriptor table.
-    pub descrs: &'static [BhDescr],
+    pub descrs: &'static dyn DescrTable,
     /// Dispatch table: opcode byte → handler fn pointer.
     /// RPython builds `dispatch_loop` closure via `unrolling_iterable`;
     /// Rust uses indirect call through this table.
@@ -2080,7 +2080,7 @@ impl BlackholeInterpBuilder {
             op_catch_exception: u8::MAX,
             op_rvmprof_code: u8::MAX,
             // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
-            descrs: &[],
+            descrs: EMPTY_DESCR_TABLE,
             dispatch_table: std::sync::Arc::new(Vec::new()),
             jitdrivers_sd: Vec::new(),
         }
@@ -2222,7 +2222,7 @@ impl BlackholeInterpBuilder {
     }
 
     /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
-    pub fn setup_descrs(&mut self, descrs: &'static [BhDescr]) {
+    pub fn setup_descrs(&mut self, descrs: &'static dyn DescrTable) {
         self.descrs = descrs;
     }
 
@@ -4741,13 +4741,10 @@ mod tests {
         fn test_clone_context_from_mirrors_acquire_interp_fields() {
             let mut builder = super::build_inline_call_only_bh_builder();
             let mut parent = builder.acquire_interp();
-            let table: &'static [BhDescr] = Box::leak(
-                vec![
-                    BhDescr::VableField { index: 1 },
-                    BhDescr::VableArray { index: 2 },
-                ]
-                .into_boxed_slice(),
-            );
+            let table: &'static [BhDescr; 2] = Box::leak(Box::new([
+                BhDescr::VableField { index: 1 },
+                BhDescr::VableArray { index: 2 },
+            ]));
             parent.descrs = table;
             // Make the parent's vable / jitdriver state non-default so
             // the assertion below distinguishes "copied" from
@@ -4766,7 +4763,10 @@ mod tests {
             assert_eq!(callee.op_rvmprof_code, parent.op_rvmprof_code);
             assert_eq!(callee.op_live, parent.op_live);
             assert!(
-                std::ptr::eq(callee.descrs.as_ptr(), parent.descrs.as_ptr()),
+                std::ptr::eq(
+                    std::ptr::from_ref(callee.descrs).cast::<()>(),
+                    std::ptr::from_ref(parent.descrs).cast::<()>(),
+                ),
                 "clone_context_from must alias the parent table"
             );
             assert_eq!(callee.virtualizable_ptr, parent.virtualizable_ptr);
@@ -6874,7 +6874,12 @@ fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a
         });
         return (descr, pos + 2);
     }
-    let descr = &bh.descrs[descr_idx]; // RPython: no fallback, index must be valid
+    let descr = bh.descrs.get(descr_idx).unwrap_or_else(|| {
+        panic!(
+            "d-arg descrs[{descr_idx}] is out of range for {} entries",
+            bh.descrs.len()
+        )
+    }); // RPython: no fallback, index must be valid
     (descr, pos + 2)
 }
 

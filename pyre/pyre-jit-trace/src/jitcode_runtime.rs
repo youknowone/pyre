@@ -19,14 +19,11 @@
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, Once};
+use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
 
 use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;
-use majit_translate::jitcode::{BhDescr, JitCode};
-
-static REHYDRATED_CALL_DESCR_REFS: LazyLock<Mutex<Vec<Option<DescrRef>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+use majit_translate::jitcode::{BhDescr, DescrTable, JitCode};
 
 struct JitCodeIndex {
     names: Vec<String>,
@@ -550,7 +547,7 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
     &INSNS_BYTE_TO_OPNAME
 }
 
-/// Deserialized `pipeline.descrs` — RPython `Assembler.descrs`
+/// Indexed `pipeline.descrs` — RPython `Assembler.descrs`
 /// (assembler.py:23). Handed to `BlackholeInterpBuilder.setup_descrs`
 /// at builder construction (blackhole.py:59 `self.setup_descrs(asm.descrs)`,
 /// :102-103 `def setup_descrs(self, descrs): self.descrs = descrs`).
@@ -559,16 +556,83 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// little-endian index into this pool. The resolved `BhDescr` is what
 /// every `bhimpl_*` handler reads for field offsets, call descriptors,
 /// sub-JitCodes, and switch dicts.
-static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+fn load_descr_index() -> &'static [u32] {
+    const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
+    const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
+    let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize descrs.bin \
+            "pyre-jit-trace: failed to deserialize descrs_index.bin \
              ({} bytes): {e}",
+            INDEX_BYTES.len(),
+        )
+    });
+    assert!(!offsets.is_empty());
+    assert_eq!(offsets.first().copied(), Some(0));
+    assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+    assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+    Box::leak(offsets.into_boxed_slice())
+}
+
+fn descrs_index() -> &'static [u32] {
+    static INDEX: OnceLock<&'static [u32]> = OnceLock::new();
+    INDEX.get_or_init(load_descr_index)
+}
+
+fn descr_count() -> usize {
+    descrs_index().len() - 1
+}
+
+fn load_descr_uncached(index: usize) -> BhDescr {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
+    let offsets = descrs_index();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize descrs.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
             BYTES.len(),
         )
     })
-});
+}
+
+fn descr_cells() -> &'static [OnceLock<&'static BhDescr>] {
+    static CELLS: OnceLock<&'static [OnceLock<&'static BhDescr>]> = OnceLock::new();
+    CELLS.get_or_init(|| {
+        let cells: Vec<OnceLock<&'static BhDescr>> =
+            (0..descr_count()).map(|_| OnceLock::new()).collect();
+        let cells = Box::leak(cells.into_boxed_slice());
+        assert_eq!(
+            cells.len() + 1,
+            descrs_index().len(),
+            "pyre-jit-trace: descr cell count must match the indexed entry count",
+        );
+        cells
+    })
+}
+
+pub fn get_descr_by_index(index: usize) -> Option<&'static BhDescr> {
+    let cell = descr_cells().get(index)?;
+    Some(*cell.get_or_init(|| Box::leak(Box::new(load_descr_uncached(index)))))
+}
+
+struct LazyDescrTable;
+
+impl DescrTable for LazyDescrTable {
+    fn get(&'static self, index: usize) -> Option<&'static BhDescr> {
+        get_descr_by_index(index)
+    }
+
+    fn len(&self) -> usize {
+        descr_count()
+    }
+}
+
+static LAZY_DESCR_TABLE: LazyDescrTable = LazyDescrTable;
+
+pub fn descr_table() -> &'static dyn DescrTable {
+    &LAZY_DESCR_TABLE
+}
 
 /// RPython: `metainterp_sd.opcode_descrs` (`pyjitpl.py:2245-2246`) — the
 /// bytecode constant pool, not `metainterp_sd.all_descrs`.
@@ -578,8 +642,17 @@ static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
 /// `MetaInterpStaticData::finish_setup_descrs`, which enumerates the live
 /// `descr_registry`. The gap between the two tables is what
 /// [`ALL_EI_DESCR_MINTS`] carries.
+#[cfg(test)]
 pub fn all_descrs() -> &'static [BhDescr] {
-    &ALL_DESCRS
+    static MATERIALIZED: OnceLock<&'static [BhDescr]> = OnceLock::new();
+    MATERIALIZED.get_or_init(|| {
+        Box::leak(
+            (0..descr_count())
+                .map(load_descr_uncached)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    })
 }
 
 /// Deserialized `pipeline.ei_descr_mints` — the gccache slots that only an
@@ -686,7 +759,6 @@ pub fn rehydrate_build_descr_raw_sets() {
         // as `AbsentContainer` and its member is dropped from the raw set for
         // the life of the process.
         crate::descr::publish_runtime_descr_groups();
-        let all = all_descrs();
         // `descr.py:25-47 setup_descrs` group order — every non-call slot
         // first.  Each `Size` / `Field` entry publishes its parent's FULL
         // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
@@ -694,9 +766,10 @@ pub fn rehydrate_build_descr_raw_sets() {
         // below can only land on slots that already carry their complete
         // layout.  Resolving in the other order would leave every member
         // whose struct has not been published yet unresolvable.
-        for bh in all.iter() {
+        for i in 0..descr_count() {
+            let bh = load_descr_uncached(i);
             if !matches!(bh, BhDescr::Call { .. } | BhDescr::JitCode { .. }) {
-                crate::descr::make_descr_from_bh(bh);
+                crate::descr::make_descr_from_bh(&bh);
             }
         }
         // Last, and only into what is still empty: the slots no opcode names,
@@ -711,15 +784,14 @@ pub fn rehydrate_build_descr_raw_sets() {
         // asks for with its own numbering.  Publishing what the established
         // producers left over keeps their answers untouched.
         crate::descr::publish_effect_info_descr_mints(&ALL_EI_DESCR_MINTS);
-        let mut refs = vec![None; all.len()];
-        for (i, bh) in all.iter().enumerate() {
-            let calldescr = match bh {
+        for i in 0..descr_count() {
+            let bh = load_descr_uncached(i);
+            let calldescr = match &bh {
                 BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
                 _ => continue,
             };
-            refs[i] = Some(rehydrated_call_descr_ref(calldescr));
+            rehydrated_call_descr_ref(calldescr);
         }
-        *REHYDRATED_CALL_DESCR_REFS.lock().unwrap() = refs;
         report_descr_spelling_gate();
     });
 }
@@ -1017,7 +1089,7 @@ pub fn descr_spelling_gate_recheck_now() {
     }
 }
 
-/// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
+/// Lazy pool of `DescrRef`s indexed alongside [`descr_table`] so the
 /// trace-side jitcode walker
 /// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each
 /// `d`/`j` argcode operand to a real `Arc<dyn Descr>`. Every entry runs
@@ -1049,25 +1121,53 @@ pub fn descr_spelling_gate_recheck_now() {
 /// per-resolution, so record sites that need the same
 /// `Arc` instance still build their own at the call site
 /// until the by-index identity factories land.
-static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
-    let refs: Vec<DescrRef> = all_descrs()
-        .iter()
-        .enumerate()
-        .map(|(i, bh)| match bh {
-            BhDescr::Call { .. } => REHYDRATED_CALL_DESCR_REFS
-                .lock()
-                .unwrap()
-                .get(i)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| crate::descr::make_descr_from_bh(bh)),
-            _ => crate::descr::make_descr_from_bh(bh),
+fn descr_ref_cells() -> &'static [OnceLock<DescrRef>] {
+    static CELLS: OnceLock<&'static [OnceLock<DescrRef>]> = OnceLock::new();
+    CELLS.get_or_init(|| {
+        Box::leak(
+            (0..descr_count())
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    })
+}
+
+/// Resolve one trace-side descriptor without forcing any other pool entry.
+///
+/// `rehydrate_build_descr_raw_sets` must remain first: its non-call pass
+/// publishes every container group into the gccache before the call-descr
+/// pass. Once that ordering has completed, `make_descr_from_bh` resolves the
+/// same cached `Arc` that tracing and EffectInfo raw sets use.
+pub fn descr_ref_at(index: usize) -> Option<DescrRef> {
+    rehydrate_build_descr_raw_sets();
+    let cell = descr_ref_cells().get(index)?;
+    Some(
+        cell.get_or_init(|| {
+            let bh = load_descr_uncached(index);
+            crate::descr::make_descr_from_bh(&bh)
         })
-        .collect();
-    if std::env::var_os("PYRE_FIELD_IDENTITY_CENSUS").is_some() {
-        field_descr_identity_census(&refs);
+        .clone(),
+    )
+}
+
+struct LazyDescrRefTable;
+
+impl crate::jitcode_dispatch::DescrRefTable for LazyDescrRefTable {
+    fn at(&self, index: usize) -> Option<DescrRef> {
+        descr_ref_at(index)
     }
-    refs
-});
+
+    fn len(&self) -> usize {
+        descr_count()
+    }
+}
+
+static LAZY_DESCR_REF_TABLE: LazyDescrRefTable = LazyDescrRefTable;
+
+pub fn descr_ref_table() -> &'static dyn crate::jitcode_dispatch::DescrRefTable {
+    &LAZY_DESCR_REF_TABLE
+}
 
 /// S4c prerequisite measurement — how many build-time `BhDescr::Field` slots
 /// resolve to the SAME `Arc` the runtime `descr.py:218-239 get_field_descr`
@@ -1080,7 +1180,8 @@ static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
 /// strictly worse than the missing raw set it would replace — hence this runs
 /// before the format change, not after.
 pub fn field_descr_identity_census_now() {
-    field_descr_identity_census(all_descr_refs());
+    rehydrate_build_descr_raw_sets();
+    field_descr_identity_census();
 }
 
 /// Same-Arc test for two `DescrRef`s.  `Arc::ptr_eq` on `Arc<dyn Descr>`
@@ -1125,7 +1226,7 @@ impl FieldIdentityClass {
     }
 }
 
-fn field_descr_identity_census(refs: &[DescrRef]) {
+fn field_descr_identity_census() {
     use std::collections::BTreeMap;
 
     let (mut fields, mut keyed, mut parentless) = (0usize, 0usize, 0usize);
@@ -1142,14 +1243,15 @@ fn field_descr_identity_census(refs: &[DescrRef]) {
     let mut pool_from_all_fielddescrs = 0usize;
     let mut samples: Vec<String> = Vec::new();
 
-    for (i, bh) in all_descrs().iter().enumerate() {
+    for i in 0..descr_count() {
+        let bh = load_descr_uncached(i);
         let BhDescr::Field {
             parent,
             name,
             owner,
             index_in_parent,
             ..
-        } = bh
+        } = &bh
         else {
             continue;
         };
@@ -1184,20 +1286,20 @@ fn field_descr_identity_census(refs: &[DescrRef]) {
             }
         };
 
-        let pool = &refs[i];
-        let (_, walker) = majit_metainterp::field_descr_ref_from_bh(bh);
-        let pool_class = classify(pool);
+        let pool = crate::descr::make_descr_from_bh(&bh);
+        let (_, walker) = majit_metainterp::field_descr_ref_from_bh(&bh);
+        let pool_class = classify(&pool);
         let walker_class = classify(&walker);
         *pool_classes.entry(pool_class).or_default() += 1;
         *walker_classes.entry(walker_class).or_default() += 1;
-        if same_arc(pool, &walker) {
+        if same_arc(&pool, &walker) {
             pool_vs_walker_same += 1;
         }
         if let Some(sd) = parent_size.as_ref().and_then(|p| p.as_size_descr()) {
             if sd
                 .all_fielddescrs()
                 .iter()
-                .any(|fd| same_arc(&(fd.clone() as DescrRef), pool))
+                .any(|fd| same_arc(&(fd.clone() as DescrRef), &pool))
             {
                 pool_from_all_fielddescrs += 1;
             }
@@ -1239,10 +1341,45 @@ fn field_descr_identity_census(refs: &[DescrRef]) {
     }
 }
 
-/// `&'static [DescrRef]` view over [`ALL_DESCR_REFS`] for the walker's
-/// `WalkContext::descr_refs` parameter.
+/// Test-only materialized view for fixtures that inspect the complete pool.
+#[cfg(test)]
 pub fn all_descr_refs() -> &'static [DescrRef] {
-    &ALL_DESCR_REFS
+    static MATERIALIZED: OnceLock<&'static [DescrRef]> = OnceLock::new();
+    MATERIALIZED.get_or_init(|| {
+        Box::leak(
+            (0..descr_count())
+                .map(|i| descr_ref_at(i).unwrap())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    })
+}
+
+/// Distinct dense descriptor indices a run actually resolves, recorded when
+/// `PYRE_DESCR_DEMAND` is set.
+///
+/// Entries materialize only when resolved. Gated behind a `OnceLock` env read
+/// so the resolve path pays nothing when the probe is off.
+static DESCR_DEMAND: LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn descr_demand_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PYRE_DESCR_DEMAND").is_some())
+}
+
+pub fn record_descr_demand(index: usize) {
+    if descr_demand_enabled()
+        && let Ok(mut set) = DESCR_DEMAND.lock()
+    {
+        set.insert(index);
+    }
+}
+
+/// `(distinct indices resolved, pool size)`; `(0, _)` when the probe is off.
+pub fn descr_demand_summary() -> (usize, usize) {
+    let touched = DESCR_DEMAND.lock().map(|s| s.len()).unwrap_or(0);
+    (touched, descr_count())
 }
 
 /// Byte offset the build-time descr pool records for `{owner}.{name}`, or
@@ -1255,19 +1392,22 @@ pub fn all_descr_refs() -> &'static [DescrRef] {
 /// `build_time_offset_matches_runtime_layout` test pins that agreement for the
 /// structs the orthodox sub-walk reads.
 pub fn build_time_field_offset(owner: &str, name: &str) -> Option<usize> {
-    all_descrs().iter().find_map(|d| match d {
-        BhDescr::Field {
-            owner: o,
-            name: n,
-            offset,
-            ..
-        } if o == owner && n == name => Some(*offset),
-        _ => None,
+    (0..descr_count()).find_map(|i| {
+        let descr = load_descr_uncached(i);
+        match descr {
+            BhDescr::Field {
+                owner: o,
+                name: n,
+                offset,
+                ..
+            } if o == owner && n == name => Some(offset),
+            _ => None,
+        }
     })
 }
 
-/// Build the metainterp-side `RuntimeBhDescr` pool from the shared
-/// build-time `ALL_DESCRS` and install it into `majit-metainterp` as the
+/// Install the metainterp-side lazy `RuntimeBhDescr` view over the shared
+/// build-time descriptor table as the
 /// process-global build-time descr pool (`JitCode::descr_at`'s fallback for
 /// LLBC-extracted jitcodes, whose per-jitcode `exec.descrs` is empty).
 /// Mirrors RPython's single shared `Assembler.descrs`: build-time jitcodes
@@ -1282,31 +1422,63 @@ pub fn build_time_field_offset(owner: &str, name: &str) -> Option<usize> {
 /// residual-call / getfield / setfield / switch dispatch arms read back via
 /// `as_bh_descr()`.
 ///
-/// Idempotent: the metainterp `OnceLock` keeps the first pool, so repeated
-/// calls (harness + production init) are safe.  The pool is built inside the
-/// `OnceLock` initializer, so a repeat call costs a load and nothing else —
-/// `drive_unpack_iterable_trace` reaches here once per
-/// `_unpackiterable_unknown_length`, and cloning every `BhDescr` (each call
-/// descr carrying its `EffectInfo` raw descr sets) only to drop it is the
-/// dominant cost of an unpack-heavy program.
-pub fn install_global_build_descr_pool() {
+/// Idempotent: the metainterp `OnceLock` keeps the first table, so repeated
+/// calls (harness + production init) are safe. Individual entries are decoded
+/// and retained only when `JitCode::descr_at` names their index.
+struct RuntimeDescrCells(&'static [OnceLock<majit_metainterp::RuntimeBhDescr>]);
+
+// SAFETY: the cells are write-once and this table only constructs `Descr` and
+// `JitCode` entries. It never constructs the raw-pointer-bearing `Call` or
+// `AssemblerToken` variants; this is the same invariant the former frozen
+// `GlobalDescrPool` wrapper enforced.
+unsafe impl Send for RuntimeDescrCells {}
+unsafe impl Sync for RuntimeDescrCells {}
+
+fn runtime_descr_cells() -> &'static [OnceLock<majit_metainterp::RuntimeBhDescr>] {
+    static CELLS: OnceLock<RuntimeDescrCells> = OnceLock::new();
+    CELLS
+        .get_or_init(|| {
+            RuntimeDescrCells(Box::leak(
+                (0..descr_count())
+                    .map(|_| OnceLock::new())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ))
+        })
+        .0
+}
+
+fn load_runtime_descr(index: usize) -> majit_metainterp::RuntimeBhDescr {
     use majit_metainterp::RuntimeBhDescr;
-    majit_metainterp::init_global_build_descr_pool(|| {
-        all_descrs()
-            .iter()
-            .map(|bh| match bh {
-                BhDescr::JitCode { jitcode_index, .. } => {
-                    match get_jitcode_by_index(*jitcode_index) {
-                        Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
-                            majit_metainterp::JitCode::from_canonical((*canonical).clone()),
-                        )),
-                        None => RuntimeBhDescr::Descr(Box::new(bh.clone())),
-                    }
-                }
-                other => RuntimeBhDescr::Descr(Box::new(other.clone())),
-            })
-            .collect()
-    });
+    let bh = load_descr_uncached(index);
+    match bh {
+        BhDescr::JitCode { jitcode_index, .. } => match get_jitcode_by_index(jitcode_index) {
+            Some(canonical) => RuntimeBhDescr::JitCode(Arc::new(
+                majit_metainterp::JitCode::from_canonical((*canonical).clone()),
+            )),
+            None => RuntimeBhDescr::Descr(Box::new(bh)),
+        },
+        other => RuntimeBhDescr::Descr(Box::new(other)),
+    }
+}
+
+struct LazyRuntimeDescrTable;
+
+impl majit_metainterp::RuntimeDescrTable for LazyRuntimeDescrTable {
+    fn get(&self, index: usize) -> Option<&'static majit_metainterp::RuntimeBhDescr> {
+        let cell = runtime_descr_cells().get(index)?;
+        Some(cell.get_or_init(|| load_runtime_descr(index)))
+    }
+
+    fn len(&self) -> usize {
+        descr_count()
+    }
+}
+
+static LAZY_RUNTIME_DESCR_TABLE: LazyRuntimeDescrTable = LazyRuntimeDescrTable;
+
+pub fn install_global_build_descr_pool() {
+    majit_metainterp::init_global_build_descr_pool(&LAZY_RUNTIME_DESCR_TABLE);
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's
@@ -1333,7 +1505,7 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
     // blackhole.py:58-59 order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
-    builder.setup_descrs(all_descrs());
+    builder.setup_descrs(descr_table());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
         .unwired_opnames()
@@ -1783,6 +1955,135 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splits the first-JIT descr cost into its stages, because the fix for
+    /// each is different: deserialization is paid by the wire format,
+    /// materialization by how much of the pool a run actually names.
+    ///
+    /// Run alone so nothing else in the process moves the number:
+    /// `cargo test -p pyre-jit-trace --no-default-features --features dynasm \
+    ///  descr_startup_rss_decomposition -- --exact --nocapture --test-threads=1`
+    ///
+    /// Ignored by default: it is a measurement, not an assertion, and the
+    /// stages are process-global `Once`/`LazyLock` state that any other test
+    /// in the binary can force first.
+    #[test]
+    #[ignore = "measurement; run alone with --exact --nocapture"]
+    fn descr_startup_rss_decomposition() {
+        // `ps` rather than `getrusage` because this crate has no libc
+        // dependency and adding one would move its LLBC fingerprint. RSS only
+        // grows across these stages, so the sample is the stage peak.
+        fn rss_kb() -> i64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p"])
+                .arg(std::process::id().to_string())
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(-1)
+        }
+
+        // Warm `Command`/`ps` bookkeeping before the baseline. On macOS the
+        // first sample itself leaves about 1 MB of process-library state
+        // resident, which otherwise gets charged to `deserialize_descrs`.
+        let _ = rss_kb();
+        // Likewise warm the exact index-deserializer monomorph. The real
+        // `descrs_index.bin` is still decoded after the baseline; this keeps
+        // cold code pages out of the retained-heap stage they would obscure.
+        let _: Vec<u32> = bincode::deserialize(&[0_u8; 8]).unwrap();
+        let base = rss_kb();
+        let n_descrs = descr_count();
+        let after_descrs = rss_kb();
+        let n_mints = ALL_EI_DESCR_MINTS.len();
+        let after_mints = rss_kb();
+        rehydrate_build_descr_raw_sets();
+        let after_rehydrate = rss_kb();
+        let n_refs = descr_ref_table().len();
+        let _ = descr_ref_cells();
+        let after_refs = rss_kb();
+
+        eprintln!("[rss-decomp] base={base} KB");
+        eprintln!(
+            "[rss-decomp] descr_index          n={n_descrs} delta={} KB",
+            after_descrs - base
+        );
+        eprintln!(
+            "[rss-decomp] deserialize_ei_mints n={n_mints} delta={} KB",
+            after_mints - after_descrs
+        );
+        eprintln!(
+            "[rss-decomp] rehydrate            delta={} KB",
+            after_rehydrate - after_mints
+        );
+        eprintln!(
+            "[rss-decomp] descr_ref_cells      n={n_refs} delta={} KB",
+            after_refs - after_rehydrate
+        );
+        eprintln!("[rss-decomp] TOTAL={} KB", after_refs - base);
+
+        // The pool census runs LAST and streams: it is the reason the stages
+        // above are worth measuring, but a full walk allocates and frees every
+        // entry, and sitting between two samples it charged that churn to
+        // whichever stage followed it.
+        {
+            use majit_translate::jitcode::BhDescr;
+            let mut variants: std::collections::BTreeMap<&str, usize> = Default::default();
+            let mut specs = 0usize;
+            let mut distinct_layouts: std::collections::HashSet<u64> = Default::default();
+            let mut strings = 0usize;
+            let mut string_bytes = 0usize;
+            let note = |sp: &majit_translate::jitcode::BhSizeSpec,
+                        specs: &mut usize,
+                        strings: &mut usize,
+                        string_bytes: &mut usize,
+                        distinct: &mut std::collections::HashSet<u64>| {
+                *specs += sp.all_fielddescrs.len();
+                distinct.insert(sp.type_id);
+                for f in &sp.all_fielddescrs {
+                    *strings += 2;
+                    *string_bytes += f.name.len() + f.field_key.len();
+                }
+            };
+            for i in 0..n_descrs {
+                let d = load_descr_uncached(i);
+                let k = match &d {
+                    BhDescr::Field { parent, .. } => {
+                        if let Some(p) = parent {
+                            note(
+                                p,
+                                &mut specs,
+                                &mut strings,
+                                &mut string_bytes,
+                                &mut distinct_layouts,
+                            );
+                        }
+                        "Field"
+                    }
+                    BhDescr::Array { .. } => "Array",
+                    BhDescr::InteriorField { .. } => "InteriorField",
+                    BhDescr::Size { .. } => "Size",
+                    BhDescr::Call { .. } => "Call",
+                    BhDescr::JitCode { .. } => "JitCode",
+                    BhDescr::Switch { .. } => "Switch",
+                    _ => "other",
+                };
+                *variants.entry(k).or_default() += 1;
+            }
+            eprintln!(
+                "[rss-decomp] size_of::<BhDescr>()={} B  -> Vec body {} KB",
+                std::mem::size_of::<BhDescr>(),
+                std::mem::size_of::<BhDescr>() * n_descrs / 1024,
+            );
+            eprintln!("[rss-decomp] variants {variants:?}");
+            eprintln!(
+                "[rss-decomp] embedded parent field specs={specs} over {} distinct type_ids; \
+                 strings={strings} ({string_bytes} B of text)",
+                distinct_layouts.len(),
+            );
+        }
+    }
 
     /// The build-time descr pool must name the same bytes `offset_of!` does.
     ///
@@ -2242,14 +2543,20 @@ mod tests {
     fn build_default_bh_builder_shares_descr_table() {
         let (mut builder, _) = build_default_bh_builder_with_unwired_report();
         assert!(!builder.descrs.is_empty(), "shared table must not be empty");
-        assert_eq!(builder.descrs.len(), all_descrs().len());
+        assert_eq!(builder.descrs.len(), descr_table().len());
         assert!(
-            std::ptr::eq(builder.descrs.as_ptr(), all_descrs().as_ptr()),
+            std::ptr::eq(
+                std::ptr::from_ref(builder.descrs).cast::<()>(),
+                std::ptr::from_ref(descr_table()).cast::<()>(),
+            ),
             "builder must ALIAS the process table, not copy it"
         );
         let bh = builder.acquire_interp();
         assert!(
-            std::ptr::eq(bh.descrs.as_ptr(), all_descrs().as_ptr()),
+            std::ptr::eq(
+                std::ptr::from_ref(bh.descrs).cast::<()>(),
+                std::ptr::from_ref(descr_table()).cast::<()>(),
+            ),
             "acquire_interp must alias, not copy (blackhole.py:288)"
         );
     }

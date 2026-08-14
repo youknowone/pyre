@@ -2116,9 +2116,7 @@ pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
             let lo = *code.get(decoded.pc + 3)? as usize;
             let hi = *code.get(decoded.pc + 4)? as usize;
             let pool_index = lo | (hi << 8);
-            crate::jitcode_runtime::all_descr_refs()
-                .get(pool_index)
-                .map(|descr| descr.index())
+            crate::jitcode_runtime::descr_ref_at(pool_index).map(|descr| descr.index())
         })
 }
 
@@ -2480,7 +2478,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.outer_active_boxes = call_site_active;
-    ctx.descr_refs = crate::jitcode_runtime::all_descr_refs();
+    ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
@@ -4456,7 +4454,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             registers_f: &mut callee_regs_f,
             concrete_registers_r: &mut callee_concrete_r,
             concrete_registers_i: &mut callee_concrete_i,
-            descr_refs: callee_descr_refs,
+            descr_refs: &callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
             store_subscr_fn_addr: ctx.store_subscr_fn_addr,

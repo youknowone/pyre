@@ -28,6 +28,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "jit_drivers.bin",
     "insns.bin",
     "descrs.bin",
+    "descrs_index.bin",
     "ei_descr_mints.bin",
     "field_mint_census.bin",
     "liveness.bin",
@@ -67,11 +68,14 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 ///
 /// What decides the cross-process verdict after these exclusions:
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
-/// `ei_descr_mints.bin`, `liveness.bin`.
+/// `descrs_index.bin`, `ei_descr_mints.bin`, `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
 /// moves it while an address change alone does not.
+/// `descrs_index.bin` is likewise a pure byte-offset table: `descrs.bin`
+/// remains host-addressed, but its index contains no address and stays in the
+/// cross-process verdict to judge descriptor population, order, and lengths.
 ///
 /// Caching them is still sound: a restore serves these tables and the
 /// `constants_i` baked against them from the *same* generation, so they stay
@@ -247,9 +251,10 @@ fn emit_llbc_extraction_placeholders() {
         bincode::serialize(&std::collections::BTreeMap::<String, u8>::new()).unwrap(),
     )
     .unwrap();
+    std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
-        format!("{out_dir}/descrs.bin"),
-        bincode::serialize(&Vec::<majit_translate::jitcode::BhDescr>::new()).unwrap(),
+        format!("{out_dir}/descrs_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -1044,8 +1049,26 @@ fn real_main() {
         // `BlackholeInterpBuilder::setup_descrs(...)` — the single-store
         // model (same list consumed by every `BlackholeInterpreter` produced
         // by `acquire_interp`).
-        let descrs_bin = bincode::serialize(&pipeline.descrs).unwrap();
+        // Encode entries independently so runtime can retain the one-pointer
+        // table shape upstream gets from translation-time constants without
+        // reconstituting every descriptor in this process.
+        let mut descrs_bin = Vec::new();
+        let mut descr_offsets = Vec::with_capacity(pipeline.descrs.len() + 1);
+        descr_offsets.push(0_u32);
+        for descr in &pipeline.descrs {
+            descrs_bin.extend(bincode::serialize(descr).unwrap());
+            descr_offsets.push(
+                u32::try_from(descrs_bin.len())
+                    .expect("serialized descrs.bin exceeds the u32 offset range"),
+            );
+        }
+        assert_eq!(descr_offsets.len(), pipeline.descrs.len() + 1);
+        assert_eq!(descr_offsets.first().copied(), Some(0));
+        assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
+        assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        let descrs_index_bin = bincode::serialize(&descr_offsets).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
+        std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
 
         // `MAJIT_MINT_INDEX_CENSUS=1`: how many `fielddescrof` mints resolved a
         // slot for `index_in_parent`, and how many carried out the `0` they were

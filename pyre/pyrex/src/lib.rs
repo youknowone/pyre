@@ -852,6 +852,12 @@ fn maybe_print_jit_stats() {
         "[jit-stats] mc_diag {} all_descrs={all_descrs_len}",
         majit_metainterp::mc_diag_summary()
     );
+    // How many of the rehydrated descr pool a run actually names, under
+    // `PYRE_DESCR_DEMAND`. Off by default; `(0, pool)` means the probe is off.
+    let (descr_demanded, descr_pool) = pyre_jit::descr_demand_summary();
+    if descr_demanded != 0 {
+        eprintln!("[jit-stats] descr_demand touched={descr_demanded} pool={descr_pool}");
+    }
     eprintln!(
         "[jit-stats] fbw_escape_split portal_only={} published_callee_only={} portal_and_published_callee={}",
         pyre_jit::fbw_diag_counter(6),

@@ -1456,7 +1456,7 @@ fn run_hint_step_with_descrs(
         registers_f: &mut [],
         concrete_registers_r: concrete_r,
         concrete_registers_i: &mut [],
-        descr_refs: descr_pool,
+        descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
         is_authoritative_executor: false,
         trace_ctx: tc,

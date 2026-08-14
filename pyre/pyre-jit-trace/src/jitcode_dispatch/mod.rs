@@ -183,6 +183,29 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
+
+/// Descriptor accessor carried by an active MIFrame walk.
+///
+/// Per-function and test pools remain ordinary slices; the build-time global
+/// pool implements the same interface with one memoized entry per index.
+pub trait DescrRefTable {
+    fn at(&self, index: usize) -> Option<DescrRef>;
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<T: AsRef<[DescrRef]> + ?Sized> DescrRefTable for T {
+    fn at(&self, index: usize) -> Option<DescrRef> {
+        self.as_ref().get(index).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+}
 use majit_metainterp::{TraceCtx, VableArrayStore, default_effect_info};
 
 // jitcode_dispatch submodules (extracted from this file). Their `pub`
@@ -352,14 +375,14 @@ impl<'a> RawDescrPool<'a> {
     /// vable-array descr operand).
     fn bh_descr_at(self, idx: usize) -> Option<&'a majit_translate::jitcode::BhDescr> {
         match self {
-            Self::Global => crate::jitcode_runtime::all_descrs().get(idx),
+            Self::Global => crate::jitcode_runtime::get_descr_by_index(idx),
             Self::PerFn(descrs) => descrs.get(idx).and_then(|d| d.as_bh_descr()),
         }
     }
 
     fn len(self) -> usize {
         match self {
-            Self::Global => crate::jitcode_runtime::all_descrs().len(),
+            Self::Global => crate::jitcode_runtime::descr_table().len(),
             Self::PerFn(descrs) => descrs.len(),
         }
     }
@@ -1475,7 +1498,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// RPython `Assembler.descrs` (`assembler.py`) +
     /// `BlackholeInterpBuilder.setup_descrs` (`blackhole.py`)
     /// — production callers pass the codewriter-emitted descr table.
-    pub descr_refs: &'static_a [DescrRef],
+    pub descr_refs: &'static_a dyn DescrRefTable,
     /// Raw `BhDescr` pool source for vable-array `(VableArray, Array)`
     /// recognition (`vable_array_descrs_from_jitcode`).  [`RawDescrPool::
     /// Global`] for build-time canonical jitcodes + tests (their operands
@@ -3811,9 +3834,9 @@ fn read_descr<Sym: WalkSym>(
     let lo = code[op.pc + 1 + operand_offset] as usize;
     let hi = code[op.pc + 1 + operand_offset + 1] as usize;
     let index = lo | (hi << 8);
+    crate::jitcode_runtime::record_descr_demand(index);
     ctx.descr_refs
-        .get(index)
-        .cloned()
+        .at(index)
         .ok_or(DispatchError::DescrIndexOutOfRange {
             pc: op.pc,
             index,
@@ -8644,12 +8667,12 @@ fn next_op_is_load_method_self_for_attr<Sym: WalkSym>(
     let r_width = 1 + r_len;
     let descr_offset = 1 + i_width + r_width;
     let descr_index = decode_descr_index(code, &next, descr_offset);
-    ctx.descr_refs
-        .get(descr_index)
-        .and_then(|descr| descr.as_call_descr())
-        .is_some_and(|cd| {
+    crate::jitcode_runtime::record_descr_demand(descr_index);
+    ctx.descr_refs.at(descr_index).is_some_and(|descr| {
+        descr.as_call_descr().is_some_and(|cd| {
             cd.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadMethodSelf
         })
+    })
 }
 
 /// STORE_ATTR mirror of [`try_walker_specialize_load_attr`] for an existing
