@@ -8243,6 +8243,11 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // eval_frame_plain here would skip maybe_enter_jit at every
     // opcode of the recursive portal frame, which breaks parity for
     // bhimpl_recursive_call_* paths.
+    // `ll_portal_runner` is an activation entry in its own right: recursive
+    // portal calls can reach it without the ordinary `eval_with_jit_inner`
+    // wrapper.  Account before constructing `FrameRoot`, because a moving GC
+    // may change the frame's address while the activation remains the same.
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
@@ -8352,10 +8357,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // FBW FOR_ITER Option-C guard snapshots this around a residual call to
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
-    // Spend one unit of the recursion budget on this frame's activation, in
-    // case this loop was reached without going through `eval_with_jit_inner`.
-    // A frame the wrapper already accounted spends nothing here.
-    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame_root.frame());
+    // Recursion accounting belongs to the activation seams
+    // (`eval_with_jit_inner` and `portal_runner_result`), not this re-entrant
+    // dispatch loop.  In particular, `FrameRoot` may have forwarded a moving
+    // frame since the seam; keying the same activation again by its new
+    // address would spend a second recursion unit.
     // Count this eval-loop activation for the GC safepoint's
     // at_outermost_activation gate (gh#393). The gate allows collection
     // at depth ≤ 2 (module + one called function) where the CALL opcode

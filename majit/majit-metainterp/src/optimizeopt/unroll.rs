@@ -250,6 +250,8 @@ fn refresh_forwarded_const_ref(
 /// - optimize_preamble: process and optimize the first iteration
 /// - optimize_peeled_loop: optimize the main loop body
 pub struct UnrollOptimizer {
+    /// Backend capability propagated to both phase optimizers.
+    pub supports_efficient_uint_mul_high: bool,
     /// The short preamble from the preamble optimization pass.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
@@ -411,6 +413,7 @@ impl UnrollOptimizer {
 
     pub fn new() -> Self {
         UnrollOptimizer {
+            supports_efficient_uint_mul_high: true,
             short_preamble: None,
             target_tokens: Vec::new(),
             attach_jitcell_token_number: None,
@@ -671,6 +674,7 @@ impl UnrollOptimizer {
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
             opt_p1.cpu = self.cpu.clone();
+            opt_p1.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
             opt_p1.trace_inputargs = self.trace_inputargs.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -967,6 +971,7 @@ impl UnrollOptimizer {
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();
+        opt_p2.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
         // Phase 2 (peeled-loop pass) runtime value seed.
         // The remap is deferred until after the Phase 2 `TraceIterator`
         // builds its `_cache`, because both inputargs AND body op results

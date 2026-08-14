@@ -526,6 +526,8 @@ use crate::optimizeopt::info::PtrInfoExt;
 ///
 /// Holds the shared state that passes read from and write to.
 pub struct OptContext {
+    /// Backend cost capability for RPython's constant-division rewrite.
+    pub supports_efficient_uint_mul_high: bool,
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
     /// Once the output buffer is drained, PtrInfo guard positions stamped
@@ -1672,6 +1674,7 @@ impl OptContext {
 
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
+            supports_efficient_uint_mul_high: true,
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(
@@ -2296,6 +2299,7 @@ impl OptContext {
         start_next_pos: u32,
     ) -> Self {
         OptContext {
+            supports_efficient_uint_mul_high: true,
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(

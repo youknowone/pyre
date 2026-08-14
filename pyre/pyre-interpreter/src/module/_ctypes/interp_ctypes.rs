@@ -472,10 +472,13 @@ pub(super) fn lookup_symbol(
             "symbol '{}' not found",
             String::from_utf8_lossy(symbol)
         ))),
-        None => Err(Error::Load(
-            rustpython_host_env::ctypes::format_error_message(None)
-                .unwrap_or_else(|| "symbol not found".to_string()),
-        )),
+        // windows-sys represents the documented NULL miss as `None`.
+        // This is the normal not-found result, not a loader failure carrying
+        // a meaningful last-error message.
+        None => Err(Error::Load(format!(
+            "symbol '{}' not found",
+            String::from_utf8_lossy(symbol)
+        ))),
     }
 }
 

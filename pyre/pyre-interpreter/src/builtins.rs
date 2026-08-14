@@ -15757,24 +15757,29 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             fileio_clear_stat_atopen(self_obj);
             return Ok(index);
         }
-        #[cfg(all(windows, not(feature = "sandbox")))]
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
-            // rposix.py:597 binds `_chsize_s` where the posix branch binds
-            // `ftruncate`. It reports failure as its return value rather than
-            // through -1, so the errno comes from the call itself; `crt_call!`
-            // supplies the invalid-parameter suppression `ftruncate` gets from
-            // `SuppressIPH` at rposix.py:606.
-            unsafe extern "C" {
-                fn _chsize_s(fd: i32, size: i64) -> i32;
-            }
-            let rc = crt_call!(_chsize_s(fd, size as i64));
-            if rc != 0 {
-                return Err(fd_errno_err(rc));
-            }
+            // `W_FileIO.truncate` delegates to `rposix.ftruncate`, which binds
+            // `_chsize_s` on Windows (rposix.py:597) under the
+            // invalid-parameter suppression of `SuppressIPH` (rposix.py:606).
+            // `crt_fd::ftruncate` is that same call, suppression and all, and
+            // it keeps the errno `_chsize_s` returns rather than reading the
+            // one a -1 return would have set.  The GIL is released around it,
+            // as the `rffi.llexternal(..., releasegil=True)` seam does.
+            use rustpython_host_env::os::ErrorExt;
+
+            let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
+            let (result, _errno) = crate::module::thread::call_external_function(|| {
+                rustpython_host_env::crt_fd::ftruncate(borrowed, size)
+            });
+            result.map_err(|error| fd_errno_err(error.posix_errno()))?;
             fileio_clear_stat_atopen(self_obj);
             return Ok(index);
         }
-        #[cfg(any(all(not(unix), not(windows)), feature = "sandbox"))]
+        #[cfg(any(
+            feature = "sandbox",
+            not(any(unix, all(windows, feature = "host_env")))
+        ))]
         {
             let _ = (fd, size);
             return Err(crate::PyError::not_implemented(

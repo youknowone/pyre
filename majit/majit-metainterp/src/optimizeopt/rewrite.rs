@@ -214,7 +214,7 @@ impl OptRewrite {
             }
 
             // General constant divisor >= 3: magic number multiplication
-            if divisor >= 3 {
+            if divisor >= 3 && ctx.supports_efficient_uint_mul_high {
                 // rewrite.py:770 `known_nonneg = b1.known_nonnegative()`:
                 // a non-negative dividend skips the sign-correction ops.
                 let known_nonneg = ctx
@@ -309,6 +309,7 @@ impl OptRewrite {
             .and_then(|b| ctx.get_constant_int_box(&b))
             && divisor >= 3
             && divisor.count_ones() != 1
+            && ctx.supports_efficient_uint_mul_high
         {
             // rewrite.py:809 `known_nonneg = b1.known_nonnegative()`:
             // a non-negative dividend skips the sign-correction ops.
@@ -2539,8 +2540,18 @@ mod tests {
         target: usize,
         constants: &[(OpRef, Value)],
     ) -> (OptimizationResult, OptContext) {
+        run_one_rewrite_only_with_mul_high(specs, target, constants, true)
+    }
+
+    fn run_one_rewrite_only_with_mul_high(
+        specs: Vec<OpSpec>,
+        target: usize,
+        constants: &[(OpRef, Value)],
+        supports_efficient_uint_mul_high: bool,
+    ) -> (OptimizationResult, OptContext) {
         let ops = build_specs(&specs);
         let mut ctx = OptContext::new(ops.len());
+        ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
         for op in &ops[..target] {
             ctx.emit((**op).clone());
         }
@@ -2772,6 +2783,25 @@ mod tests {
         assert_int_const(&ctx, OpRef::int_op(2), 0);
         // x % x = 0
         assert_binop_self(OpCode::IntMod, Some(0));
+    }
+
+    #[test]
+    fn backend_without_mul_high_keeps_native_constant_division_and_modulo() {
+        for opcode in [OpCode::IntFloorDiv, OpCode::IntMod] {
+            let (result, ctx) = run_one_rewrite_only_with_mul_high(
+                vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
+                2,
+                &[(OpRef::int_op(1), Value::Int(100))],
+                false,
+            );
+            assert_pass_on(&result);
+            assert!(
+                ctx.new_operations
+                    .iter()
+                    .all(|op| op.opcode != OpCode::UintMulHigh),
+                "{opcode:?} expanded through UintMulHigh on a backend that lacks it"
+            );
+        }
     }
 
     #[test]

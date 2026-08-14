@@ -44,6 +44,8 @@ def check_fresh_str(count):
         if value.__dict__:
             inherited += 1
         value.tag = index
+        if value.__dict__ != {"tag": index}:
+            inherited += 1
     return inherited
 
 

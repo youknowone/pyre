@@ -2365,7 +2365,11 @@ impl MiniMarkGC {
         // the next allocation, which would then answer to the dead owner's
         // entry.  Ask the same survival question `invalidate_young_weakrefs`
         // just answered, while the forwarding headers still read.
-        let pinned = &self.pinned_objects;
+        // The trace above rebuilt the live pin set in
+        // `surviving_pinned_objects`; `pinned_objects` is the previous
+        // collection's snapshot until the swap below.  A pin that died this
+        // cycle must not keep an address-keyed owner table entry alive.
+        let pinned = &self.surviving_pinned_objects;
         let nursery = &self.nursery;
         let mut classify_young_owner = |owner: usize| -> Option<usize> {
             if owner == 0 || !nursery.contains(owner) {

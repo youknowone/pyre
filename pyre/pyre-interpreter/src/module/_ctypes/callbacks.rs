@@ -25,6 +25,10 @@ mod imp {
         /// rewrites the slot, so the live pointer is read through it at call
         /// time.
         slot: *mut usize,
+        /// Size of the libffi result slot described by the callback CIF.
+        /// Kept here so the outer panic boundary can initialize it before any
+        /// Python/runtime work is attempted.
+        result_width: usize,
     }
 
     struct StoredThunk {
@@ -40,16 +44,24 @@ mod imp {
         LazyLock::new(|| Mutex::new(Vec::new()));
 
     pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-        let argtypes = funcptr::resolve_argtypes(obj).unwrap_or_default();
-        let ffi_arg_types = argtypes
-            .iter()
-            .copied()
-            .map(ffi_type_for_arg)
-            .collect::<Vec<_>>();
-        let restype = funcptr::resolve_restype(obj).map_err(|_| invalid_callback_result_type())?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
+        let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let argtypes = funcptr::resolve_argtypes(current_obj()).unwrap_or_default();
+        let argtypes_slot = pyre_object::gc_roots::shadow_stack_len();
+        for &argtype in &argtypes {
+            pyre_object::gc_roots::pin_root(argtype);
+        }
+        let ffi_arg_types = (0..argtypes.len())
+            .map(|i| ffi_type_for_arg(pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let restype =
+            funcptr::resolve_restype(current_obj()).map_err(|_| invalid_callback_result_type())?;
         let ffi_res_type = ffi_type_for_ret(&restype)?;
+        let result_width = ffi_result_width(&restype);
 
-        let mut slot = Box::new(obj as usize);
+        let mut slot = Box::new(current_obj() as usize);
         let slot_ptr = (&mut *slot) as *mut usize;
         let root_slot = slot_ptr as *mut *mut u8;
         unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
@@ -57,7 +69,10 @@ mod imp {
         let thunk = host_ctypes::CallbackThunk::new(
             ffi_arg_types,
             ffi_res_type,
-            Box::new(ThunkUserdata { slot: slot_ptr }),
+            Box::new(ThunkUserdata {
+                slot: slot_ptr,
+                result_width,
+            }),
             thunk_callback,
         );
         let code = thunk.code_ptr().0 as usize;
@@ -72,24 +87,59 @@ mod imp {
         Ok(Some(code))
     }
 
-    fn ffi_type_for_arg(at: PyObjectRef) -> host_ctypes::FfiType {
+    fn ffi_type_for_arg(at: PyObjectRef) -> Result<host_ctypes::FfiType, crate::PyError> {
         if funcptr::argtype_is_pointer_kind(at) {
-            return host_ctypes::ffi_pointer_type();
+            return Ok(host_ctypes::ffi_pointer_type());
         }
         if let Some(tc) = cdata::type_code_of(at)
             && let Some(ty) = host_ctypes::ffi_type_from_code(&tc)
         {
-            return ty;
+            return Ok(ty);
         }
-        // A `Structure`/`Union` argument has no type code and is passed by
-        // value, so the cif has to describe an aggregate of its size —
-        // declaring a pointer disagrees with the ABI and hands `decode_arg` a
-        // slot that is neither the struct nor a pointer to it. `decode_arg`
-        // already builds the instance from `size` bytes at the argument
-        // address, which is what libffi supplies for an aggregate.
-        match cdata::ctype_size_of(at) {
-            Some(size) => host_ctypes::ffi_byte_struct(size),
-            None => host_ctypes::ffi_pointer_type(),
+        ffi_type_for_layout(&funcptr::build_layout(at)?)
+    }
+
+    /// Lower the same recursive layout foreign calls use to the callback CIF.
+    /// Struct field kinds determine register classification on every major
+    /// ABI; a byte-struct of the same size is not equivalent.
+    fn ffi_type_for_layout(
+        layout: &host_ctypes::CTypeLayout,
+    ) -> Result<host_ctypes::FfiType, crate::PyError> {
+        use host_ctypes::CTypeLayout;
+        match layout {
+            CTypeLayout::Simple(code) => {
+                let mut buf = [0u8; 4];
+                host_ctypes::ffi_type_from_code(code.encode_utf8(&mut buf))
+                    .ok_or_else(|| crate::PyError::type_error("unknown callback argument type"))
+            }
+            CTypeLayout::Pointer => Ok(host_ctypes::ffi_pointer_type()),
+            CTypeLayout::Struct { fields, .. } => fields
+                .iter()
+                .map(ffi_type_for_layout)
+                .collect::<Result<Vec<_>, _>>()
+                .map(host_ctypes::FfiType::structure),
+            CTypeLayout::Array {
+                element, length, ..
+            } => Ok(host_ctypes::ffi_repeat_type(
+                ffi_type_for_layout(element)?,
+                *length,
+            )),
+            CTypeLayout::Union { size, .. } | CTypeLayout::Opaque { size } => {
+                Ok(host_ctypes::ffi_byte_struct(*size))
+            }
+        }
+    }
+
+    fn ffi_result_width(ret: &funcptr::Ret) -> usize {
+        match ret {
+            funcptr::Ret::Void => 0,
+            // host_env intentionally declares ctypes long double (`g`) as
+            // libffi f64, so use the CIF width rather than its 16-byte cdata
+            // storage size on Unix.
+            funcptr::Ret::Code(code) if code == "g" => 8,
+            funcptr::Ret::Code(code) => host_ctypes::simple_type_size(code).unwrap_or(0),
+            funcptr::Ret::Pointer(_) => host_ctypes::pointer_size(),
+            funcptr::Ret::Aggregate(_) => 0,
         }
     }
 
@@ -115,6 +165,15 @@ mod imp {
         args: *const *const c_void,
         userdata: &ThunkUserdata,
     ) {
+        if userdata.result_width != 0 {
+            unsafe {
+                std::ptr::write_bytes(
+                    (result as *mut c_void).cast::<u8>(),
+                    0,
+                    userdata.result_width,
+                )
+            };
+        }
         let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
             thunk_callback_inner(result, args, userdata)
         }));
@@ -126,13 +185,21 @@ mod imp {
         userdata: &ThunkUserdata,
     ) {
         let _callback = crate::module::thread::enter_external_callback_from_foreign_thread();
-        let obj = unsafe { *userdata.slot } as PyObjectRef;
-        let use_errno = funcptr::funcptr_flags(obj) & funcptr::FUNCFLAG_USE_ERRNO != 0;
-        let call_result = match decode_args(obj, args) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(unsafe { *userdata.slot } as PyObjectRef);
+        let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let use_errno = funcptr::funcptr_flags(current_obj()) & funcptr::FUNCFLAG_USE_ERRNO != 0;
+        let call_result = match decode_args(current_obj(), args) {
             Ok(decoded) => host_ctypes::with_callback_errno_preserved(use_errno, || {
-                let callable = funcptr::instance_get(obj, funcptr::CALLABLE_KEY)
+                let callable = funcptr::instance_get(current_obj(), funcptr::CALLABLE_KEY)
                     .ok_or_else(|| crate::PyError::type_error("callback has no callable"))?;
-                crate::call::call_function_impl_result(callable, &decoded)
+                pyre_object::gc_roots::pin_root(callable);
+                let callable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                crate::call::call_function_impl_result(
+                    pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                    &decoded,
+                )
             }),
             Err(error) => Err(error),
         };
@@ -140,8 +207,18 @@ mod imp {
         // call's own failure was already reported by `callback_result`, which
         // substitutes a zero result; what is left here is a result the declared
         // `restype` cannot represent.
-        let written = funcptr::callback_result(obj, call_result)
-            .and_then(|value| write_result(obj, value, result as *mut c_void));
+        let written = match funcptr::callback_result(current_obj(), call_result) {
+            Ok(value) => {
+                pyre_object::gc_roots::pin_root(value);
+                let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                write_result(
+                    current_obj(),
+                    pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    result as *mut c_void,
+                )
+            }
+            Err(error) => Err(error),
+        };
         if let Err(mut error) = written {
             error.write_unraisable(
                 pyre_object::w_none(),
@@ -159,18 +236,49 @@ mod imp {
         args: *const *const c_void,
     ) -> Result<Vec<PyObjectRef>, crate::PyError> {
         let argtypes = funcptr::resolve_argtypes(obj).unwrap_or_default();
-        let mut decoded = Vec::with_capacity(argtypes.len());
-        for (i, at) in argtypes.into_iter().enumerate() {
+        let argtypes_slot = pyre_object::gc_roots::shadow_stack_len();
+        for &argtype in &argtypes {
+            pyre_object::gc_roots::pin_root(argtype);
+        }
+        // `decode_arg` may itself pin construction intermediates (aggregate
+        // and function-pointer instances), so decoded results are not
+        // necessarily contiguous on the shadow stack.  Record each result's
+        // actual slot instead of deriving `base + index`.
+        let mut decoded_slots = Vec::with_capacity(argtypes.len());
+        for i in 0..argtypes.len() {
+            let at = pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i);
             let p = unsafe { *args.add(i) };
             match decode_arg(at, p) {
-                Ok(value) => decoded.push(value),
+                Ok(value) => {
+                    decoded_slots.push(pyre_object::gc_roots::shadow_stack_len());
+                    pyre_object::gc_roots::pin_root(value);
+                }
                 Err(error) => return Err(error),
             }
         }
-        Ok(decoded)
+        Ok(decoded_slots
+            .into_iter()
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .collect())
     }
 
     fn decode_arg(at: PyObjectRef, p: *const c_void) -> Result<PyObjectRef, crate::PyError> {
+        // A `_CFuncPtr` can expose the pointer type code too, but Python must
+        // receive a callable function-pointer instance, not the integer that
+        // the generic simple decoder would produce.  CPython's
+        // `ConvParam`/`PyCFuncPtrType` path likewise resolves this before the
+        // scalar fallback.
+        if funcptr::is_funcptr_type(at) {
+            let address = unsafe { *(p as *const usize) };
+            let inst = crate::call::type_call_instantiate(at, &[])?;
+            let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(inst);
+            funcptr::store_funcptr_addr(
+                pyre_object::gc_roots::shadow_stack_get(inst_slot),
+                address,
+            )?;
+            return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
+        }
         if let Some(tc) = cdata::type_code_of(at)
             && !funcptr::is_simple_subclass(at)
         {
@@ -188,9 +296,11 @@ mod imp {
         }
         if let Some(size) = cdata::ctype_size_of(at) {
             let inst = crate::call::type_call_instantiate(at, &[])?;
+            let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(inst);
             let bytes = unsafe { host_ctypes::borrow_memory(p.cast::<u8>(), size) };
-            cdata::cdata_write(inst, 0, bytes);
-            return Ok(inst);
+            cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(inst_slot), 0, bytes);
+            return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
         }
         Err(crate::PyError::type_error("cannot build parameter"))
     }
@@ -210,10 +320,9 @@ mod imp {
                 // `g` is the case that overruns — it encodes to a long double
                 // while `ffi_type_from_code` maps it to the `f64` the slot was
                 // sized for.
-                let width = std::mem::size_of::<usize>();
+                let width = ffi_result_width(&funcptr::Ret::Code(c.clone()));
                 let n = bytes.len().min(width);
                 unsafe {
-                    std::ptr::write_bytes(result.cast::<u8>(), 0, width);
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), result.cast::<u8>(), n);
                 }
                 Ok(())

@@ -327,6 +327,8 @@ pub(crate) struct PendingBridgeRd {
 ///
 /// RPython optimizer.py: Optimizer class with pass chain and shared state.
 pub struct Optimizer {
+    /// Backend capability threaded into each optimization context.
+    pub supports_efficient_uint_mul_high: bool,
     passes: Vec<Box<dyn Optimization>>,
     pub pureop_historylength: usize,
     /// Final num_inputs after optimization (may increase if virtualizable
@@ -1460,6 +1462,7 @@ impl Optimizer {
 
     pub fn new() -> Self {
         Optimizer {
+            supports_efficient_uint_mul_high: true,
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
@@ -2491,6 +2494,7 @@ impl Optimizer {
         // `cpu.cls_of_box(runtime_box)` when the optimizer-tracked
         // PtrInfo has no `known_class` recorded.
         ctx.cpu = self.cpu.clone();
+        ctx.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();

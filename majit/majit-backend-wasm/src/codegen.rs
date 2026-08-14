@@ -2270,6 +2270,24 @@ fn build_function(
     // Def / last-use positions for the post-collection Ref reload filter.
     let liveness = HomeLiveness::collect(inputargs, ops);
 
+    // `LOAD_FROM_GC_TABLE` is the backend form of a ConstPtr.  Native PyPy
+    // keeps such loop-invariant references in their allocated location across
+    // a loop; reloading the GC-table slot on every iteration is not part of
+    // the operation's semantics.  Do the same for a trace with no collecting
+    // operation: eager loads are safe, and no moving collection can stale the
+    // local before the trace exits.  Traces containing a call/allocation keep
+    // the original program points and the ordinary home/reload machinery.
+    let hoisted_gc_table_loads: indexmap::IndexSet<OpRef> =
+        if has_loop && !ops.iter().any(|op| op.opcode.can_malloc()) {
+            ops.iter()
+                .filter(|op| op.opcode == OpCode::LoadFromGcTable)
+                .map(|op| op.pos.get())
+                .filter(|result| *result != OpRef::NONE && !result.is_constant())
+                .collect()
+        } else {
+            indexmap::IndexSet::new()
+        };
+
     // Resume-at-LABEL: a peeled loop wraps its preamble in a dispatch so a
     // loop-closing bridge can re-enter AT any LABEL — key = label ordinal + 1
     // — skipping the code before it, in-module instead of round-tripping
@@ -2368,6 +2386,32 @@ fn build_function(
         }
     }
 
+    // Seed loop-invariant GC-table references after the fresh-entry home clear
+    // and input setup.  Store-on-def is mirrored here because the original op
+    // arm and its common tail are skipped below.
+    for result in &hoisted_gc_table_loads {
+        let op = ops
+            .iter()
+            .find(|op| op.pos.get() == *result)
+            .expect("hoisted GC-table result must have a producer");
+        let index = resolve_const_bits(constants, op.arg(0).to_opref());
+        let slot =
+            gc_table_base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+        sink.i32_const(slot as i32);
+        sink.i32_load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        });
+        sink.i64_extend_i32_u();
+        sink.local_set(value_types.local(result.raw()));
+        if let Some(h) = ref_homes.home(*result) {
+            sink.local_get(0);
+            sink.local_get(value_types.local(result.raw()));
+            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+        }
+    }
+
     // Seed with the fail-index base so each guard/finish exit writes
     // `base + local` into `frame[0]` (every trace passes the next free index
     // of the global fail-index space, `failguard::fail_descr_base`). The local
@@ -2446,6 +2490,34 @@ fn build_function(
                     sink.local_get(value_types.local(r.raw()));
                     sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                 }
+            }
+            // The dispatch branch skipped the eager ConstPtr loads emitted on
+            // key 0.  This JitFrame has already run the preamble, so recover
+            // those loop-invariant refs from their GC-forwarded homes.
+            for result in &hoisted_gc_table_loads {
+                if let Some(h) = ref_homes.home(*result) {
+                    sink.local_get(0);
+                    sink.i64_load(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+                } else {
+                    // A ref unused across a collecting op has no ordinary
+                    // home.  LABEL entry is cold, so reload its table slot
+                    // directly rather than manufacturing a GC root.
+                    let producer = ops
+                        .iter()
+                        .find(|op| op.pos.get() == *result)
+                        .expect("hoisted GC-table result must have a producer");
+                    let index = resolve_const_bits(constants, producer.arg(0).to_opref());
+                    let slot = gc_table_base as u64
+                        + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+                    sink.i32_const(slot as i32);
+                    sink.i32_load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                    sink.i64_extend_i32_u();
+                }
+                sink.local_set(value_types.local(result.raw()));
             }
             sink.end(); // end B_j $past_loader
             labels_passed += 1;
@@ -3742,7 +3814,7 @@ fn build_function(
                 // address; the collector forwards the slot in place, so the load
                 // reads the reference at its current address.
                 let vi = op.pos.get().raw();
-                if !OpRef::raw_is_constant(vi) {
+                if !OpRef::raw_is_constant(vi) && !hoisted_gc_table_loads.contains(&op.pos.get()) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
                     let slot = gc_table_base as u64
                         + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
@@ -5058,7 +5130,9 @@ fn build_function(
         // skipped. Each value-producing arm is operand-stack-neutral, so this
         // appended store is balanced.
         let result = op.pos.get();
-        if let Some(h) = ref_homes.home(result) {
+        if !hoisted_gc_table_loads.contains(&result)
+            && let Some(h) = ref_homes.home(result)
+        {
             sink.local_get(0);
             sink.local_get(value_types.local(result.raw()));
             sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));

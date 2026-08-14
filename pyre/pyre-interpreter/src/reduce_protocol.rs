@@ -303,9 +303,14 @@ fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_obj);
     let w_proto = pyre_object::w_int_new(proto);
+    let proto_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_1),
-        &[pyre_object::gc_roots::shadow_stack_get(obj_slot), w_proto],
+        &[
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(proto_slot),
+        ],
     )
 }
 
@@ -324,11 +329,13 @@ fn reduce_2(
     pyre_object::gc_roots::pin_root(w_args);
     pyre_object::gc_roots::pin_root(w_kwargs);
     let w_proto = pyre_object::w_int_new(proto);
+    let proto_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
         handle(REDUCE_2),
         &[
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            w_proto,
+            pyre_object::gc_roots::shadow_stack_get(proto_slot),
             pyre_object::gc_roots::shadow_stack_get(obj_slot + 1),
             pyre_object::gc_roots::shadow_stack_get(obj_slot + 2),
         ],

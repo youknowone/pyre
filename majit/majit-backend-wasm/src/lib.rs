@@ -2066,6 +2066,13 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
 }
 
 impl majit_backend::Backend for WasmBackend {
+    fn supports_efficient_uint_mul_high(&self) -> bool {
+        // WebAssembly has no high-half integer multiply.  The fallback in
+        // codegen is multi-precision software, while i64.div/rem are native
+        // Wasm operations.
+        false
+    }
+
     fn cpu_tracker(&self) -> &std::sync::Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
     }

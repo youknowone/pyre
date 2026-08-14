@@ -91,7 +91,10 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "CFuncPtr.__new__(): not enough arguments",
         ));
     }
-    let cls = args[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     reject_kwargs(kwargs)?;
     let mut callback = pyre_object::PY_NULL;
@@ -117,29 +120,41 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             0
         }
     };
-    let obj = cdata::new_cdata_obj_from_bytes(cls, host_ctypes::pointer_size(), &[])?;
-    let d = crate::baseobjspace::getdict_native(obj);
-    if d.is_null() {
-        return Err(crate::PyError::type_error(
-            "CFuncPtr instance has no instance dict",
-        ));
-    }
-    unsafe { pyre_object::w_dict_setitem_str(d, PTR_KEY, pyre_object::w_int_new(addr as i64)) };
+    let callback_slot = if callback.is_null() {
+        None
+    } else {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(callback);
+        Some(slot)
+    };
+    let obj = cdata::new_cdata_obj_from_bytes(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        host_ctypes::pointer_size(),
+        &[],
+    )?;
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), addr)?;
     if !callback.is_null() {
-        unsafe { pyre_object::w_dict_setitem_str(d, CALLABLE_KEY, callback) };
-        if let Some(code) = super::callbacks::build_thunk(obj)? {
-            let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
-                "P",
-                host_ctypes::SimpleStorageValue::Pointer(code),
-                false,
-            );
-            unsafe {
-                pyre_object::w_dict_setitem_str(d, PTR_KEY, pyre_object::w_int_new(code as i64))
-            };
-            cdata::cdata_write(obj, 0, &bytes);
+        let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let d = crate::baseobjspace::getdict_native(current_obj);
+        pyre_object::gc_roots::pin_root(d);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let callback = pyre_object::gc_roots::shadow_stack_get(callback_slot.unwrap());
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                CALLABLE_KEY,
+                callback,
+            )
+        };
+        if let Some(code) =
+            super::callbacks::build_thunk(pyre_object::gc_roots::shadow_stack_get(obj_slot))?
+        {
+            store_funcptr_addr(pyre_object::gc_roots::shadow_stack_get(obj_slot), code)?;
         }
     }
-    Ok(obj)
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
@@ -368,6 +383,41 @@ pub(super) fn funcptr_addr(obj: PyObjectRef) -> usize {
         .filter(|o| unsafe { pyre_object::is_int(*o) })
         .map(|o| unsafe { pyre_object::w_int_get_value(o) } as usize)
         .unwrap_or(0)
+}
+
+/// Store a function address in both `_ptr` and the pointer-sized CData buffer.
+/// The object and boxed integer are rooted independently because either the
+/// integer allocation or the dict write may move the instance.
+pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let w_addr = pyre_object::w_int_new(addr as i64);
+    let addr_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_addr);
+    let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let d = crate::baseobjspace::getdict_native(current_obj);
+    if d.is_null() {
+        return Err(crate::PyError::type_error(
+            "CFuncPtr instance has no instance dict",
+        ));
+    }
+    pyre_object::gc_roots::pin_root(d);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            PTR_KEY,
+            pyre_object::gc_roots::shadow_stack_get(addr_slot),
+        )
+    };
+    let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
+        "P",
+        host_ctypes::SimpleStorageValue::Pointer(addr),
+        false,
+    );
+    cdata::cdata_write(pyre_object::gc_roots::shadow_stack_get(obj_slot), 0, &bytes);
+    Ok(())
 }
 
 /// Owned argument data whose buffers must outlive the borrowed `CallArg`s
@@ -909,7 +959,7 @@ fn struct_field_types(t: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// Build the recursive `CTypeLayout` of a ctypes type, driven by its `StgInfo`
 /// `paramfunc`: simple → code, pointer → `Pointer`, array → element layout +
 /// length, struct/union → per-field layouts from `_fields_`.
-fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, crate::PyError> {
+pub(super) fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, crate::PyError> {
     use host_ctypes::CTypeLayout;
     let info = stginfo::stginfo_of(t)
         .ok_or_else(|| crate::PyError::type_error("type has no ctypes layout info"))?;

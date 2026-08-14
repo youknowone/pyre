@@ -2154,6 +2154,16 @@ fn flush_instruction_cache(ptr: *const u8, len: usize) {
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
 pub trait Backend: Send {
+    /// Whether `UINT_MUL_HIGH` is an efficient backend primitive.
+    ///
+    /// RPython's constant-division rewrite assumes the machine backend can
+    /// lower `uint_mul_high` to a native high-half multiply instruction.
+    /// Backends without one must keep division/modulo intact instead of
+    /// expanding a more expensive software multiply.
+    fn supports_efficient_uint_mul_high(&self) -> bool {
+        true
+    }
+
     /// `rpython/jit/backend/model.py:28-29` `self.tracker =
     /// CPUTotalTracker()` parity — each backend instance owns its
     /// own [`CpuTotalTracker`].  [`record_compiled_loop_token`] and

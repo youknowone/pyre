@@ -4300,6 +4300,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         // `virtualize.py:140` `vrefinfo =
         // self.optimizer.metainterp_sd.virtualref_info` — install the
@@ -6377,6 +6378,8 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.supports_efficient_uint_mul_high =
+            self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
@@ -6541,6 +6544,8 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             Optimizer::default_pipeline()
                         };
+                        simple_opt.supports_efficient_uint_mul_high =
+                            self.backend.supports_efficient_uint_mul_high();
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
                         // leave `unroll_opt.all_descrs` empty, and the
@@ -8052,6 +8057,8 @@ impl<M: Clone> MetaInterp<M> {
             .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
             .unwrap_or_default();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
+        unroll_opt.supports_efficient_uint_mul_high =
+            self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
@@ -9060,6 +9067,8 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        optimizer.supports_efficient_uint_mul_high =
+            self.backend.supports_efficient_uint_mul_high();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
@@ -9507,6 +9516,8 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
+        optimizer.supports_efficient_uint_mul_high =
+            self.backend.supports_efficient_uint_mul_high();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:220/261/307 — `Const.type` / `InputArg.type` are

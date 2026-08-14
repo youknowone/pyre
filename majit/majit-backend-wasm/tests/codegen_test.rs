@@ -2020,6 +2020,95 @@ fn test_single_label_peeled_loop_validates() {
 }
 
 #[test]
+fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
+        make_op(
+            OpCode::LoadFromGcTable,
+            &[OpRef::const_int(0)],
+            OpRef::ref_op(2),
+        ),
+        make_guard(
+            OpCode::GuardNonnull,
+            &[OpRef::ref_op(2)],
+            &[OpRef::int_op(1)],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]),
+    ];
+    let gc_table_base = 4096;
+    let (bytes, _, _, _, _) = codegen::build_wasm_module(
+        &inputargs,
+        &ops,
+        &indexmap::IndexMap::new(),
+        Some(0),
+        &HashMap::new(),
+        &codegen::GuardGcTypeInfo::default(),
+        codegen::AllocHelpers::default(),
+        0,
+        None,
+        0,
+        gc_table_base,
+        0,
+        0,
+        0,
+        codegen::FrameGeometry::fixed(),
+        codegen::CaParams::default(),
+    )
+    .expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+
+    let mut control_stack = Vec::new();
+    let mut gc_table_address_on_stack = false;
+    let mut loads_inside_loop = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::Loop { .. } => {
+                        control_stack.push(true);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::Block { .. } | wasmparser::Operator::If { .. } => {
+                        control_stack.push(false);
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::End => {
+                        control_stack.pop();
+                        gc_table_address_on_stack = false;
+                    }
+                    wasmparser::Operator::I32Const { value } if value == gc_table_base as i32 => {
+                        gc_table_address_on_stack = true;
+                    }
+                    wasmparser::Operator::I32Load { .. } if gc_table_address_on_stack => {
+                        if control_stack.contains(&true) {
+                            loads_inside_loop += 1;
+                        }
+                        gc_table_address_on_stack = false;
+                    }
+                    _ => gc_table_address_on_stack = false,
+                }
+            }
+        }
+    }
+    assert_eq!(
+        loads_inside_loop, 0,
+        "ConstPtr table slot was reloaded on the hot backedge"
+    );
+}
+
+#[test]
 fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
     let inputargs = vec![
         InputArg::from_type(Type::Ref, 0),

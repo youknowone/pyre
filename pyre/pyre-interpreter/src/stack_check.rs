@@ -97,9 +97,15 @@ pub const MAX_STACK_SIZE: usize = 48 << 18;
 /// implementation default.
 ///
 /// [`effective_stack_length`] leaves a quarter of the stack to the Rust/C
-/// frames between the probe and the guard page, so 20 MiB buys a 15 MiB
-/// ceiling.  That covers the measured guard-resume cost at the default limit
-/// (and the 90% lower bound at 2000 used by the parity fixture) without making
+/// frames between the probe and the guard page.  Most hosts use 20 MiB (a
+/// 15 MiB ceiling). Windows uses 24 MiB (an 18 MiB ceiling): Cranelift's Win64
+/// prologue/resume frames need about 16.8 MiB to reach Python's logical cutoff
+/// at a recursion limit of 2000.  Keeping the native guard above that cutoff
+/// makes the Python 3.14 logical-depth check decide the observable limit, while
+/// the native guard remains the hard-stop PyPy's `rstack` design requires.
+/// Both stay far below the 256 MiB interpreter stack reserved by
+/// `pyrex::main_entry`.  These ceilings cover the measured guard-resume cost
+/// without making
 /// `support.infinite_recursion(20_000)` consume the much larger interpreter
 /// stack before its native guard fires.  At 8 MiB the clamp cut a thread's
 /// budget below what the *default* limit is worth, so the guard, not the limit,
@@ -115,6 +121,9 @@ pub const MAX_STACK_SIZE: usize = 48 << 18;
 /// path.  A single figure for all Python-running threads keeps that shared
 /// word meaningful; upstream gets the same uniformity for free because
 /// `_ll_stack_os_limit` reads `getrlimit`, which is process-wide.
+#[cfg(windows)]
+pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 24 * 1024 * 1024;
+#[cfg(not(windows))]
 pub const DEFAULT_RUNTIME_THREAD_STACK_SIZE: usize = 20 * 1024 * 1024;
 
 /// Process-wide requested byte budget, corresponding to RPython's
