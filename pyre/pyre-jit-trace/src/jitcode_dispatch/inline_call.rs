@@ -2523,7 +2523,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // the orthodox `w_list_append` descent does.  A descent that already
         // applied an effect cannot be rewound this way, so it keeps the abort.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
-            if fbw_store_journal_len() == journal_before
+            if fbw_executed_effect_count() == effects_before
                 && fbw_has_unjournaled_effect() == unjournaled_before =>
         {
             if fbw_inline_diag_enabled() {
