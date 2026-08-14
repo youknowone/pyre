@@ -4280,6 +4280,14 @@ fn ec_field_descr(offset: usize) -> DescrRef {
 /// no write barrier), which is correct because each slot is forwarded
 /// directly as a GC root every collection (`eval::walk_pyframe_roots`), so the
 /// generational remembered-set barrier is unnecessary.
+///
+/// The group is minted with `is_gc_managed = false`: `ExecutionContext` is a
+/// plain Rust struct reached through a raw pointer (`EC_SIZE` is
+/// `size_of::<ExecutionContext>()`, the offsets are `offset_of!`), so it has no
+/// type-id word at `ref - GcHeader::SIZE`.  `StructPtrInfo.make_guards` gates
+/// `GUARD_GC_TYPE` on this flag, and the default GC-managed shape made it emit
+/// `GUARD_GC_TYPE(ec, 0)` — a guard that reads the memory preceding the EC
+/// allocation and compares it against the `type_id 0` above.
 static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     let field = |index: u32, field_key: &str, offset: usize| SimpleFieldDescrSpec {
@@ -4320,7 +4328,18 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     for (index_in_parent, spec) in specs.iter_mut().enumerate() {
         spec.index_in_parent = index_in_parent;
     }
-    majit_ir::descr::make_simple_descr_group(u32::MAX, pyre_interpreter::EC_SIZE, 0, 0, &specs)
+    majit_ir::descr::make_simple_descr_group_with_flags(
+        u32::MAX,
+        pyre_interpreter::EC_SIZE,
+        0,
+        0,
+        // is_gc_managed: no GC header, so no runtime type-id to guard on.
+        false,
+        // headerless: the JIT never allocates an `ExecutionContext`, so the
+        // `NEW` rewrite shape this flag selects is not reachable.
+        false,
+        &specs,
+    )
 });
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
