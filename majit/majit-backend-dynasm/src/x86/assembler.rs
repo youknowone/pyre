@@ -5393,6 +5393,28 @@ impl<'a> Assembler386<'a> {
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
         // canonical copy.  Must follow the `meta_descr` stamp above.
         descr_fd.set_rd_locs(rd_locs);
+        // `regalloc.py:496-499 consider_guard_value` — every upstream backend
+        // stamps the per-value counter while laying the guard out, so
+        // `store_hash` (`compile.py:826-829`, gated on `status == 0`) leaves it
+        // alone and `must_compile` hashes the (guard, failing value) pair
+        // instead of the guard alone.  Without it a guard whose failing value
+        // never repeats still accumulates in one bucket and compiles another
+        // bridge every `trace_eagerness` failures, without bound.  The index is
+        // a fail-arg position because `must_compile_with_values` reads the value
+        // back out of `fail_values`.
+        if op.opcode == majit_ir::OpCode::GuardValue
+            && let Some(fa) = op.getfailargs()
+        {
+            let arg0 = op.arg(0).to_opref();
+            if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
+                let type_tag = match descr_fd.fail_arg_types().get(idx) {
+                    Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
+                    Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                    _ => majit_backend::STATUS_TY_INT,
+                };
+                descr_fd.make_a_counter_per_value(idx as u32, type_tag);
+            }
+        }
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} rd_locs={:?}",
