@@ -132,7 +132,9 @@ fn callee_rca_virtual_state_summary(
             }
             crate::optimizeopt::virtualstate::VirtualStateInfo::VArray { items, .. } => {
                 for (idx, child) in items.iter().enumerate() {
-                    walk(format!("{prefix}[{idx}]"), child, out, seen);
+                    if let Some(child) = child {
+                        walk(format!("{prefix}[{idx}]"), child, out, seen);
+                    }
                 }
             }
             crate::optimizeopt::virtualstate::VirtualStateInfo::VArrayStruct {
@@ -141,12 +143,14 @@ fn callee_rca_virtual_state_summary(
             } => {
                 for (elem_idx, fields) in element_fields.iter().enumerate() {
                     for (field_idx, child) in fields {
-                        walk(
-                            format!("{prefix}[{elem_idx}].{field_idx}"),
-                            child,
-                            out,
-                            seen,
-                        );
+                        if let Some(child) = child {
+                            walk(
+                                format!("{prefix}[{elem_idx}].{field_idx}"),
+                                child,
+                                out,
+                                seen,
+                            );
+                        }
                     }
                 }
             }

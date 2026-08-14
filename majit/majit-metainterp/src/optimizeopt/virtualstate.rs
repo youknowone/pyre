@@ -192,7 +192,9 @@ pub enum VirtualStateInfo {
     /// virtualstate.py: VArrayStateInfo — virtual array with known elements.
     VArray {
         descr: DescrRef,
-        items: Vec<Rc<VirtualStateInfoNode>>,
+        /// virtualstate.py:257-260 / :707-710: an unwritten array slot has
+        /// `fieldstate[i] is None` and is skipped by every state walk.
+        items: Vec<Option<Rc<VirtualStateInfoNode>>>,
         /// virtualstate.py: lenbound — known bounds on array length.
         /// None means unbounded.
         lenbound: Option<IntBound>,
@@ -210,7 +212,9 @@ pub enum VirtualStateInfo {
         descr: DescrRef,
         /// virtualstate.py:289: self.fielddescrs — InteriorFieldDescr per field slot.
         fielddescrs: Vec<DescrRef>,
-        element_fields: Vec<Vec<(u32, Rc<VirtualStateInfoNode>)>>,
+        /// virtualstate.py:316-320 / :707-710: dense element/field slots keep
+        /// `None` for unwritten fields.
+        element_fields: Vec<Vec<(u32, Option<Rc<VirtualStateInfoNode>>)>>,
     },
     /// Value has a known class (non-null).
     ///
@@ -335,14 +339,19 @@ impl VirtualStateInfoNode {
                 }
             }
             VirtualStateInfo::VArray { items, .. } => {
-                for child in items {
+                // virtualstate.py:277-280: absent fieldstate entries do not
+                // participate in position or notvirtual numbering.
+                for child in items.iter().flatten() {
                     child.enum_into(state);
                 }
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                 for fields in element_fields {
                     for (_, child) in fields {
-                        child.enum_into(state);
+                        // virtualstate.py:328-331: skip `None` fieldstate.
+                        if let Some(child) = child {
+                            child.enum_into(state);
+                        }
                     }
                 }
             }
@@ -490,7 +499,7 @@ impl VirtualState {
                     }
                 }
                 VirtualStateInfo::VArray { items, .. } => {
-                    for child in items {
+                    for child in items.iter_mut().flatten() {
                         visit_node(child, visitor, seen);
                     }
                 }
@@ -502,7 +511,9 @@ impl VirtualState {
                 VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                     for fields in element_fields {
                         for (_, child) in fields {
-                            visit_node(child, visitor, seen);
+                            if let Some(child) = child {
+                                visit_node(child, visitor, seen);
+                            }
                         }
                     }
                 }
@@ -594,14 +605,16 @@ impl VirtualState {
                 }
             }
             VirtualStateInfo::VArray { items, .. } => {
-                for child in items {
+                for child in items.iter().flatten() {
                     Self::reset_positions_walk(child, visited);
                 }
             }
             VirtualStateInfo::VArrayStruct { element_fields, .. } => {
                 for fields in element_fields {
                     for (_, child) in fields {
-                        Self::reset_positions_walk(child, visited);
+                        if let Some(child) = child {
+                            Self::reset_positions_walk(child, visited);
+                        }
                     }
                 }
             }
@@ -661,11 +674,12 @@ impl VirtualState {
             }
             VirtualStateInfo::VArray { items, .. } => items
                 .iter()
+                .flatten()
                 .map(|child| Self::count_forced_boxes_for_entry_rc(child, visited))
                 .sum(),
             VirtualStateInfo::VArrayStruct { element_fields, .. } => element_fields
                 .iter()
-                .flat_map(|fields| fields.iter().map(|(_, child)| child))
+                .flat_map(|fields| fields.iter().filter_map(|(_, child)| child.as_ref()))
                 .map(|child| Self::count_forced_boxes_for_entry_rc(child, visited))
                 .sum(),
             VirtualStateInfo::KnownClass { .. }
@@ -987,6 +1001,11 @@ impl VirtualState {
                         .and_then(|info| info.getitem(index))
                         .and_then(|e| e.as_opref())
                         .unwrap_or(OpRef::NONE);
+                    // virtualstate.py:272-275: an absent fieldstate is not a
+                    // forced box and contributes no notvirtual slot.
+                    let Some(item_state) = item_state else {
+                        continue;
+                    };
                     // virtualstate.py:274 `if state.position > self.position`
                     if item_state.position.get() > node.position.get() {
                         Self::enum_forced_boxes_for_entry(
@@ -1016,11 +1035,6 @@ impl VirtualState {
                 //           if fieldstate.position > self.position:
                 //               fieldstate.enum_forced_boxes(boxes, itembox, ...)
                 //
-                // pyre stores element_fields sparsely: each inner Vec only
-                // contains the fields that have a state. The "fieldstate is
-                // None" case corresponds to a field_idx present in the
-                // runtime's vinfo but absent from the state's element_fields,
-                // which signals a schema mismatch.
                 let runtime_fields: Vec<Vec<(u32, OpRef)>> = match ctx
                     .get_box_replacement_operand_opt(opref)
                     .as_ref()
@@ -1038,10 +1052,6 @@ impl VirtualState {
                 }
                 for (elem_idx, fields) in element_fields.iter().enumerate() {
                     let runtime_elem = &runtime_fields[elem_idx];
-                    // virtualstate.py:347-349: if fieldstate is None and
-                    // itembox is not None → raise. In pyre's sparse model,
-                    // a runtime field absent from the state's element_fields
-                    // is the equivalent mismatch.
                     for (rt_field_idx, _) in runtime_elem {
                         if !fields.iter().any(|(fdidx, _)| fdidx == rt_field_idx) {
                             return Err(VirtualStatesCantMatch::default());
@@ -1056,6 +1066,14 @@ impl VirtualState {
                             .find(|(fdidx, _)| fdidx == field_idx)
                             .map(|(_, op)| *op)
                             .unwrap_or(OpRef::NONE);
+                        // virtualstate.py:347-350: absent state requires an
+                        // equally unwritten item and then skips recursion.
+                        let Some(field_state) = field_state else {
+                            if !item_ref.is_none() {
+                                return Err(VirtualStatesCantMatch::default());
+                            }
+                            continue;
+                        };
                         // virtualstate.py:352 `if state.position > self.position`
                         if field_state.position.get() > node.position.get() {
                             Self::enum_forced_boxes_for_entry(
@@ -1878,6 +1896,14 @@ impl VirtualState {
                     None
                 };
                 for (i, (ec, ic)) in ei.iter().zip(ii.iter()).enumerate() {
+                    // virtualstate.py:257-260: expected `None` skips the
+                    // slot; expected state against incoming `None` cannot
+                    // match. Only present pairs recurse.
+                    let (ec, ic) = match (ec, ic) {
+                        (None, _) => continue,
+                        (Some(_), None) => return Err(VirtualStatesCantMatch::default()),
+                        (Some(ec), Some(ic)) => (ec, ic),
+                    };
                     // virtualstate.py:251-256 + :72-76: `fieldbox` and
                     // `fieldbox_runtime` are both `None` when the parent's
                     // `_items[i]` slot is unset. pyre's VirtualArrayInfo
@@ -1974,12 +2000,28 @@ impl VirtualState {
                                 _ => None,
                             }
                         });
+                    // virtualstate.py:316-320: the positional helper's
+                    // missing-field cases are the direct `None` semantics:
+                    // expected absent skips, incoming absent against an
+                    // expected state rejects.
+                    let expected_present: Vec<(u32, Rc<VirtualStateInfoNode>)> = e_fields
+                        .iter()
+                        .filter_map(|(idx, child)| {
+                            child.as_ref().map(|child| (*idx, Rc::clone(child)))
+                        })
+                        .collect();
+                    let incoming_present: Vec<(u32, Rc<VirtualStateInfoNode>)> = i_fields
+                        .iter()
+                        .filter_map(|(idx, child)| {
+                            child.as_ref().map(|child| (*idx, Rc::clone(child)))
+                        })
+                        .collect();
                     Self::generate_guards_recurse_positional_fields(
                         arg_idx,
                         efd,
                         ifd,
-                        e_fields,
-                        i_fields,
+                        &expected_present,
+                        &incoming_present,
                         parent_fields.as_deref(),
                         runtime_box,
                         // virtualstate.py:316 `for descr in self.fielddescrs:
@@ -2316,7 +2358,7 @@ fn deep_clone_node(
             descr: descr.clone(),
             items: items
                 .iter()
-                .map(|child| deep_clone_node(child, cache))
+                .map(|child| child.as_ref().map(|child| deep_clone_node(child, cache)))
                 .collect(),
             lenbound: lenbound.clone(),
         },
@@ -2332,7 +2374,12 @@ fn deep_clone_node(
                 .map(|fields| {
                     fields
                         .iter()
-                        .map(|(idx, child)| (*idx, deep_clone_node(child, cache)))
+                        .map(|(idx, child)| {
+                            (
+                                *idx,
+                                child.as_ref().map(|child| deep_clone_node(child, cache)),
+                            )
+                        })
                         .collect()
                 })
                 .collect(),
@@ -2601,6 +2648,22 @@ impl ExportCache {
     }
 }
 
+/// virtualstate.py:707-710 `VirtualStateConstructor.create_state_or_none`.
+/// This is the single export boundary that maps an unwritten virtual slot to
+/// absent fieldstate; every present operand follows the ordinary state cache.
+fn create_state_or_none(
+    operand: &majit_ir::operand::Operand,
+    ctx: &OptContext,
+    cache: &mut ExportCache,
+) -> Option<Rc<VirtualStateInfoNode>> {
+    let opref = operand.to_opref();
+    if opref.is_none() {
+        None
+    } else {
+        Some(export_single_value(opref, ctx, cache))
+    }
+}
+
 /// Export abstract info for a single value, sharing `Rc<VirtualStateInfoNode>`
 /// across recursive calls so the resulting tree is a DAG: aliased boxes
 /// converge on a single shared `VirtualStateInfo`. virtualstate.py:712-728
@@ -2740,10 +2803,12 @@ fn export_single_value_inner(
                 };
             }
             PtrInfo::VirtualArray(vinfo) => {
-                let items: Vec<Rc<VirtualStateInfoNode>> = vinfo
+                // virtualstate.py:724-725: every fieldbox is routed through
+                // `create_state_or_none`, preserving unwritten slots.
+                let items: Vec<Option<Rc<VirtualStateInfoNode>>> = vinfo
                     .items
                     .iter()
-                    .map(|item_ref| export_single_value(item_ref.to_opref(), ctx, cache))
+                    .map(|item_ref| create_state_or_none(item_ref, ctx, cache))
                     .collect();
                 let len = items.len();
                 return VirtualStateInfo::VArray {
@@ -2775,8 +2840,9 @@ fn export_single_value_inner(
                         fields
                             .iter()
                             .map(|(field_idx, field_ref)| {
-                                let field_state =
-                                    export_single_value(field_ref.to_opref(), ctx, cache);
+                                // virtualstate.py:724-725: retain the dense
+                                // field slot while making unwritten state absent.
+                                let field_state = create_state_or_none(field_ref, ctx, cache);
                                 (*field_idx, field_state)
                             })
                             .collect()
@@ -2841,40 +2907,19 @@ fn export_single_value_inner(
     // is picked by `box.type` which is ALWAYS set on RPython Boxes.
     // pyre's OptContext::opref_type reconstructs it from value_types
     // (seeded from trace_inputargs) / producing-op result_type.
-    // The "0 hits" measured here covered the benchmark population; the
-    // example crates' test binaries are a population it did not enumerate,
-    // and one of them hits. `cel tests::policy_gates` reaches this line
-    // under a plain `cargo test --release -p cel` and panics, running
-    // `policy::run_gates` — the full pipeline, not the hand-built minimal
-    // OptContext the fallback below was written for.
-    //
-    // `cfg!(test)` is evaluated in majit-metainterp, so that fallback covers
-    // this crate's own unit tests and nothing else: downstream majit-metainterp
-    // is a plain dependency, `cfg!(test)` is false inside a downstream test
-    // binary too, and the panic is armed there. The firing is the proof — had
-    // the flag been true in cel's build, `Type::Int` would have been returned
-    // instead. So the fallback disarms the check exactly where this crate can
-    // exercise it, and leaves it live where a failure is hardest to attribute.
     let tp = ctx.opref_type(opref).unwrap_or_else(|| {
-        if !cfg!(test) {
-            // Two different failures reach this line, and the message used to
-            // spell both of them `None`: `OpRef::None` is the absent-operand
-            // sentinel arriving as the argument, while a named ref means
-            // value_types holds no entry for a ref that does exist. Which one
-            // was seen is the difference between "an unbound operand was
-            // exported" and "a seeding gap", so name it rather than printing
-            // a line that reads as a tautology.
-            let seen = if opref.is_none() {
-                "the absent-operand sentinel reached export_state"
-            } else {
-                "no type recorded for a ref that does exist"
-            };
-            panic!(
-                "not_virtual: opref_type({opref:?}) found no type — {seen}; \
-                 RPython box.type is always set (virtualstate.py:360)",
-            );
-        }
-        Type::Int
+        // Two different failures reach this line: the absent-operand sentinel
+        // is unexpected outside `create_state_or_none`, while a named ref
+        // means value_types lacks an entry for a real box. Keep both loud.
+        let seen = if opref.is_none() {
+            "the absent-operand sentinel reached export_state"
+        } else {
+            "no type recorded for a ref that does exist"
+        };
+        panic!(
+            "not_virtual: opref_type({opref:?}) found no type — {seen}; \
+             RPython box.type is always set (virtualstate.py:360)",
+        );
     });
     // virtualstate.py:476-481 NotVirtualStateInfoInt.__init__: an int leaf's
     // info is `getintbound(op)` (optimizer.py:335-338 — always an IntBound for a
@@ -2904,7 +2949,7 @@ fn export_single_value_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizeopt::info::VirtualStructInfo;
+    use crate::optimizeopt::info::{VirtualArrayInfo, VirtualStructInfo};
     use majit_ir::operand::Operand;
     use majit_ir::{Descr, FieldDescr, GcRef, Type};
     use std::sync::Arc;
@@ -3068,23 +3113,31 @@ mod tests {
         let a1 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
-                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
-                VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Int)),
+                Some(VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                    Value::Int(1),
+                ))),
+                Some(VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(
+                    Type::Int,
+                ))),
             ],
             lenbound: None,
         });
         let a2 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
             items: vec![
-                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(1))),
-                VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(Value::Int(2))),
+                Some(VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                    Value::Int(1),
+                ))),
+                Some(VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
+                    Value::Int(2),
+                ))),
             ],
             lenbound: None,
         });
         let a3 = vs1(VirtualStateInfo::VArray {
             descr: descr.clone(),
-            items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
-                Value::Int(1),
+            items: vec![Some(VirtualStateInfoNode::new_rc(
+                VirtualStateInfo::Constant(Value::Int(1)),
             ))],
             lenbound: None,
         });
@@ -3266,8 +3319,8 @@ mod tests {
             VirtualState::new(vec![VirtualStateInfo::Constant(Value::Ref(GcRef(0x1234)))]);
         let incoming = VirtualState::new(vec![VirtualStateInfo::VArray {
             descr,
-            items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Constant(
-                Value::Int(1),
+            items: vec![Some(VirtualStateInfoNode::new_rc(
+                VirtualStateInfo::Constant(Value::Int(1)),
             ))],
             lenbound: None,
         }]);
@@ -3323,6 +3376,45 @@ mod tests {
             .expect("non-virtual array length bound");
         assert_eq!((lenbound.lower, lenbound.upper), (0, 10));
         assert!(lenbound.are_knownbits_implied());
+    }
+
+    #[test]
+    fn test_export_virtual_array_skips_unwritten_slot() {
+        // virtualstate.py:707-710 / :724-725: an unwritten fieldbox exports
+        // as absent fieldstate. virtualstate.py:272-280 then gives it neither
+        // a forced box nor a position_in_notvirtuals slot.
+        let mut ctx = OptContext::new(32);
+        let array_ref = OpRef::ref_op(10);
+        let written_ref = OpRef::int_op(11);
+        let array_box = ctx.materialize_operand_at(array_ref);
+        let written_box = ctx.materialize_operand_at(written_ref);
+        ctx.set_ptr_info(
+            &array_box,
+            PtrInfo::VirtualArray(VirtualArrayInfo {
+                descr: test_descr(21),
+                clear: false,
+                items: vec![Operand::None, written_box],
+                last_guard_pos: -1,
+                avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
+            }),
+        );
+
+        let state = export_state(&[array_ref], &ctx);
+        let VirtualStateInfo::VArray { items, .. } = &state.state[0].info else {
+            panic!("exported state is not a virtual array");
+        };
+        assert!(items[0].is_none(), "unwritten slot must stay absent");
+        let written_state = items[1].as_ref().expect("written slot state");
+        assert_eq!(written_state.position_in_notvirtuals.get(), 0);
+
+        // Hand-computed LABEL/JUMP arity: virtual head 0 + absent slot 0 +
+        // one written Unknown(Int) leaf 1 = one non-virtual argument.
+        assert_eq!(state.num_boxes(), 1);
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let inputargs = state
+            .make_inputargs(&[array_ref], &mut optimizer, &mut ctx, false)
+            .expect("exported virtual array must enumerate its written slot");
+        assert_eq!(inputargs, vec![written_ref]);
     }
 
     #[test]
@@ -3634,8 +3726,8 @@ mod tests {
             VirtualStateInfo::NonNull,
             VirtualStateInfo::VArray {
                 descr,
-                items: vec![VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(
-                    Type::Int,
+                items: vec![Some(VirtualStateInfoNode::new_rc(
+                    VirtualStateInfo::Unknown(Type::Int),
                 ))],
                 lenbound: None,
             },
