@@ -837,7 +837,7 @@ until translated shadow-stack roots make the ordinary moving-nursery path safe.
 
 Kept as-is; listed for completeness.
 
-- **Diagnostics (~34, default-OFF)** — print/log/dump/probe/assert only; tooling,
+- **Diagnostics (~35, default-OFF)** — print/log/dump/probe/assert only; tooling,
   not experiments: `PYRE_FBW_DEBUG_ABORT`, `_INLINE_DIAG`, `_MF_DIAG`,
   `_STRICT_DIAG`, `PYRE_WALK_PERFN_JITCODE`, `PYRE_DUMP_PERFN_JITCODE`,
   `PYRE_P2_DIAG`, `PYRE_PCDEP_VALIDATE`, `PYRE_MIR_FRAMESTATE_DEBUG`,
@@ -847,7 +847,13 @@ Kept as-is; listed for completeness.
   `PYRE_RTYPER_VERBOSE`, `PYRE_JTRANSFORM_SHADOW`, `PYRE_DIAG124C`, `_51C`,
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `PYRE_NBODY_DEBUG`,
-  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`.
+  `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`.
+  `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
+  actually resolves, so the per-index pool loader can be measured against the
+  pool size; the resolve path reads it through a `OnceLock` and pays nothing
+  when it is unset. It is a measurement probe with no ON behaviour to graduate,
+  so it has no epic — delete it with the demand counter itself once the pool's
+  working set is settled.
 - **Default-OFF experiments (none remaining)** — triaged in §1b/§1c (4 retired
   in the 2026-07-05 pass; `PYRE_P2_DRAIN` retired with
   the framestack-walk deletion; `_VABLE_SCALAR_CA` retired 2026-07-25, see
