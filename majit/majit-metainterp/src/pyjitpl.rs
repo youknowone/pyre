@@ -1538,6 +1538,9 @@ pub struct MetaInterp<M: Clone> {
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
     pending_frontend_boxes: Option<Vec<i64>>,
+    /// Types parallel to `pending_frontend_boxes`, used to forward only Ref
+    /// slots while the bridge trace and compile are active.
+    pending_frontend_box_types: Option<Vec<Type>>,
     /// `optimizer.cpu` (model.py:39 `AbstractCPU`) backref.  Hosts
     /// `cls_of_box(box)` (model.py:199-201) and, going forward, the
     /// rest of the AbstractCPU surface (`bh_*` runtime calls, GC type
@@ -2145,6 +2148,18 @@ impl<M: Clone> MetaInterp<M> {
                 // positions (ResOp / InputArg refs) carry no inline ref.
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(gcref);
+                }
+            }
+        }
+        if let (Some(values), Some(types)) = (
+            self.pending_frontend_boxes.as_mut(),
+            self.pending_frontend_box_types.as_deref(),
+        ) {
+            for (value, ty) in values.iter_mut().zip(types.iter()) {
+                if *ty == Type::Ref && *value != 0 {
+                    let mut gcref = GcRef(*value as usize);
+                    visitor(&mut gcref);
+                    *value = gcref.0 as i64;
                 }
             }
         }
@@ -2950,6 +2965,7 @@ impl<M: Clone> MetaInterp<M> {
             declined_bridge_guards: std::collections::HashSet::new(),
             pending_preamble_tokens: indexmap::IndexMap::new(),
             pending_frontend_boxes: None,
+            pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
             staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
@@ -7437,6 +7453,7 @@ impl<M: Clone> MetaInterp<M> {
         // trip the bridgeopt.py:126 `len(frontend_boxes) == len(liveboxes)`
         // assertion against the entry bridge's own inputargs.
         self.pending_frontend_boxes = None;
+        self.pending_frontend_box_types = None;
         self.compile_trace_inner(
             green_key,
             finish_args,
@@ -13161,6 +13178,9 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py:124 frontend_boxes come directly from the guard
         // failure values in fail_arg_types order.
         self.pending_frontend_boxes = Some(fail_values.to_vec());
+        self.pending_frontend_box_types = descr_arc
+            .as_fail_descr()
+            .map(|fd| fd.fail_arg_types().to_vec());
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
