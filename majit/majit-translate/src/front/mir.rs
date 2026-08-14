@@ -1746,7 +1746,13 @@ fn derive_program_metadata(
                     enum_variant_by_discriminant.insert(leaf, by_discr);
                 }
             }
-            TypeDeclKind::Alias(_) | TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+            // A union's fields all start at offset 0 and only one is live,
+            // so there is no field-offset row to project; the declarations
+            // that reach here are foreign (`windows-sys`' `IN_ADDR_0`).
+            TypeDeclKind::Union(_)
+            | TypeDeclKind::Alias(_)
+            | TypeDeclKind::Opaque
+            | TypeDeclKind::Unknown => {}
         }
     }
 

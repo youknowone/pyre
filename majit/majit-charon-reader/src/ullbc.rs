@@ -261,6 +261,12 @@ pub enum TypeDeclKind {
     /// carries its own field list (zero-arg for unit variants, named
     /// for `Foo { a: ... }`, positional for `Bar(T)`).
     Enum(Vec<VariantDecl>),
+    /// Union body — a field list shaped like `Struct`'s, but every field
+    /// starts at offset 0 and only one is live at a time. Foreign C unions
+    /// reach the table through the dependency closure (`windows-sys`'
+    /// `IN_ADDR_0`), so the variant must parse even though no field-offset
+    /// row can be projected from it.
+    Union(Vec<FieldDecl>),
     /// Type alias (`type T = ...`). The aliased type lives in
     /// `rest["aliased_ty"]`; not currently consumed.
     Alias(Value),
