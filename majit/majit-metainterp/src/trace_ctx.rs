@@ -2219,6 +2219,14 @@ impl TraceCtx {
         self.recorder.last_guard_opcode()
     }
 
+    pub fn set_last_op_descr(&mut self, descr: DescrRef) {
+        self.recorder.set_last_op_descr(descr);
+    }
+
+    pub fn set_guard_op_descr_from_end(&mut self, from_end: usize, descr: DescrRef) {
+        self.recorder.set_guard_op_descr_from_end(from_end, descr);
+    }
+
     /// The structured green key values, if provided.
     pub fn green_key_values(&self) -> Option<&GreenKey> {
         self.green_key_values.as_ref()

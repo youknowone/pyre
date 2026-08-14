@@ -5496,7 +5496,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // Range FOR_ITER is a C-level iterator advance.  Re-emit its field
     // updates so the opaque ForIterNext residual cannot invalidate optheap;
-    // other iterator families retain the residual and its Python semantics.
+    // The user-instance route below separately enters a Python `__next__`;
+    // remaining iterator families retain the residual and its Python semantics.
     // In particular, a generic W_SeqIterObject must stay residual: its PyPy
     // `W_SeqIterObject.descr_next` frame catches IndexError from `__getitem__`
     // and turns it into iterator exhaustion.  Inlining only `__getitem__`
@@ -5510,6 +5511,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if let Some(inlined) = spec_gate("instance_next", || {
+            try_walker_specialize_instance_next(
+                ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
+            )
+        })? {
+            return Ok(inlined);
         }
     }
 

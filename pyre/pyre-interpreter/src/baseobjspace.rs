@@ -2062,6 +2062,34 @@ pub unsafe fn getitem_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64,
     }
 }
 
+/// FOR_ITER fast path: return the receiver's type, its version tag, and the
+/// `__next__` [`next`] would dispatch for a user instance, so the full-body
+/// walker can inline the method in place of the opaque residual.
+///
+/// This mirrors only [`next`]'s instance arm.  Iterator layouts claimed by an
+/// earlier arm, including the unpack iterator, and the later generic
+/// non-instance lookup retain the residual path.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn next_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
+            return None;
+        }
+        let w_type = w_instance_get_type(w_obj);
+        if w_type.is_null() {
+            return None;
+        }
+        let method = lookup_in_type_where(w_type, "__next__")?;
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
 #[inline(never)]
 /// `functional.py W_Range.descr_getitem` — integer index returns
 /// the member `start + i*step` (negative folded, bounds-checked); a slice

@@ -3242,6 +3242,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
         range_foriter_key: AtomicU64::new(0),
+        instance_next_foriter_key: AtomicU64::new(0),
     })
 }
 
@@ -3335,6 +3336,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
         range_foriter_key: AtomicU64::new(0),
+        instance_next_foriter_key: AtomicU64::new(0),
     })
 }
 
@@ -3353,6 +3355,20 @@ pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
         .and_then(|any| any.downcast_ref::<ResumeGuardDescr>())
         .expect("make_resume_guard_descr_typed constructs a ResumeGuardDescr")
         .range_foriter_key
+        .store(green_key, Ordering::Relaxed);
+    descr
+}
+
+/// Tag a guard emitted while inlining a user instance's `__next__` with the
+/// caller FOR_ITER key.  A guard-failure bridge uses the tag to keep the
+/// exception-to-exhaustion conversion on the generic residual path.
+pub fn make_resume_guard_descr_instance_next_foriter(green_key: u64) -> DescrRef {
+    let descr = make_resume_guard_descr_typed(Vec::new());
+    descr
+        .as_any()
+        .and_then(|any| any.downcast_ref::<ResumeGuardDescr>())
+        .expect("make_resume_guard_descr_typed constructs a ResumeGuardDescr")
+        .instance_next_foriter_key
         .store(green_key, Ordering::Relaxed);
     descr
 }
@@ -3616,6 +3632,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
             range_foriter_key: AtomicU64::new(0),
+            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -3884,6 +3901,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
             range_foriter_key: AtomicU64::new(0),
+            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -4136,6 +4154,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
             range_foriter_key: AtomicU64::new(0),
+            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -5132,6 +5151,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
                 range_foriter_key: AtomicU64::new(0),
+                instance_next_foriter_key: AtomicU64::new(0),
             },
         }))
     }
@@ -5353,6 +5373,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
             range_foriter_key: AtomicU64::new(0),
+            instance_next_foriter_key: AtomicU64::new(0),
         },
     })
 }
@@ -5874,6 +5895,7 @@ mod fail_descr_tests {
                 bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
                 bridge_dispatch_drop_fn: OnceLock::new(),
                 range_foriter_key: AtomicU64::new(0),
+                instance_next_foriter_key: AtomicU64::new(0),
             },
         }) as DescrRef;
         let lv_fi = lv.index();

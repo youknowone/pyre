@@ -264,6 +264,11 @@ pub struct ResumeGuardDescr {
     /// longer depends on the guard's per-trace fail index.  `0` = not a
     /// range guard.
     pub range_foriter_key: AtomicU64,
+    /// Pyre-only: FOR_ITER green key for guards emitted while inlining a user
+    /// instance's `__next__`.  A bridge from one of these guards must retain
+    /// the generic `jit_next` conversion path when it re-enters FOR_ITER.
+    /// `0` means this descr did not originate in that inline route.
+    pub instance_next_foriter_key: AtomicU64,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -285,6 +290,12 @@ impl Descr for ResumeGuardDescr {
     }
     fn range_foriter_green_key(&self) -> Option<u64> {
         match self.range_foriter_key.load(Ordering::Relaxed) {
+            0 => None,
+            key => Some(key),
+        }
+    }
+    fn instance_next_foriter_green_key(&self) -> Option<u64> {
+        match self.instance_next_foriter_key.load(Ordering::Relaxed) {
             0 => None,
             key => Some(key),
         }
@@ -316,9 +327,12 @@ impl Descr for ResumeGuardDescr {
             bridge_body_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
             bridge_dispatch_drop_fn: OnceLock::new(),
-            // The clone guards the same range site; preserve the tag so a
-            // cloned range class guard still demotes on failure.
+            // The clone guards the same FOR_ITER site; preserve either tag so
+            // guard-failure routing survives guard copying.
             range_foriter_key: AtomicU64::new(self.range_foriter_key.load(Ordering::Relaxed)),
+            instance_next_foriter_key: AtomicU64::new(
+                self.instance_next_foriter_key.load(Ordering::Relaxed),
+            ),
         }))
     }
 }
@@ -600,6 +614,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_dispatch_cell: AtomicPtr::new(std::ptr::null_mut()),
         bridge_dispatch_drop_fn: OnceLock::new(),
         range_foriter_key: AtomicU64::new(0),
+        instance_next_foriter_key: AtomicU64::new(0),
     })
 }
 

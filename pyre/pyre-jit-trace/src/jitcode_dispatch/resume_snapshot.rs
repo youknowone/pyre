@@ -326,6 +326,15 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     after_residual_call: bool,
     scope: GuardCaptureScope<'_>,
 ) -> Result<(), DispatchError> {
+    if let Some(green_key) = ctx.fbw_mode.instance_next_foriter_green_key {
+        let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(green_key);
+        match scope.guard_stamp {
+            GuardStampTarget::LastOp => ctx.trace_ctx.set_last_op_descr(descr),
+            GuardStampTarget::GuardFromEnd(from_end) => {
+                ctx.trace_ctx.set_guard_op_descr_from_end(from_end, descr)
+            }
+        }
+    }
     // A guard whose resume snapshot cannot be built must abort the trace,
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
     // box (including the identity at `[-1]`) to carry `OpRef::ty()`; a

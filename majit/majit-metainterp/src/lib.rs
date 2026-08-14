@@ -149,7 +149,7 @@ pub use call_descr::{
 };
 pub use compile::{
     make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
-    make_resume_guard_descr_range_foriter,
+    make_resume_guard_descr_instance_next_foriter, make_resume_guard_descr_range_foriter,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,

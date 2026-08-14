@@ -9470,6 +9470,14 @@ fn handle_fail(
         return HandleFailOutcome::ResumeInBlackhole;
     }
 
+    // A guard inside an inlined user `__next__` resumes its bridge at the
+    // caller's FOR_ITER.  Mark that site before bridge tracing so the bridge
+    // records generic `jit_next`: an exhausted iterator then takes the
+    // existing NULL-result exit instead of re-entering the callee sub-walk.
+    if let Some(foriter_key) = descr_arc.instance_next_foriter_green_key() {
+        pyre_jit_trace::trace::instance_next_foriter_bridge_demote_once(foriter_key);
+    }
+
     // compile.py:702-703: must_compile() AND not stack_almost_full()
     if should_bridge && !stack_almost_full() {
         let is_tracing = {

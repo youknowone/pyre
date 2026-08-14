@@ -431,6 +431,12 @@ thread_local! {
     /// executing thread's trace; no cross-thread mutable JIT state is needed.
     static RANGE_FORITER_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+    /// FOR_ITER sites whose user-instance `__next__` inline has reached a
+    /// guard-failure bridge.  Only bridge walks consult this set: the primary
+    /// loop retains its inline, while the bridge records generic `jit_next` so
+    /// exhaustion is converted by the caller opcode.
+    static INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
     /// The current bridge trace's full-body walk hit a deterministic
     /// structural decline.  The walker only knows `(w_code, start_pc)`; the
     /// bridge launcher still has the originating guard descr and consumes this
@@ -481,6 +487,17 @@ pub(crate) fn range_foriter_demoted(key: u64) -> bool {
 /// again.  It is not the key the failing trace was entered at.
 pub fn range_foriter_demote_once(site_key: u64) -> bool {
     RANGE_FORITER_DEMOTED.with(|s| s.borrow_mut().insert(site_key))
+}
+
+pub(crate) fn instance_next_foriter_bridge_demoted(key: u64) -> bool {
+    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow().contains(&key))
+}
+
+/// Mark a user-instance `__next__` guard source so its bridge walk keeps the
+/// generic FOR_ITER residual.  The set is deliberately bridge-only; it does
+/// not retire the optimized loop or suppress the inline on a later root trace.
+pub fn instance_next_foriter_bridge_demote_once(green_key: u64) -> bool {
+    INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow_mut().insert(green_key))
 }
 
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {

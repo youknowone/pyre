@@ -3125,6 +3125,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         constructor_result,
         None,
         false,
+        None,
     )
 }
 
@@ -3176,6 +3177,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
+    instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
@@ -4897,6 +4899,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
                 inline_caller_py_pc,
+                instance_next_foriter_green_key,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -6867,6 +6870,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Some(&mut result),
         true,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -6986,6 +6990,166 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         false,
         None,
     )
+}
+
+/// Inline a user instance's Python `__next__` directly under FOR_ITER.
+///
+/// The instance arm of `space.next` forwards the method's exception directly
+/// to FOR_ITER, so caller-boundary resume retains the complete handler shape.
+/// A guard-failure bridge is tagged and deliberately takes the generic
+/// residual leg when it re-enters this site, preserving exhaustion conversion
+/// without attempting to walk an already-exhausted iterator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || dst_bank != 'r'
+        || ctx.fbw_mode.inline_subwalk
+        || r_args.len() != 1
+    {
+        return Ok(None);
+    }
+
+    let Some(foriter_green_key) = walker_foriter_green_key(ctx, op.pc) else {
+        return Ok(None);
+    };
+    if ctx.trace_ctx.is_bridge_trace
+        && crate::trace::instance_next_foriter_bridge_demoted(foriter_green_key)
+    {
+        return Ok(None);
+    }
+
+    let iter_op = r_args[0];
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, w_next)) =
+        (unsafe { pyre_interpreter::baseobjspace::next_fast_path(iter_obj) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_next) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header || body_facts.has_exception_table {
+        return Ok(None);
+    }
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return Ok(None);
+    };
+    let Some((callee_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
+    else {
+        return Ok(None);
+    };
+    let replay_safety = fbw_callee_body_replay_safety(
+        body.code,
+        &[ExactNumericArg::default()],
+        body.num_regs_i,
+        body.constants_i,
+        body.num_regs_r,
+        body.constants_r,
+        callee_descr_refs,
+        false,
+    );
+    if !matches!(
+        replay_safety,
+        CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
+    ) || fbw_foriter_deferred_call_denied(w_code as usize)
+    {
+        return Ok(None);
+    }
+
+    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body_coord);
+    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iter_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(iter_obj);
+    let type_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_type);
+    let next_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_next);
+    let code_root = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+
+    let iter_obj = pyre_object::gc_roots::shadow_stack_get(iter_root);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
+    let w_next = pyre_object::gc_roots::shadow_stack_get(next_root);
+    let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+    let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
+    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
+        let type_const = ctx.trace_ctx.const_int(iter_layout);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(iter_op, iter_layout);
+
+    let next_const = ctx.trace_ctx.const_ref(w_next as i64);
+    let inline = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_next,
+        next_const,
+        w_next,
+        vec![
+            ConcreteValue::Ref(w_next),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(iter_obj),
+        ],
+        vec![iter_op],
+        vec![ConcreteValue::Ref(iter_obj)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((iter_op, iter_obj, w_type, version_tag)),
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        Some(foriter_green_key),
+    );
+    if !matches!(inline, Ok(Some((DispatchOutcome::Continue, _)))) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+
+    let item_op = ctx.registers_r[dst];
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    fbw_foriter_inflight_capture(concrete_item, body_coord);
+    ctx.vstack_last_ref = item_op;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace

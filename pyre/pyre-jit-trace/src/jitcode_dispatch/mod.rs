@@ -1426,6 +1426,10 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// bridge's own resume coordinate, restoring the RPython positional
     /// semantics.
     pub bridge_entry_merge_pc: Option<usize>,
+    /// FOR_ITER key inherited only by the user-instance `__next__` sub-walk.
+    /// Every guard it emits is tagged so a guard-failure bridge re-entering
+    /// FOR_ITER retains the generic exception-to-exhaustion conversion.
+    pub instance_next_foriter_green_key: Option<u64>,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1470,6 +1474,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
+            instance_next_foriter_green_key: None,
         }
     }
 }
