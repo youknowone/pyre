@@ -2449,51 +2449,60 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///
 /// Returns the number of retargeted edges.
 pub fn retarget_assert_raise_blocks(graph: &mut FunctionGraph) -> usize {
-    use crate::flowspace::model::HOST_ENV;
+    use crate::flowspace::model::{HOST_ENV, HostObject};
+
+    /// The raise args of a block that exists only to raise the implicit
+    /// `AssertionError`; `None` for anything else.
+    fn bare_assert_raise_args<'a>(
+        block: &'a Block,
+        exceptblock: BlockId,
+        assert_err_class: &HostObject,
+    ) -> Option<&'a Vec<LinkArg>> {
+        let [exit] = block.exits.as_slice() else {
+            return None;
+        };
+        if exit.target != exceptblock {
+            return None;
+        }
+        if !matches!(
+            exit.args.first(),
+            Some(LinkArg::Const(c))
+                if matches!(
+                    &c.value,
+                    ConstValue::HostObject(h) if h == assert_err_class
+                )
+        ) {
+            return None;
+        }
+        block
+            .operations
+            .iter()
+            .all(|op| crate::inline::can_remove_op(&op.kind))
+            .then_some(&exit.args)
+    }
 
     let assert_err_class = HOST_ENV
         .lookup_builtin("AssertionError")
         .expect("HOST_ENV missing AssertionError");
     let exceptblock = graph.exceptblock;
-    let mut raise_args: std::collections::HashMap<BlockId, Vec<LinkArg>> =
-        std::collections::HashMap::new();
-    for block in &graph.blocks {
-        if block.id == exceptblock || block.exits.len() != 1 {
-            continue;
-        }
-        let exit = &block.exits[0];
-        let raises = exit.target == exceptblock
-            && matches!(
-                exit.args.first(),
-                Some(LinkArg::Const(c))
-                    if matches!(
-                        &c.value,
-                        ConstValue::HostObject(h) if *h == assert_err_class
-                    )
-            );
-        if !raises {
-            continue;
-        }
-        if !block
-            .operations
-            .iter()
-            .all(|op| crate::inline::can_remove_op(&op.kind))
-        {
-            continue;
-        }
-        raise_args.insert(block.id, exit.args.clone());
-    }
-    if raise_args.is_empty() {
-        return 0;
-    }
     let mut retargeted = 0usize;
+    // Each edge asks its own target, so there is no side table to keep in
+    // step with the mutation — upstream carries no such map either, and a
+    // qualifying block is cheap to recognise: one exit, one constant, and
+    // operations the dead-op pass would reclaim.
     for block_idx in 0..graph.blocks.len() {
-        if raise_args.contains_key(&graph.blocks[block_idx].id) {
-            continue;
-        }
         for exit_idx in 0..graph.blocks[block_idx].exits.len() {
             let target = graph.blocks[block_idx].exits[exit_idx].target;
-            let Some(args) = raise_args.get(&target).cloned() else {
+            // An edge already naming `exceptblock` is the shape the pass
+            // matches; it is also every qualifying block's own exit, which is
+            // what keeps this from rewriting the raise onto itself.
+            if target == exceptblock {
+                continue;
+            }
+            let Some(args) =
+                bare_assert_raise_args(graph.block(target), exceptblock, &assert_err_class)
+                    .cloned()
+            else {
                 continue;
             };
             let exit = &mut graph.blocks[block_idx].exits[exit_idx];
