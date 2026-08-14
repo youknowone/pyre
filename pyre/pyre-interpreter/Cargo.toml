@@ -90,11 +90,13 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 
 [target.'cfg(windows)'.dependencies]
 # The nt calls host_env does not wrap (AddDllDirectory/RemoveDllDirectory,
-# GetFileInformationByHandle, CreateHardLinkW and ShellExecuteW). Kept on the
-# same 0.61 line rustpython-host_env's nt module resolves to, so HANDLE types
+# GetFileInformationByHandle, CreateHardLinkW and ShellExecuteW), plus the
+# WinSock entry points `_socket`'s host layer is built on. Kept on the same
+# 0.61 line rustpython-host_env's nt module resolves to, so HANDLE types
 # match at the boundary.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_System_LibraryLoader",
