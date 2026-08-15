@@ -2342,8 +2342,16 @@ fn test_single_label_peeled_loop_validates() {
     assert!(!guards[0].is_finish);
 }
 
+/// A `LoadFromGcTable` placed inside the loop body is emitted inside the loop.
+///
+/// `rewrite.py:1100-1115 remove_constptr` caches one load per gc-table index,
+/// but `rewrite.py:1003-1006 emit_label` clears `gcrefs_recently_loaded` at
+/// every LABEL, so a reference constant used after the LABEL is loaded again on
+/// each iteration. The comment there rejects keeping the value alive across the
+/// label ("don't spill it") as "the wrong level" — the backend emits the op
+/// where the trace puts it and leaves that decision to the optimizer.
 #[test]
-fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
+fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![
         make_op(
@@ -2435,16 +2443,16 @@ fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
             }
         }
     }
-    // Without these two, the zero above also holds for a body that emitted no
-    // loop at all, or dropped the table load entirely.
+    // Without this, the counts below also hold for a body that emitted no loop
+    // at all.
     assert!(saw_loop, "codegen emitted no loop for a looping trace");
-    assert!(
-        loads_outside_loop > 0,
-        "the hoisted ConstPtr table slot is never loaded"
+    assert_eq!(
+        loads_inside_loop, 1,
+        "the in-loop LoadFromGcTable must be emitted inside the loop"
     );
     assert_eq!(
-        loads_inside_loop, 0,
-        "ConstPtr table slot was reloaded on the hot backedge"
+        loads_outside_loop, 0,
+        "no gc-table load belongs outside the loop for this trace"
     );
 }
 
