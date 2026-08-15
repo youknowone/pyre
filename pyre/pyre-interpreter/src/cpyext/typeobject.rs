@@ -2452,87 +2452,102 @@ pub struct CPyTypeSpec {
 mod slot_id {
     use std::ffi::c_int;
 
-    pub const BF_GETBUFFER: c_int = 1;
-    pub const BF_RELEASEBUFFER: c_int = 2;
-    pub const MP_ASS_SUBSCRIPT: c_int = 3;
-    pub const MP_LENGTH: c_int = 4;
-    pub const MP_SUBSCRIPT: c_int = 5;
-    pub const NB_ABSOLUTE: c_int = 6;
-    pub const NB_ADD: c_int = 7;
-    pub const NB_AND: c_int = 8;
-    pub const NB_BOOL: c_int = 9;
-    pub const NB_DIVMOD: c_int = 10;
-    pub const NB_FLOAT: c_int = 11;
-    pub const NB_FLOOR_DIVIDE: c_int = 12;
-    pub const NB_INDEX: c_int = 13;
-    pub const NB_INPLACE_ADD: c_int = 14;
-    pub const NB_INPLACE_AND: c_int = 15;
-    pub const NB_INPLACE_FLOOR_DIVIDE: c_int = 16;
-    pub const NB_INPLACE_LSHIFT: c_int = 17;
-    pub const NB_INPLACE_MULTIPLY: c_int = 18;
-    pub const NB_INPLACE_OR: c_int = 19;
-    pub const NB_INPLACE_POWER: c_int = 20;
-    pub const NB_INPLACE_REMAINDER: c_int = 21;
-    pub const NB_INPLACE_RSHIFT: c_int = 22;
-    pub const NB_INPLACE_SUBTRACT: c_int = 23;
-    pub const NB_INPLACE_TRUE_DIVIDE: c_int = 24;
-    pub const NB_INPLACE_XOR: c_int = 25;
-    pub const NB_INT: c_int = 26;
-    pub const NB_INVERT: c_int = 27;
-    pub const NB_LSHIFT: c_int = 28;
-    pub const NB_MULTIPLY: c_int = 29;
-    pub const NB_NEGATIVE: c_int = 30;
-    pub const NB_OR: c_int = 31;
-    pub const NB_POSITIVE: c_int = 32;
-    pub const NB_POWER: c_int = 33;
-    pub const NB_REMAINDER: c_int = 34;
-    pub const NB_RSHIFT: c_int = 35;
-    pub const NB_SUBTRACT: c_int = 36;
-    pub const NB_TRUE_DIVIDE: c_int = 37;
-    pub const NB_XOR: c_int = 38;
-    pub const SQ_ASS_ITEM: c_int = 39;
-    pub const SQ_CONCAT: c_int = 40;
-    pub const SQ_CONTAINS: c_int = 41;
-    pub const SQ_INPLACE_CONCAT: c_int = 42;
-    pub const SQ_INPLACE_REPEAT: c_int = 43;
-    pub const SQ_ITEM: c_int = 44;
-    pub const SQ_LENGTH: c_int = 45;
-    pub const SQ_REPEAT: c_int = 46;
-    pub const TP_ALLOC: c_int = 47;
-    pub const TP_BASE: c_int = 48;
-    pub const TP_BASES: c_int = 49;
-    pub const TP_CALL: c_int = 50;
-    pub const TP_CLEAR: c_int = 51;
-    pub const TP_DEALLOC: c_int = 52;
-    pub const TP_DEL: c_int = 53;
-    pub const TP_DESCR_GET: c_int = 54;
-    pub const TP_DESCR_SET: c_int = 55;
-    pub const TP_DOC: c_int = 56;
-    pub const TP_GETATTR: c_int = 57;
-    pub const TP_GETATTRO: c_int = 58;
-    pub const TP_GETSET: c_int = 59;
-    pub const TP_HASH: c_int = 60;
-    pub const TP_INIT: c_int = 61;
-    pub const TP_IS_GC: c_int = 62;
-    pub const TP_ITER: c_int = 63;
-    pub const TP_ITERNEXT: c_int = 64;
-    pub const TP_METHODS: c_int = 65;
-    pub const TP_NEW: c_int = 66;
-    pub const TP_REPR: c_int = 67;
-    pub const TP_RICHCOMPARE: c_int = 68;
-    pub const TP_SETATTR: c_int = 69;
-    pub const TP_SETATTRO: c_int = 70;
-    pub const TP_STR: c_int = 71;
-    pub const TP_TRAVERSE: c_int = 72;
-    pub const TP_MEMBERS: c_int = 73;
-    pub const TP_FREE: c_int = 74;
-    pub const NB_MATRIX_MULTIPLY: c_int = 75;
-    pub const NB_INPLACE_MATRIX_MULTIPLY: c_int = 76;
-    pub const AM_AWAIT: c_int = 77;
-    pub const AM_AITER: c_int = 78;
-    pub const AM_ANEXT: c_int = 79;
-    pub const TP_FINALIZE: c_int = 80;
-    pub const AM_SEND: c_int = 81;
+    /// Declare each identifier once, so the constant and the name the test
+    /// looks up in `Python.h` cannot drift apart.
+    macro_rules! slot_ids {
+        ($($name:ident = $value:expr,)*) => {
+            $(pub const $name: c_int = $value;)*
+
+            #[cfg(test)]
+            pub(super) const ALL: &[(&str, c_int)] = &[$((stringify!($name), $value),)*];
+        };
+    }
+
+    slot_ids! {
+        BF_GETBUFFER = 1,
+        BF_RELEASEBUFFER = 2,
+        MP_ASS_SUBSCRIPT = 3,
+        MP_LENGTH = 4,
+        MP_SUBSCRIPT = 5,
+        NB_ABSOLUTE = 6,
+        NB_ADD = 7,
+        NB_AND = 8,
+        NB_BOOL = 9,
+        NB_DIVMOD = 10,
+        NB_FLOAT = 11,
+        NB_FLOOR_DIVIDE = 12,
+        NB_INDEX = 13,
+        NB_INPLACE_ADD = 14,
+        NB_INPLACE_AND = 15,
+        NB_INPLACE_FLOOR_DIVIDE = 16,
+        NB_INPLACE_LSHIFT = 17,
+        NB_INPLACE_MULTIPLY = 18,
+        NB_INPLACE_OR = 19,
+        NB_INPLACE_POWER = 20,
+        NB_INPLACE_REMAINDER = 21,
+        NB_INPLACE_RSHIFT = 22,
+        NB_INPLACE_SUBTRACT = 23,
+        NB_INPLACE_TRUE_DIVIDE = 24,
+        NB_INPLACE_XOR = 25,
+        NB_INT = 26,
+        NB_INVERT = 27,
+        NB_LSHIFT = 28,
+        NB_MULTIPLY = 29,
+        NB_NEGATIVE = 30,
+        NB_OR = 31,
+        NB_POSITIVE = 32,
+        NB_POWER = 33,
+        NB_REMAINDER = 34,
+        NB_RSHIFT = 35,
+        NB_SUBTRACT = 36,
+        NB_TRUE_DIVIDE = 37,
+        NB_XOR = 38,
+        SQ_ASS_ITEM = 39,
+        SQ_CONCAT = 40,
+        SQ_CONTAINS = 41,
+        SQ_INPLACE_CONCAT = 42,
+        SQ_INPLACE_REPEAT = 43,
+        SQ_ITEM = 44,
+        SQ_LENGTH = 45,
+        SQ_REPEAT = 46,
+        TP_ALLOC = 47,
+        TP_BASE = 48,
+        TP_BASES = 49,
+        TP_CALL = 50,
+        TP_CLEAR = 51,
+        TP_DEALLOC = 52,
+        TP_DEL = 53,
+        TP_DESCR_GET = 54,
+        TP_DESCR_SET = 55,
+        TP_DOC = 56,
+        TP_GETATTR = 57,
+        TP_GETATTRO = 58,
+        TP_HASH = 59,
+        TP_INIT = 60,
+        TP_IS_GC = 61,
+        TP_ITER = 62,
+        TP_ITERNEXT = 63,
+        TP_METHODS = 64,
+        TP_NEW = 65,
+        TP_REPR = 66,
+        TP_RICHCOMPARE = 67,
+        TP_SETATTR = 68,
+        TP_SETATTRO = 69,
+        TP_STR = 70,
+        TP_TRAVERSE = 71,
+        // `tp_members` and `tp_getset` break the alphabetical run: they were added
+        // after `tp_traverse` and keep the numbers they were given then.
+        TP_MEMBERS = 72,
+        TP_GETSET = 73,
+        TP_FREE = 74,
+        NB_MATRIX_MULTIPLY = 75,
+        NB_INPLACE_MATRIX_MULTIPLY = 76,
+        AM_AWAIT = 77,
+        AM_AITER = 78,
+        AM_ANEXT = 79,
+        TP_FINALIZE = 80,
+        AM_SEND = 81,
+    }
 }
 
 /// Allocate a zeroed sub-table on first use.  A heap type is immortal for the
@@ -3074,4 +3089,55 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyObject_Init as *const ());
     std::hint::black_box(PyErr_NewException as *const ());
     std::hint::black_box(PyErr_NewExceptionWithDoc as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// `PyType_FromSpec` reads the numbers an extension compiled against
+    /// `Python.h` wrote into its slot array, so the two tables are one ABI in
+    /// two places.  This walks the header and rejects any identifier whose
+    /// number the Rust side spells differently, or does not spell at all.
+    #[test]
+    fn every_slot_id_is_the_number_the_header_gives_it() {
+        const HEADER: &str = include_str!("../../include/pyre3.14t/Python.h");
+
+        let mut checked = 0;
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(' ') else {
+                continue;
+            };
+            // The identifiers are `Py_<table>_<slot>`; nothing else in the
+            // header is named that way with a bare integer for a body.
+            let Some((table, _)) = name.split_once('_') else {
+                continue;
+            };
+            if !matches!(table, "tp" | "nb" | "sq" | "mp" | "am" | "bf") {
+                continue;
+            }
+            let Ok(value) = value.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+
+            let upper = name.to_ascii_uppercase();
+            let found = super::slot_id::ALL.iter().find(|(n, _)| *n == upper);
+            let Some((_, ours)) = found else {
+                panic!("Python.h defines Py_{name} = {value}, slot_id has no {upper}");
+            };
+            assert_eq!(
+                *ours, value,
+                "Py_{name} is {value} in Python.h and {ours} in slot_id"
+            );
+            checked += 1;
+        }
+
+        assert_eq!(
+            checked,
+            super::slot_id::ALL.len(),
+            "the header defines {checked} slot identifiers and slot_id has {}",
+            super::slot_id::ALL.len()
+        );
+    }
 }
