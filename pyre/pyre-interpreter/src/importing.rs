@@ -856,9 +856,10 @@ fn init_string_module(ns: PyObjectRef) {
 /// tag. They are build metadata rather than a claim that an extension loader
 /// exists: `packaging.tags` derives a wheel's ABI tag from `EXT_SUFFIX` and
 /// fails outright when the key is absent, so every `pip install` needs it.
-/// `_sysconfigdata` publishes the same pair for `_init_posix`, and both read
-/// it from `extension_abi_suffix`, so one interpreter never spells its own
-/// ABI two ways.
+/// Both come from `extension_abi_suffix`, and the pair keeps the relation the
+/// suffix is built from: `EXT_SUFFIX == "." + SOABI + shared-library
+/// extension`. `_sysconfigdata` publishes the same keys for `_init_posix` but
+/// spells `SOABI` shorter — see [`soabi_tag`].
 fn init_sysconfig_stub(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -875,7 +876,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
                     );
                 }
                 for (name, value) in [
-                    ("SOABI", soabi_tag(&so_ext)),
+                    ("SOABI", soabi_middle(&so_ext)),
                     ("EXT_SUFFIX", so_ext.clone()),
                 ] {
                     pyre_object::w_dict_store(
@@ -890,11 +891,18 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
     );
 }
 
-/// The `SOABI` tag: the ABI half of the extension suffix.
+/// The whole middle component of the extension suffix — PEP 3149's "ABI
+/// tag"-"platform tag" together, the spelling `_sysconfig.config_vars()` uses
+/// so that `EXT_SUFFIX` stays `"." + SOABI + shared-library extension`.
+fn soabi_middle(so_ext: &str) -> String {
+    so_ext.split('.').nth(1).unwrap_or_default().to_string()
+}
+
+/// The `SOABI` `_sysconfigdata` publishes: the ABI half of the extension
+/// suffix alone, without the platform tag (`_sysconfigdata.py:19`).
 ///
-/// PEP 3149 spells the middle component "ABI tag"-"platform tag"; this is the
-/// ABI tag alone. wheel 0.34.2 depends on the shorter form, so do not widen it
-/// without checking wheel — `pep425tags.get_abi_tag` special-cases CPython.
+/// wheel 0.34.2 depends on the shorter form, so do not widen it without
+/// checking wheel — `pep425tags.get_abi_tag` special-cases CPython.
 fn soabi_tag(so_ext: &str) -> String {
     so_ext
         .split('.')
