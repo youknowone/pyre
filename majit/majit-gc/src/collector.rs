@@ -2880,7 +2880,7 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:3320-3354 `_rrc_free`.
+    /// incminimark.py:3320-3351 `_rrc_free`.
     ///
     /// The linked object has died, so the interpreter's share of the count goes
     /// away.  incminimark.py:3328-3335's `REFCNT_FROM_PYPY_LIGHT` branch has no
@@ -2901,7 +2901,7 @@ impl MiniMarkGC {
         rc -= rawrefcount::REFCNT_FROM_PYRE;
         unsafe { (*header).ob_link = 0 };
         if rc == 0 {
-            // incminimark.py:3343-3352 — a mirror at count 0 cannot sit and
+            // incminimark.py:3339-3349 — a mirror at count 0 cannot sit and
             // wait for its deallocator: some extensions read the raw pointer
             // back and expect the deallocator to have run the moment the count
             // reached 0.  Queue it and leave it at 1, so the drain's own
@@ -2912,7 +2912,7 @@ impl MiniMarkGC {
         unsafe { (*header).ob_refcnt = rc };
     }
 
-    /// incminimark.py:3356-3357 `rrc_major_collection_trace`.
+    /// incminimark.py:3353-3354 `rrc_major_collection_trace`.
     fn rrc_major_collection_trace(&mut self) {
         let old = std::mem::take(&mut self.rrc.p_list_old);
         for &pyobject in &old {
@@ -2921,7 +2921,7 @@ impl MiniMarkGC {
         self.rrc.p_list_old = old;
     }
 
-    /// incminimark.py:3359-3375 `_rrc_major_trace`.
+    /// incminimark.py:3356-3372 `_rrc_major_trace`.
     fn _rrc_major_trace(&mut self, pyobject: usize) {
         let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
         if rc == rawrefcount::REFCNT_FROM_PYRE {
@@ -2957,13 +2957,13 @@ impl MiniMarkGC {
         self.rrc.p_list_young = young;
     }
 
-    /// incminimark.py:3377-3395 `rrc_major_collection_free`.
+    /// incminimark.py:3374-3392 `rrc_major_collection_free`.
     ///
     /// Only the old half is rebuilt.  The nursery-keyed table belongs to the
     /// minor that will next empty it, and every entry it holds names a mirror
     /// still on the young list, which this pass does not walk.
     fn rrc_major_collection_free(&mut self) {
-        // incminimark.py:3378 asserts the nursery-keyed table is empty here,
+        // incminimark.py:3375 asserts the nursery-keyed table is empty here,
         // which holds upstream because a minor precedes every major step.
         // `do_collect_oldgen_nonmoving` is the one entry that deliberately runs
         // without one — that is its contract — so there the table is legitimately
@@ -2987,9 +2987,9 @@ impl MiniMarkGC {
         self.rrc.o_list_old = surviving;
     }
 
-    /// incminimark.py:3397-3409 `_rrc_major_free`.
+    /// incminimark.py:3394-3406 `_rrc_major_free`.
     fn _rrc_major_free(&mut self, pyobject: usize, surviving: &mut Vec<usize>, list: RrcList) {
-        // incminimark.py:3398-3404 — the mirror survives exactly if its object
+        // incminimark.py:3395-3401 — the mirror survives exactly if its object
         // did: VISITED means marking reached it, NO_HEAP_PTRS an immortal
         // object marking never has to reach.
         let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
