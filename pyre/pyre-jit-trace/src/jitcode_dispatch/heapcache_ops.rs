@@ -585,10 +585,17 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
                 opcode,
                 OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF
             )
-            && descr
-                .as_field_descr()
-                .is_some_and(|fd| fd.get_parent_descr().is_none())
+            && let Some(fd) = descr.as_field_descr()
+            && fd.get_parent_descr().is_none()
         {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[fbw-abort] FieldDescrMissingParentDescr field={} offset={} pc={}",
+                    fd.field_name(),
+                    fd.offset(),
+                    op.pc,
+                );
+            }
             return Err(DispatchError::FieldDescrMissingParentDescr { pc: op.pc });
         }
         // Cache miss — record op + write through.  `box_value`
