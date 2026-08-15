@@ -2551,6 +2551,21 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
                         *symbolic as u64,
                     );
                 }
+                // The descent's `pc` is an offset into the callee's own
+                // jitcode.  Crossing back into this frame re-raises the abort
+                // where the enclosing walk owns the coordinates, and its
+                // consumers read `stop_pc` as a position in THIS jitcode:
+                // `latch_abort_blackhole` hands it to `setposition`, which
+                // starts the blackhole's dispatch loop there.  Left unchanged,
+                // a callee offset lands mid-instruction in a body of a
+                // different length and the next byte read as an opcode is an
+                // operand.  This frame stopped at its CALL, so that is the
+                // position the abort carries out of here.
+                let symbolic = *symbolic;
+                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op.pc,
+                    symbolic,
+                });
             }
             return Err(error);
         }
