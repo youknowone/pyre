@@ -4141,14 +4141,24 @@ impl Optimizer {
 
         // A bridge trace carries no GUARD_FUTURE_CONDITION
         // (reached_loop_header's GFC lives in pyre's loop-creation path,
-        // which bridges skip), so `self.patchguardop` is None and the
-        // retarget's inline_short_preamble guards never receive a
-        // rd_resume_position. Synthesize patchguardop from the bridge's own
-        // last body guard (highest resume position, closest to the close).
-        // `retarget_close_jump` already gated on `has_body_guard`, so the
-        // filter is guaranteed non-empty here.
-        if retarget_close_jump
-            && self.patchguardop.is_none()
+        // which bridges skip), so `self.patchguardop` is None where upstream
+        // always has one: `_jump_to_existing_trace` dereferences
+        // `self.optimizer.patchguardop` unconditionally for the extra guards
+        // (unroll.py:333-335) and passes it to `inline_short_preamble`, which
+        // dereferences it again per replayed guard (unroll.py:409).
+        // Synthesize it from the bridge's own last body guard (highest resume
+        // position, closest to the close).
+        //
+        // Gated only on there being such a guard, NOT on `retarget_close_jump`.
+        // Every path that reaches `try_jump_to_existing_trace` below can read
+        // patchguardop, and `retarget_close_jump` is strictly narrower than
+        // that: it also demands `ops.last()` be a JUMP, while the close is
+        // decided from the post-optimization `terminal_op`. Leaving the gate
+        // there let a bridge inline a short preamble with no patchguardop,
+        // where the replayed guards keep the `rd_resume_position` cloned off
+        // the PREAMBLE's guard and resolve their snapshot against this
+        // trace's numbering. Setting it when nothing reads it is inert.
+        if self.patchguardop.is_none()
             && let Some(g) = ops
                 .iter()
                 .filter(|o| o.opcode.is_guard() && o.rd_resume_position.get() >= 0)

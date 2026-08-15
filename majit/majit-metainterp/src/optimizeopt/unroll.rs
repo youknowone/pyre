@@ -3973,13 +3973,36 @@ impl OptUnroll {
                     new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.clearfailargs();
                     new_op.clear_fail_arg_types();
-                    // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
-                    // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
-                    if let Some(ref patch) = ctx.patchguardop {
-                        new_op
-                            .rd_resume_position
-                            .set(patch.rd_resume_position.get());
-                    }
+                    // unroll.py:409: op.rd_resume_position =
+                    // patchguardop.rd_resume_position — an unconditional
+                    // dereference, so upstream has no branch for an absent
+                    // patchguardop.
+                    //
+                    // `new_op` is a clone of the short-preamble entry, which is
+                    // itself a whole-op clone of a guard from the PREAMBLE
+                    // trace, so it arrives carrying that trace's
+                    // rd_resume_position. Skipping the stamp does not leave the
+                    // guard unstamped — it leaves it stamped with a coordinate
+                    // from another trace's numbering, which
+                    // `store_final_boxes_in_guard` then resolves against this
+                    // one. Decline the inlining instead, exactly as the unmapped
+                    // -arg arm above does: the caller falls back to
+                    // jump_to_preamble and the trace still compiles.
+                    let Some(patch_pos) = ctx.patchguardop.as_ref().map(|p| p.rd_resume_position.get())
+                    else {
+                        if crate::optimizeopt::majit_log_enabled() {
+                            eprintln!(
+                                "[jit] inline_short_preamble: no patchguardop for replayed \
+                                 {:?} — InvalidLoop",
+                                new_op.opcode
+                            );
+                        }
+                        ctx.signal_invalid_loop(
+                            "inline_short_preamble: replayed guard with no patchguardop",
+                        );
+                        return Vec::new();
+                    };
+                    new_op.rd_resume_position.set(patch_pos);
                     // history.py:227/268/314 — Const values ride inline
                     // on the OpRef (ConstInt/ConstFloat/
                     // ConstPtr). No pool replay needed.
@@ -8644,5 +8667,52 @@ mod tests {
         )];
 
         assert_eq!(closing_loop_contract_arity(&ops, 5), 3);
+    }
+
+    /// unroll.py:409 stamps every replayed short-preamble guard with
+    /// `patchguardop.rd_resume_position`, unconditionally. A short-preamble
+    /// entry is a whole-op clone of a guard from the preamble trace, so it
+    /// arrives carrying that trace's coordinate; leaving it in place when no
+    /// patchguardop exists hands `store_final_boxes_in_guard` a position from
+    /// another trace's numbering. Decline the inlining instead.
+    #[test]
+    fn inline_short_preamble_declines_a_replayed_guard_with_no_patchguardop() {
+        use crate::optimizeopt::shortpreamble::{ShortPreamble, ShortPreambleOp};
+
+        let mut optimizer = Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(2, 0);
+
+        let short_input_operand = rooted_resop_operand(Type::Int, 11);
+        let short_input = short_input_operand.to_opref();
+        let jump_arg = OpRef::int_op(12);
+        ctx.materialize_operand_at(jump_arg);
+
+        // A guard carrying the PREAMBLE trace's resume coordinate.
+        let mut guard = Op::new(OpCode::GuardTrue, &[short_input_operand]);
+        guard.pos.set(OpRef::void_op(13));
+        guard.rd_resume_position.set(4242);
+
+        let mut short_preamble = ShortPreamble::empty();
+        short_preamble.inputargs = vec![short_input];
+        short_preamble.ops = vec![ShortPreambleOp {
+            op: guard,
+            arg_mapping: Vec::new(),
+            fail_arg_mapping: Vec::new(),
+        }];
+
+        assert!(ctx.patchguardop.is_none());
+        let extra = OptUnroll::inline_short_preamble(
+            &[jump_arg],
+            &[jump_arg],
+            &short_preamble,
+            &mut optimizer,
+            &mut ctx,
+        );
+
+        assert!(extra.is_empty(), "declined inlining returns no extra args");
+        assert!(
+            ctx.take_invalid_loop().is_some(),
+            "the caller must see an InvalidLoop and fall back to jump_to_preamble"
+        );
     }
 }
