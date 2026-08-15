@@ -77,7 +77,8 @@ the header below.
   `tp_setattro`, `tp_descr_get` and `tp_descr_set`;
 - heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
   `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
-  `PyType_GetQualName`, with the whole `typeslots.h` identifier set;
+  `PyType_GetQualName`, with every `typeslots.h` identifier except
+  `Py_tp_vectorcall` and `Py_tp_token`, whose protocols are absent;
 - the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
   becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
@@ -158,7 +159,10 @@ Known divergences, each documented at its definition:
 ## What remains
 
 5. `tp_traverse` and `tp_clear`, without which a cycle through C is not
-   collectable; and the remaining generated API;
+   collectable; the vectorcall protocol -- `Py_TPFLAGS_HAVE_VECTORCALL`,
+   `tp_vectorcall_offset`, `PyObject_Vectorcall` and the `Py_tp_vectorcall`
+   slot -- of which pyre has only the struct fields; `Py_tp_token` and
+   `PyType_GetBaseByToken`; and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
