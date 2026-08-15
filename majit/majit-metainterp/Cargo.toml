@@ -44,3 +44,13 @@ majit-backend-wasm = { path = "../majit-backend-wasm", version = "0.0.2", defaul
 majit-macros = { workspace = true }
 majit-gc = { workspace = true }
 smallvec = { workspace = true }
+
+# A counting `#[global_allocator]` is process-wide, so this target must own its
+# process: libtest's default runner is multi-threaded and a second test running
+# beside it would land its allocations in the same counter. `--test-threads=1`
+# cannot be spelled in a manifest, so `harness = false` is the only way to get
+# a single owned `main`.
+[[test]]
+name = "allocs_per_compiled_entry"
+path = "tests/allocs_per_compiled_entry.rs"
+harness = false
