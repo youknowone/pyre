@@ -6357,12 +6357,11 @@ impl<M: Clone> MetaInterp<M> {
 
         // PyPy: pyjitpl.py:3016-3017 gates unrolling on `unroll` in
         // warmstate.enable_opts. PYRE_NO_UNROLL remains a diagnostic override.
-        let no_unroll = crate::no_unroll_enabled()
-            || !self
-                .warm_state
-                .get_enable_opts()
-                .iter()
-                .any(|opt| opt == "unroll");
+        let no_unroll_reason = crate::unroll_skip_reason(
+            crate::no_unroll_enabled(),
+            self.warm_state.get_enable_opts(),
+        );
+        let no_unroll = no_unroll_reason.is_some();
 
         // Use UnrollOptimizer for preamble peeling when available.
         // compile.py: compile_loop → PreambleCompileData + LoopCompileData.
@@ -6462,14 +6461,11 @@ impl<M: Clone> MetaInterp<M> {
             crate::optimizeopt::unroll::ExportedState,
         )> = None;
         let optimize_start = Instant::now();
-        let optimize_result = if no_unroll {
+        let optimize_result = if let Some(reason) = no_unroll_reason {
             if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] PYRE_NO_UNROLL: skipping unroll optimizer at key={}",
-                    green_key,
-                );
+                eprintln!("[jit] skipping unroll optimizer at key={green_key} ({reason})");
             }
-            Err(crate::optimize::InvalidLoop("PYRE_NO_UNROLL"))
+            Err(crate::optimize::InvalidLoop(reason))
         } else {
             unroll_opt.optimize_trace_with_constants_and_inputs_vable_out(
                 &trace_ops,
@@ -6494,13 +6490,25 @@ impl<M: Clone> MetaInterp<M> {
                 let reason = invalid_loop.0;
                 {
                     if crate::majit_log_enabled() {
-                        eprintln!(
-                            "[jit] abort trace at key={} (InvalidLoop: {})",
-                            green_key, reason,
-                        );
+                        // A suppressed unroll reaches here through the same
+                        // `Err` as a real one, but nothing was abandoned: the
+                        // retry below compiles the simple loop and the trace
+                        // is not counted as aborted. Saying "abort trace" for
+                        // it puts the log and `Traces aborted` in open
+                        // disagreement, with the log the one that is wrong.
+                        if no_unroll {
+                            eprintln!(
+                                "[jit] unroll suppressed at key={green_key} ({reason}); \
+                                 compiling the trace as a simple loop",
+                            );
+                        } else {
+                            eprintln!(
+                                "[jit] abort trace at key={green_key} (InvalidLoop: {reason})",
+                            );
+                        }
                     }
-                    // When PYRE_NO_UNROLL is set, the InvalidLoop is synthetic
-                    // — skip the cancel_count gate and go straight to the
+                    // A suppressed unroll makes the InvalidLoop synthetic —
+                    // skip the cancel_count gate and go straight to the
                     // simple-loop retry path.
                     if !no_unroll {
                         self.cancel_count += 1;
