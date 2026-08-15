@@ -1819,7 +1819,10 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Get compiled loop metadata for the given green key.
-    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&S::Meta> {
+    ///
+    /// The `Arc` is the entry's own, not a copy: a caller that needs to hold
+    /// the metadata across a run clones the refcount.
+    pub fn get_compiled_meta(&self, green_key: u64) -> Option<&std::sync::Arc<S::Meta>> {
         self.meta.get_compiled_meta(green_key)
     }
 
@@ -4301,7 +4304,11 @@ impl<S: JitState> JitDriver<S> {
         if !state.can_trace() {
             return None;
         }
-        if self.meta.has_compiled_loop(green_key) {
+        // `warmstate.py:471-478`: a temporary token is not entered. Reporting
+        // `None` rather than an `Abort` outcome keeps the answer the same shape
+        // as the "no compiled code at all" case, which is what a tmp-only cell
+        // is from this path's point of view.
+        if self.has_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -4396,8 +4403,26 @@ impl<S: JitState> JitDriver<S> {
         if dispatch_key.is_none() && self.meta.is_cross_loop_cut_key(green_key) {
             return None;
         }
-        if self.meta.has_compiled_loop(green_key) {
-            let compiled_meta = self.meta.get_compiled_meta(green_key).unwrap().clone();
+        // `warmstate.py:471-478 maybe_compile_and_run`: a cell whose token was
+        // `attached by compile_tmp_callback()` is NOT entered — upstream falls
+        // straight to `jitcounter.tick(hash, increment_threshold)` and, on
+        // overflow, `bound_reached`. The pyre reading of "attached by
+        // compile_tmp_callback" is the absence of a `compiled_loops` meta
+        // (`has_runnable_compiled_loop`, which documents why): the temporary
+        // token has a body, so `has_compiled_loop` says yes, but MetaInterp
+        // never filed frontend meta for it. Binding the meta here rather than
+        // testing a predicate and unwrapping afterwards keeps the two in step —
+        // the fall-through below IS the counter processing upstream continues
+        // with. `has_compiled_loop` stays as the first conjunct: it is the
+        // `cell.get_procedure_token() is not None` half (code present and not
+        // invalidated), which the meta lookup alone does not imply, since
+        // `invalidate_loop` deliberately leaves the meta in place.
+        let runnable_meta = if self.entry_cell_has_compiled_code(green_key, structured_green_key) {
+            self.meta.get_compiled_meta(green_key).cloned()
+        } else {
+            None
+        };
+        if let Some(compiled_meta) = runnable_meta {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
@@ -5144,7 +5169,13 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        if self.meta.has_compiled_loop(green_key) {
+        // Same `warmstate.py:471-478` gate as `back_edge_internal`: a cell
+        // holding only a `compile_tmp_callback` token has no `compiled_loops`
+        // meta, and upstream counts it normally instead of entering it. Without
+        // the meta the runner below can only return `Abort`, which stops this
+        // route from ever reaching `maybe_start_tracing` — i.e. the counter
+        // stops ticking and the real loop is never traced.
+        if self.has_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -5369,6 +5400,35 @@ impl<S: JitState> JitDriver<S> {
             .map(std::sync::Arc::new);
         self.descriptor_cache = Some(resolved.clone());
         resolved
+    }
+
+    /// `warmstate.py:458-464`: the cell a back edge decides on is the one whose
+    /// `comparekey(*greenargs)` matches, not whichever cell heads the bucket.
+    ///
+    /// Upstream walks unconditionally because its comparison is against the
+    /// greens already sitting in the portal's arguments — it builds nothing.
+    /// Pyre's `GreenKey` is a heap object with its own `values` and `types`
+    /// vectors, and this is the entry path, so building one per warm entry to
+    /// re-confirm a single-candidate bucket would put back the per-entry
+    /// allocations this path exists to avoid. An unchained bucket HAS one
+    /// candidate: the head is what the walk would find, and the hash form is
+    /// exact. The key is therefore built only when the bucket is chained,
+    /// which is the only case in which the two answers can differ.
+    ///
+    /// A caller that reached here without a structured key (`back_edge`,
+    /// `back_edge_keyed`) cannot resolve the chain at all and keeps the hash
+    /// answer; `back_edge_structured` and `back_edge_declarative` carry one.
+    fn entry_cell_has_compiled_code(
+        &self,
+        green_key: u64,
+        structured_green_key: Option<&dyn Fn() -> GreenKey>,
+    ) -> bool {
+        match structured_green_key {
+            Some(make_key) if self.meta.green_key_bucket_is_chained(green_key) => {
+                self.meta.has_compiled_loop_for_key(&make_key())
+            }
+            _ => self.meta.has_compiled_loop(green_key),
+        }
     }
 
     fn live_values_match_descriptor(
@@ -6241,6 +6301,25 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
         self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
+    }
+
+    /// Typed twin of [`Self::has_compiled_loop`]: `warmstate.py:458-464` walks
+    /// the bucket and tests `comparekey(*greenargs)` before deciding anything,
+    /// where the hash form can answer for whichever cell heads the bucket.
+    ///
+    /// The `compiled_loops` meta the runnable form additionally requires is
+    /// hash-keyed and has no chain, so only the JitCell half is resolved on
+    /// full key identity — see `MetaInterp::has_compiled_loop_for_key`.
+    #[inline]
+    pub fn has_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
+        self.meta.has_compiled_loop_for_key(key)
+    }
+
+    /// Typed twin of [`Self::has_runnable_compiled_loop`].
+    #[inline]
+    pub fn has_runnable_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
+        self.has_compiled_loop_for_key(key)
+            && self.meta.get_compiled_meta(key.get_uhash()).is_some()
     }
 
     /// Actual key the last compile_loop stored under.
@@ -8939,6 +9018,120 @@ mod tests {
         // return None from index().
         let driver = JitDriver::<TypedRestoreState>::new(1);
         assert_eq!(driver.index(), None);
+    }
+
+    /// Install the cell shape `warmstate.py:714-723 get_assembler_token` leaves
+    /// behind when it has to synthesise a token: a procedure token carrying a
+    /// backend body, flagged `JC_TEMPORARY`, and no `compiled_loops` entry —
+    /// MetaInterp never files frontend meta for a `compile_tmp_callback` stub
+    /// (`compile.py:1101-1150`).
+    fn attach_tmp_callback_cell<S: JitState>(driver: &mut JitDriver<S>, green_key: u64) {
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
+            driver.meta.warm_state_mut().alloc_token_number(),
+        ));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, token);
+    }
+
+    /// `warmstate.py:471-478 maybe_compile_and_run`: a cell whose token was
+    /// `attached by compile_tmp_callback()` is counted normally, never entered.
+    #[test]
+    fn a_tmp_callback_only_cell_is_counted_not_entered_at_the_back_edge() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 4413u64;
+        attach_tmp_callback_cell(&mut driver, key);
+
+        assert!(
+            driver.has_compiled_loop(key),
+            "the tmp callback token has a body, so the code-presence predicate says yes",
+        );
+        assert!(
+            !driver.has_runnable_compiled_loop(key),
+            "and it has no frontend meta, so the warm-entry runner cannot enter it",
+        );
+
+        // Before this fell through, the back edge unwrapped the absent meta and
+        // panicked at the loop header of any driver that can mint a tmp token.
+        let mut state = TypedRestoreState::default();
+        assert_eq!(
+            driver.back_edge_keyed(key, 0, &mut state, &(), || {}),
+            None,
+            "nothing ran and nothing was traced on the first tick",
+        );
+        assert!(
+            !driver.meta.is_tracing(),
+            "the first back edge only ticks the counter",
+        );
+
+        // The counter keeps ticking, so the real loop still gets traced — the
+        // tmp callback delays entry, it does not disable the key.
+        driver.back_edge_keyed(key, 0, &mut state, &(), || {});
+        assert!(
+            driver.meta.is_tracing(),
+            "the threshold is reached by counting, exactly as for a cell with no token",
+        );
+    }
+
+    /// `warmstate.py:458-464` resolves the cell by `comparekey(*greenargs)`
+    /// before reading a token off it. On a chained bucket the head is a
+    /// different cell, so the hash form and the typed form answer differently
+    /// — and the typed one is the one upstream asks.
+    #[test]
+    fn the_typed_entry_predicate_reads_the_keys_own_cell_not_the_bucket_head() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = GreenKey::new(vec![1500, 1600]);
+        let hash = key.get_uhash();
+
+        // A hash-only writer squats the bucket with a comparator-less cell and
+        // gives it a code-bearing token; then a typed writer for the SAME key
+        // chains its own, token-less cell behind it.
+        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
+            driver.meta.warm_state_mut().alloc_token_number(),
+        ));
+        token.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(hash, token);
+        driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
+
+        assert!(
+            driver.meta.green_key_bucket_is_chained(hash),
+            "fixture: two cells in one bucket is the only case in which the \
+             two forms can disagree",
+        );
+        assert!(
+            driver.has_compiled_loop(hash),
+            "fixture: the head cell holds the code-bearing token, so a \
+             head-reading predicate says this key has compiled code",
+        );
+        assert!(
+            !driver.has_compiled_loop_for_key(&key),
+            "but the cell this key owns holds no token at all, so the answer \
+             upstream would give is no",
+        );
+    }
+
+    /// The `run_compiled` sibling route makes the same decision.
+    #[test]
+    fn a_tmp_callback_only_cell_is_not_dispatched_by_back_edge_or_run_compiled() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 5161u64;
+        attach_tmp_callback_cell(&mut driver, key);
+
+        let mut state = TypedRestoreState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 0, &mut state, &(), || {})
+                .is_none(),
+            "an unenterable cell reports the same `None` as a cell with no code at all",
+        );
     }
 }
 

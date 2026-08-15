@@ -4533,10 +4533,27 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_int_indexed(
+                let (opref, value) = ctx.vable_getarrayitem_int_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4568,10 +4585,27 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
+                let (opref, value) = ctx.vable_getarrayitem_ref_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4603,10 +4637,27 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let guards_before = ctx.num_guards();
-                let (opref, value) = ctx.vable_getarrayitem_float_indexed(
+                let (opref, value) = ctx.vable_getarrayitem_float_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4638,11 +4689,28 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let (value, concrete) = self.read_int_reg(src);
                 let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4682,11 +4750,28 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let (value, concrete) = self.read_ref_reg(src);
                 let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,
@@ -4723,11 +4808,28 @@ where
                 // keeps that ownership: the guard gets a full-framestack,
                 // vable-carrying snapshot instead of the minimal one
                 // `TraceCtx::promote_int` can build without an `MIFrameStack`.
-                let index =
-                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc);
+                //
+                // The hoist moves the promote to the caller, NOT ahead of the
+                // branch that selects it. `_get_arrayitem_vable_index`
+                // (pyjitpl.py:1205) opens with the promote and is entered only
+                // from the standard leg (:1229, :1244); the non-standard leg
+                // reaches its `getfield_gc_r` + `get|setarrayitem_gc_*` with
+                // the index box as it stands. So the decision is taken first
+                // and handed to the `*_checked` leg, and a non-standard access
+                // with a non-constant index no longer mints a GUARD_VALUE that
+                // over-specializes an ordinary heap read.
+                let check_guards_before = ctx.num_guards();
+                let nonstandard = ctx.nonstandard_virtualizable(opcode_pc, vable_opref, &fdescr);
+                self.capture_vable_promote_guard(ctx, sym, opcode_pc, check_guards_before, None);
+                let index = if nonstandard {
+                    index
+                } else {
+                    self.implement_guard_value(ctx, sym, index_reg, index, index_value, opcode_pc)
+                };
                 let (value, concrete) = self.read_float_reg(src);
                 let guards_before = ctx.num_guards();
-                let write = match ctx.vable_setarrayitem_indexed(
+                let write = match ctx.vable_setarrayitem_checked(
+                    nonstandard,
                     opcode_pc,
                     vable_opref,
                     index,

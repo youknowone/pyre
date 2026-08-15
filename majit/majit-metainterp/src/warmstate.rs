@@ -1100,10 +1100,45 @@ impl WarmEnterState {
     }
 
     /// warmstate.py:191-196 `get_procedure_token`.
+    ///
+    /// Reads the cell that HEADS the bucket, which is the right cell only when
+    /// the bucket holds one. `maybe_compile_and_run` (warmstate.py:458-464)
+    /// walks `cell.next` and tests `cell.comparekey(*greenargs)` before it
+    /// looks at a token at all; [`Self::get_procedure_token_for_key`] is that
+    /// walk. Callers that hold the typed key should prefer it, and
+    /// [`Self::bucket_is_chained`] says when the two can differ.
     pub fn get_procedure_token(&self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
         self.cells
             .get(&green_key_hash)
             .and_then(|cell| cell.get_procedure_token().cloned())
+    }
+
+    /// `warmstate.py:458-464` — resolve the cell by `comparekey`, then read its
+    /// procedure token.
+    ///
+    /// The typed twin of [`Self::get_procedure_token`]. Upstream reaches a
+    /// token only through a cell it has already matched on the full green key;
+    /// this is that discipline. A bucket the key does not match anywhere is
+    /// upstream's `else:` arm — "not found" — and answers `None` rather than
+    /// handing back the head cell's unrelated token.
+    pub fn get_procedure_token_for_key(&self, key: &GreenKey) -> Option<Arc<JitCellToken>> {
+        self.lookup_chain_with_key(key)
+            .and_then(|cell| cell.get_procedure_token().cloned())
+    }
+
+    /// Whether this bucket holds more than one cell, i.e. whether the hash and
+    /// typed forms of a query can disagree at all.
+    ///
+    /// A chain needs no hash collision: one green key reached through a
+    /// hash-only writer and then a typed one produces two cells in one bucket
+    /// (see [`Self::clear_all_loop_tokens`]). An unchained bucket has exactly
+    /// one candidate, so the head IS what the walk would find, and a caller can
+    /// skip building a `GreenKey` it would only use to confirm that.
+    #[inline]
+    pub fn bucket_is_chained(&self, green_key_hash: u64) -> bool {
+        self.cells
+            .get(&green_key_hash)
+            .is_some_and(|cell| cell.next.is_some())
     }
 
     /// Allocate a new unique JitCellToken number.
@@ -4626,6 +4661,73 @@ mod tests {
             0,
             "and TRACING must be cleared on that same cell",
         );
+    }
+
+    /// `warmstate.py:458-464 maybe_compile_and_run` reads a procedure token
+    /// only off a cell whose `comparekey(*greenargs)` already matched. The
+    /// hash form reads the bucket head, which on a chained bucket is a
+    /// different cell.
+    ///
+    /// Same fixture discipline as the pair above: the hash-only writer takes
+    /// the bucket first, so the head is provably the comparator-less cell and
+    /// a head-reading lookup is looking at the wrong object.
+    #[test]
+    fn get_procedure_token_for_key_reads_the_keys_own_cell_not_the_bucket_head() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![1100, 1200]);
+
+        ws.disable_noninlinable_function(key.get_uhash());
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+
+        assert!(
+            ws.bucket_is_chained(key.get_uhash()),
+            "fixture: the hash-only writer and the typed one built a chain, \
+             which is the only case in which the two forms can disagree",
+        );
+        assert!(
+            ws.get_procedure_token(key.get_uhash()).is_none(),
+            "fixture: the head is the comparator-less cell and holds no token, \
+             so the hash form cannot see the one just installed",
+        );
+
+        let found = ws
+            .get_procedure_token_for_key(&key)
+            .expect("the typed form must find the token on the key's own cell");
+        assert!(
+            Arc::ptr_eq(&found, &token),
+            "and it must be the very token installed under this key",
+        );
+    }
+
+    /// An unchained bucket has one candidate, so the head IS the match and the
+    /// hash form is exact — this is what lets the entry path skip building a
+    /// `GreenKey` on every warm entry.
+    #[test]
+    fn an_unchained_bucket_answers_the_same_through_both_forms() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![1300, 1400]);
+
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
+
+        assert!(
+            !ws.bucket_is_chained(key.get_uhash()),
+            "one typed writer and no hash-only squatter builds no chain",
+        );
+        assert!(
+            Arc::ptr_eq(
+                &ws.get_procedure_token(key.get_uhash())
+                    .expect("the hash form finds the only cell"),
+                &token,
+            ),
+            "both forms must name the same token when there is nothing to walk",
+        );
+        assert!(Arc::ptr_eq(
+            &ws.get_procedure_token_for_key(&key)
+                .expect("the typed form finds it too"),
+            &token,
+        ));
     }
 
     #[test]

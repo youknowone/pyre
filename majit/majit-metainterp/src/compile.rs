@@ -154,7 +154,12 @@ pub struct CompileResult<M> {
     /// after the run would read whatever the compiled-loop index holds by
     /// then, and compiled code re-enters the driver through residual calls,
     /// so the entry can be recompiled or dropped mid-run.
-    pub meta: M,
+    ///
+    /// The hold is a shared reference, not a copy: upstream keeps the
+    /// `loop_token` object itself alive across `execute_assembler`, and an
+    /// `Arc` gives the same "this exact metadata, for the whole run" guarantee
+    /// without paying a struct copy per entry.
+    pub meta: std::sync::Arc<M>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
@@ -182,7 +187,7 @@ pub struct RawCompileResult<M> {
     pub values: Vec<i64>,
     pub typed_values: Vec<Value>,
     /// Pre-run metadata snapshot — see `CompileResult::meta`.
-    pub meta: M,
+    pub meta: std::sync::Arc<M>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
