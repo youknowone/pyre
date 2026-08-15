@@ -3220,38 +3220,45 @@ fn build_function(
             }
 
             // Overflow variants: compute result + overflow flag
-            OpCode::IntAddOvf => {
-                ovf_flag_live = emit_ovf_binop(
+            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf => {
+                let binop = match op.opcode {
+                    OpCode::IntAddOvf => BinOp::I64Add,
+                    OpCode::IntSubOvf => BinOp::I64Sub,
+                    OpCode::IntMulOvf => BinOp::I64Mul,
+                    _ => unreachable!(),
+                };
+                let fused_guard = match binop {
+                    BinOp::I64Add | BinOp::I64Sub => next_ovf_guard(ops, op_idx),
+                    BinOp::I64Mul => None,
+                    _ => unreachable!(),
+                };
+                ovf_flag_live = match emit_ovf_binop(
                     &mut sink,
                     constants,
                     value_types,
                     op,
-                    BinOp::I64Add,
+                    binop,
                     value_types.count(),
                     ovf_flag_local,
-                );
-            }
-            OpCode::IntSubOvf => {
-                ovf_flag_live = emit_ovf_binop(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op,
-                    BinOp::I64Sub,
-                    value_types.count(),
-                    ovf_flag_local,
-                );
-            }
-            OpCode::IntMulOvf => {
-                ovf_flag_live = emit_ovf_binop(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op,
-                    BinOp::I64Mul,
-                    value_types.count(),
-                    ovf_flag_local,
-                );
+                    fused_guard.map(|guard| guard.opcode),
+                ) {
+                    OvfFlag::Absent => false,
+                    OvfFlag::InLocal => true,
+                    OvfFlag::FusedCond => {
+                        let guard = fused_guard.expect("fused overflow condition requires guard");
+                        emit_guard_if_exit(
+                            &mut sink,
+                            constants,
+                            value_types,
+                            guard_idx,
+                            guard,
+                            block_exit_depth,
+                        );
+                        guard_idx += 1;
+                        fused_guard_at = Some(op_idx + 1);
+                        false
+                    }
+                };
             }
 
             // ── Unary ops ──
@@ -5914,6 +5921,15 @@ fn next_op_can_accept_cc<'a>(
     Some(next_op)
 }
 
+/// The overflow guard immediately following an overflow op. The flag is not an
+/// SSA value — it has no local, no home slot, no LABEL capture, and can never be
+/// a fail argument — so unlike `next_op_can_accept_cc` this needs no liveness
+/// test: adjacency is the whole condition.
+fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
+    let next = ops.get(i + 1)?;
+    matches!(next.opcode, OpCode::GuardNoOverflow | OpCode::GuardOverflow).then_some(next)
+}
+
 /// Common guard exit: condition is on stack (i32), spill and branch on failure.
 ///
 /// The spill belongs in this arm rather than in one shared exit handler after
@@ -6140,8 +6156,6 @@ fn emit_umulhi_to_local(
     sink.local_set(output_local);
 }
 
-/// Overflow binary op: stores the wrapping result in pos and the signed
-/// overflow flag in the dedicated scratch local.
 /// The overflow condition for `a + c` / `a - c` against a constant `c`, as
 /// `(limit, greater_than)`: the operation overflows exactly when `a > limit`
 /// (`greater_than`) or when `a < limit`. `None` means it cannot overflow.
@@ -6189,6 +6203,36 @@ fn ovf_const_operand(
     }
 }
 
+/// What an overflow op left for the guard that follows it.
+enum OvfFlag {
+    /// The op was constant-folded and emitted nothing; there is no flag.
+    Absent,
+    /// `ovf_flag_local` holds the flag — nonzero means the op overflowed.
+    InLocal,
+    /// The following guard's failure condition is on the stack as an i32,
+    /// ready for `emit_guard_if_exit`.
+    FusedCond,
+}
+
+/// The comparison a fused guard makes on the overflow predicate.
+/// `GuardNoOverflow` exits when the op overflowed and so takes the predicate as
+/// it stands; `GuardOverflow` exits when it did not, and flipping the
+/// comparison costs nothing where negating its result would cost an
+/// instruction.
+fn overflow_failure_cmp(cmp: CmpOp, fused_guard: OpCode) -> CmpOp {
+    match fused_guard {
+        OpCode::GuardNoOverflow => cmp,
+        OpCode::GuardOverflow => match cmp {
+            CmpOp::I64GtS => CmpOp::I64LeS,
+            CmpOp::I64LtS => CmpOp::I64GeS,
+            _ => unreachable!("overflow comparison must be signed lt or gt"),
+        },
+        _ => unreachable!("overflow fusion requires an overflow guard"),
+    }
+}
+
+/// Overflow binary op: stores the wrapping result in pos and either leaves the
+/// overflow flag for a following guard or writes it to the scratch local.
 fn emit_ovf_binop(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -6197,14 +6241,16 @@ fn emit_ovf_binop(
     binop: BinOp,
     value_local_count: u32,
     ovf_flag_local: u32,
-) -> bool {
+    fused_guard: Option<OpCode>,
+) -> OvfFlag {
     let vi = op.pos.get().raw();
     if OpRef::raw_is_constant(vi) {
-        return false;
+        return OvfFlag::Absent;
     }
     let result_local = value_types.local(vi);
 
     if matches!(binop, BinOp::I64Mul) {
+        debug_assert!(fused_guard.is_none());
         // Keep both factors in the umulhi scratch bank. The hot signed-32
         // overflow check below reuses them without resolving the SSA operands
         // again; the slow 64-bit path is free to overwrite the same bank.
@@ -6222,28 +6268,35 @@ fn emit_ovf_binop(
     if let Some((var, c)) = ovf_const_operand(constants, op, binop) {
         match ovf_const_bound(binop, c) {
             Some((limit, greater_than)) => {
+                let cmp = if greater_than {
+                    CmpOp::I64GtS
+                } else {
+                    CmpOp::I64LtS
+                };
                 emit_resolve(sink, constants, value_types, var);
                 sink.i64_const(limit);
-                if greater_than {
-                    sink.i64_gt_s();
-                } else {
-                    sink.i64_lt_s();
+                if let Some(guard) = fused_guard {
+                    apply_cmp(sink, overflow_failure_cmp(cmp, guard));
+                    return OvfFlag::FusedCond;
                 }
+                apply_cmp(sink, cmp);
                 sink.i64_extend_i32_u();
             }
             // Adding or subtracting zero: the flag stays live so the paired
-            // guard still finds it, and folds against a constant zero.
+            // guard still finds it, and folds against a constant zero. There
+            // is no predicate to hand a fused guard, so this answers in the
+            // local whether or not one was offered.
             None => {
                 sink.i64_const(0);
             }
         }
         sink.local_set(ovf_flag_local);
-        return true;
+        return OvfFlag::InLocal;
     }
 
     match binop {
         BinOp::I64Add => {
-            // ((a ^ result) & (b ^ result)) >>s 63
+            // (a ^ result) & (b ^ result) — negative exactly when it overflowed
             emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             sink.local_get(result_local);
             sink.i64_xor();
@@ -6251,12 +6304,9 @@ fn emit_ovf_binop(
             sink.local_get(result_local);
             sink.i64_xor();
             sink.i64_and();
-            sink.i64_const(63);
-            sink.i64_shr_s();
-            sink.local_set(ovf_flag_local);
         }
         BinOp::I64Sub => {
-            // ((a ^ b) & (a ^ result)) >>s 63
+            // (a ^ b) & (a ^ result) — negative exactly when it overflowed
             emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
             emit_resolve(sink, constants, value_types, op.arg(1).to_opref());
             sink.i64_xor();
@@ -6264,9 +6314,6 @@ fn emit_ovf_binop(
             sink.local_get(result_local);
             sink.i64_xor();
             sink.i64_and();
-            sink.i64_const(63);
-            sink.i64_shr_s();
-            sink.local_set(ovf_flag_local);
         }
         BinOp::I64Mul => {
             // Multiplying two signed-32-bit integers cannot overflow i64: the
@@ -6320,10 +6367,23 @@ fn emit_ovf_binop(
             sink.i64_extend_i32_u();
             sink.local_set(ovf_flag_local);
             sink.end();
+            return OvfFlag::InLocal;
         }
         _ => unreachable!("overflow emitter requires add, sub, or mul"),
     }
-    true
+
+    // The sign bit of the word both arms left on the stack is the answer, so a
+    // fused guard reads it with the comparison it was going to make anyway.
+    if let Some(guard) = fused_guard {
+        sink.i64_const(0);
+        apply_cmp(sink, overflow_failure_cmp(CmpOp::I64LtS, guard));
+        OvfFlag::FusedCond
+    } else {
+        sink.i64_const(63);
+        sink.i64_shr_s();
+        sink.local_set(ovf_flag_local);
+        OvfFlag::InLocal
+    }
 }
 
 // ── Comparison ops ──
