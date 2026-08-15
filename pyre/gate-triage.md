@@ -968,13 +968,13 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (61): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (62): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
 
 `PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
-`PYRE_CELL_CENSUS`,
+`PYRE_CELL_CENSUS`, `PYRE_CHECK_INHERIT_ENV`,
 `PYRE_DESCR_SPELLING_GATE`,
 `PYRE_DEOPT_PROBE`, `PYRE_DIAG_51C`, `PYRE_DIAG_GIN`, `PYRE_DIAG_INLINE_RECOG`,
 `PYRE_DETERMINISM_TRACE`, `PYRE_DTRACE_CONST_BT`,
@@ -1003,6 +1003,13 @@ example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
 value knobs bound the capture window, sampling rate, and report size. This is a
 diagnostic tool rather than a temporary runtime experiment, so it retires only
 if the example itself is removed.
+
+`PYRE_CHECK_INHERIT_ENV` is the other odd one: an A/B switch, not a report.
+`check.py` starts a benchmark child from an allowlisted environment because the
+inherited one is startup allocation and moves `guard_failures`; setting the
+gate restores the whole-environment copy, so the size of that effect stays
+measurable on one binary. It goes when the allowlist stops being the thing
+under measurement.
 
 ## §7 — General MAJIT gates
 
