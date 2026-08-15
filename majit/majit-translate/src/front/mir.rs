@@ -2969,7 +2969,7 @@ struct Lowering<'a> {
     /// `front::option_closure_select` post-pass synthesizes (see
     /// [`crate::front::option_closure_select::ClosureSelectSite`]).
     closure_select_sites: Vec<crate::front::option_closure_select::ClosureSelectSite>,
-    /// Result-var ids of niche `Option<NonNull>` discriminant reads folded to
+    /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
     /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
     /// (the `ne` result), so a `SwitchInt` terminator on it must close with
@@ -4780,7 +4780,8 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
-                // A niche `Option<NonNull<T>>` is one pointer word, so
+                // A one-word niche `Option` is represented by its payload
+                // pointer, so
                 // constructing it names either the null pointer (`None`) or
                 // the wrapped non-null pointer (`Some(p)`) directly — not a
                 // two-word aggregate with a `__discriminant` tag.  Fold `None`
@@ -5062,7 +5063,8 @@ impl<'a> Lowering<'a> {
                     let base = self.resolve_place(mir_bb, place)?;
                     return Ok((None, base));
                 }
-                // A niche `Option<NonNull<T>>` is one pointer word: `None`
+                // A one-word niche `Option` is represented by its payload
+                // pointer: `None`
                 // = null, `Some(p)` = the non-null pointer.  Its
                 // discriminant is the pointer-null test `base != null`
                 // (`None` = 0, `Some` = 1), not a `__discriminant` field off
@@ -5394,7 +5396,8 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
-                    // A niche `Option<NonNull<T>>` is one pointer word, so the
+                    // A one-word niche `Option` is represented by its payload
+                    // pointer, so the
                     // `Some` payload IS the base pointer — reading `Some.__pos_0`
                     // is the identity on it, not a field off a two-word
                     // aggregate (there is none, and its `__pos_0` attr has no
@@ -11352,7 +11355,7 @@ impl<'a> Lowering<'a> {
     /// bare here to match it.  A SIGNED one must not: the bare root carries a
     /// single `__pos_0`, so a signed producer joining it unions `int` with
     /// `r_uint`, which cannot be proved to share a signedness.  A niche
-    /// `Option<NonNull>` has no aggregate
+    /// one-word niche `Option` has no aggregate
     /// `__discriminant` / `__pos_0` (the arms use a pointer null-test and an
     /// identity payload), so its owners are never read — keep them bare, which
     /// also mirrors [`Self::resolve_bool_then_option_dest`]'s own aggregate
@@ -11920,21 +11923,30 @@ impl<'a> Lowering<'a> {
             .is_some_and(type_decl_is_fieldless_enum)
     }
 
-    /// `true` when `ty` is a niche-optimised `Option<NonNull<T>>`,
-    /// `Option<fn(..)>`, `Option<&mut T>`, or `Option<&T>` with a thin
-    /// (Sized) ADT pointee.
-    /// Rust encodes each in ONE pointer
-    /// word (`None` = null, `Some(p)` = the non-null pointer), so
+    /// `true` when `ty` is represented as a one-word nullable `Option`:
+    /// `Option<NonNull<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
+    /// `Option<&T>` with a thin (Sized) ADT pointee, a raw pointer to a thin
+    /// nominal ADT, or a tuple payload.
+    /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
+    /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
     /// `Some` payload read is the identity on that pointer — no aggregate
     /// `__discriminant` / `__pos_0` field exists. This mirrors the
     /// fieldless-enum by-value model ([`Self::tyref_is_fieldless_enum`]).
     ///
-    /// Gated strictly to the `NonNull` payload: a raw `*mut T` / `*const T`
-    /// payload (`Option<*mut PyObject>`) has NO null niche — Rust lays it
-    /// out as a two-word tagged aggregate (discriminant word + pointer
-    /// word), so folding it to a one-word pointer would read the tag word
-    /// as the payload. Mutable references are included explicitly: Rust
+    /// Raw-pointer payloads are accepted only when their pointee resolves to
+    /// a nominal ADT with a concrete layout. Such pointers carry the object
+    /// aggregate address in these graphs, and `Some(p)` therefore aliases the
+    /// base pointer. A scalar-pointer payload remains excluded because it may
+    /// use `Some(null)` as a state distinct from `None`; collapsing both to
+    /// the null word would merge those states. A nominal unsized pointee is
+    /// excluded as well: Charon uses the fat-pointer representation for that
+    /// raw-pointer shape, so it is not a single payload word.
+    ///
+    /// Tuple payloads are already heap-aggregate pointers when the `Some`
+    /// wrapper is constructed. The tuple elements do not affect this
+    /// representation: `Some(tuple)` is the tuple pointer itself and `None`
+    /// is null. Mutable references are included explicitly: Rust
     /// guarantees their non-null representation, and generated
     /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
     /// references `&T` are included when the pointee is a thin (Sized)
@@ -11956,11 +11968,13 @@ impl<'a> Lowering<'a> {
     /// no diamond to match, so the residual `next()` call would survive as an
     /// unregistered callee (a census Skip, not a miscompile). Currently
     /// unreached: every `.iter()` for-loop that reaches iter_next iterates a
-    /// raw `*mut PyObject` / tuple / int element (none a thin nominal ADT), so
+    /// raw pointer / tuple / int element (none a thin nominal ADT), so
     /// the shared arm never fires on a `next()` result — verified by a clean
     /// census (0 `slice::iter::Iter::next` heads) and 370/370 check.py. The
     /// `&mut` arm never had this exposure: iterator receivers come from
     /// `.iter()` (`core::slice::…::iter`, a SHARED borrow), never `iter_mut`.
+    /// The new raw-pointer and tuple arms match only direct payloads, not
+    /// `&RawPtr` or `&Tuple`, so they do not expand this iter-next exposure.
     /// If a `.iter()` loop over `&[SizedStruct]` ever appears, teach
     /// iter_next the null-test shape (its matcher must accept the
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
@@ -12014,6 +12028,31 @@ impl<'a> Lowering<'a> {
         {
             return true;
         }
+        // A direct raw pointer to a nominal ADT is the one-word address of
+        // that aggregate in these graphs. Keep the concrete-layout gate even
+        // though such raw-pointer DSTs are not expected: Charon represents an
+        // unsized nominal pointee as a fat pointer, whose metadata cannot
+        // alias the single base word. Primitive/scalar pointees have no ADT
+        // def-id and deliberately remain excluded because `Some(null)` may be
+        // observably distinct from `None` for such payloads.
+        if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, self.llbc)
+            && let Some(stripped) = strip_ty_wrappers(raw_pointee, self.llbc)
+            && let Some(def_id) = adt_node_def_id(stripped)
+            && self
+                .llbc
+                .type_by_id(def_id)
+                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
+                .and_then(|l| l.size)
+                .is_some()
+        {
+            return true;
+        }
+        // A direct tuple value is already a non-null heap-aggregate pointer;
+        // its element types live behind that pointer and do not change the
+        // nullable one-word representation of the enclosing Option.
+        if type_node_is_tuple(payload, self.llbc) {
+            return true;
+        }
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
@@ -12027,7 +12066,7 @@ impl<'a> Lowering<'a> {
             == Some("core::ptr::non_null::NonNull")
     }
 
-    /// Emit a null pointer for a niche `Option<NonNull<T>>` (`None`) as a
+    /// Emit a null pointer for a one-word niche `Option` (`None`) as a
     /// `core::ptr::null_mut()` call, returning its result `Variable`.
     ///
     /// `null_mut()` is preferred over a bare `ConstRefNull`: the annotator's
@@ -13305,7 +13344,7 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
-                // A `SwitchInt` on a niche `Option<NonNull>` discriminant
+                // A `SwitchInt` on a one-word niche `Option` discriminant
                 // switches on the pointer null-test `ne(base, null)` — a
                 // `SomeBool`, not an `Int` tag.  RPython never switches on a
                 // bool: `None`/`Some` on a maybe-null `Ptr` is a True/False
@@ -13358,7 +13397,7 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Close a `SwitchInt` whose discriminant is a niche `Option<NonNull>`
+    /// Close a `SwitchInt` whose discriminant is a one-word niche `Option`
     /// null-test (`ne(base, null)`, a `SomeBool`) as a True/False `If` via
     /// [`FunctionGraph::set_branch`], so the bool exitswitch closes with
     /// `ExitCase::Bool` instead of `ExitCase::Const(Int)`.  `Some` = tag 1 =
@@ -16282,6 +16321,71 @@ fn type_node_shared_ref_pointee<'l>(
         return None;
     }
     None
+}
+
+/// The pointee type node of a raw pointer (`{"RawPtr": [ty, kind]}`), after
+/// unwrapping `Deduplicated` / `HashConsedValue` indirection — or `None` when
+/// `node` is not a direct raw pointer. Deliberately does not peel a leading
+/// reference: `&RawPtr` is a shared-reference payload, not a raw-pointer
+/// payload.
+fn type_node_raw_ptr_pointee<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj
+            .get("RawPtr")
+            .and_then(serde_json::Value::as_array)?
+            .first();
+    }
+    None
+}
+
+/// Whether a type node is Charon's direct tuple ADT after serialization
+/// indirections. Element types are intentionally not inspected: tuple values
+/// are represented by their heap-aggregate pointer. A leading reference is
+/// not unwrapped, so `&Tuple` remains solely in the shared-reference arm.
+fn type_node_is_tuple<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
+    for _ in 0..24 {
+        let Some(obj) = node.as_object() else {
+            return false;
+        };
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            let Some(body) = llbc.dedup_body(id) else {
+                return false;
+            };
+            node = body;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return obj
+            .get("Adt")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|adt| adt.get("id"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Tuple");
+    }
+    false
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -24344,6 +24448,213 @@ mod tests {
         assert!(
             has_value_switch,
             "call_intrinsic_1: expected an enum-discriminant switch after the collapse"
+        );
+    }
+
+    /// Re-type the small checked-in `option_source` graph with a chosen
+    /// payload and lower it. This preserves the exact Charon constructor CFG
+    /// used by the existing corpus harness while avoiding a large real-LLBC
+    /// load. The function has one `Some(value)` arm and one niladic `None`
+    /// arm, so the resulting graph directly exposes whether the classifier
+    /// chose aggregate construction or the nullable-pointer identities.
+    fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
+        fn replace_dedup(
+            value: &mut serde_json::Value,
+            payload_id: u64,
+            output_id: u64,
+            payload: &serde_json::Value,
+            option_ty: &serde_json::Value,
+        ) {
+            if let Some(id) = value
+                .as_object()
+                .and_then(|obj| obj.get("Deduplicated"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                if id == payload_id {
+                    *value = payload.clone();
+                } else if id == output_id {
+                    *value = option_ty.clone();
+                }
+                return;
+            }
+            match value {
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        replace_dedup(value, payload_id, output_id, payload, option_ty);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for value in values.values_mut() {
+                        replace_dedup(value, payload_id, output_id, payload, option_ty);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        let bytes = std::fs::read(path).expect("read checked-in corpus LLBC");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse checked-in corpus JSON");
+        let translated = file
+            .get_mut("translated")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("corpus translated object");
+
+        let option_def_id = translated
+            .get("type_decls")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|decls| {
+                decls.iter().find_map(|decl| {
+                    let names = decl.get("item_meta")?.get("name")?.as_array()?;
+                    let path: Vec<&str> = names
+                        .iter()
+                        .filter_map(|seg| seg.get("Ident")?.get(0)?.as_str())
+                        .collect();
+                    (path.as_slice() == ["core", "option", "Option"])
+                        .then(|| decl.get("def_id")?.as_u64())?
+                })
+            })
+            .expect("Option type declaration in corpus");
+
+        let fun = translated
+            .get_mut("fun_decls")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|decls| {
+                decls.iter_mut().find(|decl| {
+                    decl.get("item_meta")
+                        .and_then(|meta| meta.get("name"))
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|names| names.last())
+                        .and_then(|seg| seg.get("Ident"))
+                        .and_then(|ident| ident.get(0))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("option_source")
+                })
+            })
+            .expect("option_source declaration in corpus");
+        let signature = fun
+            .get("signature")
+            .and_then(serde_json::Value::as_object)
+            .expect("option_source signature");
+        let payload_id = signature
+            .get("inputs")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|inputs| inputs.get(1))
+            .and_then(|ty| ty.get("Deduplicated"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("option_source payload dedup id");
+        let output_id = signature
+            .get("output")
+            .and_then(|ty| ty.get("Deduplicated"))
+            .and_then(serde_json::Value::as_u64)
+            .expect("option_source output dedup id");
+        let option_ty = serde_json::json!({
+            "Adt": {
+                "id": { "Adt": option_def_id },
+                "generics": {
+                    "regions": [],
+                    "types": [payload.clone()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        replace_dedup(fun, payload_id, output_id, &payload, &option_ty);
+
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        super::lower_function(&llbc, "option_source").expect("lower retyped option_source")
+    }
+
+    fn niche_ctor_shape(graph: &FunctionGraph) -> (usize, usize) {
+        let ops = graph.blocks.iter().flat_map(|block| &block.operations);
+        let null_muts = ops
+            .clone()
+            .filter(|op| {
+                matches!(&op.kind, OpKind::Call { target, .. }
+                    if target.to_string() == "core::ptr::null_mut")
+            })
+            .count();
+        let transparent_ctors = ops
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        (null_muts, transparent_ctors)
+    }
+
+    #[test]
+    fn niche_option_raw_nominal_ptr_none_is_null_some_is_identity() {
+        // `HostRegistry` (def-id 4) is a sized nominal struct in the
+        // checked-in corpus.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 4 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(null_muts, 1, "None must lower to one null pointer");
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some(raw nominal pointer) must be the payload identity, with no Option aggregate"
+        );
+    }
+
+    #[test]
+    fn niche_option_raw_scalar_ptr_remains_aggregate() {
+        let payload = serde_json::json!({
+            "RawPtr": [{ "Literal": { "UInt": "U8" } }, "Mut"]
+        });
+        let graph = lower_option_source_with_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(
+            null_muts, 0,
+            "Option<*mut u8> must not collapse None to the payload null word"
+        );
+        assert!(
+            transparent_ctors >= 2,
+            "Option<*mut u8> must retain the tagged Some and None aggregates"
+        );
+    }
+
+    #[test]
+    fn niche_option_tuple_none_is_null_some_is_identity() {
+        let payload = serde_json::json!({
+            "Adt": {
+                "id": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [
+                        { "Literal": { "Int": "I64" } },
+                        { "Literal": "Bool" }
+                    ],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let graph = lower_option_source_with_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(null_muts, 1, "None must lower to one null pointer");
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some(tuple) must be the tuple-pointer identity, with no Option aggregate"
         );
     }
 
