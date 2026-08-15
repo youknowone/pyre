@@ -1,10 +1,6 @@
 {
   "host": "linux-aarch64",
   "modules": {
-    "test.test_dataclasses": {
-      "dynasm": "FAIL",
-      "reason": "JIT wrong code, not a platform difference: _process_class raises a spurious 'dictionary changed size during iteration' over cls.__dict__ although the only delattr completes before the loop. PYRE_NO_JIT=1 passes and darwin-arm64 passes, so it is neither the arch nor the OS alone"
-    },
     "test.test_unittest": {
       "dynasm": "CRASH",
       "reason": "GC bug, not a platform difference: invalid type_id at minor_custom_trace_target under minor_remembered_set, aborting through pyre_jit::call_jit::bh_call_fn mid-run. Passes when the driver is run directly, so it needs run.py's process shape to show up"
