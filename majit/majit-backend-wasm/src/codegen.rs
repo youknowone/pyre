@@ -1378,6 +1378,45 @@ impl HomeLiveness {
     }
 }
 
+/// Whether a call has to be followed by the frame and home reloads.
+///
+/// callbuilder.py:29-43 splits this in two: `emit_no_collect` prepares the
+/// arguments and calls, while `emit` additionally pushes a gcmap and reloads a
+/// possibly-forwarded frame afterwards. Without a gcmap the collector cannot
+/// reach the home slots, so a callee that cannot collect leaves the JitFrame
+/// and every home exactly where they were and the reload only re-reads what
+/// the locals already hold. `x86/assembler.py:2205-2209` takes the same
+/// decision from the same bit, as does the cranelift residual call emission.
+///
+/// Two families keep their reloads whatever the effect info says, because
+/// upstream pushes their gcmap without ever consulting it:
+///
+/// - `CALL_RELEASE_GIL` — `x86/assembler.py:2200-2203` dispatches to
+///   `emit_call_release_gil` before the `check_can_collect()` test, and
+///   `push_gcmap_for_call_release_gil` is unconditional; `emit`'s own
+///   docstring reads "not for CALL_RELEASE_GIL". The bit describes the callee,
+///   while another thread may collect for the span the GIL is released.
+/// - `COND_CALL_VALUE` — `x86/regalloc.py:952-1011` builds the gcmap with
+///   `get_gcmap()` and reads no effect info at all.
+///
+/// A call carrying no call descr also keeps its reloads: this narrows a
+/// conservative answer where the effect info is there to narrow it, and never
+/// widens one.
+fn call_can_collect(op: &Op) -> bool {
+    if matches!(
+        op.opcode,
+        OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilN
+            | OpCode::CallReleaseGilF
+            | OpCode::CondCallValueI
+            | OpCode::CondCallValueR
+    ) {
+        return true;
+    }
+    op.with_call_descr(|descr| descr.get_extra_info().check_can_collect())
+        .unwrap_or(true)
+}
+
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
 /// Every `is_malloc` op (the whole `New..=Newunicode` range, string allocations
 /// included) routes through a collecting allocator; conservatively include
@@ -4927,6 +4966,7 @@ fn build_function(
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
                 let vi = op.pos.get().raw();
+                let can_collect = call_can_collect(op);
 
                 // Direct in-module residual call: skip the `jit_call` host hop and
                 // `call_indirect` the callee's table slot with a static
@@ -4951,21 +4991,23 @@ fn build_function(
                     } else {
                         sink.drop(); // value-producing call whose result is unused
                     }
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
+                    if can_collect {
+                        emit_reload_frame_if_necessary(
+                            &mut sink,
+                            residual_type_base,
+                            ca.ca_reload_fn_ptr,
+                            ca.jf_top_addr,
+                        );
+                        emit_reload_refs_from_homes(
+                            &mut sink,
+                            value_types,
+                            ref_homes,
+                            &liveness,
+                            op_idx,
+                            (!OpRef::raw_is_constant(vi)).then_some(vi),
+                            frame,
+                        );
+                    }
                     // store-on-def (end of loop) homes a Ref result, so the
                     // direct path must NOT `continue` past it.
                 } else if let (Some(base), Some(nargs)) =
@@ -4982,21 +5024,23 @@ fn build_function(
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
                     sink.drop();
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        None,
-                        frame,
-                    );
+                    if can_collect {
+                        emit_reload_frame_if_necessary(
+                            &mut sink,
+                            residual_type_base,
+                            ca.ca_reload_fn_ptr,
+                            ca.jf_top_addr,
+                        );
+                        emit_reload_refs_from_homes(
+                            &mut sink,
+                            value_types,
+                            ref_homes,
+                            &liveness,
+                            op_idx,
+                            None,
+                            frame,
+                        );
+                    }
                 } else if let Some((sig, &type_idx)) = residual_call_float_sig(op).and_then(|sig| {
                     float_residual_type_indices
                         .get(&sig)
@@ -5022,21 +5066,23 @@ fn build_function(
                     } else {
                         sink.drop(); // value-producing call whose result is unused
                     }
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
+                    if can_collect {
+                        emit_reload_frame_if_necessary(
+                            &mut sink,
+                            residual_type_base,
+                            ca.ca_reload_fn_ptr,
+                            ca.jf_top_addr,
+                        );
+                        emit_reload_refs_from_homes(
+                            &mut sink,
+                            value_types,
+                            ref_homes,
+                            &liveness,
+                            op_idx,
+                            (!OpRef::raw_is_constant(vi)).then_some(vi),
+                            frame,
+                        );
+                    }
                 } else if let (Some(base), Some(nargs)) = (
                     true_void_residual_type_base,
                     residual_call_void_true_arity(op),
@@ -5051,21 +5097,23 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, base + nargs as u32);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        None,
-                        frame,
-                    );
+                    if can_collect {
+                        emit_reload_frame_if_necessary(
+                            &mut sink,
+                            residual_type_base,
+                            ca.ca_reload_fn_ptr,
+                            ca.jf_top_addr,
+                        );
+                        emit_reload_refs_from_homes(
+                            &mut sink,
+                            value_types,
+                            ref_homes,
+                            &liveness,
+                            op_idx,
+                            None,
+                            frame,
+                        );
+                    }
                 } else {
                     let jit_call = jit_call_idx.expect("CALL op present but jit_call not imported");
 
@@ -5112,21 +5160,23 @@ fn build_function(
                         sink.local_set(value_types.local(vi));
                     }
                     // Mirror the direct path: a trampoline residual call may force and collect.
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!is_void && !OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
+                    if can_collect {
+                        emit_reload_frame_if_necessary(
+                            &mut sink,
+                            residual_type_base,
+                            ca.ca_reload_fn_ptr,
+                            ca.jf_top_addr,
+                        );
+                        emit_reload_refs_from_homes(
+                            &mut sink,
+                            value_types,
+                            ref_homes,
+                            &liveness,
+                            op_idx,
+                            (!is_void && !OpRef::raw_is_constant(vi)).then_some(vi),
+                            frame,
+                        );
+                    }
                 }
             }
 
