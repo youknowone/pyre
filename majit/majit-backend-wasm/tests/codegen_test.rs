@@ -509,6 +509,60 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
 }
 
 #[test]
+fn peephole_folds_adjacent_local_set_get_to_local_tee() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let tee_local = 2;
+    let ops = vec![
+        make_op(
+            OpCode::SameAsI,
+            &[OpRef::input_arg_int(0)],
+            OpRef::int_op(1),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+
+    let mut has_tee = false;
+    let mut has_unfolded_pair = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut reader = body.get_operators_reader().unwrap();
+            let mut previous_local_set = None;
+            while !reader.eof() {
+                match reader.read().unwrap() {
+                    wasmparser::Operator::LocalSet { local_index } => {
+                        previous_local_set = Some(local_index);
+                    }
+                    wasmparser::Operator::LocalGet { local_index } => {
+                        has_unfolded_pair |=
+                            previous_local_set == Some(tee_local) && local_index == tee_local;
+                        previous_local_set = None;
+                    }
+                    wasmparser::Operator::LocalTee { local_index } => {
+                        has_tee |= local_index == tee_local;
+                        previous_local_set = None;
+                    }
+                    _ => previous_local_set = None,
+                }
+            }
+        }
+    }
+
+    assert!(has_tee);
+    assert!(
+        !has_unfolded_pair,
+        "the local.set/local.get pair must be folded"
+    );
+}
+
+#[test]
 fn unbound_pool_float_operand_declares_an_f64_local() {
     let folded_float = OpRef::float_op(7);
     let ops = vec![Op::new(OpCode::Finish, &[rb(folded_float)])];
@@ -1315,8 +1369,10 @@ fn void_call_with_helper(
     let mut operands = vec![rb(OpRef::const_int(42))];
     operands.extend(args.iter().copied().map(rb));
     let op = Op::new(OpCode::CallN, &operands);
-    let mut effect = EffectInfo::default();
-    effect.pyre_helper = helper;
+    let effect = EffectInfo {
+        pyre_helper: helper,
+        ..EffectInfo::default()
+    };
     op.setdescr(majit_ir::descr::make_call_descr_full(
         0,
         arg_types,
