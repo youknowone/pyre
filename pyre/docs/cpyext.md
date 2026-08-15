@@ -56,6 +56,14 @@ the header below.
 - the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
   `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
   `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
+- the call entry points in the other direction (`cpyext/object.rs`):
+  `PyObject_Call` / `CallObject` / `CallNoArgs` / `CallOneArg`, and the
+  vectorcall spellings `PyObject_Vectorcall`, `PyObject_VectorcallMethod` and
+  `PyVectorcall_Call`, which unpack the argument vector and go through the
+  interpreter's own call path rather than a type's `tp_vectorcall`. The
+  variadic ones -- `PyObject_CallFunction` / `CallMethod`, the two `ObjArgs`
+  spellings, `CallMethodNoArgs` / `CallMethodOneArg` and `PyVectorcall_NARGS`
+  -- are `static inline` in the header, like `PyArg_ParseTuple`;
 - single-phase `PyModule_Create2`, PEP 489 `PyModuleDef_Init` with
   `Py_mod_create` / `Py_mod_exec`, module state (`m_size`) and the
   `PyModule_Add*` family;
@@ -78,7 +86,8 @@ the header below.
 - heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
   `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
   `PyType_GetQualName`, with every `typeslots.h` identifier except
-  `Py_tp_vectorcall` and `Py_tp_token`, whose protocols are absent;
+  `Py_tp_vectorcall` and `Py_tp_token`, which name a type field pyre never
+  reads;
 - the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
   becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
@@ -159,10 +168,12 @@ Known divergences, each documented at its definition:
 ## What remains
 
 5. `tp_traverse` and `tp_clear`, without which a cycle through C is not
-   collectable; the vectorcall protocol -- `Py_TPFLAGS_HAVE_VECTORCALL`,
-   `tp_vectorcall_offset`, `PyObject_Vectorcall` and the `Py_tp_vectorcall`
-   slot -- of which pyre has only the struct fields; `Py_tp_token` and
-   `PyType_GetBaseByToken`; and the remaining generated API;
+   collectable; the *dispatch* half of vectorcall -- a type declaring
+   `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
+   `tp_call`, which such a type is required to have
+   (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
+   pyre does not take; `Py_tp_token` and `PyType_GetBaseByToken`; and the
+   remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged

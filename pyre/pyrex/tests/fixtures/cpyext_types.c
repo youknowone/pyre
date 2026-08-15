@@ -1568,6 +1568,46 @@ static PyObject *m_import_ref(PyObject *self, PyObject *args)
     return PyImport_AddModuleRef(name);
 }
 
+/* Build a type whose base is `int` and report the fast-subclass flag it
+   earned, alongside the flag `Point` (based on `object`) earned. */
+static PyObject *m_subclass_flags(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    PyObject *zero = PyLong_FromLong(0);
+    if (zero == NULL) {
+        return NULL;
+    }
+    PyObject *int_type = (PyObject *)Py_TYPE(zero);
+    Py_INCREF(int_type);
+    Py_DECREF(zero);
+
+    PyType_Slot slots[] = {
+        {Py_tp_base, int_type},
+        {0, NULL},
+    };
+    PyType_Spec spec;
+    spec.name = "cpyext_types.Counted";
+    spec.basicsize = 0;
+    spec.itemsize = 0;
+    spec.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
+    spec.slots = slots;
+
+    PyObject *made = PyType_FromSpec(&spec);
+    Py_DECREF(int_type);
+    if (made == NULL) {
+        return NULL;
+    }
+    unsigned long made_flags = PyType_GetFlags((PyTypeObject *)made);
+    unsigned long point_flags = PyType_GetFlags(&PointType);
+    PyObject *result = Py_BuildValue(
+        "(Oiii)", made,
+        (made_flags & Py_TPFLAGS_LONG_SUBCLASS) != 0,
+        (made_flags & Py_TPFLAGS_UNICODE_SUBCLASS) != 0,
+        (point_flags & Py_TPFLAGS_LONG_SUBCLASS) != 0);
+    Py_DECREF(made);
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"capsule_read", m_capsule_read, METH_O, "read the capsule payload"},
     {"capsule_facts", m_capsule_facts, METH_O, "name, validity and context"},
@@ -1581,6 +1621,7 @@ static PyMethodDef methods[] = {
     {"is_point", m_is_point, METH_O, "PyObject_TypeCheck"},
     {"sum_x", m_sum_x, METH_O, "read x, raising the module exception otherwise"},
     {"flags", m_flags, METH_NOARGS, "PyType_GetFlags on Point"},
+    {"subclass_flags", m_subclass_flags, METH_NOARGS, "fast-subclass flags"},
     {"is_subtype", m_is_subtype, METH_NOARGS, "PyType_IsSubtype both ways"},
     {"owner_deallocs", m_owner_deallocs, METH_NOARGS, "how often Owner.tp_dealloc ran"},
     {NULL, NULL, 0, NULL},

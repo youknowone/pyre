@@ -187,6 +187,34 @@ pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
 pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
 pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
 
+/// The fast-subclass flags, in the order `inherit_special` tests them
+/// (`typeobject.py:492-509`): the first base that matches wins, so a type is
+/// only ever marked as one of these.
+const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, std::ffi::c_ulong); 8] = [
+    (&pyre_object::interp_exceptions::EXCEPTION_TYPE, 1 << 30),
+    (&pyre_object::pyobject::TYPE_TYPE, 1 << 31),
+    (&pyre_object::pyobject::INT_TYPE, 1 << 24),
+    (&pyre_object::bytesobject::BYTES_TYPE, 1 << 27),
+    (&pyre_object::pyobject::STR_TYPE, 1 << 28),
+    (&pyre_object::pyobject::TUPLE_TYPE, 1 << 26),
+    (&pyre_object::pyobject::LIST_TYPE, 1 << 25),
+    (&pyre_object::pyobject::DICT_TYPE, 1 << 29),
+];
+
+/// Mark `tp` with the one fast-subclass flag its base chain earns it.
+fn set_fast_subclass_flags(tp: *mut CPyTypeObject, w_type: PyObjectRef) {
+    for (builtin, flag) in FAST_SUBCLASS_FLAGS {
+        let w_builtin = crate::typedef::gettypeobject(builtin);
+        if w_builtin.is_null() {
+            continue;
+        }
+        if crate::baseobjspace::issubclass(w_type, w_builtin).unwrap_or(false) {
+            unsafe { (*tp).tp_flags |= flag };
+            return;
+        }
+    }
+}
+
 const fn immortal_type() -> CPyTypeObject {
     CPyTypeObject {
         ob_base: CPyVarObject {
@@ -2412,6 +2440,7 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
             pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
         (*tp).tp_flags = ((*tp).tp_flags & !PY_TPFLAGS_READYING) | PY_TPFLAGS_READY;
     }
+    set_fast_subclass_flags(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     Ok(())
 }
 

@@ -382,16 +382,48 @@ struct _typeobject {
     uint16_t tp_versions_used;
 };
 
+/* Type flags.  `Py_TPFLAGS_DEFAULT` is 0 here as it is upstream, where it
+   reduces to `Py_TPFLAGS_HAVE_STACKLESS_EXTENSION | 0` and that half is 0 off
+   Stackless.
+
+   Only the eight `*_SUBCLASS` flags and the three pyre sets itself -- READY,
+   READYING and HEAPTYPE -- are ever filled in by pyre. The rest are declared
+   so that an extension naming one compiles, and carry whatever the extension
+   put there; a flag describing an object layout pyre does not have (the
+   MANAGED/PREHEADER/INLINE_VALUES/ITEMS_AT_END group) is never acted on. */
 #define Py_TPFLAGS_DEFAULT 0UL
 #define Py_TPFLAGS_MANAGED_WEAKREF (1UL << 3)
 #define Py_TPFLAGS_MANAGED_DICT (1UL << 4)
+#define Py_TPFLAGS_PREHEADER (Py_TPFLAGS_MANAGED_WEAKREF | Py_TPFLAGS_MANAGED_DICT)
+#define Py_TPFLAGS_SEQUENCE (1UL << 5)
+#define Py_TPFLAGS_MAPPING (1UL << 6)
+#define Py_TPFLAGS_DISALLOW_INSTANTIATION (1UL << 7)
+#define Py_TPFLAGS_IMMUTABLETYPE (1UL << 8)
 #define Py_TPFLAGS_HEAPTYPE (1UL << 9)
 #define Py_TPFLAGS_BASETYPE (1UL << 10)
+#define Py_TPFLAGS_HAVE_VECTORCALL (1UL << 11)
 #define Py_TPFLAGS_READY (1UL << 12)
 #define Py_TPFLAGS_READYING (1UL << 13)
 #define Py_TPFLAGS_HAVE_GC (1UL << 14)
-#define Py_TPFLAGS_DISALLOW_INSTANTIATION (1UL << 7)
-#define Py_TPFLAGS_IMMUTABLETYPE (1UL << 8)
+#define Py_TPFLAGS_HAVE_STACKLESS_EXTENSION 0UL
+#define Py_TPFLAGS_METHOD_DESCRIPTOR (1UL << 17)
+#define Py_TPFLAGS_HAVE_VERSION_TAG (1UL << 18)
+#define Py_TPFLAGS_VALID_VERSION_TAG (1UL << 19)
+#define Py_TPFLAGS_IS_ABSTRACT (1UL << 20)
+#define Py_TPFLAGS_INLINE_VALUES (1UL << 2)
+#define Py_TPFLAGS_ITEMS_AT_END (1UL << 23)
+#define Py_TPFLAGS_LONG_SUBCLASS (1UL << 24)
+#define Py_TPFLAGS_LIST_SUBCLASS (1UL << 25)
+#define Py_TPFLAGS_TUPLE_SUBCLASS (1UL << 26)
+#define Py_TPFLAGS_BYTES_SUBCLASS (1UL << 27)
+#define Py_TPFLAGS_UNICODE_SUBCLASS (1UL << 28)
+#define Py_TPFLAGS_DICT_SUBCLASS (1UL << 29)
+#define Py_TPFLAGS_BASE_EXC_SUBCLASS (1UL << 30)
+#define Py_TPFLAGS_TYPE_SUBCLASS (1UL << 31)
+#define Py_TPFLAGS_HAVE_FINALIZE (1UL << 0)
+
+#define PyType_HasFeature(type, feature) ((PyType_GetFlags(type) & (feature)) != 0)
+#define PyType_FastSubclass(type, flag) PyType_HasFeature(type, flag)
 
 /* `tp_richcompare` operations. */
 #define Py_LT 0

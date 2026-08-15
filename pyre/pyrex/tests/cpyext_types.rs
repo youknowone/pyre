@@ -23,6 +23,13 @@ assert m.Point.__doc__ == 'a two-dimensional point defined in C'
 assert isinstance(m.Point, type)
 assert m.flags() == (1, 1)
 
+# A C type whose base is `int` earns the long fast-subclass flag; one based on
+# `object` earns none of them.
+made, is_long, is_unicode, point_is_long = m.subclass_flags()
+assert issubclass(made, int), made
+assert (is_long, is_unicode, point_is_long) == (1, 0, 0), \
+    (is_long, is_unicode, point_is_long)
+
 # ── tp_new and tp_init ─────────────────────────────────────────────────
 p = m.Point()
 assert (p.x, p.y) == (0, 0)
