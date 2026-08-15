@@ -307,6 +307,13 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         can_move: Some(dynasm_can_move),
         supports_guard_gc_type,
     });
+    // The jitframe a compiled run returns stays alive as the deadframe until
+    // the frontend has finished reading it, and is off the JF shadow stack for
+    // that whole window. Publishing the set is what keeps its interior refs
+    // rooted; see `frame::LIVE_DEADFRAMES`.
+    majit_gc::set_active_gc_deadframe_hooks(majit_gc::ActiveGcDeadFrameHooks {
+        walk_live_deadframes: Some(crate::frame::walk_live_deadframes),
+    });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
@@ -2983,41 +2990,15 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // PyPy `llmodel.py:422-424 _decode_pos` parity: remap jitframe
-        // values via `descr.rd_locs[i]`.  Synthetic / out-of-range
-        // descrs fall back to identity slot indexing.
-        let rd_locs_len = descr_fd.rd_locs().len();
-        let mut raw_values: Vec<i64> = Vec::with_capacity(num_slots);
-        for i in 0..num_slots {
-            if i < rd_locs_len {
-                match crate::guard::decode_rd_loc_slot(descr_fd, i) {
-                    Some(slot) => {
-                        let val =
-                            unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 };
-                        raw_values.push(val);
-                    }
-                    None => raw_values.push(0),
-                }
-            } else {
-                raw_values
-                    .push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
-            }
-        }
-
-        // grab_exc_value (llmodel.py:240): read jf_guard_exc off the deadframe
-        // tip before the libc jitframe chain is freed.  The exc=True
-        // failure-recovery stub (generate_quick_failure) staged pos_exc_value
-        // here for must_save_exception guards; FrameData carries it to
-        // `grab_exc_value` since the frame is gone after the free below.
-        let exc_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
-
-        // The deadframe `result_jf` is the tip of `jf_ptr`'s `jf_forward`
-        // chain whenever `_check_frame_depth` realloc'd; free every frame in
-        // the chain (jitframe.py:139-145), not just the original head.
-        unsafe { Self::free_jitframe_chain(jf_ptr) };
-
+        // `llmodel.py:323 return ll_frame` — the deadframe IS the frame the
+        // run returned. `result_jf` is the tip of `jf_ptr`'s `jf_forward`
+        // chain whenever `_check_frame_depth` realloc'd; the whole chain is
+        // handed to the deadframe, which frees it (jitframe.py:139-145) when
+        // it drops rather than here. Every slot read, and `grab_exc_value`,
+        // then goes straight into the frame the way `llmodel.py:240-250` does
+        // — nothing is decoded eagerly and no copy of the frame is made.
         DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr, None, exc_value)),
+            data: Box::new(unsafe { FrameData::owning(jf_ptr, result_jf, num_slots, descr, None) }),
         }
     }
 
@@ -3166,22 +3147,17 @@ impl Backend for DynasmBackend {
         unsafe { (*frame).jf_descr = force_descr };
 
         let descr = self.fail_descr_arc_from_addr(force_descr);
-        let fail_descr = descr
+        let num_slots = descr
             .as_fail_descr()
-            .expect("force descriptor must implement FailDescr");
-        let raw_values = fail_descr
+            .expect("force descriptor must implement FailDescr")
             .fail_arg_types()
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                crate::guard::decode_rd_loc_slot(fail_descr, index)
-                    .map(|slot| unsafe { crate::llmodel::get_int_value_direct(frame, slot) as i64 })
-                    .unwrap_or(0)
-            })
-            .collect();
-        let exc_value = GcRef(unsafe { (*frame).jf_guard_exc });
+            .len();
+        // `llmodel.py:280-284 force` casts the resolved frame to a GCREF and
+        // returns it — the forced frame IS the deadframe, and it belongs to
+        // the compiled run that is still executing, so this deadframe borrows
+        // it rather than taking the chain over.
         Some(DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr, None, exc_value)),
+            data: Box::new(unsafe { FrameData::borrowing(frame, num_slots, descr, None) }),
         })
     }
 
@@ -3210,7 +3186,7 @@ impl Backend for DynasmBackend {
     /// must_save_exception guards (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
     /// GUARD_NOT_FORCED); other guards leave it NULL.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
-        frame.data.downcast_ref::<FrameData>().unwrap().exc_value
+        frame.data.downcast_ref::<FrameData>().unwrap().exc_value()
     }
 
     fn clear_stored_exception(&self) {

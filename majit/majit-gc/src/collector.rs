@@ -2210,6 +2210,18 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
         }
+        // The jitframes the backend is still holding as DEADFRAMES. A frame
+        // reaches this walk exactly when it has left the shadow stack — the
+        // compiled epilogue pops it before returning — and has not yet been
+        // freed, which is the window in which the frontend reads its slots.
+        // `llmodel.py:240-250` reads those slots straight out of the frame, so
+        // the interior refs are live for the whole window and nothing else in
+        // this phase can see them. See `ActiveGcDeadFrameHooks`.
+        crate::walk_active_live_deadframes(&mut |addr| {
+            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
+                libc_jf_slots.push(slot_ptr);
+            });
+        });
         for slot_ptr in libc_jf_slots {
             let field_ref = unsafe { &mut *slot_ptr };
             self.drag_out_root(field_ref);
@@ -3341,6 +3353,18 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_jf_roots(&mut visit_jf_root);
         }
+        // Same source the minor-collection root phase reads; enumerated here
+        // too, so a root that exists for the collector is also a root this
+        // listing reports. A listing that omitted it would say an object is
+        // unreachable while the collector keeps it.
+        crate::walk_active_live_deadframes(&mut |addr| {
+            crate::shadow_stack::trace_libc_jitframe(addr, &mut |slot_ptr| {
+                let field_ref = unsafe { *slot_ptr };
+                if !field_ref.is_null() {
+                    result.push((field_ref, "deadframe_slot"));
+                }
+            });
+        });
 
         let mut visit_bh_root = |gcref: &mut GcRef| {
             result.push((*gcref, "blackhole_register"));

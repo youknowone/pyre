@@ -1699,6 +1699,71 @@ pub fn walk_active_extra_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
     }
 }
 
+/// Hand the collector the payload address of every jitframe that is currently
+/// a live DEADFRAME, for the visitor to trace.
+pub type LiveDeadFrameWalkerFn = fn(&mut dyn FnMut(usize));
+
+global_hook!(static ACTIVE_LIVE_DEADFRAME_WALKER: LiveDeadFrameWalkerFn);
+
+/// Backend callbacks that expose GC roots which exist only between a compiled
+/// run returning and the frontend finishing with its result.
+///
+/// `llmodel.py:240-250` (`grab_exc_value` / `get_savedata_ref`) and
+/// `llmodel.py:298` (`malloc_jitframe`) together say that the deadframe IS the
+/// jitframe: `execute_token` allocates one JITFRAME, compiled code returns it,
+/// and every `cpu.get_*_value(deadframe, i)` is a cast plus a read out of that
+/// same object. Nothing is copied out and nothing else is allocated.
+///
+/// Upstream can hold the deadframe across arbitrary frontend work because the
+/// jitframe is an ordinary GC object and `deadframe` is an ordinary local in
+/// RPython code, so the translated stack map roots it for free. **A STRUCTURAL
+/// ADAPTATION IS NEEDED HERE, AND THIS TABLE IS IT.** majit's jitframes for
+/// the dynasm backend are libc allocations outside both the nursery and the
+/// old generation; the collector reaches them only where they appear on the JF
+/// shadow stack, and the compiled epilogue pops them from it before returning.
+/// So between the run returning and the deadframe being dropped, the frame's
+/// interior `Ref` slots are visible to nobody — and any allocation the
+/// frontend makes in that window can move the objects they point at. There is
+/// no conservative stack scan to fall back on.
+///
+/// The backend therefore publishes the set of deadframes it is holding, and
+/// the collector walks it as a root source alongside the shadow stack. It is a
+/// fn-pointer table rather than a registry owned by this crate for the same
+/// reason [`ActiveGcGuardHooks`] is: majit-gc must not know what a deadframe
+/// is, and the backend already owns the lifetime.
+#[derive(Clone, Copy, Default)]
+pub struct ActiveGcDeadFrameHooks {
+    /// Yields each live deadframe's jitframe payload address. Interiors are
+    /// walked with the tracer `shadow_stack::register_libc_jitframe_tracer`
+    /// installed, the same one the shadow-stack walk uses, so a frame reached
+    /// through this table and one reached on the stack are traced identically.
+    pub walk_live_deadframes: Option<LiveDeadFrameWalkerFn>,
+}
+
+/// Install the active backend's deadframe-root callbacks. Pass a default
+/// [`ActiveGcDeadFrameHooks`] to clear.
+pub fn set_active_gc_deadframe_hooks(hooks: ActiveGcDeadFrameHooks) {
+    ACTIVE_LIVE_DEADFRAME_WALKER.set(hooks.walk_live_deadframes);
+}
+
+/// Snapshot of the installed deadframe-root callbacks.
+pub fn active_gc_deadframe_hooks() -> ActiveGcDeadFrameHooks {
+    ActiveGcDeadFrameHooks {
+        walk_live_deadframes: ACTIVE_LIVE_DEADFRAME_WALKER.get(),
+    }
+}
+
+/// Visit the payload address of every jitframe currently held as a deadframe.
+///
+/// A no-op when no backend has installed a walker — which is also the state a
+/// backend that frees its jitframe before returning leaves this in, and is
+/// correct for it: such a backend holds no frame for the collector to root.
+pub fn walk_active_live_deadframes(visitor: &mut dyn FnMut(usize)) {
+    if let Some(f) = ACTIVE_LIVE_DEADFRAME_WALKER.get() {
+        f(visitor);
+    }
+}
+
 /// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether
 /// `gcref` is a `T_IS_RPYTHON_INSTANCE` (has `typeptr` at offset 0). When
 /// no backend has installed a callback, returns `false`.
