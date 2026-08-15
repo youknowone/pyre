@@ -63,7 +63,7 @@ fn imports_single_phase_module_created_through_c_api() {
     let init_marker = out_dir.join("initialized");
     let unload_marker = out_dir.join("unloaded");
     let source = root.join("pyre/pyrex/tests/fixtures/cpyext_smoke.c");
-    let include = root.join("pyre/pyre-interpreter/include/pyre3.14");
+    let include = root.join("pyre/pyre-interpreter/include/pyre3.14t");
     let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));
     cc.arg(&source)
         .arg("-I")

@@ -240,9 +240,12 @@ pub struct W_TypeObject {
     /// `ModuleDictStrategy.version?`, the tree's other `?` declaration, the way
     /// upstream's one `QuasiImmut` class serves every quasi-immutable field.
     pub quasi_immut_watchers: crate::quasiimmut::QuasiImmutField,
-    /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type carry
-    /// the collector's two-word pre-header, which is what
-    /// `_PyType_PreHeaderSize` charges and `sys.getsizeof` therefore adds.
+    /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
+    /// the collector's traversal. A build that keeps the global interpreter
+    /// lock gives them a two-word `PyGC_Head` for it, which is what
+    /// `_PyType_PreHeaderSize` charges; one without the lock keeps the same
+    /// bits in the object header and charges nothing, so the flag records the
+    /// type property alone.
     ///
     /// A property of the type, not of the heap an instance landed in: the same
     /// `str` value must report one size whether it was folded into a code

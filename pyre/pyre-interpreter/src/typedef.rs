@@ -4943,10 +4943,14 @@ fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         .expect("list and its subclasses have CPython layout metadata")
         .0;
     let allocated = unsafe { pyre_object::listobject::w_list_allocated(list) };
-    // `list_sort_impl` temporarily writes -1. CPython performs this expression
-    // in `size_t`, so the unsigned wrap makes an exact base list report 32.
-    let size = (basicsize as usize)
-        .wrapping_add((allocated as usize).wrapping_mul(std::mem::size_of::<PyObjectRef>()));
+    // `list_sort_impl` temporarily writes -1 while the items are detached, and
+    // that sentinel is what the modification check reads back. It is not part
+    // of the size a build without a global interpreter lock reports: a list
+    // observed mid-sort answers its `tp_basicsize` and nothing more, so the
+    // detached state contributes no slots rather than wrapping in `size_t`.
+    let slots = allocated.max(0) as usize;
+    let size =
+        (basicsize as usize).wrapping_add(slots.wrapping_mul(std::mem::size_of::<PyObjectRef>()));
     Ok(w_int_new(size as i64))
 }
 
@@ -5511,15 +5515,19 @@ fn init_str_type(ns: PyObjectRef) {
                         4
                     };
                     let word = std::mem::size_of::<usize>();
-                    // unicodeobject.c:unicode_sizeof_impl. Exact ASCII uses
-                    // PyASCIIObject (5 words), exact non-ASCII uses
-                    // PyCompactUnicodeObject (7 words), and Unicode
-                    // subclasses use the two-block PyUnicodeObject (8 words).
+                    // unicodeobject.c:unicode_sizeof_impl, over the four-word
+                    // object header a build without a global interpreter lock
+                    // carries (thread id, flags, mutex, gc bits, local and
+                    // shared refcounts, type) rather than the two-word one.
+                    // Exact ASCII then uses PyASCIIObject (7 words), exact
+                    // non-ASCII uses PyCompactUnicodeObject (9 words), and
+                    // Unicode subclasses the two-block PyUnicodeObject
+                    // (10 words).
                     let base =
                         if pyre_object::pyobject::is_exact_type(args[0], &pyre_object::STR_TYPE) {
-                            if maxchar < 0x80 { 5 * word } else { 7 * word }
+                            if maxchar < 0x80 { 7 * word } else { 9 * word }
                         } else {
-                            8 * word
+                            10 * word
                         };
                     let size =
                         base.checked_add((len + 1).checked_mul(kind).ok_or_else(|| {
@@ -10702,10 +10710,16 @@ fn make_getset_property_full(
 /// `tp_is_gc` where the type installs one.
 ///
 /// This is a property of the type, not of the object's current collector
-/// state: `()` is untracked yet `sys.getsizeof` still charges it a
-/// `PyGC_Head`, because `tuple` carries the flag. Reading pyre's own GC
-/// ownership instead answers a different question — pyre's nursery owns
+/// state: `()` is untracked yet `tuple` carries the flag. Reading pyre's own
+/// GC ownership instead answers a different question — pyre's nursery owns
 /// `object()` and `b""`, which `object` and `bytes` never declare.
+///
+/// Nothing consumes it at present. `sys.getsizeof` used to, for the
+/// `PyGC_Head` that `_PyType_PreHeaderSize` charges a tracked instance, but a
+/// build without a global interpreter lock keeps the collector's bits in the
+/// object header and so charges none. The flag itself remains the answer
+/// `type.__flags__` owes for `Py_TPFLAGS_HAVE_GC`, which it does not yet
+/// report.
 pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     let Some(tp) = r#type(w_obj) else {
         return false;
@@ -10772,6 +10786,13 @@ fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
 /// These belong to the type object, not to its Python namespace: CPython's
 /// `type_members` exposes both through read-only data descriptors.
+///
+/// The sizes are the ones a build without a global interpreter lock reports,
+/// which is what `sys.abiflags` and the `Py_GIL_DISABLED` config var advertise
+/// here. Its object header is four words rather than two, so most of these run
+/// two words above their counterpart in a build that keeps the lock; `type`
+/// and `PyWeakReference` grow by three, carrying a field the lock makes
+/// unnecessary.
 pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
         return None;
@@ -10780,59 +10801,62 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
     let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
     let (base, item) = if is(&pyre_object::INSTANCE_TYPE) {
-        (2 * word, 0)
+        (4 * word, 0)
     } else if is(&pyre_object::TYPE_TYPE) {
-        (117 * word, 5 * word)
+        // `PyHeapTypeObject`, which keeps a unique-id word here that a build
+        // holding the lock has no use for.
+        (120 * word, 5 * word)
     } else if is(&pyre_object::INT_TYPE)
         || is(&pyre_object::LONG_TYPE)
         || is(&pyre_object::BOOL_TYPE)
     {
-        (3 * word, 4)
+        (5 * word, 4)
     } else if is(&pyre_object::FLOAT_TYPE) {
-        (3 * word, 0)
+        (5 * word, 0)
     } else if is(&pyre_object::COMPLEX_TYPE) {
-        (4 * word, 0)
+        (6 * word, 0)
     } else if is(&pyre_object::STR_TYPE) {
-        (8 * word, 0)
+        (10 * word, 0)
     } else if is(&pyre_object::bytesobject::BYTES_TYPE) {
-        (4 * word + 1, 1)
+        (6 * word + 1, 1)
     } else if is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE) {
-        (7 * word, 0)
+        (9 * word, 0)
     } else if is(&pyre_object::LIST_TYPE) {
-        (5 * word, 0)
+        (7 * word, 0)
     } else if is(&pyre_object::TUPLE_TYPE) {
-        (4 * word, word)
+        (6 * word, word)
     } else if is(&pyre_object::DICT_TYPE) {
-        (6 * word, 0)
+        (8 * word, 0)
     } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
-        (25 * word, 0)
+        (27 * word, 0)
     } else if is(&pyre_object::functional::RANGE_TYPE) {
-        (6 * word, 0)
+        (8 * word, 0)
     } else if is(&pyre_object::sliceobject::SLICE_TYPE) {
-        (5 * word, 0)
+        (7 * word, 0)
     } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
-        (18 * word, word)
+        (20 * word, word)
     } else if is(&pyre_object::functional::MAP_TYPE) {
-        (5 * word, 0)
+        (7 * word, 0)
     } else if is(&pyre_object::functional::FILTER_TYPE)
         || is(&pyre_object::functional::REVERSED_TYPE)
     {
-        (4 * word, 0)
-    } else if is(&pyre_object::functional::ZIP_TYPE) {
         (6 * word, 0)
+    } else if is(&pyre_object::functional::ZIP_TYPE) {
+        (8 * word, 0)
     } else if is(&pyre_object::functional::ENUMERATE_TYPE) {
-        (7 * word, 0)
+        (9 * word, 0)
     } else if is(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE) {
         // CPython 3.14 `PyWeakReference`: object header, doubly-linked
-        // weakref list, callback, hash/cache word and vectorcall slot.
+        // weakref list, callback, hash/cache word and vectorcall slot, plus
+        // the word that serialises the referent without the lock.
         // PyPy likewise gives W_WeakrefBase/W_Weakref their own typedef;
         // subclasses append their declared slots to this prefix.
-        (8 * word, 0)
+        (11 * word, 0)
     } else {
         // CPython's ordinary fixed-size heap instance begins with
         // PyObject_HEAD; user slots are appended below just like the
         // specialized builtin prefixes above.
-        (2 * word, 0)
+        (4 * word, 0)
     };
     // PyPy typeobject.py:103-129 keeps the total slot count on Layout, whose
     // typedef identifies the fixed builtin prefix. CPython appends one pointer
@@ -10867,23 +10891,26 @@ fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
     let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
     let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
     let (mut dict, mut weakref) = if is(&pyre_object::TYPE_TYPE) {
-        (33 * word, 46 * word)
+        (35 * word, 48 * word)
     } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
-        (0, 24 * word)
+        (0, 26 * word)
     } else if is(&pyre_object::memoryview::MEMORYVIEW_TYPE) {
-        (0, 17 * word)
+        (0, 19 * word)
     } else {
         (0, 0)
     };
     // Python 3.14 managed dict/weakref storage lives in the negative
     // pre-header. Preserve a builtin's positive inline offset when it already
     // owns the slot; otherwise heap types use the managed sentinel/offset.
+    // Without the lock that pre-header is the managed dict pair alone — the
+    // collector keeps its bits in the object header instead of a `PyGC_Head`
+    // ahead of it — so the weakref word sits two words back, not four.
     if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
         if dict == 0 && unsafe { pyre_object::w_type_get_hasdict(w_type) } {
             dict = -1;
         }
         if weakref == 0 && unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
-            weakref = -4 * word;
+            weakref = -2 * word;
         }
     }
     Some((dict, weakref))
@@ -10938,15 +10965,17 @@ fn init_type_type(ns: PyObjectRef) {
                     let size = if pyre_object::w_type_is_heaptype(args[0]) {
                         // CPython 3.14 typeobject.c:type___sizeof___impl:
                         // PyHeapTypeObject plus the cached-keys table carried
-                        // by a managed instance dictionary.
-                        117 * word
+                        // by a managed instance dictionary. The struct sizes
+                        // are the ones a build without a global interpreter
+                        // lock reports; the keys table is the same either way.
+                        120 * word
                             + if pyre_object::w_type_get_hasdict(args[0]) {
                                 96 * word
                             } else {
                                 0
                             }
                     } else {
-                        52 * word
+                        54 * word
                     };
                     Ok(w_int_new(size))
                 },
@@ -19918,7 +19947,7 @@ fn init_object_type(ns: PyObjectRef) {
                         .expect("every Python object has a type")
                         .as_ptr();
                     let (basicsize, itemsize) = cpython_type_layout(w_type)
-                        .unwrap_or((2 * std::mem::size_of::<usize>() as i64, 0));
+                        .unwrap_or((4 * std::mem::size_of::<usize>() as i64, 0));
                     let nitems = if itemsize == 0 {
                         0
                     } else if unsafe {
@@ -30286,7 +30315,7 @@ mod tests {
             crate::module::_weakref::interp__weakref::proxy_type(),
             crate::module::_weakref::interp__weakref::callable_proxy_type(),
         ] {
-            assert_eq!(super::cpython_type_layout(w_type), Some((8 * word, 0)));
+            assert_eq!(super::cpython_type_layout(w_type), Some((11 * word, 0)));
         }
     }
 

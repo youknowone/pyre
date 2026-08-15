@@ -71,24 +71,21 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
         ));
     }
 
-    // `_PyType_PreHeaderSize(Py_TYPE(o))` adds its two components
-    // independently: a two-word GC header for tracked objects, plus a two-word
-    // managed dict/weakref prefix where the instance type requests it.  A
-    // tracked builtin such as list has only the first; a normal heap instance
-    // has both; an untracked heap-derived value may have only the second.
+    // `_PyType_PreHeaderSize(Py_TYPE(o))` — the two-word managed dict/weakref
+    // prefix an instance type requests. Its other term, a `PyGC_Head` ahead of
+    // every tracked object, is compiled out of a build without a global
+    // interpreter lock: the collector keeps its bits in the object header
+    // there. That is why the four-word header those builds carry costs a
+    // tracked type nothing over the two-word one, while an untracked leaf pays
+    // the whole two words.
     //
-    // Both terms are read off the type. Asking instead which heap the instance
+    // The term is read off the type. Asking instead which heap the instance
     // landed in would make the answer depend on the allocation that produced
     // it: a `str` folded into a code constant sits outside the collector's
     // ranges and one built at run time does not, so the same value reported two
     // different sizes.
     let word = std::mem::size_of::<usize>() as u64;
-    let gc_header = if crate::typedef::cpython_object_is_gc(current()) {
-        2 * word
-    } else {
-        0
-    };
-    let managed_prefix = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
+    let pre_header = crate::typedef::r#type(current()).map_or(0, |tp| unsafe {
         if pyre_object::w_type_is_heaptype(tp.as_ptr())
             && (pyre_object::w_type_get_hasdict(tp.as_ptr())
                 || pyre_object::w_type_get_weakrefable(tp.as_ptr()))
@@ -98,7 +95,6 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
             0
         }
     });
-    let pre_header = gc_header + managed_prefix;
     let total = (size as u64)
         .checked_add(pre_header)
         .expect("Py_ssize_t plus the fixed pre-header fits in size_t");
@@ -1238,11 +1234,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // sys.winver — the "major.minor" tag Windows uses for the per-user site
     // directory and the PythonCore registry keys. site.getusersitepackages
-    // reads it to build USER_SITE.  It carries no `t`: that suffix is how
-    // Windows spells what `sys.abiflags` spells elsewhere, and pyre holds a
-    // global interpreter lock.
+    // reads it to build USER_SITE.  A build without a global interpreter lock
+    // carries the `t` here, which is how Windows spells what `sys.abiflags`
+    // spells elsewhere.
     #[cfg(windows)]
-    module_ns_store(ns, "winver", w_str_new("3.14"));
+    module_ns_store(ns, "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py:562` builds `pythonapi` out of it with no
@@ -2047,15 +2043,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Err(unsafe { crate::PyError::from_exc_object(exc) })
         }),
     );
-    // sys.abiflags — empty, because pyre runs its mutators under a global
-    // interpreter lock (`majit-gc/src/rgil.rs`, the `thread_gil.c` port), so
-    // the `t` that spells a free-threaded ABI does not describe this build.
-    // `site.py:409` reads the flag to name the site-packages directory and
-    // `sysconfig` derives `abi_thread` from `Py_GIL_DISABLED` for the same
-    // name, so the two must agree.  The attribute is absent on Windows, where
-    // the flag is spelled in `sys.winver`; every reader guards with `hasattr`,
-    // so an empty string answers the same.
-    module_ns_store(ns, "abiflags", w_str_new(""));
+    // sys.abiflags — `t` for a build without a global interpreter lock.  The
+    // attribute is absent on Windows, where the flag is spelled in
+    // `sys.winver` and neither the `nt` scheme nor `site._get_path` reads it;
+    // every reader guards with `hasattr`, so an empty string answers the same.
+    module_ns_store(ns, "abiflags", w_str_new(if cfg!(windows) { "" } else { "t" }));
     // sys.argv — pick up pending argv from set_sys_argv if available.
     let pending = crate::importing::take_pending_sys_argv();
     let argv = if pending.is_null() {
