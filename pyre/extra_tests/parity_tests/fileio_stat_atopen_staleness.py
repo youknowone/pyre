@@ -10,6 +10,7 @@ one below changes the file after the open and asks again.
 """
 
 import os
+import sys
 import tempfile
 
 directory = tempfile.mkdtemp()
@@ -49,12 +50,16 @@ if os.path.exists("/dev/zero"):
         assert stream.read(8) == b"\x00" * 8
 
 # Seekability is a property of the descriptor, so the answer may be kept, but
-# it belongs to that stream alone.
-read_fd, write_fd = os.pipe()
-with open(read_fd, "rb") as pipe:
-    assert pipe.seekable() is False
-    assert pipe.seekable() is False
-os.close(write_fd)
+# it belongs to that stream alone. Only the unseekable half is platform-bound:
+# a Windows anonymous-pipe descriptor answers `seekable()` True, under the
+# reference CPython as much as here, so asking it there compares a backend
+# against a failing reference. The seekable half below still runs everywhere.
+if sys.platform != "win32":
+    read_fd, write_fd = os.pipe()
+    with open(read_fd, "rb") as pipe:
+        assert pipe.seekable() is False
+        assert pipe.seekable() is False
+    os.close(write_fd)
 with open(path, "rb") as stream:
     assert stream.seekable() is True
     assert stream.seekable() is True
