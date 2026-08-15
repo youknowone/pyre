@@ -7098,7 +7098,15 @@ pub fn cranelift_resumedata_deopt(
     _bridge_num_inputs: usize,
 ) -> bool {
     use majit_backend::Backend;
+    use majit_ir::FailDescr;
     use majit_metainterp::resume;
+
+    if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ENTRIES: AtomicU64 = AtomicU64::new(0);
+        let n = ENTRIES.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[deopt-probe] entry #{n} descr_addr={descr_addr:#x}");
+    }
 
     // 1. Recover descr Arc.
     let (driver, driver_vinfo) = crate::eval::driver_pair();
@@ -7115,6 +7123,26 @@ pub fn cranelift_resumedata_deopt(
     };
     let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
         return false;
+    };
+
+    // A novable driver's resume data has no virtualizable section. Derive the
+    // owning driver from the guard descr, matching the blackhole path's
+    // caller-supplied distinction, rather than guessing from this callback's
+    // backend registration.
+    let novable = match rgd
+        .rd_loop_token_clt()
+        .and_then(|clt_any| {
+            clt_any.downcast_ref::<std::sync::Arc<majit_backend::CompiledLoopToken>>()
+        })
+        .and_then(|clt| clt.upgrade_loop_token())
+        .and_then(|token| token.outermost_jitdriver_index)
+        .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+    {
+        Some(has_vinfo) => !has_vinfo,
+        // Synthetic descr, evicted token, or stale driver slot: decline to the
+        // existing recovery-layout fallback instead of choosing the wrong
+        // resume-data shape for one of the two driver kinds.
+        None => return false,
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
@@ -7161,7 +7189,17 @@ pub fn cranelift_resumedata_deopt(
     reader.prepare(rd_virtuals_slice, rd_pendingfields);
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
-    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None, None);
+    if std::env::var_os("PYRE_DEOPT_PROBE").is_some() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static HITS: AtomicU64 = AtomicU64::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[deopt-probe] cranelift vinfo hand-off #{n} descr_addr={descr_addr:#x} novable={novable}"
+        );
+    }
+    let vinfo_arg: Option<&dyn resume::VirtualizableInfo> =
+        if novable { None } else { Some(vinfo_dyn) };
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), vinfo_arg, None, None);
 
     // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
     //    blackhole_resume_via_rd_numb's resolve_jitcode (line 1891),

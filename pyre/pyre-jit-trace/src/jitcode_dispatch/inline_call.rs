@@ -1381,14 +1381,29 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
             _ => return None,
         }
     }
-    for c in fresh {
+    // Only `null_or_self@1` may be null, and the layout above names it by
+    // index, so it is checked by position rather than by admitting a null
+    // anywhere.  Everything else here is a Python value the rewound `CALL`
+    // pops — an argument, or `kwnames` in the `call_kw` layout — and a null in
+    // one of those slots is an UNRESOLVED register, not a value: the concrete
+    // Ref bank holds `Ref(null)` for a box the walk never materialized, which
+    // is why `concrete_ref_for_color` tests for it and why the prefix loop
+    // above declines on it.  Publishing one lets the resumed interpreter pop a
+    // null where an object belongs.
+    for (index, c) in fresh.into_iter().enumerate() {
         match c {
-            ConcreteValue::Ref(r) => stack.push(r),
+            ConcreteValue::Ref(r) if index == NULL_OR_SELF_ARG_INDEX || !r.is_null() => {
+                stack.push(r)
+            }
             _ => return None,
         }
     }
     Some(stack)
 }
+
+/// `r_args` index of the `null_or_self` operand — the one slot of a residual
+/// call's Ref list whose correct value can be null.
+const NULL_OR_SELF_ARG_INDEX: usize = 1;
 
 /// Fold a keyword call's `kwnames`->parameter permutation at trace time so a
 /// `call_kw` reuses the positional inline path.  The constant `kwnames` tuple
@@ -2455,7 +2470,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     let saved_fbw_mode = ctx.fbw_mode;
-    let journal_before = fbw_store_journal_len();
+    // The odometer counts every journaled effect — a store, a list append/pop,
+    // a cell store — where the store journal counts only the first.  The
+    // rewind arm below reads it to decide whether this descent already applied
+    // something, the same question `latch_abort_call_resume` answers with it.
+    let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
     ctx.outer_resume_marker_jit_pc = call_site_marker;
@@ -2504,7 +2523,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // the orthodox `w_list_append` descent does.  A descent that already
         // applied an effect cannot be rewound this way, so it keeps the abort.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
-            if fbw_store_journal_len() == journal_before
+            if fbw_executed_effect_count() == effects_before
                 && fbw_has_unjournaled_effect() == unjournaled_before =>
         {
             if fbw_inline_diag_enabled() {
@@ -3175,12 +3194,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // that window resumes a frame whose callable slot was never
                 // written — `names(traceback)` in
                 // `synth/exception_reentry_guard_finally_residual` SIGSEGVs in
-                // `classify_callable` on a null callable.  No other deferred
-                // helper's result outlives the next op, so the loop header is
-                // only disqualifying together with that one residual.  The test
-                // is a superset of the failing shape: `names` also needs an
-                // in-window guard that actually fails, which a plain `self.attr`
-                // read folds away.
+                // `classify_callable` on a null callable.  The test is a
+                // superset of the failing shape: `names` also needs an in-window
+                // guard that actually fails, which a plain `self.attr` read
+                // folds away.
+                //
+                // ⚠️This pair is what disqualifies a CALLEE, and that is the
+                // whole of its licence — it is NOT that a method-load is the
+                // only deferred result outliving the next op, which this clause
+                // used to claim.  Measured counterexample: in
+                // `parity_tests/exception_handler_method_load_resume.py` the
+                // CALLER's `out.append(...)` leaves its `LOAD_ATTR name +
+                // NULL|self` pair on the stack across four opcodes, and the
+                // deopt did resume over the unwritten slot — the same SIGSEGV,
+                // through a caller this gate never examines.  What prevents it
+                // is the producer of the flush's operand image refusing to
+                // publish an unresolved null (`collect_call_stack_overrides`),
+                // not any admission test here.
                 let loop_header_admitted = !body_facts.owns_loop_header
                     || !fbw_callee_body_has_load_method_self_residual(body.code, callee_descr_refs);
                 foriter_deferred_admit = entry_is_call_boundary
@@ -4243,7 +4273,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // prologue's side effects a second time at trace time.  RPython's
     // `do_residual_call` runs the call exactly once (`pyjitpl.py`), so a
     // side-effecting prologue must decline the CA inline (see the arm).
-    let prologue_journal_before = fbw_store_journal_len();
+    //
+    // The odometer, not the store journal alone: a store, a list append/pop
+    // and a cell store each bump it, and the store journal counts only the
+    // first.  `latch_abort_call_resume` — the sibling that decides the same
+    // "did this sub-walk already run an effect" question for the abort latch —
+    // reads it for that reason.
+    let prologue_effects_before = fbw_executed_effect_count();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
     // initializes `outer_active_boxes: Vec::new()`; it is computed
@@ -5020,12 +5056,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // CODEX1 parity: decline the CA inline when the prologue sub-walk
-            // mutated the heap (a journaled list store, or an unjournaled
+            // mutated the heap (any journaled effect the odometer counts — a
+            // store, a list append/pop, a cell store — or an unjournaled
             // effect newly set during the sub-walk).  Emitting the CA here
             // would re-run the whole call via the residual executor, applying
             // those side effects twice at trace time.  A side-effect-free
             // prologue (the common loop-setup-only case) still inlines.
-            if fbw_store_journal_len() > prologue_journal_before
+            if fbw_executed_effect_count() != prologue_effects_before
                 || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
             {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));

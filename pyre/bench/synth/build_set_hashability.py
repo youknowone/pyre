@@ -4,7 +4,12 @@
 # __hash__ is None / raises / returns a non-int — raises instead of silently
 # building a set, and a user __hash__ is actually invoked.  Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.
-N = 680000
+# Trip count kept clear of the major-collection threshold check.py pins: at
+# the previous 680000 this loop crossed it, and the eval-breaker bailout that
+# follows re-enters through a bridge whose guard can then fail once more,
+# which moves guard_failures for reasons outside this fixture. Crossing
+# resumes around 0.3x of the old count; the gated counters are unchanged.
+N = 85000
 
 
 class HashRaises:

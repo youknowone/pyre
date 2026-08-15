@@ -6486,10 +6486,23 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 let orig_size = pyre_object::dictmultiobject::w_dict_len(source);
                 let mut i = 0;
                 loop {
-                    let Some((k, v)) = pyre_object::dictmultiobject::w_dict_nth_item(
-                        resolve_dict_backing(data()),
-                        i,
-                    ) else {
+                    // `getiteritems_with_hash` (`dictmultiobject.py:991`) — an
+                    // object- or unicode-shaped source already stores each key's
+                    // hash, so reusing it keeps `__hash__` at the single call
+                    // that filled the source.  Re-deriving it here is observable
+                    // for a key whose `__hash__` has side effects, and it puts
+                    // an extra Python call inside this walk.  Typed strategies
+                    // store no hash and `w_dict_nth_hashed_key` returns `None`
+                    // for them, which selects the plain walk below.
+                    let source_now = resolve_dict_backing(data());
+                    let hashed = pyre_object::is_exact_type(source_now, &pyre_object::DICT_TYPE)
+                        .then(|| pyre_object::dictmultiobject::w_dict_nth_hashed_key(source_now, i))
+                        .flatten();
+                    let Some((k, v)) = (match hashed {
+                        Some(key) => pyre_object::dictmultiobject::w_dict_nth_value(source_now, i)
+                            .map(|v| (key.obj, v)),
+                        None => pyre_object::dictmultiobject::w_dict_nth_item(source_now, i),
+                    }) else {
                         break;
                     };
                     let _iteration_roots = pyre_object::gc_roots::push_roots();
@@ -6498,7 +6511,16 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     pyre_object::gc_roots::pin_root(v);
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
-                    dict_store_checked(dict(), k, v)?;
+                    match hashed {
+                        Some(key) => pyre_object::dictmultiobject::w_dict_store_hashed_checked(
+                            dict(),
+                            k,
+                            v,
+                            key.hash,
+                        )
+                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?,
+                        None => dict_store_checked(dict(), k, v)?,
+                    }
                     if orig_size
                         != pyre_object::dictmultiobject::w_dict_len(resolve_dict_backing(data()))
                     {

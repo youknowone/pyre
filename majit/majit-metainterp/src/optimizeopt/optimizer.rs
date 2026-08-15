@@ -1690,37 +1690,23 @@ impl Optimizer {
     /// the inner restore must preserve that.
     ///
     /// ```text
-    /// let guard = optimizer.cant_replace_guards();
+    /// let guard = optimizer.cant_replace_guards(ctx);
     /// // ... guarded section ...
-    /// optimizer.restore_can_replace_guards(guard);
+    /// optimizer.restore_can_replace_guards(ctx, guard);
     /// ```
-    pub fn cant_replace_guards(&mut self) -> CantReplaceGuards {
+    pub fn cant_replace_guards(&mut self, ctx: &mut OptContext) -> CantReplaceGuards {
+        debug_assert_eq!(self.can_replace_guards, ctx.can_replace_guards);
         let oldval = self.can_replace_guards;
         self.can_replace_guards = false;
+        ctx.can_replace_guards = false;
         CantReplaceGuards::new(oldval)
     }
 
     /// Pair with `cant_replace_guards` — restores the saved oldval.
     /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
-    pub fn restore_can_replace_guards(&mut self, guard: CantReplaceGuards) {
+    pub fn restore_can_replace_guards(&mut self, ctx: &mut OptContext, guard: CantReplaceGuards) {
         self.can_replace_guards = guard.oldval;
-    }
-
-    /// **Legacy flat setter** kept for tests that exercise the flag
-    /// outside the cant_replace_guards save/restore pattern. New
-    /// production callers should use `cant_replace_guards()` +
-    /// `restore_can_replace_guards(oldval)` so nested scopes preserve
-    /// the outer value. Test-only entry; production unroll path
-    /// already migrated to the save/restore pair.
-    #[cfg(test)]
-    pub fn disable_guard_replacement(&mut self) {
-        self.can_replace_guards = false;
-    }
-
-    /// Companion to `disable_guard_replacement` — test-only.
-    #[cfg(test)]
-    pub fn enable_guard_replacement(&mut self) {
-        self.can_replace_guards = true;
+        ctx.can_replace_guards = guard.oldval;
     }
 
     /// `optimizer.py:243` + `heap.py:807-808`
@@ -2452,6 +2438,7 @@ impl Optimizer {
             start_next_pos,
         );
         ctx.skip_flush_mode = self.skip_flush;
+        ctx.building_bridge = self.building_bridge;
         ctx.constant_fold_alloc = self.constant_fold_alloc.take();
         // Seed the canonical `find_producer_op` surface (`input_ops`) with
         // the input ops' producers so they resolve directly; `find_producer_op`
@@ -3944,7 +3931,7 @@ impl Optimizer {
         );
 
         // Preserve final context for jump_to_existing_trace.
-        let mut ops = std::mem::take(&mut ctx.new_operations);
+        let mut ops = ctx.take_new_operations();
 
         // RPython compile.py:327 final loop assembly:
         //   loop.operations = ([start_label] + preamble_ops
@@ -4313,7 +4300,9 @@ impl Optimizer {
                     result.append(&mut ctx.new_operations);
                     return Ok((result, false));
                 }
-                return Ok((optimized_ops, false));
+                let mut result = optimized_ops;
+                result.append(&mut ctx.new_operations);
+                return Ok((result, false));
             }
         };
 
@@ -4345,7 +4334,16 @@ impl Optimizer {
             if let Some(ref mut state) = self.exported_loop_state {
                 state.runtime_boxes = runtime_boxes.to_vec();
             }
-            return Ok((optimized_ops, true));
+            // unroll.py:234-236 returns `self._newoperations` whole, so the
+            // retrace is built on the flush + end-of-preamble force + failed
+            // match guards above, not on the body alone. `retarget_close_jump`
+            // set `self.skip_flush`, which suppressed the in-body flush, so
+            // OptHeap's deferred setfield_gc stores are exactly what the
+            // `self.flush` above emitted — dropping this buffer would erase a
+            // heap store the bridge body performed.
+            let mut result = optimized_ops;
+            result.append(&mut ctx.new_operations);
+            return Ok((result, true));
         }
 
         // unroll.py:220-227: retrace limit reached, try force_boxes=True.
@@ -4400,7 +4398,9 @@ impl Optimizer {
             result.append(&mut ctx.new_operations);
             Ok((result, false))
         } else {
-            Ok((optimized_ops, false))
+            let mut result = optimized_ops;
+            result.append(&mut ctx.new_operations);
+            Ok((result, false))
         }
     }
 
@@ -7090,11 +7090,14 @@ mod tests {
     #[test]
     fn test_guard_replacement_flag() {
         let mut opt = Optimizer::new();
+        let mut ctx = OptContext::new(0);
         assert!(opt.can_replace_guards);
-        opt.disable_guard_replacement();
+        let guard = opt.cant_replace_guards(&mut ctx);
         assert!(!opt.can_replace_guards);
-        opt.enable_guard_replacement();
+        assert!(!ctx.can_replace_guards);
+        opt.restore_can_replace_guards(&mut ctx, guard);
         assert!(opt.can_replace_guards);
+        assert!(ctx.can_replace_guards);
     }
 
     #[test]

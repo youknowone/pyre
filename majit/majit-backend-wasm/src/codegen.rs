@@ -37,27 +37,43 @@ struct ValueLocals {
 }
 
 impl ValueLocals {
-    fn mark(by_id: &mut [Option<u32>], id_types: &mut [ValType], id: u32, ty: ValType) {
+    fn mark(
+        by_id: &mut [Option<u32>],
+        id_types: &mut [ValType],
+        has_authoritative_type: &mut [bool],
+        id: u32,
+        ty: ValType,
+        authoritative: bool,
+    ) {
         let i = id as usize;
         assert!(i < by_id.len(), "value id {id} exceeds pre-pass bounds");
         by_id[i] = Some(0);
-        id_types[i] = ty;
+        // InputArg::tp and Op::result_type describe the defining value.  An
+        // operand may be visited before its producer, so its embedded tag
+        // only supplies a type while no definition has claimed this id.
+        if authoritative || !has_authoritative_type[i] {
+            id_types[i] = ty;
+        }
+        has_authoritative_type[i] |= authoritative;
     }
 
     fn collect(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Self {
         let mut by_id = vec![None; num_vars as usize];
         let mut id_types = vec![ValType::I64; num_vars as usize];
+        let mut has_authoritative_type = vec![false; num_vars as usize];
 
         for ia in inputargs {
             Self::mark(
                 &mut by_id,
                 &mut id_types,
+                &mut has_authoritative_type,
                 ia.index,
                 if ia.tp == Type::Float {
                     ValType::F64
                 } else {
                     ValType::I64
                 },
+                true,
             );
         }
         for op in ops {
@@ -66,27 +82,49 @@ impl ValueLocals {
                 Self::mark(
                     &mut by_id,
                     &mut id_types,
+                    &mut has_authoritative_type,
                     result.raw(),
                     if op.result_type() == Type::Float {
                         ValType::F64
                     } else {
                         ValType::I64
                     },
+                    true,
                 );
             }
             for arg in op.getarglist() {
                 let arg = arg.to_opref();
                 if arg != OpRef::NONE && !arg.is_constant() {
-                    let ty = id_types[arg.raw() as usize];
-                    Self::mark(&mut by_id, &mut id_types, arg.raw(), ty);
+                    Self::mark(
+                        &mut by_id,
+                        &mut id_types,
+                        &mut has_authoritative_type,
+                        arg.raw(),
+                        if arg.ty() == Some(Type::Float) {
+                            ValType::F64
+                        } else {
+                            ValType::I64
+                        },
+                        false,
+                    );
                 }
             }
             if let Some(failargs) = op.getfailargs() {
                 for arg in failargs {
                     let arg = arg.to_opref();
                     if arg != OpRef::NONE && !arg.is_constant() {
-                        let ty = id_types[arg.raw() as usize];
-                        Self::mark(&mut by_id, &mut id_types, arg.raw(), ty);
+                        Self::mark(
+                            &mut by_id,
+                            &mut id_types,
+                            &mut has_authoritative_type,
+                            arg.raw(),
+                            if arg.ty() == Some(Type::Float) {
+                                ValType::F64
+                            } else {
+                                ValType::I64
+                            },
+                            false,
+                        );
                     }
                 }
             }
@@ -838,6 +876,80 @@ fn emitted_write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> 
         return None;
     }
     Some(base)
+}
+
+/// Pre-pass `SameAsI`/`SameAsR` forwarding edges by result value id.  The
+/// wasm backend materializes these ops, but rewrite.py keys its applied-barrier
+/// set through their forwarded box identity.
+fn same_as_forwardings(ops: &[Op], num_vars: u32) -> Vec<Option<OpRef>> {
+    let mut forwardings = vec![None; num_vars as usize];
+    for op in ops {
+        if !matches!(op.opcode, OpCode::SameAsI | OpCode::SameAsR) {
+            continue;
+        }
+        let result = op.pos.get();
+        if result == OpRef::NONE || result.is_constant() {
+            continue;
+        }
+        if let Some(slot) = forwardings.get_mut(result.raw() as usize) {
+            *slot = Some(op.arg(0).to_opref());
+        }
+    }
+    forwardings
+}
+
+/// Follow a `SameAsI`/`SameAsR` forwarding chain to its fixed point.  The
+/// bounded walk also makes malformed cyclic forwarding terminate.
+fn resolve_same_as_forwarding(base: OpRef, forwardings: &[Option<OpRef>]) -> OpRef {
+    let mut current = base;
+    for _ in 0..forwardings.len() {
+        if current == OpRef::NONE || current.is_constant() {
+            break;
+        }
+        let Some(next) = forwardings.get(current.raw() as usize).copied().flatten() else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Emit a store write barrier unless the base's forwarded value already has
+/// one on this path. The emitted barrier still receives the store's own base.
+#[allow(clippy::too_many_arguments)]
+fn emit_write_barrier_if_needed(
+    sink: &mut InstructionSink<'_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    jit_call_idx: Option<u32>,
+    residual_type_base: Option<u32>,
+    wb_fn_ptr: i64,
+    base: Option<OpRef>,
+    same_as_forwardings: &[Option<OpRef>],
+    wb_applied: &mut indexmap::IndexSet<OpRef>,
+) {
+    let Some(base) = base else {
+        return;
+    };
+    let wb_key = resolve_same_as_forwarding(base, same_as_forwardings);
+    if wb_applied.contains(&wb_key) {
+        return;
+    }
+    emit_write_barrier(
+        sink,
+        constants,
+        value_types,
+        jit_call_idx,
+        residual_type_base,
+        wb_fn_ptr,
+        base,
+    );
+    // rewrite.rs:1941-1947 `gen_write_barrier`: remember only after the
+    // barrier has been emitted.
+    wb_applied.insert(wb_key);
 }
 
 /// Whether any op in the trace needs a write-barrier trampoline call, which
@@ -2273,6 +2385,7 @@ fn build_function(
     // at every potentially-collecting op and LABEL so this describes every
     // path reaching the next op, including entry through a LABEL loader.
     let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
+    let same_as_forwardings = same_as_forwardings(ops, num_vars);
 
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label || op.opcode.can_malloc() {
@@ -3029,22 +3142,17 @@ fn build_function(
                 }
             }
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                if let Some(base) = emitted_write_barrier_base(op, ref_values)
-                    && !wb_applied.contains(&base)
-                {
-                    emit_write_barrier(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        jit_call_idx,
-                        residual_type_base,
-                        wb_fn_ptr,
-                        base,
-                    );
-                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
-                    // only after the barrier has been emitted.
-                    wb_applied.insert(base);
-                }
+                emit_write_barrier_if_needed(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    jit_call_idx,
+                    residual_type_base,
+                    wb_fn_ptr,
+                    emitted_write_barrier_base(op, ref_values),
+                    &same_as_forwardings,
+                    &mut wb_applied,
+                );
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -3128,22 +3236,17 @@ fn build_function(
                 }
             }
             OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                if let Some(base) = emitted_write_barrier_base(op, ref_values)
-                    && !wb_applied.contains(&base)
-                {
-                    emit_write_barrier(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        jit_call_idx,
-                        residual_type_base,
-                        wb_fn_ptr,
-                        base,
-                    );
-                    // rewrite.rs:1941-1947 `gen_write_barrier`: remember
-                    // only after the barrier has been emitted.
-                    wb_applied.insert(base);
-                }
+                emit_write_barrier_if_needed(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    jit_call_idx,
+                    residual_type_base,
+                    wb_fn_ptr,
+                    emitted_write_barrier_base(op, ref_values),
+                    &same_as_forwardings,
+                    &mut wb_applied,
+                );
                 emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());

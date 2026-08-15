@@ -12042,11 +12042,28 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         if !r_args.is_empty() || dst_bank != 'r' {
             return Ok(None);
         }
-        let (prev, prev_obj) = if let Some(seed) = ctx.fbw_mode.current_exception_seed {
-            // resume.py applies pending fields before resumed
-            // execution.  Bridge tracing does not mutate the live EC, so use
-            // the decoded fieldbox directly; a runtime GETFIELD here would
-            // read the pre-guard TLS value before the bridge applies anything.
+        // Two Python instructions lower to this helper, and they want
+        // different things from a bridge seed.  A bare `raise` / `RERAISE` wants
+        // the exception the bridge is resuming with — the compiled loop is free
+        // to elide its `sys_exc_value` store (a balanced save/store/restore
+        // DCEs), so the live slot is not a source there and only the seed
+        // names the exception to re-raise.  `PUSH_EXC_INFO`'s `prev` save wants
+        // the field itself, and at a bridge that resumes AT the handler the
+        // seed is the exception this opcode is two ops away from publishing:
+        // saving it as `prev` makes the matching `POP_EXCEPT` reinstate the
+        // exception the handler just finished with.  Read the live slot for
+        // that one — `_prepare_pendingfields` (state.rs, its `execute` block)
+        // runs every decoded pending write through `bh_setfield_gc_r` at bridge
+        // entry, so the slot is current.  A seed this walk stored itself is a
+        // view of the field either way, and reusing its OpRef keeps the
+        // save/store/restore triple balanced.
+        let seed_answers_this_read = ctx.fbw_mode.current_exception_seed_from_walk_store
+            || super::recording_instruction_is_bare_reraise(ctx, op.pc);
+        let (prev, prev_obj) = if let Some(seed) = ctx
+            .fbw_mode
+            .current_exception_seed
+            .filter(|_| seed_answers_this_read)
+        {
             (seed, ctx.fbw_mode.current_exception_seed_concrete)
         } else {
             let Some(ec) = walker_ensure_execution_context(ctx) else {
@@ -12159,6 +12176,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     pyre_interpreter::eval::set_current_exception(store_concrete);
     ctx.fbw_mode.current_exception_seed = Some(store_op);
     ctx.fbw_mode.current_exception_seed_concrete = store_concrete;
+    ctx.fbw_mode.current_exception_seed_from_walk_store = true;
     Ok(Some(()))
 }
 

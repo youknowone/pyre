@@ -10,6 +10,7 @@ description = "Meta-interpreter and optimizer for majit JIT compiler"
 # Backend selection is mandatory and intentionally has no default.
 dynasm = ["dep:majit-backend-dynasm"]
 cranelift = ["dep:majit-backend-cranelift"]
+jit-audits = ["majit-ir/jit-audits"]
 
 [dependencies]
 majit-ir = { workspace = true }

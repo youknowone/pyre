@@ -889,6 +889,7 @@ fn parse_checked_ovf_match(
 #[cfg(test)]
 mod unroll_binding_tests {
     use super::*;
+    use crate::jit_interp::jitcode_lower::dispatch::InlineArmOutcome;
 
     fn int_binding(reg: u16) -> Binding {
         Binding {
@@ -940,5 +941,76 @@ mod unroll_binding_tests {
             !lowerer.bindings.contains_key("y"),
             "a body-local let must not escape the loop"
         );
+    }
+
+    #[test]
+    fn unlowerable_while_condition_restores_the_label_snapshot() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.next_label = 17;
+        let expr: syn::ExprWhile = syn::parse_quote! {
+            while unsupported_condition() {}
+        };
+
+        assert!(lowerer.lower_while_loop(&expr).is_none());
+        assert_eq!(lowerer.next_label, 17);
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
+
+    #[test]
+    fn failed_if_and_match_classification_do_not_consume_forward_labels() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.next_label = 23;
+
+        let expr_if: syn::ExprIf = syn::parse_quote! {
+            if 1 { unsupported_body() }
+        };
+        assert!(lowerer.lower_if_stmt(&expr_if).is_none());
+        assert_eq!(lowerer.next_label, 23);
+
+        let expr_match: syn::ExprMatch = syn::parse_quote! {
+            match 0 {
+                (1, 2) => {},
+                _ => {},
+            }
+        };
+        assert!(lowerer.lower_match_stmt(&expr_match).is_none());
+        assert_eq!(lowerer.next_label, 23);
+    }
+
+    #[test]
+    fn failed_inline_dispatch_arm_restores_allocated_labels() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.next_label = 31;
+        let body: Expr = syn::parse_quote! {{
+            match 0 {
+                0 => unsupported_body(),
+                _ => 1,
+            };
+        }};
+
+        assert_eq!(
+            lowerer.try_inline_dispatch_arm(&body),
+            InlineArmOutcome::Rejected,
+        );
+        assert_eq!(lowerer.next_label, 31);
+        assert!(lowerer.statements.is_empty());
+        assert!(lowerer.op_metadata.is_empty());
+    }
+
+    #[test]
+    fn typed_local_binds_like_the_unannotated_spelling() {
+        let mut lowerer = Lowerer::new(None);
+        let stmt: Stmt = syn::parse_quote! { let value: i64 = 7; };
+        let Stmt::Local(local) = stmt else {
+            unreachable!("parse_quote produced the requested let statement")
+        };
+
+        assert!(lowerer.lower_local(&local).is_some());
+        let binding = lowerer
+            .bindings
+            .get("value")
+            .expect("the typed local must create its identifier binding");
+        assert!(matches!(binding.kind, BindingKind::Int));
     }
 }

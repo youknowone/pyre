@@ -4687,14 +4687,23 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // dict | dict — PEP 584 merge. PyPy: dictmultiobject.py descr_or.
         // Returns a new dict built from `a`'s items, then updated with `b`'s.
         if pyre_object::is_dict(a) && pyre_object::is_dict(b) {
-            let new_dict = pyre_object::w_dict_new();
-            for (k, v) in pyre_object::w_dict_items(a) {
-                pyre_object::w_dict_store(new_dict, k, v);
-            }
-            for (k, v) in pyre_object::w_dict_items(b) {
-                pyre_object::w_dict_store(new_dict, k, v);
-            }
-            return Ok(new_dict);
+            // `dictmultiobject.py:288-293 descr_or` — `copyself = self.copy()`
+            // then `update1(space, copyself, w_other)`.  Storing `a`'s items
+            // one at a time instead re-hashes every key through its `__hash__`,
+            // which the strategy copy does not do.  Each of those hashes also
+            // runs Python, and the merge target, both operands and the item
+            // snapshots are bare locals no root walker scans; `dict_update1`
+            // already brackets its own operands for that reason.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(a);
+            pyre_object::gc_roots::pin_root(b);
+            let src = || pyre_object::gc_roots::shadow_stack_get(root_base);
+            let other = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+            let merged = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+            pyre_object::gc_roots::pin_root(crate::type_methods::dict_method_copy(&[src()])?);
+            crate::type_methods::dict_update1(merged(), other())?;
+            return Ok(merged());
         }
         // user-class + typedef (dict_view, …) dispatch: forward __or__ then reflected
         // __ror__, exactly once.  Skipped when a gated special above already ran, so a
@@ -4965,17 +4974,45 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             && is_exact_type(b, &pyre_object::DICT_TYPE)
             && matches!(op, CompareOp::Eq | CompareOp::Ne)
         {
-            let la = pyre_object::w_dict_len(a);
-            let lb = pyre_object::w_dict_len(b);
+            // `w_dict_lookup_checked` hashes `k` through its `__hash__` and
+            // `eq_w` runs the values' `__eq__`; both are collection points.
+            // `b` and every entry of the `w_dict_items` snapshot are native
+            // locals no root walker updates, and the operands were popped off
+            // the value stack before this dispatch, so publish the whole set
+            // and read each entry back after the comparisons that precede it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(a);
+            pyre_object::gc_roots::pin_root(b);
+            let la = pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base));
+            let lb =
+                pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
             let mut equal = la == lb;
             if equal {
-                for (k, v) in pyre_object::w_dict_items(a) {
-                    match pyre_object::dictmultiobject::w_dict_lookup_checked(b, k)
-                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?
-                    {
+                let items =
+                    pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
+                let items_base = pyre_object::gc_roots::shadow_stack_len();
+                for &(k, v) in &items {
+                    pyre_object::gc_roots::pin_root(k);
+                    pyre_object::gc_roots::pin_root(v);
+                }
+                for index in 0..items.len() {
+                    let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
+                    let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
+                        pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                        k,
+                    )
+                    .map_err(|_| {
+                        crate::baseobjspace::take_pending_dict_key_error(
+                            pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
+                        )
+                    })?;
+                    match other {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
                             // w_rightval): return space.w_False`
+                            let v =
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1);
                             if !crate::baseobjspace::eq_w(v, other_v)? {
                                 equal = false;
                                 break;
@@ -5072,23 +5109,35 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // the live lists (CPython 3.14 `list_richcompare_impl`; PyPy
         // `list_eq` / `_compare_unwrappeditems`).
         if is_list(a) && is_list(b) {
+            // `eq_w` below runs a user `__eq__`, which is a collection point,
+            // and `a`/`b` are native copies no root walker updates — the
+            // operands were popped off the value stack before this dispatch, so
+            // the frame no longer roots them either.  Publish both and read
+            // them back at every loop boundary and length read, which is also
+            // what makes the "read the live lists" contract above hold.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(a);
+            pyre_object::gc_roots::pin_root(b);
+            let a = || pyre_object::gc_roots::shadow_stack_get(root_base);
+            let b = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && pyre_object::w_list_len(a) != pyre_object::w_list_len(b)
+                && pyre_object::w_list_len(a()) != pyre_object::w_list_len(b())
             {
                 return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
             }
 
             let mut i = 0usize;
-            while i < pyre_object::w_list_len(a) && i < pyre_object::w_list_len(b) {
-                let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
-                let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
+            while i < pyre_object::w_list_len(a()) && i < pyre_object::w_list_len(b()) {
+                let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
+                let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
                 if !crate::baseobjspace::eq_w(ea, eb)? {
                     break;
                 }
                 i += 1;
             }
-            let la = pyre_object::w_list_len(a);
-            let lb = pyre_object::w_list_len(b);
+            let la = pyre_object::w_list_len(a());
+            let lb = pyre_object::w_list_len(b());
             if i >= la || i >= lb {
                 return Ok(w_bool_from(match op {
                     CompareOp::Lt => la < lb,
@@ -5104,8 +5153,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             }
             // CPython deliberately fetches the live items again: equality may
             // have replaced either element before the ordering comparison.
-            let ea = pyre_object::w_list_getitem(a, i as i64).unwrap_or(PY_NULL);
-            let eb = pyre_object::w_list_getitem(b, i as i64).unwrap_or(PY_NULL);
+            let ea = pyre_object::w_list_getitem(a(), i as i64).unwrap_or(PY_NULL);
+            let eb = pyre_object::w_list_getitem(b(), i as i64).unwrap_or(PY_NULL);
             return compare(ea, eb, op);
         }
         // range value comparison — functional.py W_Range.descr_eq:

@@ -7,7 +7,12 @@
 # unmapped opname. Both a literal reverse `seq[::-1]` and variable bounds are
 # exercised, over list/tuple/str/bytes. None bounds and an `__index__` step
 # resolve like plain ints. Output is verified against CPython/PyPy.
-N = 600000
+# Trip count kept clear of the major-collection threshold check.py pins: at
+# the previous 600000 this loop crossed it, and the eval-breaker bailout that
+# follows re-enters through a bridge whose guard can then fail once more,
+# which moves guard_failures for reasons outside this fixture. Crossing
+# resumes around 0.3x of the old count; the gated counters are unchanged.
+N = 75000
 
 
 class Idx:

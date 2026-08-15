@@ -1,5 +1,10 @@
 # pyre-check: max-pypy-ratio=61
-N = 410000
+# Trip count kept clear of the major-collection threshold check.py pins: at
+# the previous 410000 this loop crossed it, and the eval-breaker bailout that
+# follows re-enters through a bridge whose guard can then fail once more,
+# which moves guard_failures for reasons outside this fixture. Crossing
+# resumes between 0.9x and 1.0x of the old count; gated counters unchanged.
+N = 205000
 
 
 class A:

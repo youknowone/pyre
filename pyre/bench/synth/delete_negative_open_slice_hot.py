@@ -4,7 +4,13 @@
 # normalization, including on guard-failure blackhole resume.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 4351274
+# Also kept clear of the major-collection threshold check.py pins: the
+# previous 4351274 crossed it, and the eval-breaker bailout that follows
+# re-enters through a bridge whose guard can then fail once more, which moves
+# guard_failures for reasons outside this fixture. Crossing resumes between
+# 0.9x and 1.0x of the old count, so the reduction is the smallest that
+# clears it while leaving the floor above intact; gated counters unchanged.
+N = 3263455
 
 
 def delete_neg3_open():

@@ -415,7 +415,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // unlike the FOR_ITER `jit_next`); `drain_list_append` is a `-> ()`
     // `dont_look_inside` seam over `w_list_append` that collapses append's
     // strategy/grow helper subtree to one registered residual (the global
-    // `list.append` stays traced), and binds its Rust `fn` directly.
+    // `list.append` stays traced). The registered target is its uniform i64
+    // carrier adapter: the raw pointer arguments are wasm i32 values, while
+    // residual Int/Ref operands use i64 carriers.
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::baseobjspace::next",
@@ -427,18 +429,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "next",
         crate::runtime_ops::bh_next as *const (),
     );
-    let drain_list_append: unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) =
-        pyre_object::listobject::drain_list_append;
     push_alias_pair(
         &mut entries,
         "pyre_object::listobject::drain_list_append",
         "pyre_object::drain_list_append",
-        drain_list_append as *const (),
+        pyre_object::listobject::jit_drain_list_append as *const (),
     );
     push_fnaddr(
         &mut entries,
         "drain_list_append",
-        drain_list_append as *const (),
+        pyre_object::listobject::jit_drain_list_append as *const (),
     );
 
     // The drain's prologue (`w_list_new_empty`) and epilogue

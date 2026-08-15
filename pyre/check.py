@@ -746,6 +746,31 @@ def _jit_panic_reason(stderr):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _jit_stats_merged(stderr):
+    """Every `[jit-stats]` line merged into one `key -> value` map, UNFILTERED.
+
+    `None` when the run printed no such line at all, which is a different
+    condition from printing one with no keys.
+
+    Split out from `_jit_stats_snapshot` because the two callers want opposite
+    things. A committed baseline may only contain the host-stable surface, so
+    the snapshot narrows to `JITSTATS_SNAPSHOT_FIELDS`; a *non-vacuity* check
+    has to read a counter precisely because it is NOT recorded — see
+    `JITSTATS_DENOMINATOR_FIELDS`. Narrowing first would hide it.
+    """
+    fields = {}
+    seen = False
+    for line in stderr.splitlines():
+        if not line.startswith("[jit-stats]"):
+            continue
+        seen = True
+        for token in line[len("[jit-stats]") :].split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+    return fields if seen else None
+
+
 def _jit_stats_snapshot(stderr):
     """Return every jit-stats line merged into normalized key/value text.
 
@@ -769,17 +794,8 @@ def _jit_stats_snapshot(stderr):
     questions: merging arms the floor, the filter keeps the recorded surface
     host-stable.
     """
-    fields = {}
-    seen = False
-    for line in stderr.splitlines():
-        if not line.startswith("[jit-stats]"):
-            continue
-        seen = True
-        for token in line[len("[jit-stats]") :].split():
-            if "=" in token:
-                key, value = token.split("=", 1)
-                fields[key] = value
-    if not seen:
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
         return None
     fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
     # This watches what the JIT compiles, never how well. A regression that
@@ -899,6 +915,16 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_store_journal_rollback_failed",
 )
 
+# A zero-valued badness counter is meaningful only if its source census ran.
+# Pair counters whose census has a reliable denominator and reject runs where
+# that denominator is absent or zero. The denominator is not baselined because
+# it describes a host-dependent descriptor population; only non-vacuity is
+# stable across hosts. `field_pos_attached_misplaced` is intentionally absent:
+# its checked population can legitimately be empty for compiled fixtures.
+JITSTATS_DENOMINATOR_FIELDS = {
+    "field_pos_spec_misplaced": "field_pos_spec_checked",
+}
+
 # The count-valued counters, and what a move in either direction means:
 #
 # * `guard_failures` counts every guard failure that re-enters the metainterp,
@@ -913,8 +939,11 @@ JITSTATS_BADNESS_FIELDS = (
 #   makes the tracer stop admitting a frame at all — a widened
 #   `unsupported_jit_shape` predicate, a pre-trace decline — aborts nothing
 #   (`loops_aborted` holds) and *lowers* `guard_failures` (the compiled guards
-#   that used to fail are gone), so a fall here is the only signal that a hot
-#   loop went back to running interpreted.
+#   that used to fail are gone), so a fall here is the signal that a hot loop
+#   went back to running interpreted.
+#   This counts all compilations, including straight-line traces, so it cannot
+#   distinguish a loop-shaped trace from a flat trace. Inspect `Label` and
+#   `Jump` operations when that distinction matters.
 # * `bridges_compiled` is that same signal one level down: guards that stop
 #   earning a bridge keep re-entering the metainterp forever. It was left
 #   ungated for a long time on the grounds that it "moves in both directions
@@ -942,10 +971,9 @@ JITSTATS_BADNESS_FIELDS = (
 # reshuffling them, but the merged set also carries keys that are not comparable
 # against a file checked into the repo:
 #
-# * `all_descrs` and `descr_set_resolved` are HOST-DEPENDENT — the Charon/LLBC
-#   extraction runs per host, so the same commit reads `all_descrs` 1168 on
-#   macOS, 1396 on ubuntu and 1365 on windows. Committing either makes every
-#   host but one disagree.
+# * `all_descrs` and `descr_set_resolved` are host-dependent because Charon/LLBC
+#   extraction runs per host. Committing either count would make otherwise
+#   equivalent hosts disagree.
 # * the `mc_diag` tallies include contention counters (`busy_skip`,
 #   `stfe_cell_busy`, `stfe_tick`) that move with machine load.
 # * `PYRE_WASM_JIT_STATS=1` adds wall-clock (`compile_ms`) and repeated
@@ -984,7 +1012,8 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # `loops_compiled` is inverted against the badness fields: it is the counter
 # that falls when the tracer stops admitting a frame at all, which aborts
 # nothing and *lowers* `guard_failures`, so a fall is the regression and a rise
-# is the gain. `retraces_compiled` has the same polarity: a fall means an
+# is the gain — within the limit recorded above, that it counts compiles and not
+# loop-shaped ones. `retraces_compiled` has the same polarity: a fall means an
 # assembled retrace stopped being attached. The blackhole adoption counters are
 # inverted the same way: a fall means the interpreter stopped receiving an
 # image and went back to replay.
@@ -1063,6 +1092,30 @@ def _jit_stats_change(saved, current):
     return regressions, improvements
 
 
+def _jit_stats_vacuous(stderr):
+    """Return why a gated badness counter is vacuous this run, or "".
+
+    A badness counter's zero means "clean" only when its source census ran.
+    Require a nonzero denominator without baselining its host-dependent value.
+    This detects total loss of a census, not a producer that merely omits some
+    census updates.
+    """
+    fields = _jit_stats_merged(stderr)
+    if fields is None:
+        return ""  # the caller already failed this run for the missing line
+    for numerator, denominator in JITSTATS_DENOMINATOR_FIELDS.items():
+        raw = fields.get(denominator)
+        if raw is not None and raw.isdigit() and int(raw) > 0:
+            continue
+        return (
+            f"{denominator}={raw if raw is not None else '<absent>'} — "
+            f"the census behind `{numerator}` did not run, so that counter's 0 "
+            f"means 'nothing was checked', not 'nothing is misplaced', and its "
+            f"gate passed without inspecting anything"
+        )
+    return ""
+
+
 def _jit_stats_context(current):
     """Return " (observed loops_compiled=N bridges_compiled=M)", or "".
 
@@ -1135,6 +1188,52 @@ def synth_perf_gate(path):
                 raise ValueError(f"invalid synthetic performance gate in {path}: {line.strip()}") from e
             if ratio <= 0:
                 raise ValueError(f"synthetic performance gate must be positive in {path}")
+    return ratio
+
+
+def wasm_ratio_gate(path):
+    """Read an optional per-fixture ceiling on wasm's ratio to dynasm:
+        # pyre-check: max-wasm-ratio=6
+
+    Absence means `WASM_MAX_DYNASM_RATIO`, not "no ceiling" -- the opposite of
+    `synth_perf_gate` and `synth_rss_gate`, whose absence exempts a fixture
+    entirely. A directive here is therefore an allowance carved out of a gate
+    that already applies, so a run names every fixture that used one: an
+    allowance that is quietly the reason a suite is green is worse than no gate.
+
+    Read for every bench rather than synthetic ones alone, because the fixtures
+    that need an allowance are not all synthetic.
+
+    What the fixtures carrying one have in common: the wasm backend reaches
+    CPython-level objects through interpreter round-trips and allocates each on
+    a Rust heap the wasm path does not yet collect, so a loop dominated by that
+    work runs several times dynasm's execution time for a reason that is
+    structural rather than a regression. The allowances are set at the highest
+    ratio observed plus 15%, and each fixture records the ratios it was fitted
+    to. ubuntu-24.04 is the only runner that builds wasm, so it supplies most of
+    them; a fixture sitting on the gate locally is fitted here instead.
+
+    15% rather than the ~3% ubuntu shows between runs because the ratio moves
+    with host load even though both sides are user-CPU and measured in the same
+    invocation: fannkuch reads 2.9x on an idle machine here and 3.1x on the same
+    machine under a load average of 41. An allowance fitted to an idle reading
+    would be a gate that fails on a busy runner.
+    """
+    prefix = "# pyre-check: max-wasm-ratio="
+    ratio = None
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix) or ratio is not None:
+                continue
+            try:
+                ratio = float(line[len(prefix):].strip())
+            except ValueError as e:
+                raise ValueError(f"invalid wasm ratio gate in {path}: {line.strip()}") from e
+            if ratio <= 0:
+                raise ValueError(f"wasm ratio gate must be positive in {path}")
     return ratio
 
 
@@ -1420,10 +1519,18 @@ class Check:
         # measured on the same host under the same load; a recorded one would
         # age out of the machine it was taken on.
         self.bench_elapsed = {}
-        # Fixtures where the wasm run had no dynasm time to divide by, so
-        # WASM_MAX_DYNASM_RATIO was never applied. Reported in the summary: an
-        # unevaluated gate otherwise prints the same green as a satisfied one.
+        # Fixtures where the wasm run had no dynasm time to divide by -- absent
+        # or under the noise floor -- so WASM_MAX_DYNASM_RATIO was never
+        # applied. Reported in the summary: an unevaluated gate otherwise
+        # prints the same green as a satisfied one.
         self.wasm_ratio_ungated = []
+        # (bench name, ceiling) for fixtures whose header raised the ratio
+        # above WASM_MAX_DYNASM_RATIO, for the same reason as the line above: a
+        # gate widened for a fixture and a gate the fixture satisfied both print
+        # green. Reported from `print_summary` rather than beside that line,
+        # because three of the fixtures carrying an allowance are regular
+        # benches and a `--no-synthetic` run would otherwise not name them.
+        self.wasm_ratio_allowed = []
         self.snapshot_diffs = []
         self.snapshot_missing = []
         self.jitstats_diffs = []
@@ -1441,6 +1548,12 @@ class Check:
         # baseline is a bench nobody recorded, an absent line is a bench that
         # stopped reporting.
         self.jitstats_absent = []
+        # Benches whose run printed the line, but with a badness counter's
+        # census denominator at zero — the counter's gate passed on an
+        # instrument that inspected nothing. Tracked apart from
+        # `jitstats_absent` because the line IS there and every other gate on it
+        # is still meaningful; only the paired counters are void.
+        self.jitstats_vacuous = []
 
     # ── backend helpers ──
 
@@ -1682,6 +1795,11 @@ class Check:
         #   "recorded and clean" — which is how the floor came to cover 3 of 340
         #   synthetic fixtures without anyone noticing.
         # * A counter that moved, in either direction.
+        # * A badness counter reading 0 because its census never ran, rather
+        #   than because nothing is wrong — `JITSTATS_DENOMINATOR_FIELDS`. The
+        #   other three disarms are visible as an absence (no line, no file, no
+        #   move); this one is invisible, because a disarmed census and a clean
+        #   one print the same digit.
         if self.args.snapshot_mode != "record":
             if jitstats is None:
                 self.jitstats_absent.append(f"{backend}/{name}")
@@ -1696,6 +1814,10 @@ class Check:
                     f"no committed jit-stats baseline ({jitstats_path.name}) — record it with "
                     f"`pyre/check.py --snapshot --backend {backend}`"
                 )
+            vacuous = _jit_stats_vacuous(stderr)
+            if vacuous:
+                self.jitstats_vacuous.append(f"{backend}/{name}")
+                return "fail", vacuous
             regressions, improvements = _jit_stats_change(
                 jitstats_path.read_text(encoding="utf-8"), jitstats
             )
@@ -2047,6 +2169,21 @@ class Check:
             and float(exec_b) <= EXEC_TIME_FLOOR_S
         )
 
+    def _baseline_exec_time_thin(self, baseline, baseline_time):
+        """Whether a baseline clears the floor but not the floor gate's bar.
+
+        Reporting only: the ceiling accepts any value above
+        `EXEC_TIME_FLOOR_S`, while the floor gate requires
+        `FLOOR_GATE_MIN_BASELINE_S`. Mark ratios in the intervening band so
+        they are not mistaken for values accepted by both directions.
+        """
+        exec_b = self._exec_time(baseline, baseline_time)
+        return (
+            not self.args.no_startup_subtract
+            and exec_b not in (None, "-")
+            and EXEC_TIME_FLOOR_S < float(exec_b) < FLOOR_GATE_MIN_BASELINE_S
+        )
+
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
         baseline_cmd, expected_output, baseline_key, minimum=None,
@@ -2238,7 +2375,17 @@ class Check:
             den = self._exec_time("pypy", pypy_val)
             if den in (None, "-") or float(den) <= 0 or num in (None, "-"):
                 return "-"
-            marker = "~" if self._baseline_exec_time_clamped("pypy", pypy_val) else ""
+            # Display only: neither marker reaches a verdict. `~` says no gate
+            # was applied; `?` says one was, against a baseline under the bar
+            # the floor gate uses. An unmarked ratio now means both directions
+            # of the gate accepted the denominator, which is what a reader has
+            # been entitled to assume all along.
+            if self._baseline_exec_time_clamped("pypy", pypy_val):
+                marker = "~"
+            elif self._baseline_exec_time_thin("pypy", pypy_val):
+                marker = "?"
+            else:
+                marker = ""
             return f"{marker}{float(num) / float(den):.1f}x"
 
         ratio = _ratio(elapsed, t_pypy) if elapsed > 0 else "-"
@@ -2316,20 +2463,36 @@ class Check:
         # baselines still reports each one.
         if backend == "wasm":
             dynasm_elapsed = self.bench_elapsed.get(("dynasm", name))
-            if dynasm_elapsed is None:
+            dynasm_exec = (
+                self._exec_time("dynasm", dynasm_elapsed)
+                if dynasm_elapsed is not None
+                else None
+            )
+            # Both sides of this ratio are measured in this invocation, so the
+            # denominator carries the full startup-subtraction error rather
+            # than a recorded constant's stability. `_baseline_exec_time_clamped`
+            # would only reject one already pinned to EXEC_TIME_FLOOR_S, which
+            # leaves the band up to FLOOR_GATE_MIN_BASELINE_S dividing by
+            # something the same size as its own error.
+            ceiling = wasm_ratio_gate(script) or WASM_MAX_DYNASM_RATIO
+            if ceiling > WASM_MAX_DYNASM_RATIO:
+                self.wasm_ratio_allowed.append((name, ceiling))
+            if dynasm_exec in (None, "-") or (
+                float(dynasm_exec) < FLOOR_GATE_MIN_BASELINE_S
+            ):
                 self.wasm_ratio_ungated.append(name)
-            elif not self._baseline_exec_time_clamped("dynasm", dynasm_elapsed):
+            else:
                 passed, bound, checked_elapsed, checked_baseline, retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
-                        WASM_MAX_DYNASM_RATIO, dynasm_elapsed,
+                        ceiling, dynasm_elapsed,
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
                     )
                 )
                 if not passed:
                     detail = self._gate_fail_detail(
                         backend, "dynasm", checked_elapsed, checked_baseline,
-                        WASM_MAX_DYNASM_RATIO, bound,
+                        ceiling, bound,
                     )
                     suffix = f" ({retry_note})" if retry_note else ""
                     failures.append(
@@ -2574,7 +2737,15 @@ class Check:
         # `N to run,` rather than the runner's own "no regressions": a
         # selection that came out empty prints every counter as zero and
         # still exits 0, which reads as a pass and tests nothing.
-        selected = re.search(r"^(\d+) to run,", output, re.M)
+        #
+        # The default runner gates only modules whose recorded baseline passes.
+        # Report skipped and non-gated counts so this subset is not mistaken
+        # for the full suite.
+        selected = re.search(
+            r"^(\d+) to run, (\d+) skipped(?:, (\d+) not gated \(non-PASS\))?,",
+            output,
+            re.M,
+        )
         if code == 124:
             detail = f"timeout (>{CPYTHON_SUITE_TIMEOUT_S}s)"
         elif selected is None:
@@ -2593,7 +2764,13 @@ class Check:
             self._append_comparison(backend, name, "-", "-", "FAIL")
             return
         self._record(backend, True, name, "")
-        print(f"{green('PASS')}  {selected.group(1)} modules, {elapsed:.0f}s")
+        ran, not_run, degated = (
+            selected.group(1), selected.group(2), selected.group(3) or "0",
+        )
+        print(
+            f"{green('PASS')}  {ran} gated, {degated} not gated, "
+            f"{not_run} skipped, {elapsed:.0f}s"
+        )
         self._append_comparison(backend, name, "-", "-", f"{elapsed:.0f}s")
 
     # ── synthetic parity suite ──
@@ -2731,15 +2908,17 @@ class Check:
                     f"for {len(self.cpython_reference_skips)}: {names}"
                 )
             )
-        # A wasm run with no dynasm run beside it leaves WASM_MAX_DYNASM_RATIO
-        # with nothing to divide by. Said out loud because the per-fixture line
-        # for an unevaluated gate is the same green as a satisfied one.
+        # A wasm run with no usable dynasm denominator beside it leaves
+        # WASM_MAX_DYNASM_RATIO with nothing to divide by. Said out loud
+        # because the per-fixture line for an unevaluated gate is the same
+        # green as a satisfied one.
         if self.wasm_ratio_ungated:
             print(
                 dim(
                     f"wasm/dynasm {WASM_MAX_DYNASM_RATIO:g}x ratio not evaluated for "
                     f"{len(self.wasm_ratio_ungated)} fixture(s): dynasm did not run "
-                    f"them in this invocation"
+                    f"them in this invocation, or its execution-only time stayed "
+                    f"under {FLOOR_GATE_MIN_BASELINE_S * 1000:g}ms"
                 )
             )
         # The same weaker baseline, asked for rather than discovered. Listed
@@ -2782,6 +2961,14 @@ class Check:
                 "  ~ pypy exec clamped to floor; ratio is not a measurement, "
                 "and no ratio gate is applied to it"
             )
+        # Sniffing the rendered cell, like the line above: no other cell value
+        # contains a `?` (they are times, ratios, FAIL/WRONG/UNSTABLE/skip/-).
+        if any("?" in c[b] for c in self.comparisons for b in cols):
+            print(
+                "  ? pypy exec is above the floor but under "
+                "FLOOR_GATE_MIN_BASELINE_S; the ceiling is applied, the floor "
+                "gate declines the same baseline as too small to judge"
+            )
         print("  " + "─" * (54 + 19 * len(cols)))
         for c in self.comparisons:
             row = f"  {c['name']:<35s} {c['cpython']:>8s} {c['pypy']:>8s}"
@@ -2792,6 +2979,18 @@ class Check:
         print()
         self.print_comparison_table()
         print()
+
+        if self.wasm_ratio_allowed:
+            names = ", ".join(
+                f"{name} {ceiling:g}x"
+                for name, ceiling in sorted(set(self.wasm_ratio_allowed))
+            )
+            print(
+                dim(
+                    f"wasm/dynasm ratio raised above {WASM_MAX_DYNASM_RATIO:g}x by "
+                    f"`# pyre-check: max-wasm-ratio` for: {names}"
+                )
+            )
 
         if self.results:
             print("─" * 53)
@@ -2818,6 +3017,7 @@ class Check:
                 (yellow, "jit-stats unstable (not gated)", self.jitstats_unstable),
                 (red, "jit-stats baseline missing", self.jitstats_missing),
                 (red, "jit-stats line absent", self.jitstats_absent),
+                (red, "jit-stats census vacuous", self.jitstats_vacuous),
             ):
                 if benches:
                     print(

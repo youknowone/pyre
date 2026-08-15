@@ -906,7 +906,21 @@ fn writer_writerow_impl(
     let n = row.len();
     let mut rec = rustpython_wtf8::Wtf8Buf::new();
 
-    for (i, &w_field) in row.iter().enumerate() {
+    // Rendering a field runs its `__str__` / `__repr__` and `float_w` its
+    // `__float__`, so every turn is a collection point.  The collected row and
+    // the bound `_write` are native locals no root walker updates, so publish
+    // them and read each field back after the render that precedes its
+    // remaining type queries.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let write_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_filewrite);
+    let row_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &row {
+        pyre_object::gc_roots::pin_root(item);
+    }
+
+    for i in 0..n {
+        let w_field = pyre_object::gc_roots::shadow_stack_get(row_base + i);
         let field = if unsafe { pyre_object::is_none(w_field) } {
             rustpython_wtf8::Wtf8Buf::new()
         } else if unsafe { pyre_object::is_float(w_field) } {
@@ -914,6 +928,7 @@ fn writer_writerow_impl(
         } else {
             unsafe { crate::display::py_str_wtf8(w_field) }?
         };
+        let w_field = pyre_object::gc_roots::shadow_stack_get(row_base + i);
 
         let mut quoted = match cfg.quoting {
             QUOTE_NONNUMERIC => crate::baseobjspace::float_w(w_field).is_err(),
@@ -1013,7 +1028,10 @@ fn writer_writerow_impl(
     }
 
     rec.push_str(&cfg.lineterminator);
-    crate::call::call_function_impl_result(w_filewrite, &[pyre_object::w_str_from_wtf8(rec)])
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(write_slot),
+        &[pyre_object::w_str_from_wtf8(rec)],
+    )
 }
 
 /// `W_Writer.writerows` — serialize a sequence of records.

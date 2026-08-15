@@ -1,3 +1,6 @@
+# pyre-check: max-wasm-ratio=3.6
+# Reported 2.9x here idle and 3.1x here under load, and under the gate on
+# ubuntu-24.04 twice.
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)
 # Ported for pyre: while-loop only, no range/list/enumerate
 

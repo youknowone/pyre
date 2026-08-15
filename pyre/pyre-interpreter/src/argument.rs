@@ -243,7 +243,34 @@ pub fn do_combine_starstarargs_wrapped(
     // present-but-unread per `seen[key] = None` at line 446).
     let mut seen: std::collections::HashMap<rustpython_wtf8::Wtf8Buf, ()> =
         std::collections::HashMap::new();
-    for (i, &w_key) in keys_w.iter().enumerate() {
+    // The per-key value lookup below runs `__getitem__` (or the dict
+    // descriptor, which hashes the key), so every turn is a collection point.
+    // The key list, the mapping, the callable, the names the caller already
+    // accepted and the pairs filled so far are native locals no root walker
+    // updates, so publish the whole set and read each one back on the turn
+    // that uses it.  The two output slices are written from the published
+    // pairs once the loop is done.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_starstararg);
+    pyre_object::gc_roots::pin_root(w_function);
+    let existing_base = pyre_object::gc_roots::shadow_stack_len();
+    let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
+    for &w_name in existingkeywords_w.unwrap_or_default() {
+        pyre_object::gc_roots::pin_root(w_name);
+    }
+    let keys_base = pyre_object::gc_roots::shadow_stack_len();
+    for &key in keys_w {
+        pyre_object::gc_roots::pin_root(key);
+    }
+    let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+    for _ in 0..2 * keys_w.len() {
+        pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+    }
+    let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    for i in 0..keys_w.len() {
+        let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py:431 — `key = space.text_w(w_key)`; raise TypeError
         // if w_key is not a string.  `_PyStack_UnpackDict` reports this
         // without the callable's qualname or the offending key's type, where
@@ -260,17 +287,20 @@ pub fn do_combine_starstarargs_wrapped(
         };
         // argument.py:439-445 — duplicate check against existing kwargs +
         // already-seen names in this iteration.
-        let already_in_existing = existingkeywords_w
-            .map(|existing| contains_w_names(w_key, existing))
-            .unwrap_or(false);
+        let already_in_existing = existing_len != 0 && {
+            let existing_now: Vec<PyObjectRef> = (0..existing_len)
+                .map(|j| pyre_object::gc_roots::shadow_stack_get(existing_base + j))
+                .collect();
+            contains_w_names(w_key, &existing_now)
+        };
         if already_in_existing || seen.contains_key(&key) {
             return Err(raise_type_error(
-                w_function,
+                w_function(),
                 format!("got multiple values for keyword argument '{key}'"),
             ));
         }
         // argument.py:448 — `keyword_names_w[i] = w_key`.
-        keyword_names_w[i] = w_key;
+        pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i, w_key);
         // argument.py:449-457 — value lookup.
         let w_value = if is_dict {
             // argument.py:449-455 — `dict_getitem` direct-storage
@@ -295,7 +325,7 @@ pub fn do_combine_starstarargs_wrapped(
             // `w_dict_getitem_str` returns None is mid-iteration
             // mutation, which `dict.__getitem__` (the descriptor PyPy
             // calls via `dict_getitem`) surfaces as KeyError.
-            let backing = crate::type_methods::resolve_dict_backing(w_starstararg);
+            let backing = crate::type_methods::resolve_dict_backing(w_starstararg());
             let direct = if backing.is_null() {
                 None
             } else {
@@ -307,12 +337,16 @@ pub fn do_combine_starstarargs_wrapped(
             }
         } else {
             // argument.py:457 — `w_value = space.getitem(...)`.
-            crate::baseobjspace::getitem(w_starstararg, w_key)?
+            crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
-        keywords_w[i] = w_value;
+        pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i + 1, w_value);
         // argument.py:446 `seen[key] = None` — record key, value slot
         // is unread.
         seen.insert(key, ());
+    }
+    for i in 0..keys_w.len() {
+        keyword_names_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
+        keywords_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
     }
     Ok(())
 }
@@ -419,16 +453,26 @@ pub fn combine_starstarargs_wrapped(
     w_starstararg: PyObjectRef,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    // Deriving the key list reaches `__getattribute__` and the mapping's own
+    // `keys()`, both of which run Python, and `w_starstararg` is read again
+    // afterwards to fetch each value.  Publish the mapping and the callable so
+    // that later read is of the live object, not the address they had on entry.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_starstararg);
+    pyre_object::gc_roots::pin_root(w_function);
+    let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     // argument.py:109 — fast path via view_as_kwargs.  Both halves of
     // the tuple are `Option`; PyPy's base default is `(None, None)`
     // while the kwargsdict-aware override returns `(Some, Some)`.
-    let (fast_names, fast_values) = crate::baseobjspace::view_as_kwargs(w_starstararg);
+    let (fast_names, fast_values) = crate::baseobjspace::view_as_kwargs(w_starstararg());
     if let Some(names) = fast_names {
         let values = fast_values
             .expect("baseobjspace.py:1159 view_as_kwargs returns matching Some/Some or None/None");
         // argument.py:111-119 — merge with optional duplicate check.
         if !keyword_names_out.is_empty() {
-            check_not_duplicate_kwargs(keyword_names_out, &names, &values, w_function)?;
+            check_not_duplicate_kwargs(keyword_names_out, &names, &values, w_function())?;
         }
         keyword_names_out.extend(names);
         keywords_out.extend(values);
@@ -462,9 +506,9 @@ pub fn combine_starstarargs_wrapped(
     // path, the fallback collapses to dead code.
     let is_dict = unsafe {
         let isinst = if w_dict_type.is_null() {
-            pyre_object::is_dict(w_starstararg)
+            pyre_object::is_dict(w_starstararg())
         } else {
-            crate::baseobjspace::isinstance_w(w_starstararg, w_dict_type)
+            crate::baseobjspace::isinstance_w(w_starstararg(), w_dict_type)
         };
         if !isinst {
             false
@@ -477,8 +521,8 @@ pub fn combine_starstarargs_wrapped(
             // Pyre's `findattr` matches the same shape (Option<W>),
             // modulo async-propagation (still a known gap covered by
             // the `findattr` TODO).
-            let w_obj_type =
-                crate::typedef::r#type(w_starstararg).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+            let w_obj_type = crate::typedef::r#type(w_starstararg())
+                .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
             let lhs = if w_obj_type.is_null() {
                 None
             } else {
@@ -498,18 +542,18 @@ pub fn combine_starstarargs_wrapped(
         }
     };
     let keys_w: Vec<PyObjectRef> = if is_dict {
-        crate::baseobjspace::unpackiterable(w_starstararg, -1)?
+        crate::baseobjspace::unpackiterable(w_starstararg(), -1)?
     } else {
         // argument.py:131-138 — the `try` covers the whole
         // `space.call_method(w_starstararg, "keys")`, so an
         // AttributeError raised either while finding `keys` OR inside
         // the keys() call is converted to the mapping TypeError below.
-        let w_keys_meth = match crate::baseobjspace::getattr_str(w_starstararg, "keys") {
+        let w_keys_meth = match crate::baseobjspace::getattr_str(w_starstararg(), "keys") {
             Ok(m) => m,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                let tp = type_name_of(w_starstararg);
+                let tp = type_name_of(w_starstararg());
                 return Err(raise_type_error(
-                    w_function,
+                    w_function(),
                     format!("argument after ** must be a mapping, not {tp}"),
                 ));
             }
@@ -518,9 +562,9 @@ pub fn combine_starstarargs_wrapped(
         let w_keys = match crate::call::call_function_impl_result(w_keys_meth, &[]) {
             Ok(w) => w,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                let tp = type_name_of(w_starstararg);
+                let tp = type_name_of(w_starstararg());
                 return Err(raise_type_error(
-                    w_function,
+                    w_function(),
                     format!("argument after ** must be a mapping, not {tp}"),
                 ));
             }
@@ -541,12 +585,12 @@ pub fn combine_starstarargs_wrapped(
     };
     do_combine_starstarargs_wrapped(
         &keys_w,
-        w_starstararg,
+        w_starstararg(),
         &mut keyword_names_w,
         &mut keywords_w,
         existing,
         is_dict,
-        w_function,
+        w_function(),
     )?;
     // argument.py:145-150 — merge into the running output buffers.
     keyword_names_out.extend(keyword_names_w);

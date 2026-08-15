@@ -12,9 +12,13 @@ pub mod op_descr;
 pub mod op_info;
 pub mod op_type_index;
 pub mod operand;
+#[cfg(any(test, feature = "jit-audits"))]
+pub mod opref_audit;
 pub mod optimize;
 pub mod ptr_info;
 pub mod rawbuffer;
+#[cfg(any(test, feature = "jit-audits"))]
+pub mod reg_write_audit;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;

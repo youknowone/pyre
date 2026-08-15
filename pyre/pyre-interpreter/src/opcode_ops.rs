@@ -728,11 +728,27 @@ pub fn dict_merge_value(
     w_callable: PyObjectRef,
 ) -> Result<(), PyError> {
     // pyopcode.py:1979 `_dict_merge`.
+    // `__len__`, `keys()`, `__getitem__` and `__contains__` all run Python, so
+    // every step below is a collection point, and the three operands arrive as
+    // native copies no root walker updates — the dispatch peeked them and the
+    // frame slots that rooted them are gone by the time a subclass' `keys()`
+    // returns.  Publish them and read each one back per use: a stale target
+    // reaches `dict.__contains__` as a receiver its own type check rejects,
+    // and a stale source is read as a mapping it no longer is.  `dict_update`
+    // above brackets the same walk.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(dict);
+    pyre_object::gc_roots::pin_root(source);
+    pyre_object::gc_roots::pin_root(w_callable);
+    let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let source = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let w_callable = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
     let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
     // a non-dict target is a RuntimeError, not a TypeError.
-    if !unsafe { crate::baseobjspace::isinstance_w(dict, w_dict_type) } {
-        let type_name = unsafe { (*(*dict).ob_type).name };
+    if !unsafe { crate::baseobjspace::isinstance_w(dict(), w_dict_type) } {
+        let type_name = unsafe { (*(*dict()).ob_type).name };
         return Err(PyError::new(
             crate::PyErrorKind::RuntimeError,
             format!("expected a dict, got {type_name}"),
@@ -740,15 +756,15 @@ pub fn dict_merge_value(
     }
     // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
     // would be UB on a dict subclass whose layout is not `W_DictObject`.
-    let l1 = crate::baseobjspace::len_w(dict)?;
-    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source, w_dict_type) };
+    let l1 = crate::baseobjspace::len_w(dict())?;
+    let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type) };
     if !source_is_dict {
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
         // after ** must be a mapping, not %T")`.
-        if !crate::baseobjspace::ismapping_w(source) {
-            let type_name = unsafe { pyre_object::type_name_of(source) };
+        if !crate::baseobjspace::ismapping_w(source()) {
+            let type_name = unsafe { pyre_object::type_name_of(source()) };
             return Err(crate::argument::raise_type_error(
-                w_callable,
+                w_callable(),
                 format!("argument after ** must be a mapping, not {type_name}"),
             ));
         }
@@ -757,12 +773,24 @@ pub fn dict_merge_value(
         // duplicate check (`update1`); an empty source is a no-op.  The raw
         // items walk is exact-dict only — a dict subclass may override
         // `keys()` / `__getitem__`, so it falls through to the generic loop.
-        let l2 = crate::baseobjspace::len_w(source)?;
-        if l1 == 0 && unsafe { pyre_object::is_dict(source) } {
-            unsafe {
-                for (k, v) in pyre_object::w_dict_items(source) {
-                    pyre_object::w_dict_store(dict, k, v);
-                }
+        let l2 = crate::baseobjspace::len_w(source())?;
+        if l1 == 0 && unsafe { pyre_object::is_dict(source()) } {
+            // A store into the target allocates the storage it grows into, so
+            // the snapshot has to be published too.
+            let items = unsafe { pyre_object::w_dict_items(source()) };
+            let items_base = pyre_object::gc_roots::shadow_stack_len();
+            for &(k, v) in &items {
+                pyre_object::gc_roots::pin_root(k);
+                pyre_object::gc_roots::pin_root(v);
+            }
+            for index in 0..items.len() {
+                unsafe {
+                    pyre_object::w_dict_store(
+                        dict(),
+                        pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
+                        pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
+                    )
+                };
             }
             return Ok(());
         }
@@ -773,25 +801,44 @@ pub fn dict_merge_value(
     // `_dict_merge_loop`: iterate `iter(w_item.keys())`, look each value up
     // with `space.getitem`, reject a key already present in the target with
     // `"%s got multiple values for keyword argument '%S'"`, then store.
-    let keys_method = match crate::baseobjspace::getattr_str(source, "keys") {
+    let keys_method = match crate::baseobjspace::getattr_str(source(), "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = unsafe { (*(*source).ob_type).name };
+            let type_name = unsafe { (*(*source()).ob_type).name };
             return Err(crate::argument::raise_type_error(
-                w_callable,
+                w_callable(),
                 format!("argument after ** must be a mapping, not {type_name}"),
             ));
         }
         Err(e) => return Err(e),
     };
-    let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
-    for key in keys {
-        let val = crate::baseobjspace::getitem(source, key)?;
-        if crate::baseobjspace::contains(dict, key)? {
-            let key_str = unsafe { crate::display::py_str_wtf8(key) }?;
+    let keys_method_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(keys_method);
+    let keys_obj = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(keys_method_slot),
+        &[],
+    )?;
+    let keys_obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(keys_obj);
+    let keys =
+        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
+    let keys_base = pyre_object::gc_roots::shadow_stack_len();
+    for &key in &keys {
+        pyre_object::gc_roots::pin_root(key);
+    }
+    for index in 0..keys.len() {
+        let key = || pyre_object::gc_roots::shadow_stack_get(keys_base + index);
+        let val = crate::baseobjspace::getitem(source(), key())?;
+        // `val` is fresh and `__contains__` runs Python; it needs a root of its
+        // own for that call, released again each turn so the bracket stays
+        // fixed-size.
+        let _iteration_roots = pyre_object::gc_roots::push_roots();
+        let val_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(val);
+        if crate::baseobjspace::contains(dict(), key())? {
+            let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
             return Err(crate::argument::raise_type_error(
-                w_callable,
+                w_callable(),
                 crate::display::wtf8_format!(
                     "got multiple values for keyword argument '",
                     key_str,
@@ -799,7 +846,13 @@ pub fn dict_merge_value(
                 ),
             ));
         }
-        unsafe { pyre_object::w_dict_store(dict, key, val) };
+        unsafe {
+            pyre_object::w_dict_store(
+                dict(),
+                key(),
+                pyre_object::gc_roots::shadow_stack_get(val_slot),
+            )
+        };
     }
     Ok(())
 }

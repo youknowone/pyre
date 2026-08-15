@@ -20770,13 +20770,10 @@ mod tests {
             .find(|fd| fd.item_meta.name_path().ends_with("::__pyre_wrap_random"))
             .expect("_random::__pyre_wrap_random");
         let graph = super::lower_fun_decl(&llbc, fd).expect("lower wrapper");
-        let ops: Vec<_> = graph
+        let receiver = graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
-            .collect();
-        let receiver = ops
-            .iter()
             .find_map(|op| match &op.kind {
                 OpKind::Call {
                     target: CallTarget::Method { name, .. },
@@ -20786,10 +20783,19 @@ mod tests {
                 _ => None,
             })
             .expect("random receiver");
-        let producer = ops
+        // The receiver reaches the `random` call across a block link, which
+        // renames the value: `Variable` equality is object identity, so a flat
+        // scan for an op whose `result` is this variable finds nothing.
+        // `resolve_to_producer_op` walks the links back to the producing op —
+        // the same resolver `extract_fmt_chain` opens with.
+        let (block_id, idx) =
+            super::resolve_to_producer_op(&graph, &receiver).expect("random receiver producer");
+        let producer = &graph
+            .blocks
             .iter()
-            .find(|op| op.result.as_ref().is_some_and(|result| result == &receiver))
-            .expect("random receiver producer");
+            .find(|block| block.id == block_id)
+            .expect("producer block")
+            .operations[idx];
         assert!(matches!(
             &producer.kind,
             OpKind::Call {
@@ -22416,15 +22422,30 @@ mod tests {
         assert_eq!(result.id(), result_id(6));
     }
 
-    /// Anchor [`extract_fmt_chain`] to the real lowered IR of
+    /// Anchor the `format!` collapse to the real lowered IR of
     /// `stack_underflow_error` (= `type_error(format!("stack underflow
-    /// during {context}"))`). Ignored by default (loads the 242MB real
-    /// LLBC); run with `cargo test -p majit-translate --lib
-    /// extract_fmt_chain_matches_real -- --ignored --nocapture`.
+    /// during {context}"))`). Ignored by default (loads the real LLBC); run
+    /// with `cargo test -p majit-translate --lib
+    /// real_stack_underflow_fmt_chain -- --ignored --nocapture`.
+    ///
+    /// This grades the collapse's OUTPUT rather than calling
+    /// [`extract_fmt_chain`] on the returned graph, because that call is not
+    /// reachable here: `collapse_fmt_chains` runs unconditionally inside the
+    /// lowering pipeline and consumes the `alloc::fmt::format` call, so no
+    /// entry point hands back a graph still carrying one. The two facts the
+    /// recognizer's `FmtChain` stated — the literal piece, and one argument
+    /// rendered by `Display` — survive as ops, so they are asserted on the
+    /// ops. [`extract_fmt_chain`] itself is graded on synthetic graphs by
+    /// `extract_fmt_chain_recovers_pieces_and_args_cross_block`.
+    ///
+    /// The expected shape is read from the artefact:
+    /// `stack_underflow_error` lowers to five ops — the `context: Str` input,
+    /// `__str_const("stack underflow during ")`, `str(context)`, their `add`,
+    /// and the `error::PyError::type_error` call. Re-take it from a dump if
+    /// the message text or the template changes.
     #[test]
     #[ignore]
-    fn extract_fmt_chain_matches_real_stack_underflow() {
-        use super::{FmtArgKind, extract_fmt_chain};
+    fn real_stack_underflow_fmt_chain_collapses_to_str_concat() {
         use crate::model::{CallTarget, OpKind};
 
         let path = concat!(
@@ -22434,31 +22455,56 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "stack_underflow_error")
             .expect("lower stack_underflow_error");
-
-        // Find the `alloc::fmt::format(args)` call and extract its arg.
-        let fmt_args = graph
+        let ops: Vec<_> = graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
-            .find_map(|op| match &op.kind {
+            .collect();
+
+        // The chain is consumed: no `alloc::fmt::format` call survives.
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments },
-                    args,
                     ..
-                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => {
-                    args.first().cloned()
-                }
+                } if super::fmt_path_ends_with(segments, &["fmt", "format"])
+            )),
+            "the fmt chain must not residualize as an alloc::fmt::format call"
+        );
+
+        // The template's literal piece became a `__str_const`.
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    == &[
+                        "__str_const".to_string(),
+                        "stack underflow during ".to_string(),
+                    ]
+            )),
+            "expected a __str_const carrying the template's literal piece"
+        );
+
+        // The one Display argument became a native `str` render, concatenated
+        // onto that literal.
+        let render = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::UnaryOp { op: name, .. } if name == "str" => op.result.clone(),
                 _ => None,
             })
-            .expect("alloc::fmt::format call present");
-
-        let chain = extract_fmt_chain(&graph, &fmt_args).expect("recognized real fmt chain");
-        assert_eq!(
-            chain.pieces,
-            vec!["stack underflow during ".to_string(), String::new()]
+            .expect("expected a `str` render of the Display argument");
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op: name, rhs, .. } if name == "add" && rhs == &render
+            )),
+            "the rendered argument must be concatenated onto the literal piece"
         );
-        assert_eq!(chain.args.len(), 1);
-        assert_eq!(chain.args[0].kind, FmtArgKind::Display);
     }
 
     /// Anchor the `Arguments::from_str_nonconst` alias to the real lowered IR
@@ -22838,10 +22884,23 @@ mod tests {
     /// Anchor [`Lowering::fold_size_const_global`] to the real lowered
     /// IR of `function_new_impl` (= reads `FUNCTION_OBJECT_SIZE`, a
     /// `const usize = size_of::<Function>()`).  The global read must fold
-    /// to `Function`'s concrete byte size (144) rather than residualize
-    /// as an unregisterable `FunctionPath` accessor call.  Ignored by
-    /// default (loads the 249MB real LLBC); run with `cargo test -p
-    /// majit-translate --lib fold_size_const_real -- --ignored`.
+    /// to `Function`'s concrete byte size rather than residualize as an
+    /// unregisterable `FunctionPath` accessor call.  Ignored by default
+    /// (loads the real LLBC); run with `cargo test -p majit-translate
+    /// --lib fold_size_const_real -- --ignored`.
+    ///
+    /// The literal is READ from the artefact this fold consumes, not
+    /// computed: `pyre-interpreter.ullbc` carries exactly one layout
+    /// entry for `Function`, `"size":176`, `"align":8`, `"repr_algo":"C"`,
+    /// with 21 `field_offsets` running `[0,16,24,…,168]`.  A source census
+    /// of `struct Function` reads the same 21 fields, and `168 + 8` is the
+    /// same 176.  Because there is a single entry, `select_target_layout`
+    /// resolves it through its sole-entry fallback even when `TARGET` is
+    /// unset, so a declining fold cannot be the reason this reds — the
+    /// second assertion below is what catches that case.
+    ///
+    /// Re-take the literal from the artefact's `layout` entry whenever
+    /// `Function` changes.
     #[test]
     #[ignore]
     fn fold_size_const_real_function_object_size() {
@@ -22864,8 +22923,8 @@ mod tests {
 
         // The `size_of::<Function>()` const read folded to its byte size.
         assert!(
-            ops.iter().any(|k| matches!(k, OpKind::ConstInt(144))),
-            "expected a ConstInt(144) for the folded FUNCTION_OBJECT_SIZE"
+            ops.iter().any(|k| matches!(k, OpKind::ConstInt(176))),
+            "expected a ConstInt(176) for the folded FUNCTION_OBJECT_SIZE"
         );
         // No residual accessor call to the const remains.
         let residual = ops.iter().any(|k| {

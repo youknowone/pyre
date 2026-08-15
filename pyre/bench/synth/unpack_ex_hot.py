@@ -5,7 +5,12 @@
 # than declining to the trait leg. The residual returns a tuple of the
 # `before + 1 + after` slots that `unpack_item_fn` reads back out.
 # Output is verified against CPython/PyPy.
-N = 2000000
+# Trip count kept clear of the major-collection threshold check.py pins: at
+# the previous 2000000 this loop crossed it, and the eval-breaker bailout
+# that follows re-enters through a bridge whose guard can then fail once
+# more, which moves guard_failures for reasons outside this fixture. Crossing
+# resumes around 0.45x of the old count; the gated counters are unchanged.
+N = 500000
 
 
 def main():

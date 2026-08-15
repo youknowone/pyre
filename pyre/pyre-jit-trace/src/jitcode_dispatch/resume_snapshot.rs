@@ -109,7 +109,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
 /// and panic.  A callee frame is non-standard whether reached by an
 /// inline sub-walk or compiled as its own Finish portal (via
 /// call_user_function_with_eval); the production main frame IS the
-/// standard virtualizable, so the check short-circuits at Step 1 and
+/// standard virtualizable, so *that* check short-circuits at Step 1 and
 /// emits nothing — gate on a full-body walk being active so this is a
 /// no-op (one cheap `num_guards` read) outside it.  The non-standard
 /// fact is cached per box
@@ -138,20 +138,21 @@ pub(crate) fn walker_capture_inline_nonstandard_vable_guard<Sym: WalkSym>(
     guards_before: usize,
     write: Option<majit_metainterp::VableEntryWrite>,
 ) -> Result<(), DispatchError> {
-    // The non-standard virtualizable's internal promote GuardValue is
-    // emitted only inside a full-body walk against a callee frame that is
-    // not the production standard virtualizable: either an inline sub-walk's
-    // callee heap frame, or a callee compiled as its own Finish portal
-    // (reached via call_user_function_with_eval). Outside a full-body walk
-    // the frame is always the standard virtualizable and emits no such
-    // guard.
+    // The non-standard virtualizable's `_nonstandard_virtualizable` promote
+    // GuardValue is emitted inside a full-body walk against a callee frame
+    // that is not the production standard virtualizable: either an inline
+    // sub-walk's callee heap frame, or a callee compiled as its own Finish
+    // portal (reached via call_user_function_with_eval).
     if ctx.fbw_mode.snapshot_sym.is_null() {
         return Ok(());
     }
     if ctx.trace_ctx.num_guards() <= guards_before {
-        // Standard virtualizable (the production main frame): the
-        // `_nonstandard_virtualizable` check short-circuited and emitted no
-        // guard, so there is nothing to capture.
+        // No guard was recorded by the call this wraps, so there is nothing
+        // to capture.
+        //
+        // Test the observed count rather than the virtualizable kind: the
+        // standard path may also emit a guard when promoting a non-constant
+        // array index.
         return Ok(());
     }
     let restored = write.and_then(|w| {

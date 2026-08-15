@@ -528,6 +528,9 @@ use crate::optimizeopt::info::PtrInfoExt;
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
+    /// Once the output buffer is drained, PtrInfo guard positions stamped
+    /// against the old buffer no longer name operations in this context.
+    new_operations_drained: bool,
     /// O(1) `OpRef → OpRc` index mirroring `new_operations`, keyed by each
     /// op's result position. `find_producer_op`'s highest-priority lookup
     /// otherwise scans `new_operations` with `iter().rfind(...)`, which is
@@ -677,7 +680,7 @@ pub struct OptContext {
     pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
-    pub can_replace_guards: bool,
+    can_replace_guards: bool,
     /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
     /// Used by unroll to attach resume data to extra guards from short preamble.
     pub patchguardop: Option<Op>,
@@ -688,6 +691,16 @@ pub struct OptContext {
     /// RPython unroll.py relies on this distinction so virtualize can keep
     /// body-side allocations concrete when guard recovery cannot rebuild them.
     pub skip_flush_mode: bool,
+    /// Bridge mode from `optimizer.building_bridge` (unroll.py:183-236
+    /// `optimize_bridge`).
+    ///
+    /// A bridge's inputargs are rebuilt from the deadframe frame-first, so the
+    /// virtualizable identity sits at slot 0 whatever the front end's own
+    /// layout says. `inputarg_base` cannot carry that distinction: Phase 2
+    /// shifts the base as well (`unroll.rs` `phase2_inputarg_base`), so a
+    /// consumer keying on `inputarg_base != 0` treats an unrolled loop body as
+    /// a bridge. This flag is the discriminator; the base is the namespace.
+    pub building_bridge: bool,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -1660,6 +1673,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(
                 estimated_ops,
                 Default::default(),
@@ -1691,6 +1705,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -2282,6 +2297,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
+            new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(
                 estimated_ops,
                 Default::default(),
@@ -2313,6 +2329,7 @@ impl OptContext {
             patchguardop: None,
             preamble_end_args: None,
             skip_flush_mode: false,
+            building_bridge: false,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -4523,10 +4540,18 @@ impl OptContext {
     /// stored `last_guard_pos`, or `None` when the slot is `-1` (no guard
     /// recorded) or the operand has no PtrInfo.
     pub fn get_last_guard(&self, op: &Operand) -> Option<&Op> {
+        if self.new_operations_drained {
+            return None;
+        }
         // info.py:100-103: read last_guard_pos from terminal PtrInfo.
         let resolved = op.get_box_replacement(false);
         let pos = resolved.ptr_info().and_then(|p| p.get_last_guard_pos())?;
-        self.new_operations.get(pos).map(|rc| rc.as_ref())
+        let op = self.new_operations.get(pos).map(|rc| rc.as_ref())?;
+        debug_assert!(
+            op.opcode.is_guard(),
+            "info.py:118 last_guard_pos must denote a guard"
+        );
+        Some(op)
     }
 
     /// resoperation.py:57-68 get_box_replacement: follow the forwarding
@@ -5098,6 +5123,9 @@ impl OptContext {
     /// `info.py:91-103 PtrInfo.get_last_guard_pos` operand-direct reader.
     /// Walks chain to terminal and reads its `_forwarded` PtrInfo slot.
     pub fn last_guard_pos(&self, op: &Operand) -> Option<usize> {
+        if self.new_operations_drained {
+            return None;
+        }
         op.get_box_replacement(false)
             .ptr_info()
             .and_then(|p| p.get_last_guard_pos())
@@ -6299,6 +6327,44 @@ impl OptContext {
         // separate section after vable_array. opencoder.py:767
         // create_top_snapshot writes both arrays into the snapshot.
         snapshot.vref_array = vref_oprefs;
+
+        // Compare every snapshot cell's carried type with the type encoded by
+        // its `OpRef` variant. `None` is an unclassified producer rather than
+        // agreement. This complements the variant audit because `OpRef::ty()`
+        // deliberately collapses variants within one type bank.
+        #[cfg(feature = "jit-audits")]
+        if majit_ir::opref_audit::enabled() {
+            let mut agree = 0usize;
+            let mut disagree = 0usize;
+            let mut untyped = 0usize;
+            let cells = snapshot
+                .framestack
+                .iter()
+                .flat_map(|frame| frame.boxes.iter())
+                .chain(snapshot.vable_array.iter())
+                .chain(snapshot.vref_array.iter());
+            for cell in cells {
+                let encoded = cell.opref.ty();
+                match cell.tp {
+                    None => untyped += 1,
+                    Some(tp) if Some(tp) == encoded => agree += 1,
+                    Some(tp) => {
+                        disagree += 1;
+                        eprintln!(
+                            "[snapbox-tp] DISAGREE opref={:?} tp={:?} ty={:?}",
+                            cell.opref, tp, encoded
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "[snapbox-tp] cells={} agree={} disagree={} untyped={}",
+                agree + disagree + untyped,
+                agree,
+                disagree,
+                untyped
+            );
+        }
 
         if crate::callee_rca_enabled() {
             let env = OptBoxEnv { ctx: self };
@@ -8533,13 +8599,20 @@ impl OptContext {
     /// compile.ResumeAtPositionDescr).
     /// guard_pos is a _newoperations index (info.py:100-103).
     pub fn is_resume_at_position_guard(&self, guard_pos: i32) -> bool {
-        if guard_pos < 0 {
+        if self.new_operations_drained || guard_pos < 0 {
             return false;
         }
         self.new_operations
             .get(guard_pos as usize)
             .and_then(|op| op.getdescr())
             .is_some_and(|descr| descr.is_resume_at_position())
+    }
+
+    /// Drain the emitted-operation buffer and invalidate every PtrInfo guard
+    /// position that named the old buffer.
+    pub(crate) fn take_new_operations(&mut self) -> Vec<majit_ir::OpRc> {
+        self.new_operations_drained = true;
+        std::mem::take(&mut self.new_operations)
     }
 
     /// Take ownership of PtrInfo, replacing with None.
@@ -9294,6 +9367,22 @@ mod boxref_forwarding_tests {
             ctx.peek_ptr_info(&b).and_then(|i| i.get_last_guard_pos()),
             Some(5)
         );
+    }
+
+    #[test]
+    fn drained_operations_invalidate_recorded_guard_positions() {
+        let (mut ctx, b) = ctx_with_one_ref_box();
+        let guard = std::rc::Rc::new(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&b)));
+        ctx.push_new_operation(guard);
+        ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: 0 });
+        assert!(ctx.get_last_guard(&b).is_some());
+
+        let _old_operations = ctx.take_new_operations();
+        ctx.push_new_operation(std::rc::Rc::new(Op::new(OpCode::IntAdd, &[])));
+
+        assert!(ctx.get_last_guard(&b).is_none());
+        assert!(ctx.last_guard_pos(&b).is_none());
+        assert!(!ctx.is_resume_at_position_guard(0));
     }
 
     #[test]

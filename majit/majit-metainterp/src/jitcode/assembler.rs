@@ -3407,6 +3407,12 @@ impl JitCodeBuilder {
         );
     }
 
+    /// Emit a void residual call whose `void_word_abi` flag retains an ignored
+    /// machine-word result. `descr.py:647` gives `lltype.Void` descriptors
+    /// `result_size = 0`, so it has no counterpart for a semantically void
+    /// helper that physically returns a word. `pyre-jit/src/jit/codewriter.rs:5828-5836`
+    /// (`CodeWriter::intern_call_descr_stub`) sets it for
+    /// `PyreHelperKind::ListAppendValue`.
     pub fn residual_call_void_canonical_via_target_with_effect_info_and_word_abi(
         &mut self,
         fn_ptr_idx: u16,

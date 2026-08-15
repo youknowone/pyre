@@ -646,9 +646,58 @@ fn clone_bridge_ops_preserving_value(bridge_ops: &[majit_ir::Op]) -> Vec<majit_i
         .collect()
 }
 
+#[cfg(feature = "jit-audits")]
+thread_local! {
+    /// Scope key for the `translate_trace_iter` OpRef-variant audit: one value
+    /// per `prepare_bridge_trace_for_optimizer` call, never reused.
+    ///
+    /// A generation counter keeps separate bridge preparations apart without
+    /// depending on allocation addresses that may be reused.
+    static AUDIT_PREPARE_GENERATION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Open a new audit scope, one per bridge preparation.
+///
+/// Bump once per preparation, not per operand; otherwise every note would have
+/// a unique scope and collisions would become unrepresentable.
+///
+/// Wrapping is unreachable at one increment per compiled bridge and is spelled
+/// explicitly so the counter can never abort a debug build from an audit path.
+#[cfg(feature = "jit-audits")]
+fn next_audit_prepare_generation() {
+    AUDIT_PREPARE_GENERATION.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// The scope opened by the most recent `prepare_bridge_trace_for_optimizer` on
+/// this thread; 0 before any has run.
+///
+/// Private translation helpers call this only within
+/// `prepare_bridge_trace_for_optimizer`, after opening a generation.
+#[cfg(feature = "jit-audits")]
+fn audit_prepare_generation() -> usize {
+    AUDIT_PREPARE_GENERATION.with(std::cell::Cell::get)
+}
+
 fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<majit_ir::operand::Operand>]) -> OpRef {
     if opref.is_none() || opref.is_constant() {
         return opref;
+    }
+    // Record which variants claim each SLOT of this cache — the query below
+    // and, once resolved, the operand the slot actually holds. Both are noted
+    // under `opref.raw()`, the slot, not under their own raws: they carry
+    // different raws by construction (`InputArgInt(0)` lands on a slot filled
+    // for `InputArgRef(4824)`), so keying each by its own raw files them
+    // apart and compares nothing.
+    //
+    // This is wider than the bank compare below, which fires only when the
+    // two banks disagree on `ty()`; `InputArgInt(n)` against `IntOp(n)` is the
+    // same `ty()` and passes it silently. The per-preparation generation
+    // scopes the keys to one bridge, so two bridges reusing a position are not
+    // a collision.
+    #[cfg(feature = "jit-audits")]
+    {
+        let audit_scope = audit_prepare_generation();
+        majit_ir::opref_audit::note_key("translate_trace_iter", audit_scope, opref.raw(), opref);
     }
     // opencoder.py:286-289 `_get(self, i)` parity — `assert _cache[i] is
     // not None`. The bridge fresh-iterator
@@ -732,6 +781,12 @@ fn prepare_bridge_trace_for_optimizer(
     runtime_boxes: Vec<OpRef>,
     bridge_inputarg_base: u32,
 ) -> PreparedBridgeTrace {
+    // Open this bridge's audit scope before anything reads it. Every caller of
+    // `translate_trace_iter_opref` and `translate_trace_iter_box_map` is below
+    // this line, so the keys they file all carry this call's generation and no
+    // two preparations share one.
+    #[cfg(feature = "jit-audits")]
+    next_audit_prepare_generation();
     // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
     // RPython allocates fresh InputArg / ResOperation objects before
     // optimize_bridge() consumes the trace; majit's analogue is a fresh
@@ -1538,6 +1593,9 @@ pub struct MetaInterp<M: Clone> {
     /// guard failure DeadFrame. Saved by start_retrace_from_guard, used
     /// by compile_bridge for cls_of_box during deserialize_optimizer_knowledge.
     pending_frontend_boxes: Option<Vec<i64>>,
+    /// Types parallel to `pending_frontend_boxes`, used to forward only Ref
+    /// slots while the bridge trace and compile are active.
+    pending_frontend_box_types: Option<Vec<Type>>,
     /// `optimizer.cpu` (model.py:39 `AbstractCPU`) backref.  Hosts
     /// `cls_of_box(box)` (model.py:199-201) and, going forward, the
     /// rest of the AbstractCPU surface (`bh_*` runtime calls, GC type
@@ -2145,6 +2203,18 @@ impl<M: Clone> MetaInterp<M> {
                 // positions (ResOp / InputArg refs) carry no inline ref.
                 if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
                     visitor(gcref);
+                }
+            }
+        }
+        if let (Some(values), Some(types)) = (
+            self.pending_frontend_boxes.as_mut(),
+            self.pending_frontend_box_types.as_deref(),
+        ) {
+            for (value, ty) in values.iter_mut().zip(types.iter()) {
+                if *ty == Type::Ref && *value != 0 {
+                    let mut gcref = GcRef(*value as usize);
+                    visitor(&mut gcref);
+                    *value = gcref.0 as i64;
                 }
             }
         }
@@ -2950,6 +3020,7 @@ impl<M: Clone> MetaInterp<M> {
             declined_bridge_guards: std::collections::HashSet::new(),
             pending_preamble_tokens: indexmap::IndexMap::new(),
             pending_frontend_boxes: None,
+            pending_frontend_box_types: None,
             cpu: crate::cpu::default_cpu(),
             issubclass: Some(default_issubclass),
             staticdata: std::sync::Arc::new(MetaInterpStaticData::new()),
@@ -6309,7 +6380,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         unroll_opt.retraced_count = prior_retraced_count_early;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
@@ -6580,8 +6651,8 @@ impl<M: Clone> MetaInterp<M> {
         // cpu.vector_ext and cpu.vector_ext.is_enabled()`. No pyre jitdriver
         // declares vectorize=True, so `jitdriver_sd.vec` is false and the
         // gate reduces to `warmstate.vec_all`; `vector_register_size()` is
-        // `cpu.vector_ext` collapsed to a byte width (0 ⇒ absent/disabled,
-        // non-zero ⇒ is_enabled()). The unroll-free retry is the simple-loop
+        // `cpu.vector_ext` collapsed to a byte width (0 means absent/disabled,
+        // non-zero means is_enabled()). The unroll-free retry is the simple-loop
         // path (compile.py:233 compile_simple_loop), which is not vectorized.
         let optimized_ops = {
             let driver_vec = false; // jitdriver_sd.vec
@@ -7437,6 +7508,7 @@ impl<M: Clone> MetaInterp<M> {
         // trip the bridgeopt.py:126 `len(frontend_boxes) == len(liveboxes)`
         // assertion against the entry bridge's own inputargs.
         self.pending_frontend_boxes = None;
+        self.pending_frontend_box_types = None;
         self.compile_trace_inner(
             green_key,
             finish_args,
@@ -7983,7 +8055,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        unroll_opt.target_tokens = prior_front_target_tokens.clone();
+        unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `compile.py:797-811` — a retrace grown from a guard failure is
         // installed under the source guard's own loop token, so a close onto
         // one of that token's target tokens stays inside a single live code
@@ -9200,6 +9272,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&inputargs);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
@@ -12111,6 +12185,8 @@ impl<M: Clone> MetaInterp<M> {
         // profiler.start_backend() ... try: do_compile_loop ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         let compile_start = Instant::now();
+        forget_optimization_info(&optimized_ops);
+        forget_optimization_info(&entry_inputargs);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -13157,6 +13233,9 @@ impl<M: Clone> MetaInterp<M> {
         // bridgeopt.py:124 frontend_boxes come directly from the guard
         // failure values in fail_arg_types order.
         self.pending_frontend_boxes = Some(fail_values.to_vec());
+        self.pending_frontend_box_types = descr_arc
+            .as_fail_descr()
+            .map(|fd| fd.fail_arg_types().to_vec());
         let _compiled = match self.compiled_loops.get(&green_key) {
             Some(c) => c,
             None => {
