@@ -15426,7 +15426,12 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             {
                 #[cfg(not(feature = "sandbox"))]
                 if crt_call!(libc::lseek(fd, 0, libc::SEEK_END)) < 0 {
-                    return Err(fd_errno_err(crt_errno()));
+                    // A pipe has no end to seek to, and opening one for append
+                    // is legal; only a real seek failure is an error.
+                    let errno = crt_errno();
+                    if errno != libc::ESPIPE {
+                        return Err(fd_errno_err(errno));
+                    }
                 }
                 #[cfg(feature = "sandbox")]
                 crate::host_seam::ops::lseek(fd, 0, libc::SEEK_END)
@@ -16291,15 +16296,26 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             #[cfg(not(feature = "sandbox"))]
-            let n = {
+            let n = loop {
                 // `count` is `size_t` on Unix but `c_uint` on Windows.
                 let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
                     libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _)
                 });
-                if n < 0 {
-                    return Err(fd_io_err(std::io::Error::from_raw_os_error(errno)));
+                if n >= 0 {
+                    break n as i64;
                 }
-                n as i64
+                // `interp_fileio.py:433-442` `write_w`: a non-blocking fd that
+                // accepted nothing reports "not now" as None, which is what
+                // `BufferedWriter._raw_write` turns into a BlockingIOError
+                // carrying the count actually written.
+                if errno == libc::EAGAIN {
+                    return Ok(w_none());
+                }
+                // The same lines wrap `os.write` in `eintr_retry=True`: a write
+                // cut short by a signal runs the handler and is re-issued, so
+                // the interruption surfaces as whatever the handler raised
+                // rather than as `InterruptedError`.
+                eintr_retry(std::io::Error::from_raw_os_error(errno))?;
             };
             #[cfg(feature = "sandbox")]
             let n = crate::host_seam::ops::write(fd, &bytes)

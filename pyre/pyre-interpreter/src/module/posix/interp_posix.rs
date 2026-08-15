@@ -2336,13 +2336,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-                        libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _)
-                    });
-                    if ret < 0 {
-                        return Err(errno_err(errno, ""));
+                    // interp_posix.py:375-385 `write`: the syscall sits inside
+                    // the `eintr_retry=True` loop, so an interrupted write runs
+                    // the pending signal handlers and is re-issued rather than
+                    // surfacing as `InterruptedError`.  The blocking guard is
+                    // scoped to the syscall alone: `checksignals` runs Python.
+                    loop {
+                        let (ret, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::write(
+                                    fd,
+                                    data.as_ptr() as *const libc::c_void,
+                                    data.len() as _,
+                                )
+                            });
+                        if ret >= 0 {
+                            break ret as i64;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(errno),
+                            |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
+                        )?;
                     }
-                    ret as i64
                 };
                 #[cfg(feature = "sandbox")]
                 let ret = crate::host_seam::ops::write(fd, &data)
