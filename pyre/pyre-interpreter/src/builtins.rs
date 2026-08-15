@@ -4006,6 +4006,31 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         (args, None, None, None, false)
     };
 
+    // The values to print need the same treatment as the sink below, and they
+    // need it first: `resolve_default_print_target` reaches `sys.stdout`
+    // through the module dict, and every `emit` runs the argument's own
+    // `__str__` / `__repr__`.  `positional` is the caller's native slice and
+    // `sep` / `end` are native locals, so all of them name pre-collection
+    // addresses from the first of those calls onwards.
+    let arg_roots = pyre_object::gc_roots::push_roots();
+    let args_base = arg_roots.base();
+    for &arg in positional {
+        arg_roots.pin_root(arg);
+    }
+    let nargs = positional.len();
+    // `base()` is the bracket's fixed save point, so the two slots that follow
+    // the arguments are read off the live top instead.
+    let sep = sep.map(|s| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        arg_roots.pin_root(s);
+        slot
+    });
+    let end = end.map(|e| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        arg_roots.pin_root(e);
+        slot
+    });
+
     // With no explicit `file` (absent or `file=None`), the sink is the live
     // `sys.stdout`, resolved per call so a Python-level rebinding redirects
     // `print()`.  The unmodified default keeps the native path (`file = None`).
@@ -4092,17 +4117,19 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
         Ok(())
     };
-    for (i, &obj) in positional.iter().enumerate() {
+    for i in 0..nargs {
         if i > 0 {
             match sep {
-                Some(s) => emit(s)?,
+                Some(slot) => emit(arg_roots.get(slot))?,
                 None => emit_literal(" ")?,
             }
         }
-        emit(obj)?;
+        // Read the value only here: the emits before it ran Python, and the
+        // rooted slot is what a move under them updated.
+        emit(arg_roots.get(args_base + i))?;
     }
     match end {
-        Some(e) => emit(e)?,
+        Some(slot) => emit(arg_roots.get(slot))?,
         None => emit_literal("\n")?,
     }
     if flush {
