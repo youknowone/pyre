@@ -2520,9 +2520,18 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         // descent back and let the ordinary residual call run, the same way
         // the orthodox `w_list_append` descent does.  A descent that already
         // applied an effect cannot be rewound this way, so it keeps the abort.
+        // The `unjournaled` requirement is an all-clear walk, not a
+        // same-as-before walk: a walk that already carries an unjournaled
+        // effect can no longer flush a `CloseLoop` end at all, so continuing
+        // past the rolled back call strands the recorded tail of the loop
+        // body when the close is declined and the FOR_ITER delivery refusal
+        // drops the consumed iteration.  Propagating instead hands the abort
+        // to the frame latch, which resumes forward at this opcode losing
+        // nothing.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
             if fbw_executed_effect_count() == effects_before
-                && fbw_has_unjournaled_effect() == unjournaled_before =>
+                && !unjournaled_before
+                && !fbw_has_unjournaled_effect() =>
         {
             if fbw_inline_diag_enabled() {
                 eprintln!(
