@@ -6951,6 +6951,8 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
         }
     }
 
+    let descent_journal_before = fbw_store_journal_len();
+    let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let ((callee_outcome, _callee_end_pc), callee_class_of_last_exc_is_const) = {
         let mut sub_wc = WalkContext {
             callee_shadow: None,
@@ -7012,7 +7014,25 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
             }
         }
-        let (outcome, end_pc) = walk(sub_body.code, 0, &mut sub_wc)?;
+        let (outcome, end_pc) = match walk(sub_body.code, 0, &mut sub_wc) {
+            Ok(pair) => pair,
+            Err(error) => {
+                // The error carries a pc in THIS sub-jitcode, and the enclosing
+                // frame resumes at its own CALL instead.  That resume re-enters
+                // the descent, so whether it can re-apply something already
+                // applied is a question about this frame's effect delta —
+                // report it, the way the abort channel already reports every
+                // decline.
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",
+                        fbw_store_journal_len() as i64 - descent_journal_before as i64,
+                        fbw_has_unjournaled_effect() != descent_unjournaled_before,
+                    );
+                }
+                return Err(error);
+            }
+        };
         (
             (outcome, end_pc),
             sub_wc.fbw_mode.class_of_last_exc_is_const,
