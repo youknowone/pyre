@@ -6,7 +6,8 @@ use super::*;
 /// struct.  `descr.py:218-239 get_field_descr` derives both from `FIELDTYPE`,
 /// but the macro sees only the field's name at the access site, so a sub-word
 /// integer field has to be named in `int_fields` to be registered as one.
-/// Anything undeclared keeps the machine-word default.
+/// Anything undeclared keeps the machine-word default — and has to be eight
+/// bytes wide to keep it, which the returned witness enforces.
 pub(super) fn field_scalar_tokens(
     config: &LowererConfig,
     key: &str,
@@ -42,10 +43,53 @@ pub(super) fn field_scalar_tokens(
         // `scalar_size`'s own default for a non-`Ref` field: the `i64` storage,
         // which is 8 on every target and NOT the machine word (a `usize` here
         // would report 4 on wasm32).
+        //
+        // That default is a CLAIM about the field — eight bytes — and it used to
+        // be the one claim here that carried no witness.  The declared arm above
+        // cannot drift from the struct; the undeclared arm could say eight bytes
+        // about a `u32` and register a descr four bytes too wide, with the
+        // sub-word range a declaration exists to buy silently gone.  Omission is
+        // the dangerous direction precisely because it is spelled as nothing at
+        // all, so the default witnesses itself too.
+        //
+        // WIDTH, not type identity, because width is what the claim is about.
+        // The storage this registers is reached as a raw eight-byte word, and a
+        // `#[repr(transparent)]` newtype over `i64` — a tagged value word is the
+        // usual one — is exactly that word.  Demanding the field spell `i64`
+        // would reject those for no defect.  What stays uncheckable either way
+        // is the sign, which no Rust type-level test can recover from a field
+        // the macro only knows by name.
         None => (
             quote! { ::core::mem::size_of::<i64>() },
             quote! { true },
-            ref_field_witness_tokens(&config.ref_fields, key, struct_path, member),
+            match ref_field_witness_tokens(&config.ref_fields, key, struct_path, member) {
+                // A ref field is a pointer word and carries its own witness.
+                witness if !witness.is_empty() => witness,
+                _ => {
+                    let message = format!(
+                        "`{key}` is not the eight-byte scalar an undeclared field is \
+                         registered as. Name its Rust integer type in `int_fields`, or its \
+                         pointee in `ref_fields` / its element type in `array_fields`, so \
+                         the emitted descr reports the field's own width instead of this \
+                         default.",
+                    );
+                    quote! {
+                        const _: () = {
+                            // Names the field's type without spelling it, which
+                            // is the only handle available here: the macro sees
+                            // the member, not its declaration.
+                            const fn __field_width<T>(_: fn(&#struct_path) -> T) -> usize {
+                                ::core::mem::size_of::<T>()
+                            }
+                            assert!(
+                                __field_width(|__s: &#struct_path| __s.#member)
+                                    == ::core::mem::size_of::<i64>(),
+                                #message,
+                            );
+                        };
+                    }
+                }
+            },
         ),
     }
 }

@@ -82,13 +82,40 @@ impl<'c> Lowerer<'c> {
                 layouts.push((path, Vec::new()));
                 &mut layouts.last_mut().unwrap().1
             };
-            let is_ref = config.ref_fields.contains_key(&key);
             // Same declared width the getfield/setfield lowering registers, so
             // this write-EI rebuild mints the field descr the reads resolve to
             // rather than a machine-word twin of it.
+            //
+            // A pointer field stays a pointer field whichever map declares it.
+            // `ref_fields` names the pointee of a single-object link; an array
+            // declaration names the element type of a buffer the field points
+            // at.  Both read back through `getfield_gc_r`, and the array base's
+            // own layout registration describes the field as a pointer word.
+            // Asking only `ref_fields` here therefore describes the SAME member
+            // as an eight-byte signed integer at a second producer, and
+            // `get_field_descr` resolves that disagreement by keeping whichever
+            // producer reached its `(struct, fieldname)` slot first — so the
+            // read's descr and the write set's are the same object only by
+            // registration order.
             let member = syn::Member::Named(field.clone());
-            let (__fsize, __fsigned, __fcheck) =
-                super::lower_vable::field_scalar_tokens(config, &key, path, &member);
+            let (is_ref, __fsize, __fsigned, __fcheck) = match config.array_fields.get(&key) {
+                Some((_, _, element_path)) => (
+                    true,
+                    quote! { ::core::mem::size_of::<usize>() },
+                    quote! { false },
+                    // The array base's witness, for the same reason it gives:
+                    // naming the pointee accepts `*const T` as well as `*mut T`.
+                    quote! {
+                        const _: fn(&#path) -> #element_path =
+                            |__s| unsafe { *__s.#field };
+                    },
+                ),
+                None => {
+                    let (size, signed, check) =
+                        super::lower_vable::field_scalar_tokens(config, &key, path, &member);
+                    (config.ref_fields.contains_key(&key), size, signed, check)
+                }
+            };
             fields.push(quote! {
                 {
                     #__fcheck
