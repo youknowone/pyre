@@ -4402,7 +4402,9 @@ impl<S: JitState> JitDriver<S> {
         // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
         // the resolved token onward for the same reason). Identity for every
         // unchained bucket, so the collision-free path is unchanged.
-        let green_key = self.meta.resolve_cell_key(green_key_hash, structured_green_key);
+        let green_key = self
+            .meta
+            .resolve_cell_key(green_key_hash, structured_green_key);
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         if !state.can_trace() {

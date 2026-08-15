@@ -594,13 +594,13 @@ fn main() {
 ///
 /// | n | site |
 /// |---|------|
-/// | 2 | `CounterState::extract_live_into` — the `Vec<i64>` the macro's `extract_live` returns, and its one regrowth |
+/// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `extract_live_values`'s default (`jit_state.rs:186-187`) calls it and then `live_value_types`, whose default (`jit_state.rs:194`) calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
 /// | 1 | `JitState::extract_live_values` default body, `jit_state.rs:190` — the `Vec<Value>` it collects into |
 /// | 1 | `JitState::live_value_types` default body, `jit_state.rs:194` — the `Vec<Type>` it collects into |
 /// | 1 | `<[Type]>::to_vec` — `descr.fail_arg_types().to_vec()` |
 /// | 1 | `<[Value]>::to_vec` — the FINISH values copied out of the run result |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key`, `pyjitpl.rs:10547` — `values` |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key`, `pyjitpl.rs:10548` — `typed_values` |
+/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key` — `values` (the run result's own output vector; find it by symbol, the line drifts) |
+/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key` — `typed_values` (ditto) |
 ///
 /// ⚠ THE FIRST FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
 /// entry path in general. `codegen_state.rs:1731` emits the non-allocating

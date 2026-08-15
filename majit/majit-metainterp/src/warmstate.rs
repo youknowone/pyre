@@ -721,11 +721,8 @@ impl WarmEnterState {
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
-            if self.should_start_dont_trace_here_trace(
-                cell_key,
-                flags,
-                has_seen_a_procedure_token,
-            ) {
+            if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
+            {
                 return self.start_tracing_cell(cell_key);
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
@@ -1816,10 +1813,8 @@ impl WarmEnterState {
             return false;
         }
         crate::mc_diag_bump(25);
-        self.counter.tick(
-            self.bucket_of(cell_key),
-            self.increment_function_threshold,
-        )
+        self.counter
+            .tick(self.bucket_of(cell_key), self.increment_function_threshold)
     }
 
     /// Check if inlining is allowed at the given depth.
