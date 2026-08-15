@@ -683,6 +683,7 @@ pub fn install_builtin_modules() {
         #[cfg(unix)]
         pyre_install_module!(syslog);
         pyre_install_module!(select);
+        #[cfg(unix)]
         pyre_install_module!(termios);
         pyre_install_module!(_socket);
         #[cfg(not(target_arch = "wasm32"))]
