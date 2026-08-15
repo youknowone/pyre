@@ -512,6 +512,11 @@ impl CodeWriter {
                 || stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var),
             );
         }
+        // rstr.py `StringRepr.convert_const` resolves string literals into
+        // prebuilt `Ptr(STR)` constants before the codewriter sees the
+        // graph. Fold the synthetic `__str_const` calls the front lowers
+        // literals to, so jtransform sees a constant rather than a call.
+        crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph_owned);
         let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =

@@ -16,16 +16,16 @@
 //! performs the lltype materialization, keeping low-level pointers out of
 //! the model graph.
 //!
-//! # Deliberately dormant
+//! # The consumer half
 //!
-//! This pass is deliberately not wired into the translation pipeline yet.
-//! Wiring it without the consumer half turns a string constant into a real
-//! traced value that no string-taking consumer can read correctly; this has
-//! been observed as a silent wrong answer in `pickle._dumps`. Before the pass
-//! can be enabled, the JIT must have both a one-word string representation it
-//! can carry and `jit_*` shims that let string-taking helpers be published or
-//! looked inside. RPython strings are `Ptr(STR)`, a single word carrying its
-//! own length, so upstream has no fat-pointer gap here.
+//! The folded value is a one-word `llstr` constant. Helpers that read a
+//! string through a two-word view (`&str`, `&Wtf8`) cannot take it as a
+//! residual-call argument — they are unpublished, so a descent that reaches
+//! one aborts instead of miscalling it. An earlier wiring attempt predates
+//! that unpublication and observed a silent wrong answer in `pickle._dumps`;
+//! with the fat-pointer publications gone the pickle family runs green.
+//! RPython strings are `Ptr(STR)`, a single word carrying its own length, so
+//! upstream has no fat-pointer gap here.
 
 use crate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -38,7 +38,6 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// `front/mir.rs:18091`, so it is always valid UTF-8 and this guard cannot fire.
 /// The guard stays so that a future byte-carrying representation leaves the
 /// call symbolic and aborts the descent instead of reaching the runtime panic.
-#[allow(dead_code)]
 pub fn fold_str_consts(graph: &mut FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
