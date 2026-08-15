@@ -207,6 +207,12 @@ pub fn request_deferred_major_collection() {
 pub struct GcConfig {
     /// Nursery size in bytes.
     pub nursery_size: usize,
+    /// incminimark.py:326/472 `debug_tiny_nursery` — the bytes
+    /// `collect_and_reserve` leaves free after each reservation, so a minor
+    /// collection runs roughly every `debug_tiny_nursery` bytes of allocation.
+    /// `None` is upstream's `-1` (off).  Set only by the `PYPY_GC_NURSERY`
+    /// clamp; an explicitly configured `nursery_size` is left alone.
+    pub debug_tiny_nursery: Option<usize>,
     /// Maximum object size that can be allocated in the nursery.
     /// Larger objects go directly to old gen.
     pub large_object_threshold: usize,
@@ -581,14 +587,42 @@ fn estimate_best_nursery_size() -> usize {
     best_nursery_size_for_l2cache(get_l2cache())
 }
 
-fn default_nursery_size() -> usize {
-    // incminimark.py:459-470:
-    //   newsize = env.read_from_env('PYPY_GC_NURSERY')
-    //   if newsize <= 0: newsize = env.estimate_best_nursery_size()
-    //   if newsize <= 0: newsize = defaultsize
+/// incminimark.py:453 `minsize = 2 * (self.nonlarge_max + 1)` — pyre stores
+/// `nonlarge_max + 1` directly as the large-object cutoff, so the doubling is
+/// of the cutoff itself.  A nursery below this cannot hold one non-large
+/// object, which is why upstream never lets the environment configure one.
+const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * 8;
+
+/// incminimark.py:459-473 — the environment-configured nursery size, and the
+/// `debug_tiny_nursery` budget a request below `minsize` turns into.
+///
+/// ```python
+/// newsize = env.read_from_env('PYPY_GC_NURSERY')
+/// if newsize <= 0:
+///     newsize = env.estimate_best_nursery_size()
+///     if newsize <= 0:
+///         newsize = defaultsize
+/// if newsize < minsize:
+///     self.debug_tiny_nursery = newsize & ~(WORD-1)
+///     newsize = minsize
+/// ```
+///
+/// `PYPY_GC_NURSERY=1` means "collect on every malloc", not "a one-byte
+/// nursery": the arena stays at `minsize` so every non-large object still
+/// fits, and the requested size becomes the budget
+/// `collect_and_reserve` leaves free after each reservation.  Dropping the
+/// clamp and keeping the raw value instead hands out an arena smaller than a
+/// single object.
+fn default_nursery_size() -> (usize, Option<usize>) {
     // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
     // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
-    read_uint_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size)
+    let newsize = read_uint_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size);
+    let minsize = 2 * LARGE_OBJECT_THRESHOLD;
+    if newsize < minsize {
+        (minsize, Some(newsize & !(std::mem::size_of::<usize>() - 1)))
+    } else {
+        (newsize, None)
+    }
 }
 
 /// env.py:67 `addressable_size = float(2**63)` for a 64-bit host: the most
@@ -675,9 +709,11 @@ fn get_total_memory() -> f64 {
 impl Default for GcConfig {
     fn default() -> Self {
         // large_object = (16384+512)*8 from incminimark for 64-bit
+        let (nursery_size, debug_tiny_nursery) = default_nursery_size();
         GcConfig {
-            nursery_size: default_nursery_size(),
-            large_object_threshold: (16384 + 512) * 8,
+            nursery_size,
+            debug_tiny_nursery,
+            large_object_threshold: LARGE_OBJECT_THRESHOLD,
             card_page_indices: 128,
             taggedpointers: false,
         }
@@ -1436,6 +1472,7 @@ impl MiniMarkGC {
             !ptr.is_null(),
             "collect_and_reserve could not find nursery space for a non-large object"
         );
+        self.apply_debug_tiny_nursery();
         self.finish_nursery_object(ptr, type_id)
     }
 
@@ -1579,7 +1616,32 @@ impl MiniMarkGC {
             !ptr.is_null(),
             "collect_and_reserve could not find nursery space for a non-large object"
         );
+        self.apply_debug_tiny_nursery();
         self.finish_nursery_object(ptr, type_id)
+    }
+
+    /// incminimark.py:946-948, the tail of `collect_and_reserve`:
+    ///
+    /// ```python
+    /// if self.debug_tiny_nursery >= 0:   # for debugging
+    ///     if self.nursery_top - self.nursery_free > self.debug_tiny_nursery:
+    ///         self.nursery_free = self.nursery_top - self.debug_tiny_nursery
+    /// ```
+    ///
+    /// Runs after the reservation, so the object just handed out kept the
+    /// whole arena and only what follows it is rationed.
+    #[inline]
+    fn apply_debug_tiny_nursery(&mut self) {
+        let Some(budget) = self.config.debug_tiny_nursery else {
+            return;
+        };
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if top.saturating_sub(free) > budget {
+            // SAFETY: `top - budget` is above `free`, which the reservation
+            // just established is inside the nursery.
+            unsafe { self.nursery.set_free_ptr((top - budget) as *mut u8) };
+        }
     }
 
     /// The tail a successful nursery bump runs: `init_gc_object`, then
