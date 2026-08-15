@@ -6350,6 +6350,22 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
+        // compile.py:49-50 `CompileData.optimize_trace`:
+        //     if self.log_noopt:
+        //         metainterp_sd.logger_noopt.log_loop_from_trace(self.trace, ...)
+        // logger.py:15-24 wraps it in the `jit-log-noopt` section and heads the
+        // dump with the traced op count. This is the only view of the trace as
+        // the optimizer receives it; every other section is post-optimization.
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-noopt");
+            crate::debug::debug_print(&format!(
+                "# Traced loop or bridge with {num_ops_before} ops"
+            ));
+            for line in majit_ir::format_trace(&trace.ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
+        }
+
         // Save trace_ops + constants snapshot for potential unroll-free retry
         // (pyjitpl.py:3016-3021).
         let trace_ops_snapshot = trace_ops.clone();
