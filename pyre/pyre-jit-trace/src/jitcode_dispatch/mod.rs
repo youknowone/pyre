@@ -5832,6 +5832,9 @@ impl<'a> InlineFrameGuard<'a> {
             parent,
             entry_executed_effects: fbw_executed_effect_count(),
         });
+        if fbw_depth_census_enabled() {
+            fbw_depth_census_record(&session.borrow().framestack);
+        }
         ACTIVE_WALK_SESSION.with(|c| c.set(session as *const _));
         InlineFrameGuard(session)
     }

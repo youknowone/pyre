@@ -326,6 +326,77 @@ pub(crate) fn fbw_spec_census_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some())
 }
 
+const FBW_DEPTH_HIST_BUCKETS: usize = 32;
+
+static FBW_DEPTH_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FBW_DEPTH_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FBW_DEPTH_HIST: [std::sync::atomic::AtomicU64; FBW_DEPTH_HIST_BUCKETS] = {
+    const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    [Z; FBW_DEPTH_HIST_BUCKETS]
+};
+static FBW_DEPTH_DEEPEST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// `PYRE_FBW_DEPTH_CENSUS`: process-wide inline-walker descent depths and the
+/// `w_code` chain for the deepest entry. Off by default; the cached test is the
+/// only added work on the descent path when disabled.
+#[inline]
+pub(crate) fn fbw_depth_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEPTH_CENSUS").is_some())
+}
+
+/// Record the post-push framestack. The histogram's last slot is the `>=32`
+/// bucket; all earlier slots correspond to their one-based depth.
+pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    let depth = framestack.len();
+    debug_assert!(depth > 0);
+    FBW_DEPTH_ENTRIES.fetch_add(1, ordering);
+    FBW_DEPTH_HIST[depth.saturating_sub(1).min(FBW_DEPTH_HIST_BUCKETS - 1)].fetch_add(1, ordering);
+
+    if depth > FBW_DEPTH_MAX.load(ordering) {
+        let mut deepest = FBW_DEPTH_DEEPEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if depth > FBW_DEPTH_MAX.load(ordering) {
+            deepest.clear();
+            deepest.extend(framestack.iter().map(|frame| frame.w_code));
+            FBW_DEPTH_MAX.store(depth, ordering);
+        }
+    }
+}
+
+/// One process-exit line for the inline-walker descent census.
+pub fn fbw_depth_census_summary() -> String {
+    use std::fmt::Write;
+
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    let deepest = FBW_DEPTH_DEEPEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut hist = String::new();
+    for (idx, count) in FBW_DEPTH_HIST.iter().enumerate() {
+        if idx != 0 {
+            hist.push(',');
+        }
+        if idx + 1 == FBW_DEPTH_HIST_BUCKETS {
+            write!(hist, ">=32:{}", count.load(ordering)).unwrap();
+        } else {
+            write!(hist, "{}:{}", idx + 1, count.load(ordering)).unwrap();
+        }
+    }
+    let deepest = deepest
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "[fbw-depth] entries={} max_depth={} hist={hist} deepest=[{deepest}]\n",
+        FBW_DEPTH_ENTRIES.load(ordering),
+        FBW_DEPTH_MAX.load(ordering),
+    )
+}
+
 /// Parse `PYRE_FBW_NO_SPECIALIZE` once into table-index bits and unknown
 /// selector tokens.  The reserved `all` token turns off these 56 rows and
 /// nothing else: the `try_walker_fold_*` trio, the 11 `try_walker_inline_*`

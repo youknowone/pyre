@@ -822,6 +822,7 @@ fn maybe_print_jit_stats() {
     maybe_print_gc_diag();
     maybe_print_spec_census();
     maybe_print_cell_census();
+    maybe_print_fbw_depth_census();
     if std::env::var_os("MAJIT_STATS").is_none() {
         return;
     }
@@ -972,6 +973,13 @@ fn maybe_print_spec_census() {
         return;
     }
     eprint!("{}", pyre_jit::spec_census_summary());
+}
+
+fn maybe_print_fbw_depth_census() {
+    if std::env::var_os("PYRE_FBW_DEPTH_CENSUS").is_none() {
+        return;
+    }
+    eprint!("{}", pyre_jit::fbw_depth_census_summary());
 }
 
 /// Print the guard-failure → bridge-trace gate tallies. Until this existed the

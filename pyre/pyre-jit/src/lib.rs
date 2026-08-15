@@ -103,6 +103,10 @@ pub fn spec_census_summary() -> String {
     pyre_jit_trace::jitcode_dispatch::spec_census_summary()
 }
 
+pub fn fbw_depth_census_summary() -> String {
+    pyre_jit_trace::jitcode_dispatch::fbw_depth_census_summary()
+}
+
 /// The `PYPY_GC_*` variables the collector sizes itself from, and the setter
 /// for an embedder whose platform hands the process no environment to read them
 /// out of. Re-exported so such a host reaches them through the crate it already
