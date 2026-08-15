@@ -47,6 +47,9 @@ const _: () = assert!(
 /// for a live object, arbitrarily far from the store that wrote it. The host
 /// therefore declares its own, the way it already declares the `rbigint`
 /// payload's ([`crate::rbigint::set_rbigint_gc_type_id`]).
+///
+/// One host per process: see [`declare_array_gc_type_id`] for what that costs
+/// and where the instance-scoped owner is upstream.
 static GC_INT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(UNSET_GC_TYPE_ID);
 
@@ -54,16 +57,56 @@ static GC_INT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 static GC_FLOAT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(UNSET_GC_TYPE_ID);
 
+/// Publish `id` as the declaring host's slot for `lltype`.
+///
+/// The cell is process-global because the collector it indexes is: `gc_sync`
+/// holds one collector singleton for the process, and the allocator hook these
+/// ids feed (`ACTIVE_ALLOC_NURSERY_TYPED`) is a single global cell as well.
+/// One host per process is a standing assumption of the whole allocation path,
+/// not a shortcut taken here. Upstream carries no such cell:
+/// `GcLLDescr_framework.init_array_descr` (`gc.py:544-549`) reads the tid off
+/// `self.layoutbuilder` and writes it into the individual `ArrayDescr`, both
+/// instance-owned, so two backends in one process keep separate ids. Pyre has
+/// no descriptor object at the allocation site — the block allocators take a
+/// bare `tid: u32` — so there is nothing instance-scoped for the id to live on
+/// until that plumbing exists, and moving only these two ids off the static
+/// would buy no second host while the singleton and the allocator hook remain.
+///
+/// Re-declaring the SAME slot is how a rebuilt heap
+/// (`eval.rs reset_gc_fresh_for_test`) re-announces its registration: the
+/// registry belongs to the collector and the registration order is fixed, so a
+/// fresh collector hands the same ids back. A DIFFERENT slot is a second host
+/// stamping over the first host's registrations, which nothing downstream can
+/// detect — the collector reads the word and indexes its own registry with it.
+/// Refuse it here in debug rather than let it surface as a mis-trace.
+fn declare_array_gc_type_id(slot: &std::sync::atomic::AtomicU32, id: u32, lltype: &str) {
+    let previous = slot.swap(id, std::sync::atomic::Ordering::Relaxed);
+    debug_assert!(
+        previous == UNSET_GC_TYPE_ID || previous == id,
+        "{lltype} GC type id re-declared as {id} over {previous}: a second host \
+         is stamping its own registry slots over the first host's"
+    );
+}
+
 /// Declare the slot this host's `gc.register_type` returned for
 /// `GcArray(Signed)`. Call it from the same place the host registers the type.
 pub fn set_gc_int_array_gc_type_id(id: u32) {
-    GC_INT_ARRAY_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+    declare_array_gc_type_id(&GC_INT_ARRAY_GC_TYPE_ID, id, "GcArray(Signed)");
 }
 
 /// Declare the slot this host's `gc.register_type` returned for
 /// `GcArray(Float)`.
 pub fn set_gc_float_array_gc_type_id(id: u32) {
-    GC_FLOAT_ARRAY_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+    declare_array_gc_type_id(&GC_FLOAT_ARRAY_GC_TYPE_ID, id, "GcArray(Float)");
+}
+
+/// Return both slots to [`UNSET_GC_TYPE_ID`] so a test can exercise the
+/// declaration channel more than once. The production channel is
+/// declare-once-per-process; only the tests below need to undo it.
+#[cfg(test)]
+fn undeclare_array_gc_type_ids() {
+    GC_INT_ARRAY_GC_TYPE_ID.store(UNSET_GC_TYPE_ID, std::sync::atomic::Ordering::Relaxed);
+    GC_FLOAT_ARRAY_GC_TYPE_ID.store(UNSET_GC_TYPE_ID, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// [`UNSET_GC_TYPE_ID`] until a host declares one.
@@ -383,22 +426,60 @@ pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlo
 mod tests {
     use super::*;
 
+    /// The declaration cells are process-global, so the tests that write them
+    /// take turns — and each starts from the undeclared state, which is the
+    /// only state a fresh process ever presents to a host.
+    static DECLARATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialize on [`DECLARATION`] and hand back the undeclared state a host
+    /// starts from. A test that ends by panicking poisons the lock; the next
+    /// test is not the one that failed, so take the guard through the poison.
+    ///
+    /// This leaves the ids briefly undeclared while other tests in this binary
+    /// run. Nothing here installs a GC allocator, and that is the gate
+    /// `try_alloc_typed_items_block_nursery` takes its undeclared-id refusal
+    /// from, so no sibling can observe the window.
+    fn declaration_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = DECLARATION.lock().unwrap_or_else(|e| e.into_inner());
+        undeclare_array_gc_type_ids();
+        guard
+    }
+
     /// The declaration channel carries whatever slot the host's registry
     /// handed out, including `0` — which is a real slot (`TypeRegistry::
     /// register` returns `entries.len()`), and which the undeclared state
     /// must stay distinguishable from.
     #[test]
     fn a_declared_array_type_id_reads_back_and_zero_is_a_real_slot() {
+        let _guard = declaration_lock();
         set_gc_int_array_gc_type_id(0);
         assert_eq!(gc_int_array_gc_type_id(), 0);
         assert_ne!(gc_int_array_gc_type_id(), UNSET_GC_TYPE_ID);
 
         set_gc_float_array_gc_type_id(42);
         assert_eq!(gc_float_array_gc_type_id(), 42);
+    }
 
-        // Leave both declared: a sibling test that allocates an items block
-        // while a collector owns the heap would otherwise trip the
-        // undeclared-id refusal in `try_alloc_typed_items_block_nursery`.
-        set_gc_int_array_gc_type_id(41);
+    /// A rebuilt heap (`eval.rs reset_gc_fresh_for_test`) re-runs the host's
+    /// registrations against a fresh collector, whose registry hands the same
+    /// slots back in the same order. That re-declaration is the supported
+    /// case, not the overwrite the guard is looking for.
+    #[test]
+    fn re_declaring_the_same_slot_is_accepted() {
+        let _guard = declaration_lock();
+        set_gc_int_array_gc_type_id(7);
+        set_gc_int_array_gc_type_id(7);
+        assert_eq!(gc_int_array_gc_type_id(), 7);
+    }
+
+    /// A second host's registry hands out its own slots; stamping them over
+    /// the first host's is undetectable once the word reaches a GC header.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic = "re-declared"]
+    fn a_conflicting_re_declaration_is_refused() {
+        let _guard = declaration_lock();
+        set_gc_float_array_gc_type_id(7);
+        set_gc_float_array_gc_type_id(8);
     }
 }

@@ -891,6 +891,148 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
     }
 }
 
+/// `_opimpl_getarrayitem_vable` (pyjitpl.py:1218-1230) and
+/// `_opimpl_setarrayitem_vable` (:1236-1247) take the
+/// `_nonstandard_virtualizable` decision FIRST, and their non-standard branch
+/// reaches `getarrayitem_gc_*` / `setarrayitem_gc_any` with the index box as it
+/// stands. The promote lives at the head of `_get_arrayitem_vable_index`
+/// (:1201-1216), which only the standard branch enters. So a non-standard
+/// access must mint no GUARD_VALUE on the index — promoting there pins a value
+/// upstream leaves free, over-specializing the trace on an access that reads
+/// ordinary heap.
+///
+/// The non-standard branch mints a GUARD_VALUE of its own (the Step 4 PTR_EQ
+/// promote), so the subject here is which BOX a guard names, not how many
+/// guards there are.
+#[test]
+fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
+    for opname in ["getarrayitem_vable_i", "setarrayitem_vable_i"] {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let array_len = 3;
+        let slot_count = info.num_static_extra_boxes + array_len;
+        // The standard virtualizable, i.e. `virtualizable_boxes[-1]`.
+        let standard = tc.const_ref(1);
+        let initial_boxes = vec![tc.const_null(); slot_count];
+        let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+        tc.init_virtualizable_boxes(
+            &info,
+            standard,
+            Value::Ref(majit_ir::GcRef(1)),
+            &initial_boxes,
+            &initial_values,
+            &[array_len],
+        );
+        // A different frame: `_nonstandard_virtualizable` reaches its Step 4
+        // PTR_EQ, reads unequal, and takes the non-standard branch.
+        let vable = tc.const_ref(2);
+        // A non-constant index carrying a recording-time concrete — the only
+        // shape for which the promote is not already a no-op.
+        let zero = tc.const_int(0);
+        let index = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+        tc.set_opref_concrete(index, Value::Int(0));
+        assert!(!index.is_constant(), "the index box must be promotable");
+
+        let bh_array = majit_translate::jitcode::BhDescr::from_array_descr(
+            info.array_descrs[0]
+                .as_array_descr()
+                .expect("the fixture's array descr"),
+        );
+        let raw_pool = vec![
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+                majit_translate::jitcode::BhDescr::VableArray { index: 0 },
+            )),
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+        ];
+        // `ridd>i` (read): r-reg(0) + i-reg(1) + fdescr(0) + adescr(1) + dst(2).
+        // `riidd` (write): r-reg(0) + i-reg(1) + value i-reg(2) + fdescr(0) +
+        // adescr(1).
+        let code: [u8; 8] = if opname == "getarrayitem_vable_i" {
+            [0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02]
+        } else {
+            [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00]
+        };
+        let stored_value = tc.const_int(7);
+        let mut regs_r = vec![vable];
+        let mut regs_i = vec![zero, index, stored_value];
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let guards_before = tc.num_guards();
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: test_fbw_mode(),
+            session: &session,
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::PerFn(&raw_pool),
+            is_authoritative_executor: false,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            outer_active_boxes: Vec::new(),
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        let op = DecodedOp {
+            key: opname,
+            opname,
+            argcodes: "",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let result = match opname {
+            "getarrayitem_vable_i" => getarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            _ => setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+        };
+        drop(wc);
+        assert!(
+            tc.num_guards() > guards_before,
+            "{opname} must still mint the Step 4 PTR_EQ promote, or this test \
+             would pass on a walk that never took the non-standard branch",
+        );
+        // Read the guard before the dispatch outcome: an unconditional promote
+        // records its GUARD_VALUE and only then tries to build a snapshot, so
+        // checking the outcome first would report the snapshot failure and
+        // leave the promote itself unnamed.
+        let promoted_index = tc.ops().iter().any(|recorded| {
+            recorded.opcode == majit_ir::OpCode::GuardValue
+                && recorded
+                    .getarglist()
+                    .first()
+                    .is_some_and(|arg| arg.to_opref() == index)
+        });
+        assert!(
+            !promoted_index,
+            "{opname} promoted the index on the non-standard branch; \
+             pyjitpl.py:1220/:1239 reach the heap op with the index box unpromoted",
+        );
+        assert_eq!(
+            result.map(|(outcome, _)| outcome),
+            Ok(DispatchOutcome::Continue),
+            "{opname} must dispatch through the non-standard branch",
+        );
+    }
+}
+
 #[test]
 #[ignore = "T3 audit probe — dumps runtime opnames + walker-handled set + \
                 per-opname JitCode hit count. Run with \
