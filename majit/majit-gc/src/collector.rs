@@ -2993,9 +2993,18 @@ impl MiniMarkGC {
         // did: VISITED means marking reached it, NO_HEAP_PTRS an immortal
         // object marking never has to reach.
         let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
-        let hdr = unsafe { header_of(obj) };
-        let alive =
-            unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) };
+        let alive = if !self.is_managed_heap_object(obj) {
+            // Upstream reaches the flag test unconditionally because every
+            // RPython GC object has a header, prebuilt ones included — which is
+            // what its GCFLAG_NO_HEAP_PTRS arm is for.  `malloc_typed` objects
+            // here live outside both generations with no header at all, so
+            // there is no flag word at that address to read.  Nothing sweeps
+            // them either, so nothing can prove one dead.
+            true
+        } else {
+            let hdr = unsafe { header_of(obj) };
+            unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) }
+        };
         if alive {
             surviving.push(pyobject);
             if list == RrcList::P {
