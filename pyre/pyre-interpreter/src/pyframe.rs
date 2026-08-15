@@ -3892,8 +3892,7 @@ impl PyFrame {
     /// / freevar from the mapping via `space.finditem_str` (KeyError →
     /// missing); a frame with no locals bound has nothing to copy.
     pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
-        let w_locals = self.get_w_locals();
-        if w_locals.is_null() {
+        if self.get_w_locals().is_null() {
             return Ok(());
         }
         let code_ptr = unsafe { pyframe_get_pycode(self) };
@@ -3908,7 +3907,12 @@ impl PyFrame {
                 continue;
             }
             let name = &code.varnames[i];
-            let w_value = finditem_str_object(w_locals, name)?.unwrap_or(PY_NULL);
+            // `pyframe.py:576` reads `self.w_locals` per turn.  The lookup
+            // dispatches the mapping's `__getitem__`, so a hoisted copy names
+            // the address the mapping had before the previous turn ran.  The
+            // frame's own trace forwards the field, so re-reading it is the
+            // whole fix.
+            let w_value = finditem_str_object(self.get_w_locals(), name)?.unwrap_or(PY_NULL);
             let slot = locals_w!(self)[i];
             let is_cell_slot = i < code.localspluskinds.len()
                 && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
@@ -3945,7 +3949,7 @@ impl PyFrame {
             };
             let idx = numlocals + i;
             if idx < locals_w!(self).len() {
-                let w_value = finditem_str_object(w_locals, name)?.unwrap_or(PY_NULL);
+                let w_value = finditem_str_object(self.get_w_locals(), name)?.unwrap_or(PY_NULL);
                 let slot = locals_w!(self)[idx];
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
@@ -4714,8 +4718,17 @@ fn finditem_str_object(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
-    let key = unsafe { pyre_object::w_str_new(name) };
-    match crate::baseobjspace::getitem(w_obj, key) {
+    // Minting the key allocates, so the mapping moves between entry and the
+    // lookup that uses it as the receiver.  A stale receiver reaches
+    // `dict.__getitem__` as a descriptor mismatch against its own type name,
+    // not as a crash, so publish it across the mint the way its `setitem` and
+    // `delitem` siblings do.
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = roots.base();
+    roots.pin_root(w_obj);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    match crate::baseobjspace::getitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(v) if !v.is_null() => Ok(Some(v)),
         Ok(_) => Ok(None),
         Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(None),
