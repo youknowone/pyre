@@ -25,9 +25,10 @@ mod imp {
         /// rewrites the slot, so the live pointer is read through it at call
         /// time.
         slot: *mut usize,
-        /// Size of the libffi result slot described by the callback CIF.
-        /// Kept here so the outer panic boundary can initialize it before any
-        /// Python/runtime work is attempted.
+        /// Size of the libffi result slot the callback CIF returns through —
+        /// one `ffi_arg` word for an integral result narrower than that.  Kept
+        /// here so the outer panic boundary can initialize the whole slot
+        /// before any Python/runtime work is attempted.
         result_width: usize,
     }
 
@@ -49,17 +50,17 @@ mod imp {
         pyre_object::gc_roots::pin_root(obj);
         let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let argtypes = funcptr::resolve_argtypes(current_obj()).unwrap_or_default();
-        let argtypes_slot = pyre_object::gc_roots::shadow_stack_len();
-        for &argtype in &argtypes {
-            pyre_object::gc_roots::pin_root(argtype);
-        }
+        // The whole livevar set is published before the first forwarding query:
+        // `pin_root` in a loop queries after the first write, and that query is
+        // a safepoint at which the entries still only in the `Vec` can move.
+        let argtypes_slot = pyre_object::gc_roots::pin_roots(&argtypes);
         let ffi_arg_types = (0..argtypes.len())
             .map(|i| ffi_type_for_arg(pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i)))
             .collect::<Result<Vec<_>, _>>()?;
         let restype =
             funcptr::resolve_restype(current_obj()).map_err(|_| invalid_callback_result_type())?;
         let ffi_res_type = ffi_type_for_ret(&restype)?;
-        let result_width = ffi_result_width(&restype);
+        let result_width = ffi_result_slot_width(&restype);
 
         let mut slot = Box::new(current_obj() as usize);
         let slot_ptr = (&mut *slot) as *mut usize;
@@ -140,6 +141,38 @@ mod imp {
             funcptr::Ret::Code(code) => host_ctypes::simple_type_size(code).unwrap_or(0),
             funcptr::Ret::Pointer(_) => host_ctypes::pointer_size(),
             funcptr::Ret::Aggregate(_) => 0,
+        }
+    }
+
+    /// Width of `ffi_arg`, the word a libffi closure reserves for an integral
+    /// return however narrow the declared result is.
+    const FFI_ARG_SIZE: usize = std::mem::size_of::<usize>();
+
+    /// A floating-point result code, which libffi returns through its own
+    /// register file and never widens to `ffi_arg`.
+    fn is_float_code(code: &str) -> bool {
+        matches!(code, "f" | "d" | "g")
+    }
+
+    /// Bytes of the closure's return slot the result owns.  An integral result
+    /// narrower than `ffi_arg` still owns the whole word, so that is what gets
+    /// cleared and what the value is placed within.
+    fn ffi_result_slot_width(ret: &funcptr::Ret) -> usize {
+        let width = ffi_result_width(ret);
+        match ret {
+            funcptr::Ret::Code(code) if !is_float_code(code) => width.max(FFI_ARG_SIZE),
+            _ => width,
+        }
+    }
+
+    /// Offset of an `n`-byte value inside its `ffi_arg` return slot: a
+    /// big-endian ABI keeps the value at the end of the word
+    /// (`callbacks.c:234-239`).
+    fn ffi_result_offset(ret: &funcptr::Ret, n: usize) -> usize {
+        if cfg!(target_endian = "big") {
+            ffi_result_slot_width(ret).saturating_sub(n)
+        } else {
+            0
         }
     }
 
@@ -236,10 +269,10 @@ mod imp {
         args: *const *const c_void,
     ) -> Result<Vec<PyObjectRef>, crate::PyError> {
         let argtypes = funcptr::resolve_argtypes(obj).unwrap_or_default();
-        let argtypes_slot = pyre_object::gc_roots::shadow_stack_len();
-        for &argtype in &argtypes {
-            pyre_object::gc_roots::pin_root(argtype);
-        }
+        // Published as one set for the reason `pin_roots` documents: pinning
+        // them one at a time makes the first query a safepoint at which the
+        // still-unpinned entries can move.
+        let argtypes_slot = pyre_object::gc_roots::pin_roots(&argtypes);
         // `decode_arg` may itself pin construction intermediates (aggregate
         // and function-pointer instances), so decoded results are not
         // necessarily contiguous on the shadow stack.  Record each result's
@@ -314,16 +347,20 @@ mod imp {
             funcptr::Ret::Void => Ok(()),
             funcptr::Ret::Code(c) => {
                 let bytes = cdata::encode_value_into(&c, value, obj, "result")?;
-                // The return slot is one `ffi_arg` word: a narrow value has to
-                // go into a zeroed word rather than beside whatever the closure
-                // left there, and nothing wider than the word may be written.
-                // `g` is the case that overruns — it encodes to a long double
-                // while `ffi_type_from_code` maps it to the `f64` the slot was
-                // sized for.
-                let width = ffi_result_width(&funcptr::Ret::Code(c.clone()));
-                let n = bytes.len().min(width);
+                // The return slot is one `ffi_arg` word: a narrow value goes
+                // into a word `thunk_callback` already cleared rather than
+                // beside whatever the closure left there, and nothing wider
+                // than the CIF's own type may be written.  `g` is the case that
+                // overruns — it encodes to a long double while
+                // `ffi_type_from_code` maps it to the `f64` the slot holds.
+                let ret = funcptr::Ret::Code(c.clone());
+                let n = bytes.len().min(ffi_result_width(&ret));
                 unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), result.cast::<u8>(), n);
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        result.cast::<u8>().add(ffi_result_offset(&ret, n)),
+                        n,
+                    );
                 }
                 Ok(())
             }
