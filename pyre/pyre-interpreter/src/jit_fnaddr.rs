@@ -1853,6 +1853,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::ll_issubclass",
         ll_issubclass as *const (),
     );
+    // `elidable_cannot_raise` bool singleton lookup; the trampoline widens the
+    // returned pointer to one word.
+    let w_bool_from: extern "C" fn(i64) -> i64 =
+        pyre_object::boolobject::__majit_call_target_w_bool_from;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::boolobject::w_bool_from",
+        "pyre_object::w_bool_from",
+        w_bool_from as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
