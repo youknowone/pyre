@@ -95,7 +95,7 @@ use crate::compile;
 use crate::compile::make_jitcell_token;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
-    DeadFrameArtifacts, RawCompileResult,
+    DeadFrameArtifacts, ExitTypes, RawCompileResult,
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
@@ -358,7 +358,7 @@ impl StoredExitLayout {
             trace_id,
             fail_index,
             source_op_index: self.source_op_index,
-            exit_types: self.resolve_exit_types().to_vec(),
+            exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
             gc_ref_slots: self.gc_ref_slots.clone(),
@@ -2616,7 +2616,7 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -2816,11 +2816,13 @@ impl<M: Clone> MetaInterp<M> {
                         layout.rd_pendingfields.clone().unwrap_or_default(),
                     )
                 });
-                let exit_types = if layout.fail_arg_types.is_empty() {
+                // `from_vec`, so whichever arm wins hands over the buffer it
+                // already owns instead of being copied into a fresh one.
+                let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
                     frontend_exit_types.unwrap_or_default()
                 } else {
                     layout.fail_arg_types
-                };
+                });
                 let gc_ref_slots = if layout.gc_ref_slots.is_empty() {
                     exit_types
                         .iter()
@@ -2860,7 +2862,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index: layout.fail_index,
                 source_op_index: Some(layout.op_index),
-                exit_types: layout.exit_types,
+                exit_types: ExitTypes::from_vec(layout.exit_types),
                 is_finish: layout.is_finish,
                 is_exception_exit: layout.is_exception_exit,
                 gc_ref_slots: layout.gc_ref_slots,
@@ -2907,7 +2909,7 @@ impl<M: Clone> MetaInterp<M> {
                         trace_id,
                         fail_index: layout.fail_index,
                         source_op_index: layout.source_op_index,
-                        exit_types: layout.fail_arg_types,
+                        exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                         is_finish: layout.is_finish,
                         is_exception_exit: layout.is_exception_exit,
                         gc_ref_slots: layout.gc_ref_slots,
@@ -2963,7 +2965,7 @@ impl<M: Clone> MetaInterp<M> {
                             trace_id,
                             fail_index: layout.fail_index,
                             source_op_index: Some(layout.op_index),
-                            exit_types: layout.exit_types,
+                            exit_types: ExitTypes::from_vec(layout.exit_types),
                             is_finish: layout.is_finish,
                             is_exception_exit: layout.is_exception_exit,
                             gc_ref_slots: layout.gc_ref_slots,
@@ -10230,7 +10232,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: layout
                         .source_op_index
                         .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
-                    exit_types: layout.fail_arg_types,
+                    exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots: layout.gc_ref_slots,
@@ -10342,7 +10344,10 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        // Borrowed, not copied — see the sibling
+        // `run_compiled_detailed_with_values_at_dispatch_key` for why the copy
+        // does not belong on a path every entry takes.
+        let exit_types: &[Type] = descr.fail_arg_types();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -10383,7 +10388,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.clone(),
+                exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots,
@@ -10412,7 +10417,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.clone(),
+                    exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
@@ -10575,7 +10580,7 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.to_vec(),
+                exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
                 // Moved rather than cloned: the `else` arm below is the only
@@ -10604,7 +10609,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.to_vec(),
+                    exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
@@ -12062,7 +12067,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<Vec<Type>> {
         let exit_layout =
             self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
-        Some(exit_layout.exit_types.clone())
+        Some(exit_layout.exit_types.to_vec())
     }
 
     /// resume.py:924-926 _prepare: get rd_virtuals + rd_pendingfields
@@ -23295,7 +23300,7 @@ mod tests {
         let layout = meta
             .get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
             .expect("previous token backend layout should remain visible");
-        assert_eq!(layout.exit_types, vec![Type::Int]);
+        assert_eq!(layout.exit_types.as_slice(), [Type::Int]);
         assert!(!layout.is_finish);
         assert_eq!(
             meta.get_exit_types(green_key, trace_id, fail_index),
@@ -23407,7 +23412,10 @@ mod tests {
                 .map(|storage| storage.rd_numb.clone()),
             expected_rd_numb
         );
-        assert_eq!(recovery.exit_layout.exit_types, expected_exit_types);
+        assert_eq!(
+            recovery.exit_layout.exit_types.as_slice(),
+            expected_exit_types
+        );
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]

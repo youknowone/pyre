@@ -116,6 +116,17 @@ fn derive_slot_types(
         .collect()
 }
 
+/// Storage for one exit's type list.
+///
+/// Inline up to a width that costs nothing. `Type` is one byte, so sixteen of
+/// them occupy exactly the bytes a heap vector spends on its pointer and
+/// capacity anyway: both spellings are 24 bytes. What the inline storage buys
+/// is that the steady exit — a FINISH returning one word, or a guard with a
+/// handful of fail arguments — carries its types without asking the allocator,
+/// on a path taken once per entry into compiled code. A wider exit spills to
+/// the heap and pays exactly what it paid before.
+pub type ExitTypes = smallvec::SmallVec<[Type; 16]>;
+
 /// Static exit metadata for a compiled guard or finish point.
 #[derive(Debug, Clone)]
 pub struct CompiledExitLayout {
@@ -126,7 +137,7 @@ pub struct CompiledExitLayout {
     pub trace_id: u64,
     pub fail_index: u32,
     pub source_op_index: Option<usize>,
-    pub exit_types: Vec<Type>,
+    pub exit_types: ExitTypes,
     pub is_finish: bool,
     /// `compile.py:658-662 ExitFrameWithExceptionDescrRef`
     /// vs `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes
@@ -1569,7 +1580,7 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
     let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
-    let exit_types: Vec<Type> = op
+    let exit_types: ExitTypes = op
         .getarglist()
         .iter()
         .map(|opref| {
@@ -1644,7 +1655,7 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
             // `ExitFrameWithExceptionDescrRef`, both of which expose
             // `fail_arg_types()` directly, so the cache stays `None`.
             let op_arg_types_for_jump =
-                (op.opcode == OpCode::Jump).then(|| layout.exit_types.clone());
+                (op.opcode == OpCode::Jump).then(|| layout.exit_types.to_vec());
             layouts.insert(
                 op_index,
                 StoredExitLayout {

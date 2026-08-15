@@ -4647,7 +4647,7 @@ impl<S: JitState> JitDriver<S> {
             // arguments, so the buffers go back before the first exit past
             // this point.
             self.entry_scratch_out(scratch);
-            let result = result?;
+            let mut result = result?;
             if portal_rca_enabled() {
                 eprintln!(
                     "[portal-rca][compiled-exit] green_key={green_key} \
@@ -4674,7 +4674,9 @@ impl<S: JitState> JitDriver<S> {
                 // no variant for "the function returned", so the `#[jit_interp]`
                 // expansion drains this latch right after the call and returns it
                 // as the portal's own return value.
-                self.meta.back_edge_finish = Some(result.typed_values.clone());
+                // Taken, not copied: this arm returns below, so the exit values
+                // in `result` have no reader past this point.
+                self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
                 let run_meta = result.meta.clone();
                 // The FINISH arguments are NOT the loop-carried state, so they
                 // are not written back into it. `warmstate.py:405-419
