@@ -2599,7 +2599,20 @@ fn build_function(
     // code, preserving captures written when the source loop first crossed
     // the LABEL.  Chained bridges have no capture plan and clear only their
     // own low ordinary-home prefix.
+    // A home the input loop fills below needs no null first: its store follows
+    // immediately and nothing between the two allocates, so no collection can
+    // read the slot while it is stale. Homes no input fills keep their clear
+    // because store-on-def writes them only later.
+    let mut input_filled_home = vec![false; ref_homes.len()];
+    for ia in inputargs {
+        if let Some(h) = ref_homes.home_id(ia.index) {
+            input_filled_home[h as usize] = true;
+        }
+    }
     for h in 0..ref_homes.len() as u64 {
+        if input_filled_home[h as usize] {
+            continue;
+        }
         sink.local_get(0);
         sink.i64_const(0);
         sink.i64_store(mem64(frame.home_slot_base + h * SLOT_SIZE));
