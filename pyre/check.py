@@ -464,6 +464,98 @@ def run_timed(args, timeout_s=None, env=None):
     return out.replace("\r\n", "\n"), t, rc, err
 
 
+# Names the child is allowed to inherit. Everything else in this process's
+# environment is dropped before the child sees it — see `child_env_base`.
+ENV_ALLOWLIST = (
+    # Locating the loader, the shell a subprocess needs, and scratch space.
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SHELL",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    # Windows refuses to start a process, resolve a system DLL or initialise
+    # WinSock without these.
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    # The home a `~` expands to, and the account naming it.
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "USER",
+    "USERNAME",
+    "LOGNAME",
+    # Shared-library search, which a build out of the source tree depends on.
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    # The locale chain, because an unset chain resolves to the C locale and
+    # changes how the child decodes its own stdio — not something to vary
+    # under a run whose stdout is diffed against an oracle.
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PYTHONIOENCODING",
+)
+
+# Prefixes a developer sets deliberately to steer this run, kept so an A/B
+# stays reachable without editing this file.
+ENV_ALLOWLIST_PREFIXES = ("PYRE_", "MAJIT_", "PYPY_", "PYTHON")
+
+
+def child_env_base():
+    """The environment a measured child starts from: an allowlist, not a copy.
+
+    pyre copies every environment entry into `posix.environ` at startup
+    (`interp_posix.rs:882 create_environ`, PyPy's `_convertenviron`), so the
+    environment's total size is startup allocation like any other. That
+    allocation moves where the nursery fills, which moves where a collection
+    lands, which changes how many times a compiled trace re-enters a guarded
+    branch afterwards — and `guard_failures` counts those re-entries.
+
+    Measured on one binary with nothing but unrelated variables added:
+    `str_fstring` read 658 or 659, entirely from one guard in trace 6 firing
+    51 times or 52. `loops_compiled` and `bridges_compiled` did not move at
+    all, so nothing about what was compiled differed — only how often the
+    compiled code re-entered one branch. That fixture no longer demonstrates
+    it: its trip counts were halved so it stops short of the major-collection
+    threshold entirely, which is the durable fix for one fixture and not for
+    the input.
+
+    A CI runner injects dozens of variables a developer's shell does not
+    (GITHUB_*, RUNNER_*, JAVA_HOME, and the rest), and those are exactly the
+    class of input shown above to move a counter. Dropping them removes that
+    input rather than relaxing the comparison. It is not established that it
+    is the *only* per-host input — this pin narrows what a counter can depend
+    on; it does not prove a counter now depends on nothing but the tree.
+
+    The allowlist is not a fixed environment either: the `PYTHON` prefix keeps
+    whatever a host names that way (PYTHONLOCATION, PYTHON3_ROOT_DIR on the
+    runners), because the same prefix carries the PYTHONSAFEPATH and
+    PYTHONDONTWRITEBYTECODE overrides a developer sets deliberately and that
+    `LAUNCH_ENV_NAMES` forwards to the wasm guest. What it removes is the bulk.
+
+    Any non-empty `PYRE_CHECK_INHERIT_ENV` restores the old whole-environment
+    copy, so the effect of this normalisation stays measurable.
+    """
+    if os.environ.get("PYRE_CHECK_INHERIT_ENV"):
+        return dict(os.environ)
+    env = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper in ENV_ALLOWLIST or upper.startswith(ENV_ALLOWLIST_PREFIXES):
+            env[name] = value
+    return env
+
+
 def pyre_env():
     """Child environment for pyre runs: strict JIT plus one-line stats.
 
@@ -479,7 +571,7 @@ def pyre_env():
     cannot reproduce, the name is the whole diagnosis. Naming costs one stderr
     line per member and only ever prints when a member fails to resolve.
     """
-    env = dict(os.environ)
+    env = child_env_base()
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
     env["PYRE_DESCR_SPELLING_GATE"] = "1"
@@ -553,7 +645,20 @@ def pyre_env():
     # `build_set_hashability` 4 and 1, `str_fstring` 658 and 657. So the pin
     # narrows the class and does not close it, which is why the counter split
     # above exists — those 11 were the fixtures that flipped between hosts.
-    # Host RAM cannot re-open it: `max_delta`
+    #
+    # The residual is not more of the same class, though, and calling those 21
+    # "poll failures" is wrong. Taking `str_fstring` apart guard by guard: its
+    # 658-vs-657 is one guard in trace 6 firing 52 times or 51, and that guard
+    # is an ordinary branch, not the breaker poll. The poll is what bails out;
+    # re-entry after the bailout takes the branch once more, and that hit is
+    # what the counter records. So the counter split above removed the poll
+    # class exactly as described, and what is left is a real deopt the split
+    # cannot absorb and no GC pin closes, because it is not a crossing being
+    # counted. What closes it for a fixture is keeping the fixture short of the
+    # crossing — see `str_fstring.py`'s header, where halving the trip counts
+    # is what settled this one. Holding the startup allocation still
+    # (`child_env_base`) narrows what can move the placement; it does not
+    # remove the placement. Host RAM cannot re-open it: `max_delta`
     # (0.125 * total memory) enters only as an upper bound at collector.rs:3570
     # and the `min_heap_size` floor is applied after it (:2452), so the floor
     # wins on every host.
@@ -643,6 +748,37 @@ def pyre_env():
     # stays reachable for an A/B: pyre reads the variable as a presence flag, so
     # passing it empty is what turns the flag back off.
     env.setdefault("PYTHONSAFEPATH", "1")
+    # Write no bytecode cache, so a reading describes the tree rather than what
+    # earlier runs left on disk. Importing a module the cache already holds
+    # unmarshals where importing it cold compiles, and that difference reaches
+    # jit-stats the same way the ambient import loop above does: `import json,
+    # base64, textwrap` alone drops 30 `__pycache__/*.pyre314.pyc` files into
+    # the pinned stdlib, so the first run of a fresh checkout and every run
+    # after it measure different work.
+    #
+    # It also removes a class of platform disagreement rather than papering
+    # over it. On Windows nothing pyre wrote was readable until FileIO put an
+    # adopted descriptor in binary mode — `_write_atomic` wraps a raw fd, whose
+    # CRT text mode turned every `\n` into `\r\n` — so the same tree read one
+    # set of counters while the cache was dead and another once it worked.
+    #
+    # This suppresses writing only; a stale cache from before this pin is still
+    # read, so an A/B against an older tree wants `__pycache__` cleared first.
+    # `launch_env::finalize` folds the name as an integer flag, so an explicit
+    # PYTHONDONTWRITEBYTECODE=0 turns it back off. It reaches the wasm guest
+    # too: the name is in `LAUNCH_ENV_NAMES`, which the runner forwards through
+    # `pyre_set_launch_env`.
+    #
+    # Only pyre is pinned this way. The oracles are spawned with the inherited
+    # environment (`run_timed([PYTHON3, script])`), so they keep writing and
+    # reading their own caches and import warm from their first run onward,
+    # while pyre now imports cold on every run. Startup subtraction covers the
+    # imports an empty program performs, not the ones a fixture adds on top, so
+    # for the handful that `import json` / `re` / `pickle` the ratio carries
+    # that difference. Determinism is the trade taken here: a warm pyre depends
+    # on what earlier runs left behind, and a ratio that moves with disk state
+    # is worse than one that is consistently cold.
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     # Pin the vendored, `_sre.MAGIC`-matched stdlib so pyre never picks up a
     # version-mismatched host `python3` off the PATH. An explicit PYRE_STDLIB
     # in the environment wins.
@@ -1747,11 +1883,18 @@ class Check:
         # content is not a host disagreement, it is a boundary the harness has
         # not pinned yet. An overlay would have frozen it per platform instead.
         #
-        # An overlay also shadows the shared baseline permanently, so one
-        # written against a value that later converges becomes a failure main
-        # does not have: `recursive_call_frame_relocation` was given one for
-        # 637, and windows later converged on its shared value. Read all three
-        # runners back before adding or retaining another.
+        # `child_env_base` since removed the environment term of that volume:
+        # a child starts from an allowlist rather than a copy of the runner's
+        # environment. That closes one input, not the class -- any other change
+        # in allocation volume still moves the point, which is why taking the
+        # fixture off the threshold is what actually settled it.
+        #
+        # An overlay also shadows the shared baseline permanently, so one written
+        # against a value that later converges becomes a failure main does not
+        # have: `recursive_call_frame_relocation` was given one for 637, and
+        # windows later converged on its shared value. Read all three runners
+        # back before adding one, and prefer removing the fixture's dependence on
+        # the host input to recording the host.
         source = Path(script)
         if os.environ.get("GITHUB_ACTIONS") == "true":
             github_runner = source.with_name(
@@ -2129,6 +2272,7 @@ class Check:
 
     def _retry_performance_gate(
         self, backend, script, timeout, baseline_cmd, expected_output,
+        baseline_key,
     ):
         """Return median (pyre, baseline) timings after a slow first sample.
 
@@ -2138,11 +2282,17 @@ class Check:
         """
         attempts = PERF_RETRY_RUNS
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
+        # The wasm gate's baseline is a pyre binary, not an oracle, so it needs
+        # the pyre environment the numerator already runs under — otherwise the
+        # ratio compares a pinned run against an unpinned one. It was also the
+        # one pyre spawn left outside `pyre_env()`, which is how a bytecode
+        # cache still appeared under a run that pins PYTHONDONTWRITEBYTECODE.
+        baseline_env = pyre_env() if baseline_key in ALL_BACKENDS else None
         pyre_times = []
         baseline_times = []
         for _ in range(attempts):
             _, baseline_time, baseline_code, _ = run_timed(
-                baseline_cmd, timeout_s=effective_timeout,
+                baseline_cmd, timeout_s=effective_timeout, env=baseline_env,
             )
             if baseline_code != 0:
                 return None
@@ -2271,6 +2421,7 @@ class Check:
 
         retry = self._retry_performance_gate(
             backend, script, timeout, baseline_cmd, expected_output,
+            baseline_key,
         )
         if retry is not None:
             median_elapsed, median_baseline = retry

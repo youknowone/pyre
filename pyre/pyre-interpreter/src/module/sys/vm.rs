@@ -2625,8 +2625,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.meta_path — empty
     module_ns_store(ns, "meta_path", w_list_new(vec![]));
     // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
-    // (`-B` / PYTHONDONTWRITEBYTECODE); no bytecode cache is written regardless,
-    // but the reported value tracks the flag for compatibility.
+    // (`-B` / PYTHONDONTWRITEBYTECODE). The flag is honoured, not merely
+    // reported: `_bootstrap_external` writes `__pycache__/*.pyre314.pyc` next
+    // to every source it imports unless it is set.
     module_ns_store(
         ns,
         "dont_write_bytecode",

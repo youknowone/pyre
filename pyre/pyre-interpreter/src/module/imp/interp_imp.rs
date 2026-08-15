@@ -680,6 +680,14 @@ pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_ob
 /// `_cached_compile` store half (best effort): write the marshalled code with
 /// the validating header.  I/O failures (e.g. a read-only stdlib) are ignored —
 /// the next startup simply recompiles.
+///
+/// `-B` / PYTHONDONTWRITEBYTECODE does **not** suppress this, even though the
+/// file lands in `__pycache__`.  A frozen module is marshalled into the binary
+/// at build time and never recompiled; pyre keeps the source and caches the
+/// compile instead, so this file stands in for that build step rather than for
+/// an import-time `.pyc`.  Letting `-B` reach it would make the flag force a
+/// recompile of the ~116 KB bootstrap on every startup, which nothing else
+/// does.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_object::PyObjectRef) {
     let Some(path) = frozen_cache_path(cache_key) else {
