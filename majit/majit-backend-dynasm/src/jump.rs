@@ -129,7 +129,16 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
     let mut pending_dests = dst_locations.len() as i32;
     let mut srccount: IndexMap<i32, i32> = IndexMap::new();
     for dst in dst_locations {
-        srccount.insert(loc_as_key(dst), 0);
+        // `jump.py:7 assert key not in srccount`. A repeated destination shares
+        // one entry while `pending_dests` counts both, so the second one can
+        // never be retired: every key reaches -1, the loop stops making
+        // progress, and the cycle-breaking arm finds no key left at or above
+        // zero to park — the whole call spins. `insert` returns the displaced
+        // value, so the check costs nothing beyond the store already made.
+        assert!(
+            srccount.insert(loc_as_key(dst), 0).is_none(),
+            "duplicate value in dst_locations!",
+        );
     }
     for i in 0..dst_locations.len() {
         let src = src_locations[i];
