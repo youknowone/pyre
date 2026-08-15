@@ -27,6 +27,7 @@ use crate::jitframe::{
     FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
     JF_GUARD_EXC_OFS,
 };
+use crate::jump::RegallocMoves;
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
@@ -776,246 +777,6 @@ impl<'a> AssemblerARM64<'a> {
         }
         self.opref_to_slot.insert(opref, slot);
         slot
-    }
-
-    // ── Location-aware code emission (RPython regalloc parity) ──
-    // assembler.py regalloc_mov: move value between any two locations.
-
-    /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
-    /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
-    pub(crate) fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
-        if majit_ir::debug::have_debug_prints() {
-            majit_ir::debug::log_one("jit-backend", &format!("remap-mov: {src:?} -> {dst:?}"));
-        }
-        match (src, dst) {
-            (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
-            (Loc::Reg(s), Loc::Reg(d)) => {
-                if s.is_xmm && d.is_xmm {
-                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), D(s.value));
-                } else if !s.is_xmm && !d.is_xmm {
-                    dynasm!(self.mc ; .arch aarch64 ; mov X(d.value), X(s.value));
-                } else if s.is_xmm && !d.is_xmm {
-                    dynasm!(self.mc ; .arch aarch64 ; fmov X(d.value), D(s.value));
-                } else {
-                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(s.value));
-                }
-            }
-            (Loc::Reg(s), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
-                if s.is_xmm {
-                    self.emit_str_fp_d(s.value, ofs);
-                } else {
-                    self.emit_str_fp(s.value, ofs);
-                }
-            }
-            (Loc::Frame(f), Loc::Reg(d)) => {
-                let ofs = f.ebp_loc.value;
-                if d.is_xmm {
-                    self.emit_ldr_fp_d(d.value, ofs);
-                } else {
-                    self.emit_ldr_fp(d.value, ofs);
-                }
-            }
-            (Loc::Immed(i), Loc::Reg(d)) => {
-                if d.is_xmm {
-                    self.emit_mov_imm64(16, i.value); // x16 = scratch
-                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
-                } else {
-                    self.emit_mov_imm64(d.value as u32, i.value);
-                }
-            }
-            (Loc::Immed(i), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
-                self.emit_mov_imm64(16, i.value);
-                self.emit_str_fp(16, ofs);
-            }
-            (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
-            (Loc::Frame(f1), Loc::Frame(f2)) => {
-                let o1 = f1.ebp_loc.value;
-                let o2 = f2.ebp_loc.value;
-                self.emit_ldr_fp(16, o1);
-                self.emit_str_fp(16, o2);
-            }
-            _ => {}
-        }
-    }
-
-    fn loc_as_key(loc: &Loc) -> i32 {
-        match loc {
-            Loc::Reg(r) if r.is_xmm => 0x2000 + i32::from(r.value),
-            Loc::Reg(r) => 0x1000 + i32::from(r.value),
-            Loc::Frame(f) => f.ebp_loc.value,
-            Loc::Ebp(e) => e.value,
-            Loc::Immed(_) => i32::MIN,
-            Loc::Addr(a) => a.offset,
-        }
-    }
-
-    fn loc_width(loc: &Loc) -> usize {
-        match loc {
-            Loc::Reg(r) => r.get_width(),
-            Loc::Frame(f) => f.ebp_loc.get_width(),
-            Loc::Ebp(e) => e.get_width(),
-            _ => WORD,
-        }
-    }
-
-    fn regalloc_push(&mut self, loc: &Loc) {
-        match loc {
-            Loc::Reg(r) if r.is_xmm => {
-                dynasm!(self.mc ; .arch aarch64 ; str D(r.value), [sp, #-16]!);
-            }
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, #-16]!);
-            }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                self.emit_ldr_fp_d(15, f.ebp_loc.value);
-                dynasm!(self.mc ; .arch aarch64 ; str D(15), [sp, #-16]!);
-            }
-            Loc::Frame(f) => {
-                self.emit_ldr_fp(16, f.ebp_loc.value);
-                dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, #-16]!);
-            }
-            _ => {}
-        }
-    }
-
-    fn regalloc_pop(&mut self, loc: &Loc) {
-        match loc {
-            Loc::Reg(r) if r.is_xmm => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(r.value), [sp], #16);
-            }
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr X(r.value), [sp], #16);
-            }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16);
-                self.emit_str_fp_d(15, f.ebp_loc.value);
-            }
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16);
-                self.emit_str_fp(16, f.ebp_loc.value);
-            }
-            _ => {}
-        }
-    }
-
-    fn remap_frame_layout(&mut self, src_locations: &[Loc], dst_locations: &[Loc], tmpreg: Loc) {
-        let mut pending_dests = dst_locations.len() as i32;
-        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
-        for dst in dst_locations {
-            srccount.insert(Self::loc_as_key(dst), 0);
-        }
-        for i in 0..dst_locations.len() {
-            let src = src_locations[i];
-            if src.is_immed() {
-                continue;
-            }
-            let key = Self::loc_as_key(&src);
-            if let Some(cnt) = srccount.get_mut(&key) {
-                if key == Self::loc_as_key(&dst_locations[i]) {
-                    *cnt = -(dst_locations.len() as i32) - 1;
-                    pending_dests -= 1;
-                } else {
-                    *cnt += 1;
-                }
-            }
-        }
-
-        while pending_dests > 0 {
-            let mut progress = false;
-            for i in 0..dst_locations.len() {
-                let dst = dst_locations[i];
-                let key = Self::loc_as_key(&dst);
-                if srccount.get(&key).copied().unwrap_or(-1) == 0 {
-                    srccount.insert(key, -1);
-                    pending_dests -= 1;
-                    let src = src_locations[i];
-                    if !src.is_immed() {
-                        let src_key = Self::loc_as_key(&src);
-                        if let Some(cnt) = srccount.get_mut(&src_key) {
-                            *cnt -= 1;
-                        }
-                    }
-                    if dst.is_stack() && src.is_stack() {
-                        self.regalloc_mov(&src, &tmpreg);
-                        self.regalloc_mov(&tmpreg, &dst);
-                    } else {
-                        self.regalloc_mov(&src, &dst);
-                    }
-                    progress = true;
-                }
-            }
-            if !progress {
-                let mut sources: IndexMap<i32, Loc> = IndexMap::new();
-                for i in 0..dst_locations.len() {
-                    sources.insert(Self::loc_as_key(&dst_locations[i]), src_locations[i]);
-                }
-                for dst in dst_locations {
-                    let originalkey = Self::loc_as_key(dst);
-                    if srccount.get(&originalkey).copied().unwrap_or(-1) >= 0 {
-                        self.regalloc_push(dst);
-                        let mut cur_dst = *dst;
-                        loop {
-                            let key = Self::loc_as_key(&cur_dst);
-                            srccount.insert(key, -1);
-                            pending_dests -= 1;
-                            let src = sources[&key];
-                            if Self::loc_as_key(&src) == originalkey {
-                                break;
-                            }
-                            if cur_dst.is_stack() && src.is_stack() {
-                                self.regalloc_mov(&src, &tmpreg);
-                                self.regalloc_mov(&tmpreg, &cur_dst);
-                            } else {
-                                self.regalloc_mov(&src, &cur_dst);
-                            }
-                            cur_dst = src;
-                        }
-                        self.regalloc_pop(&cur_dst);
-                    }
-                }
-            }
-        }
-    }
-
-    fn remap_frame_layout_mixed(
-        &mut self,
-        src_locations1: &[Loc],
-        dst_locations1: &[Loc],
-        tmpreg1: Loc,
-        src_locations2: &[Loc],
-        dst_locations2: &[Loc],
-        tmpreg2: Loc,
-    ) {
-        let mut extrapushes = Vec::new();
-        let mut dst_keys = IndexMap::new();
-        for loc in dst_locations1 {
-            dst_keys.insert(Self::loc_as_key(loc), ());
-        }
-        let mut src_locations2red = Vec::new();
-        let mut dst_locations2red = Vec::new();
-        for i in 0..src_locations2.len() {
-            let loc = src_locations2[i];
-            let dstloc = dst_locations2[i];
-            if loc.is_stack() {
-                let key = Self::loc_as_key(&loc);
-                if dst_keys.contains_key(&key)
-                    || (Self::loc_width(&loc) > WORD && dst_keys.contains_key(&(key + WORD as i32)))
-                {
-                    self.regalloc_push(&loc);
-                    extrapushes.push(dstloc);
-                    continue;
-                }
-            }
-            src_locations2red.push(loc);
-            dst_locations2red.push(dstloc);
-        }
-        self.remap_frame_layout(src_locations1, dst_locations1, tmpreg1);
-        self.remap_frame_layout(&src_locations2red, &dst_locations2red, tmpreg2);
-        while let Some(loc) = extrapushes.pop() {
-            self.regalloc_pop(&loc);
-        }
     }
 
     /// Load a (lhs, src) pair for a 3-operand binop into registers,
@@ -3153,7 +2914,8 @@ impl<'a> AssemblerARM64<'a> {
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::RegLoc::new(16, false));
                 let tmpreg2 = Loc::Reg(crate::regloc::RegLoc::new(15, true));
-                self.remap_frame_layout_mixed(
+                crate::jump::remap_frame_layout_mixed(
+                    self,
                     &src_locations1,
                     &dst_locations1,
                     tmpreg1,
@@ -5911,8 +5673,8 @@ impl<'a> AssemblerARM64<'a> {
         // aarch64/callbuilder.py:62-65 — remap non-float then float args.
         let tmp_nf = Loc::Reg(crate::regloc::RegLoc::new(16, false)); // x16 (ip0)
         let tmp_fp = Loc::Reg(crate::regloc::RegLoc::new(15, true)); // d15
-        self.remap_frame_layout(&non_float_src, &non_float_dst, tmp_nf);
-        self.remap_frame_layout(&float_src, &float_dst, tmp_fp);
+        crate::jump::remap_frame_layout(self, &non_float_src, &non_float_dst, tmp_nf);
+        crate::jump::remap_frame_layout(self, &float_src, &float_dst, tmp_fp);
 
         // Immediate args after remap (each targets a distinct ABI reg).
         for (abi_idx, val, is_float) in immed_args {
@@ -8156,5 +7918,107 @@ mod tests {
             immed_cards, expected,
             "each index must dirty exactly its own card, and nothing else"
         );
+    }
+}
+
+/// `jump.py`'s three primitives. The parallel-move algorithm that drives
+/// them is one shared implementation in `crate::jump`; only these differ per
+/// backend, which is what makes them the trait and it the free function.
+impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
+    fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one("jit-backend", &format!("remap-mov: {src:?} -> {dst:?}"));
+        }
+        match (src, dst) {
+            (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
+            (Loc::Reg(s), Loc::Reg(d)) => {
+                if s.is_xmm && d.is_xmm {
+                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), D(s.value));
+                } else if !s.is_xmm && !d.is_xmm {
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(d.value), X(s.value));
+                } else if s.is_xmm && !d.is_xmm {
+                    dynasm!(self.mc ; .arch aarch64 ; fmov X(d.value), D(s.value));
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(s.value));
+                }
+            }
+            (Loc::Reg(s), Loc::Frame(f)) => {
+                let ofs = f.ebp_loc.value;
+                if s.is_xmm {
+                    self.emit_str_fp_d(s.value, ofs);
+                } else {
+                    self.emit_str_fp(s.value, ofs);
+                }
+            }
+            (Loc::Frame(f), Loc::Reg(d)) => {
+                let ofs = f.ebp_loc.value;
+                if d.is_xmm {
+                    self.emit_ldr_fp_d(d.value, ofs);
+                } else {
+                    self.emit_ldr_fp(d.value, ofs);
+                }
+            }
+            (Loc::Immed(i), Loc::Reg(d)) => {
+                if d.is_xmm {
+                    self.emit_mov_imm64(16, i.value); // x16 = scratch
+                    dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(16));
+                } else {
+                    self.emit_mov_imm64(d.value as u32, i.value);
+                }
+            }
+            (Loc::Immed(i), Loc::Frame(f)) => {
+                let ofs = f.ebp_loc.value;
+                self.emit_mov_imm64(16, i.value);
+                self.emit_str_fp(16, ofs);
+            }
+            (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
+            (Loc::Frame(f1), Loc::Frame(f2)) => {
+                let o1 = f1.ebp_loc.value;
+                let o2 = f2.ebp_loc.value;
+                self.emit_ldr_fp(16, o1);
+                self.emit_str_fp(16, o2);
+            }
+            _ => {}
+        }
+    }
+
+    fn regalloc_push(&mut self, loc: &Loc) {
+        match loc {
+            Loc::Reg(r) if r.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; str D(r.value), [sp, #-16]!);
+            }
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, #-16]!);
+            }
+            Loc::Frame(f) if f.ebp_loc.is_float => {
+                self.emit_ldr_fp_d(15, f.ebp_loc.value);
+                dynasm!(self.mc ; .arch aarch64 ; str D(15), [sp, #-16]!);
+            }
+            Loc::Frame(f) => {
+                self.emit_ldr_fp(16, f.ebp_loc.value);
+                dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, #-16]!);
+            }
+            _ => {}
+        }
+    }
+
+    fn regalloc_pop(&mut self, loc: &Loc) {
+        match loc {
+            Loc::Reg(r) if r.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(r.value), [sp], #16);
+            }
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr X(r.value), [sp], #16);
+            }
+            Loc::Frame(f) if f.ebp_loc.is_float => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16);
+                self.emit_str_fp_d(15, f.ebp_loc.value);
+            }
+            Loc::Frame(f) => {
+                dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16);
+                self.emit_str_fp(16, f.ebp_loc.value);
+            }
+            _ => {}
+        }
     }
 }

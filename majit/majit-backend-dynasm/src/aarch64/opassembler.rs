@@ -10,6 +10,7 @@
 use dynasmrt::{DynasmApi, dynasm};
 
 use super::assembler::AssemblerARM64;
+use crate::jump::RegallocMoves;
 use crate::regloc::{Loc, RegLoc};
 
 impl<'a> AssemblerARM64<'a> {

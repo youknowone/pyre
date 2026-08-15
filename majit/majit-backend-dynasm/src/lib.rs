@@ -25,7 +25,7 @@ pub mod guard;
 pub(crate) mod j2plan;
 pub use majit_backend::jitframe;
 pub use majit_backend::llmodel;
-pub mod jump;
+pub(crate) mod jump;
 #[expect(
     clippy::too_many_arguments,
     reason = "the register-allocation entry points preserve RPython's explicit state-threading signatures; bundling those arguments would diverge from the audited line-by-line backend port"
