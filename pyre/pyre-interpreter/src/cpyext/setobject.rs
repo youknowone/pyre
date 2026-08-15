@@ -21,10 +21,8 @@ fn method(
     for &argument in args {
         roots.pin_root(argument);
     }
-    let bound = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(base),
-        name,
-    )?;
+    let bound =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(base), name)?;
     let bound_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(bound);
     let args: Vec<PyObjectRef> = (0..args.len())

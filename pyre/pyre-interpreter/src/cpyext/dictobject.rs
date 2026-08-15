@@ -221,10 +221,7 @@ pub unsafe extern "C" fn PyDict_Copy(object: *mut CPyObject) -> *mut CPyObject {
 /// # Safety
 /// `key` must be a NUL-terminated string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyDict_DelItemString(
-    object: *mut CPyObject,
-    key: *const c_char,
-) -> c_int {
+pub unsafe extern "C" fn PyDict_DelItemString(object: *mut CPyObject, key: *const c_char) -> c_int {
     let (Some(dict), Some(name)) = (dict_argument(object, "PyDict_DelItemString"), key_name(key))
     else {
         return -1;
@@ -246,8 +243,10 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(
     object: *mut CPyObject,
     key: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(dict), Some(key)) = (dict_argument(object, "PyDict_GetItemWithError"), argument(key))
-    else {
+    let (Some(dict), Some(key)) = (
+        dict_argument(object, "PyDict_GetItemWithError"),
+        argument(key),
+    ) else {
         return std::ptr::null_mut();
     };
     match crate::baseobjspace::getitem(dict, key) {
@@ -297,7 +296,8 @@ pub unsafe extern "C" fn PyDict_GetItemRef(
     key: *mut CPyObject,
     result: *mut *mut CPyObject,
 ) -> c_int {
-    let (Some(dict), Some(key)) = (dict_argument(object, "PyDict_GetItemRef"), argument(key)) else {
+    let (Some(dict), Some(key)) = (dict_argument(object, "PyDict_GetItemRef"), argument(key))
+    else {
         return -1;
     };
     let found = match crate::baseobjspace::getitem(dict, key) {
@@ -331,7 +331,11 @@ pub unsafe extern "C" fn PyDict_GetItemStringRef(
 /// Build one of the three view lists.  Upstream answers a `list` rather than a
 /// view object (`dictobject.py:180-206`), the C caller expecting something it
 /// can index.
-fn view_list(object: *mut CPyObject, name: &str, part: fn(PyObjectRef) -> Vec<PyObjectRef>) -> *mut CPyObject {
+fn view_list(
+    object: *mut CPyObject,
+    name: &str,
+    part: fn(PyObjectRef) -> Vec<PyObjectRef>,
+) -> *mut CPyObject {
     let Some(dict) = dict_argument(object, name) else {
         return std::ptr::null_mut();
     };
@@ -414,9 +418,9 @@ pub unsafe extern "C" fn PyDict_Merge(
         };
         let keys_slot = pyre_object::gc_roots::shadow_stack_len();
         roots.pin_root(keys);
-        let keys = match trap(unpack_all(
-            pyre_object::gc_roots::shadow_stack_get(keys_slot),
-        )) {
+        let keys = match trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
+            keys_slot,
+        ))) {
             Some(keys) => keys,
             None => return -1,
         };
@@ -472,10 +476,9 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     seq2: *mut CPyObject,
     over: c_int,
 ) -> c_int {
-    let (Some(target), Some(sequence)) = (
-        dict_argument(into, "PyDict_MergeFromSeq2"),
-        argument(seq2),
-    ) else {
+    let (Some(target), Some(sequence)) =
+        (dict_argument(into, "PyDict_MergeFromSeq2"), argument(seq2))
+    else {
         return -1;
     };
     let roots = pyre_object::gc_roots::push_roots();
@@ -484,17 +487,17 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     roots.pin_root(sequence);
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
 
-    let Some(pairs) = trap(unpack_all(
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-    )) else {
+    let Some(pairs) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
+        base + 1,
+    ))) else {
         return -1;
     };
     for (index, pair) in pairs.into_iter().enumerate() {
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
         roots.pin_root(pair);
-        let Some(items) = trap(unpack_all(
-            pyre_object::gc_roots::shadow_stack_get(pair_slot),
-        )) else {
+        let Some(items) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
+            pair_slot,
+        ))) else {
             return -1;
         };
         if items.len() != 2 {
@@ -534,10 +537,9 @@ type SnapshotMap = std::collections::HashMap<
     usize,
     std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
 >;
-static ITERATION_KEYS: super::ForkMutex<SnapshotMap> =
-    super::ForkMutex::new(SnapshotMap::with_hasher(
-        std::hash::BuildHasherDefault::new(),
-    ));
+static ITERATION_KEYS: super::ForkMutex<SnapshotMap> = super::ForkMutex::new(
+    SnapshotMap::with_hasher(std::hash::BuildHasherDefault::new()),
+);
 
 /// `PyDict_Next(dict, &pos, &key, &value)` — 1 for each pair, 0 once they are
 /// all reported.  `pos` starts at 0 and is only ever handed back
@@ -579,9 +581,7 @@ pub unsafe extern "C" fn PyDict_Next(
         .map(|(key, _)| key)
         .collect();
         let held = pyobject::make_ref(pyre_object::listobject::w_list_new(keys));
-        let previous = ITERATION_KEYS
-            .lock()
-            .insert(object as usize, held as usize);
+        let previous = ITERATION_KEYS.lock().insert(object as usize, held as usize);
         if let Some(previous) = previous {
             unsafe { pyobject::decref(previous as *mut CPyObject) };
         }

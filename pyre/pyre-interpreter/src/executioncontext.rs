@@ -514,9 +514,8 @@ impl ExecutionContext {
         ))]
         {
             let space = self.space;
-            SPACE_CPYEXT_DEALLOC_ACTION.get_or_init(|| {
-                Box::into_raw(PyObjDeallocAction::new(space, actionflag)) as usize
-            });
+            SPACE_CPYEXT_DEALLOC_ACTION
+                .get_or_init(|| Box::into_raw(PyObjDeallocAction::new(space, actionflag)) as usize);
         }
         crate::module::gc::hook::initialize(self.space, actionflag);
         pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
@@ -2726,10 +2725,7 @@ static SPACE_CPYEXT_DEALLOC_ACTION: OnceLock<usize> = OnceLock::new();
     any(target_os = "macos", target_os = "linux")
 ))]
 pub fn fire_cpyext_dealloc_action() {
-    let action = SPACE_CPYEXT_DEALLOC_ACTION
-        .get()
-        .copied()
-        .unwrap_or(0) as *mut PyObjDeallocAction;
+    let action = SPACE_CPYEXT_DEALLOC_ACTION.get().copied().unwrap_or(0) as *mut PyObjDeallocAction;
     if !action.is_null() {
         unsafe { (*action).base.fire() };
     }
