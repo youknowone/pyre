@@ -783,6 +783,8 @@ PyAPI_FUNC(PyObject *) PyNumber_And(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_Xor(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_Or(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_Power(PyObject *base, PyObject *exponent, PyObject *modulus);
+PyAPI_FUNC(PyObject *) PyNumber_InPlacePower(PyObject *base, PyObject *exponent, PyObject *modulus);
+PyAPI_FUNC(PyObject *) PyNumber_ToBase(PyObject *object, int base);
 PyAPI_FUNC(PyObject *) PyNumber_InPlaceAdd(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_InPlaceSubtract(PyObject *left, PyObject *right);
 PyAPI_FUNC(PyObject *) PyNumber_InPlaceMultiply(PyObject *left, PyObject *right);
@@ -820,6 +822,16 @@ PyAPI_FUNC(Py_ssize_t) PySequence_Index(PyObject *object, PyObject *value);
 PyAPI_FUNC(PyObject *) PySequence_List(PyObject *object);
 PyAPI_FUNC(PyObject *) PySequence_Tuple(PyObject *object);
 PyAPI_FUNC(PyObject *) PySequence_GetSlice(PyObject *object, Py_ssize_t start, Py_ssize_t stop);
+PyAPI_FUNC(int) PySequence_SetSlice(PyObject *object, Py_ssize_t low, Py_ssize_t high, PyObject *value);
+PyAPI_FUNC(int) PySequence_DelSlice(PyObject *object, Py_ssize_t low, Py_ssize_t high);
+PyAPI_FUNC(int) PySequence_In(PyObject *object, PyObject *value);
+PyAPI_FUNC(Py_ssize_t) PySequence_Count(PyObject *object, PyObject *value);
+PyAPI_FUNC(PyObject *) PySequence_Fast(PyObject *object, const char *message);
+/* Functions rather than the macros the reference header spells: a mirror has
+   no item array of its own, so the length and the items come from the
+   interpreter object behind it. */
+PyAPI_FUNC(Py_ssize_t) PySequence_Fast_GET_SIZE(PyObject *object);
+PyAPI_FUNC(PyObject *) PySequence_Fast_GET_ITEM(PyObject *object, Py_ssize_t index);
 
 /* The mapping protocol. */
 PyAPI_FUNC(int) PyMapping_Check(PyObject *object);
@@ -839,6 +851,7 @@ PyAPI_FUNC(PyObject *) PyObject_GetIter(PyObject *object);
 PyAPI_FUNC(PyObject *) PyObject_SelfIter(PyObject *object);
 PyAPI_FUNC(int) PyIter_Check(PyObject *object);
 PyAPI_FUNC(PyObject *) PyIter_Next(PyObject *object);
+PyAPI_FUNC(int) PyIter_NextItem(PyObject *iterator, PyObject **item);
 PyAPI_FUNC(PySendResult) PyIter_Send(PyObject *iterator, PyObject *value, PyObject **result);
 PyAPI_FUNC(PyObject *) PyObject_GetAIter(PyObject *object);
 PyAPI_FUNC(int) PyAiter_Check(PyObject *object);
@@ -928,11 +941,36 @@ PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t size);
 PyAPI_FUNC(Py_ssize_t) PyTuple_Size(PyObject *object);
 PyAPI_FUNC(PyObject *) PyTuple_GetItem(PyObject *object, Py_ssize_t index);
 PyAPI_FUNC(int) PyTuple_SetItem(PyObject *object, Py_ssize_t index, PyObject *item);
+PyAPI_FUNC(PyObject *) PyTuple_GetSlice(PyObject *object, Py_ssize_t low, Py_ssize_t high);
 PyAPI_FUNC(int) PyTuple_Check(PyObject *object);
 PyAPI_FUNC(int) PyTuple_CheckExact(PyObject *object);
 #define PyTuple_GET_SIZE(ob) PyTuple_Size((PyObject *)(ob))
 #define PyTuple_GET_ITEM(ob, i) PyTuple_GetItem((PyObject *)(ob), (i))
 #define PyTuple_SET_ITEM(ob, i, v) ((void)PyTuple_SetItem((PyObject *)(ob), (i), (v)))
+
+/* Variadic, so it is built here out of the non-variadic exports. */
+static inline PyObject *PyTuple_Pack(Py_ssize_t n, ...)
+{
+    PyObject *result = PyTuple_New(n);
+    va_list vargs;
+    Py_ssize_t i;
+
+    if (result == NULL) {
+        return NULL;
+    }
+    va_start(vargs, n);
+    for (i = 0; i < n; i++) {
+        PyObject *item = va_arg(vargs, PyObject *);
+        Py_XINCREF(item);
+        if (PyTuple_SetItem(result, i, item) < 0) {
+            va_end(vargs);
+            Py_DECREF(result);
+            return NULL;
+        }
+    }
+    va_end(vargs);
+    return result;
+}
 
 /* list. */
 PyAPI_FUNC(PyObject *) PyList_New(Py_ssize_t size);
@@ -940,11 +978,33 @@ PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *object);
 PyAPI_FUNC(PyObject *) PyList_GetItem(PyObject *object, Py_ssize_t index);
 PyAPI_FUNC(int) PyList_SetItem(PyObject *object, Py_ssize_t index, PyObject *item);
 PyAPI_FUNC(int) PyList_Append(PyObject *object, PyObject *item);
+PyAPI_FUNC(PyObject *) PyList_GetItemRef(PyObject *object, Py_ssize_t index);
+PyAPI_FUNC(int) PyList_Insert(PyObject *object, Py_ssize_t index, PyObject *item);
+PyAPI_FUNC(int) PyList_Sort(PyObject *object);
+PyAPI_FUNC(int) PyList_Reverse(PyObject *object);
+PyAPI_FUNC(PyObject *) PyList_AsTuple(PyObject *object);
+PyAPI_FUNC(PyObject *) PyList_GetSlice(PyObject *object, Py_ssize_t low, Py_ssize_t high);
+PyAPI_FUNC(int) PyList_SetSlice(PyObject *object, Py_ssize_t low, Py_ssize_t high, PyObject *itemlist);
 PyAPI_FUNC(int) PyList_Check(PyObject *object);
 PyAPI_FUNC(int) PyList_CheckExact(PyObject *object);
 #define PyList_GET_SIZE(ob) PyList_Size((PyObject *)(ob))
 #define PyList_GET_ITEM(ob, i) PyList_GetItem((PyObject *)(ob), (i))
 #define PyList_SET_ITEM(ob, i, v) ((void)PyList_SetItem((PyObject *)(ob), (i), (v)))
+
+/* slice. */
+PyAPI_FUNC(PyObject *) PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
+PyAPI_FUNC(int) PySlice_Check(PyObject *object);
+PyAPI_FUNC(int) PySlice_Unpack(PyObject *slice, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step);
+PyAPI_FUNC(Py_ssize_t) PySlice_AdjustIndices(Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t step);
+PyAPI_FUNC(int) PySlice_GetIndices(PyObject *slice, Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step);
+PyAPI_FUNC(int) PySlice_GetIndicesEx(PyObject *slice, Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step, Py_ssize_t *slicelength);
+/* The spelling every extension compiles against.  The exported function is the
+   same composition, so a caller reaching either gets the same answer. */
+#define PySlice_GetIndicesEx(slice, length, start, stop, step, slicelen) (      \
+    PySlice_Unpack((slice), (start), (stop), (step)) < 0 ?                      \
+    ((*(slicelen) = 0), -1) :                                                   \
+    ((*(slicelen) = PySlice_AdjustIndices((length), (start), (stop), *(step))), \
+     0))
 
 /* dict. */
 PyAPI_FUNC(PyObject *) PyDict_New(void);

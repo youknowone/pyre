@@ -93,6 +93,39 @@ pub unsafe extern "C" fn PyIter_Next(object: *mut CPyObject) -> *mut CPyObject {
     }
 }
 
+/// `PyIter_NextItem(iterator, *item)` — 1 with the next item, 0 with NULL at
+/// exhaustion, -1 with NULL and an exception set.
+///
+/// The spelling that tells an exhausted iterator apart from a failed one
+/// without reading the error indicator, which `PyIter_Next` cannot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyIter_NextItem(
+    iterator: *mut CPyObject,
+    item: *mut *mut CPyObject,
+) -> c_int {
+    if item.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    unsafe { *item = std::ptr::null_mut() };
+    let Some(iterator) = argument(iterator) else {
+        return -1;
+    };
+    match crate::baseobjspace::next(iterator) {
+        Ok(value) => {
+            unsafe { *item = pyobject::make_ref(value) };
+            1
+        }
+        Err(mut error) => {
+            if is_stop_iteration(&mut error) {
+                return 0;
+            }
+            super::pyerrors::set_pending_error(error);
+            -1
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GetAIter(object: *mut CPyObject) -> *mut CPyObject {
     let Some(object) = argument(object) else {
@@ -179,6 +212,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyIter_Check as *const ());
     std::hint::black_box(PyAiter_Check as *const ());
     std::hint::black_box(PyIter_Next as *const ());
+    std::hint::black_box(PyIter_NextItem as *const ());
     std::hint::black_box(PyObject_GetAIter as *const ());
     std::hint::black_box(PyIter_Send as *const ());
 }

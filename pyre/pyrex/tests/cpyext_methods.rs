@@ -214,6 +214,89 @@ assert got == 2, got
 assert (after_merge, after_update) == (3, 3), (after_merge, after_update)
 assert (kept, replaced) == (2, 20), (kept, replaced)
 
+# ── the rest of the list protocol, PyTuple_Pack and PyTuple_GetSlice ───
+(head, after_reverse, after_sort,
+ as_tuple, sliced, mutated, packed, tuple_slice) = m.list_ops([3, 1, 2])
+
+# 99 went in at the front and PyList_GetItemRef read it back.
+assert head == 99, head
+# [99,3,1,2] reversed is [2,1,3,99]; sorting it puts 1 first.
+assert after_reverse == 2, after_reverse
+assert after_sort == 1, after_sort
+assert as_tuple == (1, 2, 3, 99), as_tuple
+assert sliced == [2, 3], sliced
+# [1,2,3,99] with [0:2] replaced by [-1,-2] is [-1,-2,3,99]; deleting [0:1]
+# leaves [-2,3,99].
+assert mutated == [-2, 3, 99], mutated
+assert packed == (None, True, False), packed
+assert tuple_slice == (True, False), tuple_slice
+
+# ── the slice protocol ─────────────────────────────────────────────────
+(u_start, u_stop, u_step,
+ a_start, a_stop, a_len,
+ g_start, g_stop, g_step,
+ e_start, e_stop, e_step, e_len,
+ made, made_is_slice, none_is_slice) = m.slice_ops(slice(1, 10, 2), 5)
+
+# Unpack reads the bounds without consulting the length.
+assert (u_start, u_stop, u_step) == (1, 10, 2), (u_start, u_stop, u_step)
+# Adjusting against 5 clips the stop and leaves 2 items: 1 and 3.
+assert (a_start, a_stop, a_len) == (1, 5, 2), (a_start, a_stop, a_len)
+assert (g_start, g_stop, g_step) == (1, 5, 2), (g_start, g_stop, g_step)
+assert (e_start, e_stop, e_step, e_len) == (1, 5, 2, 2)
+assert made == slice(1, None, 1), made
+assert (made_is_slice, none_is_slice) == (1, 0)
+
+# An unbounded negative slice unpacks to the open-ended sentinels.
+u_start, u_stop, u_step, a_start, a_stop, a_len = \
+    m.slice_ops(slice(None, None, -1), 4)[:6]
+assert u_start == sys.maxsize, u_start
+assert u_stop == -sys.maxsize - 1, u_stop
+assert u_step == -1
+assert (a_start, a_stop, a_len) == (3, -1, 4), (a_start, a_stop, a_len)
+
+# ── the rest of the sequence protocol, PyIter_NextItem, ToBase, ipow ───
+(count, contained, fast_items, fast_size, fast_is_self,
+ drained, clean, owned, based, powered) = m.seq_more([1, 2, 2, 3], 2)
+
+assert (count, contained) == (2, 1), (count, contained)
+# A list is already fast, so PySequence_Fast hands back the list itself.
+assert fast_is_self == 1
+assert (fast_items, fast_size) == ([1, 2, 2, 3], 4)
+assert drained == [1, 2, 2, 3], drained
+assert clean == 1
+# [1,2,2,3] with [0:1] set to [7] is [7,2,2,3]; deleting [1:2] leaves [7,2,3].
+assert owned == [7, 2, 3], owned
+assert based == '0x2', based
+assert powered == 81, powered
+
+# A range is neither a list nor a tuple, so PySequence_Fast builds one.
+(count, contained, fast_items, fast_size, fast_is_self,
+ drained, clean, owned, based, powered) = m.seq_more(range(4), 2)
+
+assert (count, contained) == (1, 1), (count, contained)
+assert fast_is_self == 0
+assert (fast_items, fast_size) == ([0, 1, 2, 3], 4)
+assert drained == [0, 1, 2, 3], drained
+assert owned == [7, 2, 3], owned
+assert based == '0x2'
+
+# PyNumber_ToBase rejects a base it has no marker for.
+try:
+    m.to_base(5, 7)
+except SystemError:
+    pass
+else:
+    raise AssertionError('to_base accepted base 7')
+assert m.to_base(255, 2) == '0b11111111'
+assert m.to_base(255, 8) == '0o377'
+assert m.to_base(255, 10) == '255'
+assert m.to_base(255, 16) == '0xff'
+
+# PySequence_GetItem under sustained allocation pressure: 20000 calls, each
+# boxing its own index, over a list built inside the same C call.
+assert m.gc_window(20000) == 70000, m.gc_window(20000)
+
 print('cpyext-methods-ok')
 "#;
 

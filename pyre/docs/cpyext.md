@@ -96,7 +96,20 @@ the header below.
 - the `tp_as_async` table as `__await__` / `__aiter__` / `__anext__`, with
   `am_send` reached through `PyIter_Send`, and the iterator entry points
   `PyObject_GetIter`, `PyObject_SelfIter`, `PyIter_Check`, `PyIter_Next`,
-  `PyObject_GetAIter` and `PyAiter_Check` (`cpyext/iterator.rs`);
+  `PyIter_NextItem`, `PyObject_GetAIter` and `PyAiter_Check`
+  (`cpyext/iterator.rs`);
+- the concrete `list`, `tuple` and `slice` protocols (`cpyext/listobject.rs`,
+  `cpyext/tupleobject.rs`, `cpyext/sliceobject.rs`): all of `listobject.h` and
+  `tupleobject.h`, and `PySlice_New` / `Check` / `Unpack` / `AdjustIndices` /
+  `GetIndices` / `GetIndicesEx`.  Three of these are not exports:
+  `PyTuple_Pack` is variadic, so it is a `static inline` in `Python.h` built
+  from `PyTuple_New` and `PyTuple_SetItem`; `PySequence_Fast_GET_ITEM` and
+  `PySequence_Fast_GET_SIZE` are functions rather than the macros the
+  reference header spells, because a mirror carries no item array of its own
+  and the length and items have to come from the interpreter object.
+  `PySlice_GetIndicesEx` is both, matching the reference header: a macro over
+  `PySlice_Unpack` and `PySlice_AdjustIndices` plus an export that is the same
+  composition;
 - the `tp_as_buffer` table (`cpyext/buffer.rs`): a C exporter's `bf_getbuffer`
   becomes a `memoryview` over the exported memory and its `bf_releasebuffer`
   runs when that view is released, so `memoryview(x)`, `bytes(x)` and the
@@ -173,8 +186,16 @@ Known divergences, each documented at its definition:
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
    pyre does not take; `Py_tp_token` and `PyType_GetBaseByToken`; and the
-   remaining generated API;
+   remaining generated API. Of the 763 `PyAPI_FUNC` entry points CPython 3.14
+   declares in its top-level `Include/*.h`, 270 are present;
 6. Windows API DLL/import-library packaging.
+
+`PySequence_Fast_ITEMS` is absent rather than pending: it hands out a
+`PyObject **` into the sequence's own storage, which requires a list whose
+items are a contiguous array of mirrors. Upstream converts the list to a
+CPython-backed strategy for exactly this (`cpyext/listobject.py`
+`get_list_storage`); pyre has no such strategy, so there is no array to point
+at.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
 binary would falsely claim that CPython's private object layouts and symbols
@@ -211,6 +232,12 @@ are ABI-compatible with pyre.
 - `pypy/module/cpyext/buffer.py` and `memoryobject.py`: `Py_buffer`, the
   `PyBuffer_*` entry points and `PyMemoryView_*`.
 - `pypy/module/cpyext/iterator.py`: the iterator entry points.
+- `pypy/module/cpyext/listobject.py`, `tupleobject.py` and `sliceobject.py`:
+  the concrete list, tuple and slice entry points. Two divergences, both
+  following the 3.14 specification where upstream predates it:
+  `PySequence_Fast` answers a list where `sequence.py:52-66` answers a tuple,
+  and `PyNumber_ToBase(n, 10)` is the plain decimal spelling rather than a
+  radix format, `format_index_radix` covering only the power-of-two radices.
 - `pypy/module/cpyext/src/getargs.c`: `PyArg_ParseTuple` and `Py_BuildValue`,
   which are C there too.
 - `pypy/module/imp/interp_imp.py`: `_imp` entry points.

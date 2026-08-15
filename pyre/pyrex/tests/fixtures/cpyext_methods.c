@@ -632,6 +632,258 @@ done:
     return result;
 }
 
+/* Drive the list entry points, PyTuple_Pack and PyTuple_GetSlice.
+   `args` is (items,). */
+static PyObject *m_list_ops(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *items;
+    if (!PyArg_ParseTuple(args, "O", &items)) {
+        return NULL;
+    }
+
+    PyObject *built = NULL, *ref = NULL, *as_tuple = NULL, *sliced = NULL;
+    PyObject *packed = NULL, *tuple_slice = NULL, *result = NULL;
+    long head_value = -1, after_reverse = -1, after_sort = -1;
+
+    built = PySequence_List(items);
+    if (built == NULL) goto done;
+
+    /* Insert at the front, then read the new head back strongly. */
+    PyObject *head = PyLong_FromLong(99);
+    if (head == NULL) goto done;
+    int inserted = PyList_Insert(built, 0, head);
+    Py_DECREF(head);
+    if (inserted < 0) goto done;
+    ref = PyList_GetItemRef(built, 0);
+    if (ref == NULL) goto done;
+    head_value = PyLong_AsLong(ref);
+
+    /* Reverse, then sort: the sorted order is the one that survives. */
+    if (PyList_Reverse(built) < 0) goto done;
+    after_reverse = PyLong_AsLong(PyList_GetItem(built, 0));
+    if (PyList_Sort(built) < 0) goto done;
+    after_sort = PyLong_AsLong(PyList_GetItem(built, 0));
+
+    as_tuple = PyList_AsTuple(built);
+    sliced = PyList_GetSlice(built, 1, 3);
+    if (as_tuple == NULL || sliced == NULL) goto done;
+
+    /* Replace [0:2] with a two-item list, then delete [0:1]. */
+    PyObject *replacement = Py_BuildValue("[ii]", -1, -2);
+    if (replacement == NULL) goto done;
+    int replaced = PyList_SetSlice(built, 0, 2, replacement);
+    Py_DECREF(replacement);
+    if (replaced < 0) goto done;
+    if (PyList_SetSlice(built, 0, 1, NULL) < 0) goto done;
+
+    packed = PyTuple_Pack(3, Py_None, Py_True, Py_False);
+    if (packed == NULL) goto done;
+    tuple_slice = PyTuple_GetSlice(packed, 1, 3);
+    if (tuple_slice == NULL) goto done;
+
+    result = Py_BuildValue("(lllOOOOO)", head_value, after_reverse, after_sort,
+                           as_tuple, sliced, built, packed, tuple_slice);
+
+done:
+    Py_XDECREF(built);
+    Py_XDECREF(ref);
+    Py_XDECREF(as_tuple);
+    Py_XDECREF(sliced);
+    Py_XDECREF(packed);
+    Py_XDECREF(tuple_slice);
+    return result;
+}
+
+/* Drive the slice entry points.  `args` is (slice, length). */
+static PyObject *m_slice_ops(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *sl;
+    Py_ssize_t length;
+    if (!PyArg_ParseTuple(args, "On", &sl, &length)) {
+        return NULL;
+    }
+
+    Py_ssize_t u_start, u_stop, u_step;
+    if (PySlice_Unpack(sl, &u_start, &u_stop, &u_step) < 0) {
+        return NULL;
+    }
+
+    /* AdjustIndices clamps in place and answers the slice length. */
+    Py_ssize_t a_start = u_start, a_stop = u_stop;
+    Py_ssize_t a_len = PySlice_AdjustIndices(length, &a_start, &a_stop, u_step);
+
+    Py_ssize_t g_start, g_stop, g_step;
+    if (PySlice_GetIndices(sl, length, &g_start, &g_stop, &g_step) < 0) {
+        return NULL;
+    }
+
+    Py_ssize_t e_start, e_stop, e_step, e_len;
+    if (PySlice_GetIndicesEx(sl, length, &e_start, &e_stop, &e_step, &e_len) < 0) {
+        return NULL;
+    }
+
+    /* A NULL bound reads as None. */
+    PyObject *one = PyLong_FromLong(1);
+    if (one == NULL) return NULL;
+    PyObject *made = PySlice_New(one, NULL, one);
+    Py_DECREF(one);
+    if (made == NULL) return NULL;
+
+    PyObject *result = Py_BuildValue(
+        "(nnn nnn nnn nnnn Oii)",
+        u_start, u_stop, u_step,
+        a_start, a_stop, a_len,
+        g_start, g_stop, g_step,
+        e_start, e_stop, e_step, e_len,
+        made, PySlice_Check(made), PySlice_Check(Py_None));
+    Py_DECREF(made);
+    return result;
+}
+
+/* Drive the rest of the sequence protocol, PyIter_NextItem and the two
+   remaining number spellings.  `args` is (sequence, value). */
+static PyObject *m_seq_more(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *sequence, *value;
+    if (!PyArg_ParseTuple(args, "OO", &sequence, &value)) {
+        return NULL;
+    }
+
+    PyObject *fast = NULL, *fast_items = NULL, *iterator = NULL, *drained = NULL;
+    PyObject *owned = NULL, *based = NULL, *powered = NULL, *result = NULL;
+    int clean_after_drain = 0, fast_is_self = 0;
+    Py_ssize_t fast_size = -1;
+
+    Py_ssize_t count = PySequence_Count(sequence, value);
+    int contained = PySequence_In(sequence, value);
+    if (count < 0 || contained < 0) goto done;
+
+    /* Fast hands back the sequence itself when it is already a list or a
+       tuple, and a list of its items otherwise. */
+    fast = PySequence_Fast(sequence, "seq_more() wants a sequence");
+    if (fast == NULL) goto done;
+    fast_is_self = fast == sequence;
+    fast_size = PySequence_Fast_GET_SIZE(fast);
+    fast_items = PyList_New(0);
+    if (fast_items == NULL) goto done;
+    for (Py_ssize_t i = 0; i < fast_size; i++) {
+        PyObject *item = PySequence_Fast_GET_ITEM(fast, i);   /* borrowed */
+        if (item == NULL) goto done;
+        if (PyList_Append(fast_items, item) < 0) goto done;
+    }
+
+    /* Drain an iterator: 1 with an item each step, then 0 with no exception. */
+    iterator = PyObject_GetIter(sequence);
+    if (iterator == NULL) goto done;
+    drained = PyList_New(0);
+    if (drained == NULL) goto done;
+    for (;;) {
+        PyObject *item = NULL;
+        int stepped = PyIter_NextItem(iterator, &item);
+        if (stepped < 0) goto done;
+        if (stepped == 0) break;
+        int appended = PyList_Append(drained, item);
+        Py_DECREF(item);
+        if (appended < 0) goto done;
+    }
+    clean_after_drain = PyErr_Occurred() == NULL;
+
+    /* Slice assignment and deletion, on a list this call owns. */
+    owned = PySequence_List(sequence);
+    if (owned == NULL) goto done;
+    PyObject *replacement = Py_BuildValue("[i]", 7);
+    if (replacement == NULL) goto done;
+    int assigned = PySequence_SetSlice(owned, 0, 1, replacement);
+    Py_DECREF(replacement);
+    if (assigned < 0) goto done;
+    if (PySequence_DelSlice(owned, 1, 2) < 0) goto done;
+
+    based = PyNumber_ToBase(value, 16);
+    if (based == NULL) goto done;
+
+    powered = PyLong_FromLong(3);
+    if (powered == NULL) goto done;
+    PyObject *exponent = PyLong_FromLong(4);
+    if (exponent == NULL) goto done;
+    PyObject *raised = PyNumber_InPlacePower(powered, exponent, Py_None);
+    Py_DECREF(exponent);
+    if (raised == NULL) goto done;
+    Py_SETREF(powered, raised);
+
+    result = Py_BuildValue("(niOniOiOOO)", count, contained, fast_items,
+                           fast_size, fast_is_self, drained, clean_after_drain,
+                           owned, based, powered);
+
+done:
+    Py_XDECREF(fast);
+    Py_XDECREF(fast_items);
+    Py_XDECREF(iterator);
+    Py_XDECREF(drained);
+    Py_XDECREF(owned);
+    Py_XDECREF(based);
+    Py_XDECREF(powered);
+    return result;
+}
+
+/* PyNumber_ToBase on its own, so that the base rejection is reachable.
+   `args` is (n, base). */
+static PyObject *m_to_base(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *n;
+    int base;
+    if (!PyArg_ParseTuple(args, "Oi", &n, &base)) {
+        return NULL;
+    }
+    return PyNumber_ToBase(n, base);
+}
+
+/* Index a list this call has just built, many times over, so that the entry
+   point runs under sustained allocation pressure rather than once.  The answer
+   is the running total, so a misread item shows up as a wrong sum rather than
+   only as a crash.  `args` is (rounds,). */
+static PyObject *m_gc_window(PyObject *self, PyObject *args)
+{
+    (void)self;
+    long rounds;
+    if (!PyArg_ParseTuple(args, "l", &rounds)) {
+        return NULL;
+    }
+
+    PyObject *fresh = PyList_New(0);
+    if (fresh == NULL) return NULL;
+    for (int i = 0; i < 8; i++) {
+        PyObject *value = PyLong_FromLong(i);
+        if (value == NULL || PyList_Append(fresh, value) < 0) {
+            Py_XDECREF(value);
+            Py_DECREF(fresh);
+            return NULL;
+        }
+        Py_DECREF(value);
+    }
+
+    long total = 0;
+    for (long round = 0; round < rounds; round++) {
+        PyObject *item = PySequence_GetItem(fresh, round % 8);
+        if (item == NULL) {
+            Py_DECREF(fresh);
+            return NULL;
+        }
+        long value = PyLong_AsLong(item);
+        Py_DECREF(item);
+        if (value == -1 && PyErr_Occurred()) {
+            Py_DECREF(fresh);
+            return NULL;
+        }
+        total += value;
+    }
+    Py_DECREF(fresh);
+    return PyLong_FromLong(total);
+}
+
 static PyMethodDef methods[] = {
     {"bump", (PyCFunction)m_bump, METH_NOARGS, "bump the module counter"},
     {"wrap", (PyCFunction)m_wrap, METH_O, NULL},
@@ -655,6 +907,11 @@ static PyMethodDef methods[] = {
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
     {"dict_more", (PyCFunction)m_dict_more, METH_VARARGS, NULL},
+    {"list_ops", (PyCFunction)m_list_ops, METH_VARARGS, NULL},
+    {"slice_ops", (PyCFunction)m_slice_ops, METH_VARARGS, NULL},
+    {"seq_more", (PyCFunction)m_seq_more, METH_VARARGS, NULL},
+    {"to_base", (PyCFunction)m_to_base, METH_VARARGS, NULL},
+    {"gc_window", (PyCFunction)m_gc_window, METH_VARARGS, NULL},
     {NULL, NULL, 0, NULL},
 };
 

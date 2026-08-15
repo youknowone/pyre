@@ -1,6 +1,6 @@
 //! `list` -- PyPy `cpyext/listobject.py`.
 
-use super::object::argument;
+use super::object::{argument, result};
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
@@ -88,6 +88,137 @@ pub unsafe extern "C" fn PyList_Append(object: *mut CPyObject, item: *mut CPyObj
     0
 }
 
+/// `PyList_GetItemRef(list, index)` — `PyList_GetItem`'s strong-reference
+/// spelling, the one that stays defined while another thread shrinks the list.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_GetItemRef(object: *mut CPyObject, index: isize) -> *mut CPyObject {
+    let Some(value) = list_argument(object, "PyList_GetItemRef") else {
+        return std::ptr::null_mut();
+    };
+    let Some(item) = (unsafe { pyre_object::listobject::w_list_getitem(value, index as i64) })
+    else {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "list index out of range",
+        ));
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(item)
+}
+
+/// A list, or the `SystemError` `PyErr_BadInternalCall` records.
+///
+/// The rejection `PyList_Sort` and `PyList_Reverse` make, which is not the
+/// `TypeError` the reading entry points make (`listobject.py:130`, `:139`).
+fn internal_list(object: *mut CPyObject) -> Option<PyObjectRef> {
+    let value = argument(object)?;
+    if !unsafe { pyre_object::is_list(value) } {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return None;
+    }
+    Some(value)
+}
+
+/// The `list` type's own method, which is what `space.call_method(space.w_list,
+/// name, ...)` reaches: an override on a subclass is deliberately not consulted
+/// (`listobject.py:96-142`).
+fn list_method(
+    method: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    arguments: &[PyObjectRef],
+) -> c_int {
+    match super::pyerrors::trap(method(arguments)) {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
+/// `PyList_Insert(list, index, item)` (`listobject.py:95-102`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_Insert(
+    object: *mut CPyObject,
+    index: isize,
+    item: *mut CPyObject,
+) -> c_int {
+    let index = pyre_object::w_int_new(index as i64);
+    let (Some(value), Some(item)) = (argument(object), argument(item)) else {
+        return -1;
+    };
+    list_method(
+        crate::type_methods::list_method_insert,
+        &[value, index, item],
+    )
+}
+
+/// `PyList_Sort(list)` (`listobject.py:126-133`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_Sort(object: *mut CPyObject) -> c_int {
+    let Some(value) = internal_list(object) else {
+        return -1;
+    };
+    list_method(crate::type_methods::list_method_sort, &[value])
+}
+
+/// `PyList_Reverse(list)` (`listobject.py:135-142`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_Reverse(object: *mut CPyObject) -> c_int {
+    let Some(value) = internal_list(object) else {
+        return -1;
+    };
+    list_method(crate::type_methods::list_method_reverse, &[value])
+}
+
+/// `PyList_AsTuple(list)` — `tuple(list)` (`listobject.py:120-124`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_AsTuple(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(value) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    result(
+        crate::baseobjspace::unpackiterable(value, -1).map(pyre_object::tupleobject::w_tuple_new),
+    )
+}
+
+/// `PyList_GetSlice(list, low, high)` — `list[low:high]`, with no negative
+/// index handling (`listobject.py:144-152`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_GetSlice(
+    object: *mut CPyObject,
+    low: isize,
+    high: isize,
+) -> *mut CPyObject {
+    let slice = super::sliceobject::range_slice(low, high);
+    let Some(value) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    result(crate::baseobjspace::getitem(value, slice))
+}
+
+/// `PyList_SetSlice(list, low, high, sequence)` — a NULL `sequence` deletes the
+/// slice (`listobject.py:154-166`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_SetSlice(
+    object: *mut CPyObject,
+    low: isize,
+    high: isize,
+    sequence: *mut CPyObject,
+) -> c_int {
+    let slice = super::sliceobject::range_slice(low, high);
+    let Some(value) = argument(object) else {
+        return -1;
+    };
+    let items = unsafe { pyobject::from_ref(sequence) };
+    let assigned = if items.is_null() {
+        crate::baseobjspace::delitem(value, slice)
+    } else {
+        crate::baseobjspace::setitem(value, slice, items).map(drop)
+    };
+    if super::pyerrors::trap(assigned).is_none() {
+        -1
+    } else {
+        0
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -105,6 +236,13 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyList_GetItem as *const ());
     std::hint::black_box(PyList_SetItem as *const ());
     std::hint::black_box(PyList_Append as *const ());
+    std::hint::black_box(PyList_GetItemRef as *const ());
+    std::hint::black_box(PyList_Insert as *const ());
+    std::hint::black_box(PyList_Sort as *const ());
+    std::hint::black_box(PyList_Reverse as *const ());
+    std::hint::black_box(PyList_AsTuple as *const ());
+    std::hint::black_box(PyList_GetSlice as *const ());
+    std::hint::black_box(PyList_SetSlice as *const ());
     std::hint::black_box(PyList_Check as *const ());
     std::hint::black_box(PyList_CheckExact as *const ());
 }

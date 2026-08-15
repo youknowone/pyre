@@ -95,6 +95,21 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     0
 }
 
+/// `PyTuple_GetSlice(tuple, low, high)` — `tuple[low:high]`
+/// (`tupleobject.py:216-221`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyTuple_GetSlice(
+    object: *mut CPyObject,
+    low: isize,
+    high: isize,
+) -> *mut CPyObject {
+    let slice = super::sliceobject::range_slice(low, high);
+    let Some(value) = tuple_argument(object, "PyTuple_GetSlice") else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(crate::baseobjspace::getitem(value, slice))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyTuple_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -111,6 +126,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyTuple_Size as *const ());
     std::hint::black_box(PyTuple_GetItem as *const ());
     std::hint::black_box(PyTuple_SetItem as *const ());
+    std::hint::black_box(PyTuple_GetSlice as *const ());
     std::hint::black_box(PyTuple_Check as *const ());
     std::hint::black_box(PyTuple_CheckExact as *const ());
 }

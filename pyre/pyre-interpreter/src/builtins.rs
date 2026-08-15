@@ -18002,7 +18002,7 @@ fn format_int_radix(value: &BigInt, radix: u32, prefix: &str) -> Result<String, 
 /// `space.index(obj).asbigint().format(...)` without cloning a W_LongObject's
 /// immutable payload. PyPy's `W_LongObject.asbigint()` returns `self.num`;
 /// only compact int/bool results need a temporary rbigint materialisation.
-fn format_index_radix(
+pub(crate) fn format_index_radix(
     obj: PyObjectRef,
     radix: u32,
     prefix: &str,

@@ -394,6 +394,65 @@ pub unsafe extern "C" fn PyNumber_Power(
     ))
 }
 
+/// `PyNumber_InPlacePower(base, exponent, modulus)` — a modulus other than
+/// `None` has no in-place operator to reach, so it is refused
+/// (`number.py:146-152`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyNumber_InPlacePower(
+    base: *mut CPyObject,
+    exponent: *mut CPyObject,
+    modulus: *mut CPyObject,
+) -> *mut CPyObject {
+    let (Some(base), Some(exponent)) = (argument(base), argument(exponent)) else {
+        return std::ptr::null_mut();
+    };
+    let modulus = unsafe { super::pyobject::from_ref(modulus) };
+    if !modulus.is_null() && !unsafe { pyre_object::is_none(modulus) } {
+        return result(Err(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "PyNumber_InPlacePower with non-None modulus is not supported",
+        )));
+    }
+    result(crate::opcode_ops::binary_value(
+        base,
+        exponent,
+        BinaryOperator::InplacePower,
+    ))
+}
+
+/// `PyNumber_ToBase(n, base)` — `n.__index__()` written in `base` behind its
+/// `0b`/`0o`/`0x` marker (`number.py:57-83`).
+///
+/// Any other base is a `SystemError`: the marker table has no entry for it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyNumber_ToBase(object: *mut CPyObject, base: c_int) -> *mut CPyObject {
+    let Some(object) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let prefix = match base {
+        2 => "0b",
+        8 => "0o",
+        16 => "0x",
+        // Base ten carries no marker, so it is the plain decimal spelling of
+        // the index rather than a radix format.
+        10 => {
+            let decimal = crate::baseobjspace::space_index(object)
+                .and_then(|index| crate::builtins::builtin_str(&[index]));
+            return result(decimal);
+        }
+        _ => {
+            return result(Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "PyNumber_ToBase: base must be 2, 8, 10 or 16",
+            )));
+        }
+    };
+    result(
+        crate::builtins::format_index_radix(object, base as u32, prefix)
+            .map(|written| pyre_object::w_str_new(&written)),
+    )
+}
+
 /// `nb_index`, `nb_int` or `nb_float` — the test `PyNumber_Check` performs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Check(object: *mut CPyObject) -> c_int {
@@ -486,6 +545,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyNumber_Invert as *const ());
     std::hint::black_box(PyNumber_Absolute as *const ());
     std::hint::black_box(PyNumber_Power as *const ());
+    std::hint::black_box(PyNumber_InPlacePower as *const ());
+    std::hint::black_box(PyNumber_ToBase as *const ());
     std::hint::black_box(PyNumber_Check as *const ());
     std::hint::black_box(PyNumber_Index as *const ());
     std::hint::black_box(PyNumber_Float as *const ());

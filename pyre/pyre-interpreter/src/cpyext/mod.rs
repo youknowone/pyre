@@ -34,6 +34,7 @@ pub mod pymem;
 pub mod pyobject;
 pub mod sequence;
 pub mod setobject;
+pub mod sliceobject;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
@@ -723,6 +724,7 @@ pub fn ensure_linked() {
     pyerrors::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();
+    sliceobject::ensure_linked();
     modsupport::ensure_linked();
     object::ensure_linked();
     longobject::ensure_linked();
