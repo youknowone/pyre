@@ -419,17 +419,21 @@ class EnvBuilder:
 
             if do_copies:
                 for dest, src in copy_sources.items():
-                    if not os.path.isfile(src):
+                    source = src
+                    if not os.path.isfile(source):
                         # No launcher stub is shipped with this interpreter.
                         # It locates its own stdlib and honours pyvenv.cfg, so
                         # a plain copy of the running executable behaves like
-                        # the launcher would.
-                        src = context.executable
+                        # the launcher would.  There is one executable and it
+                        # is a console one, so the pythonw names get it too:
+                        # a console window is a smaller surprise than a
+                        # Scripts directory missing pythonw.exe entirely.
+                        source = context.executable
                     dest = os.path.join(binpath, dest)
                     try:
-                        shutil.copy2(src, dest)
+                        shutil.copy2(source, dest)
                     except OSError:
-                        logger.warning('Unable to copy %r to %r', src, dest)
+                        logger.warning('Unable to copy %r to %r', source, dest)
 
             if sysconfig.is_python_build():
                 # copy init.tcl
