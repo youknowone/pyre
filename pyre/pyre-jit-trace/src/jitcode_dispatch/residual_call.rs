@@ -444,6 +444,14 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // opcode boundary and keeps the snapshot-array source; a capability-gap
         // abort stops mid-opcode and needs this.
         let mirror_stack = capture_vstack_mirror_image(ctx, origin);
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[latch-accept] origin={origin} single-frame pc={} jitcode={:?} index={:?}",
+                miframe.pc,
+                miframe.jitcode.name(),
+                miframe.jitcode.try_index(),
+            );
+        }
         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                 miframe,
@@ -3557,6 +3565,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         // reloads an operand from the virtualizable array, so
                         // publish the root stack from the walker's mirror.
                         let mirror_stack = capture_vstack_mirror_image(ctx, "escape-flush");
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[latch-accept] origin=escape-flush single-frame pc={} \
+                                 jitcode={:?} index={:?}",
+                                miframe.pc,
+                                miframe.jitcode.name(),
+                                miframe.jitcode.try_index(),
+                            );
+                        }
                         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
                             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                                 miframe,

@@ -571,6 +571,14 @@ impl BlackholeInterpreter {
         // RPython: descrs are shared on the builder (setup_descrs).
         self.jitcode = jitcode;
         self.reset_position_state(position);
+        if crate::bh_debug_enabled() {
+            eprintln!(
+                "[bh-setpos] jitcode={:?} index={:?} position={position} code_len={}",
+                self.jitcode.name,
+                self.jitcode.try_index(),
+                self.jitcode.code.len(),
+            );
+        }
     }
 
     /// blackhole.py:1095-1099 `get_portal_runner(jdindex)`.
@@ -1642,12 +1650,16 @@ impl BlackholeInterpreter {
             // per class — and a byte that is unwired here is just as likely to
             // be an operand the frame was resumed in the middle of as an opname
             // the builder forgot.  Report the index and whether the position is
-            // a recorded instruction boundary so the two read apart.
+            // a recorded instruction boundary so the two read apart.  `entry`
+            // separates the two further: equal to `pos` means the frame was
+            // `setposition`ed straight onto this byte and dispatched with no
+            // prior step, so nothing walked it forward from a valid boundary.
             panic!(
-                "dispatch_step: unwired opcode={opcode:#x} pos={} \
+                "dispatch_step: unwired opcode={opcode:#x} pos={} entry={} \
                  table_len={} jitcode={:?} index={:?} startpoint={} — extend the \
                  builder's setup_insns to cover this opname",
                 self.last_opcode_position,
+                self.entry_position,
                 self.dispatch_table.len(),
                 self.jitcode.name,
                 self.jitcode.try_index(),
