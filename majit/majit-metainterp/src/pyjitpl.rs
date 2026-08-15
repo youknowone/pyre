@@ -4743,6 +4743,18 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
+                // `maybe_compile_with_key` has just installed (or found) this
+                // key's cell, so resolving now names it — and the trace, its
+                // `compiled_loops` entry, its `JitCellToken::green_key` and
+                // every `rd_loop_token` stamped off that token all inherit the
+                // CELL key rather than a bucket hash they would each have to
+                // re-resolve. `warmstate.py:483/:511` carries the resolved
+                // artifact on for the same reason.
+                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                    self.warm_state.cell_key_for(key)
+                })
+                .flatten()
+                .unwrap_or(green_key);
                 // The only reader of either value.  The key factory closes over
                 // `Copy` locals bound once at the back edge
                 // (`jit_interp/mod.rs` `__green_slotN`), and the descriptor
@@ -5029,7 +5041,15 @@ impl<M: Clone> MetaInterp<M> {
         let recursive_target =
             |jd_index: usize, green_values: &[i64]| -> Option<(Arc<JitCellToken>, u64)> {
                 let jd = staticdata.jitdrivers_sd.get(jd_index)?;
-                let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
+                let spec = jd.green_args_spec();
+                // Resolve to the callee's CELL key before consulting either
+                // index: the token comes off the celltable and the key travels
+                // on to the `CALL_ASSEMBLER` descr, so both must name the cell
+                // the callee's greens own rather than whatever heads its bucket.
+                let green_key = warm_state
+                    .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
+                        majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
+                    });
                 warm_state
                     .get_compiled(green_key)
                     .map(|arc| (Arc::clone(arc), green_key))
@@ -5050,7 +5070,15 @@ impl<M: Clone> MetaInterp<M> {
             let Some(jd) = staticdata.jitdrivers_sd.get(jd_index) else {
                 return InlineDecision::ResidualCall;
             };
-            let green_key = crate::green_key_hash_typed(green_values, &jd.green_args_spec());
+            let spec = jd.green_args_spec();
+            // Same resolve as `recursive_target` above, and it must be the same
+            // one: `decide_recursive_inline` exists to keep this decision and
+            // that resolver from drifting, which they would if one asked the
+            // celltable about a cell the other never looked at.
+            let green_key = warm_state
+                .resolve_cell_key(crate::green_key_hash_typed(green_values, &spec), || {
+                    majit_ir::GreenKey::with_types(green_values.to_vec(), spec.clone())
+                });
             // `callee_compiled` must recognise every token the sibling
             // `recursive_target` resolver can produce — `warm_state.get_compiled`
             // returns the cell's procedure token, including the tmp-callback
@@ -6146,7 +6174,7 @@ impl<M: Clone> MetaInterp<M> {
         // committing to a compile we mirror that by reading green_key
         // from the live trace ctx; only the "committed" exits below
         // take ownership of the ctx and drop the trace session.
-        let (green_key, cut_inner_green_key) = {
+        let (closed, cut_inner_green_key, outer_green_key) = {
             let ctx = self
                 .tracing
                 .as_ref()
@@ -6160,8 +6188,26 @@ impl<M: Clone> MetaInterp<M> {
             // so the origin key is only the fallback for traces that did not
             // close on a merge point.  If older traces lack typed close
             // greens, preserve the existing cross-loop-cut inner key path.
-            let closed = ctx.close_green_key_hash();
-            (closed.or(cut_inner).unwrap_or(outer), cut_inner)
+            let closed = ctx.close_green_key();
+            (closed, cut_inner, outer)
+        };
+        // File the loop under the CELL key, not the bucket hash: this is the
+        // key a later warm entry resolves and looks `compiled_loops` up by, and
+        // on a chained bucket a bucket hash names a different cell's slot. The
+        // resolve is the same one the entry does (`warmstate.py:458-464`), so
+        // compile and entry agree by construction.
+        let green_key = match closed {
+            Some(key) => self
+                .warm_state
+                .resolve_cell_key(key.get_uhash(), || key.clone()),
+            // `outer` is `ctx.green_key`, already resolved at trace start. The
+            // cross-loop-cut inner key is produced inside the trace walker,
+            // which holds no `WarmEnterState`, so it arrives as a bucket hash
+            // and can only be resolved for an unchained bucket — the same
+            // greens-less decline every hash-only producer takes.
+            None => cut_inner_green_key
+                .map(|inner| self.warm_state.sole_cell_key(inner).unwrap_or(inner))
+                .unwrap_or(outer_green_key),
         };
 
         // pyjitpl.py:3185-3189: has_compiled_targets(ptoken) →
@@ -11381,10 +11427,10 @@ impl<M: Clone> MetaInterp<M> {
     /// different key that shares the bucket. Consumers that hold the typed key
     /// at the decision point should ask this one.
     ///
-    /// Scope: this resolves the JitCell half only. `compiled_loops` — the
-    /// frontend meta index that [`Self::get_compiled_meta`] reads — is keyed by
-    /// hash and has no chain to walk, so it stays hash-resolved. That is the
-    /// remaining collision surface on the entry path.
+    /// Equivalent to `resolve_cell_key` followed by [`Self::has_compiled_loop`]:
+    /// `compiled_loops` and the celltable are indexed by the same cell key, so
+    /// the meta half and the JitCell half no longer answer about different
+    /// cells on a chained bucket.
     #[inline]
     pub fn has_compiled_loop_for_key(&self, key: &majit_ir::GreenKey) -> bool {
         self.warm_state
@@ -11398,6 +11444,47 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn green_key_bucket_is_chained(&self, green_key: u64) -> bool {
         self.warm_state.bucket_is_chained(green_key)
+    }
+
+    /// **Resolve once.** Turn the raw green-key hash an entry arrives with into
+    /// the CELL key that names the one cell those greens own, and hand that key
+    /// back so the caller can carry it everywhere instead of re-deriving a cell
+    /// from the bucket at each consumer.
+    ///
+    /// `warmstate.py:458-464` resolves greens + `comparekey` + `get_uhash`
+    /// together, once, and `warmstate.py:483/:511` then carries the resolved
+    /// `procedure_token` to the executor (`raise
+    /// EnterJitAssembler(procedure_token, *execute_args)`) rather than handing
+    /// on a key for a second lookup — which is exactly why upstream has no
+    /// second reader that can disagree with the decision. This is that step,
+    /// spelled in the currency pyre carries across crates.
+    ///
+    /// Allocation discipline (the reason this is not simply
+    /// `cell_key_for(&make_key())`): upstream compares against greens already
+    /// sitting in the portal's arguments and builds nothing, while pyre's
+    /// `GreenKey` is a heap object with `values` and `types` vectors, and this
+    /// is the warm-entry path. An unchained bucket has ONE candidate, so
+    /// `sole_cell_key` is exact without a key; the key is built only when the
+    /// bucket is chained, which is the only shape in which the candidates
+    /// differ.
+    ///
+    /// A caller with no structured key on a chained bucket cannot resolve at
+    /// all, and gets the raw hash back. That names the bucket's original
+    /// occupant if it is still there and nothing otherwise — a miss, never a
+    /// guess at which sibling was meant.
+    #[inline]
+    pub fn resolve_cell_key(
+        &self,
+        green_key: u64,
+        structured_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
+    ) -> u64 {
+        match structured_green_key {
+            Some(make_key) => self.warm_state.resolve_cell_key(green_key, make_key),
+            None => self
+                .warm_state
+                .sole_cell_key(green_key)
+                .unwrap_or(green_key),
+        }
     }
 
     /// Check if any guard in the compiled trace has Float-typed fail_args.
@@ -16018,7 +16105,13 @@ impl<M: Clone> MetaInterp<M> {
             "warmspot.py:663 _green_args_spec must agree with the \
              jitcode arg layout greenargs prefix",
         );
-        let green_key = crate::green_key_hash_typed(&green_values, &green_types);
+        // Resolve to the target's CELL key: the token this key selects is
+        // carried into the `CALL_ASSEMBLER` descr, so it has to be the token of
+        // the cell these greens own.
+        let green_key = self.warm_state.resolve_cell_key(
+            crate::green_key_hash_typed(&green_values, &green_types),
+            || majit_ir::GreenKey::with_types(green_values.clone(), green_types.clone()),
+        );
         // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
         // the *same* Arc that `compiled_loops` / warm cell own through to the
         // descr so `record_loop_or_bridge` can downcast and push it directly,

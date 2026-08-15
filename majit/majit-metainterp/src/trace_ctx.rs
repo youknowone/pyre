@@ -2198,9 +2198,21 @@ impl TraceCtx {
     /// `original_boxes[:num_green_args]`, i.e. the greens captured at the
     /// merge point that closed the trace.
     pub fn close_green_key_hash(&self) -> Option<u64> {
+        Some(self.close_green_key()?.get_uhash())
+    }
+
+    /// The typed form of [`Self::close_green_key_hash`].
+    ///
+    /// A hash alone cannot say WHICH cell in a chained bucket the close
+    /// belongs to, and the loop this key files under is the one a later entry
+    /// has to find again. Callers with a `WarmEnterState` in hand resolve
+    /// through this (`WarmEnterState::resolve_cell_key`) and file under the
+    /// resolved cell key; the vectors it builds are the ones
+    /// `merge_point_green_key_hash` already built to hash.
+    pub fn close_green_key(&self) -> Option<GreenKey> {
         let greens = self.close_greens.as_ref()?;
         let pc = self.close_green_pc?;
-        self.merge_point_green_key_hash(pc, greens)
+        self.merge_point_green_key(pc, greens)
     }
 
     /// pyjitpl.py:1553 / :3005 `get_procedure_token(greenboxes)` analog: the
@@ -2212,6 +2224,16 @@ impl TraceCtx {
         pc: i64,
         greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
     ) -> Option<u64> {
+        Some(self.merge_point_green_key(pc, greens)?.get_uhash())
+    }
+
+    /// The typed form of [`Self::merge_point_green_key_hash`], for callers
+    /// that must resolve the key to a cell rather than only hash it.
+    pub fn merge_point_green_key(
+        &self,
+        pc: i64,
+        greens: &(Vec<i64>, Vec<i64>, Vec<i64>),
+    ) -> Option<GreenKey> {
         let (ints, refs, floats) = greens;
         let spec = if let Some(key) = self.green_key_values.as_ref() {
             debug_assert_eq!(
@@ -2254,7 +2276,7 @@ impl TraceCtx {
             values.push(value);
         }
         types.extend(spec);
-        Some(crate::green_key_hash_typed(&values, &types))
+        Some(GreenKey::with_types(values, types))
     }
 
     /// Set the structured green key values.

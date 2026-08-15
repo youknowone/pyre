@@ -4362,6 +4362,15 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
+        // **Resolve once, then carry.** From here down `green_key` names ONE
+        // cell, not a celltable bucket — the decision below, the
+        // `compiled_loops` meta the runner executes, the invalidation on a
+        // shape mismatch and the front-target tables all read through this one
+        // number, so they cannot name different cells the way a bucket hash
+        // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
+        // the resolved token onward for the same reason). Identity for every
+        // unchained bucket, so the collision-free path is unchanged.
+        let green_key = self.meta.resolve_cell_key(green_key, structured_green_key);
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         if !state.can_trace() {
@@ -4417,7 +4426,12 @@ impl<S: JitState> JitDriver<S> {
         // `cell.get_procedure_token() is not None` half (code present and not
         // invalidated), which the meta lookup alone does not imply, since
         // `invalidate_loop` deliberately leaves the meta in place.
-        let runnable_meta = if self.entry_cell_has_compiled_code(green_key, structured_green_key) {
+        // Both halves read through the resolved cell key, so the artifact the
+        // entry DECIDES on and the artifact it EXECUTES are the same object.
+        // They were not: the decision walked the bucket by `comparekey` while
+        // the runner read `compiled_loops[hash]`, so on a chained bucket the
+        // entry could decide about one cell's token and run another's.
+        let runnable_meta = if self.meta.has_compiled_loop(green_key) {
             self.meta.get_compiled_meta(green_key).cloned()
         } else {
             None
@@ -5410,35 +5424,6 @@ impl<S: JitState> JitDriver<S> {
         resolved
     }
 
-    /// `warmstate.py:458-464`: the cell a back edge decides on is the one whose
-    /// `comparekey(*greenargs)` matches, not whichever cell heads the bucket.
-    ///
-    /// Upstream walks unconditionally because its comparison is against the
-    /// greens already sitting in the portal's arguments — it builds nothing.
-    /// Pyre's `GreenKey` is a heap object with its own `values` and `types`
-    /// vectors, and this is the entry path, so building one per warm entry to
-    /// re-confirm a single-candidate bucket would put back the per-entry
-    /// allocations this path exists to avoid. An unchained bucket HAS one
-    /// candidate: the head is what the walk would find, and the hash form is
-    /// exact. The key is therefore built only when the bucket is chained,
-    /// which is the only case in which the two answers can differ.
-    ///
-    /// A caller that reached here without a structured key (`back_edge`,
-    /// `back_edge_keyed`) cannot resolve the chain at all and keeps the hash
-    /// answer; `back_edge_structured` and `back_edge_declarative` carry one.
-    fn entry_cell_has_compiled_code(
-        &self,
-        green_key: u64,
-        structured_green_key: Option<&dyn Fn() -> GreenKey>,
-    ) -> bool {
-        match structured_green_key {
-            Some(make_key) if self.meta.green_key_bucket_is_chained(green_key) => {
-                self.meta.has_compiled_loop_for_key(&make_key())
-            }
-            _ => self.meta.has_compiled_loop(green_key),
-        }
-    }
-
     fn live_values_match_descriptor(
         descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
@@ -6313,21 +6298,24 @@ impl<S: JitState> JitDriver<S> {
 
     /// Typed twin of [`Self::has_compiled_loop`]: `warmstate.py:458-464` walks
     /// the bucket and tests `comparekey(*greenargs)` before deciding anything,
-    /// where the hash form can answer for whichever cell heads the bucket.
-    ///
-    /// The `compiled_loops` meta the runnable form additionally requires is
-    /// hash-keyed and has no chain, so only the JitCell half is resolved on
-    /// full key identity — see `MetaInterp::has_compiled_loop_for_key`.
+    /// where a bare bucket hash can answer for whichever cell holds it.
     #[inline]
     pub fn has_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
         self.meta.has_compiled_loop_for_key(key)
     }
 
     /// Typed twin of [`Self::has_runnable_compiled_loop`].
+    ///
+    /// Both conjuncts read through the SAME resolved cell key, so the JitCell
+    /// half and the `compiled_loops` half cannot answer about different cells.
+    /// They could: `compiled_loops` was consulted at the bare `key.get_uhash()`
+    /// while the token half walked the chain by `comparekey`.
     #[inline]
     pub fn has_runnable_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
-        self.has_compiled_loop_for_key(key)
-            && self.meta.get_compiled_meta(key.get_uhash()).is_some()
+        self.meta
+            .warm_state_ref()
+            .cell_key_for(key)
+            .is_some_and(|cell_key| self.has_runnable_compiled_loop(cell_key))
     }
 
     /// Actual key the last compile_loop stored under.
@@ -7253,7 +7241,14 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        let key_hash = crate::green_key_hash_typed(green_values, green_types);
+        // Resolve once (`warmstate.py:458-464`) and carry the cell key from
+        // here on, exactly as `back_edge_internal` does — the closure that
+        // builds the key runs only on a chained bucket, so the common entry
+        // still allocates nothing.
+        let key_hash = self.meta.resolve_cell_key(
+            crate::green_key_hash_typed(green_values, green_types),
+            Some(&|| GreenKey::with_types(green_values.to_vec(), green_types.to_vec())),
+        );
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(key_hash);
         if !state.can_trace() {

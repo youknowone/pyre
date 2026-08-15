@@ -101,6 +101,31 @@ pub struct BaseJitCell {
     /// counter.py:75 / warmstate.py BaseJitCell.next
     /// Linked list for per-bucket chain in the celltable.
     pub next: Option<Box<BaseJitCell>>,
+    /// This cell's own u64 identity — what every hash-form entry point on
+    /// [`WarmEnterState`] names it by, and what flows on through
+    /// `MetaInterp::compiled_loops`, `JitCellToken::green_key` and
+    /// `rd_loop_token`.
+    ///
+    /// Upstream needs no such field: `maybe_compile_and_run`
+    /// (warmstate.py:458-464) resolves greens + `comparekey` + `get_uhash`
+    /// *together* into a cell object and then carries **that object** to the
+    /// executor (`raise EnterJitAssembler(procedure_token, ...)`,
+    /// warmstate.py:483/:511), so nothing downstream re-derives which cell was
+    /// meant. Pyre carries a `u64` instead, and a bucket hash does not name a
+    /// cell when the bucket is chained — two cells, one number. The cell key
+    /// restores the missing half of the identity: it is
+    ///
+    /// * the bucket's raw `JitCell.get_uhash` when this cell is the only
+    ///   occupant, so the collision-free case is bit-for-bit what it always
+    ///   was, and
+    /// * a minted, live-set-unique u64 ([`WarmEnterState::mint_cell_key`])
+    ///   when this cell landed in a bucket whose raw hash another cell had
+    ///   already taken.
+    ///
+    /// `None` only between [`BaseJitCell::new`] and the
+    /// [`WarmEnterState::install_new_cell`] that files the cell — an
+    /// unassigned cell is in no chain and is reachable by nothing.
+    pub cell_key: Option<u64>,
     /// warmstate.py:568-582 — typed green-key carried per-cell so
     /// `JitCell.comparekey(*greenargs2)` can do per-green typed
     /// equality across hash collisions:
@@ -153,6 +178,7 @@ impl BaseJitCell {
             loop_token: None,
             abort_count: 0,
             next: None,
+            cell_key: None,
             comparekey: None,
             retained_greens: RetainedGreens::default(),
         }
@@ -366,13 +392,53 @@ pub struct JitStats {
     pub num_pinned_refs: usize,
 }
 
+/// # The `u64` this type is keyed by is a CELL key, not a bucket hash
+///
+/// Every `green_key_hash: u64` parameter below names one cell
+/// ([`BaseJitCell::cell_key`]), not a celltable bucket. The two are the same
+/// number whenever a bucket holds one cell — which is every collision-free
+/// workload, so nothing observable changes there — and differ only for a cell
+/// that had to be minted a key because a sibling already held the bucket's raw
+/// hash.
+///
+/// The distinction exists because pyre carries a `u64` where upstream carries
+/// the cell object. `maybe_compile_and_run` (warmstate.py:458-464) resolves
+/// greens + `comparekey` + `get_uhash` together into a cell and then hands
+/// *that cell's* procedure token to the executor (warmstate.py:483/:511:
+/// `raise EnterJitAssembler(procedure_token, *execute_args)`) rather than
+/// handing on a key for a second lookup — which is why upstream has no second
+/// reader that can disagree with the first. Pyre restores that property by
+/// resolving once, at the hash producer ([`WarmEnterState::cell_key_for`] /
+/// [`WarmEnterState::ensure_cell_key`] / [`WarmEnterState::sole_cell_key`]),
+/// and carrying the resolved cell key onward — through `MetaInterp`'s
+/// `compiled_loops`, `JitCellToken::green_key` and `rd_loop_token` alike.
+///
+/// The counter is the deliberate exception: `jitcounter.tick(hash, ...)`
+/// (warmstate.py:467) is indexed by the BUCKET upstream, so colliding keys
+/// share one back-edge counter. Every counter call here therefore goes through
+/// [`WarmEnterState::bucket_of`] first.
 pub struct WarmEnterState {
     /// counter.py JitCounter parity: single timetable shared by loop
     /// entry, guard failure, and function entry — each caller passes
     /// a different pre-computed increment to tick(hash, increment).
     pub counter: JitCounter,
-    /// Per-greenkey cells, keyed by the hash of the green key.
+    /// counter.py:227-256 celltable: per-bucket chains, keyed by the raw
+    /// `JitCell.get_uhash` of the green key. The map entry is the chain HEAD;
+    /// walk `BaseJitCell::next` for the rest. A cell inside a chain is named
+    /// by its own [`BaseJitCell::cell_key`], not by this map key.
     cells: indexmap::IndexMap<u64, BaseJitCell>,
+    /// Minted cell keys → the raw bucket hash the cell lives in.
+    ///
+    /// Only cells that could not take their bucket's raw hash appear here, so
+    /// this map is empty for every workload that never chains a bucket, and
+    /// [`WarmEnterState::bucket_of`] short-circuits on `is_empty()`. The
+    /// invariant it maintains is: **`bucket_of(cell_key)` is the bucket the
+    /// cell lives in** — trivially `cell_key` itself for an unminted key,
+    /// because an unminted key is only ever assigned inside the bucket whose
+    /// hash it equals.
+    minted: indexmap::IndexMap<u64, u64>,
+    /// Serial feeding [`WarmEnterState::mint_cell_key`]'s candidate sequence.
+    mint_serial: u64,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
     /// warmstate.py:254: increment_threshold = compute_threshold(threshold).
@@ -469,20 +535,18 @@ impl WarmEnterState {
             return false;
         }
         if flags & jc_flags::TRACING_OCCURRED != 0 {
-            self.counter.tick(green_key_hash, self.increment_threshold)
+            let bucket = self.bucket_of(green_key_hash);
+            self.counter.tick(bucket, self.increment_threshold)
         } else {
             true
         }
     }
 
     fn start_tracing_cell(&mut self, green_key_hash: u64) -> HotResult {
-        self.counter.reset(green_key_hash);
+        self.counter.reset(self.bucket_of(green_key_hash));
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
@@ -507,6 +571,8 @@ impl WarmEnterState {
         WarmEnterState {
             counter,
             cells: indexmap::IndexMap::new(),
+            minted: indexmap::IndexMap::new(),
+            mint_serial: 0,
             threshold,
             increment_threshold,
             trace_eagerness: DEFAULT_TRACE_EAGERNESS,
@@ -541,7 +607,7 @@ impl WarmEnterState {
     /// Mark a green key as DONT_TRACE_HERE permanently.
     /// Clear the loop token for a cell, so is_compiled() returns false.
     pub fn clear_loop_token(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
             cell.loop_token = None;
         }
     }
@@ -574,7 +640,7 @@ impl WarmEnterState {
     /// in jitdriver.rs for cold keys.
     #[inline]
     pub fn counter_would_fire(&self, green_key_hash: u64) -> bool {
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
@@ -586,12 +652,12 @@ impl WarmEnterState {
             }
         }
         self.counter
-            .would_tick_fire(green_key_hash, self.increment_threshold)
+            .would_tick_fire(self.bucket_of(green_key_hash), self.increment_threshold)
     }
 
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
     pub fn counter_tick(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return;
             }
@@ -599,12 +665,13 @@ impl WarmEnterState {
                 return;
             }
         }
-        let _ = self.counter.tick(green_key_hash, self.increment_threshold);
+        let bucket = self.bucket_of(green_key_hash);
+        let _ = self.counter.tick(bucket, self.increment_threshold);
     }
 
     pub fn counter_tick_checked(&mut self, green_key_hash: u64) -> bool {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
@@ -625,15 +692,16 @@ impl WarmEnterState {
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — loop-header counter entry must also
             // remove invalidated token cells before it starts counting again.
-            self.cleanup_chain(green_key_hash);
+            self.cleanup_chain(self.bucket_of(green_key_hash));
             return false;
         }
-        self.counter.tick(green_key_hash, self.increment_threshold)
+        let bucket = self.bucket_of(green_key_hash);
+        self.counter.tick(bucket, self.increment_threshold)
     }
 
     pub fn maybe_compile(&mut self, green_key_hash: u64) -> HotResult {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             let has_procedure_token = cell.get_procedure_token().is_some();
             let is_compiled = cell.is_compiled();
             let is_tracing = cell.is_tracing();
@@ -668,11 +736,14 @@ impl WarmEnterState {
         if cleanup_dead_token_cell {
             // warmstate.py:483-500 — an invalidated/dead procedure token is
             // removed from the chain, resetting the hot counter so it re-arms.
-            self.cleanup_chain(green_key_hash);
+            self.cleanup_chain(self.bucket_of(green_key_hash));
             return HotResult::NotHot;
         }
 
-        if !self.counter.tick(green_key_hash, self.increment_threshold) {
+        if !self
+            .counter
+            .tick(self.bucket_of(green_key_hash), self.increment_threshold)
+        {
             return HotResult::NotHot;
         }
 
@@ -856,7 +927,7 @@ impl WarmEnterState {
     /// Used by function-entry tracing where the caller has already
     /// determined that tracing should begin.
     pub fn force_start_tracing(&mut self, green_key_hash: u64) -> HotResult {
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             if cell.is_compiled() {
                 return HotResult::RunCompiled;
             }
@@ -917,7 +988,7 @@ impl WarmEnterState {
     /// The caller is responsible for compiling the trace and calling
     /// `attach_procedure_to_interp` with the resulting JitCellToken.
     pub fn finish_tracing(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             // State remains Tracing until attach_procedure_to_interp is called.
         }
@@ -928,7 +999,7 @@ impl WarmEnterState {
     /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
     /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
     pub fn abort_tracing(&mut self, green_key_hash: u64, disable_noninlinable_function: bool) {
-        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
             if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
@@ -971,10 +1042,7 @@ impl WarmEnterState {
         token: impl Into<Arc<JitCellToken>>,
     ) -> Option<Arc<JitCellToken>> {
         let token = token.into();
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
         cell.flags &= !jc_flags::TRACING;
         cell.set_procedure_token(token, false)
     }
@@ -1018,10 +1086,7 @@ impl WarmEnterState {
         token: impl Into<Arc<JitCellToken>>,
     ) {
         let token = token.into();
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
         let _old = cell.set_procedure_token(token, true);
     }
 
@@ -1033,7 +1098,7 @@ impl WarmEnterState {
     /// companion `attach_procedure_to_interp` / `abort_tracing` calls own
     /// the state transition for whichever cell they touch.
     pub fn clear_tracing_flag(&mut self, green_key_hash: u64) {
-        if let Some(cell) = self.cells.get_mut(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key_mut(green_key_hash) {
             cell.flags &= !jc_flags::TRACING;
         }
     }
@@ -1043,16 +1108,18 @@ impl WarmEnterState {
     ///
     /// `JC_TRACING` is *set* through [`Self::mark_as_being_traced_for_key`],
     /// which installs through [`Self::ensure_cell_for_key`] and therefore
-    /// writes the cell that matches the key. The hash form above clears
-    /// whichever cell happens to *head* the bucket. Once both spellings have
-    /// written one key those are two different cells
-    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`), and
-    /// `install_new_cell` prepends survivors so the typed cell is the one that
-    /// is *not* the head. The set then lands on the tail and the clear on the
-    /// head, the flag is never cleared, and every gate that reads the head —
-    /// `counter_would_fire`, `counter_tick_checked`, `maybe_compile`,
-    /// `force_start_tracing`, `should_trace_function_entry` — refuses that key
-    /// from then on.
+    /// writes the cell that matches the key. The hash form above clears the
+    /// cell its CELL KEY names, which is the same cell whenever the caller's
+    /// u64 was resolved from these greens — but a caller holding a raw bucket
+    /// hash on a chained bucket names the bucket's first occupant instead.
+    /// Once a hash-only writer and a typed one have both written one key those
+    /// are two different cells
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`) with
+    /// two different keys, so the set can land on one and the clear on the
+    /// other, the flag is never cleared, and every gate that reads the
+    /// unresolved key — `counter_would_fire`, `counter_tick_checked`,
+    /// `maybe_compile`, `force_start_tracing`, `should_trace_function_entry` —
+    /// refuses that key from then on.
     ///
     /// Deliberately does NOT route through `ensure_cell_for_key` the way the
     /// `_for_key` writers do: clearing a flag must not install a cell. A key
@@ -1077,8 +1144,7 @@ impl WarmEnterState {
     /// [`Self::attach_tmp_callback_to_interp`] got. Give it a typed form at
     /// the point a caller appears, not before.
     pub fn take_procedure_token(&mut self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
-        self.cells
-            .get_mut(&green_key_hash)
+        self.cell_by_key_mut(green_key_hash)
             .and_then(|cell| cell.loop_token.take())
     }
 
@@ -1094,22 +1160,20 @@ impl WarmEnterState {
     /// runner, the CALL_ASSEMBLER inline gate, or the bridge stitch
     /// surface.
     pub fn get_compiled(&self, green_key_hash: u64) -> Option<&Arc<JitCellToken>> {
-        self.cells
-            .get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
             .and_then(|cell| cell.get_procedure_token())
     }
 
     /// warmstate.py:191-196 `get_procedure_token`.
     ///
-    /// Reads the cell that HEADS the bucket, which is the right cell only when
-    /// the bucket holds one. `maybe_compile_and_run` (warmstate.py:458-464)
-    /// walks `cell.next` and tests `cell.comparekey(*greenargs)` before it
-    /// looks at a token at all; [`Self::get_procedure_token_for_key`] is that
-    /// walk. Callers that hold the typed key should prefer it, and
-    /// [`Self::bucket_is_chained`] says when the two can differ.
+    /// Reads the cell the CELL KEY names — one cell, whatever the bucket holds
+    /// — so this and [`Self::get_procedure_token_for_key`] answer about the
+    /// same object for any key that has been resolved
+    /// ([`Self::cell_key_for`]). Handing this a raw bucket hash instead is a
+    /// different question with a different answer: it names the bucket's first
+    /// occupant.
     pub fn get_procedure_token(&self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
-        self.cells
-            .get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
             .and_then(|cell| cell.get_procedure_token().cloned())
     }
 
@@ -1121,24 +1185,30 @@ impl WarmEnterState {
     /// this is that discipline. A bucket the key does not match anywhere is
     /// upstream's `else:` arm — "not found" — and answers `None` rather than
     /// handing back the head cell's unrelated token.
+    ///
+    /// Equivalent to [`Self::cell_key_for`] followed by
+    /// [`Self::get_procedure_token`], and callers that need the key as well as
+    /// the token should spell it that way so the key they carry onward is the
+    /// one this matched on.
     pub fn get_procedure_token_for_key(&self, key: &GreenKey) -> Option<Arc<JitCellToken>> {
         self.lookup_chain_with_key(key)
             .and_then(|cell| cell.get_procedure_token().cloned())
     }
 
-    /// Whether this bucket holds more than one cell, i.e. whether the hash and
-    /// typed forms of a query can disagree at all.
+    /// Whether this bucket holds more than one cell, i.e. whether a raw hash
+    /// leaves anything to choose between.
     ///
     /// A chain needs no hash collision: one green key reached through a
     /// hash-only writer and then a typed one produces two cells in one bucket
     /// (see [`Self::clear_all_loop_tokens`]). An unchained bucket has exactly
-    /// one candidate, so the head IS what the walk would find, and a caller can
-    /// skip building a `GreenKey` it would only use to confirm that.
+    /// one candidate, so [`Self::sole_cell_key`] is exact and a caller can skip
+    /// building a `GreenKey` it would only use to confirm that — which is what
+    /// keeps [`Self::resolve_cell_key`] allocation-free on the entry path.
     #[inline]
     pub fn bucket_is_chained(&self, green_key_hash: u64) -> bool {
         self.cells
-            .get(&green_key_hash)
-            .is_some_and(|cell| cell.next.is_some())
+            .get(&self.bucket_of(green_key_hash))
+            .is_some_and(|head| head.next.is_some())
     }
 
     /// Allocate a new unique JitCellToken number.
@@ -1164,7 +1234,7 @@ impl WarmEnterState {
 
     /// Reset the hot counter for a specific green key to zero.
     pub fn reset_counter(&mut self, green_key_hash: u64) {
-        self.counter.reset(green_key_hash);
+        self.counter.reset(self.bucket_of(green_key_hash));
     }
 
     /// Reset ALL counters to zero. Used after invalidation with incomplete
@@ -1177,29 +1247,26 @@ impl WarmEnterState {
 
     /// Check if a green key is marked DontTraceHere.
     pub fn is_dont_trace_here(&self, green_key_hash: u64) -> bool {
-        self.cells
-            .get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
             .is_some_and(|c| c.state == BaseJitCellState::DontTraceHere)
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
     pub fn get_cell(&self, green_key_hash: u64) -> Option<&BaseJitCell> {
-        self.cells.get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
     }
 
     /// Typed-key variant of [`Self::get_cell`]:
     /// `warmstate.py:596-604 JitCell.get_jitcell(*greenargs)`.
     ///
     /// Walks the chain by `comparekey`, so it selects the cell belonging to
-    /// this key rather than whichever cell happens to head the bucket. That
-    /// distinction is load-bearing today, not once the table is bucketed: a
-    /// hash-only writer installs a cell with `comparekey: None`, which
-    /// `comparekey_matches` refuses unconditionally, so one key can already
-    /// own two cells in one bucket with no hash collision at all
-    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`).
-    /// `install_new_cell` links survivors ahead of the new cell, so the
-    /// hash-installed one is the head and the typed one is *not* — reading
-    /// the head here returned the wrong cell.
+    /// this key rather than the cell that happens to hold the bucket's raw
+    /// hash as its key. Those differ whenever a bucket chains: a hash-only
+    /// writer installs a cell with `comparekey: None`, which
+    /// `comparekey_matches` refuses unconditionally, so one key can own two
+    /// cells in one bucket with no hash collision at all
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`) — and
+    /// the hash-installed one took the raw hash, because it was there first.
     ///
     /// The reason to route through the key rather than the hash at all:
     /// every upstream cell lookup takes greenargs and compares them
@@ -1269,10 +1336,7 @@ impl WarmEnterState {
     where
         F: FnOnce() -> Result<Arc<JitCellToken>, E>,
     {
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
         if let Some(token) = cell.get_procedure_token() {
             return Ok(token.clone());
         }
@@ -1530,8 +1594,7 @@ impl WarmEnterState {
     /// `DONT_TRACE_HERE`, callers must stop inlining it and instead let it
     /// converge to a separate functrace / call_assembler path.
     pub fn can_inline_callable(&self, callee_key: u64) -> bool {
-        self.cells
-            .get(&callee_key)
+        self.cell_by_key(callee_key)
             .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
     }
 
@@ -1540,10 +1603,7 @@ impl WarmEnterState {
     ///
     /// This is the warm-state equivalent of PyPy's `disable_noninlinable_function()`.
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
-        let cell = self
-            .cells
-            .entry(callee_key)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(callee_key);
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         if cell.flags & jc_flags::TRACING == 0 {
             cell.state = BaseJitCellState::DontTraceHere;
@@ -1554,14 +1614,12 @@ impl WarmEnterState {
     ///
     /// This is the warm-state equivalent of PyPy's `mark_as_being_traced()`.
     pub fn mark_as_being_traced(&mut self, callee_key: u64) {
-        let cell = self
-            .cells
-            .entry(callee_key)
-            .or_insert_with(BaseJitCell::new);
+        let tracing_generation = self.tracing_generation;
+        let cell = self.ensure_cell_by_key(callee_key);
         cell.flags |= jc_flags::TRACING;
         if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
             cell.state = BaseJitCellState::Tracing;
-            cell.tracing_generation = self.tracing_generation;
+            cell.tracing_generation = tracing_generation;
         }
     }
 
@@ -1621,10 +1679,7 @@ impl WarmEnterState {
     /// `comparekey`. Prefer [`Self::mark_force_finish_tracing_for_key`]
     /// wherever the green key itself is in scope.
     pub fn mark_force_finish_tracing(&mut self, green_key_hash: u64) {
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
         cell.flags |= jc_flags::FORCE_FINISH;
     }
 
@@ -1647,8 +1702,7 @@ impl WarmEnterState {
     /// alive while it is set, and once set it persists until the cell itself
     /// is removed.
     pub fn should_force_finish_tracing(&self, green_key_hash: u64) -> bool {
-        self.cells
-            .get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
             .is_some_and(|cell| cell.flags & jc_flags::FORCE_FINISH != 0)
     }
 
@@ -1667,7 +1721,8 @@ impl WarmEnterState {
     /// The moment a cell read is added here, this needs a `&GreenKey` like
     /// [`Self::get_cell_for_key`]'s cohort.
     pub fn trace_next_iteration(&mut self, green_key_hash: u64) {
-        self.counter.change_current_fraction(green_key_hash, 0.98);
+        self.counter
+            .change_current_fraction(self.bucket_of(green_key_hash), 0.98);
     }
 
     /// warmstate.py:467 jitcounter.tick(hash, increment_threshold) parity.
@@ -1675,7 +1730,7 @@ impl WarmEnterState {
     /// warmstate.py:256-257: jitcounter.tick(hash, increment_function_threshold).
     pub fn should_trace_function_entry(&mut self, green_key_hash: u64) -> bool {
         let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.cells.get(&green_key_hash) {
+        if let Some(cell) = self.cell_by_key(green_key_hash) {
             // Slot 23 is the total; 64/65 are its two terms, evaluated
             // independently rather than short-circuited so a cell that is both
             // reaches both tallies. `is_compiled()` fires on every probe of
@@ -1749,12 +1804,14 @@ impl WarmEnterState {
             // warmstate.py:483-500 — function-entry warmup must see an
             // invalidated token as a removed cell and re-count from cold.
             crate::mc_diag_bump(24);
-            self.cleanup_chain(green_key_hash);
+            self.cleanup_chain(self.bucket_of(green_key_hash));
             return false;
         }
         crate::mc_diag_bump(25);
-        self.counter
-            .tick(green_key_hash, self.increment_function_threshold)
+        self.counter.tick(
+            self.bucket_of(green_key_hash),
+            self.increment_function_threshold,
+        )
     }
 
     /// Check if inlining is allowed at the given depth.
@@ -1816,7 +1873,7 @@ impl WarmEnterState {
 
         let mut invalidated = 0;
         for green_key_hash in &deps {
-            if let Some(cell) = self.cells.get_mut(green_key_hash)
+            if let Some(cell) = self.cell_by_key_mut(*green_key_hash)
                 && let Some(token) = &cell.loop_token
             {
                 token.invalidate();
@@ -1855,8 +1912,7 @@ impl WarmEnterState {
     /// Returns `NotHot` if no cell exists.
     #[inline]
     pub fn get_cell_state(&self, green_key_hash: u64) -> BaseJitCellState {
-        self.cells
-            .get(&green_key_hash)
+        self.cell_by_key(green_key_hash)
             .map(|c| c.state)
             .unwrap_or(BaseJitCellState::NotHot)
     }
@@ -1872,10 +1928,7 @@ impl WarmEnterState {
     /// makes it a way for a test to build the split-cell state deliberately.
     /// A twin becomes necessary if production ever calls this.
     pub fn transition_cell(&mut self, green_key_hash: u64, new_state: BaseJitCellState) {
-        let cell = self
-            .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+        let cell = self.ensure_cell_by_key(green_key_hash);
 
         match new_state {
             BaseJitCellState::NotHot => {
@@ -2161,20 +2214,29 @@ impl WarmEnterState {
     pub fn gc_cells(&mut self) -> usize {
         let mut removed = 0;
         let keys: Vec<u64> = self.cells.keys().copied().collect();
+        let mut dropped: Vec<BaseJitCell> = Vec::new();
         for hash in keys {
             if let Some(head) = self.cells.swap_remove(&hash) {
-                let (kept, n) = Self::clean_chain(head);
+                let (kept, n) = Self::clean_chain(head, &mut dropped);
                 removed += n;
                 if let Some(k) = kept {
                     self.cells.insert(hash, k);
                 }
             }
         }
+        for cell in &dropped {
+            self.forget_cell_key(cell);
+        }
         removed
     }
 
     /// Walk a chain, removing cells where should_remove_jitcell() is true.
-    fn clean_chain(head: BaseJitCell) -> (Option<BaseJitCell>, usize) {
+    /// Removed cells are pushed to `dropped` so the caller can retire their
+    /// minted keys ([`Self::forget_cell_key`]).
+    fn clean_chain(
+        head: BaseJitCell,
+        dropped: &mut Vec<BaseJitCell>,
+    ) -> (Option<BaseJitCell>, usize) {
         let mut keep: Option<BaseJitCell> = None;
         let mut removed = 0;
         let mut cell_opt = Some(head);
@@ -2185,10 +2247,191 @@ impl WarmEnterState {
                 keep = Some(c);
             } else {
                 removed += 1;
+                dropped.push(c);
             }
             cell_opt = next;
         }
         (keep, removed)
+    }
+
+    /// The bucket a cell key lives in.
+    ///
+    /// An unminted cell key IS its bucket's raw hash (it is only ever handed
+    /// out inside that bucket), so the common path costs one `is_empty()`
+    /// test and no lookup at all.
+    #[inline]
+    pub(crate) fn bucket_of(&self, cell_key: u64) -> u64 {
+        if self.minted.is_empty() {
+            return cell_key;
+        }
+        self.minted.get(&cell_key).copied().unwrap_or(cell_key)
+    }
+
+    /// The cell named by `cell_key`, or `None` if no cell holds that key.
+    ///
+    /// This is what every hash-form entry point resolves through. Upstream's
+    /// equivalent is not a lookup at all: `maybe_compile_and_run` already
+    /// holds the cell object it matched (warmstate.py:458-464). Pyre's u64 is
+    /// carried across crate boundaries (`compiled_loops`,
+    /// `JitCellToken::green_key`, `rd_loop_token`), so it resolves back to the
+    /// cell here — and it resolves to exactly one, which is the property that
+    /// bucket-head reading did not have.
+    #[inline]
+    pub(crate) fn cell_by_key(&self, cell_key: u64) -> Option<&BaseJitCell> {
+        let mut cell = self.cells.get(&self.bucket_of(cell_key));
+        while let Some(c) = cell {
+            if c.cell_key == Some(cell_key) {
+                return Some(c);
+            }
+            cell = c.next.as_deref();
+        }
+        None
+    }
+
+    /// Mutable [`Self::cell_by_key`].
+    #[inline]
+    pub(crate) fn cell_by_key_mut(&mut self, cell_key: u64) -> Option<&mut BaseJitCell> {
+        let bucket = self.bucket_of(cell_key);
+        let mut cell = self.cells.get_mut(&bucket);
+        while let Some(c) = cell {
+            if c.cell_key == Some(cell_key) {
+                return Some(c);
+            }
+            cell = c.next.as_deref_mut();
+        }
+        None
+    }
+
+    /// The cell named by `cell_key`, installing a comparekey-less one if the
+    /// key names none — the hash-form analogue of
+    /// [`Self::ensure_cell_for_key`], and what `cells.entry(hash)` used to be.
+    ///
+    /// The cell it installs carries no `comparekey`, exactly as before: a
+    /// caller holding only a u64 has no greens to store. Such a cell is
+    /// reachable by its key and by nothing else — no typed walk will ever
+    /// match it (`comparekey_matches` refuses `None` unconditionally), which
+    /// is the pre-existing hazard this migration does not pretend to close.
+    /// What it does close is the other half: the cell is now named by a key
+    /// that means only this cell, so the writer and every later reader of that
+    /// u64 land on the same object even after the bucket chains.
+    fn ensure_cell_by_key(&mut self, cell_key: u64) -> &mut BaseJitCell {
+        if self.cell_by_key(cell_key).is_none() {
+            let mut newcell = BaseJitCell::new();
+            newcell.cell_key = Some(cell_key);
+            self.install_new_cell(self.bucket_of(cell_key), Some(newcell));
+        }
+        self.cell_by_key_mut(cell_key)
+            .expect("just installed a cell under this key")
+    }
+
+    /// Resolve greens to the cell key their cell is named by, WITHOUT
+    /// installing anything.
+    ///
+    /// This is the "resolve once" step. `warmstate.py:596-604
+    /// JitCell.get_jitcell` takes greens + `comparekey` + `get_uhash`
+    /// together and yields a cell; pyre yields that cell's key, and every
+    /// consumer downstream carries the key instead of re-deriving it from the
+    /// bucket hash (warmstate.py:483/:511 carries the resolved
+    /// `procedure_token` for the same reason).
+    ///
+    /// `None` means this key owns no cell AND its bucket's raw hash is already
+    /// taken by a different cell — the only state in which there is no u64
+    /// that names this key's (absent) cell. Readers must treat it as a miss;
+    /// writers call [`Self::ensure_cell_key`], which mints.
+    pub fn cell_key_for(&self, key: &GreenKey) -> Option<u64> {
+        if let Some(cell) = self.lookup_chain_with_key(key) {
+            return cell.cell_key;
+        }
+        let hash = key.get_uhash();
+        // Nothing holds the raw hash, so it is the key this green key's cell
+        // would be installed under, and it names no other cell meanwhile.
+        self.cell_by_key(hash).is_none().then_some(hash)
+    }
+
+    /// Resolve greens to their cell key, installing the cell (with its
+    /// `comparekey`) if the key owns none — `warmstate.py:626-641
+    /// _ensure_jit_cell_at_key`, reporting the identity of the cell it
+    /// ensured.
+    pub fn ensure_cell_key(&mut self, key: &GreenKey) -> u64 {
+        self.ensure_cell_for_key(key);
+        self.lookup_chain_with_key(key)
+            .and_then(|cell| cell.cell_key)
+            .expect("ensure_cell_for_key just installed a keyed cell for this key")
+    }
+
+    /// **Resolve once**: the cell key the greens behind `hash` name.
+    ///
+    /// `make_key` is called only when the bucket is chained — an unchained
+    /// bucket has one candidate, so [`Self::sole_cell_key`] is already exact
+    /// and no `GreenKey` has to be built to confirm it. Producers that cannot
+    /// build one on a chained bucket get `hash` back, which names the bucket's
+    /// original occupant or nothing: a miss, not a guess.
+    ///
+    /// See [`WarmEnterState`]'s type doc for why the resolve happens at the
+    /// producer and the result is carried, rather than each consumer
+    /// re-deriving a cell from the bucket.
+    #[inline]
+    pub fn resolve_cell_key(&self, hash: u64, make_key: impl FnOnce() -> GreenKey) -> u64 {
+        if self.bucket_is_chained(hash) {
+            self.cell_key_for(&make_key()).unwrap_or(hash)
+        } else {
+            self.sole_cell_key(hash).unwrap_or(hash)
+        }
+    }
+
+    /// The key the sole occupant of `hash`'s bucket is named by, if the bucket
+    /// holds exactly one cell.
+    ///
+    /// The entry path's allocation-free half. A one-cell bucket has one
+    /// candidate, so the walk `maybe_compile_and_run` would do can only find
+    /// that cell — no `GreenKey` has to be built to prove it. Normally the
+    /// answer is `hash` itself; it differs only when the cell that held the
+    /// raw hash has been evicted out from under a minted sibling.
+    #[inline]
+    pub fn sole_cell_key(&self, hash: u64) -> Option<u64> {
+        let head = self.cells.get(&hash)?;
+        if head.next.is_some() {
+            return None;
+        }
+        head.cell_key
+    }
+
+    /// Mint a cell key for a cell whose bucket's raw hash is already taken.
+    ///
+    /// **No sub-range of `u64` can be reserved for minted keys.**
+    /// `JitCell.get_uhash` (warmstate.py:584-593) is a full-width multiply-xor
+    /// fold over arbitrary greens, so every `u64` is a hash some green key can
+    /// produce; a reserved range would be a range real keys also land in.
+    /// Uniqueness is therefore enforced against the LIVE key set instead:
+    /// derive a candidate from the bucket and a monotone serial through the
+    /// same fold, then step until the candidate names no live cell and is not
+    /// already a minted key. Both tests are needed — `cell_by_key` would find
+    /// an unminted twin in its own bucket, and `bucket_of` would misroute a
+    /// duplicate mint.
+    ///
+    /// What is NOT guaranteed: that a green key compiled *later* cannot hash
+    /// to a live minted key. Nothing can guarantee that, and the consequence
+    /// is the pre-existing one — the later key resolves through
+    /// [`Self::cell_key_for`], sees its raw hash taken, and mints in turn, so
+    /// the two stay distinct cells. Only a caller that holds a bare hash and
+    /// no greens can land on the wrong one, which is the same class of miss a
+    /// raw hash collision already had.
+    fn mint_cell_key(&mut self, bucket: u64) -> u64 {
+        loop {
+            self.mint_serial = self.mint_serial.wrapping_add(1);
+            let candidate = majit_ir::green_uhash_step(
+                bucket ^ self.mint_serial,
+                majit_ir::GreenType::Int,
+                self.mint_serial as i64,
+            );
+            if candidate != bucket
+                && self.cell_by_key(candidate).is_none()
+                && !self.minted.contains_key(&candidate)
+            {
+                self.minted.insert(candidate, bucket);
+                return candidate;
+            }
+        }
     }
 
     /// counter.py:239-240 lookup_chain(hash)
@@ -2219,8 +2462,24 @@ impl WarmEnterState {
     ///          cell = nextcell
     ///      self.celltable[index] = keep
     /// ```
+    ///
+    /// Pyre addition: the cell being filed is given its [`BaseJitCell::cell_key`]
+    /// here if it does not already carry one — the bucket's raw hash when that
+    /// is free, a minted key when it is not. Filing is the moment the cell
+    /// acquires an identity because it is the moment it becomes reachable;
+    /// upstream needs no equivalent because it hands the cell object itself
+    /// on (warmstate.py:483/:511) and never re-derives it from a number.
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
         let mut keep = newcell;
+        if let Some(cell) = &mut keep
+            && cell.cell_key.is_none()
+        {
+            cell.cell_key = Some(if self.cell_by_key(hash).is_none() {
+                hash
+            } else {
+                self.mint_cell_key(hash)
+            });
+        }
         let mut cell_opt = self.cells.swap_remove(&hash);
         // Walk the existing chain, unlink each node.
         while let Some(mut cell) = cell_opt {
@@ -2229,12 +2488,28 @@ impl WarmEnterState {
                 // counter.py:253-254: cell.next = keep; keep = cell
                 cell.next = keep.map(Box::new);
                 keep = Some(cell);
+            } else {
+                self.forget_cell_key(&cell);
             }
             cell_opt = next;
         }
         // counter.py:256: self.celltable[index] = keep
         if let Some(k) = keep {
             self.cells.insert(hash, k);
+        }
+    }
+
+    /// Retire a dropped cell's minted key so [`Self::mint_cell_key`] may reuse
+    /// the number and `bucket_of` stops answering for a cell that is gone.
+    ///
+    /// Unminted keys need no retiring: they equal their bucket hash, so they
+    /// are recomputable from greens and are re-taken by the next cell that
+    /// installs into an empty bucket.
+    fn forget_cell_key(&mut self, cell: &BaseJitCell) {
+        if let Some(key) = cell.cell_key
+            && !self.minted.is_empty()
+        {
+            self.minted.swap_remove(&key);
         }
     }
 
@@ -2273,25 +2548,19 @@ impl WarmEnterState {
     /// installs a cell that can carry no `comparekey`, the typed path then
     /// installs its own, and `install_new_cell` links the survivor ahead —
     /// so the bucket holds two cells for one key with no collision anywhere.
-    /// Reading `cells.get(&hash)` gets whichever happens to head the bucket.
     /// A full-width hash makes collisions impractical but says nothing about
     /// multiple cells linked under one hash. See
     /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`.
     ///
-    /// The tracing lifecycle is migrated — `start_tracing_cell_for_key`,
-    /// `finish_tracing_for_key`, `abort_tracing_for_key` and their siblings
-    /// walk the chain through `lookup_chain_with_key_mut`. What still reads
-    /// the bucket HEAD is the `u64` API surface kept for callers that hold
-    /// only a hash: `clear_loop_token`, `counter_would_fire`, `counter_tick`,
-    /// `counter_tick_checked`, `maybe_compile`, `force_start_tracing`,
-    /// `finish_tracing`, `abort_tracing`, `clear_tracing_flag`, `get_cell`,
-    /// `should_trace_function_entry`, `invalidate_quasiimmut`. Those cannot
-    /// move until their callers carry a `GreenKey`, which is the same reason
-    /// `MetaInterp`'s `compiled_loops` / `cut_compiled_keys` are `u64`-keyed:
-    /// the hash, not the green tuple, is the identity currency across the
-    /// metainterp. (`loop_header_pcs` was a third such table; it now lives on
-    /// `CompiledEntry::loop_header_pc`, so it is reached through
-    /// `compiled_loops`' `u64` key rather than carrying one of its own.)
+    /// This is the resolve half of [`Self::cell_key_for`], which is how the
+    /// `u64` API surface reaches the same cell without holding the greens: the
+    /// walk happens ONCE, at the hash producer, and the cell key it yields is
+    /// what `clear_loop_token`, `counter_tick`, `maybe_compile`,
+    /// `finish_tracing`, `abort_tracing`, `get_cell` and the rest are handed —
+    /// along with `MetaInterp`'s `compiled_loops` / `cut_compiled_keys`, which
+    /// are indexed by the same key and so describe the same cell. That is the
+    /// property the `u64` currency previously lacked: it named a bucket, and a
+    /// bucket is not a cell.
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
         let hash = key.get_uhash();
         let mut cell = self.cells.get(&hash);
@@ -2320,13 +2589,9 @@ impl WarmEnterState {
     ///     return newcell
     /// ```
     ///
-    /// Returns the index into `self.cells[hash]`'s chain identifying
-    /// the matching cell — pyre stores chains as boxed linked lists
-    /// keyed by hash, so the simplest matching identifier is "head or
-    /// linked offset". For now the helper returns nothing and the
-    /// caller uses `lookup_chain_with_key` for read access; full
-    /// mutable-by-key access lands when the celltable migrates from
-    /// `HashMap<u64, BaseJitCell>` to a chain-aware container.
+    /// Returns nothing; the caller reads the ensured cell back through
+    /// `lookup_chain_with_key`, or through [`Self::ensure_cell_key`] when what
+    /// it needs is the cell's identity rather than the cell.
     ///
     /// On a miss (no chained cell matches the typed key) the helper
     /// allocates a new cell, stores the key through `set_comparekey` —
@@ -4751,35 +5016,54 @@ mod tests {
     /// handing on the key for a second lookup — which is why upstream has no
     /// second reader that could disagree.
     ///
-    /// # Why this is `#[ignore]` and not a green test
+    /// # What this used to pin, and what it pins now
     ///
-    /// It FAILS, and the failure is the open defect, not a broken fixture. On
-    /// the tree that added it the assertion below reports `decided token #2,
-    /// executed token #1`.
+    /// This is the rewritten body of the `#[ignore]`d pin
+    /// `the_entry_decision_and_the_entry_execution_can_name_different_tokens`,
+    /// rewritten with the repo owner's explicit approval. The fixture below —
+    /// two cells, one bucket, a compiled token each — is the original's,
+    /// unchanged. The assertion is inverted from "these two readers disagree,
+    /// and that is the open defect" to "these two readers resolve through one
+    /// cell key, so they cannot disagree", which is what the cell-unique-key
+    /// migration makes true.
     ///
-    /// It is not fixed here because the fix is not the one this file could
-    /// make alone. The token half is small — thread the cell-resolved token to
-    /// the runner, which is upstream's own shape. But the runner reads TWO
-    /// things off the hash, and the second is
-    /// `MetaInterp::compiled_loops[hash]`, an `IndexMap<u64, CompiledEntry<M>>`
-    /// with ONE slot per hash and no chain to walk (`pyjitpl.rs` says so at
-    /// `has_compiled_loop_for_key`). Two colliding keys cannot both file a
-    /// meta there at all, so the second compile overwrites the first, and no
-    /// amount of walking on the cell side reaches a per-cell meta that does
-    /// not exist. Moving `meta` alone onto the cell would leave the rest of
-    /// `CompiledEntry` — traces, exit layouts, front target tokens, all read
-    /// across ~189 sites — indexed by hash while its `meta` was indexed by
-    /// cell: one artifact described through two index bases, which is a worse
-    /// state than this one, because it would look fixed.
+    /// **Pre-migration failure, recorded from the run that authorised this
+    /// rewrite.** On `add4516a533` the same fixture and the same final
+    /// assertion, with the executed side reading `chained_key.get_uhash()` —
+    /// the raw bucket hash, which is the only u64 the runner had to carry
+    /// then — reports:
     ///
-    /// So the pin stays failing and named. Re-enabling it is the acceptance
-    /// test for moving the compiled meta onto the cell.
+    /// ```text
+    /// thread 'warmstate::tests::the_entry_decision_and_the_entry_execution_can_name_different_tokens'
+    /// panicked at majit/majit-metainterp/src/warmstate.rs:4842:9:
+    /// the entry decided `chained_key` has compiled code and then ran a DIFFERENT
+    /// key's artifact: decided token #2, executed token #1. The two must resolve
+    /// through the same cell.
+    /// ```
+    ///
+    /// The old pin's stated blocker — `MetaInterp::compiled_loops` is an
+    /// `IndexMap<u64, CompiledEntry<M>>` with one slot per hash, so two
+    /// colliding keys cannot both file a meta — is what the migration
+    /// dissolves rather than works around: the u64 those tables are keyed by
+    /// became cell-unique, so two colliding green keys file two entries and
+    /// nothing had to move onto the cell.
+    ///
+    /// **Measured again after the migration, by substitution.** Replacing
+    /// `carried` with `bucket` on the `executed` line below — the only
+    /// difference between this body and the pre-migration one — reproduces the
+    /// same failure on the migrated tree:
+    ///
+    /// ```text
+    /// panicked at majit/majit-metainterp/src/warmstate.rs:5127:9:
+    /// the entry decided `chained_key` has compiled code and then ran a DIFFERENT
+    /// key's artifact: decided token #2, executed token #1.
+    /// ```
+    ///
+    /// So the resolve is what carries this test, not a fixture that stopped
+    /// colliding. The last two assertions pin that in-test: the raw bucket
+    /// hash still names the HEAD cell's artifact.
     #[test]
-    #[ignore = "open defect: the entry decides on the comparekey-walked cell \
-                and executes off the bucket head; fixing it needs the compiled \
-                meta to move onto the cell, since compiled_loops holds one \
-                slot per hash"]
-    fn the_entry_decision_and_the_entry_execution_can_name_different_tokens() {
+    fn the_entry_decision_and_the_entry_execution_resolve_through_one_cell_key() {
         let mut ws = WarmEnterState::new(100);
         let head_key = GreenKey::new(vec![2100, 2200]);
         let chained_key = GreenKey::new(vec![2300, colliding_last_green(&head_key, 2300)]);
@@ -4824,7 +5108,19 @@ mod tests {
              defect has nothing to show",
         );
 
-        // What the driver decides on for `chained_key`.
+        // THE RESOLVE, once, at the entry — `jitdriver.rs back_edge_internal`
+        // calls `MetaInterp::resolve_cell_key` exactly here, with the bucket
+        // hash it arrived with and the greens behind it. Everything after this
+        // line carries `carried` and looks nothing up by bucket again.
+        let carried = ws.resolve_cell_key(bucket, || chained_key.clone());
+        assert_ne!(
+            carried, bucket,
+            "fixture: the chained cell had to be minted its own key, or the \
+             two halves below would agree for the trivial reason",
+        );
+
+        // What the driver decides on for `chained_key` — the `comparekey`
+        // walk, `has_compiled_loop_for_key`.
         let decided = ws
             .get_procedure_token_for_key(&chained_key)
             .expect("the decision resolves the chain and finds the key's cell");
@@ -4833,11 +5129,11 @@ mod tests {
             "the decision is about the chained cell's artifact",
         );
 
-        // What the runner then executes for that same key.
-        let executed = ws.get_procedure_token(chained_key.get_uhash()).expect(
-            "the runner reads the bucket head, which has a token here, \
-             so it does not decline",
-        );
+        // What the runner then executes: the u64 reader, handed the key the
+        // entry resolved rather than the bucket hash it arrived with.
+        let executed = ws
+            .get_procedure_token(carried)
+            .expect("the carried cell key names the cell the decision matched");
 
         assert!(
             Arc::ptr_eq(&executed, &decided),
@@ -4846,6 +5142,145 @@ mod tests {
              The two must resolve through the same cell.",
             decided.number,
             executed.number,
+        );
+
+        // Non-vacuity: the bucket hash has NOT stopped naming the head cell.
+        // Substituting it for `carried` above is the pre-migration reading and
+        // still fails the assertion, so the resolve is what carries this test.
+        let by_bucket_hash = ws
+            .get_procedure_token(bucket)
+            .expect("the head cell holds the bucket's raw hash as its key");
+        assert!(
+            Arc::ptr_eq(&by_bucket_hash, &head_token),
+            "the raw hash names the bucket's first occupant, as it always did",
+        );
+        assert!(
+            !Arc::ptr_eq(&by_bucket_hash, &decided),
+            "and that is a DIFFERENT artifact from the one the entry decided \
+             on, which is the whole reason the resolve has to happen",
+        );
+    }
+
+    /// A producer that reaches a chained bucket with no greens DECLINES rather
+    /// than guessing which sibling was meant.
+    ///
+    /// This is the answer to the hazard the hash-only cell creators leave
+    /// behind: they install cells with `comparekey: None`
+    /// (`attach_procedure_to_interp`, `attach_tmp_callback_to_interp`,
+    /// `disable_noninlinable_function`, `mark_as_being_traced`,
+    /// `mark_force_finish_tracing`, `transition_cell`), and a cell with no
+    /// comparator cannot be told from a colliding neighbour by any mechanism —
+    /// upstream cannot even express the state, since `JitCell.__init__`
+    /// (warmstate.py:610-616) always stores the greens.
+    ///
+    /// So the resolve does not try. With no greens it answers the raw bucket
+    /// hash, which names the bucket's ORIGINAL occupant — the cell that took
+    /// the hash as its key — and names nothing at all once that cell is gone.
+    /// That is a miss, and a miss is the honest port: a `None` from
+    /// `cell_key_for` and a raw hash naming no cell both dead-end in the same
+    /// "not found" arm `maybe_compile_and_run` has at warmstate.py:464.
+    #[test]
+    fn a_chained_bucket_reached_without_greens_answers_the_first_occupant() {
+        let mut ws = WarmEnterState::new(100);
+        let first = GreenKey::new(vec![3500, 3600]);
+        let second = GreenKey::new(vec![3700, colliding_last_green(&first, 3700)]);
+        let bucket = first.get_uhash();
+
+        // A procedure token keeps the first cell non-removable, so the second
+        // install chains it rather than pruning it (counter.py:246-256's
+        // `should_remove_jitcell` gate — a cold, tokenless cell is dropped).
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        ws.attach_procedure_to_interp_for_key(&first, token);
+        let first_key = ws
+            .cell_key_for(&first)
+            .expect("the first key owns the cell it just installed");
+        let second_key = ws.ensure_cell_key(&second);
+        assert!(
+            ws.bucket_is_chained(bucket),
+            "fixture: the two keys must share a bucket",
+        );
+
+        assert_eq!(
+            first_key, bucket,
+            "the first occupant keeps the raw hash, so every workload that \
+             never collides is bit-for-bit unchanged",
+        );
+        assert_ne!(second_key, bucket, "the second had to be minted one");
+        assert_eq!(
+            ws.sole_cell_key(bucket),
+            None,
+            "and a greens-less producer gets no answer from the bucket: two \
+             candidates, nothing to choose between them",
+        );
+
+        // Which leaves the raw hash, and the raw hash names the first
+        // occupant — never the minted sibling.
+        assert_eq!(
+            ws.cell_by_key(bucket).and_then(|cell| cell.cell_key),
+            Some(first_key),
+        );
+    }
+
+    /// Two colliding green keys file two entries in a `u64`-keyed artifact
+    /// table — the precondition `MetaInterp::compiled_loops` and
+    /// `MemoryManager` eviction both need, and the one the old pin named as
+    /// its blocker.
+    ///
+    /// `compiled_loops` is an `IndexMap<u64, CompiledEntry<M>>` and
+    /// `try_to_free_some_loops` reaches an entry by
+    /// `token.green_key()` (`JitCellToken::green_key: Cell<u64>`). While that
+    /// u64 was a bucket hash, two colliding keys shared ONE slot: the second
+    /// compile overwrote the first, and the loser's token could not reach its
+    /// own entry to be freed. The stand-in table below is that shape — the
+    /// subject is the keys, not the payload, so the payload is the token
+    /// number.
+    #[test]
+    fn two_colliding_keys_file_two_entries_in_a_u64_keyed_artifact_table() {
+        let mut ws = WarmEnterState::new(100);
+        let key_a = GreenKey::new(vec![3100, 3200]);
+        let key_b = GreenKey::new(vec![3300, colliding_last_green(&key_a, 3300)]);
+        assert_eq!(
+            key_a.get_uhash(),
+            key_b.get_uhash(),
+            "fixture: one bucket, two keys",
+        );
+
+        let cell_a = ws.ensure_cell_key(&key_a);
+        let cell_b = ws.ensure_cell_key(&key_b);
+        assert_ne!(
+            cell_a, cell_b,
+            "colliding keys must be told apart by the u64 the artifact tables \
+             are indexed by, or one of them has no reachable entry at all",
+        );
+
+        // The two tokens each stamp their own cell key, which is what
+        // `compile.rs:2436 jitcell_token.green_key.set(green_key)` writes and
+        // what `try_to_free_some_loops` reads back.
+        let token_a = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        let token_b = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        token_a.green_key.set(cell_a);
+        token_b.green_key.set(cell_b);
+
+        let mut compiled_loops: indexmap::IndexMap<u64, u64> = indexmap::IndexMap::new();
+        compiled_loops.insert(token_a.green_key(), token_a.number);
+        compiled_loops.insert(token_b.green_key(), token_b.number);
+        assert_eq!(
+            compiled_loops.len(),
+            2,
+            "both compiles must file; a shared slot means the second erased \
+             the first",
+        );
+
+        // Eviction of B reaches B's entry and leaves A's alone.
+        assert_eq!(
+            compiled_loops.swap_remove(&token_b.green_key()),
+            Some(token_b.number),
+            "the evicted token's own key must name its own entry",
+        );
+        assert_eq!(
+            compiled_loops.get(&token_a.green_key()),
+            Some(&token_a.number),
+            "and the colliding sibling's artifact must survive it",
         );
     }
 
