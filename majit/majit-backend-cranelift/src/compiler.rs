@@ -6098,7 +6098,7 @@ fn ptr_arg_as_i64(
     }
 }
 
-/// Compute per-call gcmap for ref root slots.
+/// Compute a gcmap for live ref root slots plus any caller-supplied slots.
 ///
 /// RPython regalloc.py get_gcmap (1092-1108): builds a bitmap of frame
 /// slots that hold GC references at a given call site. The bitmap bit
@@ -6106,22 +6106,57 @@ fn ptr_arg_as_i64(
 ///
 /// regalloc.py:1089-1106 get_gcmap
 ///
-/// Build a per-call-site gcmap bitmap marking only the ref root slots
-/// that are still alive at `position`. A ref is alive when its
-/// `last_usage >= position` (regalloc.py:380 is_still_alive).
+/// Build a gcmap bitmap marking the caller-supplied slots and the ref root
+/// slots that are still alive at `position`. A ref is alive when its
+/// `last_usage >= position` (regalloc.py:380 is_still_alive). Guard/finish
+/// exits supply their Ref fail-arg slots; ordinary calls supply none.
 ///
 /// Returns a leaked `[length, data]` gcmap array pointer (same layout
 /// as RPython's allocate_gcmap), or 0 (NULLGCMAP) if no live refs.
 fn get_gcmap(
     position: usize,
     max_output_slots: usize,
+    always_live_bit_positions: &[usize],
+    dense_ref_bindings: &IndexMap<usize, u32>,
     ref_root_slots: &[(u32, usize)],
     longevity: &IndexMap<u32, usize>,
     defined_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
 ) -> i64 {
     // regalloc.py:1093-1105: iterate bindings, include only alive refs.
-    let mut live_bit_positions: Vec<usize> = Vec::new();
+    let mut live_bit_positions: Vec<usize> = always_live_bit_positions.to_vec();
+    // regalloc.py:696-747 `_sync_var_to_stack` → `frame_manager.loc` → `bind`:
+    // a box `before_call` spills keeps its frame binding afterwards, so every
+    // later `get_gcmap` in the same trace marks that slot for as long as
+    // `is_still_alive` holds. The dense publishes below are raw stores with no
+    // binding of their own, so the bindings are tracked alongside and replayed
+    // here — otherwise the very next collecting call (an inline nursery bump is
+    // enough) leaves the published words holding pre-collection addresses that
+    // `force_token_to_dead_frame` then hands to the resume machinery.
+    for (&slot, &var_idx) in dense_ref_bindings {
+        if let Some(&last_usage) = longevity.get(&var_idx)
+            && last_usage >= position
+        {
+            live_bit_positions.push(slot);
+        }
+    }
     for &(var_idx, slot) in ref_root_slots {
+        // A demoted loop-invariant Ref has no loop-body SSA definition, so it
+        // never enters `defined_ref_vars`, and its `longevity` entry ends at
+        // its last regular use. Both filters below would therefore drop it from
+        // every gcmap — while `spill_ref_roots` skips writing it precisely
+        // because "its value already lives in its ref-root slot, kept current
+        // in place because the slot is a live root in this call's gcmap".
+        // Nothing else keeps the slot current: unmarked, a minor collection
+        // does not forward it, so the frame-resident copy dangles and the next
+        // guard exit publishes it as a Ref fail-arg. Its home is a live root
+        // for the whole LABEL body, which is what regalloc.py:1096's
+        // `box.type == REF and is_still_alive(box)` means for a value the
+        // register allocator has pinned to the frame.
+        if is_demoted_failarg(demoted_failarg_slots, var_idx) {
+            live_bit_positions.push(max_output_slots + slot);
+            continue;
+        }
         if !defined_ref_vars.contains(&var_idx) {
             continue;
         }
@@ -6133,13 +6168,22 @@ fn get_gcmap(
             live_bit_positions.push(max_output_slots + slot);
         }
     }
+    allocate_gcmap(&live_bit_positions)
+}
+
+/// llsupport/assembler.py:60-64 `allocate_gcmap` — pack frame-slot indices into
+/// the `[length, data…]` array `jitframe_trace` walks. Positions rather than a
+/// `u64` because a 157- or 340-slot frame puts live bits well past bit 63.
+///
+/// Returns a leaked array pointer, or 0 (NULLGCMAP) when nothing is live.
+fn allocate_gcmap(live_bit_positions: &[usize]) -> i64 {
     if live_bit_positions.is_empty() {
         return 0; // NULLGCMAP
     }
     let max_bit = live_bit_positions.iter().copied().max().unwrap() + 1;
     if max_bit <= 64 {
         let mut bitmap: usize = 0;
-        for bit_pos in &live_bit_positions {
+        for bit_pos in live_bit_positions {
             bitmap |= 1usize << bit_pos;
         }
         let gcmap_arr = Box::leak(Box::new([1isize, bitmap as isize]));
@@ -6148,7 +6192,7 @@ fn get_gcmap(
     let num_words = max_bit.div_ceil(64);
     let mut gcmap: Vec<isize> = vec![0; 1 + num_words];
     gcmap[0] = num_words as isize;
-    for bit_pos in &live_bit_positions {
+    for bit_pos in live_bit_positions {
         let word_idx = bit_pos / 64;
         let bit_idx = bit_pos % 64;
         gcmap[1 + word_idx] |= (1usize << bit_idx) as isize;
@@ -6156,6 +6200,31 @@ fn get_gcmap(
     let leaked = gcmap.into_boxed_slice();
     let ptr = Box::leak(leaked).as_ptr();
     ptr as i64
+}
+
+/// Record the frame bindings a `before_call` dense publish establishes.
+///
+/// regalloc.py:696-747: `_sync_var_to_stack` binds the spilled box to its frame
+/// location, and the binding outlives the call — `get_gcmap` keeps marking the
+/// slot until `is_still_alive` goes false. The emitted publish is a raw store,
+/// so the binding is kept here instead. A slot is rebound on every publish, so
+/// the newest writer owns it; a Const fail-arg carries its value inline
+/// (history.py:227/268/314) and binds nothing.
+fn bind_published_dense_refs(
+    dense_ref_bindings: &mut IndexMap<usize, u32>,
+    info: &GuardInfo,
+    constants: &IndexMap<u32, i64>,
+) {
+    for &slot in &info.failarg_ref_slots {
+        let Some(&arg_ref) = info.fail_arg_refs.get(slot) else {
+            continue;
+        };
+        if arg_ref.is_none() || arg_ref.is_constant() || constants.contains_key(&arg_ref.raw()) {
+            dense_ref_bindings.swap_remove(&slot);
+            continue;
+        }
+        dense_ref_bindings.insert(slot, arg_ref.raw());
+    }
 }
 
 fn live_ref_root_slots_at(
@@ -7066,17 +7135,29 @@ fn emit_guard_exit(
     //   POP [ebp + jf_gcmap]   — #2104
     //   POP [ebp + jf_descr]   — #2105
     // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
-    // Skip gcmap store when null (no ref fail_args) — saves 1 iconst + 1 store.
-    if info.gcmap != 0 {
-        // allocate_gcmap (gcmap.py:7-18): Array(Unsigned) [length, data...].
-        let gcmap_arr = Box::leak(Box::new([1isize, info.gcmap as isize]));
-        let gcmap_val = builder
-            .ins()
-            .iconst(cl_types::I64, gcmap_arr.as_ptr() as i64);
-        builder
-            .ins()
-            .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
-    }
+    //
+    // The store is unconditional. `POP_b(ofs2)` writes whatever
+    // `generate_quick_failure` pushed, including a null gcmap, and
+    // `genop_finish` spells the same clear out longhand for the no-ref case
+    // (assembler.py:2155-2157) with a comment that keeping it is deliberate:
+    // "note that the 0 here is redundant, but I would rather keep that one and
+    // kill all the others". dynasm ports it as the `else { pop_gcmap() }` arm
+    // of its FINISH branch.
+    //
+    // Storing only for `info.gcmap != 0` leaves the field holding the map an
+    // earlier exit installed. `jitframe_trace` (jitframe.py:115-116) returns
+    // early only on a null `jf_gcmap`, so a stale non-null map makes the frame
+    // walk slots that this exit never wrote — the dangling young pointer then
+    // reaches `copy_nursery_object` through the remembered set.
+    let gcmap_val = if info.gcmap != 0 {
+        builder.ins().iconst(cl_types::I64, info.gcmap)
+    } else {
+        // pop_gcmap (assembler.py:2030-2032): MOV [ebp + jf_gcmap], 0
+        builder.ins().iconst(cl_types::I64, 0)
+    };
+    builder
+        .ins()
+        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     // _build_failure_recovery (assembler.py:2089-2096) parity:
     // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
     //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
@@ -8002,6 +8083,8 @@ fn run_compiled_code_inner(
 }
 
 struct GuardInfo {
+    /// Source operation whose failure layout this metadata describes.
+    source_op_index: usize,
     #[expect(
         dead_code,
         reason = "guard metadata keeps the assigned fail index alongside emitted layouts"
@@ -8012,9 +8095,13 @@ struct GuardInfo {
     /// assembler.py:40-44 must_save_exception(): true for
     /// GUARD_EXCEPTION, GUARD_NO_EXCEPTION, GUARD_NOT_FORCED.
     must_save_exception: bool,
-    /// gcmap bitmap: bit i set ⇔ fail_arg[i] is Ref type.
+    /// Dense output slots holding this guard's Ref fail-args. They are the
+    /// guard's whole gcmap (`GuardToken.compute_gcmap`), and the slots a
+    /// paired CALL_MAY_FORCE / CALL_RELEASE_GIL publishes into before its call.
+    failarg_ref_slots: Vec<usize>,
+    /// Leaked `[length, data...]` gcmap pointer, or 0 for NULLGCMAP.
     /// allocate_gcmap (gcmap.py:7-18) parity.
-    gcmap: u64,
+    gcmap: i64,
     /// assembler.py:2126 get_gcref_from_faildescr parity: written to
     /// jf_descr on guard exit.  This is the metainterp
     /// `AbstractFailDescr` Arc's data pointer (matching `history.py:125`
@@ -9271,6 +9358,11 @@ impl CraneliftBackend {
             .collect();
         let mut synced_ref_vars: IndexSet<u32> = IndexSet::new();
         let mut stale_ref_vars: IndexSet<u32> = IndexSet::new();
+        // regalloc.py `fm.bindings` for the boxes `before_call` publishes into
+        // the dense `jf_frame` area: slot index → the box living there. Read by
+        // `get_gcmap` so the published words keep being forwarded for as long
+        // as `is_still_alive` holds, not only across the call that wrote them.
+        let mut dense_ref_bindings: IndexMap<usize, u32> = IndexMap::new();
 
         // regalloc.py:1173-1213 compute_vars_longevity
         // Compute last_usage for each ref root variable. Used by get_gcmap
@@ -9798,11 +9890,15 @@ impl CraneliftBackend {
         // No per-call registration/unregistration inside the compiled code.
         // Per-call spill/reload keeps the roots array up-to-date.
 
-        // The jitframe allocation path is zero-filled (gc.py:30-34
-        // malloc_zero_filled, pyre Nursery::new/reset).  RPython relies on
-        // that allocator property instead of clearing every frame slot in
-        // the trace prologue.  Undefined ref-root slots are also absent from
-        // per-call gcmaps, so the GC will not trace them.
+        // The prologue clears no frame slot.  What makes that safe is the
+        // gcmap, not the allocator: a slot no path has written is absent from
+        // every gcmap, so the GC never reads it.  incminimark is explicitly
+        // NOT zero-filling (incminimark.py:211 `malloc_zero_filled = False`,
+        // and `gen_zero_gc_pointers` skips `Array(Signed)`), so a frame reached
+        // through `_frame_realloc_slowpath` starts on recycled bytes upstream
+        // too.  `run_compiled_code_inner` does zero its payload, but do not
+        // build on that: widening a map to cover slots this path never writes
+        // is what turns recycled bytes into traced roots.
 
         // RPython compile.py sends loops to the backend as:
         // [start_label] + preamble_ops + [loop_label] + body_ops
@@ -10199,14 +10295,44 @@ impl CraneliftBackend {
                 jf_ptr = builder.ins().get_pinned_reg(ptr_type);
             }
 
+            let paired_may_force = matches!(
+                op.opcode,
+                OpCode::CallMayForceI
+                    | OpCode::CallMayForceR
+                    | OpCode::CallMayForceF
+                    | OpCode::CallMayForceN
+                    | OpCode::CallReleaseGilI
+                    | OpCode::CallReleaseGilF
+                    | OpCode::CallReleaseGilN
+            );
+            // Both emitters below publish the paired GUARD_NOT_FORCED's Ref
+            // fail-args into the dense `jf_frame` area *before* the call
+            // (regalloc.py:812-820 `before_call`, which spills through the
+            // frame manager so those boxes stay in `fm.bindings` and every
+            // later `get_gcmap` marks them). Here they are raw stores, so the
+            // call's own map has to name them: a collection inside the callee
+            // otherwise leaves the just-written copies holding pre-collection
+            // addresses that `force_token_to_dead_frame` and the guard's exit
+            // republish.
+            let pre_call_failarg_slots: &[usize] = if paired_may_force {
+                guard_infos
+                    .get(guard_idx)
+                    .filter(|info| info.source_op_index == op_idx + 1)
+                    .map_or(&[], |info| info.failarg_ref_slots.as_slice())
+            } else {
+                &[]
+            };
             // regalloc.py:1089-1106 get_gcmap: per-call-site gcmap
-            // marking only alive ref root slots at this position.
+            // marking the alive ref root slots at this position.
             let per_call_gcmap = get_gcmap(
                 op_idx,
                 max_output_slots,
+                pre_call_failarg_slots,
+                &dense_ref_bindings,
                 &ref_root_slots,
                 &longevity,
                 &defined_ref_vars,
+                &demoted_failarg_slots,
             );
             let live_ref_root_slots =
                 live_ref_root_slots_at(op_idx, &ref_root_slots, &longevity, &defined_ref_vars);
@@ -11475,7 +11601,7 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -12016,6 +12142,7 @@ impl CraneliftBackend {
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
                     }
+                    bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     // x86/assembler.py:2236: self._genop_call(op, arglocs, result_loc)
@@ -12036,7 +12163,7 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         call_jf,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -12099,6 +12226,7 @@ impl CraneliftBackend {
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
                     }
+                    bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     let descr = op
@@ -12112,7 +12240,7 @@ impl CraneliftBackend {
                     spill_ref_roots(
                         &mut builder,
                         call_jf,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -12208,7 +12336,7 @@ impl CraneliftBackend {
                     reload_ref_roots(
                         &mut builder,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
@@ -12257,7 +12385,7 @@ impl CraneliftBackend {
                             call_conv,
                             ptr_type,
                             call_jf,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -12316,7 +12444,7 @@ impl CraneliftBackend {
                             call_conv,
                             ptr_type,
                             call_jf,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -12423,7 +12551,7 @@ impl CraneliftBackend {
                         spill_ref_roots(
                             &mut builder,
                             jf_ptr,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -12445,7 +12573,7 @@ impl CraneliftBackend {
                         reload_ref_roots(
                             &mut builder,
                             jf_ptr_slow,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
@@ -12486,7 +12614,7 @@ impl CraneliftBackend {
                             ptr_type,
                             call_conv,
                             jf_ptr,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -12611,7 +12739,7 @@ impl CraneliftBackend {
                         spill_ref_roots(
                             &mut builder,
                             jf_ptr,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -12635,7 +12763,7 @@ impl CraneliftBackend {
                         reload_ref_roots(
                             &mut builder,
                             jf_ptr_slow,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
@@ -12701,7 +12829,7 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -12797,7 +12925,7 @@ impl CraneliftBackend {
                     spill_ref_roots(
                         &mut builder,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -12820,7 +12948,7 @@ impl CraneliftBackend {
                     reload_ref_roots(
                         &mut builder,
                         jf_ptr_slow,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
@@ -14550,7 +14678,7 @@ impl CraneliftBackend {
                             ptr_type,
                             call_conv,
                             cur_jf,
-                            &ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -14651,7 +14779,7 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -14840,7 +14968,7 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         jf_ptr,
-                        &ref_root_slots,
+                        &live_ref_root_slots,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -15732,9 +15860,12 @@ fn collect_guards(
             }
         }
         let recovery_layout = Some(recovery_layout);
-        // Guard gcmap: bit i ⟺ fail_args[i] is Ref, stored at jf_frame[i].
-        // No JITFRAME_FIXED_SIZE offset needed because fail_args start at
-        // jf_frame[0] (not jf_frame[JITFRAME_FIXED_SIZE]).
+        // Guard gcmap fail-arg portion: bit i ⟺ fail_args[i] is Ref,
+        // stored at jf_frame[i]. No JITFRAME_FIXED_SIZE offset is needed
+        // because fail_args start at jf_frame[0]. `get_gcmap` later unions
+        // these slots with the live Ref-home region starting at
+        // `max_output_slots`; keeping positions instead of a u64 avoids
+        // truncating frames wider than one bitmap word.
         // assembler.py:2114-2155 genop_finish + regalloc.py:1190-1206 longevity:
         //   - GUARD: getfailargs() must not contain Const (regalloc.py:1206 assert).
         //   - FINISH: getarglist() may contain Const (regalloc.py:1192-1193 skip).
@@ -15745,8 +15876,8 @@ fn collect_guards(
         //     also contain Const (handled by regalloc.py:1192-1193 in the same
         //     loop). majit groups external JUMP with FINISH for fail_args
         //     bookkeeping; treat their gcmap the same way.
-        let gcmap = {
-            let mut bits: u64 = 0;
+        let failarg_ref_slots = {
+            let mut slots = Vec::new();
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
                     let arg_ref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
@@ -15758,12 +15889,10 @@ fn collect_guards(
                         is_finish || is_external_jump || !arg_ref.is_constant(),
                         "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
                     );
-                    if (i as u32) < 64 {
-                        bits |= 1u64 << i;
-                    }
+                    slots.push(i);
                 }
             }
-            bits
+            slots
         };
         // assembler.py:2456-2462 closing_jump parity for the external-JUMP
         // branch: the TargetToken descr referenced by `op.descr` is captured
@@ -16021,11 +16150,19 @@ fn collect_guards(
                 | majit_ir::OpCode::GuardNotForced
         );
         guard_infos.push(GuardInfo {
+            source_op_index: op_idx,
             fail_index,
             can_have_bridge,
             fail_arg_refs,
             must_save_exception,
-            gcmap,
+            // llsupport/assembler.py:46-64 `GuardToken.compute_gcmap` walks
+            // `failargs` x `fail_locs` and nothing else — a guard's map is
+            // narrower than `regalloc.get_gcmap()`, which is reserved for sites
+            // where `before_call` has just refreshed every named slot. dynasm
+            // ports the same split (`guard_gcmap_from_faillocs`). Anything a
+            // guard exit does not itself write must stay out of this map.
+            gcmap: allocate_gcmap(&failarg_ref_slots),
+            failarg_ref_slots,
             fail_descr_ptr,
             bridge_cache_addrs,
             accum_info,
