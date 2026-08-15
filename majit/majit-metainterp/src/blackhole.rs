@@ -659,7 +659,16 @@ impl BlackholeInterpreter {
     /// Set an integer register value.
     ///
     /// RPython: `BlackholeInterpreter.setarg_i(index, value)`
+    ///
+    /// The working registers occupy `0 .. num_regs_i`; everything above is the
+    /// jitcode's constant table, which no write may reach.
     pub fn setarg_i(&mut self, index: usize, value: i64) {
+        // `init_register_file_from_i64s` lays the jitcode's integer constants
+        // out at `num_regs_i ..`, so a write at or above that bound replaces a
+        // constant the instruction stream still reads as one.  The read side
+        // cannot tell the difference, and the value surfaces far away — as a
+        // bogus array index or callee address — so fail at the write.
+        debug_assert_constant_slot_untouched(index, self.jitcode.num_regs_i(), "setarg_i");
         self.registers_i[index] = value;
     }
 
@@ -7619,6 +7628,24 @@ fn check_residual_call_exception_after(
 /// it as a no-op returning `0`/null, a convention pyre relies on for host calls
 /// left unbound on purpose.
 #[inline]
+/// Refuse a register write that would land in the constant table.
+///
+/// `init_register_file_from_i64s` places the jitcode's constants at
+/// `num_regs_i ..` of the same bank the working registers live in, so the two
+/// are only separated by that bound.  Nothing distinguishes them at the read,
+/// which is why a clobbered constant is reported here rather than where its
+/// value is finally used.
+#[track_caller]
+fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str) {
+    if crate::jit_strict_mode() {
+        assert!(
+            index < num_regs,
+            "{who}: register index {index} is at or past num_regs {num_regs}, so it \
+             addresses the jitcode's constant table rather than a working register",
+        );
+    }
+}
+
 fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
     if crate::majit_log_enabled() {
         eprintln!(

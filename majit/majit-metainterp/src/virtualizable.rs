@@ -2996,6 +2996,23 @@ pub(crate) unsafe fn vable_read_array_item(
         if data_ptr.is_null() {
             0
         } else {
+            // An index past the end reads whatever follows the payload and
+            // hands it back as a value of `item_type` — for a `Ref` array that
+            // is a pointer the caller will dereference, so the fault lands in
+            // whatever consumes the result rather than here.  The operand is
+            // an interpreter register, so a stale or clobbered one is a defect
+            // in the producer; report it against this array instead of letting
+            // the poison value travel.
+            if crate::jit_strict_mode() {
+                let len = bhimpl_arraylen_vable(vable_ptr, array);
+                assert!(
+                    index < len,
+                    "vable_read_array_item: index {index} is past the end of \
+                     virtualizable array {:?} (len {len}, item_type {:?})",
+                    array.name,
+                    array.item_type,
+                );
+            }
             let src = data_ptr.add(index * item_size);
             if array.item_type == Type::Ref {
                 *(src as *const usize) as i64
