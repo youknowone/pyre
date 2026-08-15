@@ -7062,6 +7062,49 @@ fn emit_guard_exit(
                 .store(MemFlagsData::trusted(), val, jf_ptr, offset);
         }
     }
+    // _build_failure_recovery (assembler.py:2102-2105) parity:
+    //   POP [ebp + jf_gcmap]   — #2104
+    //   POP [ebp + jf_descr]   — #2105
+    // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
+    //
+    // The store is unconditional. `POP_b(ofs2)` writes whatever
+    // `generate_quick_failure` pushed, including a null gcmap, and
+    // `genop_finish` spells the same clear out longhand for the no-ref case
+    // (assembler.py:2155-2157) with a comment that keeping it is deliberate:
+    // "note that the 0 here is redundant, but I would rather keep that one and
+    // kill all the others". dynasm ports it as the `else { pop_gcmap() }` arm
+    // of its FINISH branch.
+    //
+    // Storing only for `info.gcmap != 0` leaves the field holding the map an
+    // earlier exit installed. `jitframe_trace` (jitframe.py:115-116) returns
+    // early only on a null `jf_gcmap`, so a stale non-null map makes the frame
+    // walk slots that this exit never wrote.
+    //
+    // Both stores sit ahead of the closing-jump and attached-bridge dispatches
+    // below, which tail-call and never come back. Those paths still publish the
+    // Ref fail-args above, and the frame is allocated in the old generation
+    // (`jitframe_prefer_oldgen`), so a publish that skipped this pair left an
+    // old object holding young pointers with neither a map that describes them
+    // nor a place in the remembered set: the next minor collection walked past
+    // the frame and its slots kept addresses the collection had already moved.
+    // `llmodel.py:150 realloc_frame` fires the same barrier for the same
+    // reason after copying `jf_frame` into a fresh frame.
+    let gcmap_val = if info.gcmap != 0 {
+        builder.ins().iconst(cl_types::I64, info.gcmap)
+    } else {
+        // pop_gcmap (assembler.py:2030-2032): MOV [ebp + jf_gcmap], 0
+        builder.ins().iconst(cl_types::I64, 0)
+    };
+    builder
+        .ins()
+        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
+    if info.gcmap != 0 {
+        // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`: RPython
+        // emits a JITFrame write-barrier wherever a promoted frame's slots take
+        // young pointers, so they remain trackable.
+        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
+    }
+
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
     // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
@@ -7131,33 +7174,6 @@ fn emit_guard_exit(
         );
     }
 
-    // _build_failure_recovery (assembler.py:2102-2105) parity:
-    //   POP [ebp + jf_gcmap]   — #2104
-    //   POP [ebp + jf_descr]   — #2105
-    // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
-    //
-    // The store is unconditional. `POP_b(ofs2)` writes whatever
-    // `generate_quick_failure` pushed, including a null gcmap, and
-    // `genop_finish` spells the same clear out longhand for the no-ref case
-    // (assembler.py:2155-2157) with a comment that keeping it is deliberate:
-    // "note that the 0 here is redundant, but I would rather keep that one and
-    // kill all the others". dynasm ports it as the `else { pop_gcmap() }` arm
-    // of its FINISH branch.
-    //
-    // Storing only for `info.gcmap != 0` leaves the field holding the map an
-    // earlier exit installed. `jitframe_trace` (jitframe.py:115-116) returns
-    // early only on a null `jf_gcmap`, so a stale non-null map makes the frame
-    // walk slots that this exit never wrote — the dangling young pointer then
-    // reaches `copy_nursery_object` through the remembered set.
-    let gcmap_val = if info.gcmap != 0 {
-        builder.ins().iconst(cl_types::I64, info.gcmap)
-    } else {
-        // pop_gcmap (assembler.py:2030-2032): MOV [ebp + jf_gcmap], 0
-        builder.ins().iconst(cl_types::I64, 0)
-    };
-    builder
-        .ins()
-        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
     // _build_failure_recovery (assembler.py:2089-2096) parity:
     // if exc: MOV ebx, [pos_exc_value]; MOV [pos_exception], 0;
     //         MOV [pos_exc_value], 0; MOV [jf_guard_exc], ebx
@@ -7185,15 +7201,11 @@ fn emit_guard_exit(
             .ins()
             .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
     }
-    if info.gcmap != 0 || info.must_save_exception {
-        // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`:
-        // RPython emits a JITFrame write-barrier after any potentially-
-        // allocating CALL when `gcrootmap and wbdescr` so promoted-frame
-        // young-pointer slots remain trackable. Cranelift cannot patch
-        // mid-trace, so the barrier is hoisted to guard exits that return a
-        // deadframe after writing Ref fail-args (gcmap != 0) or staging an
-        // exception value (must_save_exception).  Attached bridge hits tail-call
-        // above and skip this deadframe-only slow work.
+    if info.must_save_exception {
+        // `jf_guard_exc` is a header GCREF field (jitframe.py:105-109), traced
+        // on every walk and independent of the gcmap, so the staging store
+        // above needs its own barrier. The fail-arg publish is covered by the
+        // barrier that runs before the dispatch tail-calls.
         emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
     }
     builder
