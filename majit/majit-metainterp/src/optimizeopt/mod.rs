@@ -9497,6 +9497,7 @@ mod boxref_forwarding_tests {
                 fields: Vec::new(),
                 field_descrs: Vec::new(),
                 arrays: Vec::new(),
+                heap_fields: Vec::new(),
                 last_guard_pos: -1,
             }),
         );

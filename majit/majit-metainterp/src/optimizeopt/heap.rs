@@ -4430,6 +4430,140 @@ mod tests {
         let _ = heap.optimize_getfield(&op, &std::rc::Rc::new(op.clone()), &mut ctx);
     }
 
+    /// Same shape as `test_getfield_read_after_read`, but through a descr that
+    /// owns a parent SizeDescr and sits at a non-zero slot — the production
+    /// shape (`PyFrame.execution_context` is `index_in_parent: 7`). The
+    /// parentless `TestDescr` used by the sibling test takes
+    /// `field_slot_index`'s `Descr::index()` fallback, so it never exercises
+    /// the `index_in_parent` slot that `ensure_ptr_info_arg0` sizes the
+    /// `StructPtrInfo` for at `optimizer.py:484 init_fields`.
+    #[test]
+    fn getfield_read_after_read_folds_through_a_parented_descr() {
+        let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "second read of the same parented field must reuse the first: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcR);
+        assert_eq!(result[1].opcode, OpCode::Jump);
+    }
+
+    /// The frame-enter shape `inline_helper` traces: read `ec` off the frame,
+    /// read `ec.topframeref`, read `ec` again, then store through the first
+    /// `ec` and read back through the second. Both `ec` reads name the same
+    /// receiver and the same descr, so the second must fold; once it does, the
+    /// store is visible to the read-back and the pair can cancel.
+    #[test]
+    fn getfield_folds_across_an_intervening_read_of_its_own_result() {
+        let d_ec: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let d_tf: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 0 });
+        let p0 = rooted_inputarg_operand(Type::Ref, 100);
+        let stored = rooted_inputarg_operand(Type::Ref, 101);
+        // `assign_positions` numbers ops by index, so op 0's result is RefOp(0).
+        let ec1 = bound_arg(OpRef::ref_op(0));
+        let ec2 = bound_arg(OpRef::ref_op(2));
+        let mut ops = vec![
+            Op::with_descr(OpCode::GetfieldGcR, &[p0.clone()], d_ec.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[ec1.clone()], d_tf.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[p0.clone()], d_ec.clone()),
+            Op::with_descr(OpCode::SetfieldGc, &[ec1, stored], d_tf.clone()),
+            Op::with_descr(OpCode::GetfieldGcR, &[ec2], d_tf),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt(&mut ops);
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+
+        let ec_reads = result
+            .iter()
+            .filter(|o| {
+                o.opcode == OpCode::GetfieldGcR
+                    && o.getdescr()
+                        .is_some_and(|dd| OptHeap::field_cache_identity(&dd) == OptHeap::field_cache_identity(&d_ec))
+            })
+            .count();
+        assert_eq!(ec_reads, 1, "the second `ec` read must fold: {opcodes:?}");
+    }
+
+    /// Drive two identical `getfield_gc_r`s at a receiver that already carries
+    /// a given `PtrInfo`, and report whether the second folded.
+    fn second_getfield_folds_with_receiver_info(
+        seed: crate::optimizeopt::info::PtrInfo,
+    ) -> bool {
+        let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
+        let mut heap = OptHeap::new();
+        let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
+        let p0_box = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        ctx.seed_boxes_canonical(std::slice::from_ref(&p0_box));
+        ctx.set_ptr_info(&p0_box, seed);
+
+        let mut folded = false;
+        for _ in 0..2 {
+            let pos = ctx.reserve_pos_typed(Type::Ref);
+            let mut op = Op::with_descr(OpCode::GetfieldGcR, &[p0_box.clone()], d.clone());
+            op.pos.set(pos);
+            let op_rc = std::rc::Rc::new(op.clone());
+            ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+            folded = matches!(
+                heap.optimize_getfield(&op, &op_rc, &mut ctx),
+                OptimizationResult::Remove
+            );
+        }
+        folded
+    }
+
+    /// An ordinary heap field read off a *virtualizable* receiver must still be
+    /// cached. Upstream has no `VirtualizablePtrInfo` — `info.py`'s hierarchy
+    /// stops at `InstancePtrInfo` / `StructPtrInfo` — so a virtualizable frame
+    /// carries a plain `InstancePtrInfo` and `optimizer.py:484 init_fields`
+    /// gives every declared slot a home. pyre's extra `PtrInfo::Virtualizable`
+    /// variant has no `setfield` / `getfield` arm (`ptr_info.rs` falls through
+    /// to `_ => {}` / `_ => None`), and `ensure_ptr_info_arg0` early-returns on
+    /// it instead of upgrading, so the write is dropped and every later read of
+    /// the same field misses.
+    ///
+    /// `inline_helper` traces exactly this: six `getfield_gc_r(p0,
+    /// PyFrame.execution_context)` off one frame, none folded, which keeps the
+    /// frame push/pop `topframeref` stores from cancelling and forces the
+    /// virtual `VRef` that `NewWithVtable`/`ForceToken` then materialise.
+    #[test]
+    fn getfield_off_a_virtualizable_receiver_is_still_cached() {
+        use crate::optimizeopt::info::{PtrInfo, VirtualizableFieldState};
+
+        assert!(
+            second_getfield_folds_with_receiver_info(PtrInfo::instance(None, None)),
+            "control: a non-virtualizable receiver must fold the second read"
+        );
+        assert!(
+            second_getfield_folds_with_receiver_info(PtrInfo::Virtualizable(
+                VirtualizableFieldState {
+                    fields: Vec::new(),
+                    field_descrs: Vec::new(),
+                    arrays: Vec::new(),
+                    heap_fields: Vec::new(),
+                    last_guard_pos: -1,
+                }
+            )),
+            "an ordinary field read off a virtualizable receiver must be cached too"
+        );
+    }
+
     // ── Test 2: Two GETFIELDs on same object/field → second eliminated ──
 
     #[test]

@@ -390,6 +390,16 @@ pub struct VirtualizableFieldState {
     /// Tracked array field values: (array_field_index, element_values).
     /// Indices correspond to VirtualizableInfo::array_fields order.
     pub arrays: Vec<(u32, Vec<Operand>)>,
+    /// Ordinary (non-virtualizable) heap fields read off this object, keyed by
+    /// `FieldDescr::index_in_parent` — the same `_fields` role
+    /// `AbstractStructPtrInfo` plays at `info.py:175-214`.
+    ///
+    /// `fields` above is a different index space (`VirtualizableInfo::
+    /// static_fields` order), so the two cannot share storage. Upstream needs
+    /// no such split: it has no virtualizable-specific `PtrInfo` subclass, so
+    /// a virtualizable frame carries a plain `InstancePtrInfo` and every field
+    /// read off it lands in the one `_fields` list the heap cache consults.
+    pub heap_fields: Vec<(u32, FieldEntry)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
 }
@@ -1155,6 +1165,15 @@ impl PtrInfo {
                 }
                 v.fields.push((field_idx, value));
             }
+            PtrInfo::Virtualizable(v) => {
+                for entry in &mut v.heap_fields {
+                    if entry.0 == field_idx {
+                        entry.1 = FieldEntry::Value(value.clone());
+                        return;
+                    }
+                }
+                v.heap_fields.push((field_idx, FieldEntry::Value(value)));
+            }
             _ => {}
         }
     }
@@ -1170,6 +1189,13 @@ impl PtrInfo {
             PtrInfo::Struct(v) => {
                 v.fields.retain(|(k, _)| *k != field_idx);
                 v.fields.push((field_idx, FieldEntry::Preamble(pop)));
+            }
+            // The catch-all below re-seats `self` as an `InstancePtrInfo`,
+            // which would drop the tracked virtualizable state. Store the
+            // hoisted field alongside the other ordinary heap fields instead.
+            PtrInfo::Virtualizable(v) => {
+                v.heap_fields.retain(|(k, _)| *k != field_idx);
+                v.heap_fields.push((field_idx, FieldEntry::Preamble(pop)));
             }
             _ => {
                 *self = PtrInfo::Instance(InstancePtrInfo {
@@ -1202,6 +1228,10 @@ impl PtrInfo {
                 .any(|(k, e)| *k == field_idx && e.is_preamble()),
             PtrInfo::Struct(v) => v
                 .fields
+                .iter()
+                .any(|(k, e)| *k == field_idx && e.is_preamble()),
+            PtrInfo::Virtualizable(v) => v
+                .heap_fields
                 .iter()
                 .any(|(k, e)| *k == field_idx && e.is_preamble()),
             _ => false,
@@ -1276,6 +1306,7 @@ impl PtrInfo {
             }
             PtrInfo::Virtual(v) => v.fields.retain(|(k, _)| *k != field_idx),
             PtrInfo::VirtualStruct(v) => v.fields.retain(|(k, _)| *k != field_idx),
+            PtrInfo::Virtualizable(v) => v.heap_fields.retain(|(k, _)| *k != field_idx),
             _ => {}
         }
     }
@@ -1334,6 +1365,11 @@ impl PtrInfo {
                 .iter()
                 .find(|(k, _)| *k == field_idx)
                 .map(|(_, v)| FieldEntry::Value(v.clone())),
+            PtrInfo::Virtualizable(v) => v
+                .heap_fields
+                .iter()
+                .find(|(k, _)| *k == field_idx)
+                .map(|(_, e)| e.clone()),
             _ => None,
         }
     }

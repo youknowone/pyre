@@ -220,6 +220,7 @@ impl VirtualizableTracker {
                                 fields: vec![],
                                 field_descrs: vec![],
                                 arrays: vec![],
+                                heap_fields: vec![],
                                 last_guard_pos: -1,
                             }),
                         );
@@ -244,6 +245,7 @@ impl VirtualizableTracker {
             fields: vec![],
             field_descrs: vec![],
             arrays: vec![],
+            heap_fields: vec![],
             last_guard_pos: -1,
         };
         // Input-layout seeding applies only to the initial loop/preamble entry
@@ -3428,6 +3430,7 @@ mod tests {
                 fields: vec![],
                 field_descrs: vec![],
                 arrays: vec![(0, vec![Operand::None])],
+                heap_fields: vec![],
                 last_guard_pos: -1,
             }),
         );
