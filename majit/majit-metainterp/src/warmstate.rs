@@ -4700,6 +4700,155 @@ mod tests {
         );
     }
 
+    /// The second green of a two-`Int` key beginning with `first` that makes it
+    /// hash to the same bucket as `other`.
+    ///
+    /// Constructed rather than searched. `get_uhash` folds
+    /// `x = (x ^ hash_whatever(tp, v)) * GREEN_UHASH_MULT` (warmstate.py:584-593)
+    /// and `hash_whatever(Int, v)` is `v` itself, so with the multiply the same
+    /// on both sides the two hashes agree exactly when the pre-multiply words
+    /// do — one xor away. A searched collision would pin the hash function; the
+    /// subject here is what a chained bucket does.
+    fn colliding_last_green(other: &GreenKey, first: i64) -> i64 {
+        use majit_ir::{GREEN_UHASH_SEED, GreenType, green_uhash_step};
+        assert_eq!(other.values.len(), 2, "written for two-green Int keys");
+        let other_prefix = green_uhash_step(GREEN_UHASH_SEED, GreenType::Int, other.values[0]);
+        let this_prefix = green_uhash_step(GREEN_UHASH_SEED, GreenType::Int, first);
+        (this_prefix ^ other_prefix ^ (other.values[1] as u64)) as i64
+    }
+
+    /// A token that answers `has_compiled_code()`, which is what both halves of
+    /// the entry gate test. The payload is never read — `has_compiled_code` is
+    /// `self.compiled.get().is_some()` — so its type only has to satisfy the
+    /// `Any + Send` bound.
+    fn token_with_compiled_code(ws: &mut WarmEnterState) -> Arc<JitCellToken> {
+        let token = Arc::new(JitCellToken::new(ws.alloc_token_number()));
+        token.set_compiled(Box::new(()));
+        assert!(token.has_compiled_code());
+        token
+    }
+
+    /// **The entry path decides on one cell and executes off another.**
+    ///
+    /// `jitdriver.rs entry_cell_has_compiled_code` resolves a chained bucket
+    /// through `comparekey` — `has_compiled_loop_for_key`, i.e.
+    /// `get_procedure_token_for_key` — but the runner it then calls,
+    /// `MetaInterp::run_compiled_detailed_with_values_at_dispatch_key`, reads
+    /// `warm_state.get_procedure_token(hash)`: the bucket HEAD.
+    ///
+    /// [`get_procedure_token_for_key_reads_the_keys_own_cell_not_the_bucket_head`]
+    /// above pins the reader in isolation, and its head cell holds no token at
+    /// all — so the entry it models DECLINES, which is safe. This one gives the
+    /// head a compiled token of its own, which is the shape a real collision
+    /// between two warm keys has, and then nothing declines: the decision is
+    /// about the chained cell's artifact and the execution is the head cell's.
+    ///
+    /// `warmstate.py:568-593` reaches a token only through the cell it has
+    /// already matched on greens + comparekey + `get_uhash` together, so the
+    /// two can never name different objects upstream. `warmstate.py:483/511`
+    /// then carries that resolved `procedure_token` to the executor
+    /// (`raise EnterJitAssembler(procedure_token, *execute_args)`) rather than
+    /// handing on the key for a second lookup — which is why upstream has no
+    /// second reader that could disagree.
+    ///
+    /// # Why this is `#[ignore]` and not a green test
+    ///
+    /// It FAILS, and the failure is the open defect, not a broken fixture. On
+    /// the tree that added it the assertion below reports `decided token #2,
+    /// executed token #1`.
+    ///
+    /// It is not fixed here because the fix is not the one this file could
+    /// make alone. The token half is small — thread the cell-resolved token to
+    /// the runner, which is upstream's own shape. But the runner reads TWO
+    /// things off the hash, and the second is
+    /// `MetaInterp::compiled_loops[hash]`, an `IndexMap<u64, CompiledEntry<M>>`
+    /// with ONE slot per hash and no chain to walk (`pyjitpl.rs` says so at
+    /// `has_compiled_loop_for_key`). Two colliding keys cannot both file a
+    /// meta there at all, so the second compile overwrites the first, and no
+    /// amount of walking on the cell side reaches a per-cell meta that does
+    /// not exist. Moving `meta` alone onto the cell would leave the rest of
+    /// `CompiledEntry` — traces, exit layouts, front target tokens, all read
+    /// across ~189 sites — indexed by hash while its `meta` was indexed by
+    /// cell: one artifact described through two index bases, which is a worse
+    /// state than this one, because it would look fixed.
+    ///
+    /// So the pin stays failing and named. Re-enabling it is the acceptance
+    /// test for moving the compiled meta onto the cell.
+    #[test]
+    #[ignore = "open defect: the entry decides on the comparekey-walked cell \
+                and executes off the bucket head; fixing it needs the compiled \
+                meta to move onto the cell, since compiled_loops holds one \
+                slot per hash"]
+    fn the_entry_decision_and_the_entry_execution_can_name_different_tokens() {
+        let mut ws = WarmEnterState::new(100);
+        let head_key = GreenKey::new(vec![2100, 2200]);
+        let chained_key = GreenKey::new(vec![2300, colliding_last_green(&head_key, 2300)]);
+        let bucket = head_key.get_uhash();
+        assert_eq!(
+            chained_key.get_uhash(),
+            bucket,
+            "fixture: the two keys must land in one bucket by their own hash, \
+             not by being installed there — `lookup_chain_with_key` starts \
+             from `key.get_uhash()`, so a hand-placed cell would simply be \
+             unreachable and the test would pass for the wrong reason",
+        );
+        assert_ne!(
+            head_key, chained_key,
+            "fixture: and they must be DIFFERENT keys, which is what makes \
+             one bucket two artifacts",
+        );
+
+        // Installed first, and keepable (a cell holding a procedure token is
+        // never `should_remove_jitcell`), so `install_new_cell` folds it in
+        // front of the second and it ends up HEADING the bucket.
+        let head_token = token_with_compiled_code(&mut ws);
+        let mut head_cell = BaseJitCell::new();
+        head_cell.set_comparekey(&head_key);
+        head_cell.set_procedure_token(Arc::clone(&head_token), false);
+        ws.install_new_cell(bucket, Some(head_cell));
+
+        let chained_token = token_with_compiled_code(&mut ws);
+        let mut chained_cell = BaseJitCell::new();
+        chained_cell.set_comparekey(&chained_key);
+        chained_cell.set_procedure_token(Arc::clone(&chained_token), false);
+        ws.install_new_cell(bucket, Some(chained_cell));
+
+        assert!(
+            ws.bucket_is_chained(bucket),
+            "fixture: both cells must share one bucket, which is the only \
+             case in which the two readers can disagree",
+        );
+        assert!(
+            !Arc::ptr_eq(&head_token, &chained_token),
+            "fixture: the two cells must hold DIFFERENT artifacts, or the \
+             defect has nothing to show",
+        );
+
+        // What the driver decides on for `chained_key`.
+        let decided = ws
+            .get_procedure_token_for_key(&chained_key)
+            .expect("the decision resolves the chain and finds the key's cell");
+        assert!(
+            Arc::ptr_eq(&decided, &chained_token),
+            "the decision is about the chained cell's artifact",
+        );
+
+        // What the runner then executes for that same key.
+        let executed = ws.get_procedure_token(chained_key.get_uhash()).expect(
+            "the runner reads the bucket head, which has a token here, \
+             so it does not decline",
+        );
+
+        assert!(
+            Arc::ptr_eq(&executed, &decided),
+            "the entry decided `chained_key` has compiled code and then ran a \
+             DIFFERENT key's artifact: decided token #{}, executed token #{}. \
+             The two must resolve through the same cell.",
+            decided.number,
+            executed.number,
+        );
+    }
+
     /// An unchained bucket has one candidate, so the head IS the match and the
     /// hash form is exact — this is what lets the entry path skip building a
     /// `GreenKey` on every warm entry.
