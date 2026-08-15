@@ -3519,6 +3519,12 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         is_quasi_immutable: false,
         flag,
         virtualizable: false,
+        // The group lists only the four read-only payload fields; the
+        // inherited `PyObject` header row is not among them, so none of them
+        // is the class word and `class_word_field` answers `None` for this
+        // layout. Testing `offset == W_CLASS_OFFSET` the way the object-group
+        // factory does would read as if the header could appear here.
+        is_class_word: false,
         index_in_parent: 0,
     };
     let mut specs = vec![
