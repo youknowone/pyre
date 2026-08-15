@@ -751,7 +751,7 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     // `build_multi_frame_miframe` already declines this class for its own
     // innermost frame. Declining is the supported outcome: every caller falls
     // back to the rollback/replay path.
-    if !instruction_starts_at(&jitcode.code, resume_pc) {
+    if !instruction_starts_at(&jitcode, resume_pc) {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[s2-fill-decline] resume_pc={resume_pc} is not an instruction \
@@ -766,15 +766,27 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     fill_trace_too_long_register_banks(ctx, &mut miframe).then_some(miframe)
 }
 
-/// Whether `pc` is an instruction boundary of `code`.
+/// Whether `pc` is an instruction boundary of `jitcode`.
 ///
-/// `decoded_ops` walks the fallthrough layout from 0 and stops at the first
-/// byte it cannot decode, so a pc it never yields is either inside an
-/// instruction or past a decode failure — neither is a coordinate the
-/// blackhole may dispatch from. The end of the code is a boundary: a frame
-/// that resumes there returns without dispatching.
-fn instruction_starts_at(code: &[u8], pc: usize) -> bool {
-    pc == code.len() || crate::jitcode_runtime::decoded_ops(code).any(|op| op.pc == pc)
+/// `startpoints` (`jitcode.py:40`) is the assembler's own record of where
+/// instructions begin, and the authority the blackhole already uses for this
+/// question — `blackhole.py:88 dispatch_loop` asserts its position against it,
+/// and `find_catch_before_resume_live` scans it for op boundaries. Assembled
+/// jitcodes always populate it; a hand-built one leaves it `None`
+/// (`jitcode.py:24 setup(..., startpoints=None)`), so fall back to walking the
+/// fallthrough layout. `decoded_ops` starts at 0 and stops at the first byte it
+/// cannot decode, so a pc it never yields is either inside an instruction or
+/// past a decode failure — neither is a coordinate the blackhole may dispatch
+/// from. The end of the code is a boundary either way: a frame that resumes
+/// there returns without dispatching.
+fn instruction_starts_at(jitcode: &majit_metainterp::jitcode::JitCode, pc: usize) -> bool {
+    if pc == jitcode.code.len() {
+        return true;
+    }
+    match jitcode.startpoints.as_ref() {
+        Some(startpoints) => startpoints.contains(&pc),
+        None => crate::jitcode_runtime::decoded_ops(&jitcode.code).any(|op| op.pc == pc),
+    }
 }
 
 /// Fill every currently-known register color, matching

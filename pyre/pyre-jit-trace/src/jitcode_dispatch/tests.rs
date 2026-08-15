@@ -551,7 +551,9 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
         code: vec![0, 0],
         c_num_regs_r: 3,
-        startpoints: Some([0_usize].into_iter().collect()),
+        // Two single-byte ops, so pc 1 is a post-step position that starts an
+        // instruction and carries no `-live-` marker.
+        startpoints: Some([0_usize, 1].into_iter().collect()),
         ..Default::default()
     });
     let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(
@@ -570,6 +572,26 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         miframe.ref_values[2],
         Some(forwarded_obj_ptr as i64),
         "the complete-bank image must prefer the GC-forwarded Box payload",
+    );
+
+    // A pc the jitcode does not name as an instruction start is refused: the
+    // blackhole `setposition`s onto it and dispatches, so it would read an
+    // operand byte as an opcode.
+    let mid_instruction_jc = majit_metainterp::jitcode::JitCode::new("trace_too_long_mid_insn");
+    mid_instruction_jc.set_body(majit_translate::jitcode::JitCodeBody {
+        code: vec![0, 0],
+        c_num_regs_r: 3,
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    assert!(
+        super::residual_call::build_trace_too_long_single_frame_miframe(
+            &wc,
+            std::sync::Arc::new(mid_instruction_jc),
+            1,
+        )
+        .is_none(),
+        "a resume pc inside an instruction must decline",
     );
 }
 
