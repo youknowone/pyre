@@ -443,6 +443,20 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             //   pending exc cell at runtime) → RESTORE_EXCEPTION → GUARD_EXCEPTION
             //   (`handle_possible_exception`; deopts on a class mismatch, and
             //   consumes/clears the pending exception cell on match).
+            //
+            // RPython splits this across two calls because resume-data replay
+            // runs between them: `_prepare_exception_resumption` records the
+            // two SAVEs at the trace start (`pyjitpl.py:3148` asserts the trace
+            // is still empty), and `prepare_resume_from_failure` records
+            // RESTORE_EXCEPTION only after the resume operations. That gap is
+            // the whole point of the SAVE/RESTORE pair — a bare
+            // GUARD_NO_EXCEPTION at the bridge start is removable by the
+            // optimizer (`pyjitpl.py:3132-3138`). pyre emits nothing between
+            // them today, so `remove_bridge_exception`
+            // (`majit-gc/src/rewrite.rs`, rewrite.py:988-1001) strips the
+            // consecutive triple and leaves the guard. Once pyre replays
+            // resume data here, this must split into the same two phases
+            // rather than stay one block.
             let class_op = wc.trace_ctx.save_exc_class();
             let value_op = wc.trace_ctx.save_exception();
             wc.trace_ctx.restore_exception(class_op, value_op);

@@ -11513,13 +11513,18 @@ impl<M: Clone> MetaInterp<M> {
             // compile.py:753-781: GUARD_VALUE per-value hash.
             let index = (status >> Self::ST_SHIFT) as u32;
             let typetag = status & Self::ST_TYPE_MASK;
-            let raw = fail_values.get(index as usize).copied().unwrap_or(0);
-            let intval: i64 = match typetag {
-                Self::TY_INT => raw,
-                Self::TY_REF => raw,
-                Self::TY_FLOAT => raw,
-                _ => raw,
-            };
+            // compile.py:772-773 `else: assert 0, typetag`.
+            debug_assert!(
+                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
+                "compile.py:772-773 assert 0, typetag: unknown typetag {typetag:#x}"
+            );
+            // compile.py:761-771 turns each tag into an integer before hashing:
+            // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
+            // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
+            // host (codewriter/longlong.py:28) — the double's raw bit pattern.
+            // `fail_values` already holds every slot as that raw word, so all
+            // three tags hash the stored value unchanged.
+            let intval: i64 = fail_values.get(index as usize).copied().unwrap_or(0);
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
             //   + intval * 1442968193
             (descr_addr as u64)
@@ -13613,50 +13618,6 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {
         self.backend.is_force_token_armed(GcRef(token as usize))
-    }
-
-    /// RPython pyjitpl.py:3101 _prepare_exception_resumption +
-    /// pyjitpl.py:3132 prepare_resume_from_failure parity.
-    ///
-    /// Emit SAVE_EXC_CLASS + SAVE_EXCEPTION + RESTORE_EXCEPTION at
-    /// the bridge trace start for exception guard bridges, then emit
-    /// GUARD_EXCEPTION (pyjitpl.py:3140-3147
-    /// `handle_possible_exception`).
-    ///
-    /// When the three SAVE/RESTORE ops are consecutive (no resume-data
-    /// virtual-reconstruction ops between them — the current pyre
-    /// state), `rewrite.rs::remove_bridge_exception` strips them,
-    /// leaving only the GUARD_EXCEPTION.  When pyre gains
-    /// resume-data replay (emitting NEW_WITH_VTABLE etc. between
-    /// SAVE and RESTORE), this method must be split into two phases
-    /// matching RPython's `_prepare_exception_resumption` (phase 1,
-    /// trace start) and `prepare_resume_from_failure` (phase 2,
-    /// after resume ops).
-    ///
-    /// Not on the live path: the bridge walker emits this sequence itself at
-    /// the bridge-entry frame state, where the GUARD_EXCEPTION it ends with
-    /// carries a snapshot.  The guard emitted here carries none, so it could
-    /// only ever serve a trace that gets discarded.
-    pub fn emit_exception_bridge_prologue(&mut self, exc_class: i64, exc_value: i64) {
-        let Some(ref mut ctx) = self.tracing else {
-            return;
-        };
-        let class_const = ctx.const_int(exc_class);
-        let value_const = ctx.const_int(exc_value);
-        let class_op = ctx.record_op(OpCode::SaveExcClass, &[class_const]);
-        let value_op = ctx.record_op(OpCode::SaveException, &[value_const]);
-        ctx.record_op(OpCode::RestoreException, &[class_op, value_op]);
-        // pyjitpl.py:3140-3147: after RESTORE_EXCEPTION, RPython calls
-        // execute_ll_raised(exception_obj) which sets last_exc_value,
-        // then handle_possible_exception() which emits GUARD_EXCEPTION.
-        // The guard tells the optimizer "this bridge starts with a known
-        // exception of class exc_class" — without it, the optimizer may
-        // incorrectly remove a later GUARD_NO_EXCEPTION.
-        if exc_class != 0 {
-            ctx.guard_exception(class_const, 0);
-        } else {
-            ctx.guard_no_exception(0);
-        }
     }
 
     /// Handle a guard failure: recover interpreter state using resume data.

@@ -2886,9 +2886,7 @@ pub trait WalkSym {
     fn set_last_exc_box(&mut self, value: OpRef);
     fn class_of_last_exc_is_const(&self) -> bool;
     fn set_class_of_last_exc_is_const(&mut self, value: bool);
-    fn current_exc_value(&self) -> pyre_object::PyObjectRef;
     fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef);
-    fn current_exc_box(&self) -> OpRef;
     fn set_current_exc_box(&mut self, value: OpRef);
     fn trace_built_exc(&self) -> &indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
     fn trace_built_exc_mut(&mut self) -> &mut indexmap::IndexMap<OpRef, pyre_object::PyObjectRef>;
@@ -3081,18 +3079,8 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
-    fn current_exc_value(&self) -> pyre_object::PyObjectRef {
-        self.current_exc_value
-    }
-
-    #[inline]
     fn set_current_exc_value(&mut self, value: pyre_object::PyObjectRef) {
         self.current_exc_value = value;
-    }
-
-    #[inline]
-    fn current_exc_box(&self) -> OpRef {
-        self.current_exc_box
     }
 
     #[inline]
