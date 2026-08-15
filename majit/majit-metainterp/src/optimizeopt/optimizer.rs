@@ -1690,37 +1690,23 @@ impl Optimizer {
     /// the inner restore must preserve that.
     ///
     /// ```text
-    /// let guard = optimizer.cant_replace_guards();
+    /// let guard = optimizer.cant_replace_guards(ctx);
     /// // ... guarded section ...
-    /// optimizer.restore_can_replace_guards(guard);
+    /// optimizer.restore_can_replace_guards(ctx, guard);
     /// ```
-    pub fn cant_replace_guards(&mut self) -> CantReplaceGuards {
+    pub fn cant_replace_guards(&mut self, ctx: &mut OptContext) -> CantReplaceGuards {
+        debug_assert_eq!(self.can_replace_guards, ctx.can_replace_guards);
         let oldval = self.can_replace_guards;
         self.can_replace_guards = false;
+        ctx.can_replace_guards = false;
         CantReplaceGuards::new(oldval)
     }
 
     /// Pair with `cant_replace_guards` — restores the saved oldval.
     /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
-    pub fn restore_can_replace_guards(&mut self, guard: CantReplaceGuards) {
+    pub fn restore_can_replace_guards(&mut self, ctx: &mut OptContext, guard: CantReplaceGuards) {
         self.can_replace_guards = guard.oldval;
-    }
-
-    /// **Legacy flat setter** kept for tests that exercise the flag
-    /// outside the cant_replace_guards save/restore pattern. New
-    /// production callers should use `cant_replace_guards()` +
-    /// `restore_can_replace_guards(oldval)` so nested scopes preserve
-    /// the outer value. Test-only entry; production unroll path
-    /// already migrated to the save/restore pair.
-    #[cfg(test)]
-    pub fn disable_guard_replacement(&mut self) {
-        self.can_replace_guards = false;
-    }
-
-    /// Companion to `disable_guard_replacement` — test-only.
-    #[cfg(test)]
-    pub fn enable_guard_replacement(&mut self) {
-        self.can_replace_guards = true;
+        ctx.can_replace_guards = guard.oldval;
     }
 
     /// `optimizer.py:243` + `heap.py:807-808`
@@ -7103,11 +7089,14 @@ mod tests {
     #[test]
     fn test_guard_replacement_flag() {
         let mut opt = Optimizer::new();
+        let mut ctx = OptContext::new(0);
         assert!(opt.can_replace_guards);
-        opt.disable_guard_replacement();
+        let guard = opt.cant_replace_guards(&mut ctx);
         assert!(!opt.can_replace_guards);
-        opt.enable_guard_replacement();
+        assert!(!ctx.can_replace_guards);
+        opt.restore_can_replace_guards(&mut ctx, guard);
         assert!(opt.can_replace_guards);
+        assert!(ctx.can_replace_guards);
     }
 
     #[test]

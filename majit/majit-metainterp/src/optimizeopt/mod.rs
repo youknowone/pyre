@@ -677,7 +677,7 @@ pub struct OptContext {
     pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
-    pub can_replace_guards: bool,
+    can_replace_guards: bool,
     /// RPython optimizer.py: `patchguardop` — the last GUARD_FUTURE_CONDITION op.
     /// Used by unroll to attach resume data to extra guards from short preamble.
     pub patchguardop: Option<Op>,

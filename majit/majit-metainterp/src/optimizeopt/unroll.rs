@@ -3328,7 +3328,7 @@ impl OptUnroll {
         // preserve the outer False via the saved token. An InvalidLoop is
         // recorded as a deferred signal on `ctx` (no unwinding), so a plain
         // call + restore preserves the "restore on exit" contract.
-        let guard = optimizer.cant_replace_guards();
+        let guard = optimizer.cant_replace_guards(ctx);
         let result = self.jump_to_existing_trace_impl(
             jump_args,
             current_label_args,
@@ -3339,7 +3339,7 @@ impl OptUnroll {
             runtime_boxes,
             pre_vs,
         );
-        optimizer.restore_can_replace_guards(guard);
+        optimizer.restore_can_replace_guards(ctx, guard);
         result
     }
 
