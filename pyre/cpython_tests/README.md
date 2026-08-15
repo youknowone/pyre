@@ -50,7 +50,10 @@ Key flags: `--backend dynasm|cranelift`, `--no-jit` (`PYRE_NO_JIT=1`),
 
 - `script` (default): `pyre <path>/test_xxx.py` — runs the file directly as
   `__main__`, firing its `unittest.main()`. The most robust mode today; it
-  bypasses `runpy` / `importlib.util.find_spec`.
+  bypasses `runpy` / `importlib.util.find_spec`. A package, and a file with no
+  `if __name__ == "__main__"` block of its own, are driven through a
+  synthesized unittest entry — running those directly defines their test
+  classes and exits 0 without running a single test.
 - `module`: `pyre -m test.<module>` — the same module entry via `runpy`,
   without libregrtest's process setup and result protocol.
 - `regrtest`: `pyre -m test -v <module>` — CPython's libregrtest, the

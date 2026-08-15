@@ -12,7 +12,9 @@ Each module is launched one of three ways, selectable with `--mode`:
   * script (default): `pyre <path>/test_xxx.py` — runs the test file directly
     as `__main__` so its `if __name__ == "__main__": unittest.main()` block
     fires. Needs only `unittest` plus the module's own imports, so it remains
-    the most robust mode today. Runner metadata gives
+    the most robust mode today. A package, and a file carrying no such block,
+    go through a synthesized unittest entry instead — running those directly
+    exits 0 without testing anything. Runner metadata gives
     resource-heavy or dotted-identity-sensitive modules the corresponding
     libregrtest bootstrap without changing this default.
   * module: `pyre -m test.<module>` — same unittest entry but via `runpy`
@@ -22,7 +24,9 @@ Each module is launched one of three ways, selectable with `--mode`:
 
 A (module, backend) result is classified as:
 
-  PASS        rc 0 (unittest printed OK)
+  PASS        rc 0 (unittest printed OK) and at least one test actually ran
+  SKIP        the module opted out: it bailed with unittest.SkipTest, was
+              denied a resource, or ran nothing but skips
   FAIL        clean nonzero exit (test failures/errors)
   CRASH       rust panic / nonzero internal_compile_panics / signal
   TIMEOUT     exceeded --timeout
@@ -303,6 +307,35 @@ def death_signal(rc: int) -> str:
         return f"rc={rc}"
 
 
+def unittest_tally(out: str, err: str) -> tuple[int, int] | None:
+    """`(tests run, tests skipped)`, totalled over unittest's own summaries.
+
+    `None` when the module wrote no summary at all.
+
+    Every `Ran N tests` and the `skipped=N` of the verdict closing it are added
+    up rather than the last summary winning: a test file may run more than one
+    suite, and one that prints a captured child interpreter's output carries
+    that child's summary too. Totalling them keeps the caller's "nothing ran"
+    test conservative, since one suite that did run real tests outweighs
+    another that skipped everything.
+    """
+    ran = skipped = 0
+    counted = False
+    for line in f"{out}\n{err}".splitlines():
+        line = line.strip()
+        if line.startswith("Ran ") and " test" in line:
+            count = line.split()[1]
+            if count.isdigit():
+                ran += int(count)
+                counted = True
+        elif line.startswith(("OK (", "FAILED (")) and line.endswith(")"):
+            for field in line[line.index("(") + 1:-1].split(", "):
+                name, _, value = field.partition("=")
+                if name == "skipped" and value.isdigit():
+                    skipped += int(value)
+    return (ran, skipped) if counted else None
+
+
 def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     """Map a finished run to (status, detail).
 
@@ -311,6 +344,15 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
     framework executed (a genuine test FAIL), while its absence means the
     module could not even be loaded — an interpreter/stdlib gap, which is the
     Phase-0 backlog this suite is meant to surface.
+
+    The PASS vs SKIP split on a clean exit keys on whether anything was
+    actually exercised: a run whose every case was skipped exits 0 and prints
+    `OK`, and calling that PASS records a gate entry for a module that carries
+    no signal. `test.test_interpreters` was recorded PASS while its five
+    submodules were nothing but `unittest.loader` placeholders for a missing
+    `_interpreters` (`loader.py` `_make_skipped_test` turns an import-time
+    `SkipTest` into a skipped test rather than a failure), so the entry claimed
+    coverage of a package that ran no test at all.
     """
     panic = jit_panic_reason(err)
     if panic:
@@ -333,6 +375,15 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         )
         if denied is not None:
             return "SKIP", denied[:120]
+        tally = unittest_tally(out, err)
+        # Both halves of `ran == skipped` are the same absence of a result:
+        # every case opted out, or the suite was empty. libregrtest keeps a
+        # state of its own for the second (`single.py:92` raises
+        # `TestDidNotRun` on a run with no tests, no skips and no errors,
+        # which `result.py` prints as "ran no tests").
+        if tally is not None and tally[0] == tally[1]:
+            ran = tally[0]
+            return "SKIP", f"ran {ran}, every test skipped" if ran else "ran no tests"
         return "PASS", ""
     last = last_stderr_line(err)
     ran = "Ran " in out or "Ran " in err or "FAILED (" in out or "FAILED (" in err
@@ -382,6 +433,24 @@ def is_package(module: str) -> bool:
     """A `test.<name>` whose `<name>` is a package directory, not a file."""
     name = module.split(".", 1)[1]
     return (TESTDIR / name / "__init__.py").exists()
+
+
+def runs_its_own_tests(module: str) -> bool:
+    """Whether running the module's file as `__main__` runs its tests.
+
+    Script mode bets on the file's own `if __name__ == "__main__":
+    unittest.main()` block. Not every test file carries one — libregrtest
+    imports the module and builds the suite itself, so a file written only for
+    that entry needs none — and running such a file directly defines its test
+    classes, runs nothing, and exits 0. That is a clean exit which asserted
+    nothing, and it was recorded as PASS: `test_type_params` alone collects
+    over a hundred tests that never ran.
+    """
+    try:
+        source = module_path(module).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return 'if __name__ == "__main__"' in source or "if __name__ == '__main__'" in source
 
 
 # Driver that imports a test *package* with real package context (so its
@@ -494,7 +563,9 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             driver = Path(cwd) / "_pyre_pkg_main.py"
             driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
             cmd = [str(binary), str(driver)]
-        elif mode == "script" and module in DOTTED_IDENTITY_MODULES:
+        elif mode == "script" and (
+            module in DOTTED_IDENTITY_MODULES or not runs_its_own_tests(module)
+        ):
             driver = Path(cwd) / "_pyre_dotted_main.py"
             driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
             cmd = [str(binary), str(driver)]

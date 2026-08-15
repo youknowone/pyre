@@ -37,8 +37,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_annotationlib": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "IMPORTERROR",
+      "dynasm": "IMPORTERROR"
     },
     "test.test_apple": {
       "cranelift": "PASS",
@@ -235,12 +235,12 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_compiler_assemble": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_compiler_codegen": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_complex": {
       "dynasm": "PASS"
@@ -276,7 +276,7 @@
       "dynasm": "PASS"
     },
     "test.test_coroutines": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_cppext": {
       "dynasm": "SKIP",
@@ -718,8 +718,8 @@
       "dynasm": "FAIL"
     },
     "test.test_math_property": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_memoryio": {
       "dynasm": "PASS"
@@ -1138,8 +1138,8 @@
       "dynasm": "PASS"
     },
     "test.test_tabnanny": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_tarfile": {
       "dynasm": "IMPORTERROR"
@@ -1229,12 +1229,12 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_type_aliases": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_type_annotations": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_type_cache": {
       "dynasm": "IMPORTERROR"
