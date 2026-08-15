@@ -2364,24 +2364,194 @@ fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     ]))
 }
 
-/// `enum_certificates(store_name)` and `enum_crls(store_name)` report the
-/// contents of a Windows system certificate store: the first as
-/// (cert_bytes, encoding_type, trust) triples, where `encoding_type` is
-/// `"x509_asn"` or `"pkcs_7_asn"` and `trust` is either a frozenset of
-/// enhanced-key-usage OIDs or `True` for "valid for every purpose"; the second
-/// as (crl_bytes, encoding_type) pairs.
-///
-/// Both stores always read as empty.  Walking one means CertOpenStore plus
-/// CertEnumCertificatesInStore/CertEnumCRLsInStore, and this build links no
-/// wincrypt binding to reach them.  Verification does not depend on it —
-/// `set_default_verify_paths` loads the Windows roots through the platform
-/// certificate provider — but callers that mine the store themselves
-/// (`ssl.enum_certificates`, `wincertstore`) see nothing.  `ssl.py` imports
-/// both names unconditionally on win32, which is why they exist at all.
+/// The Windows system-certificate-store readers behind `ssl.enum_certificates`
+/// and `ssl.enum_crls` (`_ssl_enum_certificates_impl`, `_ssl_enum_crls_impl`).
+/// Verification does not depend on them — `set_default_verify_paths` loads the
+/// Windows roots through the platform certificate provider — but callers that
+/// mine the store themselves (`wincertstore`, trust-list builders) read it
+/// through these.
 #[cfg(windows)]
-fn enum_windows_cert_store(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::baseobjspace::str_utf8_w(args[0])?;
-    Ok(w_list_new(Vec::new()))
+mod cert_store {
+    use pyre_object::{
+        PyObjectRef, w_bool_from, w_bytes_from_bytes, w_frozenset_from_items, w_int_new,
+        w_list_new, w_str_new, w_tuple_new,
+    };
+    use windows_sys::Win32::Foundation::CRYPT_E_NOT_FOUND;
+    use windows_sys::Win32::Security::Cryptography::{
+        CERT_CONTEXT, CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG,
+        CERT_STORE_PROV_SYSTEM_A, CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        CRL_CONTEXT, CTL_USAGE, CertCloseStore, CertEnumCRLsInStore, CertEnumCertificatesInStore,
+        CertFreeCRLContext, CertFreeCertificateContext, CertGetEnhancedKeyUsage, CertOpenStore,
+        HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    };
+    use windows_sys::core::BOOL;
+
+    /// The OSError the calling thread's last Win32 error names
+    /// (`PyErr_SetFromWindowsErr`).
+    fn last_win32_error() -> crate::PyError {
+        crate::PyError::os_error_win32_syscall2(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    }
+
+    /// The encoding-type element of a result tuple: `"x509_asn"` for
+    /// `X509_ASN_ENCODING`, `"pkcs_7_asn"` for `PKCS_7_ASN_ENCODING`, and the
+    /// raw flag value for anything else (`certEncodingType`).
+    fn encoding_type(encoding: u32) -> PyObjectRef {
+        match encoding {
+            X509_ASN_ENCODING => w_str_new("x509_asn"),
+            PKCS_7_ASN_ENCODING => w_str_new("pkcs_7_asn"),
+            other => w_int_new(other as i64),
+        }
+    }
+
+    /// A `CertGetEnhancedKeyUsage` failure: `CRYPT_E_NOT_FOUND` means no EKU
+    /// restriction is recorded — the certificate is valid for every purpose —
+    /// and anything else is an error.
+    fn key_usage_not_found() -> Result<Option<PyObjectRef>, crate::PyError> {
+        match std::io::Error::last_os_error().raw_os_error().unwrap_or(0) {
+            CRYPT_E_NOT_FOUND => Ok(None),
+            _ => Err(last_win32_error()),
+        }
+    }
+
+    /// The enhanced-key-usage OIDs `CertGetEnhancedKeyUsage` reports for
+    /// `flags`, as a frozenset of dotted-decimal strings, or `None` for a
+    /// certificate valid for every purpose (`parseKeyUsage`).
+    unsafe fn enhanced_key_usage(
+        cert: *const CERT_CONTEXT,
+        flags: u32,
+    ) -> Result<Option<PyObjectRef>, crate::PyError> {
+        let mut size = 0u32;
+        if CertGetEnhancedKeyUsage(cert, flags, std::ptr::null_mut(), &mut size) == 0 {
+            return key_usage_not_found();
+        }
+        // The byte count is read back through a `CTL_USAGE`, so give the
+        // buffer that struct's alignment and at least its size.
+        let words = (size as usize)
+            .max(std::mem::size_of::<CTL_USAGE>())
+            .div_ceil(std::mem::size_of::<u64>());
+        let mut buffer = vec![0u64; words];
+        let usage = buffer.as_mut_ptr() as *mut CTL_USAGE;
+        if CertGetEnhancedKeyUsage(cert, flags, usage, &mut size) == 0 {
+            return key_usage_not_found();
+        }
+        let usage = &*usage;
+        let mut oids = Vec::with_capacity(usage.cUsageIdentifier as usize);
+        for i in 0..usage.cUsageIdentifier as usize {
+            let oid = *usage.rgpszUsageIdentifier.add(i);
+            if !oid.is_null() {
+                let oid = std::ffi::CStr::from_ptr(oid.cast());
+                oids.push(w_str_new(&oid.to_string_lossy()));
+            }
+        }
+        Ok(Some(w_frozenset_from_items(&oids)))
+    }
+
+    /// Walk one kind of store content: `next` is `CertEnumCertificatesInStore`
+    /// or `CertEnumCRLsInStore`, which frees the context handed back to it, so
+    /// the explicit `free` runs only when `convert` bails mid-walk.
+    unsafe fn walk_store<T>(
+        store: HCERTSTORE,
+        next: unsafe extern "system" fn(HCERTSTORE, *const T) -> *mut T,
+        free: unsafe extern "system" fn(*const T) -> BOOL,
+        convert: impl Fn(&T) -> Result<PyObjectRef, crate::PyError>,
+    ) -> Result<Vec<PyObjectRef>, crate::PyError> {
+        let mut items = Vec::new();
+        let mut context: *mut T = std::ptr::null_mut();
+        loop {
+            context = next(store, context);
+            if context.is_null() {
+                return Ok(items);
+            }
+            match convert(&*context) {
+                Ok(item) => items.push(item),
+                Err(error) => {
+                    free(context);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// The frame both readers share: open the named local-machine system store
+    /// read-only, hand it to `walk`, and always close it.  A store that cannot
+    /// be opened — an unknown or empty name — raises OSError from the Win32
+    /// code, as does a failing close, which may shadow a walk error.
+    fn enum_store(
+        args: &[PyObjectRef],
+        walk: impl Fn(HCERTSTORE) -> Result<Vec<PyObjectRef>, crate::PyError>,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| crate::PyError::value_error("embedded null character".to_string()))?;
+        let store = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_A,
+                0,
+                0,
+                CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
+                name.as_ptr().cast(),
+            )
+        };
+        if store.is_null() {
+            return Err(last_win32_error());
+        }
+        let items = walk(store);
+        if unsafe { CertCloseStore(store, 0) } == 0 {
+            return Err(last_win32_error());
+        }
+        Ok(w_list_new(items?))
+    }
+
+    /// `enum_certificates(store_name)` — the store's certificates as
+    /// (cert_bytes, encoding_type, trust) triples, where `trust` is a
+    /// frozenset of enhanced-key-usage OID strings or `True` for a
+    /// certificate valid for every purpose.
+    pub fn enum_certificates(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        enum_store(args, |store| unsafe {
+            walk_store(
+                store,
+                CertEnumCertificatesInStore,
+                CertFreeCertificateContext,
+                |cert| {
+                    // The EKU property is consulted first; only a certificate
+                    // it leaves unrestricted falls through to the extension.
+                    let trust =
+                        match enhanced_key_usage(cert, CERT_FIND_PROP_ONLY_ENHKEY_USAGE_FLAG)? {
+                            Some(oids) => Some(oids),
+                            None => enhanced_key_usage(cert, CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG)?,
+                        };
+                    Ok(w_tuple_new(vec![
+                        w_bytes_from_bytes(std::slice::from_raw_parts(
+                            cert.pbCertEncoded,
+                            cert.cbCertEncoded as usize,
+                        )),
+                        encoding_type(cert.dwCertEncodingType),
+                        trust.unwrap_or_else(|| w_bool_from(true)),
+                    ]))
+                },
+            )
+        })
+    }
+
+    /// `enum_crls(store_name)` — the store's certificate-revocation lists as
+    /// (crl_bytes, encoding_type) pairs.
+    pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        enum_store(args, |store| unsafe {
+            walk_store(store, CertEnumCRLsInStore, CertFreeCRLContext, |crl| {
+                Ok(w_tuple_new(vec![
+                    w_bytes_from_bytes(std::slice::from_raw_parts(
+                        crl.pbCrlEncoded,
+                        crl.cbCrlEncoded as usize,
+                    )),
+                    encoding_type(crl.dwCertEncodingType),
+                ]))
+            })
+        })
+    }
 }
 
 fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2522,11 +2692,11 @@ crate::py_module! {
         for (name, func) in [
             (
                 "enum_certificates",
-                crate::py_module_fn!("enum_certificates", 1, enum_windows_cert_store),
+                crate::py_module_fn!("enum_certificates", 1, cert_store::enum_certificates),
             ),
             (
                 "enum_crls",
-                crate::py_module_fn!("enum_crls", 1, enum_windows_cert_store),
+                crate::py_module_fn!("enum_crls", 1, cert_store::enum_crls),
             ),
         ] {
             crate::module_ns_store(ns, name, crate::gateway::with_module("_ssl", func));

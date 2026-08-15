@@ -248,6 +248,12 @@ pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
 }
 #[cfg(windows)]
 pub fn inet_aton(text: &std::ffi::CStr) -> Option<[u8; 4]> {
+    // `INADDR_NONE` is both the failure report and the broadcast address, so
+    // the one spelling that collides is answered before the call — the
+    // substitution `rsocket.py`'s own `inet_addr` fallback makes.
+    if text.to_bytes() == b"255.255.255.255" {
+        return Some([0xff; 4]);
+    }
     init();
     let addr = unsafe { ws::inet_addr(text.as_ptr() as *const u8) };
     (addr != ws::INADDR_NONE).then(|| addr.to_ne_bytes())
@@ -868,4 +874,190 @@ pub unsafe fn inet_ntop(
 ) -> *const libc::c_char {
     init();
     unsafe { ws::inet_ntop(family, src, dst as *mut u8, size as usize) as *const libc::c_char }
+}
+
+// ---------------------------------------------------------------------------
+// The legacy `<netdb.h>` resolvers.
+//
+// `libc` 0.2.186 declares none of them, and the two records they answer with
+// are not the same type on both platforms: `hostent`'s `h_addrtype` and
+// `h_length` are `int` on POSIX and `short` in WinSock, and `servent` orders
+// `s_proto` before `s_port` on Win64 and the other way round everywhere else.
+// A single `#[repr(C)]` mirror would therefore be wrong on one side, so the
+// record stays opaque and every field is read through an accessor.
+// ---------------------------------------------------------------------------
+
+/// The resolver's `hostent` record. Never constructed here — only the pointer
+/// the resolver returns is ever held, and it points into process-global
+/// storage that the next lookup overwrites.
+#[cfg(unix)]
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct Hostent {
+    h_name: *const libc::c_char,
+    h_aliases: *mut *mut libc::c_char,
+    h_addrtype: libc::c_int,
+    h_length: libc::c_int,
+    h_addr_list: *mut *mut libc::c_char,
+}
+#[cfg(windows)]
+pub type Hostent = ws::HOSTENT;
+
+/// The resolver's `servent` record, held on the same terms as [`Hostent`].
+#[cfg(unix)]
+#[repr(C)]
+#[allow(non_snake_case)]
+pub struct Servent {
+    s_name: *const libc::c_char,
+    s_aliases: *mut *mut libc::c_char,
+    s_port: libc::c_int,
+    s_proto: *const libc::c_char,
+}
+#[cfg(windows)]
+pub type Servent = ws::SERVENT;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "gethostbyname"]
+    fn c_gethostbyname(name: *const libc::c_char) -> *mut Hostent;
+    #[link_name = "gethostbyaddr"]
+    fn c_gethostbyaddr(
+        addr: *const libc::c_void,
+        len: libc::socklen_t,
+        family: libc::c_int,
+    ) -> *mut Hostent;
+    #[link_name = "getservbyname"]
+    fn c_getservbyname(name: *const libc::c_char, proto: *const libc::c_char) -> *mut Servent;
+    #[link_name = "getservbyport"]
+    fn c_getservbyport(port: libc::c_int, proto: *const libc::c_char) -> *mut Servent;
+}
+
+/// `rsocket._get_netdb_lock_thread`: the lookups below answer with a pointer
+/// into one process-global record, so a second lookup on another thread
+/// invalidates the first one's answer. Hold this across both the lookup and
+/// the copying out of everything the caller needs.
+pub fn netdb_lock() -> std::sync::MutexGuard<'static, ()> {
+    static NETDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    NETDB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Read one slot of a `char **` array the resolver owns.
+///
+/// Darwin packs these arrays at byte-aligned addresses — immediately after a C
+/// string, for instance. C permits the resulting unaligned pointer load and
+/// Rust references do not, so the slot is read as raw storage, matching
+/// `rsocket.gethost_common`'s rffi access rather than manufacturing an aligned
+/// reference.
+pub unsafe fn pointer_at(array: *mut *mut libc::c_char, index: usize) -> *mut libc::c_char {
+    unsafe { std::ptr::read_unaligned(array.add(index)) }
+}
+
+/// # Safety
+/// `name` must be a valid NUL-terminated C string. The returned pointer is
+/// borrowed from process-global storage — see [`netdb_lock`].
+pub unsafe fn host_by_name(name: *const libc::c_char) -> *mut Hostent {
+    #[cfg(unix)]
+    {
+        unsafe { c_gethostbyname(name) }
+    }
+    #[cfg(windows)]
+    {
+        init();
+        unsafe { ws::gethostbyname(name as *const u8) }
+    }
+}
+
+/// # Safety
+/// `addr` must point to `len` readable bytes, and the answer is borrowed —
+/// see [`host_by_name`].
+pub unsafe fn host_by_addr(
+    addr: *const libc::c_void,
+    len: SockLen,
+    family: libc::c_int,
+) -> *mut Hostent {
+    #[cfg(unix)]
+    {
+        unsafe { c_gethostbyaddr(addr, len, family) }
+    }
+    #[cfg(windows)]
+    {
+        init();
+        unsafe { ws::gethostbyaddr(addr as *const u8, len, family) }
+    }
+}
+
+/// # Safety
+/// Both arguments must be valid NUL-terminated C strings or null, and the
+/// answer is borrowed — see [`host_by_name`].
+pub unsafe fn serv_by_name(name: *const libc::c_char, proto: *const libc::c_char) -> *mut Servent {
+    #[cfg(unix)]
+    {
+        unsafe { c_getservbyname(name, proto) }
+    }
+    #[cfg(windows)]
+    {
+        init();
+        unsafe { ws::getservbyname(name as *const u8, proto as *const u8) }
+    }
+}
+
+/// # Safety
+/// `proto` must be a valid NUL-terminated C string or null, and the answer is
+/// borrowed — see [`host_by_name`].
+pub unsafe fn serv_by_port(port: libc::c_int, proto: *const libc::c_char) -> *mut Servent {
+    #[cfg(unix)]
+    {
+        unsafe { c_getservbyport(port, proto) }
+    }
+    #[cfg(windows)]
+    {
+        init();
+        unsafe { ws::getservbyport(port, proto as *const u8) }
+    }
+}
+
+/// # Safety
+/// `h` must be a live answer from one of the host lookups above.
+pub unsafe fn hostent_name(h: *mut Hostent) -> *const libc::c_char {
+    unsafe { (*h).h_name as *const libc::c_char }
+}
+
+/// # Safety
+/// See [`hostent_name`].
+pub unsafe fn hostent_aliases(h: *mut Hostent) -> *mut *mut libc::c_char {
+    unsafe { (*h).h_aliases as *mut *mut libc::c_char }
+}
+
+/// # Safety
+/// See [`hostent_name`].
+pub unsafe fn hostent_addr_type(h: *mut Hostent) -> libc::c_int {
+    unsafe { (*h).h_addrtype as libc::c_int }
+}
+
+/// # Safety
+/// See [`hostent_name`].
+pub unsafe fn hostent_length(h: *mut Hostent) -> libc::c_int {
+    unsafe { (*h).h_length as libc::c_int }
+}
+
+/// # Safety
+/// See [`hostent_name`].
+pub unsafe fn hostent_addr_list(h: *mut Hostent) -> *mut *mut libc::c_char {
+    unsafe { (*h).h_addr_list as *mut *mut libc::c_char }
+}
+
+/// # Safety
+/// `s` must be a live answer from one of the service lookups above.
+pub unsafe fn servent_name(s: *mut Servent) -> *const libc::c_char {
+    unsafe { (*s).s_name as *const libc::c_char }
+}
+
+/// The port as the record stores it: network byte order, in the low 16 bits.
+///
+/// # Safety
+/// See [`servent_name`].
+pub unsafe fn servent_port(s: *mut Servent) -> u16 {
+    unsafe { (*s).s_port as u16 }
 }

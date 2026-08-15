@@ -13,64 +13,6 @@
 #[cfg(any(unix, windows))]
 use super::rsocket_rffi as rffi;
 
-// The legacy <netdb.h> resolver entry points, missing from libc 0.2.186.
-// They return pointers into process-global storage and have no WinSock
-// counterpart with the same struct layout, so their callers stay POSIX-only.
-#[cfg(unix)]
-unsafe extern "C" {
-    fn gethostbyname(name: *const libc::c_char) -> *mut HostentRaw;
-    fn gethostbyaddr(
-        addr: *const libc::c_void,
-        len: libc::socklen_t,
-        family: libc::c_int,
-    ) -> *mut HostentRaw;
-    fn getservbyname(name: *const libc::c_char, proto: *const libc::c_char) -> *mut ServentRaw;
-    fn getservbyport(port: libc::c_int, proto: *const libc::c_char) -> *mut ServentRaw;
-}
-
-/// Minimal mirror of `struct hostent` — we only read `h_addr_list[0]`
-/// and `h_length`, so the rest can stay opaque.
-#[cfg(unix)]
-#[repr(C)]
-#[allow(non_snake_case, dead_code)]
-struct HostentRaw {
-    h_name: *const libc::c_char,
-    h_aliases: *mut *mut libc::c_char,
-    h_addrtype: libc::c_int,
-    h_length: libc::c_int,
-    h_addr_list: *mut *mut libc::c_char,
-}
-
-/// Darwin's resolver may pack the pointer arrays owned by `hostent` at
-/// byte-aligned addresses (for example, immediately after a C string).
-/// C permits the resulting unaligned pointer loads; Rust references do not.
-/// Read each array slot as raw C storage, matching RPython's rffi access in
-/// `rsocket.gethost_common` without manufacturing an aligned reference.
-#[cfg(unix)]
-unsafe fn hostent_pointer_at(array: *mut *mut libc::c_char, index: usize) -> *mut libc::c_char {
-    unsafe { std::ptr::read_unaligned(array.add(index)) }
-}
-
-/// Minimal mirror of `struct servent` — we read `s_name` and `s_port`.
-#[cfg(unix)]
-#[repr(C)]
-#[allow(non_snake_case, dead_code)]
-struct ServentRaw {
-    s_name: *const libc::c_char,
-    s_aliases: *mut *mut libc::c_char,
-    s_port: libc::c_int,
-    s_proto: *const libc::c_char,
-}
-
-/// RPython `rsocket._get_netdb_lock_thread`: legacy gethostbyname/
-/// gethostbyaddr return pointers into one process-global static hostent.
-/// Keep lookup and copying under the same process-global lock.
-#[cfg(unix)]
-fn netdb_lock() -> std::sync::MutexGuard<'static, ()> {
-    static NETDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    NETDB_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// _socket module — PyPy: pypy/module/_socket/.
 ///
 /// **Slice S1: constants + name resolution helpers.**
@@ -982,12 +924,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
     }
 
-    // The legacy resolver entry points and `sethostname`, which have no
-    // WinSock counterpart this module can reach through the same struct.
-    #[cfg(unix)]
+    // `sethostname` alone stays POSIX-only: WinSock has no counterpart and
+    // `moduledef.py` does not export it where rsocket cannot provide it.
+    #[cfg(all(unix, feature = "host_env"))]
     {
         // sethostname(name) → None  (host_env::socket-backed)
-        #[cfg(feature = "host_env")]
         crate::module_ns_store(
             ns,
             "sethostname",
@@ -1030,7 +971,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 1,
             ),
         );
+    }
 
+    // The legacy resolvers. Both platforms reach them through
+    // `rsocket_rffi`'s accessors, because the records they answer with are
+    // not the same type on each — see the netdb section there.
+    #[cfg(any(unix, windows))]
+    {
         // gethostbyname(name) → ip_string.  `interp_func.py:32-44` —
         // host argument runs through encode_idna (→ idna_converter)
         // before the rsocket call.
@@ -1048,8 +995,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let _netdb = netdb_lock();
-                    let he = unsafe { gethostbyname(c.as_ptr()) };
+                    let _netdb = rffi::netdb_lock();
+                    let he = unsafe { rffi::host_by_name(c.as_ptr()) };
                     if he.is_null() {
                         let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
                         return Err(socket_converted_error(
@@ -1059,9 +1006,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     unsafe {
-                        let h = &*he;
-                        let first_addr = hostent_pointer_at(h.h_addr_list, 0);
-                        if h.h_length != 4 || first_addr.is_null() {
+                        let first_addr = rffi::pointer_at(rffi::hostent_addr_list(he), 0);
+                        if rffi::hostent_length(he) != 4 || first_addr.is_null() {
                             return Err(socket_converted_error(
                                 "gaierror",
                                 None,
@@ -1100,8 +1046,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let _netdb = netdb_lock();
-                    let he = unsafe { gethostbyname(c.as_ptr()) };
+                    let _netdb = rffi::netdb_lock();
+                    let he = unsafe { rffi::host_by_name(c.as_ptr()) };
                     if he.is_null() {
                         let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
                         return Err(socket_converted_error(
@@ -1134,7 +1080,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let host_bytes = socket_idna_converter(args[0])?;
                     let c = std::ffi::CString::new(host_bytes.clone())
                         .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let _netdb = netdb_lock();
+                    let _netdb = rffi::netdb_lock();
                     // Try IPv4 first, then IPv6, then fall back to
                     // gethostbyname → hostent.h_addr to obtain a raw
                     // bytestring for gethostbyaddr.
@@ -1167,8 +1113,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             // FFI call safely.
                             let mut owned: [u8; 16] = buf6;
                             let he = unsafe {
-                                gethostbyaddr(
-                                    owned.as_mut_ptr() as *mut libc::c_void,
+                                rffi::host_by_addr(
+                                    owned.as_mut_ptr() as *const libc::c_void,
                                     16 as rffi::SockLen,
                                     rffi::AF_INET6,
                                 )
@@ -1184,7 +1130,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             return unpack_hostent(he);
                         }
                         // Fall back: name → hostent → first IPv4 addr
-                        let he = unsafe { gethostbyname(c.as_ptr()) };
+                        let he = unsafe { rffi::host_by_name(c.as_ptr()) };
                         if he.is_null() {
                             let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
                             return Err(socket_converted_error(
@@ -1194,8 +1140,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             ));
                         }
                         unsafe {
-                            let h = &*he;
-                            let first_addr = hostent_pointer_at(h.h_addr_list, 0);
+                            let first_addr =
+                                rffi::pointer_at(rffi::hostent_addr_list(he), 0);
                             if first_addr.is_null() {
                                 return Err(socket_converted_error(
                                     "herror",
@@ -1204,13 +1150,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 ));
                             }
                             (
-                                h.h_addrtype as libc::c_int,
+                                rffi::hostent_addr_type(he),
                                 first_addr as *const libc::c_void,
-                                h.h_length as rffi::SockLen,
+                                rffi::hostent_length(he) as rffi::SockLen,
                             )
                         }
                     };
-                    let he = unsafe { gethostbyaddr(addr_ptr, addr_len, family) };
+                    let he = unsafe { rffi::host_by_addr(addr_ptr, addr_len, family) };
                     if he.is_null() {
                         let host_repr = String::from_utf8_lossy(&host_bytes).into_owned();
                         return Err(socket_converted_error(
@@ -1256,7 +1202,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         None
                     };
                 let p = unsafe {
-                    getservbyname(
+                    rffi::serv_by_name(
                         c_name.as_ptr(),
                         proto_c
                             .as_ref()
@@ -1271,7 +1217,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         &format!("service/proto not found: {name}"),
                     ));
                 }
-                let port = unsafe { u16::from_be((*p).s_port as u16) };
+                let port = unsafe { u16::from_be(rffi::servent_port(p)) };
                 Ok(pyre_object::w_int_new(port as i64))
             }),
         );
@@ -1298,7 +1244,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         None
                     };
                 let p = unsafe {
-                    getservbyport(
+                    rffi::serv_by_port(
                         port.to_be() as libc::c_int,
                         proto_c
                             .as_ref()
@@ -1314,7 +1260,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let name = unsafe {
-                    std::ffi::CStr::from_ptr((*p).s_name)
+                    std::ffi::CStr::from_ptr(rffi::servent_name(p))
                         .to_string_lossy()
                         .into_owned()
                 };
@@ -1775,26 +1721,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 }
 
 // ── hostent → (name, aliases, addrs) ──
-// `interp_func.py:46-51 common_wrapgethost` — packs a libc hostent
+// `interp_func.py:46-51 common_wrapgethost` — packs a resolver hostent
 // into the 3-tuple shape used by gethostbyname_ex / gethostbyaddr.
-#[cfg(unix)]
-fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+#[cfg(any(unix, windows))]
+fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     unsafe {
-        let h = &*he;
-        let name = if h.h_name.is_null() {
+        let host_name = rffi::hostent_name(he);
+        let name = if host_name.is_null() {
             String::new()
         } else {
-            std::ffi::CStr::from_ptr(h.h_name)
+            std::ffi::CStr::from_ptr(host_name)
                 .to_string_lossy()
                 .into_owned()
         };
         // Copy all resolver-owned storage while the process-global netdb lock
         // is held, before allocating any Python objects.
+        let aliases = rffi::hostent_aliases(he);
         let mut alias_strings = Vec::new();
-        if !h.h_aliases.is_null() {
+        if !aliases.is_null() {
             let mut index = 0;
             loop {
-                let alias = hostent_pointer_at(h.h_aliases, index);
+                let alias = rffi::pointer_at(aliases, index);
                 if alias.is_null() {
                     break;
                 }
@@ -1802,18 +1749,21 @@ fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate
                 index += 1;
             }
         }
+        let addr_list = rffi::hostent_addr_list(he);
+        let addr_type = rffi::hostent_addr_type(he);
+        let addr_length = rffi::hostent_length(he);
         let mut addr_strings = Vec::new();
-        if !h.h_addr_list.is_null() {
+        if !addr_list.is_null() {
             let mut index = 0;
             loop {
-                let addr_ptr = hostent_pointer_at(h.h_addr_list, index);
+                let addr_ptr = rffi::pointer_at(addr_list, index);
                 if addr_ptr.is_null() {
                     break;
                 }
-                let addr_str = if h.h_addrtype == rffi::AF_INET && h.h_length == 4 {
+                let addr_str = if addr_type == rffi::AF_INET && addr_length == 4 {
                     let packed = std::ptr::read_unaligned(addr_ptr as *const u32).to_ne_bytes();
                     rffi::inet_ntoa(packed).unwrap_or_default()
-                } else if h.h_addrtype == rffi::AF_INET6 && h.h_length == 16 {
+                } else if addr_type == rffi::AF_INET6 && addr_length == 16 {
                     let mut packed_addr = [0u8; 16];
                     std::ptr::copy_nonoverlapping(
                         addr_ptr as *const u8,
@@ -1847,10 +1797,19 @@ fn unpack_hostent(he: *mut HostentRaw) -> Result<pyre_object::PyObjectRef, crate
             .iter()
             .map(|addr| pyre_object::w_str_new(addr))
             .collect();
+        // `w_list_new` roots the items it is handed, not the header it returns,
+        // and that header is a movable nursery object (`rlist.py:116 LIST =
+        // GcStruct`). Each list therefore stays pinned across the allocation
+        // that follows it and is re-read from its slot afterwards.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let aliases_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_list_new(aliases));
+        let addrs_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::w_list_new(addrs));
         Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new(&name),
-            pyre_object::w_list_new(aliases),
-            pyre_object::w_list_new(addrs),
+            pyre_object::gc_roots::shadow_stack_get(aliases_slot),
+            pyre_object::gc_roots::shadow_stack_get(addrs_slot),
         ]))
     }
 }
