@@ -110,6 +110,12 @@ KNOWN_SKIPS = {
     "test.test_embed": "needs embedded CPython",
     "test.test_xpickle": "spawns per-version pythonX.Y subprocesses (PATH-dependent, can deadlock)",
     "test.test_c_locale_coercion": "asserts child stderr is empty, but MAJIT_STATS=1 prints a [jit-stats] line to every process's stderr",
+    # `test/test_interpreters/__init__.py` raises SkipTest("GIL disabled")
+    # when `test.support.Py_GIL_DISABLED` is set, and pyre reports
+    # `Py_GIL_DISABLED = 1` (abiflags `t`) on every host. The package therefore
+    # opts out everywhere, which is a fact about the build rather than about
+    # one host.
+    "test.test_interpreters": "package skips itself on a free-threaded build (Py_GIL_DISABLED)",
 }
 
 # Whole modules that CPython skips at import on some platforms. Off-platform

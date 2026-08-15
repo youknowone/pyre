@@ -631,8 +631,9 @@
       "dynasm": "PASS"
     },
     "test.test_interpreters": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP",
+      "reason": "package skips itself on a free-threaded build (Py_GIL_DISABLED)"
     },
     "test.test_io": {
       "dynasm": "IMPORTERROR"
