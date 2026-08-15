@@ -3930,7 +3930,7 @@ impl Optimizer {
         );
 
         // Preserve final context for jump_to_existing_trace.
-        let mut ops = std::mem::take(&mut ctx.new_operations);
+        let mut ops = ctx.take_new_operations();
 
         // RPython compile.py:327 final loop assembly:
         //   loop.operations = ([start_label] + preamble_ops

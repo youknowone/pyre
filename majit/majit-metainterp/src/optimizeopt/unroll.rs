@@ -1763,7 +1763,7 @@ impl UnrollOptimizer {
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
-                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
+                redirected_tail_ops = jump_ctx.take_new_operations();
                 // A close onto the body token this compilation just minted is
                 // always legal. A close onto any other token is legal exactly
                 // when that token belongs to the artifact this compilation will
@@ -1907,8 +1907,7 @@ impl UnrollOptimizer {
                     // carries it out (final_ctx is abandoned with the
                     // discarded trace).
                     opt_p2.send_extra_operation(&end_jump, &mut final_ctx)?;
-                    let redirected_tail_ops: Vec<majit_ir::OpRc> =
-                        std::mem::take(&mut final_ctx.new_operations);
+                    let redirected_tail_ops: Vec<majit_ir::OpRc> = final_ctx.take_new_operations();
                     opt_p2.final_ctx = Some(final_ctx);
                     body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
                 } else {
