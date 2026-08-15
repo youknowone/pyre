@@ -9,6 +9,7 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
+use crate::regloc::ebp_loc_pat;
 use indexmap::IndexMap;
 use majit_ir::IndexMapExt;
 use std::sync::Arc;
@@ -7945,16 +7946,16 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64 ; fmov D(d.value), X(s.value));
                 }
             }
-            (Loc::Reg(s), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
+            (Loc::Reg(s), ebp_loc_pat!(e)) => {
+                let ofs = e.value;
                 if s.is_xmm {
                     self.emit_str_fp_d(s.value, ofs);
                 } else {
                     self.emit_str_fp(s.value, ofs);
                 }
             }
-            (Loc::Frame(f), Loc::Reg(d)) => {
-                let ofs = f.ebp_loc.value;
+            (ebp_loc_pat!(e), Loc::Reg(d)) => {
+                let ofs = e.value;
                 if d.is_xmm {
                     self.emit_ldr_fp_d(d.value, ofs);
                 } else {
@@ -7969,15 +7970,15 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                     self.emit_mov_imm64(d.value as u32, i.value);
                 }
             }
-            (Loc::Immed(i), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
+            (Loc::Immed(i), ebp_loc_pat!(e)) => {
+                let ofs = e.value;
                 self.emit_mov_imm64(16, i.value);
                 self.emit_str_fp(16, ofs);
             }
-            (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
-            (Loc::Frame(f1), Loc::Frame(f2)) => {
-                let o1 = f1.ebp_loc.value;
-                let o2 = f2.ebp_loc.value;
+            (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) if e1.value == e2.value => {}
+            (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) => {
+                let o1 = e1.value;
+                let o2 = e2.value;
                 self.emit_ldr_fp(16, o1);
                 self.emit_str_fp(16, o2);
             }
@@ -7997,12 +7998,12 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch aarch64 ; str X(r.value), [sp, #-16]!);
             }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                self.emit_ldr_fp_d(15, f.ebp_loc.value);
+            ebp_loc_pat!(e) if e.is_float => {
+                self.emit_ldr_fp_d(15, e.value);
                 dynasm!(self.mc ; .arch aarch64 ; str D(15), [sp, #-16]!);
             }
-            Loc::Frame(f) => {
-                self.emit_ldr_fp(16, f.ebp_loc.value);
+            ebp_loc_pat!(e) => {
+                self.emit_ldr_fp(16, e.value);
                 dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, #-16]!);
             }
             _ => panic!(
@@ -8020,13 +8021,13 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch aarch64 ; ldr X(r.value), [sp], #16);
             }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
+            ebp_loc_pat!(e) if e.is_float => {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(15), [sp], #16);
-                self.emit_str_fp_d(15, f.ebp_loc.value);
+                self.emit_str_fp_d(15, e.value);
             }
-            Loc::Frame(f) => {
+            ebp_loc_pat!(e) => {
                 dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16);
-                self.emit_str_fp(16, f.ebp_loc.value);
+                self.emit_str_fp(16, e.value);
             }
             _ => panic!(
                 "parallel move cannot restore {loc:?} from the stack; emitting \

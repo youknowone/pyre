@@ -9,6 +9,7 @@
 ///   _assemble — assembler.py:779 (walk ops + emit code)
 ///   patch_jump_for_descr — assembler.py:965
 ///   redirect_call_assembler — assembler.py:1138
+use crate::regloc::ebp_loc_pat;
 use indexmap::IndexMap;
 use std::sync::Arc;
 
@@ -8827,16 +8828,16 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; movq Rx(d.value), Rq(s.value));
                 }
             }
-            (Loc::Reg(s), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
+            (Loc::Reg(s), ebp_loc_pat!(e)) => {
+                let ofs = e.value;
                 if s.is_xmm {
                     dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(s.value));
                 } else {
                     dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(s.value));
                 }
             }
-            (Loc::Frame(f), Loc::Reg(d)) => {
-                let ofs = f.ebp_loc.value;
+            (ebp_loc_pat!(e), Loc::Reg(d)) => {
+                let ofs = e.value;
                 if d.is_xmm {
                     dynasm!(self.mc ; .arch x64 ; movsd Rx(d.value), [rbp + ofs]);
                 } else {
@@ -8854,18 +8855,18 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), QWORD i.value);
                 }
             }
-            (Loc::Immed(i), Loc::Frame(f)) => {
-                let ofs = f.ebp_loc.value;
+            (Loc::Immed(i), ebp_loc_pat!(e)) => {
+                let ofs = e.value;
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov Rq(scratch), QWORD i.value
                     ; mov [rbp + ofs], Rq(scratch)
                 );
             }
-            (Loc::Frame(f1), Loc::Frame(f2)) if f1.position == f2.position => {}
-            (Loc::Frame(f1), Loc::Frame(f2)) => {
-                let o1 = f1.ebp_loc.value;
-                let o2 = f2.ebp_loc.value;
+            (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) if e1.value == e2.value => {}
+            (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) => {
+                let o1 = e1.value;
+                let o2 = e2.value;
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 dynasm!(self.mc ; .arch x64
                     ; mov Rq(scratch), [rbp + o1]
@@ -8888,11 +8889,11 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
             }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch x64 ; sub rsp, 8 ; movsd xmm15, [rbp + f.ebp_loc.value] ; movsd [rsp], xmm15);
+            ebp_loc_pat!(e) if e.is_float => {
+                dynasm!(self.mc ; .arch x64 ; sub rsp, 8 ; movsd xmm15, [rbp + e.value] ; movsd [rsp], xmm15);
             }
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + f.ebp_loc.value]);
+            ebp_loc_pat!(e) => {
+                dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + e.value]);
             }
             _ => panic!(
                 "parallel move cannot park {loc:?} on the stack; emitting nothing \
@@ -8909,11 +8910,11 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Reg(r) => {
                 dynasm!(self.mc ; .arch x64 ; pop Rq(r.value));
             }
-            Loc::Frame(f) if f.ebp_loc.is_float => {
-                dynasm!(self.mc ; .arch x64 ; movsd xmm15, [rsp] ; add rsp, 8 ; movsd [rbp + f.ebp_loc.value], xmm15);
+            ebp_loc_pat!(e) if e.is_float => {
+                dynasm!(self.mc ; .arch x64 ; movsd xmm15, [rsp] ; add rsp, 8 ; movsd [rbp + e.value], xmm15);
             }
-            Loc::Frame(f) => {
-                dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + f.ebp_loc.value]);
+            ebp_loc_pat!(e) => {
+                dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + e.value]);
             }
             _ => panic!(
                 "parallel move cannot restore {loc:?} from the stack; emitting \

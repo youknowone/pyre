@@ -159,12 +159,35 @@ pub enum Loc {
     Addr(AddressLoc),
 }
 
+/// Matches either spelling of a frame-pointer location, binding its
+/// `RawEbpLoc`.
+///
+/// `regloc.py:113 class FrameLoc(RawEbpLoc)` — the two are one type upstream,
+/// separated here only because Rust has no inheritance. Every operand that
+/// addresses through the frame pointer accepts both (`mov`'s `'b'` code), so a
+/// match naming just one spelling silently excludes the other.
+macro_rules! ebp_loc_pat {
+    ($e:ident) => {
+        $crate::regloc::Loc::Frame($crate::regloc::FrameLoc { ebp_loc: $e, .. })
+            | $crate::regloc::Loc::Ebp($e)
+    };
+}
+
+pub(crate) use ebp_loc_pat;
+
 impl Loc {
     pub fn is_reg(&self) -> bool {
         matches!(self, Loc::Reg(_))
     }
+    /// `regloc.py:82 RawEbpLoc.is_stack` returns True, and `FrameLoc` inherits
+    /// it — a frame slot is a raw ebp location that also knows its stack
+    /// position, so both spellings are stack locations.
+    ///
+    /// Naming only `Frame` here makes an `Ebp` operand look like a register to
+    /// the parallel move, which then skips the scratch register and hands the
+    /// backend a memory-to-memory move no machine encodes.
     pub fn is_stack(&self) -> bool {
-        matches!(self, Loc::Frame(_))
+        matches!(self, Loc::Frame(_) | Loc::Ebp(_))
     }
     pub fn is_immed(&self) -> bool {
         matches!(self, Loc::Immed(_))

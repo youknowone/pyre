@@ -25,10 +25,13 @@ use indexmap::IndexMap;
 /// The three emitters `remap_frame_layout` drives, named as `jump.py` calls
 /// them on the `assembler` it is handed.
 ///
-/// **Operand contract.** A destination is a register or a frame slot; a source
-/// is one of those or an immediate. Nothing else is a location this algorithm
-/// can schedule, and an implementation must fault on anything else rather than
-/// emit nothing: a move that is counted in `pending_dests` and then silently
+/// **Operand contract.** A destination is a register or a frame-pointer
+/// location in either spelling — `Loc::Frame`, which knows its stack position,
+/// or the bare `Loc::Ebp`, which does not (`regloc.py:113 class
+/// FrameLoc(RawEbpLoc)`). A source is one of those or an immediate. The one
+/// location left out is `Loc::Addr`, which upstream cannot key either. An
+/// implementation must fault on anything outside this rather than emit
+/// nothing: a move that is counted in `pending_dests` and then silently
 /// dropped leaves the destination holding a stale value, and a dropped
 /// `regalloc_pop` leaves the machine stack pointer shifted as well.
 ///
@@ -77,8 +80,11 @@ pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
         // Never a destination and re-materialisable at will, so it needs no
         // identity — only a value no real location can take.
         Loc::Immed(_) => i32::MIN,
-        // Not in the operand contract above. Minting a key for it would put an
-        // entry in `pending_dests` that no emitter can retire.
+        // `AddressLoc` is the one location class upstream leaves without a key:
+        // it overrides neither `_getregkey` nor, for its `'a'`/`'m'` codes, the
+        // `value` the inherited one reads (`regloc.py:207-250`), so a parallel
+        // move handed one raises there as well. Minting a key here instead
+        // would put an entry in `pending_dests` that no emitter can retire.
         Loc::Addr(a) => panic!(
             "parallel move over an address location (offset {}), which no \
              regalloc_mov can emit",
