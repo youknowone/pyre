@@ -193,6 +193,27 @@ assert (is_set, is_frozen, is_any) == (1, 1, 1), (is_set, is_frozen, is_any)
 # PyMem_Calloc zeroed, PyMem_Realloc kept the bytes, PyMem_New sized right.
 assert typed == 1234, typed
 
+# ── the rest of the dict protocol ──────────────────────────────────────
+d = {'a': 1, 'b': 2}
+(copy, keys, values, items, walked,
+ ref_hit, ref_miss, str_hit, miss_clean, with_error_clean, got,
+ after_merge, after_update, kept, replaced) = m.dict_more(d, 'b', {'b': 20, 'c': 3})
+
+assert copy == d and copy is not d, copy
+assert sorted(keys) == ['a', 'b'], keys
+assert sorted(values) == [1, 2], values
+assert sorted(items) == [('a', 1), ('b', 2)], items
+# PyDict_Next reported every pair exactly once.
+assert sorted(walked) == [('a', 1), ('b', 2)], walked
+# GetItemRef: 1 when present, 0 when absent, and an absent key sets no error.
+assert (ref_hit, ref_miss, str_hit) == (1, 0, 1), (ref_hit, ref_miss, str_hit)
+assert miss_clean == 1
+assert with_error_clean == 1
+assert got == 2, got
+# Merge without override kept 'b' at 2 and added 'c'; Update then replaced 'b'.
+assert (after_merge, after_update) == (3, 3), (after_merge, after_update)
+assert (kept, replaced) == (2, 20), (kept, replaced)
+
 print('cpyext-methods-ok')
 "#;
 

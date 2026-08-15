@@ -554,6 +554,84 @@ done:
     return result;
 }
 
+/* Drive the dict entry points.  `args` is (dict, key, other_mapping). */
+static PyObject *m_dict_more(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *d, *key, *other;
+    if (!PyArg_ParseTuple(args, "OOO", &d, &key, &other)) {
+        return NULL;
+    }
+
+    PyObject *copy = NULL, *merged = NULL, *keys = NULL, *values = NULL, *items = NULL;
+    PyObject *walked = NULL, *result = NULL, *got = NULL;
+    int ref_hit = -2, ref_miss = -2, str_hit = -2;
+    PyObject *ref_out = NULL, *miss_out = (PyObject *)1, *str_out = NULL;
+
+    copy = PyDict_Copy(d);
+    merged = PyDict_Copy(d);
+    keys = PyDict_Keys(d);
+    values = PyDict_Values(d);
+    items = PyDict_Items(d);
+    if (copy == NULL || merged == NULL || keys == NULL || values == NULL ||
+        items == NULL) goto done;
+
+    /* GetItemRef hands back a strong reference and says whether it was there. */
+    ref_hit = PyDict_GetItemRef(d, key, &ref_out);
+    PyObject *absent = PyUnicode_FromString("no-such-key");
+    if (absent == NULL) goto done;
+    ref_miss = PyDict_GetItemRef(d, absent, &miss_out);
+    /* A miss must not leave an exception behind. */
+    int miss_clean = PyErr_Occurred() == NULL;
+    Py_DECREF(absent);
+    str_hit = PyDict_GetItemStringRef(d, "a", &str_out);
+
+    /* GetItemWithError: NULL and no exception for an absent key. */
+    got = PyDict_GetItemWithError(d, key);   /* borrowed */
+    int with_error_clean = PyErr_Occurred() == NULL;
+
+    /* Walk every pair, building the list of keys PyDict_Next reported. */
+    walked = PyList_New(0);
+    if (walked == NULL) goto done;
+    {
+        Py_ssize_t pos = 0;
+        PyObject *k, *v;
+        while (PyDict_Next(d, &pos, &k, &v)) {
+            PyObject *pair = Py_BuildValue("(OO)", k, v);
+            if (pair == NULL) goto done;
+            if (PyList_Append(walked, pair) < 0) { Py_DECREF(pair); goto done; }
+            Py_DECREF(pair);
+        }
+    }
+
+    /* Merge without override leaves existing keys alone; Update replaces. */
+    if (PyDict_Merge(merged, other, 0) < 0) goto done;
+    Py_ssize_t after_merge = PyDict_Size(merged);
+    PyObject *kept = PyDict_GetItemString(merged, "b");   /* borrowed */
+    long kept_value = kept == NULL ? -1 : PyLong_AsLong(kept);
+    if (PyDict_Update(merged, other) < 0) goto done;
+    Py_ssize_t after_update = PyDict_Size(merged);
+    PyObject *replaced = PyDict_GetItemString(merged, "b");
+    long replaced_value = replaced == NULL ? -1 : PyLong_AsLong(replaced);
+
+    result = Py_BuildValue("(OOOOOiiiiiOnnll)", copy, keys, values, items, walked,
+                           ref_hit, ref_miss, str_hit, miss_clean,
+                           with_error_clean,
+                           got == NULL ? Py_None : got,
+                           after_merge, after_update, kept_value, replaced_value);
+
+done:
+    Py_XDECREF(copy);
+    Py_XDECREF(merged);
+    Py_XDECREF(keys);
+    Py_XDECREF(values);
+    Py_XDECREF(items);
+    Py_XDECREF(walked);
+    Py_XDECREF(ref_out);
+    Py_XDECREF(str_out);
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"bump", (PyCFunction)m_bump, METH_NOARGS, "bump the module counter"},
     {"wrap", (PyCFunction)m_wrap, METH_O, NULL},
@@ -576,6 +654,7 @@ static PyMethodDef methods[] = {
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
+    {"dict_more", (PyCFunction)m_dict_more, METH_VARARGS, NULL},
     {NULL, NULL, 0, NULL},
 };
 

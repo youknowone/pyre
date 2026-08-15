@@ -333,6 +333,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // be the last reference to its own container, so that recursion runs here.
     release_borrowed(raw);
     BYTE_CACHE.lock().remove(&address);
+    super::dictobject::forget_iteration(address);
     if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
         unsafe { call(raw) };
