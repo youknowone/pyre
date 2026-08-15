@@ -3059,14 +3059,17 @@ impl<'a> AssemblerARM64<'a> {
                 }
             }
             // ── Calls ──
-            // RPython: regalloc consider_call does before_call (save caller-saved
-            // regs), collects arglocs, calls after_call for result. The assembler
-            // receives arglocs = [func_addr_or_descr_info..., arg_locs...] and
-            // result_loc = register for return value.
+            // `consider_call` (regalloc.rs) has already captured `arglocs =
+            // [func_addr_or_descr_info..., arg_locs...]` and run `before_call`
+            // for this op, so the register file is in its across-the-call shape
+            // by the time the emitter sees it. Which registers that saved is the
+            // `SAVE_ALL_REGS / SAVE_GCREF_REGS / SAVE_DEFAULT_REGS` choice made
+            // there, not a blanket spill: `spill_or_move_registers_before_call`
+            // (`regalloc.py:714`) drops values that die at the call, leaves
+            // callee-saved ones where they are, and prefers moving the rest to a
+            // free callee-saved register over spilling them.
             //
-            // For now, flush all register-resident values to their frame slots
-            // before the call, use the existing frame-slot genop_call, then
-            // mark the result in the allocated register.
+            // What is left here is the call and the result placement.
             OpCode::CallI
             | OpCode::CallF
             | OpCode::CallN
