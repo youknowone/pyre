@@ -10601,12 +10601,37 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         let obj_type = super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
-    // descriptor.py `_super_from_frame`: zero-arg super() finds the first
-    // argument and the `__class__` free variable in the live caller frame.
-    // CURRENT_FRAME is that caller because a builtin call creates no Python
-    // frame of its own.
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame_ptr = current.get();
+    // descriptor.py:24-26 / `_super_from_frame`: zero-arg super() reads
+    // `space.getexecutioncontext().gettopframe()`.  This must come from the
+    // per-frame EC chain, not pyre's portal-level CURRENT_FRAME TLS anchor: an
+    // inlined callee has its own red frame/vref at `topframeref`, while the TLS
+    // slot can still name the outer portal frame.
+    let execution_context = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if execution_context.is_null() {
+        return Err(crate::PyError::runtime_error("super(): no current frame"));
+    }
+    if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
+        let top = unsafe { (*execution_context).topframeref };
+        let is_vref = unsafe {
+            majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8)
+        };
+        let referent = crate::executioncontext::vref_referent(top);
+        if referent.is_null() {
+            eprintln!(
+                "[builtin-super-ec] ec={execution_context:p} top={top:p} \
+                 is_vref={is_vref} referent={referent:p} code=<null>"
+            );
+        } else {
+            let code = unsafe { &*(*referent).code() };
+            eprintln!(
+                "[builtin-super-ec] ec={execution_context:p} top={top:p} is_vref={is_vref} \
+                 referent={referent:p} code={} freevars={:?}",
+                code.obj_name, code.freevars,
+            );
+        }
+    }
+    let frame_ptr = unsafe { (*execution_context).gettopframe() };
+    {
         if frame_ptr.is_null() {
             return Err(crate::PyError::runtime_error("super(): no current frame"));
         }
@@ -10662,7 +10687,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         Ok(pyre_object::descriptor::w_super_new(
             w_class, obj_type, w_self,
         ))
-    })
+    }
 }
 
 /// `descriptor.py _super_check` — validate the explicit `(type, obj)` pair

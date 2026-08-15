@@ -2448,6 +2448,21 @@ pub fn call_with_kwargs_in_ctx(
     pos_args: &[PyObjectRef],
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
+    call_with_kwargs_in_ctx_impl(execution_context, callable, pos_args, kwargs, true)
+}
+
+/// Shared keyword-call implementation.  `dispatch_metaclass_call` is false
+/// only for `type.__call__`: PyPy's `W_TypeObject.descr_call` invokes
+/// `__new__`/`__init__` directly after a custom metaclass delegates through
+/// `super().__call__`, so redispatching that same metaclass override here
+/// would recurse instead of reaching the default constructor path.
+fn call_with_kwargs_in_ctx_impl(
+    execution_context: *const crate::PyExecutionContext,
+    callable: PyObjectRef,
+    pos_args: &[PyObjectRef],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
+    dispatch_metaclass_call: bool,
+) -> PyResult {
     // RPython's `Arguments` is GC-traced for the whole call. Mirror the GC
     // transform explicitly: keyword binding below allocates tuples, dicts,
     // and keyword-name strings before the callee frame owns these values.
@@ -2521,7 +2536,8 @@ pub fn call_with_kwargs_in_ctx(
 
     // A class call routes through `type(cls).__call__` when the metaclass
     // overrides it (enum functional API passes `module=`/`type=` kwargs).
-    if unsafe { pyre_object::is_type(callable) }
+    if dispatch_metaclass_call
+        && unsafe { pyre_object::is_type(callable) }
         && let Some(bound) = metaclass_call_override(callable)
     {
         return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
@@ -3469,6 +3485,21 @@ pub fn type_call_instantiate(
         return Err(err);
     }
     Ok(result)
+}
+
+/// Keyword-preserving `type.__call__` entry.
+///
+/// PyPy: `typeobject.py W_TypeObject.descr_call(self, __args__)`.  The same
+/// `Arguments` object is passed to both `__new__` and `__init__`, and this
+/// descriptor is already the default metaclass implementation reached after
+/// `super().__call__`; it must not consult the custom metaclass override a
+/// second time.
+pub fn type_call_instantiate_with_kwargs(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
+) -> Result<PyObjectRef, PyError> {
+    call_with_kwargs_in_ctx_impl(take_last_exec_ctx(), w_type, args, kwargs, false)
 }
 
 /// Type call without a PyFrame.

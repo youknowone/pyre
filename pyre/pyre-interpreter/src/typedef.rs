@@ -11027,22 +11027,67 @@ fn init_type_type(ns: PyObjectRef) {
             ),
         );
     }
-    // type.__call__(cls, *args) — typeobject.c type_call.  The implicit
+    // type.__call__(cls, *args, **kwargs) — PyPy typeobject.py
+    // W_TypeObject.descr_call(self, __args__).  The implicit
     // instantiation path handles `Cls()` directly, but a custom metaclass
     // whose `__call__` delegates via `super().__call__(...)` needs this
-    // entry to resolve to the default __new__/__init__ behaviour.
+    // entry to preserve the complete Arguments shape while resolving to the
+    // default __new__/__init__ behaviour.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", |args| {
-                let Some((&cls, rest)) = args.split_first() else {
-                    return Err(crate::PyError::type_error(
-                        "type.__call__() takes at least 1 argument (0 given)",
-                    ));
-                };
-                crate::call::type_call_instantiate(cls, rest)
-            }),
+            crate::make_builtin_function_with_signature(
+                "__call__",
+                |args| {
+                    let Some(&cls) = args.first().filter(|cls| !cls.is_null()) else {
+                        return Err(crate::PyError::type_error(
+                            "type.__call__() takes at least 1 argument (0 given)",
+                        ));
+                    };
+                    let packed_args = args.get(1).copied().unwrap_or(PY_NULL);
+                    let packed_kwargs = args.get(2).copied().unwrap_or(PY_NULL);
+                    if packed_args.is_null() || !unsafe { pyre_object::is_tuple(packed_args) } {
+                        return Err(crate::PyError::type_error(
+                            "type.__call__() internal *args must be a tuple",
+                        ));
+                    }
+                    if packed_kwargs.is_null() || !unsafe { pyre_object::is_dict(packed_kwargs) } {
+                        return Err(crate::PyError::type_error(
+                            "type.__call__() internal **kwargs must be a dict",
+                        ));
+                    }
+
+                    // PyPy's Arguments is GC-traced across descr_call.  Keep the
+                    // packed containers and every unpacked positional rooted while
+                    // specialised tuple items are boxed and the keyword entries
+                    // are materialised for pyre's flat call ABI.
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let root_base = roots.base();
+                    roots.pin_root(cls);
+                    roots.pin_root(packed_args);
+                    roots.pin_root(packed_kwargs);
+                    let nargs = unsafe { pyre_object::w_tuple_len(roots.get(root_base + 1)) };
+                    for index in 0..nargs {
+                        let value = unsafe {
+                            pyre_object::w_tuple_getitem(roots.get(root_base + 1), index as i64)
+                        }
+                        .expect("index is in the packed type.__call__ argument range");
+                        roots.pin_root(value);
+                    }
+                    let positional: Vec<PyObjectRef> = (0..nargs)
+                        .map(|index| roots.get(root_base + 3 + index))
+                        .collect();
+                    let kwargs =
+                        unsafe { pyre_object::w_dict_str_entries_wtf8(roots.get(root_base + 2)) };
+                    crate::call::type_call_instantiate_with_kwargs(
+                        roots.get(root_base),
+                        &positional,
+                        &kwargs,
+                    )
+                },
+                crate::Signature::new(vec!["cls"], Some("args"), Some("kwargs"), 0, 1),
+            ),
         )
     };
     // typeobject.py `W_TypeObject.descr_repr`.  Native `py_repr` handles the
