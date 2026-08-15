@@ -13,11 +13,18 @@ pub(super) fn field_scalar_tokens(
     struct_path: &syn::Path,
     member: &syn::Member,
 ) -> (TokenStream, TokenStream, TokenStream) {
-    // Every `int_fields` / `ref_fields` consultation reaches the maps through
-    // here, so this one line is the whole record of which declared keys an
-    // access site asked about.  Recorded whether or not the key is declared:
-    // the report is over the DECLARED keys, and an undeclared one describes
-    // nothing to begin with.
+    // Every consultation THIS lowering makes reaches the maps through here, so
+    // one line records which declared keys an access site asked about.
+    // Recorded whether or not the key is declared: the report is over the
+    // DECLARED keys, and an undeclared one describes nothing to begin with.
+    //
+    // Not the only reader of `ref_fields`, and the difference bounds what the
+    // report can claim.  `RefFieldRewriter` consults it too, to rewrite the
+    // CONCRETE body's `x.field` into a deref of the raw-pointer carrier.  Both
+    // walk the same source, so they normally agree — they diverge exactly where
+    // this lowering stopped early and the rewriter did not, which is a degraded
+    // arm.  That is why an unconsulted key is reported rather than rejected,
+    // and why the gate prints the degraded arms beside it.
     config
         .consulted_field_keys
         .borrow_mut()
