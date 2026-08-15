@@ -95,9 +95,10 @@ skip_if_unsupported(3, 9, test_dunion_ror0)
 skip_if_unsupported(3, 9, test_dunion_other_types)
 
 
-def test_dunion_preserves_left_hashes():
-    # `d | other` copies the left operand and updates the copy, so the left
-    # keys keep their stored hashes instead of being re-hashed one at a time.
+def test_dunion_preserves_stored_hashes():
+    # `d | other` copies the left operand and updates the copy from the right,
+    # and a dict-to-dict update reuses each key's stored hash.  Neither half
+    # re-invokes `__hash__`, which is observable for a key that records it.
     calls = []
 
     class Key:
@@ -112,10 +113,29 @@ def test_dunion_preserves_left_hashes():
             return isinstance(other, Key) and self.i == other.i
 
     left = {Key(i): i for i in range(5)}
+    right = {Key(50 + i): i for i in range(3)}
+
     calls.clear()
     merged = left | {}
     assert calls == [], f"left operand was re-hashed: {calls=}"
     assert len(merged) == 5, f"unexpected merge result {merged=}"
 
+    calls.clear()
+    merged = left | right
+    assert calls == [], f"merge re-hashed an operand: {calls=}"
+    assert len(merged) == 8, f"unexpected merge result {merged=}"
 
-skip_if_unsupported(3, 9, test_dunion_preserves_left_hashes)
+    # The same reuse applies to `update` into a destination that is not empty,
+    # which is the path the merge above takes for its right operand.
+    destination = {Key(99): 0}
+    calls.clear()
+    destination.update(left)
+    assert calls == [], f"update re-hashed the source: {calls=}"
+    assert len(destination) == 6, f"unexpected update result {destination=}"
+
+    # Typed-strategy sources carry no stored hash and take the plain walk.
+    assert {1: "a"} | {2: "b"} == {1: "a", 2: "b"}
+    assert {"x": 1} | {"y": 2} == {"x": 1, "y": 2}
+
+
+skip_if_unsupported(3, 9, test_dunion_preserves_stored_hashes)
