@@ -320,10 +320,7 @@ fn install_gc() {
     #[cfg(feature = "cranelift")]
     {
         let jitframe_tid = majit_gc::gc_sync::gc_op(|gc| {
-            majit_gc::GcAllocator::register_type(
-                gc,
-                majit_backend::jitframe::jitframe_type_info(),
-            )
+            majit_gc::GcAllocator::register_type(gc, majit_backend::jitframe::jitframe_type_info())
         });
         majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
     }
