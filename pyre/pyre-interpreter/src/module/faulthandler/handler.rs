@@ -13,7 +13,7 @@
 // reraises the signal so the process dies the normal way.
 // ──────────────────────────────────────────────────────────────────────
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 static FAULTHANDLER_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -21,7 +21,7 @@ static FAULTHANDLER_ENABLED: std::sync::atomic::AtomicBool =
 /// keeps it on the Handler instance, but the signal handler below is a bare
 /// `extern "C" fn` and cannot capture, so it is handed over through a static.
 /// Defaults to 2, which is what `get_fileno_and_file` answers for None.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 static FAULTHANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(2);
 
 /// `handler.py:145` `self.fatal_error_w_file = w_file` / `handler.py:150`
@@ -31,13 +31,13 @@ static FAULTHANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::Atomic
 /// no Handler instance and the signal callback is a bare `extern "C" fn` that
 /// cannot capture one, so the owner is a process-global slot, walked as a GC
 /// root by [`walk_faulthandler_roots`].
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 static FAULTHANDLER_FILE: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// Take ownership of the object owning the fatal-error descriptor; a null
 /// drops it (`enable` with a plain fd, and `disable`).
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn set_fatal_error_file(w_file: pyre_object::PyObjectRef) {
     FAULTHANDLER_FILE.store(w_file, std::sync::atomic::Ordering::Relaxed);
 }
@@ -55,7 +55,7 @@ fn set_fatal_error_file(w_file: pyre_object::PyObjectRef) {
 /// taken, and the fatal-signal handler reads `FAULTHANDLER_FD` atomically
 /// without acquiring anything.  A failed install still builds its exception
 /// inside the guard, so take it through `lock_faulthandler_state`.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 static FAULTHANDLER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// Only a contended acquisition blocks, and a thread parked in the futex can no
@@ -65,7 +65,7 @@ static FAULTHANDLER_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mute
 /// exception and its args) requests a stop-the-world the waiter can never
 /// acknowledge, and both threads hang.  Same try-then-block split as
 /// `w_list_lock`.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn lock_faulthandler_state() -> parking_lot::MutexGuard<'static, ()> {
     if let Some(guard) = FAULTHANDLER_STATE_LOCK.try_lock() {
         return guard;
@@ -115,7 +115,7 @@ fn clear_user_signal_file(signum: libc::c_int) {
 /// `FAULTHANDLER_STATE_LOCK`: the thread that requested the collection may be
 /// holding that guard (`register` allocates its `OSError` inside it), and the
 /// collector would then wait on a lock only a quiesced mutator can release.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let mut forward = |addr: usize| -> usize {
         let mut slot: pyre_object::PyObjectRef = addr as pyre_object::PyObjectRef;
@@ -130,16 +130,19 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    for entry in FAULTHANDLER_USER_FILES.lock().iter_mut() {
-        entry.1 = forward(entry.1);
+    #[cfg(unix)]
+    {
+        for entry in FAULTHANDLER_USER_FILES.lock().iter_mut() {
+            entry.1 = forward(entry.1);
+        }
     }
 }
 
-/// No fatal-signal handlers to own a file for off the host_env unix path.
-#[cfg(not(all(unix, feature = "host_env")))]
+/// No fatal-signal handlers to own a file without a native host environment.
+#[cfg(not(all(any(unix, windows), feature = "host_env")))]
 pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     // Stay async-signal-safe: write with raw libc::write and restore the
     // default disposition before reraising.
@@ -236,7 +239,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // keep those side effects behind the support gate, so a build
                 // that can only answer NotImplementedError does not run them
                 // first.
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     let (fd, w_file) = faulthandler_get_fileno_and_file(
                         args.first().copied().unwrap_or(pyre_object::PY_NULL),
@@ -259,9 +262,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let _state = lock_faulthandler_state();
                     let previous_fd =
                         FAULTHANDLER_FD.swap(fd, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(unix)]
+                    let flags = libc::SA_NODEFER | libc::SA_ONSTACK;
+                    #[cfg(windows)]
+                    let flags = 0;
                     let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
                         faulthandler_signal_handler,
-                        libc::SA_NODEFER | libc::SA_ONSTACK,
+                        flags,
                     );
                     if ok {
                         FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -277,7 +284,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "faulthandler.enable: sigaction failed",
                     ))
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                 {
                     let _ = args;
                     Err(crate::PyError::not_implemented(
@@ -296,7 +303,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "disable",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     let _state = lock_faulthandler_state();
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
@@ -315,13 +322,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "is_enabled",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     Ok(pyre_object::w_bool_from(
                         FAULTHANDLER_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
                     ))
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                 Ok(pyre_object::w_bool_from(false))
             },
             0,
