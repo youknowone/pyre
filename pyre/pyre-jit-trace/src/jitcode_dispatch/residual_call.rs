@@ -152,6 +152,11 @@ pub(crate) struct LatchedSingleFrameBlackhole {
     /// `None` means the walk had no resolvable mirror, and the adopt then
     /// declines rather than publishing a partial stack.
     pub(crate) mirror_stack: Option<MirrorStackImage>,
+    /// Which latch published this image.  Every latch supplies the resume
+    /// coordinate from a different source, so an image that resumes at a
+    /// coordinate the jitcode cannot dispatch is only attributable once the
+    /// adopter can name its producer.
+    pub(crate) origin: &'static str,
 }
 
 pub(crate) struct LatchedMultiFrameBlackhole {
@@ -164,6 +169,8 @@ pub(crate) struct LatchedMultiFrameBlackhole {
     /// to the live red frame before the blackhole runs.  The vable-force path
     /// stops at a call resume marker and retains its existing handoff.
     pub(crate) publish_root_stack: bool,
+    /// Which latch published this image — see the single-frame counterpart.
+    pub(crate) origin: &'static str,
 }
 
 pub(crate) fn single_frame_blackhole_cell_ptr()
@@ -443,6 +450,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 last_exc_value,
                 raising_exception: false,
                 mirror_stack,
+                origin,
             });
         });
         true
@@ -468,6 +476,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 // caller image captured at the outermost inline push, exactly
                 // where RPython keeps that root MIFrame's register bank.
                 mirror_stack: capture_root_parent_resume_stack(ctx),
+                origin,
             });
         });
         true
@@ -3493,6 +3502,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                                 last_exc_value,
                                 raising_exception,
                                 mirror_stack,
+                                origin: "escape-flush",
                             });
                         });
                     }
@@ -3537,6 +3547,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                             raising_exception,
                             publish_root_stack: false,
                             mirror_stack: None,
+                            origin: "escape-flush",
                         });
                     });
                 }

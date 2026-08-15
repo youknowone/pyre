@@ -2336,6 +2336,20 @@ fn try_adopt_single_frame_blackhole(
         );
         return false;
     };
+    // Name the image's producer alongside its resume coordinate.  Each latch
+    // derives that coordinate from a different source, and one that lands
+    // inside an operand payload stays invisible until the drive decodes the
+    // payload byte as an opcode — arbitrarily far from the latch that wrote it.
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() || majit_metainterp::bh_debug_enabled() {
+        eprintln!(
+            "[s1-adopt] origin={} leg={commit_leg:?} jitcode={} name={:?} pc={} boundary={}",
+            latched.origin,
+            latched.miframe.jitcode.index(),
+            latched.miframe.jitcode.name,
+            latched.miframe.pc,
+            latched.miframe.jitcode.is_valid_startpoint(latched.miframe.pc),
+        );
+    }
     let jitcode_index = match i32::try_from(latched.miframe.jitcode.index()) {
         Ok(index) => index,
         Err(_) => {
@@ -2745,6 +2759,23 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("no latched multi-frame image; single-frame adopt follows");
         return false;
     };
+    // Per-frame counterpart of the single-frame `[s1-adopt]` line: name the
+    // producer and check each level's resume coordinate against its OWN
+    // jitcode's instruction boundaries.  A level built from one frame's pc and
+    // another's jitcode only shows up here.
+    if crate::jitcode_dispatch::fbw_debug_abort_enabled() || majit_metainterp::bh_debug_enabled() {
+        for (index, frame) in latched.framestack.frames.iter().enumerate() {
+            eprintln!(
+                "[mf-adopt] origin={} leg={commit_leg:?} frame={index} jitcode={} name={:?} \
+                 pc={} boundary={}",
+                latched.origin,
+                frame.jitcode.index(),
+                frame.jitcode.name,
+                frame.pc,
+                frame.jitcode.is_valid_startpoint(frame.pc),
+            );
+        }
+    }
     let depth = latched.framestack.len();
     if ctx.virtualizable_info().is_none() {
         mfdbg!("no virtualizable_info");
