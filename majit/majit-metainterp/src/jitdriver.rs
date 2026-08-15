@@ -4381,7 +4381,7 @@ impl<S: JitState> JitDriver<S> {
     )]
     fn back_edge_internal(
         &mut self,
-        green_key: u64,
+        green_key_hash: u64,
         structured_green_key: Option<&dyn Fn() -> GreenKey>,
         target_pc: usize,
         state: &mut S,
@@ -4393,15 +4393,16 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
-        // **Resolve once, then carry.** From here down `green_key` names ONE
-        // cell, not a celltable bucket — the decision below, the
+        // **Resolve once, then carry.** The parameter is a raw bucket hash;
+        // from here down `green_key` names ONE cell, not a celltable bucket —
+        // the decision below, the
         // `compiled_loops` meta the runner executes, the invalidation on a
         // shape mismatch and the front-target tables all read through this one
         // number, so they cannot name different cells the way a bucket hash
         // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
         // the resolved token onward for the same reason). Identity for every
         // unchained bucket, so the collision-free path is unchanged.
-        let green_key = self.meta.resolve_cell_key(green_key, structured_green_key);
+        let green_key = self.meta.resolve_cell_key(green_key_hash, structured_green_key);
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         if !state.can_trace() {
@@ -6322,31 +6323,38 @@ impl<S: JitState> JitDriver<S> {
     /// (`ResumeFromInterpDescr`, `compile.py:1079-1083`) DO get a
     /// `compiled_loops` entry despite carrying 0 target tokens, so they remain
     /// dispatchable — this predicate only excludes bare tmp callbacks.
+    ///
+    /// No typed twin, and unlike [`Self::has_compiled_loop_for_key`] that is
+    /// not a gap: the strengthening above is pyre-only, so there is no
+    /// warmstate.py reader for a twin to mirror. What a twin would add is a
+    /// `cell_key_for` resolve in front, and the entry path already resolves at
+    /// the producer (`back_edge_internal`, `resolve_cell_key`) — after which
+    /// both conjuncts here index by that one cell key, so the disagreement a
+    /// twin existed to prevent (`compiled_loops` read at the bare
+    /// `key.get_uhash()` while the token half walked the chain) can no longer
+    /// be expressed. `warmstate::tests::
+    /// the_entry_decision_and_the_entry_execution_resolve_through_one_cell_key`
+    /// is the pin for that.
     #[inline]
     pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
         self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
     }
 
-    /// Typed twin of [`Self::has_compiled_loop`]: `warmstate.py:458-464` walks
-    /// the bucket and tests `comparekey(*greenargs)` before deciding anything,
-    /// where a bare bucket hash can answer for whichever cell holds it.
+    /// Typed twin of [`Self::has_compiled_loop`], and the shape upstream
+    /// actually has: `warmstate.py:455-464` walks the bucket and tests
+    /// `comparekey(*greenargs)` before deciding anything, and only then
+    /// (`warmstate.py:482-483`) reads `cell.get_procedure_token()` and gates on
+    /// it. The hash form has no upstream counterpart at all — a bare bucket
+    /// hash can answer for whichever cell holds it — so this is the reader to
+    /// ask wherever the typed key is in scope at the decision point.
+    ///
+    /// Kept as the typed reader API even though its only callers today are
+    /// tests: `the_typed_entry_predicate_reads_the_keys_own_cell_not_the_bucket_head`
+    /// is what pins the hash/typed disagreement the entry path resolves away,
+    /// and a chained bucket is the only state in which the two can differ.
     #[inline]
     pub fn has_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
         self.meta.has_compiled_loop_for_key(key)
-    }
-
-    /// Typed twin of [`Self::has_runnable_compiled_loop`].
-    ///
-    /// Both conjuncts read through the SAME resolved cell key, so the JitCell
-    /// half and the `compiled_loops` half cannot answer about different cells.
-    /// They could: `compiled_loops` was consulted at the bare `key.get_uhash()`
-    /// while the token half walked the chain by `comparekey`.
-    #[inline]
-    pub fn has_runnable_compiled_loop_for_key(&self, key: &GreenKey) -> bool {
-        self.meta
-            .warm_state_ref()
-            .cell_key_for(key)
-            .is_some_and(|cell_key| self.has_runnable_compiled_loop(cell_key))
     }
 
     /// Actual key the last compile_loop stored under.

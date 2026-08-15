@@ -11499,15 +11499,15 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn resolve_cell_key(
         &self,
-        green_key: u64,
+        green_key_hash: u64,
         structured_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
     ) -> u64 {
         match structured_green_key {
-            Some(make_key) => self.warm_state.resolve_cell_key(green_key, make_key),
+            Some(make_key) => self.warm_state.resolve_cell_key(green_key_hash, make_key),
             None => self
                 .warm_state
-                .sole_cell_key(green_key)
-                .unwrap_or(green_key),
+                .sole_cell_key(green_key_hash)
+                .unwrap_or(green_key_hash),
         }
     }
 
