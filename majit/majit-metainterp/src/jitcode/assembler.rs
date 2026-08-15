@@ -1865,22 +1865,30 @@ impl JitCodeBuilder {
 
     /// Add a GC-array descriptor for a raw-pointer-element array (one-word
     /// `*mut T` items) to the descrs pool; returns the descr index for
-    /// `getarrayitem_gc_r`.  Models a length-prefixed `{ len: usize,
-    /// items: [*mut T; N] }` whose base pointer points at the `len` word:
-    /// `base_size = 8` (items start one word in), `len_offset = Some(0)`
-    /// (length at the base).  The lendescr is required: the optimizer
-    /// narrows the array's lenbound on a constant-index read (`heap.py:676
-    /// getlenbound().make_gt_const(index)`) and the short preamble re-emits
-    /// `ARRAYLEN_GC` to re-establish the `len > index` guard each loop entry
-    /// — without a lendescr the GC rewrite of that `ARRAYLEN_GC` panics.
-    /// An interpreter supplies that header itself — a length word at offset
-    /// 0 with the pointer array at offset 8.  Deduped structurally by
-    /// `add_bh_descr`.
-    pub fn add_ptr_array_descr(&mut self) -> u16 {
+    /// `getarrayitem_gc_r`.  Models `[*mut T; N]` living inside a struct the
+    /// caller owns: `base_size` is the byte offset of the first item from the
+    /// pointer the read indexes off, and `len_offset` names a length word
+    /// ahead of it when the caller keeps one.
+    ///
+    /// Both are the caller's to state because both are its layout.  RPython
+    /// derives them from the lltype (`descr.py get_array_descr(gccache,
+    /// ARRAY)`); a hand-written consumer struct has no lltype, so the values
+    /// arrive from the declaration or they are guessed.
+    ///
+    /// `len_offset = None` is a supported shape, not a degraded one: a plain
+    /// fixed-size inline array has no length in memory, and
+    /// `ArrayPtrInfo.make_guards` skips the short preamble's `ARRAYLEN_GC` for
+    /// a descr without a lendescr (`optimizeopt/info.rs`) rather than emitting
+    /// an op the mandatory GC rewrite would then unwrap.  With a length word
+    /// declared, the read keeps the `len > index` bound the optimizer narrows
+    /// on a constant index (`heap.py:676 getlenbound().make_gt_const(index)`).
+    ///
+    /// Deduped structurally by `add_bh_descr`.
+    pub fn add_ptr_array_descr(&mut self, base_size: usize, len_offset: Option<usize>) -> u16 {
         self.add_array_descr(CanonicalBhDescr::Array {
-            base_size: std::mem::size_of::<usize>(),
+            base_size,
             itemsize: scalar_size(majit_ir::value::Type::Ref),
-            len_offset: Some(0),
+            len_offset,
             type_id: 0,
             gc_type_id: 0,
             item_type: majit_ir::value::Type::Ref,

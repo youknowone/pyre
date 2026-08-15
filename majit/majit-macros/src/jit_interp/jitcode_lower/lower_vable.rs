@@ -98,6 +98,48 @@ fn ref_field_witness_tokens(
     }
 }
 
+/// The `(base_size, len_offset, witness)` a `pool_arrays` declaration reports
+/// for its array, and the compile-time checks that the declaration describes
+/// the struct it names.
+///
+/// Both numbers are `offset_of!` on the declaration's own field names, so a
+/// field reordered ahead of the items moves the read with it instead of leaving
+/// it behind.  The witnesses cover what an offset cannot: that `items` really
+/// is an array of pointer-width elements, and that `len` really is a `usize` —
+/// the width the descr's lendescr reads it at.  Without the second one, a `u32`
+/// length word would be read as a machine word with its top half taken from
+/// whatever follows.
+///
+/// The element witness needs the declared pointee, so it is emitted only for a
+/// declaration that names one.  `offset_of!` is unconditional.
+fn pool_array_layout_tokens(
+    entry: &super::PoolArrayLowering,
+) -> (TokenStream, TokenStream, TokenStream) {
+    let struct_path = &entry.struct_path;
+    let items = &entry.items_field;
+    let base_size = quote! { ::core::mem::offset_of!(#struct_path, #items) };
+    let (len_offset, len_witness) = match &entry.len_field {
+        Some(len) => (
+            quote! { ::core::option::Option::Some(::core::mem::offset_of!(#struct_path, #len)) },
+            quote! {
+                const _: fn(&#struct_path) -> usize = |__s| __s.#len;
+            },
+        ),
+        None => (quote! { ::core::option::Option::None }, quote! {}),
+    };
+    let element_witness = match &entry.element_type {
+        Some(element) => quote! {
+            const _: fn(&#struct_path) -> *mut #element = |__s| __s.#items[0];
+        },
+        None => quote! {},
+    };
+    (
+        base_size,
+        len_offset,
+        quote! { #len_witness #element_witness },
+    )
+}
+
 /// A `<local ref binding>.<field>` access that `array_fields` declares, resolved
 /// but not yet emitted.  See [`JitCodeLowerer::match_array_field_base`].
 struct ArrayFieldBase {
@@ -1434,8 +1476,9 @@ impl<'c> Lowerer<'c> {
 
     /// Recognizes a pool-array element read through the registered getter call
     /// `<getter>(state.<pool_base_ref>, <int index>)` → `getarrayitem_gc_r` on
-    /// the raw-pointer array (`[*mut U; N]` at offset 0) the ref-scalar points
-    /// at — the `pools[selected]` read.  Unlike the residual-call form (an
+    /// the raw-pointer array (`[*mut U; N]` at the declared `items` offset) the
+    /// ref-scalar points at — the `pools[selected]` read.  Unlike the
+    /// residual-call form (an
     /// opaque CALL_R the optimizer can neither re-produce in the short preamble
     /// nor invalidate), the getarrayitem on the immutable `pools` array
     /// re-derives the element each loop entry from the consistent `selected`
@@ -1448,7 +1491,8 @@ impl<'c> Lowerer<'c> {
     /// `(state.<base>, int)` arg shape does NOT match, so it is not miscompiled
     /// into a pool read — it falls through to its own residual body (which is
     /// also the getter's concrete fallback when no `pool_arrays` is configured).
-    /// Pointer elements are 8 bytes at array offset 0 (`add_ptr_array_descr`).
+    /// Elements are pointer-width; where they start, and whether a length word
+    /// precedes them, come from the declaration (`pool_array_layout_tokens`).
     pub(super) fn lower_pool_array_get_call(&mut self, call: &syn::ExprCall) -> Option<Binding> {
         let config = self.config?;
         if call.args.len() != 2 {
@@ -1468,12 +1512,12 @@ impl<'c> Lowerer<'c> {
         // fallback (the marker function's own body) rather than miscompiling an
         // unrelated helper into a `getarrayitem_gc_r`.
         let func_segments = canonical_expr_segments(&call.func)?;
-        let element_type = config
+        let entry = config
             .pool_arrays
             .iter()
-            .find(|(base, getter, _)| base == &base_name && getter == &func_segments)?
-            .2
-            .clone();
+            .find(|entry| entry.base == base_name && entry.getter == func_segments)?;
+        let element_type = entry.element_type.clone();
+        let (base_size, len_offset, layout_witness) = pool_array_layout_tokens(entry);
         // Lower the `state.<base>` ref-scalar (declares its ref identity slot
         // live for resume) and the index, then read the pointer element.
         let base = self.lower_state_field_read(&call.args[0])?;
@@ -1494,7 +1538,8 @@ impl<'c> Lowerer<'c> {
                 vec![Register::ref_(result_reg)],
             ),
             quote! {
-                let __descr_idx = __builder.add_ptr_array_descr();
+                #layout_witness
+                let __descr_idx = __builder.add_ptr_array_descr(#base_size, #len_offset);
                 __builder.getarrayitem_gc_r(
                     #result_reg as u16,
                     #base_reg as u16,

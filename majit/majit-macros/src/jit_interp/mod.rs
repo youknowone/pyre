@@ -383,17 +383,29 @@ pub struct ResidualWriteEntry {
 
 /// A `ref(T)` state scalar that is the base of a contiguous raw-pointer array,
 /// paired with the marker `getter` function whose call indexes it.  Declared as
-/// `pool_arrays = { <ref> => <getter> [-> ElementType], ... }`.  The lowering
-/// recognizes a pool read only when BOTH the call's function path matches
-/// `getter` AND arg0 is `state.<base>` — operation identity, not arg shape
-/// alone, so an unrelated helper that happens to take the same
+/// `pool_arrays = { <ref>.<items>[<len>] => <getter> [-> ElementType], ... }`.
+/// The lowering recognizes a pool read only when BOTH the call's function path
+/// matches `getter` AND arg0 is `state.<base>` — operation identity, not arg
+/// shape alone, so an unrelated helper that happens to take the same
 /// `(state.<base>, int)` shape is not miscompiled into a `getarrayitem_gc_r`.
 #[derive(Clone)]
 pub struct PoolArrayEntry {
     pub base: Ident,
     pub getter: Path,
-    /// The concrete element type each array slot points at (`pools: [*mut T; N]`),
-    /// declared as `<base> => <getter> -> T`.  Supplies `struct_type` for the
+    /// The array field inside the base struct, e.g. `pools` in
+    /// `Storage { pools: [*mut T; N], .. }`.  Its `offset_of!` is what the
+    /// element read adds to the base pointer.  Naming it is what leaves the
+    /// struct free to hold anything else: undeclared, the read has to assume a
+    /// layout and the consumer has to build its struct to match, with the
+    /// agreement written on neither side in anything the compiler checks.
+    pub items_field: Ident,
+    /// A length word ahead of the items, declared as `<items>[<len>]`.  Absent
+    /// for a plain fixed-size array, which has no length in memory; present
+    /// when the consumer keeps one, which buys the `len > index` bound the
+    /// short preamble re-establishes on each loop entry.
+    pub len_field: Option<Ident>,
+    /// The concrete element type each array slot points at (`items: [*mut T; N]`),
+    /// declared as `... => <getter> -> T`.  Supplies `struct_type` for the
     /// getter's ref binding so field access on a LOCAL `let x = <getter>(...)`
     /// resolves the layout (state-field refs get this from their decl instead).
     pub element_type: Option<Path>,
@@ -844,15 +856,29 @@ fn parse_residual_writes_map(input: ParseStream) -> syn::Result<Vec<ResidualWrit
     Ok(entries)
 }
 
-/// Parse `pool_arrays = { <ref> => <getter> [-> ElementType], ... }`.  Each
-/// entry maps a `ref(T)` state scalar (the array base) to the marker function
-/// whose call indexes it, optionally tagging the loaded element's struct type.
+/// Parse `pool_arrays = { <ref>.<items>[<len>] => <getter> [-> ElementType],
+/// ... }`.  Each entry maps a `ref(T)` state scalar (the array base) and the
+/// array field inside it to the marker function whose call indexes it,
+/// optionally naming a length word ahead of the items and tagging the loaded
+/// element's struct type.
+///
+/// `<items>` is mandatory: the read has to add some offset to the base, and the
+/// only alternatives to declaring it are assuming one or hard-coding one.
 fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
     while !content.is_empty() {
         let base: Ident = content.parse()?;
+        content.parse::<Token![.]>()?;
+        let items_field: Ident = content.parse()?;
+        let len_field = if content.peek(syn::token::Bracket) {
+            let len;
+            syn::bracketed!(len in content);
+            Some(len.parse::<Ident>()?)
+        } else {
+            None
+        };
         content.parse::<Token![=>]>()?;
         let getter: Path = content.parse()?;
         let element_type = if content.peek(Token![->]) {
@@ -864,6 +890,8 @@ fn parse_pool_arrays_map(input: ParseStream) -> syn::Result<Vec<PoolArrayEntry>>
         entries.push(PoolArrayEntry {
             base,
             getter,
+            items_field,
+            len_field,
             element_type,
         });
         let _ = content.parse::<Token![,]>();
