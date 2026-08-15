@@ -74,6 +74,15 @@ struct PointerFieldState {
     state_fields = { a: int, sel: ref(PointerFieldStack) },
     greens = [],
     array_fields = { PointerFieldStack::data => i64 },
+    int_fields = {
+        // Declared for its width, not its kind. `usize` is four bytes on a
+        // 32-bit target, and naming a field in a write set is what sends it
+        // through the undeclared-scalar default, whose witness demands eight —
+        // so leaving it undeclared fails macro expansion on wasm32 before any
+        // of this runs. The control below still reads whatever kind the
+        // write-set path decided.
+        PointerFieldStack::size => usize,
+    },
     calls = { jit_scramble_pointer_field => residual_void },
     residual_writes = {
         // `size` is here only so the scalar control below has a descr to read.
