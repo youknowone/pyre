@@ -291,8 +291,22 @@ pub mod frame_locals_proxy {
                 return Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("update failed")));
             }
-            for (key, value) in unsafe { pyre_object::dictmultiobject::w_dict_items(incoming) } {
-                self.setitem_value(key, value)?;
+            // `setitem_value` can hash the key into `f_extra_locals`, which
+            // runs `__hash__` and collects.  `incoming` and the item snapshot
+            // are native locals no root walker updates, so publish the set and
+            // read each pair back across the stores that precede it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let items_base = pyre_object::gc_roots::shadow_stack_len();
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(incoming) };
+            for &(key, value) in &items {
+                pyre_object::gc_roots::pin_root(key);
+                pyre_object::gc_roots::pin_root(value);
+            }
+            for index in 0..items.len() {
+                self.setitem_value(
+                    pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
+                    pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
+                )?;
             }
             Ok(())
         }

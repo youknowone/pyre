@@ -578,16 +578,32 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 /// `__hash__` / `__eq__`); an unhashable key raises, so — like
 /// `build_set_from_refs` — this is fallible.
 pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let dict = w_dict_new();
-    for pair in items.chunks_exact(2) {
-        let key = pair[0];
-        let value = pair[1];
+    // Each store hashes its key through `__hash__`, so every turn is a
+    // collection point.  The fresh dict and `items` — for the JIT entries a
+    // copy of the compiled call's argument registers — are native locals no
+    // root walker updates, so publish the whole set and read every operand
+    // back.  `build_set_from_refs` reaches the same bracket through
+    // `builtin_set_add_items_impl`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in items {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_dict_new());
+    let dict = || pyre_object::gc_roots::shadow_stack_get(dict_slot);
+    for index in (0..items.len() - items.len() % 2).step_by(2) {
+        let key = pyre_object::gc_roots::shadow_stack_get(items_base + index);
+        let value = pyre_object::gc_roots::shadow_stack_get(items_base + index + 1);
         unsafe {
-            w_dict_store_checked(dict, key, value)
-                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
+            w_dict_store_checked(dict(), key, value).map_err(|_| {
+                crate::baseobjspace::take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(items_base + index),
+                )
+            })?;
         }
     }
-    Ok(dict)
+    Ok(dict())
 }
 
 /// BUILD_SET evaluation, shared by the JIT residual (`bh_build_set_from_array`).
@@ -1295,19 +1311,32 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
         Err(e) => return Err(e),
     };
-    let mut items = Vec::with_capacity(count);
+    // `next` runs the iterator's `__next__` on every turn, so the accumulator
+    // cannot be a plain `Vec` — nothing scans it, which would leave each item
+    // already pulled unreachable while the next one is produced, and `iter` is
+    // a native copy the collector does not update.  Publish the whole set and
+    // rebuild the flat return from it, as `_unpackiterable_known_length_jitlook`
+    // does for the same loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(seq);
+    pyre_object::gc_roots::pin_root(iter);
+    let seq = || pyre_object::gc_roots::shadow_stack_get(seq_slot);
+    let iter = || pyre_object::gc_roots::shadow_stack_get(seq_slot + 1);
+    let root_base = seq_slot + 1;
+    let mut pulled = 0usize;
     loop {
-        match crate::baseobjspace::next(iter) {
+        match crate::baseobjspace::next(iter()) {
             Ok(val) => {
-                if items.len() == count {
+                if pulled == count {
                     // CPython 3.14 ceval.c:2313-2320 checks the original
                     // object's exact builtin kind only after `PyIter_Next`
                     // found the first excess item.  Lists and tuples took the
                     // fast path above; exact dicts reach this iterator path.
                     // Keep dict subclasses generic so their `__len__` is not
                     // observed and the message has no total.
-                    if unsafe { pyre_object::is_exact_type(seq, &pyre_object::DICT_TYPE) } {
-                        let len = unsafe { pyre_object::w_dict_len(seq) };
+                    if unsafe { pyre_object::is_exact_type(seq(), &pyre_object::DICT_TYPE) } {
+                        let len = unsafe { pyre_object::w_dict_len(seq()) };
                         if len > count {
                             return Err(PyError::value_error(format!(
                                 "too many values to unpack (expected {count}, got {len})"
@@ -1318,20 +1347,22 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
                         "too many values to unpack (expected {count})"
                     )));
                 }
-                items.push(val);
+                pyre_object::gc_roots::pin_root(val);
+                pulled += 1;
             }
             Err(e) if e.kind == PyErrorKind::StopIteration => break,
             Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
             Err(e) => return Err(e),
         }
     }
-    if items.len() < count {
+    if pulled < count {
         return Err(PyError::value_error(format!(
-            "not enough values to unpack (expected {count}, got {})",
-            items.len()
+            "not enough values to unpack (expected {count}, got {pulled})"
         )));
     }
-    Ok(items)
+    Ok((0..pulled)
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index))
+        .collect())
 }
 
 /// UNPACK_EX — split `value` for `a, *b, c = value` into `before` head

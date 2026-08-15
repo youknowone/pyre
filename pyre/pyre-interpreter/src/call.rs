@@ -1150,23 +1150,37 @@ pub fn call_function_ex_in_ctx(
     starargs: PyObjectRef,
     kwargs_or_null: PyObjectRef,
 ) -> PyResult {
+    // Unpacking `*` already runs Python — a generator body, or a subtype's
+    // `__iter__` — so `callable`, the mapping and the prepended receiver are
+    // stale by the time the `**` merge and the dispatch read them.  Publish
+    // them before the first unpack, not after it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    pyre_object::gc_roots::pin_root(kwargs_or_null);
+    pyre_object::gc_roots::pin_root(self_or_null);
+    pyre_object::gc_roots::pin_root(starargs);
+    let callable = || pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    let kwargs_or_null = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 1);
+    let self_or_null = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 2);
+    let starargs = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 3);
     let mut args: Vec<PyObjectRef> = unsafe {
         // argument.py:92-104 reaches `space.fixedview`, whose fast paths
         // (`objspace.py:519-527`) are a tuple whose `__iter__` is still
         // `tuple.__iter__` and an exact list.  A subtype that replaced
         // `__iter__` falls through to the generic path so the override runs.
-        if pyre_object::is_tuple(starargs)
-            && crate::baseobjspace::builtin_iter_replacement(starargs, &pyre_object::TUPLE_TYPE)
+        if pyre_object::is_tuple(starargs())
+            && crate::baseobjspace::builtin_iter_replacement(starargs(), &pyre_object::TUPLE_TYPE)
                 .is_none()
         {
-            let n = pyre_object::w_tuple_len(starargs);
+            let n = pyre_object::w_tuple_len(starargs());
             (0..n as i64)
-                .filter_map(|i| pyre_object::w_tuple_getitem(starargs, i))
+                .filter_map(|i| pyre_object::w_tuple_getitem(starargs(), i))
                 .collect()
-        } else if pyre_object::is_exact_list(starargs) {
-            let n = pyre_object::w_list_len(starargs);
+        } else if pyre_object::is_exact_list(starargs()) {
+            let n = pyre_object::w_list_len(starargs());
             (0..n as i64)
-                .filter_map(|i| pyre_object::w_list_getitem(starargs, i))
+                .filter_map(|i| pyre_object::w_list_getitem(starargs(), i))
                 .collect()
         } else {
             // argument.py:92-104 `_combine_starargs_wrapped` — a non-tuple/list
@@ -1174,27 +1188,41 @@ pub fn call_function_ex_in_ctx(
             // "argument after * must be an iterable, not %T" (not the bare
             // `iter()` TypeError).
             let mut unpacked: Vec<PyObjectRef> = Vec::new();
-            crate::argument::combine_starargs_wrapped(&mut unpacked, starargs, callable)?;
+            crate::argument::combine_starargs_wrapped(&mut unpacked, starargs(), callable())?;
             unpacked
         }
     };
-    if !self_or_null.is_null() {
-        args.insert(0, self_or_null);
+    if !self_or_null().is_null() {
+        args.insert(0, self_or_null());
     }
+
+    // The unpacked positional set is a native `Vec` no root walker updates and
+    // the `**` merge below runs Python too, so publish it and rebuild the
+    // slice for the dispatch.
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in &args {
+        pyre_object::gc_roots::pin_root(arg);
+    }
+    let nargs = args.len();
+    let args = || -> Vec<PyObjectRef> {
+        (0..nargs)
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(args_base + index))
+            .collect()
+    };
 
     // Merge the `**` mapping into the call.  argument.py:106-150
     // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
     // path or an arbitrary object via `keys()` / `__getitem__` — raising
     // "argument after ** must be a mapping" for a non-mapping and
     // "keywords must be strings" for a non-str key.
-    if !kwargs_or_null.is_null() {
+    if !kwargs_or_null().is_null() {
         let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
         let mut keywords_w: Vec<PyObjectRef> = Vec::new();
         crate::argument::combine_starstarargs_wrapped(
             &mut keyword_names_w,
             &mut keywords_w,
-            kwargs_or_null,
-            callable,
+            kwargs_or_null(),
+            callable(),
         )?;
         if !keyword_names_w.is_empty() {
             let entries: Vec<(Wtf8Buf, PyObjectRef)> = keyword_names_w
@@ -1202,11 +1230,11 @@ pub fn call_function_ex_in_ctx(
                 .zip(keywords_w.iter())
                 .map(|(&k, &v)| (unsafe { pyre_object::w_str_get_wtf8(k) }.to_owned(), v))
                 .collect();
-            return call_with_kwargs_in_ctx(execution_context, callable, &args, &entries);
+            return call_with_kwargs_in_ctx(execution_context, callable(), &args(), &entries);
         }
     }
 
-    call_callable_in_ctx(execution_context, callable, &args)
+    call_callable_in_ctx(execution_context, callable(), &args())
 }
 
 /// [`call_kw_in_ctx`] reached from a frame — the `pyopcode.py:1402

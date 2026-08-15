@@ -13701,28 +13701,42 @@ fn _unpackiterable_known_length_jitlook(
     w_iterator: PyObjectRef,
     expected_length: usize,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let mut items: Vec<PyObjectRef> = Vec::with_capacity(expected_length);
+    // Each `next` runs the iterator's `__next__`, so every loop turn is a
+    // collection point.  A plain `Vec` accumulator is scanned by no root
+    // walker, which would leave every item already pulled unreachable while
+    // the next one is produced, and `w_iterator` is a native copy the
+    // collector does not update.  `_unpackiterable_unknown_length`
+    // accumulates into a rooted `W_List` for this reason; the flat return
+    // shape here is rebuilt from the published set instead.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iterator);
+    let iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let mut count = 0usize;
     loop {
-        match next(w_iterator) {
+        match next(iterator()) {
             Ok(w_item) => {
-                if items.len() == expected_length {
+                if count == expected_length {
                     return Err(crate::PyError::value_error(format!(
                         "too many values to unpack (expected {expected_length})",
                     )));
                 }
-                items.push(w_item);
+                pyre_object::gc_roots::pin_root(w_item);
+                count += 1;
             }
             Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
             Err(e) => return Err(e),
         }
     }
-    if items.len() < expected_length {
+    if count < expected_length {
         return Err(crate::PyError::value_error(format!(
             "not enough values to unpack (expected {expected_length}, got {got})",
-            got = items.len(),
+            got = count,
         )));
     }
-    Ok(items)
+    Ok((0..count)
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index))
+        .collect())
 }
 
 /// pypy/interpreter/baseobjspace.py:1159-1163 base default + the

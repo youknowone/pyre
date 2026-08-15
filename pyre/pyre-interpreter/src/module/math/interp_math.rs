@@ -1233,15 +1233,42 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
             "Inputs are not the same length",
         ));
     }
+    // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
+    // Decimal or Fraction element makes every turn a collection point.  Both
+    // collected sequences and the running total are native locals no root
+    // walker updates, so publish them and read each operand back per turn.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let p_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &p {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let q_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &q {
+        pyre_object::gc_roots::pin_root(item);
+    }
     // The accumulator starts as int 0 so type coercion follows the pure
     // Python `total = 0; total += p_i * q_i` recipe: int stays int, and a
     // Decimal/Fraction/float product widens the running total on first add.
-    let mut acc: PyObjectRef = w_int_new(0);
-    for (a, b) in p.iter().zip(q.iter()) {
-        let prod = crate::baseobjspace::mul(*a, *b)?;
-        acc = crate::baseobjspace::add(acc, prod)?;
+    let acc_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_int_new(0));
+    for index in 0..p.len() {
+        let prod = crate::baseobjspace::mul(
+            pyre_object::gc_roots::shadow_stack_get(p_base + index),
+            pyre_object::gc_roots::shadow_stack_get(q_base + index),
+        )?;
+        // `prod` is fresh and `add` runs Python; it needs a root of its own for
+        // that call, released again each turn so the bracket stays fixed-size.
+        let iteration_roots = pyre_object::gc_roots::push_roots();
+        let prod_slot = pyre_object::gc_roots::shadow_stack_len();
+        iteration_roots.pin_root(prod);
+        let total = crate::baseobjspace::add(
+            pyre_object::gc_roots::shadow_stack_get(acc_slot),
+            pyre_object::gc_roots::shadow_stack_get(prod_slot),
+        )?;
+        drop(iteration_roots);
+        pyre_object::gc_roots::shadow_stack_set(acc_slot, total);
     }
-    Ok(acc)
+    Ok(pyre_object::gc_roots::shadow_stack_get(acc_slot))
 }
 
 pub fn frexp(args: &[PyObjectRef]) -> PyResult {
