@@ -358,6 +358,24 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         push_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     }
 
+    // `#[pyre_methods]` `type_object()` accessors are `dont_look_inside`
+    // (`majit-translate` `front::llbc_hints` stamps them: the JIT residualizes
+    // the `OnceLock` body rather than lifting its unliftable `CELL` read), so
+    // each residual call needs the accessor's runtime address.  The macro
+    // registers every `(path, fn)` into this link-time slice; iterate it
+    // instead of hand-listing ~46 module-qualified paths (which mis-resolve
+    // inline-mod spellings and miss per-module `cfg` gates).  Register the
+    // crate-stripped alias too, mirroring `push_alias_pair`, so either
+    // spelling of the residual `FunctionPath` resolves.
+    #[cfg(not(target_arch = "wasm32"))]
+    for desc in pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS {
+        let fnptr = desc.func as *const ();
+        push_fnaddr(&mut entries, desc.path, fnptr);
+        if let Some((_crate_seg, rest)) = desc.path.split_once("::") {
+            push_fnaddr(&mut entries, rest, fnptr);
+        }
+    }
+
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::runtime_ops::jit_make_function_from_globals",
@@ -3569,6 +3587,27 @@ mod tests {
             expected
         );
         assert_eq!(bindings["module::_random::Random::genrand32"], expected);
+    }
+
+    /// `PYRE_TYPE_OBJECT_FNADDRS` is a native-only `distributed_slice`, so the
+    /// `#[pyre_methods]` `type_object()` residual addresses are published only
+    /// off wasm32.  Both the crate-qualified path (the residual `FunctionPath`)
+    /// and the crate-stripped alias resolve to the accessor.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn jit_trace_fnaddrs_covers_deque_iter_type_object_residual() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            crate::module::_collections::deque_iter::type_object as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::module::_collections::deque_iter::type_object"],
+            expected
+        );
+        assert_eq!(
+            bindings["module::_collections::deque_iter::type_object"],
+            expected
+        );
     }
 
     /// `BUILTIN_WRAPPER_DESCRIPTORS` is only pushed into the binding table off

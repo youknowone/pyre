@@ -200,6 +200,35 @@ unsafe impl Sync for PyreClassDescriptor {}
 #[::linkme::distributed_slice]
 pub static PYRE_CLASS_DESCRIPTORS: [&'static PyreClassDescriptor] = [..];
 
+/// Link-time descriptor for a `#[pyre_methods]`-generated `type_object()`
+/// accessor.  The accessor's body is the `OnceLock<usize>` type-object cache;
+/// its `CELL` read is unliftable, so the JIT stamps the accessor
+/// `dont_look_inside` (`majit-translate` `front::llbc_hints`) and residualizes
+/// the call.  A residual call needs the callee's runtime address, so each
+/// accessor registers its census-visible path and pointer here, the same
+/// link-time census `PYRE_CLASS_DESCRIPTORS` uses for pytype statics.
+pub struct TypeObjectFnDescriptor {
+    /// `concat!(module_path!(), "::type_object")` — the `FunctionPath` the
+    /// residual call names, matched against `jit_trace_fnaddrs`.
+    pub path: &'static str,
+    /// The accessor.  `fn() -> PyObjectRef` is a single-word ref return with
+    /// no arguments — the plainest residual-call ABI the codewriter emits.
+    pub func: fn() -> crate::PyObjectRef,
+}
+
+// Safety: `path` is `'static` and `func` is a plain `fn` pointer to
+// process-global code; sharing across threads is sound.
+unsafe impl Sync for TypeObjectFnDescriptor {}
+
+/// Link-time registry of every `#[pyre_methods]` `type_object()` accessor,
+/// populated by the macro so `jit_trace_fnaddrs` publishes each residual-call
+/// address without a hand-maintained list (which would mis-resolve inline-mod
+/// paths and miss per-module `cfg` gates).  Native only, matching
+/// [`PYRE_CLASS_DESCRIPTORS`]: `distributed_slice` rejects `wasm32`.
+#[cfg(not(target_arch = "wasm32"))]
+#[::linkme::distributed_slice]
+pub static PYRE_TYPE_OBJECT_FNADDRS: [TypeObjectFnDescriptor] = [..];
+
 /// Compile-time bridge between a `#[pyre_class]` struct and its
 /// per-type static `PyType` / `PyreClassDescriptor`.  Implemented
 /// automatically by `#[pyre_class]`; consumed by `py_class_typed!`

@@ -46,6 +46,13 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
 /// the marker consts present in `llbcs`.
 pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    // The `type_object` residual resolves through `PYRE_TYPE_OBJECT_FNADDRS`, a
+    // native-only link-time slice (empty on wasm32, which linkme rejects).
+    // Residualizing there would emit a call to an unpublished address, so keep
+    // those accessors on the legacy walker when building for wasm.
+    let residualize_type_object = !std::env::var("TARGET")
+        .unwrap_or_default()
+        .starts_with("wasm32");
     for llbc in llbcs {
         let function_paths: HashSet<String> = llbc
             .iter_local_fns()
@@ -131,6 +138,30 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                         push_hint(&mut out, key.clone(), hint);
                     }
                     break;
+                }
+            }
+        }
+        // Residualize the `#[pyre_methods]`-generated `type_object()`
+        // accessors.  The body is the `OnceLock<usize>` type-object cache
+        // (`make_builtin_type_with_layout` building the class namespace dict) —
+        // unliftable host plumbing whose lift fails at the `CELL` read and
+        // poisons every caller.  Stamping `dont_look_inside` prefills a
+        // signature-only stub and lets the codewriter emit a residual call to
+        // the accessor's registered C ABI address (published through the
+        // `PYRE_TYPE_OBJECT_FNADDRS` link-time slice into `jit_trace_fnaddrs`).
+        // Gated on the exact accessor signature — leaf `type_object`, no inputs,
+        // `*mut PyObject` return — so the stamped set equals the funcptr set the
+        // macro registers, never a stray same-named function.  Skipped entirely
+        // on wasm, which has no funcptr slice to resolve the residual against.
+        if residualize_type_object {
+            for fd in llbc.iter_local_fns() {
+                let path = strip_crate_prefix(&fd.item_meta.name_path());
+                let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+                if leaf == "type_object"
+                    && fd.signature.inputs.is_empty()
+                    && crate::front::mir::output_type_is_objectptr(&fd.signature.output, llbc)
+                {
+                    push_hint(&mut out, path, "dont_look_inside");
                 }
             }
         }

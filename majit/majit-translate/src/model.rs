@@ -3306,8 +3306,8 @@ pub fn fuse_boxing_alloc(
         w_class: Option<Payload>,
     }
     let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable| -> Option<HeaderPlan> {
-        let header = store_value(graph, agg, "ob_header")
-            .or_else(|| store_value(graph, agg, "ob"))?;
+        let header =
+            store_value(graph, agg, "ob_header").or_else(|| store_value(graph, agg, "ob"))?;
         let mut roots = Vec::new();
         if !store_roots(graph, &header, 8, &mut roots) {
             return None;

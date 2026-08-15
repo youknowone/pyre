@@ -16676,7 +16676,7 @@ fn ref_return_is_single_word(ast: &str) -> bool {
     false
 }
 
-fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
+pub(crate) fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
         .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
