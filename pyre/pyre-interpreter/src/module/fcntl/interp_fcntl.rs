@@ -7,8 +7,9 @@
 ///
 /// fcntl(fd, cmd, arg=0) / ioctl(fd, request, arg=0) / flock(fd, op) /
 /// lockf(fd, cmd, len=0, start=0, whence=0).  Backed by
-/// `rustpython_host_env::fcntl`.  Only the integer-argument forms are
-/// implemented; bytes-buffer (out-arg) variants are out of scope.
+/// `rustpython_host_env::fcntl`.  `ioctl` is still limited to the
+/// integer-argument form; its buffer form needs writable-buffer acquisition
+/// and `mutate_flag` handling from `interp_fcntl.py:252-300`.
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
@@ -21,9 +22,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "fcntl() takes 2 or 3 arguments",
                     ));
                 }
-                if !unsafe { pyre_object::is_int(args[1]) }
-                    || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
-                {
+                if !unsafe { pyre_object::is_int(args[1]) } {
                     return Err(crate::PyError::type_error(
                         "fcntl() arguments must be integers",
                     ));
@@ -33,7 +32,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // number it wraps.
                 let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                if args.len() >= 3 && unsafe { pyre_object::bytesobject::is_bytes_like(args[2]) } {
+                    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[2]) };
+                    let mut buf = data.to_vec();
+                    buf.push(0);
+                    // `interp_fcntl.py:118-138 fcntl` tries the string-buffer
+                    // path before falling back to the integer path, and
+                    // returns exactly the original buffer length.
+                    loop {
+                        let outcome = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            rustpython_host_env::fcntl::fcntl_with_bytes(fd, cmd, &mut buf)
+                        };
+                        match outcome {
+                            Ok(_) => {
+                                return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+                                    &buf[..data.len()],
+                                ));
+                            }
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("fcntl: {e}"),
+                                )
+                            })?,
+                        }
+                    }
+                }
                 let arg = if args.len() >= 3 {
+                    if !unsafe { pyre_object::is_int(args[2]) } {
+                        return Err(crate::PyError::type_error(
+                            "fcntl() arguments must be integers",
+                        ));
+                    }
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
                 } else {
                     0
