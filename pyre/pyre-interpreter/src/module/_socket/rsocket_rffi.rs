@@ -59,7 +59,9 @@ pub fn is_invalid(s: Socket) -> bool {
 /// 64-bit integer, so `INVALID_SOCKET` reads back as `-1` there too and the
 /// closed-socket sentinel is the same value on both platforms.
 pub fn socket_to_i64(s: Socket) -> i64 {
-    s as i64
+    // Through the pointer-width signed type, so a 32-bit `SOCKET` reaches the
+    // widening as `-1` rather than as `4294967295`.
+    s as isize as i64
 }
 
 pub fn socket_from_i64(v: i64) -> Socket {
@@ -462,9 +464,37 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
 /// connection started in non-blocking mode reports its outcome by making the
 /// socket writable.  Windows-only because `SO_SNDTIMEO` already bounds a
 /// POSIX connect.
+///
+/// `select` with the socket in `exceptfds` as well as `writefds`, which is how
+/// `internal_select(connect=1)` waits: a refused connection makes the socket
+/// readable and exceptional rather than writable, and `WSAPoll` did not wake
+/// for one at all before Windows 10 version 2004 — the caller would read
+/// `WSAETIMEDOUT` where the connection error belongs.
 #[cfg(windows)]
 pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
-    poll_one(s, ws::POLLOUT, timeout_ms)
+    let mut writefds = ws::FD_SET {
+        fd_count: 1,
+        ..Default::default()
+    };
+    writefds.fd_array[0] = s;
+    let mut exceptfds = writefds;
+    let timeout = ws::TIMEVAL {
+        tv_sec: timeout_ms / 1000,
+        tv_usec: (timeout_ms % 1000) * 1000,
+    };
+    let _blocked = crate::module::thread::before_external_block();
+    // WinSock ignores `nfds`: its fd_set is a counted SOCKET array, not a
+    // descriptor-indexed bitmap.
+    let ready = unsafe {
+        ws::select(
+            0,
+            std::ptr::null_mut(),
+            &mut writefds,
+            &mut exceptfds,
+            &timeout,
+        )
+    };
+    (ready, last_error_code())
 }
 
 #[cfg(windows)]
