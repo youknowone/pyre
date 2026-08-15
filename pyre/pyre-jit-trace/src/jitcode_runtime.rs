@@ -254,7 +254,25 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
             let fnaddr = crate::runtime_fnaddr_patch::runtime_fnaddr(build_fnaddr) as usize;
             // Identical-code folding can map several build-time addresses to
             // one runtime address; retain the first target for that address.
-            by_fnaddr.entry(fnaddr).or_insert(index);
+            //
+            // `pyjitpl.py:2335 bytecode_for_address` asserts the address is
+            // absent instead, because RPython's translation never folds two
+            // graphs onto one entry point. Keeping the first target is the
+            // only choice available here, but a wrong pick would otherwise be
+            // invisible, so name every dropped target once at startup.
+            match by_fnaddr.entry(fnaddr) {
+                indexmap::map::Entry::Vacant(slot) => {
+                    slot.insert(index);
+                }
+                indexmap::map::Entry::Occupied(kept) => majit_ir::debug::log_one(
+                    "jit-indirectcalltargets",
+                    &format!(
+                        "runtime fnaddr {fnaddr:#x} already resolves to target {}; \
+                         dropping target {index} (build fnaddr {build_fnaddr:#x})",
+                        kept.get()
+                    ),
+                ),
+            }
         }
         by_fnaddr
     });

@@ -4494,8 +4494,9 @@ mod tests {
             .iter()
             .filter(|o| {
                 o.opcode == OpCode::GetfieldGcR
-                    && o.getdescr()
-                        .is_some_and(|dd| OptHeap::field_cache_identity(&dd) == OptHeap::field_cache_identity(&d_ec))
+                    && o.getdescr().is_some_and(|dd| {
+                        OptHeap::field_cache_identity(&dd) == OptHeap::field_cache_identity(&d_ec)
+                    })
             })
             .count();
         assert_eq!(ec_reads, 1, "the second `ec` read must fold: {opcodes:?}");
@@ -4503,9 +4504,7 @@ mod tests {
 
     /// Drive two identical `getfield_gc_r`s at a receiver that already carries
     /// a given `PtrInfo`, and report whether the second folded.
-    fn second_getfield_folds_with_receiver_info(
-        seed: crate::optimizeopt::info::PtrInfo,
-    ) -> bool {
+    fn second_getfield_folds_with_receiver_info(seed: crate::optimizeopt::info::PtrInfo) -> bool {
         let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
         let mut heap = OptHeap::new();
         let mut ctx = OptContext::with_inputarg_types(4, &[Type::Ref]);
