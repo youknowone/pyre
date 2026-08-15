@@ -587,6 +587,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             )
             && let Some(fd) = descr.as_field_descr()
             && fd.get_parent_descr().is_none()
+            && !fd.is_w_class()
         {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 eprintln!(
