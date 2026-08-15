@@ -3020,7 +3020,17 @@ pub fn walk<Sym: WalkSym>(
                     && !carrier_owned
                     && !abort_blackhole_latched()
                 {
-                    let _ = latch_abort_blackhole(ctx, error.stop_pc(), "mod2730");
+                    // The image belongs to THIS WalkContext's MIFrame, so its
+                    // resume coordinate must be this frame's opcode boundary.
+                    // A canonical helper is transparent: an error raised at
+                    // helper pc N propagates through `step`, but N indexes the
+                    // helper JitCode and is not a coordinate in this Python
+                    // frame's JitCode.  RPython keeps those as distinct
+                    // MIFrames; pairing the helper pc with the enclosing frame
+                    // lands `setposition` inside an operand payload.  Resume
+                    // the enclosing frame at the opcode whose step propagated
+                    // the abort instead.
+                    let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730");
                 }
                 return Err(error);
             }
