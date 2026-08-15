@@ -427,7 +427,11 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // cannot report it.  Left out, an unwind to the handler read as a block
     // permutation and armed the reorder region over the whole handler body,
     // where `ShadowReseed` drops every operand box the shadow does not carry.
-    let cfg_successor = new_pypc as usize == prev_pypc
+    // One Python opcode's jitcode expansion can carry more than one boundary
+    // marker, so a boundary can report the py_pc it came from.  The walk has
+    // not left that opcode there, so the opcode has not retired.
+    let repeat_boundary = new_pypc as usize == prev_pypc;
+    let cfg_successor = repeat_boundary
         || (has_fallthrough && new_pypc as usize == fallthrough)
         || crate::liveness::target_pc(code, &instr, prev_pypc, op_arg) == Some(new_pypc as usize)
         || crate::liveness::exception_target_pc(code, prev_pypc) == Some(new_pypc as usize);
@@ -642,11 +646,25 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // A NONE in either slot is just permuted (the later hole-fill /
             // legacy-defer handles it); a malformed / out-of-range arg
             // declines (latch invalid).
+            //
+            // The exchange belongs to the boundary that RETIRES the opcode.  A
+            // repeat boundary has not left it, and SWAP is the one class whose
+            // replay is not idempotent: exchanging the same pair twice restores
+            // the pre-SWAP order, so the mirror ends up disagreeing with the
+            // `setarrayitem_vable_r` stores the walk executed for that SWAP,
+            // and the capture overlay then publishes the stale order into a
+            // branch guard's virtualizable resume section.  A repeat is invisible
+            // to `layout_only_boundary` here precisely because the net-zero
+            // depth matches the fallthrough successor.  The depth normalization
+            // still runs: it is what keeps mirror slot `s` naming operand-stack
+            // slot `s` at the observed depth.
             ctx.vstack_boxes.truncate(new_depth);
             if ctx.vstack_boxes.len() < new_depth {
                 ctx.vstack_boxes.resize(new_depth, OpRef::NONE);
             }
-            if new_depth >= 1 && i >= 1 && i <= new_depth {
+            if repeat_boundary {
+                // The retiring boundary performs the exchange.
+            } else if new_depth >= 1 && i >= 1 && i <= new_depth {
                 let top = new_depth - 1;
                 let other = new_depth - i;
                 ctx.vstack_boxes.swap(top, other);
