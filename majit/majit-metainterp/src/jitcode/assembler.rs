@@ -628,6 +628,7 @@ impl JitCodeBuilder {
         headerless: bool,
         fields: &[(usize, bool, &str, usize, bool)],
     ) {
+        crate::note_struct_layout_registration(fields.len());
         // Every emit site re-registers the layout it accesses, so the same few
         // type_ids arrive hundreds of times.  When the spec already lists an
         // offset for each incoming field the merge below pushes nothing, and
@@ -636,19 +637,20 @@ impl JitCodeBuilder {
         // `is_gc_managed` or `headerless`, so returning here is exactly
         // equivalent and skips building `new_fields` (one owned String per
         // field) only to discard it.
-        if self
-            .struct_size_specs
-            .get(&type_id)
-            .is_some_and(|existing| {
-                fields.iter().all(|&(offset, _, _, _, _)| {
-                    existing
-                        .all_fielddescrs
-                        .iter()
-                        .any(|ef| ef.offset == offset)
-                })
-            })
-        {
-            return;
+        //
+        // The same walk answers whether the offset that made a field redundant
+        // was really *this* field's, so `Self::record_layout_conflicts` runs
+        // off it rather than repeating it.
+        if let Some(existing) = self.struct_size_specs.get(&type_id) {
+            let mut every_offset_known = true;
+            for &field in fields {
+                if !Self::record_layout_conflicts(existing, type_id, field) {
+                    every_offset_known = false;
+                }
+            }
+            if every_offset_known {
+                return;
+            }
         }
         let new_fields = Self::field_specs_from_layout(fields);
         // Merge into existing spec if present — each getfield/setfield
@@ -687,6 +689,88 @@ impl JitCodeBuilder {
                 },
             );
         }
+    }
+
+    /// Whether `existing` already lists `field`'s offset, recording what the
+    /// offset-keyed dedup would discard if it does so for the wrong reason.
+    ///
+    /// The dedup key is the byte offset, but an offset does not identify a
+    /// field: a flattened inline aggregate and its first leaf sit at one
+    /// address, and the corpus really contains such pairs. So a hit at a known
+    /// offset splits three ways.
+    ///
+    /// * The same name, described the same way — the redundant re-registration
+    ///   every emit site performs, and what the dedup exists for.
+    /// * The same name, described differently — one site calls the word a GC
+    ///   pointer and another a scalar, so emit order decides what the collector
+    ///   traces.
+    /// * A different name — a real sibling, which the merge then drops. The
+    ///   spec is left short an entry that `add_struct_field_descr` resolves
+    ///   `index_in_parent` and `name` against.
+    ///
+    /// Only the first is silent. The other two are recorded and the caller
+    /// still merges as before: this reports the disagreement, it does not
+    /// arbitrate it.
+    fn record_layout_conflicts(
+        existing: &BhSizeSpec,
+        type_id: u64,
+        (offset, is_ref, name, decl_size, decl_signed): (usize, bool, &str, usize, bool),
+    ) -> bool {
+        let mut at_offset = existing
+            .all_fielddescrs
+            .iter()
+            .filter(|ef| ef.offset == offset)
+            .peekable();
+        if at_offset.peek().is_none() {
+            return false;
+        }
+        crate::note_struct_layout_comparison();
+        // Both sides are compared in the form the spec RETAINS, not the form
+        // the caller submitted: `field_specs_from_layout` discards a ref
+        // field's declared width and sign for the pointer word's own, so a
+        // recorded ref never remembers what it was handed. Normalising the
+        // incoming field the same way is what keeps two agreeing ref
+        // registrations from reading as a disagreement.
+        let incoming = crate::StructLayoutField {
+            name: name.to_string(),
+            is_ref,
+            size: if is_ref {
+                scalar_size(majit_ir::value::Type::Ref)
+            } else {
+                decl_size
+            },
+            signed: !is_ref && decl_signed,
+        };
+        let describe = |ef: &BhFieldSpec| crate::StructLayoutField {
+            name: ef.name.clone(),
+            is_ref: matches!(ef.field_type, majit_ir::value::Type::Ref),
+            size: ef.field_size,
+            signed: ef.is_field_signed,
+        };
+        let mut same_name = at_offset.clone().filter(|ef| ef.name == name).peekable();
+        let (kept, kind) = match same_name.peek() {
+            Some(&ef) => (describe(ef), crate::StructLayoutConflictKind::Redescribed),
+            // Every field at this offset is named something else, so this one is
+            // a sibling the merge has no slot for. Report it against the entry
+            // the dedup will keep: the lowest-ranked one there.
+            None => {
+                let ef = at_offset.next().expect("peeked Some above");
+                (
+                    describe(ef),
+                    crate::StructLayoutConflictKind::DroppedSibling,
+                )
+            }
+        };
+        if kept != incoming {
+            crate::record_struct_layout_conflict(crate::StructLayoutConflict {
+                type_id,
+                offset,
+                kind,
+                kept,
+                dropped: incoming,
+            });
+        }
+        true
     }
 
     /// Build `Vec<BhFieldSpec>` from a `(offset, is_ref, name)` layout,

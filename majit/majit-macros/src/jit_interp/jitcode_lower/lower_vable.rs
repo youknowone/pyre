@@ -64,9 +64,16 @@ pub(super) fn field_scalar_tokens(
 /// Empty for a key `ref_fields` does not declare, and that is a decision, not
 /// an omission: an undeclared field reads into the Int bank, and stable Rust
 /// has no way to assert that a type is *not* a pointer.  Catching that half
-/// needs a different mechanism — a same-offset `is_ref` disagreement reaching
-/// `Assembler::register_struct_layout`, which today merges by offset alone and
-/// keeps whichever registration arrived first.
+/// takes a mechanism that works by disagreement instead of by declaration —
+/// `Assembler::register_struct_layout`'s conflict check, which reports one word
+/// registered as a pointer at one emit site and as a scalar at another.
+///
+/// It is not a general second line for this one, and the reason is worth
+/// stating: each jitcode gets its OWN layout map, so two *declarations* never
+/// meet there.  What meets is two emit sites within one jitcode — the same
+/// member reached by two lowering paths.  A machine whose sole access to an
+/// undeclared pointer field goes through one path stays undetected by both
+/// mechanisms.
 fn ref_field_witness_tokens(
     ref_fields: &HashMap<String, (syn::Path, Ident, syn::Path)>,
     key: &str,

@@ -614,6 +614,160 @@ pub fn assert_no_degraded_dispatch_arms(interp: &str) {
     );
 }
 
+/// One field of a struct layout, as an emit site described it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StructLayoutField {
+    /// The field's declared name — its identity. Empty at the mint sites that
+    /// carry none, where the byte offset is all there is to key on.
+    pub name: String,
+    /// Whether the word holds a GC pointer. Decides `ArrayFlag::Pointer` vs a
+    /// signed/unsigned integer flag, and with it whether the collector traces
+    /// through the word.
+    pub is_ref: bool,
+    /// The field's width in bytes. A ref is a pointer word by construction.
+    pub size: usize,
+    /// Signedness, for an integer field.
+    pub signed: bool,
+}
+
+/// Why a struct-layout registration could not be honoured as submitted.
+///
+/// `JitCodeBuilder::register_struct_layout` accumulates a struct's layout
+/// across the emit sites that touch it, and dedups on the byte offset alone.
+/// An offset does not identify a field, so a second registration at a known
+/// offset is one of three things and only the first is benign: the same field
+/// again (the common case — every emit site re-registers what it accesses), a
+/// different field that happens to sit there, or the same field described
+/// differently. The latter two are these variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StructLayoutConflictKind {
+    /// A field arrived at an offset the spec already lists under a *different*
+    /// name, so the offset-keyed dedup discarded it. A flattened inline
+    /// aggregate and its first leaf share an address, which is how two real
+    /// fields legitimately collide.
+    ///
+    /// The spec is then short an entry: `add_struct_field_descr` resolves
+    /// `index_in_parent` and `name` against it, so an access to the dropped
+    /// field either resolves to its sibling's slot or fails to resolve at all.
+    DroppedSibling,
+    /// The *same* named field arrived described differently — most consequentially
+    /// as a GC pointer at one site and as a scalar at another. Whichever
+    /// registration arrived first decides what the collector believes about the
+    /// word, so the outcome depends on emit order.
+    Redescribed,
+}
+
+/// A struct-layout registration that disagreed with what was already recorded.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StructLayoutConflict {
+    /// The struct's `path_hash` type id, the key of the layout cache.
+    pub type_id: u64,
+    /// The byte offset both registrations name.
+    pub offset: usize,
+    pub kind: StructLayoutConflictKind,
+    /// What the spec holds — the registration that arrived first.
+    pub kept: StructLayoutField,
+    /// What arrived second and was discarded.
+    pub dropped: StructLayoutField,
+}
+
+static STRUCT_LAYOUT_CONFLICTS: std::sync::Mutex<Vec<StructLayoutConflict>> =
+    std::sync::Mutex::new(Vec::new());
+
+static STRUCT_LAYOUT_REGISTRATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static STRUCT_LAYOUT_COMPARISONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that a layout registration disagreed with the recorded spec.
+///
+/// Deduplicated by content: a jitcode may be built many times per process and
+/// the fact reported is per-disagreement, not per-build.
+pub fn record_struct_layout_conflict(conflict: StructLayoutConflict) {
+    let mut conflicts = STRUCT_LAYOUT_CONFLICTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if conflicts.contains(&conflict) {
+        return;
+    }
+    if majit_log_enabled() {
+        eprintln!("[jit] struct layout conflict: {conflict:?}");
+    }
+    conflicts.push(conflict);
+}
+
+/// Count `fields` submitted field descriptions.
+pub fn note_struct_layout_registration(fields: usize) {
+    STRUCT_LAYOUT_REGISTRATIONS.fetch_add(fields, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one field that met an entry already recorded at its offset — i.e. one
+/// field the conflict check actually had something to compare against.
+///
+/// The first one announces itself under `MAJIT_LOG`. A run that reports no
+/// conflicts has said nothing until something says the check ran at all, and
+/// the only other way to learn that from outside the process is to read
+/// [`struct_layout_comparisons`], which a binary does not expose.
+pub fn note_struct_layout_comparison() {
+    let previous = STRUCT_LAYOUT_COMPARISONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if previous == 0 && majit_log_enabled() {
+        eprintln!("[jit] struct layout conflict check is live");
+    }
+}
+
+/// Snapshot of every layout disagreement recorded so far.
+pub fn struct_layout_conflicts() -> Vec<StructLayoutConflict> {
+    STRUCT_LAYOUT_CONFLICTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Field descriptions submitted to `register_struct_layout` so far.
+pub fn struct_layout_registrations() -> usize {
+    STRUCT_LAYOUT_REGISTRATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Submitted fields that arrived at an offset already recorded for their
+/// struct — the denominator for [`struct_layout_conflicts`].
+///
+/// [`struct_layout_registrations`] is the wrong one. A field at an offset
+/// nobody has registered yet is simply appended: there is nothing to disagree
+/// with, so it does not exercise the check. A corpus could submit thousands of
+/// those, report zero conflicts, and never have compared anything. This counts
+/// the fields that were actually compared.
+pub fn struct_layout_comparisons() -> usize {
+    STRUCT_LAYOUT_COMPARISONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Panic unless some layout was re-registered AND none of the re-registrations
+/// disagreed.
+///
+/// Call it after whatever builds the jitcodes. Layouts are registered as the
+/// bytecode is emitted, so building the portal is enough — running the machine
+/// is not required.
+pub fn assert_no_struct_layout_conflicts() {
+    let comparisons = struct_layout_comparisons();
+    assert!(
+        comparisons > 0,
+        "no field was ever submitted at an offset already recorded for its \
+         struct, so the conflict check never compared anything and its empty \
+         result says nothing. {} field descriptions were registered in total. \
+         Build the jitcodes (or run the machine) first.",
+        struct_layout_registrations(),
+    );
+    let conflicts = struct_layout_conflicts();
+    assert!(
+        conflicts.is_empty(),
+        "{} of {comparisons} re-registered field descriptions disagreed with \
+         the layout already recorded for their struct. The first registration \
+         wins, so what the optimizer and the collector believe about these \
+         words depends on emit order: {conflicts:#?}",
+        conflicts.len(),
+    );
+}
+
 /// The shape of a compiled loop body, as a tier gate needs to read it.
 ///
 /// A compile counter says a trace was *compiled*; an op count says the body is
