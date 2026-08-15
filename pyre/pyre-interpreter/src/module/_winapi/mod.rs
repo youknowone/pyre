@@ -413,6 +413,11 @@ crate::py_module! {
         // arguments at import time, and reach them once a launch has a
         // process to wait on.
         fn WaitForSingleObject(handle: i64, milliseconds: i64) -> i64 {
+            // `rpython/rlib/rwin32.py` declares this through `winexternal`,
+            // whose default `releasegil='auto'` runs the native call between
+            // the rffi around-handlers.  In particular, an infinite wait must
+            // let the Python thread which will signal the handle run.
+            let _blocked = crate::module::thread::before_external_block();
             unsafe {
                 windows_sys::Win32::System::Threading::WaitForSingleObject(
                     handle as *mut _,
