@@ -1294,13 +1294,21 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
     pub carrier_resume: bool,
-    /// Bridge-entry view of `ExecutionContext.sys_exc_value` reconstructed
-    /// from the failing guard's pending setfield.  The walk is temporally
-    /// displaced from the guard failure, so live TLS is not a valid source
-    /// until a walked SETFIELD replaces this seed.
+    /// The exception a bridge resumes with, and after a walked
+    /// `set_current_exception` the value that store published.  Read by the
+    /// nullary bare-reraise folds, and by the PUSH_EXC_INFO `prev` save only
+    /// under [`FbwWalkMode::current_exception_seed_from_walk_store`].
     pub current_exception_seed: Option<OpRef>,
     /// Concrete shadow paired with [`FbwWalkMode::current_exception_seed`].
     pub current_exception_seed_concrete: pyre_object::PyObjectRef,
+    /// Whether [`FbwWalkMode::current_exception_seed`] names a value this walk
+    /// stored into `ExecutionContext.sys_exc_value`, as opposed to the
+    /// exception the bridge is resuming with.  Only the former answers "what
+    /// does that field hold": the bridge's in-flight exception is the one a
+    /// handler's `PUSH_EXC_INFO` is about to publish, so saving it as that
+    /// opcode's `prev` makes the matching `POP_EXCEPT` reinstate the exception
+    /// the handler just finished with.
+    pub current_exception_seed_from_walk_store: bool,
     /// Walker-carried mirror of
     /// `MetaInterp.class_of_last_exc_is_const` (`pyjitpl.py`).
     /// This is shared logically across recursive MIFrame walks; catch routing
@@ -1361,6 +1369,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,
+            current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
         }
