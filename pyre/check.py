@@ -2287,14 +2287,24 @@ class Check:
         # ratio compares a pinned run against an unpinned one. It was also the
         # one pyre spawn left outside `pyre_env()`, which is how a bytecode
         # cache still appeared under a run that pins PYTHONDONTWRITEBYTECODE.
-        baseline_env = pyre_env() if baseline_key in ALL_BACKENDS else None
+        baseline_is_pyre = baseline_key in ALL_BACKENDS
+        baseline_env = pyre_env() if baseline_is_pyre else None
         pyre_times = []
         baseline_times = []
         for _ in range(attempts):
-            _, baseline_time, baseline_code, _ = run_timed(
+            baseline_output, baseline_time, baseline_code, baseline_stderr = run_timed(
                 baseline_cmd, timeout_s=effective_timeout, env=baseline_env,
             )
             if baseline_code != 0:
+                return None
+            # A pyre baseline is under test itself, so it answers to the same
+            # bar as the numerator: a median built on a denominator that
+            # printed the wrong answer or panicked out of the JIT would let the
+            # failing gate pass on a time no correct run produced.
+            if baseline_is_pyre and (
+                baseline_output != expected_output
+                or _jit_panic_reason(baseline_stderr)
+            ):
                 return None
             output, elapsed, code, stderr = run_timed(
                 [self._pyre(backend), script], timeout_s=effective_timeout,
