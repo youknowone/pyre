@@ -7981,7 +7981,11 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, o1);
                 self.emit_str_fp(16, o2);
             }
-            _ => {}
+            _ => panic!(
+                "parallel move {src:?} -> {dst:?} is outside the RegallocMoves \
+                 operand contract; emitting nothing here would leave the \
+                 destination stale",
+            ),
         }
     }
 
@@ -8001,7 +8005,10 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                 self.emit_ldr_fp(16, f.ebp_loc.value);
                 dynasm!(self.mc ; .arch aarch64 ; str x16, [sp, #-16]!);
             }
-            _ => {}
+            _ => panic!(
+                "parallel move cannot park {loc:?} on the stack; emitting nothing \
+                 here would leave the matching pop unbalanced",
+            ),
         }
     }
 
@@ -8021,7 +8028,10 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                 dynasm!(self.mc ; .arch aarch64 ; ldr x16, [sp], #16);
                 self.emit_str_fp(16, f.ebp_loc.value);
             }
-            _ => {}
+            _ => panic!(
+                "parallel move cannot restore {loc:?} from the stack; emitting \
+                 nothing here would leave the stack pointer shifted",
+            ),
         }
     }
 }

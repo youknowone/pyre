@@ -25,9 +25,17 @@ use indexmap::IndexMap;
 /// The three emitters `remap_frame_layout` drives, named as `jump.py` calls
 /// them on the `assembler` it is handed.
 ///
+/// **Operand contract.** A destination is a register or a frame slot; a source
+/// is one of those or an immediate. Nothing else is a location this algorithm
+/// can schedule, and an implementation must fault on anything else rather than
+/// emit nothing: a move that is counted in `pending_dests` and then silently
+/// dropped leaves the destination holding a stale value, and a dropped
+/// `regalloc_pop` leaves the machine stack pointer shifted as well.
+///
 /// `regalloc_push`/`regalloc_pop` exist only to serve the cycle-breaking arm
 /// below — parking one value of a cycle on the machine stack is the whole
-/// reason a cycle can be resolved at all.
+/// reason a cycle can be resolved at all. They are only ever handed a
+/// destination, so an immediate never reaches them.
 pub(crate) trait RegallocMoves {
     /// `assembler.py:1145 regalloc_mov(from_loc, to_loc)`.
     fn regalloc_mov(&mut self, src: &Loc, dst: &Loc);
@@ -37,18 +45,65 @@ pub(crate) trait RegallocMoves {
 
 /// A location's identity for the dependency bookkeeping.
 ///
-/// Registers and frame slots share one number space, so the constants keep the
-/// classes apart; an immediate has no identity because it is never anyone's
-/// destination and can be re-materialised at will.
+/// Two locations must get the same key exactly when they are the same storage.
+/// Handing two distinct destinations one key collapses them to a single
+/// `IndexMap` entry, and the move for whichever one loses is never emitted.
+///
+/// Registers and stack slots are told apart **by sign**: a register key is
+/// positive, a stack key is `!offset` and so negative. Upstream instead keys a
+/// register on its bare number and a frame slot on its byte offset, and argues
+/// the two cannot meet because offsets start above the register file —
+/// `regloc.py:117-120` says so in as many words and asserts `ebp_offset >= 8 +
+/// 8 * IS_X86_64` rather than trusting it. That argument does not survive the
+/// per-class bias below: an offset of 4096 is an ordinary frame for a large
+/// trace and is exactly the general-register base.
+///
+/// The bias is still worth keeping. Upstream gives `r0` and `xmm0` the same key
+/// — harmless there because the two files are remapped in separate calls, but
+/// `remap_frame_layout_mixed` compares one call's destination keys against the
+/// other's sources, which is precisely across the two files.
 pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
+    /// Keeps the two register files apart; both stay positive.
+    const XMM_KEY_BASE: i32 = 0x2000;
+    const GPR_KEY_BASE: i32 = 0x1000;
+
     match loc {
-        Loc::Reg(r) if r.is_xmm => 0x2000 + i32::from(r.value),
-        Loc::Reg(r) => 0x1000 + i32::from(r.value),
-        Loc::Frame(f) => f.ebp_loc.value,
-        Loc::Ebp(e) => e.value,
+        Loc::Reg(r) if r.is_xmm => XMM_KEY_BASE + i32::from(r.value),
+        Loc::Reg(r) => GPR_KEY_BASE + i32::from(r.value),
+        // `!offset` for a non-negative offset is negative, so no stack slot can
+        // ever land on a register key however deep the frame gets.
+        Loc::Frame(f) => stack_key(f.ebp_loc.value),
+        Loc::Ebp(e) => stack_key(e.value),
+        // Never a destination and re-materialisable at will, so it needs no
+        // identity — only a value no real location can take.
         Loc::Immed(_) => i32::MIN,
-        Loc::Addr(a) => a.offset,
+        // Not in the operand contract above. Minting a key for it would put an
+        // entry in `pending_dests` that no emitter can retire.
+        Loc::Addr(a) => panic!(
+            "parallel move over an address location (offset {}), which no \
+             regalloc_mov can emit",
+            a.offset,
+        ),
     }
+}
+
+/// The key for a stack slot at `offset` bytes from the frame pointer.
+fn stack_key(offset: i32) -> i32 {
+    debug_assert!(
+        offset >= 0,
+        "a negative frame offset ({offset}) inverts back into the positive \
+         register key space",
+    );
+    !offset
+}
+
+/// The key of the slot one machine word past `key`.
+///
+/// Stack keys run backwards against offsets — `!(offset + WORD)` is
+/// `!offset - WORD` — so the neighbour is found by subtracting, and writing
+/// `key + WORD` here would silently read the slot on the wrong side.
+fn stack_key_next_word(key: i32) -> i32 {
+    key - WORD as i32
 }
 
 pub(crate) fn loc_width(loc: &Loc) -> usize {
@@ -178,7 +233,7 @@ pub(crate) fn remap_frame_layout_mixed<A: RegallocMoves + ?Sized>(
         if loc.is_stack() {
             let key = loc_as_key(&loc);
             if dst_keys.contains_key(&key)
-                || (loc_width(&loc) > WORD && dst_keys.contains_key(&(key + WORD as i32)))
+                || (loc_width(&loc) > WORD && dst_keys.contains_key(&stack_key_next_word(key)))
             {
                 asm.regalloc_push(&loc);
                 extrapushes.push(dstloc);

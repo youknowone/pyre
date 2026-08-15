@@ -8872,7 +8872,11 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     ; mov [rbp + o2], Rq(scratch)
                 );
             }
-            _ => {}
+            _ => panic!(
+                "parallel move {src:?} -> {dst:?} is outside the RegallocMoves \
+                 operand contract; emitting nothing here would leave the \
+                 destination stale",
+            ),
         }
     }
 
@@ -8890,7 +8894,10 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Frame(f) => {
                 dynasm!(self.mc ; .arch x64 ; push QWORD [rbp + f.ebp_loc.value]);
             }
-            _ => {}
+            _ => panic!(
+                "parallel move cannot park {loc:?} on the stack; emitting nothing \
+                 here would leave the matching pop unbalanced",
+            ),
         }
     }
 
@@ -8908,7 +8915,10 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Frame(f) => {
                 dynasm!(self.mc ; .arch x64 ; pop QWORD [rbp + f.ebp_loc.value]);
             }
-            _ => {}
+            _ => panic!(
+                "parallel move cannot restore {loc:?} from the stack; emitting \
+                 nothing here would leave the stack pointer shifted",
+            ),
         }
     }
 }
