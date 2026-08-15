@@ -15158,19 +15158,21 @@ while i < 40:
         );
 
         // (5) ll_issubclass direct PyType reads match GC callback.
-        assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
-        assert!(pyre_object::pyobject::ll_issubclass(
-            &INT_TYPE,
-            &INSTANCE_TYPE
-        ));
-        assert!(!pyre_object::pyobject::ll_issubclass(
-            &INT_TYPE,
-            &FLOAT_TYPE
-        ));
-        assert!(!pyre_object::pyobject::ll_issubclass(
-            &FLOAT_TYPE,
-            &INT_TYPE
-        ));
+        unsafe {
+            assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &INT_TYPE,
+                &INSTANCE_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &INT_TYPE,
+                &FLOAT_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &FLOAT_TYPE,
+                &INT_TYPE
+            ));
+        }
     }
 
     #[test]

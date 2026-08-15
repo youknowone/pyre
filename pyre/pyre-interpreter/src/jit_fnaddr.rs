@@ -1843,6 +1843,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
     );
+    // `elidable_cannot_raise` subclass-range check; the trampoline widens its
+    // one-word bool return by zero-extension.
+    let ll_issubclass: extern "C" fn(i64, i64) -> i64 =
+        pyre_object::pyobject::__majit_call_target_ll_issubclass;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::pyobject::ll_issubclass",
+        "pyre_object::ll_issubclass",
+        ll_issubclass as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",

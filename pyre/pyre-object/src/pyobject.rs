@@ -288,8 +288,17 @@ pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
 ///
 /// O(1) subclass check via preorder numbering:
 ///   `int_between(cls.subclassrange_min, subcls.subclassrange_min, cls.subclassrange_max)`
+/// The subclass ranges are stamped once during startup and never change afterwards,
+/// as declared by `PyType`'s `jit_immutable_fields`, so the result depends only on
+/// the arguments and the call cannot raise.
+///
+/// # Safety
+/// Both pointers must be non-null pointers to static `PyType`s.
+#[majit_macros::elidable_cannot_raise]
 #[inline]
-pub fn ll_issubclass(subcls: &PyType, cls: &PyType) -> bool {
+pub unsafe fn ll_issubclass(subcls: *const PyType, cls: *const PyType) -> bool {
+    let subcls = unsafe { &*subcls };
+    let cls = unsafe { &*cls };
     // Seqlock read: a concurrent one-time batch re-stamp must not be observed
     // half-applied, or `cls`/`subcls` could temporarily carry ranges from
     // different completed batches.
@@ -336,13 +345,13 @@ pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
     // `int` vtable, checked against `cls`'s subclass range without the
     // `ob_type` deref. Gated on `CAN_BE_TAGGED` (default false).
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
-        return ll_issubclass(&INT_TYPE, cls);
+        return unsafe { ll_issubclass(&INT_TYPE, cls) };
     }
     if obj.is_null() {
         return false;
     }
     let obj_cls = unsafe { &*(*obj).ob_type };
-    ll_issubclass(obj_cls, cls)
+    unsafe { ll_issubclass(obj_cls, cls) }
 }
 
 /// rclass.py:1173-1178 `ll_inst_type(obj)`.
