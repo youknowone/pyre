@@ -12893,7 +12893,14 @@ pub fn unpackiterable(
     w_iterable: PyObjectRef,
     expected_length: isize,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-    let w_iterator = iter(w_iterable)?;
+    // `iter()` dispatches `__iter__`, which runs Python, and `w_iterable` is
+    // read again afterwards for the drain's length hint.  Publish it across
+    // that call so the hint reads the live object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iterable);
+    let w_iterator = iter(pyre_object::gc_roots::shadow_stack_get(iterable_slot))?;
+    let w_iterable = || pyre_object::gc_roots::shadow_stack_get(iterable_slot);
     if expected_length == -1 {
         // baseobjspace.py:989-993 — generator fast path.  PyPy comments
         // (`generator.py:322 "This is a hack for performance"`) flag this
@@ -12911,7 +12918,7 @@ pub fn unpackiterable(
         // The drain returns the grown `W_List` ref (`Type::Ref`, RPython's
         // `return items`); read it back into the `Vec<PyObjectRef>` the Rust
         // signature promises here, outside the traced/blackholed drain body.
-        let w_list = _unpackiterable_unknown_length(w_iterator, w_iterable)?;
+        let w_list = _unpackiterable_unknown_length(w_iterator, w_iterable())?;
         // `warmspot.py:998-1005` re-raises `ExitFrameWithExceptionRef` out of
         // `ll_portal_runner`.  jd1 is entered from a merge-point hook that
         // returns unit, so a recording walk that ran the raising `next()` for
@@ -13015,32 +13022,44 @@ fn generator_unpack_driver_jit_merge_point(_pycode: PyObjectRef) {}
 /// null frame_ptr.  `_invoke_execute_frame(space.w_None)` corresponds to
 /// the frame's own `execute_frame(None, None)` resume — same routing as
 /// `generator_send_ex` for the `already_started=true, w_arg=None` path.
+///
+/// `results` is RPython's traced list; the `Vec` standing in for it here is
+/// native storage no root walker updates, and each resume runs the generator
+/// body, so an item already collected is unreachable across the next `yield`.
+/// Publish the generator and every produced item on the shadow stack and
+/// rebuild `results` from it once the drain ends.
 fn generator_unpack_into(
     gen_obj: PyObjectRef,
     results: &mut Vec<PyObjectRef>,
 ) -> Result<(), crate::PyError> {
     use pyre_object::generator::*;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(gen_obj);
+    let gen_obj = || pyre_object::gc_roots::shadow_stack_get(gen_slot);
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
-        if w_generator_is_running(gen_obj) {
+        if w_generator_is_running(gen_obj()) {
             // generator.py:112 `"%s already executing" % self.KIND`.
             return Err(PyError::value_error(format!(
                 "{} already executing",
-                generator_kind(gen_obj)
+                generator_kind(gen_obj())
             )));
         }
-        if w_generator_is_exhausted(gen_obj) {
+        if w_generator_is_exhausted(gen_obj()) {
             return Ok(());
         }
-        let frame_ptr = w_generator_get_frame(gen_obj) as *mut crate::pyframe::PyFrame;
+        let frame_ptr = w_generator_get_frame(gen_obj()) as *mut crate::pyframe::PyFrame;
         if frame_ptr.is_null() {
-            w_generator_set_exhausted(gen_obj);
+            w_generator_set_exhausted(gen_obj());
             return Ok(());
         }
         let frame = &mut *frame_ptr;
         // generator.py:328 `pycode = self.pycode` — pyre stashes pycode on
         // the suspended frame; expose it as the JitDriver greenkey.
         let pycode = frame.pycode as PyObjectRef;
+        let results_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut produced = 0usize;
         loop {
             // generator.py:330 `jitdriver.jit_merge_point(pycode=pycode)`.
             generator_unpack_driver_jit_merge_point(pycode);
@@ -13060,9 +13079,9 @@ fn generator_unpack_into(
             // push entirely, so `yield`-expressions that bind the
             // resume value (e.g. `x = yield`) would observe stale
             // stack on the second iteration.
-            w_generator_set_started(gen_obj);
+            w_generator_set_started(gen_obj());
             let result = generator_invoke_execute_frame(
-                gen_obj,
+                gen_obj(),
                 frame,
                 Some(pyre_object::w_none()),
                 None,
@@ -13076,14 +13095,18 @@ fn generator_unpack_into(
                     // generator.py:339-341 — frame finished ⇒ RETURNed,
                     // mark exhausted and stop without appending.
                     if frame.frame_finished_execution() {
-                        generator_frame_is_finished(gen_obj, frame);
+                        generator_frame_is_finished(gen_obj(), frame);
                         break;
                     }
                     // generator.py:342 `results.append(w_result)`.
-                    results.push(w_result);
+                    pyre_object::gc_roots::pin_root(w_result);
+                    produced += 1;
                 }
             }
         }
+        results.extend(
+            (0..produced).map(|i| pyre_object::gc_roots::shadow_stack_get(results_base + i)),
+        );
         Ok(())
     }
 }
@@ -13109,24 +13132,65 @@ fn generator_unpack_into(
 ///         items.append(w_item)
 ///     return items
 /// ```
+/// Append `w_item` to the drained `W_List` published at shadow-stack slot
+/// `slot`, reading the list back inside the call.
+///
+/// The read has to happen here rather than in the drain's `Ok` arm.
+/// `try_fuse_drain_match` (`majit-translate front/result_exc.rs`) recognises
+/// that arm only when the `Result` payload read is the carrier's sole use and
+/// feeds the arm's single call directly; a shadow-stack read spelled in the arm
+/// ends the block around that read and forwards the carrier on a link instead.
+/// The fusion declines silently, leaving the `StopIteration` constructor and
+/// the `PyErrorKind::eq` in the drain — residuals with no host funcptr for the
+/// jd1 walk to invoke.
+///
+/// # Safety
+/// `slot` must be a live shadow-stack index holding a `W_List`.
+unsafe fn drain_append_at(slot: usize, w_item: PyObjectRef) {
+    unsafe {
+        pyre_object::listobject::drain_list_append(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            w_item,
+        )
+    }
+}
+
 fn _unpackiterable_unknown_length(
     w_iterator: PyObjectRef,
     w_iterable: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `next()` runs the iterator's `__next__`, so both RPython livevars of the
+    // loop move under it.  Reload them from the shadow stack on every turn
+    // rather than reusing the addresses they had before the first resume.
+    // `w_iterator` is published ahead of the hint because that call reaches
+    // `__len__` / `__length_hint__`, which run Python too.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_iterator);
+    let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
     // baseobjspace.py:1005-1008 — `try: items = newlist_hint(length_hint(...))
     // except MemoryError: items = []`.
     let _ = length_hint(w_iterable, 0)?;
-    let items = pyre_object::listobject::w_list_new_empty();
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(items);
+    pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new_empty());
+    // The slot index is computed once here, not at the append below.  Spelled
+    // `root_base + 1` inside the drain's `Ok` arm, the addition lands in the
+    // arm's own block ahead of the call, and the link out of that block then
+    // carries the `Result` alongside the element — the exact shape
+    // `try_fuse_drain_match` (`majit-translate front/result_exc.rs`) declines.
+    // Its decline is silent and leaves the `StopIteration` constructor and the
+    // `PyErrorKind::eq` in the drain, residuals with no host funcptr for the
+    // jd1 walk to invoke.  `test_result_exc_lowering.rs
+    // unpackiterable_drain_match_fuses_to_kind_test` is the guard.
+    let items_slot = root_base + 1;
+    let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     // baseobjspace.py:1010 `greenkey = self.iterator_greenkey(w_iterator)`.
-    let greenkey = iterator_greenkey(w_iterator);
+    let greenkey = iterator_greenkey(w_iterator());
     loop {
         // baseobjspace.py:1012
         // `unpackiterable_driver.jit_merge_point(greenkey=greenkey)`.
-        unpackiterable_driver.jit_merge_point(greenkey, w_iterator, items);
-        match next(w_iterator) {
-            Ok(w_item) => unsafe { pyre_object::listobject::drain_list_append(items, w_item) },
+        unpackiterable_driver.jit_merge_point(greenkey, w_iterator(), items());
+        match next(w_iterator()) {
+            Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
             // `except OperationError as e: if not e.match(space,
             // w_StopIteration): raise; break` — the StopIteration test rides
             // inside the handler (`e` is bound once, consumed only on the
@@ -13146,7 +13210,7 @@ fn _unpackiterable_unknown_length(
     // the blackhole epilogue is a plain `ref_return` rather than a
     // multi-word (`Vec`, sret-ABI) residual the single-register residual-call
     // handlers cannot invoke.
-    Ok(items)
+    Ok(items())
 }
 
 /// Copy the drained `W_List` back into a `Vec<PyObjectRef>` for the Rust
