@@ -285,7 +285,15 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     let fuel_limit: Option<u64> = std::env::var("PYRE_WASM_FUEL")
         .ok()
         .and_then(|s| s.parse().ok());
-    if fuel_limit.is_some() {
+    // Fuel doubles as an exact executed-instruction counter, reported as
+    // `wasm_ops` in the stats line below. It is the one wasm measurement that
+    // does not move with machine load, which makes it the right thing to
+    // compare a codegen change against. Metering costs time on every
+    // instruction, so it stays confined to the two diagnostic modes that ask
+    // for it — a timed run sets neither and pays nothing.
+    let jit_stats = std::env::var_os("PYRE_WASM_JIT_STATS").is_some();
+    let meter_fuel = fuel_limit.is_some() || jit_stats;
+    if meter_fuel {
         config.consume_fuel(true);
     }
     // Diagnostic: PYRE_WASM_GUEST_PROFILE=<out.json> writes a sampling profile
@@ -348,7 +356,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         });
     }
     store.data_mut().stdlib_root = std::env::var("PYRE_STDLIB").ok();
-    if let Some(n) = fuel_limit {
+    // Counting-only runs get the whole budget: `wasm_ops` is a subtraction, and
+    // a run that exhausts its fuel reports the limit rather than its own cost.
+    let fuel_start = meter_fuel.then(|| fuel_limit.unwrap_or(u64::MAX));
+    if let Some(n) = fuel_start {
         store.set_fuel(n)?;
     }
 
@@ -545,19 +556,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
     // export calls below would themselves immediately trap and read as 0.
     // Refill so the readout reflects the real (compile-time) counter values.
-    // Read the remaining budget first: `limit - remaining` is the executed
+    // Read the remaining budget first: `start - remaining` is the executed
     // instruction count, which makes "how much does one loop iteration cost"
     // answerable by differencing two runs at different trip counts. A run that
     // exhausted its budget reports `used == limit` and says nothing, so size the
     // limit above what the script needs.
-    if let Some(limit) = fuel_limit {
+    let wasm_ops = fuel_start.map(|start| {
         let remaining = store.get_fuel().unwrap_or(0);
-        eprintln!(
-            "[fuel] used={} remaining={remaining}",
-            limit.saturating_sub(remaining)
-        );
+        let used = start.saturating_sub(remaining);
+        if let Some(limit) = fuel_limit {
+            eprintln!("[fuel] used={used} remaining={remaining} limit={limit}");
+        }
         let _ = store.set_fuel(u64::MAX);
-    }
+        used
+    });
     if let Some(path) = &guest_profile_out
         && let Some(p) = store.data_mut().guest_profiler.take()
     {
@@ -874,13 +886,14 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let host = store.data();
         eprintln!(
             "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} jit_call_ms={:.1} \
-             linear_mem={} gc_oldgen={} gc_nursery={} \
+             wasm_ops={} linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
             host.jit_compile_time_ns as f64 / 1.0e6,
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
             host.jit_call_time_ns as f64 / 1.0e6,
+            wasm_ops.map_or(-1, |n| n as i64),
             lin_mem,
             gc_oldgen,
             gc_nursery,
