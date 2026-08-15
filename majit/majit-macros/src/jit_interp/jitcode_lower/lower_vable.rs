@@ -6,8 +6,10 @@ use super::*;
 /// struct.  `descr.py:218-239 get_field_descr` derives both from `FIELDTYPE`,
 /// but the macro sees only the field's name at the access site, so a sub-word
 /// integer field has to be named in `int_fields` to be registered as one.
-/// Anything undeclared keeps the machine-word default — and has to be eight
-/// bytes wide to keep it, which the returned witness enforces.
+/// Anything undeclared is registered as an `i64` — and has to be that wide to
+/// stay so, which the returned witness enforces. `i64`, not `usize`: the two
+/// part company on a 32-bit target such as wasm32, and it is the eight-byte
+/// word that is claimed here.
 pub(super) fn field_scalar_tokens(
     config: &LowererConfig,
     key: &str,
@@ -78,11 +80,18 @@ pub(super) fn field_scalar_tokens(
                             // Names the field's type without spelling it, which
                             // is the only handle available here: the macro sees
                             // the member, not its declaration.
-                            const fn __field_width<T>(_: fn(&#struct_path) -> T) -> usize {
+                            //
+                            // Through a reference, not by value. `|s| s.field`
+                            // returns `T` and so moves out of a shared borrow,
+                            // which only compiles for a `Copy` field — an
+                            // eight-byte field that is not `Copy` would fail
+                            // expansion with a borrow error naming generated
+                            // code, for a struct with nothing wrong with it.
+                            const fn __field_width<T>(_: fn(&#struct_path) -> &T) -> usize {
                                 ::core::mem::size_of::<T>()
                             }
                             assert!(
-                                __field_width(|__s: &#struct_path| __s.#member)
+                                __field_width(|__s: &#struct_path| &__s.#member)
                                     == ::core::mem::size_of::<i64>(),
                                 #message,
                             );
