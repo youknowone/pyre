@@ -1253,8 +1253,8 @@ struct ResidualFrameChainGuard {
 }
 
 impl ResidualFrameChainGuard {
-    fn enter(frame: usize) -> Option<Self> {
-        let frame = frame as *mut pyre_interpreter::PyFrame;
+    fn enter() -> Option<Self> {
+        let frame = current_inline_concrete_frame() as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
             return None;
         }
@@ -3335,22 +3335,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame, escape_py_pc, escape_stack);
         // `executioncontext.py:85 enter` for the inlined callee this residual
         // runs inside of.
-        // RPython's residual executes against `metainterp.framestack[-1]`:
-        // the concrete frame belongs to the live MIFrame, not to the portal
-        // root.  A forward inline publishes the same identity through
-        // `InlineConcreteFrameGuard`; a bridge-reconstructed inline carries
-        // it on its own `CalleeLocalsShadow`, because that frame must not be
-        // installed as the walk's standard virtualizable.  Prefer the
-        // per-context frame so bridge tracing cannot collapse `super()` /
-        // `sys._getframe()` onto the caller, retaining the TLS value only for
-        // older non-shadow inline paths.
-        let concrete_inline_frame = ctx
-            .callee_shadow
-            .as_ref()
-            .map(|shadow| shadow.concrete_frame)
-            .filter(|&frame| frame != 0)
-            .unwrap_or_else(current_inline_concrete_frame);
-        let _frame_chain = ResidualFrameChainGuard::enter(concrete_inline_frame);
+        let _frame_chain = ResidualFrameChainGuard::enter();
         let live_py_pc = if ctx.fbw_mode.inline_subwalk {
             ctx.vstack_cur_pypc
         } else {
