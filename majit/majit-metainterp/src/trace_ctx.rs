@@ -3816,6 +3816,28 @@ impl TraceCtx {
         true
     }
 
+    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`
+    /// as a standalone decision, for callers that must act between the check
+    /// and the branch it selects.
+    ///
+    /// `_opimpl_getarrayitem_vable` (pyjitpl.py:1220) and
+    /// `_opimpl_setarrayitem_vable` (:1239) take this decision FIRST and reach
+    /// `implement_guard_value` on the index only through
+    /// `_get_arrayitem_vable_index` (:1205), i.e. only on the standard branch.
+    /// A caller that owns an `MIFrameStack` promotes the index itself, so that
+    /// the GUARD_VALUE is built against its own framestack; it takes the
+    /// decision here and hands it to the matching `*_checked` leg rather than
+    /// letting the leg re-run a check that records ops.
+    pub fn nonstandard_virtualizable(
+        &mut self,
+        pc: usize,
+        vable_opref: OpRef,
+        fielddescr: &DescrRef,
+    ) -> bool {
+        let concrete = self.concrete_of_opref(vable_opref);
+        self.is_nonstandard_virtualizable(pc, vable_opref, fielddescr, concrete)
+    }
+
     /// Resolve a `setfield_vable`/`getfield_vable` static field descr (the
     /// `vable_static_field_descr(idx)` singleton, or the vinfo's own
     /// `SimpleFieldDescr`) to the parent-struct-layout `FieldDescr` for
@@ -4584,8 +4606,37 @@ impl TraceCtx {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let nonstandard = self.nonstandard_virtualizable(pc, vable_opref, &fdescr);
+        self.vable_getarrayitem_int_checked(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+        )
+    }
+
+    /// `_opimpl_getarrayitem_vable` body with the `_nonstandard_virtualizable`
+    /// decision already taken by the caller (see
+    /// [`Self::nonstandard_virtualizable`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter list mirrors the corresponding RPython metainterpreter routine plus the hoisted branch decision; grouping arguments into a Rust-only context object would obscure line-by-line parity"
+    )]
+    pub fn vable_getarrayitem_int_checked(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+        if nonstandard {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
@@ -4702,8 +4753,37 @@ impl TraceCtx {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let nonstandard = self.nonstandard_virtualizable(pc, vable_opref, &fdescr);
+        self.vable_getarrayitem_ref_checked(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+        )
+    }
+
+    /// `_opimpl_getarrayitem_vable` ref body with the
+    /// `_nonstandard_virtualizable` decision already taken by the caller (see
+    /// [`Self::nonstandard_virtualizable`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter list mirrors the corresponding RPython metainterpreter routine plus the hoisted branch decision; grouping arguments into a Rust-only context object would obscure line-by-line parity"
+    )]
+    pub fn vable_getarrayitem_ref_checked(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+        if nonstandard {
             let fwd = self.nonstandard_vable_element_concrete(
                 vable_opref,
                 &fdescr,
@@ -4779,8 +4859,37 @@ impl TraceCtx {
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
+        let nonstandard = self.nonstandard_virtualizable(pc, vable_opref, &fdescr);
+        self.vable_getarrayitem_float_checked(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+        )
+    }
+
+    /// `_opimpl_getarrayitem_vable` float body with the
+    /// `_nonstandard_virtualizable` decision already taken by the caller (see
+    /// [`Self::nonstandard_virtualizable`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter list mirrors the corresponding RPython metainterpreter routine plus the hoisted branch decision; grouping arguments into a Rust-only context object would obscure line-by-line parity"
+    )]
+    pub fn vable_getarrayitem_float_checked(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+    ) -> (OpRef, Option<Value>) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
+        if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             return (
                 self.vable_getarrayitem_float_descr(array_opref, index, adescr),
@@ -4859,8 +4968,42 @@ impl TraceCtx {
         concrete: Value,
         live_null_push: bool,
     ) -> VableArrayStore {
-        let vable_concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
+        let nonstandard = self.nonstandard_virtualizable(pc, vable_opref, &fdescr);
+        self.vable_setarrayitem_checked(
+            nonstandard,
+            pc,
+            vable_opref,
+            index,
+            index_runtime_value,
+            fdescr,
+            adescr,
+            value,
+            concrete,
+            live_null_push,
+        )
+    }
+
+    /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`
+    /// decision already taken by the caller (see
+    /// [`Self::nonstandard_virtualizable`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+    )]
+    pub fn vable_setarrayitem_checked(
+        &mut self,
+        nonstandard: bool,
+        pc: usize,
+        vable_opref: OpRef,
+        index: OpRef,
+        index_runtime_value: i64,
+        fdescr: DescrRef,
+        adescr: DescrRef,
+        value: OpRef,
+        concrete: Value,
+        live_null_push: bool,
+    ) -> VableArrayStore {
+        if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             self.profiler()
                 .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
