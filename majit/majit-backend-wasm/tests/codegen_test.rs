@@ -2071,12 +2071,15 @@ fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
     let mut control_stack = Vec::new();
     let mut gc_table_address_on_stack = false;
     let mut loads_inside_loop = 0usize;
+    let mut loads_outside_loop = 0usize;
+    let mut saw_loop = false;
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
             let mut operators = body.get_operators_reader().unwrap();
             while !operators.eof() {
                 match operators.read().unwrap() {
                     wasmparser::Operator::Loop { .. } => {
+                        saw_loop = true;
                         control_stack.push(true);
                         gc_table_address_on_stack = false;
                     }
@@ -2094,6 +2097,8 @@ fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
                     wasmparser::Operator::I32Load { .. } if gc_table_address_on_stack => {
                         if control_stack.contains(&true) {
                             loads_inside_loop += 1;
+                        } else {
+                            loads_outside_loop += 1;
                         }
                         gc_table_address_on_stack = false;
                     }
@@ -2102,6 +2107,13 @@ fn loop_invariant_gc_table_load_stays_outside_non_collecting_loop() {
             }
         }
     }
+    // Without these two, the zero above also holds for a body that emitted no
+    // loop at all, or dropped the table load entirely.
+    assert!(saw_loop, "codegen emitted no loop for a looping trace");
+    assert!(
+        loads_outside_loop > 0,
+        "the hoisted ConstPtr table slot is never loaded"
+    );
     assert_eq!(
         loads_inside_loop, 0,
         "ConstPtr table slot was reloaded on the hot backedge"

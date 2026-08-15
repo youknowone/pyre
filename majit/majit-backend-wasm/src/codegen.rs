@@ -2390,26 +2390,16 @@ fn build_function(
     // and input setup.  Store-on-def is mirrored here because the original op
     // arm and its common tail are skipped below.
     for result in &hoisted_gc_table_loads {
-        let op = ops
-            .iter()
-            .find(|op| op.pos.get() == *result)
-            .expect("hoisted GC-table result must have a producer");
-        let index = resolve_const_bits(constants, op.arg(0).to_opref());
-        let slot =
-            gc_table_base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
-        sink.i32_const(slot as i32);
-        sink.i32_load(MemArg {
-            offset: 0,
-            align: 2,
-            memory_index: 0,
-        });
-        sink.i64_extend_i32_u();
-        sink.local_set(value_types.local(result.raw()));
-        if let Some(h) = ref_homes.home(*result) {
-            sink.local_get(0);
-            sink.local_get(value_types.local(result.raw()));
-            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
-        }
+        emit_seed_gc_table_ref(
+            &mut sink,
+            ops,
+            constants,
+            value_types,
+            ref_homes,
+            frame,
+            gc_table_base,
+            *result,
+        );
     }
 
     // Seed with the fail-index base so each guard/finish exit writes
@@ -2492,32 +2482,22 @@ fn build_function(
                 }
             }
             // The dispatch branch skipped the eager ConstPtr loads emitted on
-            // key 0.  This JitFrame has already run the preamble, so recover
-            // those loop-invariant refs from their GC-forwarded homes.
+            // key 0.  Their ordinary homes are the low prefix a chained bridge
+            // clears and remaps for its own Refs, so what sits there on resume
+            // may be zero or another trace's object; the gc_table slot is the
+            // root the collector forwards in place, so read it again exactly
+            // as fresh entry does.  LABEL entry is cold enough to pay for it.
             for result in &hoisted_gc_table_loads {
-                if let Some(h) = ref_homes.home(*result) {
-                    sink.local_get(0);
-                    sink.i64_load(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
-                } else {
-                    // A ref unused across a collecting op has no ordinary
-                    // home.  LABEL entry is cold, so reload its table slot
-                    // directly rather than manufacturing a GC root.
-                    let producer = ops
-                        .iter()
-                        .find(|op| op.pos.get() == *result)
-                        .expect("hoisted GC-table result must have a producer");
-                    let index = resolve_const_bits(constants, producer.arg(0).to_opref());
-                    let slot = gc_table_base as u64
-                        + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
-                    sink.i32_const(slot as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
-                }
-                sink.local_set(value_types.local(result.raw()));
+                emit_seed_gc_table_ref(
+                    &mut sink,
+                    ops,
+                    constants,
+                    value_types,
+                    ref_homes,
+                    frame,
+                    gc_table_base,
+                    *result,
+                );
             }
             sink.end(); // end B_j $past_loader
             labels_passed += 1;
@@ -5367,6 +5347,44 @@ fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) ->
             .copied()
             .unwrap_or_else(|| missing_emit_const(opref))
     })
+}
+
+/// Load one hoisted `LoadFromGcTable` result from its table slot into its
+/// local and refresh the ordinary Ref home the in-loop reload path reads.
+///
+/// The table slot is the root the collector forwards in place
+/// (`assembler.py:1545 genop_load_from_gc_table`), which is why both the
+/// fresh-entry seeding and the LABEL resume loader read it rather than a home.
+#[allow(clippy::too_many_arguments)]
+fn emit_seed_gc_table_ref(
+    sink: &mut InstructionSink<'_>,
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    gc_table_base: u32,
+    result: OpRef,
+) {
+    let producer = ops
+        .iter()
+        .find(|op| op.pos.get() == result)
+        .expect("hoisted GC-table result must have a producer");
+    let index = resolve_const_bits(constants, producer.arg(0).to_opref());
+    let slot = gc_table_base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+    sink.i32_const(slot as i32);
+    sink.i32_load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    });
+    sink.i64_extend_i32_u();
+    sink.local_set(value_types.local(result.raw()));
+    if let Some(h) = ref_homes.home(result) {
+        sink.local_get(0);
+        sink.local_get(value_types.local(result.raw()));
+        sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+    }
 }
 
 fn emit_resolve(

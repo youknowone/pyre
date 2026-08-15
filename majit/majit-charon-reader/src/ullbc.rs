@@ -855,4 +855,23 @@ mod tests {
         // empty list → None
         assert!(select_target_layout(Vec::new(), "aarch64-apple-darwin").is_none());
     }
+
+    /// A union body keeps its field list. `#[serde(other)]` turns any tag this
+    /// enum does not name into `Unknown`, so a missing `Union` arm would lose
+    /// the fields silently rather than fail to parse — the shape `IN_ADDR_0`
+    /// arrives in through the `windows-sys` dependency closure.
+    #[test]
+    fn union_decl_kind_keeps_its_fields() {
+        let json = r#"{"Union": [
+            {"name": "S_un_b", "ty": {"Deduplicated": 170}, "attr_info": null},
+            {"name": "S_addr", "ty": {"Deduplicated": 42}, "attr_info": null}
+        ]}"#;
+        let kind: TypeDeclKind = serde_json::from_str(json).unwrap();
+        let TypeDeclKind::Union(fields) = kind else {
+            panic!("union body parsed as {kind:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name.as_deref(), Some("S_un_b"));
+        assert_eq!(fields[1].ty.label(), "ty#42");
+    }
 }

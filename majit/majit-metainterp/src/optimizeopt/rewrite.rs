@@ -1136,7 +1136,12 @@ impl OptRewrite {
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
-        // rewrite.py:797-805: intdiv.modulo_operations fallback
+        // rewrite.py:797-805: intdiv.modulo_operations fallback, which emits
+        // UINT_MUL_HIGH.  A backend without one leaves the residual call in
+        // place, the same answer the IntMod arm gives.
+        if !ctx.supports_efficient_uint_mul_high {
+            return None;
+        }
         let known_nonneg = b1.known_nonnegative();
         let result_ref = crate::optimizeopt::intdiv::modulo_operations(
             arg1.to_opref(),
@@ -1239,7 +1244,12 @@ impl OptRewrite {
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
-        // rewrite.py:758-766: intdiv.division_operations fallback
+        // rewrite.py:758-766: intdiv.division_operations fallback, which emits
+        // UINT_MUL_HIGH.  A backend without one leaves the residual call in
+        // place, the same answer the IntFloorDiv arm gives.
+        if !ctx.supports_efficient_uint_mul_high {
+            return None;
+        }
         let known_nonneg = b1.known_nonnegative();
         let result_ref = crate::optimizeopt::intdiv::division_operations(
             arg1.to_opref(),
@@ -2785,6 +2795,59 @@ mod tests {
         assert_binop_self(OpCode::IntMod, Some(0));
     }
 
+    /// Whether the magic-number expansion ran.  `intdiv` queues its sequence
+    /// through `emit_extra`, so it is still in `extra_operations_after` when
+    /// the pass returns.
+    fn emitted_uint_mul_high(ctx: &OptContext) -> bool {
+        ctx.new_operations
+            .iter()
+            .map(|op| op.opcode)
+            .chain(ctx.extra_operations_after.iter().map(|(_, op)| op.opcode))
+            .any(|opcode| opcode == OpCode::UintMulHigh)
+    }
+
+    /// A `CALL_PURE_I` carrying one of the Python division oopspecs, with the
+    /// divisor already constant-folded — the shape `optimize_call_int_py_div`
+    /// and `optimize_call_int_py_mod` are reached through.
+    fn run_int_py_call(
+        oopspecindex: majit_ir::OopSpecIndex,
+        divisor: i64,
+        supports_efficient_uint_mul_high: bool,
+    ) -> (OptimizationResult, OptContext) {
+        let ops = build_specs(&[same_i(), same_i(), same_i()]);
+        let mut ctx = OptContext::new(4);
+        ctx.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
+        for op in &ops {
+            ctx.emit((**op).clone());
+        }
+        let b = ctx.materialize_operand_at(OpRef::int_op(2));
+        ctx.make_constant_box(&b, Value::Int(divisor));
+
+        let mut call = Op::new(
+            OpCode::CallPureI,
+            &[
+                Operand::from_bound_op(&ops[0]),
+                Operand::from_bound_op(&ops[1]),
+                Operand::from_bound_op(&ops[2]),
+            ],
+        );
+        call.pos.set(OpRef::int_op(3));
+        call.setdescr(std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
+            0,
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            true,
+            std::mem::size_of::<i64>(),
+            majit_ir::EffectInfo::new(majit_ir::ExtraEffect::ElidableCanRaise, oopspecindex),
+        )));
+        resolve_op_args_in_ctx(&mut call, &mut ctx);
+        let op_rc = std::rc::Rc::new(call.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let mut pass = OptRewrite::new();
+        let result = pass.propagate_forward(&call, &op_rc, &mut ctx);
+        (result, ctx)
+    }
+
     #[test]
     fn backend_without_mul_high_keeps_native_constant_division_and_modulo() {
         for opcode in [OpCode::IntFloorDiv, OpCode::IntMod] {
@@ -2796,10 +2859,47 @@ mod tests {
             );
             assert_pass_on(&result);
             assert!(
-                ctx.new_operations
-                    .iter()
-                    .all(|op| op.opcode != OpCode::UintMulHigh),
+                !emitted_uint_mul_high(&ctx),
                 "{opcode:?} expanded through UintMulHigh on a backend that lacks it"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_with_mul_high_expands_constant_division_and_modulo() {
+        for opcode in [OpCode::IntFloorDiv, OpCode::IntMod] {
+            let (_result, ctx) = run_one_rewrite_only_with_mul_high(
+                vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
+                2,
+                &[(OpRef::int_op(1), Value::Int(100))],
+                true,
+            );
+            assert!(
+                emitted_uint_mul_high(&ctx),
+                "{opcode:?} kept the native division on a backend that has UintMulHigh"
+            );
+        }
+    }
+
+    /// The call-based helpers share the magic-number expansion with the
+    /// native opcodes, so they answer to the same capability.
+    #[test]
+    fn call_int_py_div_and_mod_follow_the_mul_high_capability() {
+        for oopspecindex in [
+            majit_ir::OopSpecIndex::IntPyDiv,
+            majit_ir::OopSpecIndex::IntPyMod,
+        ] {
+            let (result, ctx) = run_int_py_call(oopspecindex, 100, false);
+            assert_pass_on(&result);
+            assert!(
+                !emitted_uint_mul_high(&ctx),
+                "{oopspecindex:?} expanded through UintMulHigh on a backend that lacks it"
+            );
+
+            let (_result, ctx) = run_int_py_call(oopspecindex, 100, true);
+            assert!(
+                emitted_uint_mul_high(&ctx),
+                "{oopspecindex:?} left the residual call on a backend that has UintMulHigh"
             );
         }
     }

@@ -499,6 +499,10 @@ impl UnrollOptimizer {
     /// gcref failed type validation) and should propagate.
     pub fn optimize_preamble(&mut self, ops: &[Op]) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
+        // A fresh optimizer defaults the capability to present; carry the
+        // backend's answer over as the two-phase path does, or these callers
+        // get UINT_MUL_HIGH on a backend that has none.
+        optimizer.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
         optimizer.add_pass(Box::new(OptUnroll::new()));
         optimizer.propagate_all_forward(ops)
     }
@@ -510,8 +514,10 @@ impl UnrollOptimizer {
     /// speculative imports that may fail type validation —
     /// `unroll.py:119-123 except SpeculativeError: raise InvalidLoop`.
     pub fn optimize_peeled_loop(&mut self, ops: &[Op]) -> Vec<Op> {
+        let supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
         with_speculative_to_invalid_loop(|| {
             let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
+            optimizer.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
             optimizer.propagate_all_forward(ops)
         })
     }
@@ -572,6 +578,7 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
+        optimizer.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
         optimizer.add_pass(Box::new(OptUnroll::new()));
         let result = optimizer.optimize_with_constants(ops, constants);
         let sp = crate::optimizeopt::shortpreamble::extract_short_preamble(&result);
