@@ -672,6 +672,16 @@ pub fn unconsulted_field_declarations() -> Vec<UnconsultedFieldDeclaration> {
 /// Takes its denominator from the same census as
 /// [`assert_no_degraded_dispatch_arms`], for the same reason: an empty result
 /// is also what a portal that was never built produces.
+///
+/// ⚠ Covers ONE `#[jit_interp]` machine, which is usually the smaller half of a
+/// consumer's population. Each `#[jit_inline]` helper carries its own
+/// `int_fields` / `ref_fields` and records under its own name, so a helper
+/// repeating a declaration at every site turns one unconsulted key into dozens
+/// — and none of them have a dispatch-arm census to key this assertion on. A
+/// caller that wants the whole picture has to filter
+/// [`unconsulted_field_declarations`] itself and supply its own denominator;
+/// measured on one consumer, five of six survivors were on helpers, so a
+/// portal-only assertion reported the sixth and called the crate clean.
 pub fn assert_no_unconsulted_field_declarations(interp: &str) {
     let census = dispatch_arm_census();
     let Some(entry) = census.iter().find(|e| e.interp == interp) else {
