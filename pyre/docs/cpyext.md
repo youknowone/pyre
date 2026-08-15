@@ -101,7 +101,13 @@ the header below.
 - capsules (`cpyext/capsule.rs`) and the strong-reference import entry points
   `PyImport_ImportModule`, `PyImport_Import`, `PyImport_AddModuleRef` and
   `PyImport_GetModule` (`cpyext/import_.rs`);
-- GC forwarding for C mirror links and cached dictionaries.
+- GC forwarding for cached dictionaries, and `rawrefcount` in the collector
+  itself (`majit-gc/src/rawrefcount.rs`, `majit-gc/src/collector.rs`): a mirror
+  and its interpreter object are joined by a P-link, the collector traces and
+  frees the two together in its own minor and major passes, and a mirror whose
+  object died is handed back through a dead queue that `tp_dealloc` drains from
+  an execution-context action. `tp_dealloc` and `tp_free` therefore run, and an
+  instance of a C-defined type is reclaimed.
 
 The loader serializes extension initialization in the current import path;
 the complete port must move that ownership into interpreter/execution-context
@@ -109,9 +115,10 @@ state before subinterpreters or parallel no-GIL imports are enabled.
 
 Known divergences, each documented at its definition:
 
-- a mirror is freed as soon as C releases its last reference, so a reference
-  cycle running through C leaks; upstream's `rawrefcount` dead queue is what
-  removes that (`cpyext/pyobject.rs`);
+- a reference cycle running through C leaks: a C reference marks its object as
+  surviving along with everything the object reaches, and no `rawrefcount` pass
+  consults `tp_traverse` / `tp_clear` to break such a cycle. That limit is
+  upstream's as well (`pypy/doc/discussion/rawrefcount.rst`);
 - `md_def` and `md_state` ride reserved module-dictionary keys, and the
   `PyMethodDef` pointer, the descriptor definitions and a capsule's four C
   values ride reserved carrier-dictionary keys, because pyre has no typed
@@ -139,17 +146,19 @@ Known divergences, each documented at its definition:
   object it belongs to moves and the foreign memory does not;
 - a `memoryview` that is never released never ends its export, pyre having no
   reference counting to end it at the last drop;
-- an instance of a C-defined type is immortal, because its mirror block *is* its
-  storage: freeing the block when C drops its last reference would destroy
-  fields the interpreter object still exposes. Such an instance is therefore
-  never reclaimed. Removing that needs the same `rawrefcount` dead queue the
-  first divergence names, so that a block is released only once the collector
-  has proved the interpreter object dead as well.
+- three `rawrefcount` passes diverge from `incminimark.py` because the
+  collector they sit in is not the one upstream wrote them for, each documented
+  at its definition in `majit-gc/src/collector.rs`: the non-moving major
+  additionally traces the *young* lists, that collection running no leading
+  minor; a young mirror whose object was pinned stays young rather than being
+  freed, a pinned survivor carrying no forwarding pointer to prove it alive;
+  and a mirror linked to an object outside the managed heap is treated as
+  alive, such an object having no header to read a mark from.
 
 ## What remains
 
-5. `tp_dealloc`, `tp_traverse` and `tp_clear` on top of a `rawrefcount` dead
-   queue; and the remaining generated API;
+5. `tp_traverse` and `tp_clear`, without which a cycle through C is not
+   collectable; and the remaining generated API;
 6. Windows API DLL/import-library packaging.
 
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
@@ -162,8 +171,12 @@ are ABI-compatible with pyre.
   extension loader and initialization checks.
 - `pypy/module/cpyext/pyobject.py`: raw mirror descriptors and W_Root ↔
   `PyObject *` conversion.
-- `rpython/rlib/rawrefcount.py` and `pypy/doc/discussion/rawrefcount.rst`:
-  collector ownership and delayed deallocation.
+- `rpython/rlib/rawrefcount.py` and `pypy/doc/discussion/rawrefcount.rst`: the
+  vocabulary -- the P/O link kinds, `REFCNT_FROM_PYPY`, the dead queue -- and
+  what a C reference does and does not keep alive.
+- `rpython/memory/gc/incminimark.py`, the `rrc_*` methods: the algorithm
+  itself. The front end declares; the collector owns the lists, the traces and
+  the frees.
 - `pypy/module/cpyext/state.py`: exception state, extension cache and GC dead
   queue.
 - `pypy/module/cpyext/modsupport.py`: module definitions, method conversion and

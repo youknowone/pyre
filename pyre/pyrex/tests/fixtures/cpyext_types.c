@@ -1060,6 +1060,108 @@ static PyTypeObject DoublerType = {
     doubler_new,                                /* tp_new */
 };
 
+/* ── Owner: an observable tp_dealloc, and a slot that can close a cycle ─ */
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *held;
+} OwnerObject;
+
+static long owner_deallocs;
+
+static PyObject *owner_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    PyObject *held = NULL;
+    if (!PyArg_ParseTuple(args, "|O", &held)) {
+        return NULL;
+    }
+    OwnerObject *self = (OwnerObject *)PyType_GenericAlloc(type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    Py_XINCREF(held);
+    self->held = held;
+    return (PyObject *)self;
+}
+
+static void owner_dealloc(PyObject *self)
+{
+    OwnerObject *owner = (OwnerObject *)self;
+    owner_deallocs += 1;
+    Py_CLEAR(owner->held);
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyObject *owner_get_held(PyObject *self, PyObject *unused)
+{
+    OwnerObject *owner = (OwnerObject *)self;
+    PyObject *held = owner->held == NULL ? Py_None : owner->held;
+    Py_INCREF(held);
+    return held;
+}
+
+static PyObject *owner_set_held(PyObject *self, PyObject *value)
+{
+    OwnerObject *owner = (OwnerObject *)self;
+    PyObject *previous = owner->held;
+    Py_INCREF(value);
+    owner->held = value;
+    Py_XDECREF(previous);
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef owner_methods[] = {
+    {"held", owner_get_held, METH_NOARGS, "the object this instance holds"},
+    {"hold", owner_set_held, METH_O, "hold an object"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyObject *m_owner_deallocs(PyObject *self, PyObject *unused)
+{
+    return PyLong_FromLong(owner_deallocs);
+}
+
+static PyTypeObject OwnerType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    "cpyext_types.Owner",                       /* tp_name */
+    sizeof(OwnerObject),                        /* tp_basicsize */
+    0,                                          /* tp_itemsize */
+    owner_dealloc,                              /* tp_dealloc */
+    0,                                          /* tp_vectorcall_offset */
+    0,                                          /* tp_getattr */
+    0,                                          /* tp_setattr */
+    0,                                          /* tp_as_async */
+    0,                                          /* tp_repr */
+    0,                                          /* tp_as_number */
+    0,                                          /* tp_as_sequence */
+    0,                                          /* tp_as_mapping */
+    0,                                          /* tp_hash */
+    0,                                          /* tp_call */
+    0,                                          /* tp_str */
+    0,                                          /* tp_getattro */
+    0,                                          /* tp_setattro */
+    0,                                          /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                         /* tp_flags */
+    "counts its own deallocations",             /* tp_doc */
+    0,                                          /* tp_traverse */
+    0,                                          /* tp_clear */
+    0,                                          /* tp_richcompare */
+    0,                                          /* tp_weaklistoffset */
+    0,                                          /* tp_iter */
+    0,                                          /* tp_iternext */
+    owner_methods,                              /* tp_methods */
+    0,                                          /* tp_members */
+    0,                                          /* tp_getset */
+    0,                                          /* tp_base */
+    0,                                          /* tp_dict */
+    0,                                          /* tp_descr_get */
+    0,                                          /* tp_descr_set */
+    0,                                          /* tp_dictoffset */
+    0,                                          /* tp_init */
+    0,                                          /* tp_alloc */
+    owner_new,                                  /* tp_new */
+};
+
 /* ── Blob: the buffer table ─────────────────────────────────────────── */
 
 typedef struct {
@@ -1480,6 +1582,7 @@ static PyMethodDef methods[] = {
     {"sum_x", m_sum_x, METH_O, "read x, raising the module exception otherwise"},
     {"flags", m_flags, METH_NOARGS, "PyType_GetFlags on Point"},
     {"is_subtype", m_is_subtype, METH_NOARGS, "PyType_IsSubtype both ways"},
+    {"owner_deallocs", m_owner_deallocs, METH_NOARGS, "how often Owner.tp_dealloc ran"},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1513,6 +1616,9 @@ static int types_exec(PyObject *module)
         return -1;
     }
     if (PyModule_AddType(module, &TickerType) < 0) {
+        return -1;
+    }
+    if (PyModule_AddType(module, &OwnerType) < 0) {
         return -1;
     }
     if (PyModule_AddStringConstant(module, "ANSWER_TYPES", "types") < 0) {

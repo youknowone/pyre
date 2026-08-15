@@ -517,8 +517,9 @@ PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *type);
     (Py_TYPE(ob) == (type) || PyType_IsSubtype(Py_TYPE(ob), (type)))
 #define PyObject_New(type, tp) ((type *)PyType_GenericAlloc((tp), 0))
 #define PyObject_GC_New(type, tp) PyObject_New(type, tp)
-#define PyObject_GC_Del(ob) ((void)(ob))
-#define PyObject_Del(ob) ((void)(ob))
+PyAPI_FUNC(void) PyObject_Free(void *ob);
+PyAPI_FUNC(void) PyObject_Del(void *ob);
+#define PyObject_GC_Del(ob) PyObject_Del(ob)
 #define PyObject_GC_Track(ob) ((void)(ob))
 #define PyObject_GC_UnTrack(ob) ((void)(ob))
 

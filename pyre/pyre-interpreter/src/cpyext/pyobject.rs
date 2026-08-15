@@ -11,39 +11,43 @@
 //! =...)`, and it is why the allocation is a byte block rather than a Rust
 //! struct.
 //!
-//! # Ownership, and where it differs from upstream
+//! # Ownership
 //!
-//! `rawrefcount` lets a mirror outlive the interpreter object: a mirror whose
-//! count is exactly the link share is *not* a root, so the collector may free
-//! the linked object and queue the mirror for deallocation.  Pyre's collector
-//! has no such queue yet, so a mirror lives exactly as long as the C side holds
-//! at least one reference and the link is a strong root for that whole time.
-//! The consequence is that a reference cycle running through C leaks; the
-//! upstream dead-queue is what the later slice has to add.
+//! The link is a `rawrefcount` P-link, and the collector owns it: a mirror
+//! whose count is exactly [`REFCNT_FROM_PYRE`] is referenced by nothing but the
+//! link, so the collector is free to let the interpreter object die and queue
+//! the mirror on its dead list.  [`drain_dead`] is what then runs the mirror's
+//! deallocator.  Nothing in this module roots an interpreter object.
+//!
+//! The rule's other half is that a count *above* the link share does root the
+//! object — `rawrefcount.rst`'s "mark 'p' as surviving, as well as all its
+//! dependencies".  A reference cycle that runs through a C reference therefore
+//! stays alive, upstream included: breaking one needs the type's `tp_traverse`
+//! and `tp_clear`, which no `rawrefcount` collection consults.
 
 use super::ForkMutex;
 use super::typeobject::CPyTypeObject;
+use majit_gc::rawrefcount;
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ffi::c_char;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The large ownership contribution held by the linked pyre object.
+/// The large ownership contribution held by the linked pyre object —
+/// `rawrefcount.REFCNT_FROM_PYPY`.  Ordinary C references are added above it by
+/// the public `Py_INCREF`/`Py_DECREF` macros.
 ///
-/// PyPy calls this `rawrefcount.REFCNT_FROM_PYPY`.  Ordinary C references are
-/// added above it by the public `Py_INCREF`/`Py_DECREF` inline functions.
-pub const REFCNT_FROM_PYRE: isize = 1 << (isize::BITS - 3);
+/// The collector reads it too, and decides on it, so the constant is defined
+/// where the algorithm is.
+pub use rawrefcount::REFCNT_FROM_PYRE;
 
 /// The count an immortal mirror starts at.
 ///
 /// Type mirrors and the singletons are borrowed by every consumer and never
 /// handed out with an owning reference, so their count must never fall back to
-/// [`REFCNT_FROM_PYRE`] and free them.  The second large constant leaves the
-/// same headroom in both directions, so no realistic incref/decref imbalance
-/// can reach the deallocation threshold.
-pub const REFCNT_IMMORTAL: isize = REFCNT_FROM_PYRE + (1 << (isize::BITS - 4));
+/// [`REFCNT_FROM_PYRE`] and free them.
+pub use rawrefcount::REFCNT_IMMORTAL;
 
 /// C-visible `PyObject`, matching PyPy's `parse/cpyext_object.h` shape.
 #[repr(C)]
@@ -65,51 +69,30 @@ fn block_layout(size: usize) -> Layout {
     Layout::from_size_align(size, BLOCK_ALIGN).expect("a mirror block size is a small constant")
 }
 
-/// PyPy/rawrefcount's P-list analogue.  The relationship itself lives on the
-/// raw object (`ob_pyre_link`); this table is only the collector's census of
-/// mirrors whose inline link must be visited, and it records how each block was
-/// allocated: the byte size for one this layer owns, and 0 for a block it does
-/// not own — a `static` in this crate or in the loaded extension.
-type Census = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-static RAW_OBJECTS: ForkMutex<Census> =
+/// The collector reads a mirror's first two words as its own
+/// [`rawrefcount::PyObjHeader`], so the two spellings have to agree.
+const _: () = {
+    assert!(size_of::<CPyObject>() >= size_of::<rawrefcount::PyObjHeader>());
+    assert!(align_of::<CPyObject>() == align_of::<rawrefcount::PyObjHeader>());
+    assert!(std::mem::offset_of!(CPyObject, ob_refcnt) == 0);
+    assert!(std::mem::offset_of!(CPyObject, ob_pyre_link) == size_of::<isize>());
+};
+
+/// How each mirror block was allocated: the byte size for one this layer owns,
+/// and 0 for a block it does not — a `static` in this crate or in the loaded
+/// extension.
+///
+/// The P list itself belongs to the collector, which is where every question
+/// about a link is now asked; this survives only because a mirror block's size
+/// is not something the collector has any reason to know.  Its keys are mirror
+/// addresses, which never move, so it needs no collection-time maintenance.
+type BlockSizes = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+static BLOCK_SIZES: ForkMutex<BlockSizes> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
-static CPYEXT_GC_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Interpreter object address -> mirror address, `rawrefcount`'s `w2r`
-/// direction (`pyobject.py:make_ref` looks the mirror up before building one,
-/// so `make_ref(w)` twice is the same pointer twice).
-///
-/// Keys are addresses of moving objects, so every collection invalidates the
-/// whole table; [`LINKED_STALE`] records that and the table is rebuilt from the
-/// census — whose links the collector has just forwarded — before the next
-/// lookup.
-type LinkMap = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-static LINKED: ForkMutex<LinkMap> = ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
-static LINKED_STALE: AtomicBool = AtomicBool::new(false);
-
-/// Re-key the identity table against the addresses the collector left behind.
-///
-/// Locking order is `LINKED` before `RAW_OBJECTS` everywhere, so the rebuild
-/// cannot deadlock against a concurrent [`attach`] or [`dealloc`].
-fn linked() -> parking_lot::MutexGuard<'static, LinkMap> {
-    let mut map = LINKED.lock();
-    if LINKED_STALE.swap(false, Ordering::Acquire) {
-        map.clear();
-        for &address in RAW_OBJECTS.lock().keys() {
-            let raw = address as *mut CPyObject;
-            let link = unsafe { (*raw).ob_pyre_link };
-            if !link.is_null() {
-                map.insert(link as usize, address);
-            }
-        }
-    }
-    map
-}
 
 pub(super) unsafe fn after_fork_child() {
     unsafe {
-        RAW_OBJECTS.reinit_after_fork();
-        LINKED.reinit_after_fork();
+        BLOCK_SIZES.reinit_after_fork();
         BORROWED.reinit_after_fork();
         BYTE_CACHE.reinit_after_fork();
     }
@@ -134,7 +117,8 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
 fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
-    if let Some(&existing) = linked().get(&(w_obj as usize)) {
+    let existing = majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize));
+    if existing != 0 {
         return existing as *mut CPyObject;
     }
     if unsafe { pyre_object::is_type(w_obj) } {
@@ -152,8 +136,6 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         unsafe { (*mirror).ob_base.ob_base.ob_type = of_type };
         return mirror as *mut CPyObject;
     }
-    // The type mirror is resolved before the object's own mirror is entered so
-    // the two `linked()` acquisitions never nest.
     let ob_type = type_mirror(w_obj);
     attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type))
 }
@@ -187,11 +169,18 @@ pub(super) fn attach_foreign(w_obj: PyObjectRef, raw: *mut CPyObject) {
     enter(w_obj, raw, 0);
 }
 
+/// `pyobject.py:track_reference` — hand the collector the P-link.
+///
+/// The mirror's header is already filled at this point, including the
+/// [`REFCNT_FROM_PYRE`] share this link is worth, which is what
+/// `track_reference`'s `c_ob_refcnt += REFCNT_FROM_PYPY` establishes.
 fn enter(w_obj: PyObjectRef, raw: *mut CPyObject, size: usize) {
-    let mut map = linked();
-    RAW_OBJECTS.lock().insert(raw as usize, size);
-    map.insert(w_obj as usize, raw as usize);
-    CPYEXT_GC_ACTIVE.store(true, Ordering::Release);
+    debug_assert!(
+        unsafe { (*raw).ob_refcnt } >= REFCNT_FROM_PYRE,
+        "a linked mirror carries the link share"
+    );
+    BLOCK_SIZES.lock().insert(raw as usize, size);
+    majit_gc::gc_rawrefcount_create_link_pyre(majit_ir::GcRef(w_obj as usize), raw as usize);
 }
 
 /// How large a mirror of `ob_type` has to be.
@@ -220,6 +209,18 @@ pub fn make_ref(w_obj: PyObjectRef) -> *mut CPyObject {
     raw
 }
 
+/// The mirror, built on demand, without taking a reference.
+///
+/// The block's only owner is the link, so it lives exactly as long as `w_obj`
+/// does: the caller must be holding `w_obj` rooted, which every caller reaching
+/// this from an interpreter-side operation is.
+pub(super) fn borrow_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
+    if w_obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    ensure_mirror(w_obj)
+}
+
 /// `pyobject.py:as_pyobj` — the mirror without taking a reference.
 ///
 /// The result is only valid while some other owner keeps the mirror alive, so
@@ -229,13 +230,29 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
     if w_obj.is_null() {
         return std::ptr::null_mut();
     }
-    linked()
-        .get(&(w_obj as usize))
-        .map(|&address| address as *mut CPyObject)
-        .unwrap_or(std::ptr::null_mut())
+    majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize)) as *mut CPyObject
+}
+
+/// The address parked in a dying mirror's link slot while its deallocator runs
+/// — `pyobject.py:297 w_marker_deallocating`, written by
+/// `cpyext/src/object.c:77` before it calls `tp_dealloc`.
+///
+/// Upstream's marker is a real `W_Root` so that `from_ref` can compare against
+/// it and report a specific fatal error.  Nothing here needs an object: the
+/// address only has to be recognisable and never equal to a live one, and an
+/// address inside this module's own image is both.
+fn deallocating_marker() -> usize {
+    static MARKER: u8 = 0;
+    &raw const MARKER as usize
 }
 
 /// `pyobject.py:from_ref` — the interpreter object a mirror links to.
+///
+/// Null once the collector has cleared the link, and null while the mirror's
+/// deallocator runs: `tp_dealloc` calling back into an API that would rebuild
+/// the interpreter object is what upstream fatally errors on
+/// (`pyobject.py:310-327`), because the object it would hand back is being
+/// freed.  Returning null makes the caller take its own not-found path instead.
 ///
 /// # Safety
 /// `raw` must be null or a live mirror.  The result is only valid until the
@@ -245,17 +262,37 @@ pub unsafe fn from_ref(raw: *mut CPyObject) -> PyObjectRef {
     if raw.is_null() {
         return PY_NULL;
     }
-    unsafe { (*raw).ob_pyre_link }
+    let link = unsafe { (*raw).ob_pyre_link };
+    if link as usize == deallocating_marker() {
+        return PY_NULL;
+    }
+    link
 }
 
+/// `pyobject.py:433-438 incref`.
+///
 /// # Safety
 /// `raw` must be null or a live mirror.
 pub unsafe fn incref(raw: *mut CPyObject) {
-    if !raw.is_null() {
-        unsafe { (*raw).ob_refcnt += 1 };
+    if raw.is_null() {
+        return;
     }
+    // An immortal mirror's count carries no information, so moving it only
+    // risks walking it out of its headroom.
+    if unsafe { (*raw).ob_refcnt } >= REFCNT_IMMORTAL {
+        return;
+    }
+    unsafe { (*raw).ob_refcnt += 1 };
 }
 
+/// `pyobject.py:441-453 decref` — release one C reference, and deallocate at
+/// exactly zero.
+///
+/// Zero, not the link share: while the link is in place the collector owns that
+/// share, and a mirror the C side has finished with simply stops being a root.
+/// It is [`drain_dead`] that later gives the share back and brings the count
+/// here.
+///
 /// # Safety
 /// `raw` must be null or a live mirror, and the caller must own the reference
 /// being released.
@@ -263,40 +300,85 @@ pub unsafe fn decref(raw: *mut CPyObject) {
     if raw.is_null() {
         return;
     }
+    if unsafe { (*raw).ob_refcnt } >= REFCNT_IMMORTAL {
+        return;
+    }
+    debug_assert!(
+        unsafe { (*raw).ob_refcnt } > 0,
+        "decref of a mirror with no references left"
+    );
+    debug_assert!(
+        unsafe { (*raw).ob_pyre_link.is_null() } || unsafe { (*raw).ob_refcnt } > REFCNT_FROM_PYRE,
+        "a linked mirror must not be decrefed below the link share"
+    );
     unsafe { (*raw).ob_refcnt -= 1 };
-    if unsafe { (*raw).ob_refcnt } <= REFCNT_FROM_PYRE {
+    if unsafe { (*raw).ob_refcnt } == 0 {
         unsafe { dealloc(raw) };
     }
 }
 
-/// Drop a mirror the C side no longer references.
-///
-/// This is `_Py_Dealloc`'s job upstream.  There is no type-specific
-/// deallocator to dispatch to yet: every mirror this slice hands out owns
-/// nothing but its link and its byte cache.
+/// `cpyext/src/object.c:72-79 _Py_Dealloc` — mark the mirror deallocating, run
+/// its type's `tp_dealloc`, then release what this layer owns for it.
 ///
 /// # Safety
-/// `raw` must be a live mirror whose count has fallen to the link share.
+/// `raw` must be a live mirror whose count has fallen to zero.
 unsafe fn dealloc(raw: *mut CPyObject) {
     let address = raw as usize;
-    // Before the mirror goes: a borrow it owns may be the last reference to
-    // its own container, and that recursion has to run outside the locks below.
+    debug_assert_eq!(unsafe { (*raw).ob_refcnt }, 0, "dealloc below zero");
+    // object.c:77, the same thing as `rawrefcount.mark_deallocating()`: the
+    // link is dead but `tp_dealloc` may still ask for it.
+    majit_gc::gc_rawrefcount_mark_deallocating(deallocating_marker(), address);
+    // Everything this layer holds on the mirror's behalf goes before
+    // `tp_dealloc` can free the block out from under it.  A borrow it owns may
+    // be the last reference to its own container, so that recursion runs here.
     release_borrowed(raw);
-    let link = unsafe { (*raw).ob_pyre_link };
-    let mut map = linked();
-    let size = RAW_OBJECTS.lock().remove(&address).unwrap_or(0);
-    if map.get(&(link as usize)) == Some(&address) {
-        map.remove(&(link as usize));
-    }
-    drop(map);
     BYTE_CACHE.lock().remove(&address);
+    if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
+        let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
+        unsafe { call(raw) };
+        // A `tp_dealloc` ends in `tp_free`, which returns the block through
+        // [`free_block`]; if it did, the address is no longer ours to touch.
+        if !BLOCK_SIZES.lock().contains_key(&address) {
+            return;
+        }
+    }
+    unsafe { free_block(raw) };
+}
+
+/// Return a mirror block to the allocator this layer took it from.
+///
+/// `cpyext/src/object.c:102-105 PyObject_Free`.  A block this layer did not
+/// allocate is a `static` that outlives it, so only the bookkeeping is dropped.
+///
+/// # Safety
+/// `raw` must be a block this module entered, and must not be used afterwards.
+pub(super) unsafe fn free_block(raw: *mut CPyObject) {
+    let Some(size) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
+        return;
+    };
     unsafe {
         (*raw).ob_pyre_link = PY_NULL;
         (*raw).ob_refcnt = 0;
     }
-    // A block this layer did not allocate is a `static` that outlives it.
     if size != 0 {
         unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(size)) };
+    }
+}
+
+/// `state.py:216-228 _rawrefcount_perform` — release every mirror the collector
+/// has queued.
+///
+/// The collector left each one at a count of 1 (`incminimark.py:3352`), so the
+/// decref here is what reaches zero and runs the deallocator.  Deallocating one
+/// mirror can decref others, which is why the queue is re-read every iteration
+/// rather than drained into a list.
+pub fn drain_dead() {
+    loop {
+        let raw = majit_gc::gc_rawrefcount_next_dead() as *mut CPyObject;
+        if raw.is_null() {
+            return;
+        }
+        unsafe { decref(raw) };
     }
 }
 
@@ -378,28 +460,20 @@ pub(super) unsafe fn cached_bytes(
     (entry.as_ptr() as *const c_char, entry.len() - 1)
 }
 
-/// Forward every mirror link.
+/// `state.py:106-107` — give the collector the callback it fires when it has
+/// queued mirrors, before anything can create the first link.
 ///
-/// External C ownership keeps the linked object alive, which is the P-link
-/// rule from `rawrefcount.rst` — with the ownership divergence documented at
-/// the top of this module: pyre roots the link for as long as the mirror
-/// exists, and a mirror exists for exactly as long as C holds a reference.
-pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    if !CPYEXT_GC_ACTIVE.load(Ordering::Acquire) {
-        return;
-    }
-    for &address in RAW_OBJECTS.lock().keys() {
-        let raw = address as *mut CPyObject;
-        unsafe {
-            if !(*raw).ob_pyre_link.is_null() {
-                visitor(&mut (*raw).ob_pyre_link);
-            }
-        }
-    }
-    // Every key in the identity table is an address the visitor above was free
-    // to relocate, so the table is rebuilt from the links themselves before the
-    // next lookup rather than here — a collection must not allocate.
-    LINKED_STALE.store(true, Ordering::Release);
+/// There is no root walker to register alongside it.  Upstream has none either:
+/// a P-link is a root exactly when the mirror's count exceeds the link share,
+/// and that is a question only the collector's own trace passes can ask at the
+/// right moment.
+pub(super) fn init_rawrefcount() {
+    majit_gc::gc_rawrefcount_init(schedule_drain);
+}
+
+/// Fired from inside a collection, so it may only schedule.
+fn schedule_drain() {
+    crate::executioncontext::fire_cpyext_dealloc_action();
 }
 
 // ── the immortal singletons ─────────────────────────────────────────────

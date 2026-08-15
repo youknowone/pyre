@@ -507,6 +507,17 @@ impl ExecutionContext {
     pub fn install_user_del_action(&mut self) {
         let actionflag = self.actionflag.shared_mut();
         install_space_user_del_action(self.space, actionflag);
+        #[cfg(all(
+            feature = "cpyext",
+            not(feature = "sandbox"),
+            any(target_os = "macos", target_os = "linux")
+        ))]
+        {
+            let space = self.space;
+            SPACE_CPYEXT_DEALLOC_ACTION.get_or_init(|| {
+                Box::into_raw(PyObjDeallocAction::new(space, actionflag)) as usize
+            });
+        }
         crate::module::gc::hook::initialize(self.space, actionflag);
         pyre_object::gc_hook::register_maybe_finalizer_hook(maybe_register_user_finalizer);
     }
@@ -2630,6 +2641,97 @@ impl AsyncActionOps for UserDelAction {
 
     fn async_action_mut(&mut self) -> &mut AsyncAction {
         &mut self.base
+    }
+}
+
+/// `pypy/module/cpyext/state.py:220-224 PyObjDeallocAction` — run the
+/// deallocators of the mirrors the collector has queued.
+///
+/// Separate from [`UserDelAction`] because it is a different queue with a
+/// different trigger: the collector fires this one from
+/// `incminimark.py:3248-3250` when a raw-refcount link has died, and the
+/// deallocator it runs is a C function rather than an app-level `__del__`.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub struct PyObjDeallocAction {
+    pub base: AsyncAction,
+}
+
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+const _: () = {
+    impl PyObjDeallocAction {
+        fn new(
+            space: PyObjectRef,
+            actionflag: &mut (dyn ActionFlagOps + 'static),
+        ) -> Box<PyObjDeallocAction> {
+            let mut action = Box::new(PyObjDeallocAction {
+                base: AsyncAction {
+                    space,
+                    _action_index: -1,
+                    bitmask: 0,
+                    actionflag: actionflag as *mut dyn ActionFlagOps,
+                },
+            });
+            let action_ptr: *mut dyn AsyncActionOps = &mut *action;
+            let index = actionflag.register_nonperiodic_action(action_ptr);
+            action.base._action_index = index;
+            action.base.bitmask = 1usize << (index as usize);
+            action
+        }
+    }
+
+    /// `state.py:222-224` — `perform` is `_rawrefcount_perform(self.space)`.
+    impl AsyncActionOps for PyObjDeallocAction {
+        fn perform(
+            &mut self,
+            _executioncontext: &mut ExecutionContext,
+            _frame: *mut PyFrame,
+        ) -> Result<AsyncActionControl, crate::PyError> {
+            crate::cpyext::pyobject::drain_dead();
+            Ok(AsyncActionControl::Continue)
+        }
+
+        fn async_action(&self) -> &AsyncAction {
+            &self.base
+        }
+
+        fn async_action_mut(&mut self) -> &mut AsyncAction {
+            &mut self.base
+        }
+    }
+};
+
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+static SPACE_CPYEXT_DEALLOC_ACTION: OnceLock<usize> = OnceLock::new();
+
+/// Schedule the drain.  Called from inside a collection, so it may do nothing
+/// but set the action flag's bit.
+///
+/// A no-op before the space has installed its actions: nothing can have created
+/// a mirror yet, so nothing can be queued.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+pub fn fire_cpyext_dealloc_action() {
+    let action = SPACE_CPYEXT_DEALLOC_ACTION
+        .get()
+        .copied()
+        .unwrap_or(0) as *mut PyObjDeallocAction;
+    if !action.is_null() {
+        unsafe { (*action).base.fire() };
     }
 }
 

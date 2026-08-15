@@ -214,12 +214,13 @@ pub const fn extension_suffix() -> &'static str {
     }
 }
 
-/// Forward/mark C-mirror links and cached module dictionaries.
+/// Forward/mark the cached module dictionaries.
 ///
-/// Cached dicts are interpreter-state roots just like PyPy's
-/// `State.extensions`; the mirror links are [`pyobject::walk_gc_roots`].
+/// These are interpreter-state roots just like PyPy's `State.extensions`.  The
+/// mirror links are *not* here: a P-link is a root only while the C side holds
+/// a reference, and the collector decides that itself
+/// (`pyobject::init_rawrefcount`).
 pub fn walk_gc_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    pyobject::walk_gc_roots(visitor);
     if !EXTENSIONS_ACTIVE.load(Ordering::Acquire) {
         return;
     }
@@ -700,6 +701,9 @@ pub fn exec_dynamic(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
 /// hooks each module registers; pyre has one call because the mirrors it
 /// prepares are the singletons and the exception types.
 fn initialize() {
+    // First: every mirror below creates a P-link, and a link needs the
+    // collector's rawrefcount state to exist.
+    pyobject::init_rawrefcount();
     pyobject::init_singletons();
     pyerrors::init_exception_mirrors();
 }

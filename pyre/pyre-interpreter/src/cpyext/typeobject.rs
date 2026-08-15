@@ -6,7 +6,7 @@
 //! block of the same shape, so `Py_TYPE(x)->tp_name` reads something either
 //! way.
 
-use super::pyobject::{self, CPyObject, REFCNT_IMMORTAL};
+use super::pyobject::{self, CPyObject, REFCNT_FROM_PYRE, REFCNT_IMMORTAL};
 use pyre_object::PyObjectRef;
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
@@ -311,6 +311,25 @@ fn c_bases(w_type: PyObjectRef) -> Vec<*mut CPyTypeObject> {
     out
 }
 
+/// A dying mirror's `tp_dealloc`, read off its own `ob_type`.
+///
+/// `cpyext/src/object.c:75-78 _Py_Dealloc` reads `obj->ob_type` directly and
+/// performs no MRO walk: by the time a mirror is being deallocated its link is
+/// already the deallocating marker, so there is no interpreter type to walk.
+/// `PyType_Ready`'s `inherit_slots` is what put a base's `tp_dealloc` on the
+/// subtype, so the single read finds it.
+///
+/// # Safety
+/// `raw` must be a live mirror.
+pub(super) unsafe fn tp_dealloc_of(raw: *mut CPyObject) -> Option<*const c_void> {
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null() {
+        return None;
+    }
+    let slot = unsafe { (*tp).tp_dealloc };
+    if slot.is_null() { None } else { Some(slot) }
+}
+
 /// The nearest non-null `pick`ed slot along `w_type`'s MRO.
 fn find_slot(w_type: PyObjectRef, pick: fn(*mut CPyTypeObject) -> *const c_void) -> *const c_void {
     for raw in c_bases(w_type) {
@@ -338,13 +357,10 @@ pub(super) fn slot_of(
 /// covers an instance some other path produced and gives it the zero-filled
 /// block its type declares.
 pub(super) fn instance_block(w_self: PyObjectRef) -> *mut CPyObject {
-    let raw = pyobject::as_pyobj(w_self);
-    if !raw.is_null() {
-        return raw;
-    }
-    // The reference is not released: an instance mirror is immortal for the
-    // reason `PyType_GenericAlloc` documents.
-    pyobject::make_ref(w_self)
+    // Borrowed, not owned: the block's owner is the link, and the caller
+    // reached this through `w_self`, which keeps the instance — and therefore
+    // the block — alive for as long as it holds it.
+    pyobject::borrow_mirror(w_self)
 }
 
 // ── the descriptors a method / member / getset table becomes ────────────
@@ -2330,6 +2346,9 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
     if unsafe { (*tp).tp_alloc.is_null() } {
         unsafe { (*tp).tp_alloc = PyType_GenericAlloc as *const c_void };
     }
+    if unsafe { (*tp).tp_free.is_null() } {
+        unsafe { (*tp).tp_free = PyObject_Free as *const c_void };
+    }
     if unsafe { (*tp).tp_new.is_null() } {
         unsafe { (*tp).tp_new = PyType_GenericNew as *const c_void };
     }
@@ -2871,9 +2890,13 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(instance);
     let size = unsafe { (*tp).tp_basicsize + nitems.max(0) * (*tp).tp_itemsize } as usize;
+    // `tp_alloc` returns a new reference, so the count is the link share plus
+    // the one this call hands out.  Not immortal: the link is a rawrefcount
+    // P-link, so the instance dies when neither side holds it and the
+    // collector queues this block for `tp_dealloc`.
     let raw = pyobject::attach(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
-        REFCNT_IMMORTAL,
+        REFCNT_FROM_PYRE + 1,
         tp,
         size,
     );
@@ -2890,6 +2913,26 @@ pub unsafe extern "C" fn PyType_GenericNew(
     _kwds: *mut CPyObject,
 ) -> *mut CPyObject {
     unsafe { PyType_GenericAlloc(tp, 0) }
+}
+
+/// `cpyext/src/object.c:102-105 PyObject_Free` — the deallocator half of
+/// [`PyType_GenericAlloc`], and the `tp_free` every type inherits.
+///
+/// A `tp_dealloc` written for CPython ends in `Py_TYPE(self)->tp_free(self)`,
+/// so this has to exist and has to be reachable through the slot before any
+/// `tp_dealloc` is dispatched.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_Free(object: *mut std::ffi::c_void) {
+    if object.is_null() {
+        return;
+    }
+    unsafe { pyobject::free_block(object as *mut CPyObject) };
+}
+
+/// `PyObject_Del` — the older spelling of [`PyObject_Free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_Del(object: *mut std::ffi::c_void) {
+    unsafe { PyObject_Free(object) };
 }
 
 /// `PyObject_Init` — stamp a block's header.  The block a C extension hands in
@@ -3014,6 +3057,8 @@ fn new_exception(
 
 pub(super) fn ensure_linked() {
     std::hint::black_box(&raw const CPY_MODULE_DEF_TYPE);
+    std::hint::black_box(PyObject_Free as *const ());
+    std::hint::black_box(PyObject_Del as *const ());
     std::hint::black_box(PyType_Ready as *const ());
     std::hint::black_box(PyType_Check as *const ());
     std::hint::black_box(PyType_IsSubtype as *const ());

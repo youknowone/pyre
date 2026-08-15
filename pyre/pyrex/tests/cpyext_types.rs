@@ -427,3 +427,60 @@ fn defines_types_from_c() {
     fixtures.compile("cpyext_types");
     fixtures.expect_ok(SCRIPT, &[], "cpyext-types-ok");
 }
+
+/// Both halves of the `rawrefcount` P-link rule, neither of which any other
+/// test observes: a mirror at exactly the link share does not root its object,
+/// so the instance dies and its `tp_dealloc` runs; a mirror above the link
+/// share does root it (`rawrefcount.rst`, "mark 'p' as surviving").
+///
+/// Every step needs a real collection between the drop and the observation,
+/// and one more after it: the dead queue is drained by an async action that
+/// runs *after* the collection that filled it, so the reference it releases is
+/// only reclaimable by the next one.
+///
+/// A cycle running through a C reference is deliberately not asserted here.
+/// It is not collectable — that needs `tp_traverse`/`tp_clear` participation,
+/// which no `rawrefcount` collection consults, upstream included.
+const LIFETIME_SCRIPT: &str = r#"
+import gc
+import weakref
+import cpyext_types as m
+
+# ── an instance nothing holds is deallocated ───────────────────────────
+before = m.owner_deallocs()
+for _ in range(16):
+    m.Owner()
+gc.collect()
+after = m.owner_deallocs()
+assert after > before, f'no Owner was deallocated: {before} -> {after}'
+
+# ── a C reference roots its object ─────────────────────────────────────
+class Node:
+    pass
+
+node = Node()
+ref = weakref.ref(node)
+owner = m.Owner(node)
+del node
+gc.collect()
+gc.collect()
+assert ref() is not None, 'a C reference did not keep its object alive'
+
+# ── and releasing it lets the object go ────────────────────────────────
+before = m.owner_deallocs()
+del owner
+gc.collect()
+after = m.owner_deallocs()
+assert after > before, f'the last Owner was not deallocated: {before} -> {after}'
+gc.collect()
+assert ref() is None, 'releasing the C reference did not let the object go'
+
+print('cpyext-lifetime-ok')
+"#;
+
+#[test]
+fn a_c_reference_roots_its_object_and_releasing_it_lets_it_go() {
+    let fixtures = Fixtures::new("cpyext-lifetime");
+    fixtures.compile("cpyext_types");
+    fixtures.expect_ok(LIFETIME_SCRIPT, &[], "cpyext-lifetime-ok");
+}
