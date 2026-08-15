@@ -3281,23 +3281,12 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
     new_shadow_graph_with_portal_inputs(code, FrameInputs::None)
 }
 
-fn attach_materialized_exception_edge(
+fn attach_materialized_exception_link(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
     edge_state: &FrameState,
 ) -> super::flow::LinkRef {
-    // `flowcontext.py:148-149 guessexception` sets
-    // `block.exitswitch = c_last_exception` before the link is
-    // attached.  Run the source-block side first so that the link
-    // construction below sees a stable target/source pair.
-    {
-        let mut block_mut = block.borrow_mut();
-        block_mut.exitswitch = Some(super::flow::ExitSwitch::Value(
-            super::flow::c_last_exception().into(),
-        ));
-    }
-
     // Update the landing block's framestate / inputargs from the
     // edge state.  Note: RPython models each
     // raise site with its own `EggBlock(vars2, block, case)`
@@ -3341,6 +3330,20 @@ fn attach_materialized_exception_edge(
     append_exit(block, link.clone());
     target.add_incoming_exception_link(link.clone());
     link
+}
+
+fn attach_materialized_exception_edge(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    target: &SpamBlockRef,
+    edge_state: &FrameState,
+) -> super::flow::LinkRef {
+    // `flowcontext.py:148-149 guessexception` marks the source block as
+    // can-raise before attaching the materialized exception link.
+    block.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(
+        super::flow::c_last_exception().into(),
+    ));
+    attach_materialized_exception_link(graph, block, target, edge_state)
 }
 
 fn attach_catch_exception_edge(
@@ -11212,7 +11215,7 @@ impl CodeWriter {
                                     &stop_match_state,
                                     &site,
                                 );
-                                attach_materialized_exception_edge(
+                                attach_materialized_exception_link(
                                     &mut graph,
                                     &stop_match.block(),
                                     &site.landing,
@@ -16412,6 +16415,34 @@ mod tests {
             !ops.iter()
                 .any(|op| op.key == "goto_if_exception_mismatch/iL"),
             "FOR_ITER must not use the RPython-class typed catch opcode"
+        );
+    }
+
+    #[test]
+    fn for_iter_inside_try_keeps_bool_landing_exitswitch() {
+        let code = first_nested_function_code(
+            "def f(n):\n    total = 0\n    try:\n        for value in range(n):\n            total += value\n    except ValueError:\n        return -1\n    return total\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("FOR_ITER inside a try range must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        assert!(
+            ops.iter().any(|op| op.key == "goto_if_not/iL"),
+            "FOR_ITER's exception-match landing must retain its bool exitswitch"
         );
     }
 
