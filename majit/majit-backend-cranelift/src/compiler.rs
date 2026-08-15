@@ -336,15 +336,26 @@ fn jitframe_gc_type_id_is_explicit() -> bool {
 /// layout, item size, and custom-trace hook stay in sync with every
 /// other consumer of JITFRAME.
 fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
-    if gc.type_count() == 0 {
-        return None; // Stub GC (TrackingGc), no type registry
-    }
     if jitframe_gc_type_id_is_explicit() {
         let id = jitframe_gc_type_id();
         assert_ne!(id, u32::MAX, "explicit JITFRAME GC type id missing");
         return Some(id);
     }
+    // The stub test is `did the registration take`, asked AFTER registering.
+    //
+    // `GcAllocator::register_type`'s default body returns 0 and records
+    // nothing, so an allocator with no type table accepts the call and still
+    // reports `type_count() == 0` afterwards. Asking BEFORE registering is a
+    // different question — whether some OTHER type was registered first — and
+    // it answers "no type table" for a collector whose registry is merely
+    // still empty. Every fixture in this file that wants a nursery-allocated
+    // jitframe had to register a throwaway type to get past that reading, and
+    // a frontend that registers the JITFRAME id before any of its own types
+    // would have silently fallen back to the off-GC frame.
     let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+    if gc.type_count() == 0 {
+        return None; // No type table (test-double allocators)
+    }
     set_jitframe_gc_type_id_lazy(id);
     Some(id)
 }
@@ -18093,10 +18104,12 @@ mod tests {
             large_object_threshold: 1 << 20,
             ..GcConfig::default()
         });
-        // eval.rs registers regular GC types before installing the backend.
-        // Keep this fixture on the same path so set_gc_allocator() can lazily
-        // register JITFRAME instead of tripping the "type id not registered"
-        // assertion that only exists for half-initialized test runtimes.
+        // eval.rs registers regular GC types before installing the backend, so
+        // JITFRAME is never type id 0 in production. Keep this fixture on the
+        // same path: `install_call_assembler_test_layout` publishes whatever id
+        // the lazy registration assigns, and a fixture that made JITFRAME the
+        // first type would be exercising an id the shipped configuration
+        // cannot produce.
         gc.register_type(TypeInfo::simple(16));
         CraneliftBackend::with_gc_allocator(Box::new(gc))
     }
@@ -24991,6 +25004,90 @@ mod tests {
         assert!(!moved_root.is_null());
         assert_ne!(moved_root, root);
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0x12345678);
+    }
+
+    /// A held deadframe whose JITFRAME is nursery-born survives a collection
+    /// that MOVES the frame.
+    ///
+    /// `test_deadframe_ref_survives_collection_after_execute_token` above runs
+    /// on a 160-byte nursery, which no jitframe fits in, so its frame is born
+    /// old-gen and never moves: what it checks is that a REF INSIDE the frame
+    /// was forwarded. `jitframe.py:33-60` makes JITFRAME an ordinary GcStruct
+    /// and `llmodel.py:298 malloc_jitframe` allocates it like any other object,
+    /// so the frame itself is nursery-born and a minor collection promotes it
+    /// to a different address — and every accessor on the deadframe reads
+    /// through `jf_gcref`, which is stale the moment that happens.
+    ///
+    /// What makes it not stale is that `register_roots` hands the collector the
+    /// ADDRESS OF THE SLOT (`add_root(&mut self.jf_gcref)`) rather than the
+    /// address of the frame, so the promotion rewrites the holder's pointer.
+    /// The assertion that the frame moved is therefore load-bearing: without
+    /// it a run where the frame happened to stay put would pass while proving
+    /// nothing, which is exactly what the old-gen fixture next door does.
+    #[test]
+    fn test_deadframe_nursery_jitframe_moves_across_collection() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe {
+            *(root.0 as *mut u64) = 0x5EED_5EED;
+        }
+
+        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(1510);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+
+        let frame_addr = |frame: &DeadFrame| {
+            frame
+                .data
+                .downcast_ref::<JitFrameDeadFrame>()
+                .expect("cranelift deadframes are JitFrameDeadFrame")
+                .jf_gcref
+        };
+        let before = frame_addr(&frame);
+        assert!(
+            with_cranelift_gc_required(|gc| gc.is_nursery_object(before.0)),
+            "the frame must be nursery-born, or the promotion this test is \
+             about cannot happen"
+        );
+
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
+
+        let after = frame_addr(&frame);
+        assert_ne!(
+            after, before,
+            "a surviving nursery object is promoted, so the frame address must \
+             have changed; if it did not, this run cannot tell a rewritten \
+             root slot from an unmoved frame"
+        );
+        assert!(
+            !with_cranelift_gc_required(|gc| gc.is_nursery_object(after.0)),
+            "the promoted frame belongs to the old generation"
+        );
+
+        let moved_root = backend.get_ref_value(&frame, 0);
+        assert!(!moved_root.is_null());
+        assert_ne!(moved_root, root);
+        assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0x5EED_5EED);
     }
 
     #[test]
