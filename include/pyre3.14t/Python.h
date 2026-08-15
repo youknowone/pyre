@@ -19,6 +19,7 @@ extern "C" {
    >= 0x030E00F0` extension on its pre-release branch. */
 #define PY_VERSION_HEX 0x030E06F0
 #define PYTHON_API_VERSION 1013
+#define PYTHON_ABI_VERSION 3
 
 #if defined(_WIN32)
 #  define PyAPI_FUNC(RTYPE) __declspec(dllimport) RTYPE
@@ -460,9 +461,23 @@ PyAPI_FUNC(PyObject *) PyType_FromSpec(PyType_Spec *spec);
 PyAPI_FUNC(PyObject *) PyType_FromSpecWithBases(PyType_Spec *spec, PyObject *bases);
 PyAPI_FUNC(PyObject *) PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *spec,
                                                 PyObject *bases);
+PyAPI_FUNC(PyObject *) PyType_FromMetaclass(PyTypeObject *metaclass, PyObject *module,
+                                            PyType_Spec *spec, PyObject *bases);
 PyAPI_FUNC(void *) PyType_GetSlot(PyTypeObject *type, int slot);
 PyAPI_FUNC(PyObject *) PyType_GetName(PyTypeObject *type);
 PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyType_GetModuleName(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyType_GetFullyQualifiedName(PyTypeObject *type);
+PyAPI_FUNC(PyObject *) PyType_GetModule(PyTypeObject *type);
+PyAPI_FUNC(void *) PyType_GetModuleState(PyTypeObject *type);
+/* `PyType_GetModuleByDef` needs `PyModuleDef`, so it is declared with it. */
+PyAPI_FUNC(int) PyType_GetBaseByToken(PyTypeObject *type, void *token, PyTypeObject **result);
+PyAPI_FUNC(Py_ssize_t) PyType_GetTypeDataSize(PyTypeObject *type);
+PyAPI_FUNC(void *) PyObject_GetTypeData(PyObject *object, PyTypeObject *type);
+PyAPI_FUNC(void *) PyObject_GetItemData(PyObject *object);
+PyAPI_FUNC(void) PyType_Modified(PyTypeObject *type);
+PyAPI_FUNC(unsigned int) PyType_ClearCache(void);
+PyAPI_FUNC(int) PyType_Freeze(PyTypeObject *type);
 
 #define Py_bf_getbuffer 1
 #define Py_bf_releasebuffer 2
@@ -545,6 +560,10 @@ PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *type);
 #define Py_am_anext 79
 #define Py_tp_finalize 80
 #define Py_am_send 81
+#define Py_tp_vectorcall 82
+#define Py_tp_token 83
+/* The `Py_tp_token` value asking for the spec's own address as the token. */
+#define Py_TP_USE_SPEC NULL
 #define PyObject_TypeCheck(ob, type) \
     (Py_TYPE(ob) == (type) || PyType_IsSubtype(Py_TYPE(ob), (type)))
 #define PyObject_New(type, tp) ((type *)PyType_GenericAlloc((tp), 0))
@@ -614,9 +633,26 @@ typedef struct PyModuleDef {
 PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *def);
 PyAPI_FUNC(PyObject *) PyModule_Create2(PyModuleDef *def, int api_version);
 #define PyModule_Create(module) PyModule_Create2((module), PYTHON_API_VERSION)
+PyAPI_FUNC(PyObject *) PyModule_FromDefAndSpec2(PyModuleDef *def, PyObject *spec,
+                                                int api_version);
+#define PyModule_FromDefAndSpec(module, spec) \
+    PyModule_FromDefAndSpec2((module), (spec), PYTHON_API_VERSION)
+PyAPI_FUNC(int) PyModule_ExecDef(PyObject *module, PyModuleDef *def);
+PyAPI_FUNC(PyObject *) PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def);
+PyAPI_FUNC(PyObject *) PyModule_New(const char *name);
+PyAPI_FUNC(PyObject *) PyModule_NewObject(PyObject *name);
+PyAPI_FUNC(int) PyModule_Check(PyObject *object);
+PyAPI_FUNC(int) PyModule_CheckExact(PyObject *object);
 PyAPI_FUNC(PyObject *) PyModule_GetDict(PyObject *module);
 PyAPI_FUNC(void *) PyModule_GetState(PyObject *module);
 PyAPI_FUNC(PyModuleDef *) PyModule_GetDef(PyObject *module);
+PyAPI_FUNC(const char *) PyModule_GetName(PyObject *module);
+PyAPI_FUNC(PyObject *) PyModule_GetNameObject(PyObject *module);
+PyAPI_FUNC(const char *) PyModule_GetFilename(PyObject *module);
+PyAPI_FUNC(PyObject *) PyModule_GetFilenameObject(PyObject *module);
+PyAPI_FUNC(int) PyModule_SetDocString(PyObject *module, const char *doc);
+PyAPI_FUNC(int) PyModule_AddFunctions(PyObject *module, PyMethodDef *functions);
+PyAPI_FUNC(int) PyModule_Add(PyObject *module, const char *name, PyObject *value);
 PyAPI_FUNC(int) PyModule_AddObject(PyObject *module, const char *name, PyObject *value);
 PyAPI_FUNC(int) PyModule_AddObjectRef(PyObject *module, const char *name, PyObject *value);
 PyAPI_FUNC(int) PyModule_AddIntConstant(PyObject *module, const char *name, Py_ssize_t value);

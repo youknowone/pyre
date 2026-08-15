@@ -13,6 +13,12 @@ const PY_MOD_CREATE: c_int = 1;
 /// `Py_mod_exec`.
 const PY_MOD_EXEC: c_int = 2;
 
+/// The two versions a module may declare: the full API version an extension
+/// built against `Python.h` carries, and the stable-ABI one a limited-API
+/// build carries instead.  Both must match `Python.h`.
+const PYTHON_API_VERSION: c_int = 1013;
+const PYTHON_ABI_VERSION: c_int = 3;
+
 /// Reserved module-dict keys.
 ///
 /// CPython keeps `md_def` and `md_state` in the module object's own C struct.
@@ -373,13 +379,19 @@ pub(super) fn has_module_state(module: PyObjectRef) -> bool {
     stored_address(module, MD_STATE_KEY) != 0
 }
 
-/// `modsupport.py:exec_def` — the PEP 489 exec phase.
+/// `modsupport.py:exec_def` — the PEP 489 exec phase, on the definition the
+/// module recorded for itself.
 pub(super) fn exec_def(module: PyObjectRef) -> Result<(), crate::PyError> {
     let address = stored_address(module, MD_DEF_KEY);
     if address == 0 {
         return Ok(());
     }
-    let def = address as *mut CPyModuleDef;
+    exec_def_of(module, address as *mut CPyModuleDef)
+}
+
+/// The exec phase against an explicitly named definition, which is the form
+/// `PyModule_ExecDef` hands in.
+fn exec_def_of(module: PyObjectRef, def: *mut CPyModuleDef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(module);
@@ -559,6 +571,301 @@ pub unsafe extern "C" fn PyModule_AddStringConstant(
     0
 }
 
+/// `module.py:24` with the name object kept as it arrived: a module name can
+/// carry a lone surrogate, so projecting it through a `&str` would lose the
+/// buffer the caller handed over.
+///
+/// The four entries beyond `__name__` are the ones a module built this way is
+/// documented to arrive with; `__file__` is deliberately not among them, and
+/// is the caller's to add.
+fn new_module(w_name: PyObjectRef) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_name);
+    // The empty name is the anonymous-module sentinel, so the name is attached
+    // afterwards rather than through the allocation.
+    let module = pyre_object::w_module_new_managed("");
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(module);
+    let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
+    unsafe { pyre_object::w_module_set_name(reload(module_slot), reload(name_slot)) };
+    store(reload(module_slot), "__name__", reload(name_slot));
+    for key in ["__doc__", "__package__", "__loader__", "__spec__"] {
+        store(reload(module_slot), key, pyre_object::w_none());
+    }
+    reload(module_slot)
+}
+
+/// `modsupport.py:PyModule_New` — only `__name__` is filled in; `__file__` is
+/// the caller's to provide.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_New(name: *const c_char) -> *mut CPyObject {
+    if name.is_null() {
+        unsafe { pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let name = text_or_empty(name);
+    pyobject::make_ref(new_module(pyre_object::w_str_new(&name)))
+}
+
+/// `modsupport.py:PyModule_NewObject`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_NewObject(name: *mut CPyObject) -> *mut CPyObject {
+    let w_name = unsafe { pyobject::from_ref(name) };
+    if w_name.is_null() {
+        unsafe { pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(new_module(w_name))
+}
+
+/// The `__name__` a module reports.
+///
+/// Upstream reads `w_mod.w_name`, the name frozen at construction; the module
+/// dictionary is read here instead so that a module renamed after import
+/// reports the new name, and every module pyre builds seeds both from the same
+/// object.
+fn module_name_object(module: PyObjectRef, function: &str) -> Option<PyObjectRef> {
+    let dict = module_dict(module);
+    let name = if dict.is_null() {
+        None
+    } else {
+        unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(dict, "__name__") }
+    };
+    match name {
+        Some(name) if unsafe { pyre_object::is_str(name) } => Some(name),
+        _ => {
+            pyerrors::set_pending_error(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("{function}(): nameless module"),
+            ));
+            None
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetNameObject(module: *mut CPyObject) -> *mut CPyObject {
+    let Some(module) = module_argument(module, "PyModule_GetNameObject") else {
+        return std::ptr::null_mut();
+    };
+    let Some(name) = module_name_object(module, "PyModule_GetNameObject") else {
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(name)
+}
+
+/// The buffer belongs to the name's mirror, which the module dictionary keeps
+/// alive for as long as the module — the lifetime upstream relies on for the
+/// same `char *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetName(module: *mut CPyObject) -> *const c_char {
+    let Some(module) = module_argument(module, "PyModule_GetName") else {
+        return std::ptr::null();
+    };
+    let Some(name) = module_name_object(module, "PyModule_GetName") else {
+        return std::ptr::null();
+    };
+    unsafe { super::unicodeobject::PyUnicode_AsUTF8(pyobject::borrow_mirror(name)) }
+}
+
+/// The `__file__` a module was loaded from.
+///
+/// A missing or non-`str` entry is the `SystemError` the entry point is
+/// documented to raise, rather than the `KeyError` a plain `getitem` would
+/// surface.
+fn module_filename_object(module: PyObjectRef, function: &str) -> Option<PyObjectRef> {
+    let dict = module_dict(module);
+    let file = if dict.is_null() {
+        None
+    } else {
+        unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(dict, "__file__") }
+    };
+    match file {
+        Some(file) if unsafe { pyre_object::is_str(file) } => Some(file),
+        _ => {
+            pyerrors::set_pending_error(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("{function}(): module filename missing"),
+            ));
+            None
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetFilenameObject(module: *mut CPyObject) -> *mut CPyObject {
+    let Some(module) = module_argument(module, "PyModule_GetFilenameObject") else {
+        return std::ptr::null_mut();
+    };
+    let Some(file) = module_filename_object(module, "PyModule_GetFilenameObject") else {
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(file)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetFilename(module: *mut CPyObject) -> *const c_char {
+    let Some(module) = module_argument(module, "PyModule_GetFilename") else {
+        return std::ptr::null();
+    };
+    let Some(file) = module_filename_object(module, "PyModule_GetFilename") else {
+        return std::ptr::null();
+    };
+    unsafe { super::unicodeobject::PyUnicode_AsUTF8(pyobject::borrow_mirror(file)) }
+}
+
+/// Releases `value` whether the store succeeds or not, which is what makes
+/// this the spelling that composes with a call producing a new reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_Add(
+    module: *mut CPyObject,
+    name: *const c_char,
+    value: *mut CPyObject,
+) -> c_int {
+    let result = unsafe { PyModule_AddObjectRef(module, name, value) };
+    if !value.is_null() {
+        unsafe { pyobject::decref(value) };
+    }
+    result
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_SetDocString(
+    module: *mut CPyObject,
+    doc: *const c_char,
+) -> c_int {
+    let Some(module) = module_argument(module, "PyModule_SetDocString") else {
+        return -1;
+    };
+    if doc.is_null() {
+        unsafe { pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let text = text_or_empty(doc);
+    let roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(module);
+    let value = pyre_object::w_str_new(&text);
+    store(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        "__doc__",
+        value,
+    );
+    0
+}
+
+/// `modsupport.py:PyModule_AddFunctions`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_AddFunctions(
+    module: *mut CPyObject,
+    methods: *mut CPyMethodDef,
+) -> c_int {
+    let Some(module) = module_argument(module, "PyModule_AddFunctions") else {
+        return -1;
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(module);
+    let Some(name) = module_name_object(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        "PyModule_AddFunctions",
+    ) else {
+        return -1;
+    };
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(name);
+    if trap(convert_method_defs(
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        methods,
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    ))
+    .is_none()
+    {
+        return -1;
+    }
+    0
+}
+
+/// `modsupport.py:PyModule_ExecDef` — the exec phase driven by the caller
+/// rather than by import, against the definition it names.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_ExecDef(module: *mut CPyObject, def: *mut CPyModuleDef) -> c_int {
+    let Some(module) = module_argument(module, "PyModule_ExecDef") else {
+        return -1;
+    };
+    if def.is_null() {
+        unsafe { pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    if trap(exec_def_of(module, def)).is_none() {
+        return -1;
+    }
+    0
+}
+
+/// `modsupport.py:PyModule_FromDefAndSpec2` — the PEP 489 create phase reached
+/// from C instead of from import, so the module records no `__file__`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_FromDefAndSpec2(
+    def: *mut CPyModuleDef,
+    spec: *mut CPyObject,
+    module_api_version: c_int,
+) -> *mut CPyObject {
+    if def.is_null() {
+        unsafe { pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let w_spec = if spec.is_null() {
+        pyre_object::w_none()
+    } else {
+        unsafe { pyobject::from_ref(spec) }
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_spec);
+    let Some(name) = trap(
+        crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(spec_slot),
+            "name",
+        )
+        .and_then(|w_name| crate::baseobjspace::text_w(w_name).map(str::to_owned)),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    if module_api_version != PYTHON_API_VERSION && module_api_version != PYTHON_ABI_VERSION {
+        let truncated: String = name.chars().take(100).collect();
+        let message = format!(
+            "Python C API version mismatch for module {truncated}: \
+             This Python has API version {PYTHON_API_VERSION}, \
+             module {truncated} has version {module_api_version}."
+        );
+        if trap(crate::warn::warn_category(&message, "RuntimeWarning", 1)).is_none() {
+            return std::ptr::null_mut();
+        }
+    }
+    let Some(module) = trap(create_module_from_def_and_spec(
+        def,
+        pyre_object::gc_roots::shadow_stack_get(spec_slot),
+        &name,
+        None,
+    )) else {
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(module)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_Check(object: *mut CPyObject) -> c_int {
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && unsafe { pyre_object::module::is_module(object) }) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_CheckExact(object: *mut CPyObject) -> c_int {
+    unsafe { PyModule_Check(object) }
+}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyModuleDef_Init as *const ());
     std::hint::black_box(PyModule_Create2 as *const ());
@@ -569,4 +876,17 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyModule_AddObjectRef as *const ());
     std::hint::black_box(PyModule_AddIntConstant as *const ());
     std::hint::black_box(PyModule_AddStringConstant as *const ());
+    std::hint::black_box(PyModule_New as *const ());
+    std::hint::black_box(PyModule_NewObject as *const ());
+    std::hint::black_box(PyModule_GetName as *const ());
+    std::hint::black_box(PyModule_GetNameObject as *const ());
+    std::hint::black_box(PyModule_GetFilename as *const ());
+    std::hint::black_box(PyModule_GetFilenameObject as *const ());
+    std::hint::black_box(PyModule_Add as *const ());
+    std::hint::black_box(PyModule_SetDocString as *const ());
+    std::hint::black_box(PyModule_AddFunctions as *const ());
+    std::hint::black_box(PyModule_ExecDef as *const ());
+    std::hint::black_box(PyModule_FromDefAndSpec2 as *const ());
+    std::hint::black_box(PyModule_Check as *const ());
+    std::hint::black_box(PyModule_CheckExact as *const ());
 }

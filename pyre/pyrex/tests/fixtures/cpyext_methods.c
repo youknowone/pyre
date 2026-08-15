@@ -884,7 +884,139 @@ static PyObject *m_gc_window(PyObject *self, PyObject *args)
     return PyLong_FromLong(total);
 }
 
+/* A table added to a module after it was created, which is what
+   `PyModule_AddFunctions` exists for. */
+static PyObject *m_added(PyObject *self, PyObject *unused)
+{
+    (void)unused;
+    return PyModule_GetNameObject(self);
+}
+
+static PyMethodDef added_methods[] = {
+    {"added", m_added, METH_NOARGS, "the name of the module this was added to"},
+    {NULL, NULL, 0, NULL},
+};
+
+/* The module constructors and accessors, driven from a module that already
+   exists so the definition and the state block are known. */
+static PyObject *m_module_ops(PyObject *self, PyObject *unused)
+{
+    (void)unused;
+    PyObject *fresh = PyModule_New("cpyext_methods.fresh");
+    if (fresh == NULL) {
+        return NULL;
+    }
+    if (!PyModule_Check(fresh) || !PyModule_CheckExact(fresh)) {
+        PyErr_SetString(PyExc_SystemError, "PyModule_New did not make a module");
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    const char *fresh_name = PyModule_GetName(fresh);
+    if (fresh_name == NULL) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    if (PyModule_SetDocString(fresh, "a module built from C") < 0) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    /* `PyModule_Add` releases its argument whether or not the store worked,
+       so the count it is handed is the only one it consumes. */
+    PyObject *value = PyLong_FromLong(7);
+    if (value == NULL || PyModule_Add(fresh, "SEVEN", value) < 0) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    if (PyModule_AddFunctions(fresh, added_methods) < 0) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+
+    PyObject *name = PyUnicode_FromString("cpyext_methods.named");
+    if (name == NULL) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    PyObject *named = PyModule_NewObject(name);
+    Py_DECREF(name);
+    if (named == NULL) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    PyObject *named_name = PyModule_GetNameObject(named);
+    Py_DECREF(named);
+    if (named_name == NULL) {
+        Py_DECREF(fresh);
+        return NULL;
+    }
+
+    /* This module was imported from a file, so it has both spellings of the
+       name it was loaded from. */
+    PyObject *own_file = PyModule_GetFilenameObject(self);
+    if (own_file == NULL) {
+        Py_DECREF(fresh);
+        Py_DECREF(named_name);
+        return NULL;
+    }
+    const char *own_file_utf8 = PyModule_GetFilename(self);
+    if (own_file_utf8 == NULL) {
+        Py_DECREF(fresh);
+        Py_DECREF(named_name);
+        Py_DECREF(own_file);
+        return NULL;
+    }
+    const char *own_file_text = PyUnicode_AsUTF8(own_file);
+    if (own_file_text == NULL) {
+        Py_DECREF(fresh);
+        Py_DECREF(named_name);
+        Py_DECREF(own_file);
+        return NULL;
+    }
+    int same_file = strcmp(own_file_text, own_file_utf8) == 0;
+    Py_DECREF(own_file);
+
+    PyObject *result = Py_BuildValue(
+        "(NsNi)", fresh, fresh_name, named_name, same_file);
+    return result;
+}
+
+/* A module with no `__file__` reports the absence as an error rather than
+   handing back a missing entry. */
+static PyObject *m_module_no_file(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    PyObject *fresh = PyModule_New("cpyext_methods.bare");
+    if (fresh == NULL) {
+        return NULL;
+    }
+    PyObject *missing = PyModule_GetFilenameObject(fresh);
+    Py_DECREF(fresh);
+    if (missing == NULL) {
+        return NULL;
+    }
+    Py_DECREF(missing);
+    Py_RETURN_NONE;
+}
+
+/* The definition this fixture already carries, run a second time through the
+   entry points import would otherwise drive. */
+static PyObject *m_module_from_def(PyObject *self, PyObject *spec)
+{
+    PyObject *made = PyModule_FromDefAndSpec(&moduledef, spec);
+    if (made == NULL) {
+        return NULL;
+    }
+    if (PyModule_ExecDef(made, &moduledef) < 0) {
+        Py_DECREF(made);
+        return NULL;
+    }
+    return made;
+}
+
 static PyMethodDef methods[] = {
+    {"module_ops", m_module_ops, METH_NOARGS, "the module constructors"},
+    {"module_no_file", m_module_no_file, METH_NOARGS, "a module with no __file__"},
+    {"module_from_def", m_module_from_def, METH_O, "PyModule_FromDefAndSpec"},
     {"bump", (PyCFunction)m_bump, METH_NOARGS, "bump the module counter"},
     {"wrap", (PyCFunction)m_wrap, METH_O, NULL},
     {"add", (PyCFunction)m_add, METH_VARARGS, NULL},

@@ -300,6 +300,90 @@ assert len(s) == 21
 s.code = 4
 assert s.double() == 8
 
+# ── the module and the token a spec type carries ───────────────────────
+module, by_def_is_module, module_name, qualified = m.type_owner(m.Spec)
+assert module is m
+assert by_def_is_module == 1
+assert module_name == 'cpyext_types', module_name
+assert qualified == 'cpyext_types.Spec', qualified
+
+# Py_TP_USE_SPEC made the spec's own address the token, so Spec answers for
+# itself and Extra answers for Spec through its base.
+found, owner, extra_found, extra_owner, absent = m.type_token(m.Spec)
+assert (found, owner) == (1, m.Spec), (found, owner)
+assert (extra_found, extra_owner) == (0, None), (extra_found, extra_owner)
+assert absent == 0
+
+found, owner, extra_found, extra_owner, absent = m.type_token(m.Extra)
+assert (found, owner) == (1, m.Spec), (found, owner)
+assert (extra_found, extra_owner) == (1, m.Extra), (extra_found, extra_owner)
+assert absent == 0
+
+# A type built without a token matches none of them.
+found, owner, extra_found, extra_owner, absent = m.type_token(m.Point)
+assert (found, owner, extra_found, extra_owner, absent) == (0, None, 0, None, 0)
+
+try:
+    m.type_token_null(m.Spec)
+except SystemError:
+    pass
+else:
+    raise AssertionError('a NULL token was accepted')
+
+# ── a spec declaring storage relative to its base's ────────────────────
+assert issubclass(m.Extra, m.Spec)
+assert m.type_data_size(m.Extra) >= 16, m.type_data_size(m.Extra)
+# Spec declares a whole block, so it extends its base by nothing.
+assert m.type_data_size(m.Spec) == 0, m.type_data_size(m.Spec)
+
+e = m.Extra(9)
+assert e.code == 9
+e.set(3, 0.5)
+assert e.get() == (3, 0.5, 9), e.get()
+# The base's own storage is untouched by the extra data behind it.
+e.code = 11
+assert e.get() == (3, 0.5, 11), e.get()
+
+module, by_def_is_module, module_name, qualified = m.type_owner(m.Extra)
+assert module is m
+assert qualified == 'cpyext_types.Extra', qualified
+
+# A static type carries no module of its own.
+try:
+    m.type_owner(m.Point)
+except TypeError:
+    pass
+else:
+    raise AssertionError('a static type reported a module')
+
+# ── PyType_Freeze ──────────────────────────────────────────────────────
+class Mutable:
+    pass
+
+Mutable.before = 1
+m.freeze(Mutable)
+assert Mutable.before == 1
+try:
+    Mutable.after = 2
+except TypeError:
+    pass
+else:
+    raise AssertionError('a frozen class accepted an attribute')
+
+# A class whose base is still mutable cannot be frozen.
+class Derived(Mutable):
+    pass
+
+class Deeper(Derived):
+    pass
+
+try:
+    m.freeze(Deeper)
+except TypeError:
+    pass
+else:
+    raise AssertionError('a class with a mutable base was frozen')
+
 # ── tp_descr_get and tp_descr_set ──────────────────────────────────────
 class Holder:
     field = m.Doubler()

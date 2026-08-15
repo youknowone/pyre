@@ -8,7 +8,7 @@
 
 use super::pyobject::{self, CPyObject, REFCNT_FROM_PYRE, REFCNT_IMMORTAL};
 use pyre_object::PyObjectRef;
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
 /// `PyVarObject` — a `PyObject` with the variable-part length.
@@ -186,6 +186,8 @@ pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
 pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
 pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
 pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
+pub const PY_TPFLAGS_IMMUTABLETYPE: std::ffi::c_ulong = 1 << 8;
+pub const PY_TPFLAGS_ITEMS_AT_END: std::ffi::c_ulong = 1 << 23;
 
 /// The fast-subclass flags, in the order `inherit_special` tests them
 /// (`typeobject.py:492-509`): the first base that matches wins, so a type is
@@ -2576,6 +2578,8 @@ mod slot_id {
         AM_ANEXT = 79,
         TP_FINALIZE = 80,
         AM_SEND = 81,
+        TP_VECTORCALL = 82,
+        TP_TOKEN = 83,
     }
 }
 
@@ -2750,6 +2754,40 @@ fn single_base(bases: PyObjectRef) -> Result<*mut CPyTypeObject, crate::PyError>
     }
 }
 
+/// A type's `ht_module` and `ht_token`, which pyre has no heap-type struct to
+/// carry.
+///
+/// Both are keyed by the type's own address: a type built from a spec is
+/// leaked deliberately, so the key is stable for the life of the process.  The
+/// module is held as an owned mirror reference, and it is that reference — not
+/// the table — that roots it.
+type TypeSideTable = std::collections::HashMap<
+    usize,
+    usize,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+>;
+static TYPE_MODULES: super::ForkMutex<TypeSideTable> = super::ForkMutex::new(
+    TypeSideTable::with_hasher(std::hash::BuildHasherDefault::new()),
+);
+static TYPE_TOKENS: super::ForkMutex<TypeSideTable> = super::ForkMutex::new(
+    TypeSideTable::with_hasher(std::hash::BuildHasherDefault::new()),
+);
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe {
+        TYPE_MODULES.reinit_after_fork();
+        TYPE_TOKENS.reinit_after_fork();
+    }
+}
+
+/// The alignment a block of type data starts at, `_align_up`'s modulus: the
+/// strictest a C compiler gives any object, so a field of any type declared in
+/// the extra data is aligned wherever the base's fields end.
+fn align_up(size: isize) -> isize {
+    const ALIGNMENT: isize = super::pyobject::BLOCK_ALIGN as isize;
+    (size + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+}
+
 fn from_spec(
     spec: *mut CPyTypeSpec,
     bases: *mut CPyObject,
@@ -2766,24 +2804,65 @@ fn from_spec(
     let tp: *mut CPyTypeObject = Box::leak(Box::new(immortal_type()));
     unsafe {
         (*tp).tp_name = (*spec).name;
-        (*tp).tp_basicsize = (*spec).basicsize as isize;
         (*tp).tp_itemsize = (*spec).itemsize as isize;
         (*tp).tp_flags = (*spec).flags as std::ffi::c_ulong | PY_TPFLAGS_HEAPTYPE;
         (*tp).tp_base = single_base(pyobject::from_ref(bases))?;
     }
+    let mut token: *mut c_void = std::ptr::null_mut();
     let mut index = 0isize;
     loop {
         let entry = unsafe { (*spec).slots.offset(index) };
         if unsafe { (*spec).slots.is_null() } || unsafe { (*entry).slot } == 0 {
             break;
         }
-        apply_slot(tp, unsafe { (*entry).slot }, unsafe { (*entry).pfunc })?;
+        // `Py_tp_token` names no slot: it declares the type's identity, and
+        // the null it may carry is `Py_TP_USE_SPEC`, which asks for the spec's
+        // own address rather than for no token at all.
+        if unsafe { (*entry).slot } == slot_id::TP_TOKEN {
+            token = match unsafe { (*entry).pfunc } {
+                pfunc if pfunc.is_null() => spec as *mut c_void,
+                pfunc => pfunc,
+            };
+        } else {
+            apply_slot(tp, unsafe { (*entry).slot }, unsafe { (*entry).pfunc })?;
+        }
         index += 1;
     }
+
+    // The base's own size is what a relative or inherited `basicsize` is
+    // measured against, so it has to be final before either is resolved.
+    let base = unsafe { (*tp).tp_base };
+    if !base.is_null() {
+        ready(base)?;
+    }
+    let base_basicsize = if base.is_null() {
+        size_of::<CPyObject>() as isize
+    } else {
+        unsafe { (*base).tp_basicsize }
+    };
+    let declared = unsafe { (*spec).basicsize } as isize;
+    unsafe {
+        (*tp).tp_basicsize = match declared {
+            // Inherit: an extension that declares no storage of its own gets
+            // the block its base needs, not the bare header.
+            0 => base_basicsize,
+            // Extend: the magnitude is the extra data appended after the base,
+            // which is what `PyType_GetTypeDataSize` reports back.
+            negative if negative < 0 => align_up(base_basicsize) + align_up(-negative),
+            absolute => absolute,
+        };
+    }
+
     ready(tp)?;
-    // `module` is the owner `PyType_GetModuleState` would report; nothing
-    // reads it yet, and `__module__` comes from the spec's qualified name.
-    let _ = module;
+    if !token.is_null() {
+        TYPE_TOKENS.lock().insert(tp as usize, token as usize);
+    }
+    if !module.is_null() {
+        // An owned reference, which is what roots the module for as long as
+        // the type: the type itself is immortal, so nothing ever releases it.
+        unsafe { pyobject::incref(module) };
+        TYPE_MODULES.lock().insert(tp as usize, module as usize);
+    }
     let w_type = interpreter_type(tp);
     Ok(w_type)
 }
@@ -2888,8 +2967,8 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
     value as *mut c_void
 }
 
-/// `PyType_GetName` and `PyType_GetQualName` — the part of `tp_name` after the
-/// last dot, which is the name the interpreter type carries.
+/// `PyType_GetName` and `PyType_GetQualName` — `__name__`, which is the part
+/// of `tp_name` after the last dot for a type whose name arrived qualified.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_GetName(tp: *mut CPyTypeObject) -> *mut CPyObject {
     let w_type = interpreter_type(tp);
@@ -2897,8 +2976,7 @@ pub unsafe extern "C" fn PyType_GetName(tp: *mut CPyTypeObject) -> *mut CPyObjec
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    let name = unsafe { pyre_object::typeobject::w_type_get_name(w_type) };
-    pyobject::make_ref(pyre_object::w_str_new(&name))
+    pyobject::make_ref(unsafe { pyre_object::typeobject::w_type_get_name_obj(w_type) })
 }
 
 #[unsafe(no_mangle)]
@@ -3018,6 +3096,312 @@ pub unsafe extern "C" fn PyType_GetFlags(tp: *mut CPyTypeObject) -> std::ffi::c_
     unsafe { (*tp).tp_flags }
 }
 
+// ── what a type reports about its module, its token and its data ────────
+
+/// `tp_name` as it reads in a message, without pretending it is always there.
+fn type_name_of(tp: *mut CPyTypeObject) -> String {
+    if tp.is_null() || unsafe { (*tp).tp_name.is_null() } {
+        return "<unnamed>".to_string();
+    }
+    unsafe { CStr::from_ptr((*tp).tp_name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The module recorded for `tp` alone — no MRO walk, as `ht_module` is a field
+/// of one heap type and is never inherited.
+fn own_module(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    if tp.is_null() {
+        return std::ptr::null_mut();
+    }
+    TYPE_MODULES
+        .lock()
+        .get(&(tp as usize))
+        .map(|&address| address as *mut CPyObject)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Borrowed: the type's own reference is what keeps the module alive, and the
+/// type outlives every caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModule(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    if tp.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "PyType_GetModule: Type '{}' is not a heap type",
+            type_name_of(tp)
+        )));
+        return std::ptr::null_mut();
+    }
+    let module = own_module(tp);
+    if module.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "PyType_GetModule: Type '{}' has no associated module",
+            type_name_of(tp)
+        )));
+    }
+    module
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleState(tp: *mut CPyTypeObject) -> *mut c_void {
+    let module = unsafe { PyType_GetModule(tp) };
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { super::modsupport::PyModule_GetState(module) }
+}
+
+/// The nearest module along `tp`'s MRO built from `def`.
+///
+/// Borrowed for the same reason [`PyType_GetModule`] is.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleByDef(
+    tp: *mut CPyTypeObject,
+    def: *mut super::modsupport::CPyModuleDef,
+) -> *mut CPyObject {
+    if tp.is_null() || def.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    for base in c_bases(interpreter_type(tp)) {
+        let module = own_module(base);
+        if !module.is_null() && unsafe { super::modsupport::PyModule_GetDef(module) } == def {
+            return module;
+        }
+    }
+    super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+        "PyType_GetModuleByDef: No superclass of '{}' has the given module",
+        type_name_of(tp)
+    )));
+    std::ptr::null_mut()
+}
+
+/// `PyType_GetBaseByToken` — 1 with `result` filled, 0 for no match, -1 on a
+/// caller error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetBaseByToken(
+    tp: *mut CPyTypeObject,
+    token: *mut c_void,
+    result: *mut *mut CPyTypeObject,
+) -> c_int {
+    if !result.is_null() {
+        unsafe { *result = std::ptr::null_mut() };
+    }
+    if token.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyType_GetBaseByToken called with token=NULL",
+        ));
+        return -1;
+    }
+    if tp.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    // A static type has no heap-type superclass, so the walk cannot find one.
+    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+        return 0;
+    }
+    let wanted = token as usize;
+    for base in c_bases(interpreter_type(tp)) {
+        if TYPE_TOKENS.lock().get(&(base as usize)) != Some(&wanted) {
+            continue;
+        }
+        if !result.is_null() {
+            unsafe {
+                pyobject::incref(&raw mut (*base).ob_base.ob_base);
+                *result = base;
+            }
+        }
+        return 1;
+    }
+    0
+}
+
+/// The extra storage a type declared beyond its base's, which is the
+/// magnitude of a negative `PyType_Spec.basicsize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetTypeDataSize(tp: *mut CPyTypeObject) -> isize {
+    if tp.is_null() {
+        return 0;
+    }
+    let base = unsafe { (*tp).tp_base };
+    let base_basicsize = if base.is_null() {
+        size_of::<CPyObject>() as isize
+    } else {
+        unsafe { (*base).tp_basicsize }
+    };
+    let extra = unsafe { (*tp).tp_basicsize } - align_up(base_basicsize);
+    extra.max(0)
+}
+
+/// The address of that storage inside one instance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_GetTypeData(
+    object: *mut CPyObject,
+    tp: *mut CPyTypeObject,
+) -> *mut c_void {
+    if object.is_null() || tp.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let base = unsafe { (*tp).tp_base };
+    let base_basicsize = if base.is_null() {
+        size_of::<CPyObject>() as isize
+    } else {
+        unsafe { (*base).tp_basicsize }
+    };
+    unsafe { (object as *mut u8).offset(align_up(base_basicsize)) as *mut c_void }
+}
+
+/// The variable part of an instance of a type that put its items at the end.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_GetItemData(object: *mut CPyObject) -> *mut c_void {
+    if object.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let tp = unsafe { (*object).ob_type };
+    if tp.is_null() || unsafe { (*tp).tp_flags } & PY_TPFLAGS_ITEMS_AT_END == 0 {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "type '{}' does not have Py_TPFLAGS_ITEMS_AT_END",
+            type_name_of(tp)
+        )));
+        return std::ptr::null_mut();
+    }
+    unsafe { (object as *mut u8).offset((*tp).tp_basicsize) as *mut c_void }
+}
+
+/// `typeobject.py:PyType_Modified` — drop what the interpreter cached about a
+/// type whose C-side namespace has just been rewritten.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_Modified(tp: *mut CPyTypeObject) {
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() {
+        return;
+    }
+    // No key: the C caller says only that something changed.
+    unsafe { crate::baseobjspace::mutated(w_type, None) };
+}
+
+/// `PyType_ClearCache` — empty the method cache and report the version the
+/// entries it dropped were stamped with.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_ClearCache() -> c_uint {
+    crate::baseobjspace::clear_method_cache();
+    // Upstream's tag is a per-interpreter counter; pyre mints one identity per
+    // type instead, so the only honest whole-cache answer is that no single
+    // version described it.
+    0
+}
+
+/// `PyType_Freeze` — refuse further changes to a type's namespace.
+///
+/// Immutability is `flag_heaptype = false` here, the state every builtin type
+/// is already in, and it is what `type.__setattr__` consults.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let mro = unsafe { pyre_object::w_type_get_mro(w_type) };
+    if mro.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(
+            "unable to get the type MRO",
+        ));
+        return -1;
+    }
+    // The type itself is the head of its own MRO and is the one being frozen,
+    // so only what it inherits from has to be immutable already.
+    for &w_base in unsafe { (*mro).as_slice() }.iter().skip(1) {
+        if unsafe { pyre_object::w_type_is_heaptype(w_base) } {
+            super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+                "Creating immutable type {} from mutable base {}",
+                type_name_of(tp),
+                unsafe { pyre_object::typeobject::w_type_get_name(w_base) }
+            )));
+            return -1;
+        }
+    }
+    unsafe {
+        pyre_object::typeobject::w_type_set_heaptype(w_type, false);
+        if !tp.is_null() {
+            (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE;
+        }
+        crate::baseobjspace::mutated(w_type, None);
+    }
+    0
+}
+
+/// `__module__`, which is what a fully qualified name is built from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleName(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    super::object::result(crate::baseobjspace::getattr_str(w_type, "__module__"))
+}
+
+/// `module.qualname`, except for the two module names a name is never
+/// qualified by.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetFullyQualifiedName(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let w_qualname = unsafe { pyre_object::typeobject::w_type_get_name_obj(w_type) };
+    let qualified = unsafe { pyre_object::w_str_get_wtf8(w_qualname) }.to_string();
+    // Naming the type object once more through its mirror, which never moves:
+    // the name above may have been minted, and an allocation is the one thing
+    // that can leave the pointer read before it stale.
+    let module = crate::baseobjspace::getattr_str(interpreter_type(tp), "__module__")
+        .ok()
+        .filter(|&w_module| unsafe { pyre_object::is_str(w_module) })
+        .map(|w_module| unsafe { pyre_object::w_str_get_wtf8(w_module) }.to_string());
+    // A missing `__module__` is not the caller's problem: the bare name is
+    // still the answer, so the lookup's own error goes no further.
+    super::pyerrors::take_pending_error();
+    let name = match module.as_deref() {
+        Some("builtins") | Some("__main__") | None => qualified,
+        Some(module) => format!("{module}.{qualified}"),
+    };
+    pyobject::make_ref(pyre_object::w_str_new(&name))
+}
+
+/// `PyType_FromMetaclass` — the general form of [`PyType_FromModuleAndSpec`].
+///
+/// The metaclass a type is built through is `type` itself here: pyre builds a
+/// type through its own constructor, which has no place to put another one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_FromMetaclass(
+    metaclass: *mut CPyTypeObject,
+    module: *mut CPyObject,
+    spec: *mut CPyTypeSpec,
+    bases: *mut CPyObject,
+) -> *mut CPyObject {
+    if !metaclass.is_null() {
+        let w_metaclass = interpreter_type(metaclass);
+        if w_metaclass.is_null() || w_metaclass != crate::typedef::w_type() {
+            super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+                "Metaclass '{}' is not supported; only 'type' is",
+                type_name_of(metaclass)
+            )));
+            return std::ptr::null_mut();
+        }
+    }
+    super::object::result(from_spec(spec, bases, module))
+}
+
 /// `PyErr_NewExceptionWithDoc` — `type(name, bases, {'__doc__': doc})`.
 ///
 /// Built through the interpreter's own `type` rather than [`PyType_Ready`]:
@@ -3118,6 +3502,19 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyObject_Init as *const ());
     std::hint::black_box(PyErr_NewException as *const ());
     std::hint::black_box(PyErr_NewExceptionWithDoc as *const ());
+    std::hint::black_box(PyType_FromMetaclass as *const ());
+    std::hint::black_box(PyType_GetModule as *const ());
+    std::hint::black_box(PyType_GetModuleState as *const ());
+    std::hint::black_box(PyType_GetModuleByDef as *const ());
+    std::hint::black_box(PyType_GetModuleName as *const ());
+    std::hint::black_box(PyType_GetFullyQualifiedName as *const ());
+    std::hint::black_box(PyType_GetBaseByToken as *const ());
+    std::hint::black_box(PyType_GetTypeDataSize as *const ());
+    std::hint::black_box(PyObject_GetTypeData as *const ());
+    std::hint::black_box(PyObject_GetItemData as *const ());
+    std::hint::black_box(PyType_Modified as *const ());
+    std::hint::black_box(PyType_ClearCache as *const ());
+    std::hint::black_box(PyType_Freeze as *const ());
 }
 
 #[cfg(test)]

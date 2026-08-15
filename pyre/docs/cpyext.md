@@ -157,7 +157,16 @@ Known divergences, each documented at its definition:
 - `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
   leaving them NULL as CPython does;
 - a type is built on a single base, so a `PyType_Spec` naming more than one is
-  rejected rather than silently losing the rest;
+  rejected rather than silently losing the rest, and `PyType_FromMetaclass`
+  accepts only `type` for its metaclass: pyre builds a type through its own
+  constructor, which has no place to put another one;
+- a frozen type is one whose `flag_heaptype` is false, the state every builtin
+  type is already in and the one `type.__setattr__` consults. CPython keeps
+  the two bits apart, so a type frozen here also stops answering
+  `__annotations__`;
+- `PyType_ClearCache` empties the method cache and reports 0: upstream's return
+  value is a per-interpreter version counter, and pyre mints one version
+  identity per type, so no single number describes the entries dropped;
 - `PyObject_GetBuffer` of an *interpreter* object hands C a read-only snapshot,
   the collector being free to move the storage a `Py_buffer` would otherwise
   name; a `PyBUF_WRITABLE` request for one is refused rather than answered with
@@ -185,10 +194,18 @@ Known divergences, each documented at its definition:
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; `Py_tp_token` and `PyType_GetBaseByToken`; and the
-   remaining generated API. Of the 763 `PyAPI_FUNC` entry points CPython 3.14
-   declares in its top-level `Include/*.h`, 270 are present;
+   pyre does not take; and the remaining generated API. Of the 763
+   `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
+   `Include/*.h`, 292 are present -- counting every form `Python.h` offers
+   one in, whether an export, a `static inline` or a function-like macro;
 6. Windows API DLL/import-library packaging.
+
+A type built from a spec carries the module it was created from and the
+`Py_tp_token` it declared, both in a side table keyed by the type's own
+address: pyre has no heap-type struct, and a spec type is leaked deliberately,
+so the key is stable for the life of the process. The module is held there as
+an owned mirror reference, and it is that reference — a count above the link
+share — that roots it, not the table.
 
 `PySequence_Fast_ITEMS` is absent rather than pending: it hands out a
 `PyObject **` into the sequence's own storage, which requires a list whose
@@ -215,8 +232,13 @@ are ABI-compatible with pyre.
   the frees.
 - `pypy/module/cpyext/state.py`: exception state, extension cache and GC dead
   queue.
-- `pypy/module/cpyext/modsupport.py`: module definitions, method conversion and
-  PEP 489 slots.
+- `pypy/module/cpyext/modsupport.py`: module definitions, method conversion,
+  PEP 489 slots and the `PyModule_*` entry points. `PyModule_GetName` /
+  `GetNameObject` read `__name__` from the module dictionary where
+  `modsupport.py:240-276` reads `w_mod.w_name`, so a module renamed after
+  import reports the new name; `PyModule_GetFilenameObject` reports a missing
+  or non-`str` `__file__` as the `SystemError` it is documented to raise
+  rather than as the `KeyError` a plain `getitem` produces.
 - `pypy/module/cpyext/methodobject.py`: the `PyCFunction` carrier and its
   calling conventions.
 - `pypy/module/cpyext/pyerrors.py`: the `PyErr_*` entry points.

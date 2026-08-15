@@ -297,6 +297,42 @@ assert m.to_base(255, 16) == '0xff'
 # boxing its own index, over a list built inside the same C call.
 assert m.gc_window(20000) == 70000, m.gc_window(20000)
 
+# ── the module constructors and accessors ──────────────────────────────
+fresh, fresh_name, named_name, same_file = m.module_ops()
+
+import types as _types
+assert isinstance(fresh, _types.ModuleType), fresh
+assert fresh.__name__ == 'cpyext_methods.fresh', fresh.__name__
+assert fresh_name == 'cpyext_methods.fresh', fresh_name
+assert fresh.__doc__ == 'a module built from C', fresh.__doc__
+assert fresh.SEVEN == 7
+# PyModule_AddFunctions binds the table to the module it was added to.
+assert fresh.added() == 'cpyext_methods.fresh', fresh.added()
+assert named_name == 'cpyext_methods.named', named_name
+# Both spellings of __file__ name the same path.
+assert same_file == 1
+
+try:
+    m.module_no_file()
+except SystemError:
+    pass
+else:
+    raise AssertionError('a module with no __file__ reported one')
+
+# PyModule_FromDefAndSpec runs the same definition against a spec of its own,
+# and PyModule_ExecDef then runs its exec slot.
+class _Spec:
+    name = 'cpyext_methods.again'
+
+again = m.module_from_def(_Spec())
+assert isinstance(again, _types.ModuleType), again
+assert again.ANSWER == 42
+assert again.GREETING == 'hi'
+assert again.VIA_DICT == 'through-dict'
+# A separate module has its own state block, so its counter starts over.
+assert again.bump() == 1
+assert m.bump() == m.bump() - 1
+
 print('cpyext-methods-ok')
 "#;
 

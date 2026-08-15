@@ -6,6 +6,8 @@
 #include <Python.h>
 #include <string.h>
 
+static struct PyModuleDef moduledef;
+
 /* ── Point: the whole slot surface on one type ──────────────────────── */
 
 typedef struct {
@@ -1482,6 +1484,8 @@ static PyType_Slot spec_slots[] = {
     {Py_tp_members, spec_members},
     {Py_tp_doc, (void *)"a heap type built from a spec"},
     {Py_sq_length, spec_length},
+    /* Py_TP_USE_SPEC: the spec's own address becomes the token. */
+    {Py_tp_token, Py_TP_USE_SPEC},
     {0, NULL},
 };
 
@@ -1489,8 +1493,66 @@ static PyType_Spec spec_spec = {
     "cpyext_types.Spec",
     sizeof(SpecObject),
     0,
-    Py_TPFLAGS_DEFAULT,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     spec_slots,
+};
+
+/* ── Extra: a spec declaring storage relative to its base's ─────────── */
+
+typedef struct {
+    long tag;
+    double weight;
+} extra_data;
+
+static PyObject *extra_set(PyObject *self, PyObject *args)
+{
+    long tag = 0;
+    double weight = 0.0;
+    if (!PyArg_ParseTuple(args, "ld", &tag, &weight)) {
+        return NULL;
+    }
+    extra_data *data = PyObject_GetTypeData(self, Py_TYPE(self));
+    if (data == NULL) {
+        return NULL;
+    }
+    data->tag = tag;
+    data->weight = weight;
+    Py_RETURN_NONE;
+}
+
+static PyObject *extra_get(PyObject *self, PyObject *unused)
+{
+    (void)unused;
+    extra_data *data = PyObject_GetTypeData(self, Py_TYPE(self));
+    if (data == NULL) {
+        return NULL;
+    }
+    /* The code the base declared is still readable through the base's own
+       fields, which is what a relative basicsize is for. */
+    return Py_BuildValue("(ldl)", data->tag, data->weight,
+                         ((SpecObject *)self)->code);
+}
+
+static PyMethodDef extra_methods[] = {
+    {"set", extra_set, METH_VARARGS, "fill the extra type data"},
+    {"get", extra_get, METH_NOARGS, "read the extra type data back"},
+    {NULL, NULL, 0, NULL},
+};
+
+static char extra_token;
+
+static PyType_Slot extra_slots[] = {
+    {Py_tp_methods, extra_methods},
+    {Py_tp_token, &extra_token},
+    {0, NULL},
+};
+
+static PyType_Spec extra_spec = {
+    "cpyext_types.Extra",
+    -(int)sizeof(extra_data),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    extra_slots,
 };
 
 /* ── capsules and imports ───────────────────────────────────────────── */
@@ -1608,7 +1670,105 @@ static PyObject *m_subclass_flags(PyObject *self, PyObject *unused)
     return result;
 }
 
+/* What a spec type reports about the module and the token it was built with. */
+static PyObject *m_type_owner(PyObject *self, PyObject *type)
+{
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "type_owner wants a type");
+        return NULL;
+    }
+    PyTypeObject *cls = (PyTypeObject *)type;
+    PyObject *module = PyType_GetModule(cls);  /* borrowed */
+    if (module == NULL) {
+        return NULL;
+    }
+    PyObject *by_def = PyType_GetModuleByDef(cls, &moduledef);  /* borrowed */
+    if (by_def == NULL) {
+        return NULL;
+    }
+    PyObject *module_name = PyType_GetModuleName(cls);
+    if (module_name == NULL) {
+        return NULL;
+    }
+    PyObject *qualified = PyType_GetFullyQualifiedName(cls);
+    if (qualified == NULL) {
+        Py_DECREF(module_name);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue(
+        "(OiNN)", module, by_def == module, module_name, qualified);
+    return result;
+}
+
+/* `PyType_GetBaseByToken` against the two tokens the fixture declares, and
+   against one no type carries. */
+static PyObject *m_type_token(PyObject *self, PyObject *type)
+{
+    static char stranger;
+    PyTypeObject *cls = (PyTypeObject *)type;
+    PyTypeObject *from_spec = NULL;
+    int spec_found = PyType_GetBaseByToken(cls, &spec_spec, &from_spec);
+    if (spec_found < 0) {
+        return NULL;
+    }
+    PyTypeObject *from_extra = NULL;
+    int extra_found = PyType_GetBaseByToken(cls, &extra_token, &from_extra);
+    if (extra_found < 0) {
+        Py_XDECREF(from_spec);
+        return NULL;
+    }
+    int absent = PyType_GetBaseByToken(cls, &stranger, NULL);
+    if (absent < 0) {
+        Py_XDECREF(from_spec);
+        Py_XDECREF(from_extra);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue(
+        "(iOiOi)",
+        spec_found, from_spec ? (PyObject *)from_spec : Py_None,
+        extra_found, from_extra ? (PyObject *)from_extra : Py_None,
+        absent);
+    Py_XDECREF(from_spec);
+    Py_XDECREF(from_extra);
+    return result;
+}
+
+/* A NULL token is the caller's error, not a miss. */
+static PyObject *m_type_token_null(PyObject *self, PyObject *type)
+{
+    if (PyType_GetBaseByToken((PyTypeObject *)type, NULL, NULL) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *m_type_data_size(PyObject *self, PyObject *type)
+{
+    return PyLong_FromSsize_t(PyType_GetTypeDataSize((PyTypeObject *)type));
+}
+
+/* `PyType_Freeze` on a class handed in from Python, plus the cache calls the
+   C side is expected to make after rewriting a namespace. */
+static PyObject *m_freeze(PyObject *self, PyObject *type)
+{
+    if (!PyType_Check(type)) {
+        PyErr_SetString(PyExc_TypeError, "freeze wants a type");
+        return NULL;
+    }
+    if (PyType_Freeze((PyTypeObject *)type) < 0) {
+        return NULL;
+    }
+    PyType_Modified((PyTypeObject *)type);
+    PyType_ClearCache();
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef methods[] = {
+    {"type_owner", m_type_owner, METH_O, "the module a spec type belongs to"},
+    {"type_token", m_type_token, METH_O, "PyType_GetBaseByToken three ways"},
+    {"type_token_null", m_type_token_null, METH_O, "a NULL token is an error"},
+    {"type_data_size", m_type_data_size, METH_O, "PyType_GetTypeDataSize"},
+    {"freeze", m_freeze, METH_O, "PyType_Freeze a class"},
     {"capsule_read", m_capsule_read, METH_O, "read the capsule payload"},
     {"capsule_facts", m_capsule_facts, METH_O, "name, validity and context"},
     {"capsule_wrong_name", m_capsule_wrong_name, METH_O, "fetch under a wrong name"},
@@ -1674,7 +1834,21 @@ static int types_exec(PyObject *module)
         Py_DECREF(spec_type);
         return -1;
     }
-    int added = PyModule_AddObjectRef(module, "Spec", spec_type);
+    /* `Extra` extends `Spec`: its spec asks for storage relative to its base
+       rather than for a whole block, which is what `PyType_FromMetaclass`
+       takes an explicit metaclass and bases for. */
+    PyObject *extra_type = PyType_FromMetaclass(NULL, module, &extra_spec, spec_type);
+    if (extra_type == NULL) {
+        Py_DECREF(spec_type);
+        return -1;
+    }
+    int added = PyModule_AddObjectRef(module, "Extra", extra_type);
+    Py_DECREF(extra_type);
+    if (added < 0) {
+        Py_DECREF(spec_type);
+        return -1;
+    }
+    added = PyModule_AddObjectRef(module, "Spec", spec_type);
     Py_DECREF(spec_type);
     if (added < 0) {
         return -1;

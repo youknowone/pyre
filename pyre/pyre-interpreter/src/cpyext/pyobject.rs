@@ -63,7 +63,7 @@ pub struct CPyObject {
 /// the block has to satisfy the strictest alignment a C compiler would give a
 /// `malloc` result — `max_align_t`, which is 16 on every target this feature
 /// builds for.
-const BLOCK_ALIGN: usize = 16;
+pub(super) const BLOCK_ALIGN: usize = 16;
 
 fn block_layout(size: usize) -> Layout {
     Layout::from_size_align(size, BLOCK_ALIGN).expect("a mirror block size is a small constant")

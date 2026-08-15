@@ -187,6 +187,7 @@ pub fn after_fork_child() {
         EXTENSIONS.reinit_after_fork();
         PACKAGE_CONTEXT.reinit_after_fork();
         pyobject::after_fork_child();
+        typeobject::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
     // half-finished import must not name the next module created here.
