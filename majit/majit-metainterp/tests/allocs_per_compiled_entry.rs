@@ -7,7 +7,7 @@
 //! only way to know what a warm entry costs is to count what the allocator is
 //! asked for while one is happening, so this file counts it.
 //!
-//! Three properties are load-bearing and each one is a separate failure mode:
+//! Four properties are load-bearing and each one is a separate failure mode:
 //!
 //! 1. **The driver must outlive the measured calls.** A fixture that builds its
 //!    `JitDriver` inside the annotated function measures a driver that never
@@ -34,6 +34,13 @@
 //!    second process-global counter is kept purely so the difference can be
 //!    reported as `off-thread` — evidence that the isolation did something,
 //!    rather than an assertion that it did.
+//!
+//! 4. **A GC must be installed.** The entry path allocates its jitframe from
+//!    the nursery when there is a GC to allocate it from and out of the Rust
+//!    heap when there is not, and the two differ by a whole allocation per
+//!    entry. A fixture with no GC measures a frame shape that no shipped
+//!    configuration uses. [`install_gc`] puts the meter on the configuration
+//!    pyre and cel run.
 //!
 //! ## Per-site attribution
 //!
@@ -269,6 +276,47 @@ fn window() -> (u64, u64) {
 }
 
 // ---------------------------------------------------------------------------
+// the GC
+// ---------------------------------------------------------------------------
+
+/// Install the process GC, because WHERE the jitframe comes from is part of
+/// the configuration this file measures.
+///
+/// `llmodel.py:298 malloc_jitframe` allocates the frame through the GC, and
+/// `jitframe.py:33-60` makes JITFRAME an ordinary varsize GcStruct — so
+/// upstream's per-entry frame is a nursery bump, which no `#[global_allocator]`
+/// ever sees. The cranelift backend reproduces that only when a JITFRAME type
+/// id is registered; with no GC at all it falls back to a `Vec<i64>`, and a
+/// fixture that measured the fallback would be reporting a frame the shipped
+/// configuration never allocates. pyre and cel reach the nursery branch through
+/// `init_gc_subsystem` (pyre-jit `eval.rs`), which is the three calls below.
+///
+/// The nursery size is spelled out rather than left to `GcConfig::default`:
+/// the default is `estimate_best_nursery_size`, which reads the host's cache
+/// size, and a file whose whole point is an exact pinned integer must not take
+/// a host-dependent input. Nothing here ever collects — the entry path
+/// allocates its frames through the no-collect path and the fixture's state is
+/// int-only — so the nursery only ever fills, and 4 MB is two orders of
+/// magnitude more than the run needs. If a run ever did exhaust it, the spill
+/// to old-gen is a `rawmalloc` and the assertion at the bottom would fail with
+/// the spill named in the per-site table.
+fn install_gc() {
+    use majit_gc::collector::{GcConfig, MiniMarkGC};
+    majit_gc::gc_sync::store_singleton(Box::new(MiniMarkGC::with_config(GcConfig {
+        nursery_size: 1 << 22,
+        ..GcConfig::default()
+    })));
+    // Takes the GIL, which every `gc_sync::gc_op` under the entry path asserts
+    // this thread holds. The meter owns its process (`harness = false`), so it
+    // holds the GIL for the whole run and never has to hand it back.
+    majit_gc::gc_sync::register_thread();
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::install_gc_standalone();
+    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
+    majit_backend_dynasm::runner::install_gc_standalone();
+}
+
+// ---------------------------------------------------------------------------
 // the fixture: one machine, one persistent driver
 // ---------------------------------------------------------------------------
 
@@ -388,6 +436,7 @@ fn profile() -> &'static str {
 }
 
 fn main() {
+    install_gc();
     let program = counter_program();
 
     // Bind ONCE. Everything below calls into this driver; nothing rebuilds it.
@@ -521,12 +570,11 @@ fn main() {
 
 /// Heap allocations per warm compiled-code entry, as measured by this file.
 ///
-/// The two backends now agree, so this is one number. It was two — `dynasm`
-/// 10, `cranelift` 12 — and the difference was the two cranelift-only rows
-/// named at the bottom, both since removed. The per-backend tables below stay
-/// split anyway: the backends reach 10 through rows that only *correspond*,
-/// and a table that pretended they were the same code would misname whichever
-/// row moved.
+/// **PER BACKEND, and the two disagree.** The backend is part of the key
+/// because it owns the last rows below; pinning one number for both would make
+/// whichever leg ran second fail with a message about a regression that is
+/// really a configuration difference. The figure was briefly one number for
+/// both at 10, before cranelift's frame moved to the nursery.
 ///
 /// Eight of the allocations are shared by both backends:
 ///
@@ -560,14 +608,21 @@ fn main() {
 /// so the copy had no upstream counterpart; the frame now lives as long as the
 /// deadframe does and the accessors read it in place.
 ///
-/// `cranelift` adds two, for 10 — the same two roles, in its own spelling:
+/// `cranelift` adds ONE, for 9:
 ///
 /// | n | site |
 /// |---|------|
-/// | 1 | `<i64 as SpecFromElem>::from_elem` — `JitFrameDeadFrame::_heap_owner`, the jitframe's backing `Vec<i64>` (`llmodel.py:298 malloc_jitframe`). This is the no-GC-registry branch of `run_compiled_code_inner`; with a JITFRAME type id registered the frame comes from the nursery and this row goes away |
 /// | 1 | `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside `DeadFrame`, the `llmodel.py:240` `cast_opaque_ptr` |
 ///
-/// It used to add four. The two that went:
+/// There is no cranelift row for the frame itself, and that is the difference
+/// between the two backends. `run_compiled_code_inner` takes the JITFRAME from
+/// the nursery under its registered type id, which is `jitframe.py:48-52`
+/// `jitframe_allocate` — a bump of `nursery_free`, so the frame costs the
+/// process allocator nothing. dynasm's `execute_token` (`runner.rs:2871`)
+/// allocates its entry frame off the GC unconditionally, so it keeps paying
+/// for one; installing a GC does not move its figure.
+///
+/// It used to add four. The three that went:
 ///
 /// - `CraneliftBackend::execute_token_with_dispatch_key` unwrapped the
 ///   metainterp's `&[Value]` into an owned `Vec<i64>` before the frame
@@ -580,4 +635,9 @@ fn main() {
 ///   `llmodel.py:240-250` reads slots out of the frame through the accessors,
 ///   so the copy is now taken only where it is consumed. This is the same
 ///   removal `raw_values` got on dynasm.
-const ALLOCS_PER_ENTRY: usize = 10;
+/// - `<i64 as SpecFromElem>::from_elem`, the `Vec<i64>` behind
+///   `JitFrameDeadFrame::_heap_owner`. That was the no-GC branch of
+///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
+///   see [`install_gc`]. The branch itself remains for a backend running
+///   without a collector.
+const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 9 } else { 10 };
