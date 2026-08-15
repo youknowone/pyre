@@ -247,7 +247,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 55] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 56] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -304,6 +304,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 55] = [
     ("subscr_specialised_pair",   "specialize",    "subscr"),
     ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
     ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
+    ("instance_next",             "residual_call", "-"),
 ];
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
@@ -408,7 +409,7 @@ pub fn fbw_depth_census_summary() -> String {
 }
 
 /// Parse `PYRE_FBW_NO_SPECIALIZE` once into table-index bits and unknown
-/// selector tokens.  The reserved `all` token turns off these 55 rows and
+/// selector tokens.  The reserved `all` token turns off these 56 rows and
 /// nothing else: the `try_walker_fold_*` trio and the 11
 /// `try_walker_inline_*` descent entry points all stay live.
 fn spec_suppression() -> &'static (u64, Vec<String>) {

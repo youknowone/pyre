@@ -7065,10 +7065,17 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         callee_descr_refs,
         false,
     );
-    if !matches!(
-        replay_safety,
-        CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
-    ) || fbw_foriter_deferred_call_denied(w_code as usize)
+    // `Clean` only, unlike the seqiter route's `Clean | DeferredCall`.  A
+    // deferred residual inside `__next__` can raise, and the caller-boundary
+    // resume this route uses delivers that exception to the caller as a frame
+    // exception rather than through FOR_ITER's own arms — so a delegating
+    // `def __next__(self): return next(self._it)`, whose exhaustion arrives
+    // from the residual `next` rather than a `RaiseVarargs`, leaks
+    // StopIteration out of the loop.  Admitting it needs the paused caller to
+    // map a callee outcome through `iter_next`'s trichotomy (item /
+    // exhaustion / propagate); until that exists, decline the shape.
+    if !matches!(replay_safety, CalleeReplaySafety::Clean)
+        || fbw_foriter_deferred_call_denied(w_code as usize)
     {
         return Ok(None);
     }
