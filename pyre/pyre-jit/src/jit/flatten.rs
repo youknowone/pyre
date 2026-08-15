@@ -1676,27 +1676,6 @@ impl<'a> GraphFlattener<'a> {
         self.make_link(link, handling_ovf);
     }
 
-    fn make_bool_link(&mut self, link: &LinkRef, handling_ovf: bool) {
-        // A bool arm may forward an already-materialized exception. Keep the
-        // ordinary `flatten.py:240-267` bool switch, but preserve the seeded
-        // exception-link lowering so an exceptblock target becomes `reraise`
-        // and a Python handler target receives fresh last-exception values.
-        let carries_exception = {
-            let link = link.borrow();
-            assert_eq!(
-                link.last_exception.is_some(),
-                link.last_exc_value.is_some(),
-                "bool link must carry both exception variables or neither"
-            );
-            link.last_exception.is_some()
-        };
-        if carries_exception {
-            self.make_exception_link(link, handling_ovf);
-        } else {
-            self.make_link(link, handling_ovf);
-        }
-    }
-
     /// `rpython/jit/codewriter/flatten.py:189-204` `_ovf` rewrite of
     /// the canraise tail.
     ///
@@ -2009,10 +1988,10 @@ impl<'a> GraphFlattener<'a> {
             opargs.push(self.tlabel_for_link(&linkfalse));
             self.emitline(Insn::live(Vec::new()));
             self.emitline(Insn::op(opname, opargs));
-            self.make_bool_link(&linktrue, handling_ovf);
+            self.make_link(&linktrue, handling_ovf);
             let false_label = self.label_for_link(&linkfalse);
             self.emitline(false_label);
-            self.make_bool_link(&linkfalse, handling_ovf);
+            self.make_link(&linkfalse, handling_ovf);
             return;
         }
         self.insert_switch_exits(&exits, exitswitch, handling_ovf);

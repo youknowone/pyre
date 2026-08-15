@@ -3332,6 +3332,29 @@ fn attach_materialized_exception_link(
     link
 }
 
+fn attach_forwarded_exception_link(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    target: &SpamBlockRef,
+    edge_state: &FrameState,
+) -> super::flow::LinkRef {
+    // The exception pair was materialized when the enclosing
+    // `catch_exception` entered this block.  A later boolean split forwards
+    // those ordinary SSA values with `make_link` (`flatten.py:240-267`); it
+    // must not attach `Link.extravars`, which would emit a second
+    // `last_exception` / `last_exc_value` read after an intervening residual
+    // call has cleared the metainterp exception slot.
+    update_catch_landing_state(graph, target, edge_state);
+    let target_state = target
+        .framestate()
+        .expect("catch landing must have a framestate after update_catch_landing_state");
+    let link_args = edge_state.getoutputargs(&target_state);
+    let link = super::flow::Link::new(link_args, Some(target.block()), None).into_ref();
+    append_exit(block, link.clone());
+    target.add_incoming_exception_link(link.clone());
+    link
+}
+
 fn attach_materialized_exception_edge(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -11200,9 +11223,10 @@ impl CodeWriter {
                             stop_match.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(matched.into()));
 
-                            // False keeps the standing exception. Route it into
-                            // the Python handler covering this PC, or through the
-                            // existing reraise shape when no handler covers it.
+                            // False forwards the exception pair materialized at
+                            // this landing. Route it into the Python handler
+                            // covering this PC, or raise the forwarded value when
+                            // no handler covers it.
                             let mismatch_link = if let Some(catch_label) = catch_for_pc[py_pc] {
                                 let site = catch_sites
                                     .iter()
@@ -11215,7 +11239,7 @@ impl CodeWriter {
                                     &stop_match_state,
                                     &site,
                                 );
-                                attach_materialized_exception_link(
+                                attach_forwarded_exception_link(
                                     &mut graph,
                                     &stop_match.block(),
                                     &site.landing,
@@ -11224,13 +11248,12 @@ impl CodeWriter {
                             } else {
                                 let (exc_type, exc_value) =
                                     exception_edge_extravars(&stop_match_state);
-                                let mut link = super::flow::Link::new(
+                                let link = super::flow::Link::new(
                                     vec![exc_type.into(), exc_value.into()],
                                     Some(graph.exceptblock.clone()),
                                     None,
-                                );
-                                link.extravars(Some(exc_type), Some(exc_value));
-                                let link = link.into_ref();
+                                )
+                                .into_ref();
                                 append_exit(&stop_match.block(), link.clone());
                                 link
                             };
@@ -16402,15 +16425,21 @@ mod tests {
             .skip(match_call_index + 1)
             .find_map(|(index, op)| (op.key == "goto_if_not/iL").then_some(index))
             .expect("FOR_ITER exception match must feed an ordinary bool split");
-        let reraise_index = ops
+        let raise_index = ops
             .iter()
-            .position(|op| op.key == "reraise/")
-            .expect("a FOR_ITER outside a Python try must reraise mismatches");
+            .position(|op| op.key == "raise/r")
+            .expect("a FOR_ITER outside a Python try must raise mismatches");
         assert!(catch_index < ptr_nonzero_index);
         assert!(ptr_nonzero_index < last_exc_value_index);
         assert!(last_exc_value_index < match_call_index);
         assert!(match_call_index < bool_split_index);
-        assert!(bool_split_index < reraise_index);
+        assert!(bool_split_index < raise_index);
+        assert!(
+            !ops[match_call_index + 1..]
+                .iter()
+                .any(|op| matches!(op.key, "last_exception/>i" | "last_exc_value/>r")),
+            "the match residual clears the active exception, so its boolean arms must forward the materialized pair"
+        );
         assert!(
             !ops.iter()
                 .any(|op| op.key == "goto_if_exception_mismatch/iL"),
