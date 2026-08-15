@@ -3937,6 +3937,37 @@ mod tests {
             );
         }
 
+        /// `complex` arithmetic reaches the three interior-field loads in
+        /// generated helper JitCodes.  They already have orthodox
+        /// `bhimpl_getinteriorfield_gc_*` handlers; the production builder must
+        /// register their emitted bytes so `setup_insns` can bind them.
+        #[test]
+        fn production_bh_builder_wires_every_interior_field_load() {
+            use majit_translate::insns;
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (opname, byte) in [
+                (
+                    "getinteriorfield_gc_i/rid>i",
+                    insns::BC_GETINTERIORFIELD_GC_I,
+                ),
+                (
+                    "getinteriorfield_gc_r/rid>r",
+                    insns::BC_GETINTERIORFIELD_GC_R,
+                ),
+                (
+                    "getinteriorfield_gc_f/rid>f",
+                    insns::BC_GETINTERIORFIELD_GC_F,
+                ),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{opname}` (byte {byte}) is unwired in the production builder",
+                );
+            }
+        }
+
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
         /// A symbolic hash carries the `SYMBOLIC_FNADDR_BASE` high-16-bit tag;
@@ -8752,6 +8783,18 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // / `new_with_vtable` read `bh.cpu`, which this builder sets above.
     for (key, byte) in [
         ("arraylen_gc/rd>i", majit_translate::insns::BC_ARRAYLEN_GC),
+        (
+            "getinteriorfield_gc_i/rid>i",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_I,
+        ),
+        (
+            "getinteriorfield_gc_r/rid>r",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_R,
+        ),
+        (
+            "getinteriorfield_gc_f/rid>f",
+            majit_translate::insns::BC_GETINTERIORFIELD_GC_F,
+        ),
         (
             "cast_float_to_int/f>i",
             majit_translate::insns::BC_CAST_FLOAT_TO_INT,
