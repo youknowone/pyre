@@ -3017,6 +3017,19 @@ pub fn walk<Sym: WalkSym>(
                         .session
                         .borrow_mut()
                         .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
+                if fbw_state::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[walk-abort] err={:?} stop_pc={} opcode_position={} \
+                         helper={} inline={} claimed={} callee_jc={:?}",
+                        error,
+                        error.stop_pc(),
+                        opcode_position,
+                        ctx.fbw_mode.transparent_helper_subwalk,
+                        ctx.fbw_mode.inline_subwalk,
+                        coordinate_belongs_to_this_frame,
+                        ctx.inline_callee_consts.map(|c| c.jitcode_index),
+                    );
+                }
                 let carrier_owned = matches!(
                     error,
                     DispatchError::AbortPermanentMarkerReached { .. }
