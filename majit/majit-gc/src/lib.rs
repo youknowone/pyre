@@ -3031,7 +3031,15 @@ pub fn gc_rawrefcount_mark_deallocating(marker: usize, pyobject: usize) {
 /// The collector owns this table because it is keyed by an address the
 /// collector moves: a caller-side table would have to be rebuilt after every
 /// minor, and could not be, because a collection must not allocate.
+///
+/// Without a collector there is no table, and no link can have been created
+/// through one, so the answer is "no mirror" without a query.  That is the
+/// state a host that has not started the runtime is in -- an object built
+/// directly, outside any frame, whose type is then asked for a C slot.
 pub fn gc_rawrefcount_from_obj(obj: GcRef) -> usize {
+    if !gc_sync::is_initialized() {
+        return 0;
+    }
     gc_sync::gc_query_reentrant(|gc| gc.rawrefcount_from_obj(obj.0))
 }
 
