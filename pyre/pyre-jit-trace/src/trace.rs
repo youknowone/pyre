@@ -1742,7 +1742,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // operand-stack temps; the `_pending` callee sym is unused on the sub-walk
     // path (the sub-walk drives the callee body off `argboxes_r` + the emitted
     // frame vable, not a callee MIFrame).
-    let Some((_pending, argboxes_r)) =
+    let Some((pending, argboxes_r)) =
         crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
     else {
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
@@ -1797,6 +1797,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         local_concretes,
         resumed_stack_oprefs,
         resumed_stack_concretes,
+        pending.sym.concrete_vable_ptr as usize,
         // Depth-N: tell the deepest sub-walk that all shallower frames are
         // paused so its in-callee guard snapshots encode the full
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
@@ -2124,7 +2125,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
 ) -> Option<majit_ir::OpRef> {
-    let Some((_pending, middle_argboxes_r)) =
+    let Some((pending, middle_argboxes_r)) =
         crate::state::setup_reconstructed_callee_frame(ctx, middle, root_ec, Vec::new())
     else {
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
@@ -2169,6 +2170,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_local_concretes,
         middle_stack_oprefs,
         middle_stack_concretes,
+        pending.sym.concrete_vable_ptr as usize,
         paused_parents,
         child_result,
     );

@@ -1067,6 +1067,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
+    concrete_callee_frame: usize,
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1255,9 +1256,29 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     }
 
     let outcome = {
+        if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
+            let frame = concrete_callee_frame as *const pyre_interpreter::PyFrame;
+            let frame_code = unsafe {
+                pyre_interpreter::w_code_get_ptr((*frame).pycode as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            };
+            eprintln!(
+                "[mframe-carrier] frame={frame:p} frame_code={frame_code:p} expected={:p} freevars={:?}",
+                callee_pjc.code_ptr,
+                unsafe { &(*frame_code).freevars },
+            );
+        }
         let mut sub_wc = WalkContext {
             callee_shadow: Some(super::CalleeLocalsShadow {
                 code_ptr: callee_pjc.code_ptr,
+                // `resume.py:1042-1057` rebuilds one concrete frame for every
+                // resumed MIFrame.  Keep that identity on this callee's own
+                // walk context so residual execution can enter precisely this
+                // frame on the ExecutionContext chain.  It deliberately does
+                // not use `InlineConcreteFrameGuard`: that TLS also selects
+                // the standard-virtualizable heap-sync target, which remains
+                // the bridge root for a reconstructed carrier.
+                concrete_frame: concrete_callee_frame,
                 ..Default::default()
             }),
             inline_callee_consts: Some(consts),
@@ -1437,6 +1458,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
+    concrete_callee_frame: usize,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
@@ -1455,6 +1477,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         local_concretes,
         resumed_stack_oprefs,
         resumed_stack_concretes,
+        concrete_callee_frame,
         None,
         paused_parent_recipes,
     )
@@ -1477,6 +1500,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
     local_concretes: &[majit_ir::Value],
     resumed_stack_oprefs: &[OpRef],
     resumed_stack_concretes: &[majit_ir::Value],
+    concrete_callee_frame: usize,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
     child_result: OpRef,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
@@ -1496,6 +1520,7 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         local_concretes,
         resumed_stack_oprefs,
         resumed_stack_concretes,
+        concrete_callee_frame,
         Some(child_result),
         paused_parent_recipes,
     )
