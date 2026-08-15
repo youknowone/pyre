@@ -310,7 +310,259 @@ fn memarg(offset: u64, align: u32) -> MemArg {
     }
 }
 
-fn emit_call_area_addr(sink: &mut InstructionSink<'_>) {
+/// A small lookbehind buffer for local wasm instruction folds.
+///
+/// Every instruction method used by this emitter is spelled out below.  In
+/// particular, this type deliberately does not implement `Deref`: reaching
+/// the underlying sink without flushing would reorder pending instructions.
+struct PeepSink<'sink, 'buf> {
+    sink: &'sink mut InstructionSink<'buf>,
+    pending: Vec<PendingInstruction>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingInstruction {
+    LocalSet(u32),
+    I64Const(i64),
+    I32Const(i32),
+}
+
+macro_rules! forward_zero {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method(&mut self) -> &mut Self {
+                self.flush();
+                self.sink.$method();
+                self
+            }
+        )*
+    };
+}
+
+macro_rules! forward_one {
+    ($($method:ident($arg:ident: $ty:ty)),* $(,)?) => {
+        $(
+            fn $method(&mut self, $arg: $ty) -> &mut Self {
+                self.flush();
+                self.sink.$method($arg);
+                self
+            }
+        )*
+    };
+}
+
+macro_rules! forward_two {
+    ($($method:ident($first:ident: $first_ty:ty, $second:ident: $second_ty:ty)),* $(,)?) => {
+        $(
+            fn $method(&mut self, $first: $first_ty, $second: $second_ty) -> &mut Self {
+                self.flush();
+                self.sink.$method($first, $second);
+                self
+            }
+        )*
+    };
+}
+
+#[allow(dead_code)]
+impl<'sink, 'buf> PeepSink<'sink, 'buf> {
+    fn new(sink: &'sink mut InstructionSink<'buf>) -> Self {
+        Self {
+            sink,
+            pending: Vec::with_capacity(2),
+        }
+    }
+
+    /// Commit every buffered instruction in program order.
+    fn flush(&mut self) {
+        for instruction in self.pending.drain(..) {
+            match instruction {
+                PendingInstruction::LocalSet(local) => {
+                    self.sink.local_set(local);
+                }
+                PendingInstruction::I64Const(value) => {
+                    self.sink.i64_const(value);
+                }
+                PendingInstruction::I32Const(value) => {
+                    self.sink.i32_const(value);
+                }
+            }
+        }
+    }
+
+    fn local_set(&mut self, local: u32) -> &mut Self {
+        self.flush();
+        self.pending.push(PendingInstruction::LocalSet(local));
+        self
+    }
+
+    fn local_get(&mut self, local: u32) -> &mut Self {
+        if matches!(self.pending.last(), Some(PendingInstruction::LocalSet(previous)) if *previous == local)
+        {
+            self.pending.pop();
+            self.flush();
+            self.sink.local_tee(local);
+        } else {
+            self.flush();
+            self.sink.local_get(local);
+        }
+        self
+    }
+
+    fn i64_const(&mut self, value: i64) -> &mut Self {
+        self.flush();
+        self.pending.push(PendingInstruction::I64Const(value));
+        self
+    }
+
+    fn i32_wrap_i64(&mut self) -> &mut Self {
+        if let Some(PendingInstruction::I64Const(value)) = self.pending.pop() {
+            self.pending
+                .push(PendingInstruction::I32Const(value as u64 as u32 as i32));
+        } else {
+            self.flush();
+            self.sink.i32_wrap_i64();
+        }
+        self
+    }
+
+    fn i32_const(&mut self, value: i32) -> &mut Self {
+        if !matches!(self.pending.as_slice(), [PendingInstruction::I32Const(_)]) {
+            self.flush();
+        }
+        self.pending.push(PendingInstruction::I32Const(value));
+        self
+    }
+
+    fn i32_mul(&mut self) -> &mut Self {
+        if let [
+            PendingInstruction::I32Const(lhs),
+            PendingInstruction::I32Const(rhs),
+        ] = self.pending.as_slice()
+        {
+            let value = lhs.wrapping_mul(*rhs);
+            self.pending.clear();
+            self.pending.push(PendingInstruction::I32Const(value));
+        } else {
+            self.flush();
+            self.sink.i32_mul();
+        }
+        self
+    }
+
+    fn i32_add(&mut self) -> &mut Self {
+        if matches!(self.pending.as_slice(), [PendingInstruction::I32Const(0)]) {
+            self.pending.clear();
+        } else {
+            self.flush();
+            self.sink.i32_add();
+        }
+        self
+    }
+
+    fn br_table<V: IntoIterator<Item = u32>>(&mut self, labels: V, default: u32) -> &mut Self
+    where
+        V::IntoIter: ExactSizeIterator,
+    {
+        self.flush();
+        self.sink.br_table(labels, default);
+        self
+    }
+
+    forward_zero!(
+        drop,
+        else_,
+        end,
+        f64_abs,
+        f64_add,
+        f64_convert_i64_s,
+        f64_div,
+        f64_eq,
+        f64_floor,
+        f64_ge,
+        f64_gt,
+        f64_le,
+        f64_lt,
+        f64_mul,
+        f64_ne,
+        f64_neg,
+        f64_reinterpret_i64,
+        f64_sub,
+        i32_and,
+        i32_eq,
+        i32_eqz,
+        i32_gt_u,
+        i32_lt_u,
+        i32_ne,
+        i32_or,
+        i32_sub,
+        i64_add,
+        i64_and,
+        i64_div_s,
+        i64_eq,
+        i64_eqz,
+        i64_extend32_s,
+        i64_extend_i32_s,
+        i64_extend_i32_u,
+        i64_ge_s,
+        i64_ge_u,
+        i64_gt_s,
+        i64_gt_u,
+        i64_le_s,
+        i64_le_u,
+        i64_lt_s,
+        i64_lt_u,
+        i64_mul,
+        i64_ne,
+        i64_or,
+        i64_reinterpret_f64,
+        i64_rem_s,
+        i64_shl,
+        i64_shr_s,
+        i64_shr_u,
+        i64_sub,
+        i64_trunc_sat_f64_s,
+        i64_xor,
+        return_,
+        select,
+        unreachable,
+    );
+
+    forward_one!(
+        block(block_type: BlockType),
+        br(label: u32),
+        br_if(label: u32),
+        call(function: u32),
+        f64_load(memarg: MemArg),
+        f64_store(memarg: MemArg),
+        i32_load(memarg: MemArg),
+        i32_load16_s(memarg: MemArg),
+        i32_load16_u(memarg: MemArg),
+        i32_load8_s(memarg: MemArg),
+        i32_load8_u(memarg: MemArg),
+        i32_store(memarg: MemArg),
+        i32_store16(memarg: MemArg),
+        i32_store8(memarg: MemArg),
+        i64_load(memarg: MemArg),
+        i64_store(memarg: MemArg),
+        if_(block_type: BlockType),
+        local_tee(local: u32),
+        loop_(block_type: BlockType),
+        return_call(function: u32),
+    );
+
+    forward_two!(
+        call_indirect(table_index: u32, type_index: u32),
+        return_call_indirect(table_index: u32, type_index: u32),
+    );
+}
+
+impl Drop for PeepSink<'_, '_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+fn emit_call_area_addr(sink: &mut PeepSink<'_, '_>) {
     sink.i32_const(crate::jit_call_area_addr() as i32);
 }
 
@@ -318,7 +570,7 @@ fn emit_call_area_addr(sink: &mut InstructionSink<'_>) {
 /// `base + offset`. The scratch no longer lives in the frame, so the pair is
 /// always the static call area at offset zero, and the base-only import — whose
 /// host side adds a baked `CALL_RESULT_OFS` — can no longer be used.
-fn emit_jit_call(sink: &mut InstructionSink<'_>, jit_call_idx: u32) {
+fn emit_jit_call(sink: &mut PeepSink<'_, '_>, jit_call_idx: u32) {
     emit_call_area_addr(sink);
     sink.i32_const(0);
     sink.call(jit_call_idx);
@@ -329,7 +581,7 @@ fn emit_jit_call(sink: &mut InstructionSink<'_>, jit_call_idx: u32) {
 /// bytes. Word-sized fields are 4 bytes on wasm32 (`isize`/`usize`/pointer),
 /// 8 bytes on 64-bit; reading a fixed 8 bytes here would fold in the next
 /// field's bytes on wasm32.
-fn emit_sized_int_load(sink: &mut InstructionSink<'_>, offset: u64, size: usize, signed: bool) {
+fn emit_sized_int_load(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize, signed: bool) {
     match (size, signed) {
         (8, _) => {
             sink.i64_load(mem64(offset));
@@ -368,7 +620,7 @@ fn emit_sized_int_load(sink: &mut InstructionSink<'_>, offset: u64, size: usize,
 /// `[addr_i32, value_i64]`; the low `size` bytes of the value are stored.
 /// A fixed 8-byte store would clobber the adjacent field/item (or run past
 /// the array end) for word-sized fields and pointer array items on wasm32.
-fn emit_sized_int_store(sink: &mut InstructionSink<'_>, offset: u64, size: usize) {
+fn emit_sized_int_store(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize) {
     match size {
         8 => {
             sink.i64_store(mem64(offset));
@@ -921,7 +1173,7 @@ fn resolve_same_as_forwarding(base: OpRef, forwardings: &[Option<OpRef>]) -> OpR
 /// one on this path. The emitted barrier still receives the store's own base.
 #[allow(clippy::too_many_arguments)]
 fn emit_write_barrier_if_needed(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
@@ -971,7 +1223,7 @@ fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
 /// Operand-stack-neutral: every push is consumed by a store, the call, or
 /// the result drop.
 fn emit_write_barrier(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     jit_call_idx: Option<u32>,
@@ -1137,7 +1389,7 @@ fn collecting_call_positions(ops: &[Op], include_ca_collects: bool) -> Vec<usize
 /// value never read after `at_op` has no consumer for the reload — the
 /// native regalloc likewise reloads a spilled box only on its next use.
 fn emit_reload_refs_from_homes(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     value_types: &ValueLocals,
     ref_homes: &RefHomes,
     liveness: &HomeLiveness,
@@ -1161,7 +1413,7 @@ fn emit_reload_refs_from_homes(
 /// trace bodies: a collecting direct call may have forwarded the running
 /// JitFrame, while wasm local 0 still holds its old ITEMS base.
 fn emit_reload_frame_if_necessary(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     jf_top_addr: Option<u32>,
@@ -1186,7 +1438,7 @@ fn emit_reload_frame_if_necessary(
 /// configuration owns an inline shadow-stack top cell; all other call sites
 /// retain their pre-existing helper reload.
 fn emit_reload_ca_frame_if_necessary(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     residual_type_base: Option<u32>,
     ca_reload_fn_ptr: i64,
     ca_inline: Option<CaInlineParams>,
@@ -1202,7 +1454,7 @@ fn emit_reload_ca_frame_if_necessary(
 
 /// assembler.py `_reload_frame_if_necessary`: `top[-WORD]` is the top
 /// jitframe pointer. The wasm CA ABI carries its ITEMS base in local 0.
-fn emit_ca_reload_top(sink: &mut InstructionSink<'_>, top_addr: u32) {
+fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(top_addr as i32);
     sink.i32_load(mem32(0));
     sink.i32_const(4);
@@ -1213,7 +1465,7 @@ fn emit_ca_reload_top(sink: &mut InstructionSink<'_>, top_addr: u32) {
 }
 
 /// While a CA callee is pushed, its caller's `jf_ptr` is `top[-3 * WORD]`.
-fn emit_ca_reload_caller(sink: &mut InstructionSink<'_>, top_addr: u32) {
+fn emit_ca_reload_caller(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
     sink.i32_const(top_addr as i32);
     sink.i32_load(mem32(0));
     sink.i32_const(12);
@@ -1227,7 +1479,7 @@ fn emit_ca_reload_caller(sink: &mut InstructionSink<'_>, top_addr: u32) {
 /// callee-frame allocation. Unlike ordinary post-call reloads, these are live
 /// *at* the CALL_ASSEMBLER op, not after it.
 fn emit_reload_ca_input_refs_from_homes(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     value_types: &ValueLocals,
     ref_homes: &RefHomes,
     ref_values: &RefValues,
@@ -2246,7 +2498,8 @@ fn build_function(
         ValType::I32,
     ));
     let mut func = Function::new(locals);
-    let mut sink = func.instructions();
+    let mut raw_sink = func.instructions();
+    let mut sink = PeepSink::new(&mut raw_sink);
 
     // Bind the folded constants the optimizer left under a plain op position
     // (see `unbound_pool_const_seeds`). Emitted before every block so the
@@ -5164,6 +5417,8 @@ fn build_function(
 
     sink.local_get(0);
     sink.end(); // end function
+    sink.flush();
+    drop(sink);
 
     Ok(func)
 }
@@ -5357,7 +5612,7 @@ fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) ->
 /// fresh-entry seeding and the LABEL resume loader read it rather than a home.
 #[allow(clippy::too_many_arguments)]
 fn emit_seed_gc_table_ref(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
@@ -5388,7 +5643,7 @@ fn emit_seed_gc_table_ref(
 }
 
 fn emit_resolve(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     opref: OpRef,
@@ -5415,7 +5670,7 @@ fn emit_resolve(
 /// Resolve a Float operand as f64. Constants retain their i64 bit encoding in
 /// the constant pool and are converted at the local boundary.
 fn emit_resolve_f64(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     opref: OpRef,
@@ -5536,7 +5791,7 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
 /// Compute array element address: base + base_size + index * item_size.
 /// Leaves i32 address on the wasm stack.
 fn emit_array_addr(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -5559,7 +5814,7 @@ fn emit_array_addr(
 // ── Guard emission helpers ──
 
 fn emit_guard_true(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
@@ -5579,7 +5834,7 @@ fn emit_guard_true(
 }
 
 fn emit_guard_false(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
@@ -5679,7 +5934,7 @@ fn next_op_can_accept_cc<'a>(
 /// this opens. The stores run only on the failing edge, so the fallthrough
 /// carries no frame traffic.
 fn emit_guard_if_exit(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
@@ -5693,7 +5948,7 @@ fn emit_guard_if_exit(
 }
 
 fn emit_guard_spill(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
@@ -5733,7 +5988,7 @@ enum BinOp {
     I64ShrU,
 }
 
-fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
+fn apply_binop(sink: &mut PeepSink<'_, '_>, op: BinOp) {
     match op {
         BinOp::I64Add => {
             sink.i64_add();
@@ -5772,7 +6027,7 @@ fn apply_binop(sink: &mut InstructionSink<'_>, op: BinOp) {
 }
 
 fn emit_binop(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -5795,7 +6050,7 @@ fn emit_binop(
 ///   high = ah·bh + (mid1 >> 32) + ((al·bh + (mid1 & 0xFFFFFFFF)) >> 32)
 /// Uses the five scratch locals reserved after the dense value-local range.
 fn emit_umulhi(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -5816,7 +6071,7 @@ fn emit_umulhi(
 }
 
 fn emit_umulhi_to_local(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -5935,7 +6190,7 @@ fn ovf_const_operand(
 }
 
 fn emit_ovf_binop(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -6087,7 +6342,7 @@ enum CmpOp {
     I64GeU,
 }
 
-fn apply_cmp(sink: &mut InstructionSink<'_>, op: CmpOp) {
+fn apply_cmp(sink: &mut PeepSink<'_, '_>, op: CmpOp) {
     match op {
         CmpOp::I64LtS => {
             sink.i64_lt_s();
@@ -6178,7 +6433,7 @@ fn cond_kind_of(opcode: OpCode) -> Option<CondKind> {
 
 /// Push the comparison's i32 result (0 or 1) onto the operand stack.
 fn push_cond(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -6232,7 +6487,7 @@ fn push_cond(
 /// hot guard site. Float ordered comparisons deliberately keep `i32.eqz`:
 /// their apparent inverse is not equivalent for NaN/unordered operands.
 fn push_guard_failure_cond(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -6270,7 +6525,7 @@ fn push_guard_failure_cond(
 }
 
 fn emit_cond(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
@@ -6288,12 +6543,12 @@ fn emit_cond(
 // ── Unary op helper ──
 
 fn emit_unary_vi(
-    sink: &mut InstructionSink<'_>,
+    sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
-    prefix: impl FnOnce(&mut InstructionSink<'_>),
-    suffix: impl FnOnce(&mut InstructionSink<'_>),
+    prefix: impl FnOnce(&mut PeepSink<'_, '_>),
+    suffix: impl FnOnce(&mut PeepSink<'_, '_>),
 ) {
     let vi = op.pos.get().raw();
     if !OpRef::raw_is_constant(vi) {
@@ -6307,6 +6562,26 @@ fn emit_unary_vi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peep_sink_applies_all_local_folds() {
+        let mut bytes = Vec::new();
+        {
+            let mut raw_sink = InstructionSink::new(&mut bytes);
+            let mut sink = PeepSink::new(&mut raw_sink);
+
+            sink.local_set(1)
+                .local_get(1)
+                .i64_const(0)
+                .i32_wrap_i64()
+                .i32_const(4)
+                .i32_mul()
+                .i32_add();
+            sink.flush();
+        }
+
+        assert_eq!(bytes, [0x22, 0x01]);
+    }
 
     #[test]
     fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
