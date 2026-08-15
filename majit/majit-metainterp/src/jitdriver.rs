@@ -4628,9 +4628,17 @@ impl<S: JitState> JitDriver<S> {
                 // as the portal's own return value.
                 self.meta.back_edge_finish = Some(result.typed_values.clone());
                 let run_meta = result.meta.clone();
-                if !result.typed_values.is_empty() {
-                    state.restore_values(&run_meta, &result.typed_values);
-                }
+                // The FINISH arguments are NOT the loop-carried state, so they
+                // are not written back into it. `warmstate.py:405-419
+                // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
+                // path straight to `fail_descr.get_result(cpu, deadframe)` and
+                // returns; the only thing it reads off the deadframe is the
+                // portal's own result, and it touches no interpreter state on
+                // the way out. A `restore_values` here decodes the FINISH
+                // descr's `fail_arg_types` — one word for an int-returning
+                // portal — into slots indexed by the state's live-value
+                // layout, so a state with more than one live field indexes
+                // past the end of the list it was handed.
                 let run_descriptor = self.driver_descriptor_for(state, &run_meta);
                 self.sync_after(state, &run_meta, run_descriptor.as_deref());
                 // Kept for callers that cannot consume the latch (a portal whose
