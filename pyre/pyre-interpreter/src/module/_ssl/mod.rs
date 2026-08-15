@@ -2544,10 +2544,7 @@ mod cert_store {
                     pyre_object::gc_roots::pin_root(trust.unwrap_or_else(|| w_bool_from(true)));
                     let cert_slot = pyre_object::gc_roots::shadow_stack_len();
                     pyre_object::gc_roots::pin_root(w_bytes_from_bytes(
-                        std::slice::from_raw_parts(
-                            cert.pbCertEncoded,
-                            cert.cbCertEncoded as usize,
-                        ),
+                        std::slice::from_raw_parts(cert.pbCertEncoded, cert.cbCertEncoded as usize),
                     ));
                     let encoding = encoding_type(cert.dwCertEncodingType);
                     Ok(w_tuple_new(vec![
