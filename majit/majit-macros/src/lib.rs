@@ -2528,6 +2528,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
+    let helper_source_name = sig.ident.to_string();
     let helper_body = helper.body;
     let helper_liveness_prebuild = helper.liveness_prebuild;
     let return_reg = helper.return_reg;
@@ -2596,6 +2597,13 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             __asm: &mut majit_metainterp::Assembler,
         ) -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
+            // `jitcode.py:15 self.name = name` — every jitcode upstream is
+            // named at construction. The builder defaults the field to the
+            // empty string, and the diagnostics that print it (the bytecode
+            // encoder's register/const ceiling audit among them) then identify
+            // nothing: a declined helper reports `""` and the reader has no way
+            // to tell which of a consumer's dozens it was.
+            __builder.set_name(#helper_source_name);
             #(#ensure_param_regs)*
             #helper_body
             #helper_return

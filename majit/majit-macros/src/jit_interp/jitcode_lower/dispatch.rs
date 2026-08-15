@@ -2725,6 +2725,18 @@ pub(super) fn lower_dispatch_chain(
                 majit_metainterp::record_degraded_dispatch_arm(#interp, #arm_name, #reason);
             }
         };
+        // `jitcode.py:15 self.name = name` — the name every sub-JitCode built
+        // for this arm carries.  The same spelling the degraded-arm record
+        // uses, so a log line and a `degraded_dispatch_arms()` entry for one
+        // arm can be matched by eye.
+        //
+        // Every arm gets it, not just the ones that degrade: `BC_ABORT` has
+        // two emitter families and one opcode, and the abort log discriminates
+        // them by frame shape (`depth>1 body=1`) precisely because the name was
+        // empty.  A name only the abort stubs carried would still leave the
+        // healthy arms indistinguishable from each other in the bytecode
+        // encoder's ceiling audit, which prints one line per finished builder.
+        let sub_jitcode_name = format!("{degraded_interp_name}::{degraded_arm_name}");
 
         if std::env::var_os("MAJIT_MACRO_DEBUG").is_some() {
             let pat = &arm.pat;
@@ -2867,6 +2879,7 @@ pub(super) fn lower_dispatch_chain(
                                     let __arm_jc: Option<majit_metainterp::JitCode> =
                                         (|| -> Option<majit_metainterp::JitCode> {
                                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                            __sub_builder.set_name(#sub_jitcode_name);
                                             __sub_builder.ensure_i_regs(#min_i_regs);
                                             __sub_builder.ensure_r_regs(#min_r_regs);
                                             __sub_builder.ensure_f_regs(#min_f_regs);
@@ -2887,6 +2900,7 @@ pub(super) fn lower_dispatch_chain(
                                             // BC_ABORT.
                                             #record_degraded
                                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                            __sub_builder.set_name(#sub_jitcode_name);
                                             __sub_builder.ensure_i_regs(#min_i_regs);
                                             __sub_builder.ensure_r_regs(#min_r_regs);
                                             __sub_builder.ensure_f_regs(#min_f_regs);
@@ -2909,6 +2923,7 @@ pub(super) fn lower_dispatch_chain(
                                     {
                                         #record_degraded
                                         let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                        __sub_builder.set_name(#sub_jitcode_name);
                                         __sub_builder.abort();
                                         __sub_builder.finish()
                                     }
@@ -2927,17 +2942,30 @@ pub(super) fn lower_dispatch_chain(
                 // make the channel fire on every `_ => break` and
                 // `_ => panic!` in the corpus and stop discriminating.
                 crate::jit_interp::classify::ArmPattern::Nop => (
-                    quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
+                    quote::quote! {
+                        {
+                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                            __sub_builder.set_name(#sub_jitcode_name);
+                            __sub_builder.finish()
+                        }
+                    },
                     dispatch_arm_inline_call_tokens(&[]),
                 ),
                 crate::jit_interp::classify::ArmPattern::Halt => (
-                    quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
+                    quote::quote! {
+                        {
+                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                            __sub_builder.set_name(#sub_jitcode_name);
+                            __sub_builder.finish()
+                        }
+                    },
                     dispatch_arm_inline_call_tokens(&[]),
                 ),
                 crate::jit_interp::classify::ArmPattern::AbortPermanent => (
                     quote::quote! {
                         {
                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                            __sub_builder.set_name(#sub_jitcode_name);
                             __sub_builder.abort_permanent();
                             __sub_builder.finish()
                         }
@@ -2954,6 +2982,7 @@ pub(super) fn lower_dispatch_chain(
                             {
                                 #record_degraded
                                 let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                __sub_builder.set_name(#sub_jitcode_name);
                                 __sub_builder.abort();
                                 __sub_builder.finish()
                             }

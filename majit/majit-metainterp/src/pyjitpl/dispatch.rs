@@ -3346,11 +3346,13 @@ where
     /// inline frame whose whole body is the single abort byte, so
     /// `depth>1 body=1` is the stub and the dispatch body is neither.
     ///
-    /// `JitCode.name` would be the direct answer and is NOT usable here:
-    /// `majit_metainterp::JitCodeBuilder::new()` takes no name (unlike
-    /// `majit-translate`'s), so every macro-built JitCode carries `name: ""`.
-    /// Threading one through the macro's emit sites is the real fix; until then
-    /// these three numbers discriminate without it.
+    /// `JitCode.name` is the direct answer and the macro now supplies it: the
+    /// arm's sub-JitCode is named `<Interp>::<arm pattern>` and the dispatch
+    /// body's is the machine function's own name, so the line says which arm
+    /// aborted instead of leaving it to be inferred. The frame shape stays in
+    /// the message because it is the independent check — a name is a label the
+    /// emitter chose, `depth`/`body` is what actually ran — and because a host
+    /// still on an older builder emits `""` here.
     fn log_bytecode_abort(&mut self, insn: &str) {
         if !crate::majit_log_enabled() {
             return;
@@ -3358,9 +3360,10 @@ where
         let depth = self.frames.len();
         let frame = self.frames.current_mut();
         eprintln!(
-            "[jit] {insn} decided at pos={} depth={depth} body={} \
+            "[jit] {insn} decided in {:?} at pos={} depth={depth} body={} \
              (depth>1 body=1 = a degraded arm stub; the merge point's \
              `trace action at pc=` reports the PORTAL pc, not this one)",
+            frame.jitcode.name(),
             frame.last_opcode_position,
             frame.jitcode.code.len(),
         );

@@ -14,6 +14,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let trace_fn_name = format_ident!("__trace_{}", fn_name);
     let prebuild_fn_name = format_ident!("__prebuild_jitcode_liveness_{}", fn_name);
     let dispatch_jitcode_fn_name = format_ident!("__dispatch_jitcode_{}", fn_name);
+    let dispatch_jitcode_name = fn_name.to_string();
     let declare_schema_fn_name = format_ident!("__declare_jit_schema_{}", fn_name);
     // Must match `codegen_state.rs`'s spelling: the symbolic-state struct is one
     // module-level item shared by both emitters, suffixed so two machines can
@@ -248,6 +249,10 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 return None;
             }
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
+            // `jitcode.py:15 self.name = name`.  This is the root JitCode of
+            // the machine, so it names the dispatch function itself; its arms'
+            // sub-JitCodes name the arm they came from.
+            __builder.set_name(#dispatch_jitcode_name);
             let _live_offset_patch = __builder.live_placeholder();
             #dispatch_body
             __builder.finalize_liveness(__asm);
