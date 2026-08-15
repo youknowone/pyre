@@ -545,7 +545,17 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // After a fuel-exhaustion trap the store has no fuel, so the diagnostic
     // export calls below would themselves immediately trap and read as 0.
     // Refill so the readout reflects the real (compile-time) counter values.
-    if fuel_limit.is_some() {
+    // Read the remaining budget first: `limit - remaining` is the executed
+    // instruction count, which makes "how much does one loop iteration cost"
+    // answerable by differencing two runs at different trip counts. A run that
+    // exhausted its budget reports `used == limit` and says nothing, so size the
+    // limit above what the script needs.
+    if let Some(limit) = fuel_limit {
+        let remaining = store.get_fuel().unwrap_or(0);
+        eprintln!(
+            "[fuel] used={} remaining={remaining}",
+            limit.saturating_sub(remaining)
+        );
         let _ = store.set_fuel(u64::MAX);
     }
     if let Some(path) = &guest_profile_out
