@@ -739,8 +739,42 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
     resume_pc: usize,
 ) -> Option<majit_metainterp::MIFrame> {
+    // The blackhole `setposition`s straight onto this coordinate and dispatches
+    // there, so it has to start an instruction. Dropping the `-live-`
+    // requirement above widened the pc domain to every post-step position, and
+    // nothing else narrows it back: a coordinate inside an instruction's
+    // operands reads the next operand byte as an opcode. That is where
+    // `dispatch_step: unwired opcode=0x5 pos=18 jitcode="__new__"` came from —
+    // byte 5 is the result-register operand of a `residual_call_ir_r/iIRd>r`
+    // spanning pc 8..19, and no build emits byte 5 as an opcode at all.
+    //
+    // `build_multi_frame_miframe` already declines this class for its own
+    // innermost frame. Declining is the supported outcome: every caller falls
+    // back to the rollback/replay path.
+    if !instruction_starts_at(&jitcode.code, resume_pc) {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-fill-decline] resume_pc={resume_pc} is not an instruction \
+                 start in jitcode {:?} (len {})",
+                jitcode.name,
+                jitcode.code.len(),
+            );
+        }
+        return None;
+    }
     let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
     fill_trace_too_long_register_banks(ctx, &mut miframe).then_some(miframe)
+}
+
+/// Whether `pc` is an instruction boundary of `code`.
+///
+/// `decoded_ops` walks the fallthrough layout from 0 and stops at the first
+/// byte it cannot decode, so a pc it never yields is either inside an
+/// instruction or past a decode failure — neither is a coordinate the
+/// blackhole may dispatch from. The end of the code is a boundary: a frame
+/// that resumes there returns without dispatching.
+fn instruction_starts_at(code: &[u8], pc: usize) -> bool {
+    pc == code.len() || crate::jitcode_runtime::decoded_ops(code).any(|op| op.pc == pc)
 }
 
 /// Fill every currently-known register color, matching
