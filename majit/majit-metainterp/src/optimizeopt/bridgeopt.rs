@@ -100,14 +100,30 @@ pub fn serialize_optimizer_knowledge(
     // disagree on which Ref-typed slots get a bitfield bit, producing
     // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
     // when super-instruction GEN widens the live register set.
+    //
+    // bridgeopt.py:76-77 opens the loop with `if box is None or box.type != "r"`,
+    // so upstream emits no bit for a hole. It can also afford not to test for one
+    // when reading (bridgeopt.py:135), because
+    // `initialize_state_from_guard_failure` has already dropped them —
+    // `return [box for box in inputargs_and_holes if box]` (pyjitpl.py:3310).
+    // pyre has no such filter: a bridge's inputargs are one per fail-arg slot,
+    // holes included, and `store_final_boxes_in_guard` types every hole `Ref`.
+    // The reader therefore walks the hole positions, and skipping them here
+    // would leave it one bit ahead per hole — reading each later Ref slot's
+    // predecessor's bit, and eventually crossing into the heap section a whole
+    // word early. Emit the hole's bit instead, always clear: an absent box has
+    // no known class, so the reader learns nothing from it and the two walks
+    // stay in step.
     let mut bitfield: i32 = 0;
     let mut shifts = 0;
-    for opref in liveboxes.iter().flatten() {
-        let livebox_tp = numb_state
-            .livebox_types
-            .get(opref)
-            .copied()
-            .unwrap_or_else(|| env.get_type(*opref));
+    for slot in liveboxes.iter() {
+        let livebox_tp = slot.map_or(majit_ir::Type::Ref, |opref| {
+            numb_state
+                .livebox_types
+                .get(&opref)
+                .copied()
+                .unwrap_or_else(|| env.get_type(opref))
+        });
         if livebox_tp != majit_ir::Type::Ref {
             continue;
         }
@@ -115,7 +131,7 @@ pub fn serialize_optimizer_knowledge(
         // `bridgeopt.serialize_optimizer_knowledge` obtains `info` with
         // `getptrinfo(box)` and records whether it has a known class.
         // known_class = info is not None and info.get_known_class(cpu) is not None
-        if env.has_known_class(*opref) {
+        if slot.is_some_and(|opref| env.has_known_class(opref)) {
             bitfield |= 1;
         }
         shifts += 1;
