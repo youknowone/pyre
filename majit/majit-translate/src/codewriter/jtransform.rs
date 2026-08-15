@@ -3457,6 +3457,17 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
+        // `rtype_intmask` coerces its input to `lltype.Signed` and returns
+        // that value unchanged (`rpython/rtyper/rbuiltin.py:222-225`).  The
+        // frontend preserves the coercion as this call-shaped marker, so fold
+        // it through the same identity alias used for no-op coercions
+        // (`jtransform.py:399-401`).
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
         // A zero-arg transparent `Tuple` constructor is the unit value `()` —
         // the MIR return-place aggregate of a `-> ()` function (e.g.
         // `w_list_append`).  It carries no payload and no runtime
@@ -10566,6 +10577,62 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
         }
+    }
+
+    /// `rpython/rtyper/rbuiltin.py:222-225`: `rtype_intmask` returns its
+    /// single Signed input unchanged.
+    #[test]
+    fn rarithmetic_intmask_elides_only_the_exact_single_arg_call() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("rarithmetic_intmask");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let extra = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["rpython", "rlib", "rarithmetic", "intmask"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![arg.clone()],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "rarithmetic_intmask",
+            &mut graph,
+        );
+        assert!(matches!(rewritten, RewriteResult::Identity(alias) if alias == arg));
+
+        let wrong_target = CallTarget::function_path(["rlib", "rarithmetic", "intmask"]);
+        assert!(!matches!(
+            transformer.rewrite_op_direct_call(
+                &op,
+                &wrong_target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "rarithmetic_intmask_wrong_target",
+                &mut graph,
+            ),
+            RewriteResult::Identity(_)
+        ));
+        assert!(!matches!(
+            transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                &[arg, extra],
+                &result_ty,
+                "rarithmetic_intmask_wrong_arity",
+                &mut graph,
+            ),
+            RewriteResult::Identity(_)
+        ));
     }
 
     /// `jtransform.py:116-118` + `:176-179

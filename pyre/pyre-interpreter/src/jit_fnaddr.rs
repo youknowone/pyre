@@ -1790,6 +1790,13 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_list_len",
         w_list_len as *const (),
     );
+    let w_set_len: unsafe fn(pyre_object::PyObjectRef) -> usize = pyre_object::setobject::w_set_len;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::setobject::w_set_len",
+        "pyre_object::w_set_len",
+        w_set_len as *const (),
+    );
     // The cold list strategy dehomogenization `switch_to_object_strategy` bulk
     // re-boxes typed int/float storage into an Object items block via
     // Vec/collect allocation the tracer cannot model. Register it so the hot
