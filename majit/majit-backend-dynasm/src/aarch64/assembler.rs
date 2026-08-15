@@ -3354,7 +3354,7 @@ impl<'a> AssemblerARM64<'a> {
                 // store next GUARD_NOT_FORCED's descr ptr to jf_force_descr
                 // BEFORE the call, so forcing code knows which guard to resume.
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
-                self.genop_call_assembler(op, arglocs);
+                self.genop_call_assembler(op, arglocs, result_loc);
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
@@ -3376,9 +3376,9 @@ impl<'a> AssemblerARM64<'a> {
                     let rv = r.value;
                     dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
-                }
+                // aarch64/regalloc.py:964 forces the result into x0.  Keep
+                // it in the regalloc-assigned register; FrameManager emits a
+                // spill only if a later lifetime boundary actually needs one.
             }
             OpCode::CallMallocNurseryHeaderless => {
                 self.genop_call_malloc_nursery_headerless(op);
@@ -3485,8 +3485,11 @@ impl<'a> AssemblerARM64<'a> {
                 // CALL_ASSEMBLER store sequence that follows.
                 self.emit_propagate_memory_error_if_null(0);
                 dynasm!(self.mc ; .arch aarch64 ; =>done);
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
+                if let Some(Loc::Reg(r)) = result_loc
+                    && r.value != 0
+                {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
             }
             // aarch64/assembler.py:738 malloc_cond_varsize
@@ -3552,8 +3555,11 @@ impl<'a> AssemblerARM64<'a> {
                 // the result store so the null pointer never reaches
                 // subsequent typed stores.
                 self.emit_propagate_memory_error_if_null(0);
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
+                if let Some(Loc::Reg(r)) = result_loc
+                    && r.value != 0
+                {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(rv), x0);
                 }
             }
             // aarch64/opassembler.py:258 `emit_op_check_memory_error` →
@@ -6121,7 +6127,7 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:295-360 call_assembler parity.
     /// Uses regalloc-provided arglocs to load callee arguments instead of
     /// resolve_opref(), which drops register-carried values to Const(0).
-    fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc], result_loc: Option<&Loc>) {
         // handle_call_assembler (rewrite.py:665-695) always pre-builds the
         // callee jitframe — storing every inputarg, and for a virtualizable
         // passing the forced vable object as the second arg — so the backend
@@ -6174,9 +6180,7 @@ impl<'a> AssemblerARM64<'a> {
                         ; mov x0, xzr
                     );
                 }
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
-                }
+                self.move_call_assembler_result(op.opcode.result_type(), result_loc);
                 return;
             }
 
@@ -6256,9 +6260,28 @@ impl<'a> AssemblerARM64<'a> {
             // RPython `BaseAssembler.call_assembler` joins helper/fast paths
             // here without another frame reload.  The collecting target/helper
             // calls above already reload in `Aarch64CallBuilder.pop_gcmap`.
-            if !op.pos.get().is_none() {
-                self.store_rax_to_result(op.pos.get());
+            self.move_call_assembler_result(result_type, result_loc);
+        }
+    }
+
+    /// `llsupport/assembler.py:295-360 call_assembler` keeps the result in
+    /// `result_loc`; it does not mirror every call result into a fresh frame
+    /// slot.  The local helper ABI joins both paths with the raw result bits in
+    /// x0, so materialize those bits in the location chosen by regalloc.
+    fn move_call_assembler_result(&mut self, result_type: Type, result_loc: Option<&Loc>) {
+        match (result_type, result_loc) {
+            (Type::Void, None) => {}
+            (Type::Float, Some(Loc::Reg(r))) if r.is_xmm => {
+                dynasm!(self.mc ; .arch aarch64 ; fmov D(r.value), x0);
             }
+            (_, Some(Loc::Reg(r))) if !r.is_xmm => {
+                if r.value != 0 {
+                    dynasm!(self.mc ; .arch aarch64 ; mov X(r.value), x0);
+                }
+            }
+            _ => panic!(
+                "CALL_ASSEMBLER result must use its regalloc result register: type={result_type:?} loc={result_loc:?}"
+            ),
         }
     }
 
@@ -7775,6 +7798,44 @@ mod tests {
     };
 
     use crate::runner::DynasmBackend;
+
+    /// aarch64/regalloc.py:958-977 keeps CALL_MALLOC_NURSERY's result in x0;
+    /// only FrameManager may decide to spill it later.  The old hybrid emitter
+    /// also called `allocate_slot` unconditionally, growing every recursive
+    /// loop's JitFrame for an otherwise register-resident allocation result.
+    #[test]
+    fn malloc_nursery_result_does_not_grow_frame_depth() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        let malloc = Rc::new(Op::new(
+            OpCode::CallMallocNursery,
+            &[Operand::from_opref(OpRef::const_int(32))],
+        ));
+        malloc.pos.set(OpRef::ref_op(0));
+
+        let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&malloc)]);
+        finish.pos.set(OpRef::void_op(1));
+        finish.set_fail_arg_types(vec![Type::Ref]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(517);
+        backend
+            .compile_loop(&[], &[malloc, Rc::new(finish)], &token)
+            .expect("compile register-resident nursery result trace");
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        assert_eq!(
+            compiled.frame_depth.load(Ordering::Acquire),
+            super::JITFRAME_FIXED_SIZE,
+            "a register-resident nursery result must not allocate a shadow frame slot",
+        );
+    }
 
     fn eval_breaker_poll_ops(word_addr: usize, first_pos: u32) -> (Rc<Op>, Rc<Op>, Rc<Op>) {
         let word = Rc::new(Op::with_descr(
