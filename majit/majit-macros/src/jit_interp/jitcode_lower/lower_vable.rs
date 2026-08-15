@@ -13,6 +13,15 @@ pub(super) fn field_scalar_tokens(
     struct_path: &syn::Path,
     member: &syn::Member,
 ) -> (TokenStream, TokenStream, TokenStream) {
+    // Every `int_fields` / `ref_fields` consultation reaches the maps through
+    // here, so this one line is the whole record of which declared keys an
+    // access site asked about.  Recorded whether or not the key is declared:
+    // the report is over the DECLARED keys, and an undeclared one describes
+    // nothing to begin with.
+    config
+        .consulted_field_keys
+        .borrow_mut()
+        .insert(key.to_string());
     match config.int_fields.get(key) {
         Some((ty, signed)) => (
             quote! { ::core::mem::size_of::<#ty>() },

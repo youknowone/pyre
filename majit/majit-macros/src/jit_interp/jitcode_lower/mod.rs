@@ -230,6 +230,17 @@ pub struct LowererConfig {
     /// width and signedness with the struct layout instead of the machine-word
     /// default, which is what makes `descr.is_integer_bounded()` true for it.
     pub(super) int_fields: HashMap<String, (Ident, bool)>,
+    /// `"StructType::field"` keys some access site asked about while lowering.
+    ///
+    /// A declared key that never appears here matched no access, so it emitted
+    /// nothing — no descr width, and no witness either. That is what makes it
+    /// worth reporting rather than merely tidying: an entry that produces no
+    /// tokens is also an entry whose claim about the field was never checked,
+    /// and the two are indistinguishable from the declaration alone.
+    ///
+    /// Shared rather than cloned: the config is cloned per lowering entry
+    /// point, and a key consulted by any of them counts for all.
+    pub(super) consulted_field_keys: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
     /// Return struct type for ref-returning calls.  Key = canonical func
     /// path segments, value = struct type path.  When a `residual_ref` call
     /// result is bound, the lowerer sets `Binding.struct_type` from this map
@@ -992,6 +1003,7 @@ impl LowererConfig {
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
+            consulted_field_keys: Default::default(),
             call_returns: HashMap::new(),
             headerless_structs: headerless_structs
                 .iter()
@@ -1264,6 +1276,7 @@ impl LowererConfig {
             ref_fields: ref_fields_map,
             array_fields: array_fields_map,
             int_fields: int_fields_map(int_fields),
+            consulted_field_keys: Default::default(),
             call_returns: call_returns
                 .iter()
                 .map(|(func, ret_type)| (canonical_path_segments(func), ret_type.clone()))

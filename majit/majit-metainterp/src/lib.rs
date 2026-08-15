@@ -614,6 +614,96 @@ pub fn assert_no_degraded_dispatch_arms(interp: &str) {
     );
 }
 
+/// A declared field key that no access site asked about.
+///
+/// `int_fields` and `ref_fields` are consulted by key —
+/// `"StructType::field"`, built from the *declared* type of the base an access
+/// goes through. A key that matches no access emits nothing: no descr width,
+/// and no witness either. So the entry is at once inert and an unchecked claim
+/// about the field, and the declaration alone cannot say which.
+///
+/// Reported rather than rejected. A dispatch arm that refused to lower never
+/// reached its field accesses, so a key used only in that arm is unconsulted
+/// through no fault of the declaration; read this beside
+/// [`degraded_dispatch_arms`] before concluding an entry is dead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct UnconsultedFieldDeclaration {
+    /// The machine's declared `state = T` type name, matching
+    /// [`DegradedDispatchArm::interp`].
+    pub interp: &'static str,
+    /// The declaration's key, as written: `"StructType::field"`.
+    pub key: &'static str,
+}
+
+static UNCONSULTED_FIELD_DECLARATIONS: std::sync::Mutex<Vec<UnconsultedFieldDeclaration>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `interp` declares `key` and no access site consulted it.
+///
+/// Emitted into the `__dispatch_jitcode_*` body beside
+/// [`record_dispatch_arm_census`], so it fires when the portal is installed.
+/// Deduplicated by content: a portal may be built more than once per process
+/// and the fact is per declaration, not per build.
+pub fn record_unconsulted_field_declaration(interp: &'static str, key: &'static str) {
+    let entry = UnconsultedFieldDeclaration { interp, key };
+    let mut entries = UNCONSULTED_FIELD_DECLARATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if entries.contains(&entry) {
+        return;
+    }
+    if majit_log_enabled() {
+        eprintln!("[jit] unconsulted field declaration: {interp} declares {key}, unused");
+    }
+    entries.push(entry);
+}
+
+/// Snapshot of every unconsulted field declaration recorded so far.
+pub fn unconsulted_field_declarations() -> Vec<UnconsultedFieldDeclaration> {
+    UNCONSULTED_FIELD_DECLARATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Panic unless `interp`'s portal was installed AND every field declaration it
+/// carries was consulted.
+///
+/// Takes its denominator from the same census as
+/// [`assert_no_degraded_dispatch_arms`], for the same reason: an empty result
+/// is also what a portal that was never built produces.
+pub fn assert_no_unconsulted_field_declarations(interp: &str) {
+    let census = dispatch_arm_census();
+    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
+        panic!(
+            "no dispatch-arm census for `{interp}`: its portal was never \
+             installed in this process, so an empty unconsulted list says \
+             nothing about it. Build the dispatch JitCode (or run the machine) \
+             first. Recorded machines: {:?}",
+            census.iter().map(|e| e.interp).collect::<Vec<_>>()
+        );
+    };
+    let unconsulted: Vec<UnconsultedFieldDeclaration> = unconsulted_field_declarations()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    assert!(
+        unconsulted.is_empty(),
+        "`{interp}` declares {} field key(s) no access site consulted, across \
+         its {} dispatch arms. Each emitted no width and no witness, so the \
+         declaration was never checked against the struct it names: {unconsulted:#?}. \
+         {} of its arms degraded, and a key used only in one of those is \
+         unconsulted for that reason rather than for being stale: {degraded:#?}",
+        unconsulted.len(),
+        entry.arms,
+        degraded.len(),
+    );
+}
+
 /// One field of a struct layout, as an emit site described it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StructLayoutField {

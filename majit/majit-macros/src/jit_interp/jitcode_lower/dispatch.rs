@@ -3023,6 +3023,33 @@ pub(super) fn lower_dispatch_chain(
         }
     }
 
+    // Every arm has lowered, so the consulted-key set is final: report the
+    // declared `int_fields` / `ref_fields` keys no access site asked about.
+    //
+    // Reported rather than rejected, and the reason is the degraded arm. An
+    // arm that refused to lower never reached its field accesses, so a key
+    // used only there is unconsulted through no fault of the declaration —
+    // failing the build on it would turn one refusal into two. The consumer's
+    // gate reads this alongside `degraded_dispatch_arms` and can tell them
+    // apart; a compile error could not.
+    {
+        let interp = config.state_type_name.clone();
+        let consulted = config.consulted_field_keys.borrow();
+        let mut unconsulted: Vec<&String> = config
+            .int_fields
+            .keys()
+            .chain(config.ref_fields.keys())
+            .filter(|key| !consulted.contains(*key))
+            .collect();
+        unconsulted.sort();
+        unconsulted.dedup();
+        for key in unconsulted {
+            lowerer.emit_aux(quote::quote! {
+                majit_metainterp::record_unconsulted_field_declaration(#interp, #key);
+            });
+        }
+    }
+
     // After all arm guards, the default/exit path: unconditional GOTO.
     // default_label is bound at the typed-return emission site in
     // lower_dispatch_body (Task 1.7).

@@ -531,9 +531,39 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     maybe_dump_liveness(&helper_name, &lowerer.op_metadata);
     let liveness_prebuild =
         liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
+    // The body has lowered, so the consulted-key set is final. Reported per
+    // HELPER, not per machine: each `#[jit_inline]` carries its own
+    // `int_fields` / `ref_fields`, and a key one helper consults says nothing
+    // about the helper next to it.
+    //
+    // This surface is where the population lives. A `#[jit_interp]` machine
+    // declares a handful of keys; a consumer's helpers repeat theirs at every
+    // site, and a key that matches nothing at one site matches nothing at
+    // dozens.
+    let unconsulted_declarations = match inline_config.as_ref() {
+        Some(config) => {
+            let consulted = config.consulted_field_keys.borrow();
+            let mut keys: Vec<&String> = config
+                .int_fields
+                .keys()
+                .chain(config.ref_fields.keys())
+                .filter(|key| !consulted.contains(*key))
+                .collect();
+            keys.sort();
+            keys.dedup();
+            let records = keys.into_iter().map(|key| {
+                quote! {
+                    majit_metainterp::record_unconsulted_field_declaration(#helper_name, #key);
+                }
+            });
+            quote! { #(#records)* }
+        }
+        None => quote! {},
+    };
     let statements = lowerer.statements;
     Ok(Some(InlineHelperJitCode {
         body: quote! {
+            #unconsulted_declarations
             #(#statements)*
         },
         return_reg,
