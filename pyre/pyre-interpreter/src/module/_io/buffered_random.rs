@@ -241,6 +241,10 @@ impl W_BufferedRandom {
             };
             self.write_pos += written as i64;
             self.raw_pos = self.write_pos;
+            // Partial writes can return successfully when interrupted by a
+            // signal (see write(2)).  Run signal handlers before blocking
+            // another time, possibly indefinitely.
+            super::checksignals()?;
         }
         self.writer_reset_buf();
         Ok(())
@@ -337,6 +341,9 @@ impl W_BufferedRandom {
                     }
                     Err(error) => return Err(error),
                 }
+                // Same partial-write rule as `writer_flush_unlocked`: run the
+                // handlers before the next call can block indefinitely.
+                super::checksignals()?;
             }
 
             if this.readable {

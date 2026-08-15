@@ -19,10 +19,14 @@ pub(super) fn make_write_blocking_error(written: usize) -> crate::PyError {
     let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") else {
         return crate::PyError::os_error("write could not complete without blocking");
     };
+    // `interp_bufferedio.py:26-38` reads the saved errno here.  It may be
+    // nonsense when the raw `write` is a Python method that simply returned
+    // None, but a caller that asked for a non-blocking fd needs EAGAIN, and
+    // the only place it survives is the errno the failed syscall left.
     match crate::call::call_function_impl_result(
         blocking,
         &[
-            w_int_new(0),
+            w_int_new(crate::builtins::crt_errno() as i64),
             w_str_new("write could not complete without blocking"),
             w_int_new(written as i64),
         ],
@@ -213,6 +217,10 @@ impl W_BufferedWriter {
             };
             self.write_pos += written as i64;
             self.raw_pos = self.write_pos;
+            // Partial writes can return successfully when interrupted by a
+            // signal (see write(2)).  Run signal handlers before blocking
+            // another time, possibly indefinitely.
+            super::checksignals()?;
         }
         self.writer_reset_buf();
         Ok(())
@@ -297,6 +305,9 @@ impl W_BufferedWriter {
                     }
                     Err(error) => return Err(error),
                 }
+                // Same partial-write rule as `writer_flush_unlocked`: run the
+                // handlers before the next call can block indefinitely.
+                super::checksignals()?;
             }
 
             let remaining = data.len() - written;

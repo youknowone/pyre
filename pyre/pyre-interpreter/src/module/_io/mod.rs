@@ -79,6 +79,21 @@ pub(crate) fn unsupported_operation_type() -> PyObjectRef {
         .map_or(std::ptr::null_mut(), |&addr| addr as PyObjectRef)
 }
 
+/// `space.getexecutioncontext().checksignals()` as the buffered writer's
+/// partial-write loops call it (`interp_bufferedio.py:429`, `:914`).
+///
+/// wasm32 carries no `signal` module (`module/mod.rs`), and with no handler to
+/// run the retry has nothing to check for.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn checksignals() -> Result<(), crate::PyError> {
+    crate::module::signal::interp_signal::checksignals_now()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn checksignals() -> Result<(), crate::PyError> {
+    Ok(())
+}
+
 /// `interp_iobase.py:unsupported` — construct the module-local
 /// `UnsupportedOperation`, preserving its OSError + ValueError MRO.
 pub(crate) fn unsupported(message: &str) -> crate::PyError {
