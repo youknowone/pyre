@@ -986,6 +986,21 @@ pub trait GcAllocator: Send {
     /// Default no-op for stub allocators with no type table.
     fn freeze_types(&mut self) {}
 
+    /// Whether this allocator keeps a type table at all
+    /// (`gctypelayout.py` `TypeLayoutBuilder` — a collector translated
+    /// without one has no `type_info_group` to name a shape in).
+    ///
+    /// A capability, deliberately, rather than a reading of `type_count()`:
+    /// `register_type`'s default body returns 0 and records nothing, so an
+    /// allocator with no table and one whose table is merely still empty both
+    /// report zero, and the two want opposite answers from a caller deciding
+    /// whether a shape id can be resolved against this allocator. The default
+    /// `false` matches the same default-body allocators `freeze_types` and
+    /// `supports_guard_gc_type` are written for.
+    fn has_type_registry(&self) -> bool {
+        false
+    }
+
     /// llsupport/gc.py:162 / gc.py:318 `supports_guard_gc_type` flag.
     /// `GcLLDescr_boehm` sets it to `False`; `GcLLDescr_framework` sets
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
@@ -1423,6 +1438,9 @@ impl GcAllocator for GcHandle {
     }
     fn freeze_types(&mut self) {
         gc_sync::gc_op(|gc| gc.freeze_types())
+    }
+    fn has_type_registry(&self) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.has_type_registry())
     }
     fn supports_guard_gc_type(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.supports_guard_gc_type())

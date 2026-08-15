@@ -293,71 +293,120 @@ const JF_FRAME_ITEM0_OFS: i32 = JF_FRAME_OFS as i32 + BASEITEMOFS as i32;
 /// W_FLOAT before JITFRAME, so the JITFRAME id depends on that ordering
 /// and cannot be hard-coded here).
 ///
-/// `u32::MAX` means "not yet registered"; the backend uses this in
-/// `ensure_jitframe_type_registered` to set it up lazily with its own
-/// custom trace hook, and in `alloc_nursery_no_collect_typed` to pass
-/// the correct id to the allocator.
+/// `u32::MAX` means "the frontend has published no id". Publishing is a
+/// precondition of installing a collector on this backend, not a hint the
+/// backend may supply for itself — see [`resolve_jitframe_heap`].
+///
+/// Published twice, to one value. The atomic is what a thread that never
+/// called [`set_jitframe_gc_type_id`] reads: pyre publishes once from
+/// `build_gc`, under a `Once`, and every later thread installs the singleton
+/// against that id. The thread-local is what the publishing thread itself
+/// reads, and it exists for the test binaries, where each thread builds its
+/// own collector and registers a different number of types ahead of JITFRAME:
+/// there the atomic holds whichever thread stored last, and a thread that read
+/// it would install an id naming some other collector's type.
 static JITFRAME_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
-static JITFRAME_GC_TYPE_ID_IS_EXPLICIT: AtomicBool = AtomicBool::new(false);
 
-/// Override the JITFRAME type id explicitly. Called from the frontend
-/// after it has registered its own types so that our nursery allocations
-/// (gc.alloc_nursery_no_collect_typed) use the same id that the frontend
-/// assigned to the JITFRAME TypeInfo (jitframe.py:48-52).
+thread_local! {
+    /// This thread's own publication (see [`JITFRAME_GC_TYPE_ID`]).
+    static JITFRAME_GC_TYPE_ID_LOCAL: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Publish the JITFRAME type id. Called from the frontend after it has
+/// registered `jitframe_type_info()` on its collector, so that our nursery
+/// allocations (gc.alloc_nursery_no_collect_typed) use the same id the
+/// frontend assigned to the JITFRAME TypeInfo (jitframe.py:48-52).
+///
+/// Must precede the collector's install on this backend.
 pub fn set_jitframe_gc_type_id(id: u32) {
+    assert_ne!(
+        id,
+        u32::MAX,
+        "u32::MAX is the unpublished sentinel, not a type id"
+    );
+    JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.set(Some(id)));
     JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
-    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
 }
 
-fn jitframe_gc_type_id() -> u32 {
-    JITFRAME_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire)
-}
-
-fn set_jitframe_gc_type_id_lazy(id: u32) {
-    JITFRAME_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Release);
-    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.store(false, std::sync::atomic::Ordering::Release);
-}
-
-fn jitframe_gc_type_id_is_explicit() -> bool {
-    JITFRAME_GC_TYPE_ID_IS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire)
-}
-
-// JitFrame layout registration for the GC rewriter
-/// Ensure the JITFRAME GC type is registered, and that
-/// `JITFRAME_GC_TYPE_ID` reflects the id the GC assigned to it.
-///
-/// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
-/// called from jitframe_allocate (jitframe.py:49).
-///
-/// Lazy path (no frontend registration): register JITFRAME directly on
-/// each allocator and return the runtime-local type id. The `TypeInfo`
-/// comes from `majit_backend::jitframe::jitframe_type_info()` so the
-/// layout, item size, and custom-trace hook stay in sync with every
-/// other consumer of JITFRAME.
-fn ensure_jitframe_type_registered(gc: &mut dyn GcAllocator) -> Option<u32> {
-    if jitframe_gc_type_id_is_explicit() {
-        let id = jitframe_gc_type_id();
-        assert_ne!(id, u32::MAX, "explicit JITFRAME GC type id missing");
+fn published_jitframe_gc_type_id() -> Option<u32> {
+    if let Some(id) = JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.get()) {
         return Some(id);
     }
-    // The stub test is `did the registration take`, asked AFTER registering.
-    //
-    // `GcAllocator::register_type`'s default body returns 0 and records
-    // nothing, so an allocator with no type table accepts the call and still
-    // reports `type_count() == 0` afterwards. Asking BEFORE registering is a
-    // different question — whether some OTHER type was registered first — and
-    // it answers "no type table" for a collector whose registry is merely
-    // still empty. Every fixture in this file that wants a nursery-allocated
-    // jitframe had to register a throwaway type to get past that reading, and
-    // a frontend that registers the JITFRAME id before any of its own types
-    // would have silently fallen back to the off-GC frame.
-    let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
-    if gc.type_count() == 0 {
-        return None; // No type table (test-double allocators)
+    match JITFRAME_GC_TYPE_ID.load(std::sync::atomic::Ordering::Acquire) {
+        u32::MAX => None,
+        id => Some(id),
     }
-    set_jitframe_gc_type_id_lazy(id);
-    Some(id)
+}
+
+/// Unpublish, for the fixture that asks what an install does with no id.
+///
+/// Safe to run beside the other fixtures despite clearing process-global
+/// state: every fixture that publishes reads its own thread-local back, so
+/// the atomic has no reader but a thread that never published.
+#[cfg(test)]
+fn clear_published_jitframe_gc_type_id() {
+    JITFRAME_GC_TYPE_ID_LOCAL.with(|c| c.set(None));
+    JITFRAME_GC_TYPE_ID.store(u32::MAX, std::sync::atomic::Ordering::Release);
+}
+
+/// Where this thread's jitframes are allocated from, as decided once by
+/// `install_gc_box` / `install_gc_standalone`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JitFrameHeap {
+    /// GC-managed under this type id — `jitframe.py:48`
+    /// `lltype.malloc(JITFRAME, ...)`, reached through
+    /// `llmodel.py:298 malloc_jitframe`.
+    Nursery(u32),
+    /// The installed allocator has no type table, so there is no shape to
+    /// allocate a frame under and the frame is a plain `Vec<i64>` block
+    /// outside both generations. Test-double allocators only; upstream has
+    /// no counterpart, because a translated backend always has a
+    /// `TypeLayoutBuilder`.
+    OffGc,
+}
+
+/// Decide, at install time, where this thread's jitframes come from.
+///
+/// RPython: rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
+/// called from jitframe_allocate (jitframe.py:49) — upstream registers the
+/// shape as part of translating the frontend, so the id is settled before any
+/// compiled code exists. This is the same ordering, made a precondition: a
+/// collector with a type table must arrive with its JITFRAME id already
+/// published, and one that arrives without it is a configuration error rather
+/// than a case to be recovered from.
+///
+/// There is no backend-side lazy registration any more, and its absence is the
+/// decision. Registering here means minting an id in whichever registry
+/// happens to be installed on the calling thread, which the frontend does not
+/// know about; it also means calling `register_type` on a registry the
+/// frontend may already have frozen (`gctypelayout.py:393-398` — after
+/// `encode_type_shapes_now` there are no new types), where the only outcomes
+/// are a panic or a shape the frontend cannot name.
+fn resolve_jitframe_heap(gc: &dyn GcAllocator) -> JitFrameHeap {
+    if !gc.has_type_registry() {
+        return JitFrameHeap::OffGc;
+    }
+    let Some(id) = published_jitframe_gc_type_id() else {
+        panic!(
+            "installing a collector with a type registry on the cranelift \
+             backend requires the JITFRAME type id: register \
+             majit_backend::jitframe::jitframe_type_info() on that collector \
+             and pass the id to set_jitframe_gc_type_id() BEFORE the install"
+        );
+    };
+    // The id is published process-wide but resolved against this collector, so
+    // an id minted in a different registry is caught here rather than at the
+    // first frame allocation, where it would name whatever type happens to sit
+    // at that index and the collector would copy jitframes under the wrong
+    // shape.
+    assert_eq!(
+        gc.type_size(id),
+        Some(majit_backend::jitframe::jitframe_type_info().size),
+        "published JITFRAME type id {id} does not name a JITFRAME in the \
+         collector being installed"
+    );
+    JitFrameHeap::Nursery(id)
 }
 
 /// Store a GC allocator in the cranelift backend thread-local and
@@ -369,11 +418,11 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
-    let jitframe_type_id = ensure_jitframe_type_registered(gc.as_mut());
+    let jitframe_heap = resolve_jitframe_heap(gc.as_ref());
     gc.freeze_types();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     set_cranelift_active_gc(Some(gc));
-    set_cranelift_jitframe_type_id(jitframe_type_id);
+    set_cranelift_jitframe_heap(Some(jitframe_heap));
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -469,13 +518,13 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// the process-global `gc_sync` singleton (the per-thread GC box is the
 /// free-threading gap R4 removes).
 pub fn install_gc_standalone() {
-    let jitframe_type_id = majit_gc::gc_sync::gc_op(|gc| {
-        let id = ensure_jitframe_type_registered(gc);
+    let jitframe_heap = majit_gc::gc_sync::gc_op(|gc| {
+        let heap = resolve_jitframe_heap(gc);
         gc.freeze_types();
-        id
+        heap
     });
     let supports_guard_gc_type = majit_gc::gc_sync::gc_query(|gc| gc.supports_guard_gc_type());
-    set_cranelift_jitframe_type_id(jitframe_type_id);
+    set_cranelift_jitframe_heap(Some(jitframe_heap));
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -1470,10 +1519,13 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
 }
 
 thread_local! {
-    /// JITFRAME `Type` id of the active GC runtime. Lazy-registered when
-    /// the GC sees its first JITFRAME, cleared when the active GC is
-    /// replaced or torn down.
-    static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
+    /// What `install_gc_box` / `install_gc_standalone` decided about this
+    /// thread's jitframes, cleared when the active GC is torn down.
+    ///
+    /// `None` means no install ran ON THIS THREAD, which is not the same as
+    /// "no GC": the `gc_sync` singleton is process-global while this cell is
+    /// per-thread. [`cranelift_jitframe_type_id`] is what tells the two apart.
+    static CRANELIFT_JITFRAME_HEAP: Cell<Option<JitFrameHeap>> = const { Cell::new(None) };
 }
 
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
@@ -1623,12 +1675,39 @@ fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
     gc_box::store(gc);
 }
 
+/// The type id to allocate this thread's jitframes under, or `None` for the
+/// off-GC `Vec` frame.
+///
+/// Three configurations, and the third is why this is not a plain cell read:
+///
+/// - an install ran on this thread: it already resolved the question, and its
+///   answer stands even if some other thread has since published a different
+///   id for its own collector;
+/// - no install ran anywhere reachable from here (`cranelift_gc_active()` is
+///   false): there is no collector, and the `Vec` frame is the configuration,
+///   not a fallback;
+/// - a collector is active but was installed on ANOTHER thread — the
+///   `gc_sync` singleton is process-global while the cell is per-thread. The
+///   published id is process-global too, so it answers; and if nothing
+///   published one, this fails rather than quietly handing back a `Vec` frame
+///   whose interior refs the collector would never trace.
 fn cranelift_jitframe_type_id() -> Option<u32> {
-    CRANELIFT_JITFRAME_TYPE_ID.with(|c| c.get())
+    match CRANELIFT_JITFRAME_HEAP.with(|c| c.get()) {
+        Some(JitFrameHeap::Nursery(id)) => Some(id),
+        Some(JitFrameHeap::OffGc) => None,
+        None if !cranelift_gc_active() => None,
+        None => Some(published_jitframe_gc_type_id().unwrap_or_else(|| {
+            panic!(
+                "reached compiled code with a collector installed but no \
+                 JITFRAME type id published; the frontend must call \
+                 set_jitframe_gc_type_id() before installing the collector"
+            )
+        })),
+    }
 }
 
-fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
-    CRANELIFT_JITFRAME_TYPE_ID.with(|c| c.set(type_id));
+fn set_cranelift_jitframe_heap(heap: Option<JitFrameHeap>) {
+    CRANELIFT_JITFRAME_HEAP.with(|c| c.set(heap));
 }
 
 fn cranelift_gc_active() -> bool {
@@ -3988,7 +4067,7 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64)
 ///   all live fail-args into `old_jf->jf_frame[...]` via `emit_guard_exit`
 ///   spills; this helper only needs to copy those words verbatim.
 /// - Must run on the JIT thread that owns `CRANELIFT_ACTIVE_GC` /
-///   `CRANELIFT_JITFRAME_TYPE_ID` thread-locals.
+///   `CRANELIFT_JITFRAME_HEAP` thread-locals.
 #[inline(never)]
 pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: usize) -> *mut i64 {
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
@@ -7666,7 +7745,10 @@ fn run_compiled_code_inner(
     // When GC has a type registry (MiniMarkGC), allocate from nursery with
     // JITFRAME type_id so the GC can copy+trace it correctly. The shadow
     // stack holds a GcRef that the GC updates in place when copying.
-    // When GC is a stub (TrackingGc) or absent, fall back to Vec<i64>.
+    // With no collector at all, or one with no type table (TrackingGc), fall
+    // back to Vec<i64>. `cranelift_jitframe_type_id` is what draws that line;
+    // a collector that could trace a frame but has no shape to allocate it
+    // under fails there rather than reaching this branch.
     // jitframe_allocate (jitframe.py:48) allocates from the nursery
     // via rgc.malloc. Nursery::alloc syncs from NURSERY_FREE_ADDR
     // (incminimark.py:676 gc_adr_of_nursery_free parity) so JIT
@@ -7680,13 +7762,6 @@ fn run_compiled_code_inner(
     let use_gc_alloc = runtime_jitframe_tid.is_some();
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
         let type_id = runtime_jitframe_tid.unwrap();
-        assert_ne!(
-            type_id,
-            u32::MAX,
-            "JITFRAME GC type id not registered — frontend must call \
-             set_jitframe_gc_type_id() or ensure_jitframe_type_registered() \
-             before running compiled code"
-        );
         let gcref = with_cranelift_gc_required(|gc| {
             gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
         });
@@ -15100,7 +15175,7 @@ impl Drop for CraneliftBackend {
         // its own; matching dynasm's
         // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
         gc_box::clear_on_teardown();
-        let _ = CRANELIFT_JITFRAME_TYPE_ID.try_with(|c| c.set(None));
+        let _ = CRANELIFT_JITFRAME_HEAP.try_with(|c| c.set(None));
     }
 }
 
@@ -17823,6 +17898,7 @@ mod tests {
         let int_tid = gc.register_type(TypeInfo::simple(16));
         let int_vtable: usize = 0x1111_2200;
         majit_gc::GcAllocator::register_vtable_for_type(&mut gc, int_vtable, int_tid);
+        publish_jitframe_type(&mut gc);
 
         let mut backend = CraneliftBackend::new();
         backend.set_gc_allocator(Box::new(gc));
@@ -18098,20 +18174,86 @@ mod tests {
         return_ref
     }
 
+    /// Register JITFRAME on `gc` and publish its id, which is what a frontend
+    /// does before it installs its collector (`eval.rs build_gc` registers the
+    /// shape, then `set_jitframe_gc_type_id`, and only then
+    /// `install_gc_standalone`). `resolve_jitframe_heap` requires that
+    /// ordering of any collector that has a type registry.
+    ///
+    /// JITFRAME goes in AFTER whatever types the fixture registered for
+    /// itself, so it is never id 0: eval.rs registers OBJECT / W_INT / W_FLOAT
+    /// first, and a fixture that made JITFRAME the first type would be
+    /// exercising an id the shipped configuration cannot produce.
+    fn publish_jitframe_type(gc: &mut MiniMarkGC) -> u32 {
+        let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        set_jitframe_gc_type_id(id);
+        id
+    }
+
+    /// [`publish_jitframe_type`] and the install, for the fixtures that build a
+    /// collector and hand it straight to a fresh backend.
+    fn backend_with_gc(mut gc: MiniMarkGC) -> CraneliftBackend {
+        publish_jitframe_type(&mut gc);
+        CraneliftBackend::with_gc_allocator(Box::new(gc))
+    }
+
+    /// A collector with a type registry may not be installed without its
+    /// JITFRAME id, and the refusal is a panic rather than a fall-through to
+    /// the off-GC `Vec` frame.
+    ///
+    /// The fall-through is what makes this worth a test: a `Vec` frame is not
+    /// wrong-looking at the allocation, it is wrong four collections later,
+    /// when the collector that was installed all along never traced the ref
+    /// slots of a frame it does not own.
+    ///
+    /// `expected` names only "JITFRAME" because two refusals reach it. With
+    /// nothing published the message is the missing-id one; if a sibling
+    /// fixture on another thread republishes the atomic between the clear and
+    /// the install, this collector — which has registered no type at all —
+    /// fails the id-names-a-JITFRAME check instead. Both are the contract.
+    #[test]
+    #[should_panic(expected = "JITFRAME")]
+    fn test_gc_install_without_published_jitframe_id_panics() {
+        clear_published_jitframe_gc_type_id();
+        let _backend = CraneliftBackend::with_gc_allocator(Box::new(MiniMarkGC::new()));
+    }
+
+    /// The published id is resolved against the collector being installed, so
+    /// an id minted in a DIFFERENT registry is refused at the install.
+    ///
+    /// Without the check it would be taken at face value and name whatever
+    /// type sits at that index — the collector would then copy jitframes under
+    /// some other shape's layout, which is the failure the hard-coded `2` in
+    /// eval.rs's comment describes.
+    #[test]
+    #[should_panic(expected = "does not name a JITFRAME")]
+    fn test_gc_install_with_a_foreign_jitframe_id_panics() {
+        let mut gc = MiniMarkGC::new();
+        let plain = gc.register_type(TypeInfo::simple(16));
+        set_jitframe_gc_type_id(plain);
+        let _backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+    }
+
+    /// An allocator with no type table keeps the off-GC `Vec` frame, and that
+    /// is the whole of the exemption: it is not "no id published", it is "no
+    /// registry to publish an id into". `TrackingGc` takes `GcAllocator`'s
+    /// default `has_type_registry`, as every test double does.
+    #[test]
+    fn test_stub_gc_install_keeps_the_off_gc_frame() {
+        let stub = TrackingGc::new(Arc::new(Mutex::new(TrackingGcState::default())));
+        assert!(!majit_gc::GcAllocator::has_type_registry(&stub));
+        let _backend = CraneliftBackend::with_gc_allocator(Box::new(stub));
+        assert_eq!(cranelift_jitframe_type_id(), None);
+    }
+
     fn make_gc_backend() -> CraneliftBackend {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
             large_object_threshold: 1 << 20,
             ..GcConfig::default()
         });
-        // eval.rs registers regular GC types before installing the backend, so
-        // JITFRAME is never type id 0 in production. Keep this fixture on the
-        // same path: `install_call_assembler_test_layout` publishes whatever id
-        // the lazy registration assigns, and a fixture that made JITFRAME the
-        // first type would be exercising an id the shipped configuration
-        // cannot produce.
         gc.register_type(TypeInfo::simple(16));
-        CraneliftBackend::with_gc_allocator(Box::new(gc))
+        backend_with_gc(gc)
     }
 
     /// Publish the JitFrame layout descrs so the GC rewriter's
@@ -18119,12 +18261,13 @@ mod tests {
     /// GC_STORE against callee jitframes. Mirrors the dynasm test layout
     /// (runner.rs install_call_assembler_test_layout); the offsets match
     /// the production cranelift mapping in pyre-jit call_jit.rs
-    /// jitframe_layout_descrs. Reads jitframe_gc_type_id() after
-    /// set_gc_allocator has lazily registered JITFRAME.
+    /// jitframe_layout_descrs. Reads the type id the install resolved, so it
+    /// must run after `set_gc_allocator`.
     fn install_call_assembler_test_layout() {
         register_jitframe_layout(JitFrameLayoutInfo {
             jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-                jitframe_tid: jitframe_gc_type_id(),
+                jitframe_tid: cranelift_jitframe_type_id()
+                    .expect("call-assembler fixtures run on a GC-backed frame"),
                 jitframe_fixed_size: majit_backend::jitframe::JITFRAME_FIXED_SIZE,
                 jf_frame_info_ofs: majit_backend::jitframe::JF_FRAME_INFO_OFS,
                 jf_descr_ofs: JF_DESCR_OFS,
@@ -18143,8 +18286,8 @@ mod tests {
     /// GC-backed backend for CALL_ASSEMBLER tests:
     /// validate_call_assembler_rewrite_prereqs (compiler.rs) requires both a
     /// configured GC runtime and a registered JITFRAME layout. Build the GC
-    /// on the lazy path (like make_gc_backend), then install the layout once
-    /// set_gc_allocator has published the JITFRAME type id.
+    /// like make_gc_backend, then install the layout once the install has
+    /// resolved the JITFRAME type id.
     fn make_call_assembler_backend() -> CraneliftBackend {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 1 << 20,
@@ -18152,7 +18295,7 @@ mod tests {
             ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
-        let backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let backend = backend_with_gc(gc);
         install_call_assembler_test_layout();
         backend
     }
@@ -18181,7 +18324,7 @@ mod tests {
             ..GcConfig::default()
         });
         gc.register_type(TypeInfo::simple(16));
-        let _backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let _backend = backend_with_gc(gc);
 
         let type_id = cranelift_jitframe_type_id().expect("JITFRAME type id must be registered");
         let old = with_cranelift_gc_required(|gc| {
@@ -18485,7 +18628,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xD30F_0001;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let carried = OpRef::ref_op(1);
         let guard = mk_op(
             OpCode::GuardFalse,
@@ -18527,7 +18670,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xD30F_0003;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let carried = OpRef::ref_op(2);
         let next_count = OpRef::int_op(3);
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
@@ -18573,7 +18716,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xD30F_0002;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let carried = OpRef::ref_op(1);
         let loop_descr = make_label_descr(1701);
         let guard = mk_op(
@@ -18626,7 +18769,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xD30F_0004;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let carried = OpRef::ref_op(2);
         let start_descr = make_label_descr(1704);
         let body_descr = make_label_descr(1705);
@@ -20402,7 +20545,7 @@ mod tests {
         set_test_exception_state(exception_ref.0 as i64);
         clear_test_exception_call_log();
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
@@ -24377,7 +24520,7 @@ mod tests {
         });
         gc.register_type(TypeInfo::simple(16));
         let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, 0, 16);
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -24438,7 +24581,7 @@ mod tests {
         });
         gc.register_type(TypeInfo::simple(payload_size));
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         // test_gc_integration.py:808-817:
         //   []
@@ -24503,7 +24646,7 @@ mod tests {
         });
         gc.register_type(TypeInfo::simple(16));
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let fd = make_field_descr(0, 8, Type::Int, true);
         let inputargs = vec![];
@@ -24574,7 +24717,7 @@ mod tests {
         let filler = gc.alloc_with_type(young_node_tid, 16);
         assert!(gc.is_in_nursery(filler.0));
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
         let ref_fd = make_field_descr(0, 8, Type::Ref, false);
         let int_fd = make_field_descr(0, 8, Type::Int, true);
         let inputargs = vec![InputArg::new_ref(0)];
@@ -24870,7 +25013,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xABCDEF01;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let descr = make_call_descr(vec![Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_ref(0)];
@@ -24927,7 +25070,7 @@ mod tests {
             *(root.0 as *mut u64) = 0xFACEB00C;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let descr = make_call_descr(vec![Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_ref(0)];
@@ -24982,7 +25125,7 @@ mod tests {
             *(root.0 as *mut u64) = 0x12345678;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -25039,7 +25182,7 @@ mod tests {
             *(root.0 as *mut u64) = 0x5EED_5EED;
         }
 
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -25100,7 +25243,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(16));
 
         let root = gc.alloc_with_type(0, 16);
-        let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
+        let mut backend = backend_with_gc(gc);
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![

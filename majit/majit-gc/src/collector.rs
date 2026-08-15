@@ -6210,6 +6210,12 @@ impl GcAllocator for MiniMarkGC {
         self.types.freeze_types();
     }
 
+    /// Owns a `TypeRegistry`, so a shape id can always be resolved against
+    /// this allocator — including before anything has been registered in it.
+    fn has_type_registry(&self) -> bool {
+        true
+    }
+
     /// gc.py:318 `GcLLDescr_framework.supports_guard_gc_type = True`.
     /// MiniMarkGC owns a `TypeRegistry` that materializes a `TYPE_INFO`
     /// table on demand, so the framework-equivalent flag is always

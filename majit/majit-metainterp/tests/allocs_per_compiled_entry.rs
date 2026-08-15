@@ -310,6 +310,23 @@ fn install_gc() {
     // this thread holds. The meter owns its process (`harness = false`), so it
     // holds the GIL for the whole run and never has to hand it back.
     majit_gc::gc_sync::register_thread();
+    // The cranelift backend requires the JITFRAME id before the install — its
+    // absence is what the doc above calls "with no GC at all it falls back to a
+    // `Vec<i64>`", now a refusal rather than a fallback. Registering the shape
+    // on the singleton and publishing its id is what `eval.rs build_gc` does.
+    // Only under this cfg: the dynasm backend's frame source is settled
+    // separately, and publishing for it would move the frame this file
+    // measures.
+    #[cfg(feature = "cranelift")]
+    {
+        let jitframe_tid = majit_gc::gc_sync::gc_op(|gc| {
+            majit_gc::GcAllocator::register_type(
+                gc,
+                majit_backend::jitframe::jitframe_type_info(),
+            )
+        });
+        majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
+    }
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::install_gc_standalone();
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
