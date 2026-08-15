@@ -1788,6 +1788,15 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
     }
 }
 
+/// `pyopcode.py:1303-1316` FOR_ITER exception discrimination:
+/// `e.match(space, space.w_StopIteration)`. The caught object and match class
+/// are Python-level objects, so use the same MRO-aware helper as
+/// CHECK_EXC_MATCH. This is infallible and deliberately never publishes a
+/// backend or blackhole exception.
+pub extern "C" fn jit_exception_match(exc: i64, match_class: i64) -> i64 {
+    crate::eval::check_exc_match_against(exc as PyObjectRef, match_class as PyObjectRef) as i64
+}
+
 /// Ref-returning bridge for the `next(w_iterator)` residual call in
 /// `_unpackiterable_unknown_length` (the `unpackiterable_driver` portal).
 ///

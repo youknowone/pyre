@@ -958,6 +958,9 @@ pub enum PyreHelperKind {
     /// the in-flight iteration to the live frame instead of dropping it (the
     /// iterator advance is an irreversible side effect with no journal undo).
     ForIterNext,
+    /// `jit_exception_match(exc, match_class)` — the infallible Python-level
+    /// exception MRO test used by FOR_ITER's materialized catch arm.
+    ForIterExceptionMatch,
     /// `get_iter(obj)` — the GET_ITER residual (`iter(obj)`).  The full-body
     /// walker recognises exact machine-word `range` objects and emits the
     /// virtual `W_IntRangeIterator` allocation shape directly.

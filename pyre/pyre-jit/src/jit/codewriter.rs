@@ -3281,13 +3281,11 @@ fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
     new_shadow_graph_with_portal_inputs(code, FrameInputs::None)
 }
 
-fn attach_catch_exception_edge(
-    code: &CodeObject,
+fn attach_materialized_exception_edge(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     target: &SpamBlockRef,
-    source_state: &FrameState,
-    site: &ExceptionCatchSite,
+    edge_state: &FrameState,
 ) -> super::flow::LinkRef {
     // `flowcontext.py:148-149 guessexception` sets
     // `block.exitswitch = c_last_exception` before the link is
@@ -3300,6 +3298,59 @@ fn attach_catch_exception_edge(
         ));
     }
 
+    // Update the landing block's framestate / inputargs from the
+    // edge state.  Note: RPython models each
+    // raise site with its own `EggBlock(vars2, block, case)`
+    // (`flowcontext.py:138`), with `vars2 = [Variable(),
+    // Variable()]` per case — the egg's body is responsible for
+    // any subsequent frame-state restoration.  Pyre coalesces
+    // every raise site flowing into the same handler PC into a
+    // single catch landing block, so the landing's inputargs are
+    // the union of all incoming edge states (pyre-only).  The
+    // arity invariant below is satisfied either way because
+    // `getoutputargs` walks `target_state.mergeable()` — the
+    // same mergeable layout as `target.inputargs`.
+    update_catch_landing_state(graph, target, edge_state);
+
+    // `model.py:114-116 Link.__init__` enforces
+    // `len(args) == len(target.inputargs)`.  Build `link.args` via
+    // `FrameState::getoutputargs(target_state)` so each link arg
+    // aligns with the corresponding target inputarg by mergeable
+    // position.  This restores the RPython invariant that the
+    // previous `Link::new(Vec::new(), …)` then-mutate flow
+    // bypassed (the `Link::new` arity assert ran before
+    // `update_catch_landing_state` populated `target.inputargs`).
+    let target_state = target
+        .framestate()
+        .expect("catch landing must have a framestate after update_catch_landing_state");
+    let link_args = edge_state.getoutputargs(&target_state);
+
+    // `model.py:127-129 Link.extravars` carries the source-side
+    // `(last_exception, last_exc_value)` pair so
+    // `flatten.py:340-347` can identify the exception edge and
+    // emit `last_exception` / `last_exc_value` SSA renamings at
+    // link entry.  The pair is the SAME (exc_type, exc_value)
+    // Variables as `edge_state.last_exception`, so they appear in
+    // BOTH `link.args` (via `getoutputargs` at the
+    // `last_exception` mergeable position) AND `link.extravars`
+    // — matching `flowcontext.py:141-143`.
+    let (exc_type, exc_value) = exception_edge_extravars(edge_state);
+    let mut link = super::flow::Link::new(link_args, Some(target.block()), None);
+    link.extravars(Some(exc_type), Some(exc_value));
+    let link = link.into_ref();
+    append_exit(block, link.clone());
+    target.add_incoming_exception_link(link.clone());
+    link
+}
+
+fn attach_catch_exception_edge(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    target: &SpamBlockRef,
+    source_state: &FrameState,
+    site: &ExceptionCatchSite,
+) -> super::flow::LinkRef {
     // `flowcontext.py:130-134 guessexception` synthesises the
     // `(last_exception, last_exc_value)` Variable pair for this
     // edge.  `exception_landing_state` clones `source_state` and
@@ -3326,51 +3377,7 @@ fn attach_catch_exception_edge(
     // shifted CFG coalesce pair merges two landing inputargs.
     let seeded = exception_landing_state(graph, source_state);
     let edge_state = handler_entry_state_from_catch_site(code, graph, &seeded, site);
-
-    // Update the landing block's framestate / inputargs from the
-    // edge state.  Note: RPython models each
-    // raise site with its own `EggBlock(vars2, block, case)`
-    // (`flowcontext.py:138`), with `vars2 = [Variable(),
-    // Variable()]` per case — the egg's body is responsible for
-    // any subsequent frame-state restoration.  Pyre coalesces
-    // every raise site flowing into the same handler PC into a
-    // single catch landing block, so the landing's inputargs are
-    // the union of all incoming edge states (pyre-only).  The
-    // arity invariant below is satisfied either way because
-    // `getoutputargs` walks `target_state.mergeable()` — the
-    // same mergeable layout as `target.inputargs`.
-    update_catch_landing_state(graph, target, &edge_state);
-
-    // `model.py:114-116 Link.__init__` enforces
-    // `len(args) == len(target.inputargs)`.  Build `link.args` via
-    // `FrameState::getoutputargs(target_state)` so each link arg
-    // aligns with the corresponding target inputarg by mergeable
-    // position.  This restores the RPython invariant that the
-    // previous `Link::new(Vec::new(), …)` then-mutate flow
-    // bypassed (the `Link::new` arity assert ran before
-    // `update_catch_landing_state` populated `target.inputargs`).
-    let target_state = target
-        .framestate()
-        .expect("catch landing must have a framestate after update_catch_landing_state");
-    let link_args = edge_state.getoutputargs(&target_state);
-
-    // `model.py:127-129 Link.extravars` carries the source-side
-    // `(last_exception, last_exc_value)` pair so
-    // `flatten.py:340-347` can identify the exception edge and
-    // emit `last_exception` / `last_exc_value` SSA renamings at
-    // link entry.  The pair is the SAME (exc_type, exc_value)
-    // Variables as `edge_state.last_exception`, so they appear in
-    // BOTH `link.args` (via `getoutputargs` at the
-    // `last_exception` mergeable position) AND `link.extravars`
-    // — matching `flowcontext.py:141-143`.
-    let (exc_type, exc_value) = exception_edge_extravars(&edge_state);
-    let mut link = super::flow::Link::new(link_args, Some(target.block()), None);
-    link.extravars(Some(exc_type), Some(exc_value));
-    let link = link.into_ref();
-    let _ = source_state;
-    append_exit(block, link.clone());
-    target.add_incoming_exception_link(link.clone());
-    link
+    attach_materialized_exception_edge(graph, block, target, &edge_state)
 }
 
 fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
@@ -3596,6 +3603,7 @@ struct FnPtrIndices {
     store_slice_fn: HelperHandle,
     get_iter_fn: HelperHandle,
     for_iter_next_fn: HelperHandle,
+    for_iter_exception_match_fn: HelperHandle,
     call_kw_fn_0: HelperHandle,
     call_kw_fn_1: HelperHandle,
     call_kw_fn_2: HelperHandle,
@@ -4317,6 +4325,15 @@ fn register_helper_fn_pointers(
         cpu.clear_in_flight_exception_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
+    // `check_exc_match_against` only reads the exception's Python class and
+    // class MRO. It cannot raise or run user code, but it does read GC heap
+    // state, so use `PlainCannotRaise` rather than the no-heap flavor. Bind it
+    // last so every pre-existing helper index remains stable.
+    let for_iter_exception_match_fn = bind(
+        assembler,
+        cpu.for_iter_exception_match_fn as *const (),
+        CallFlavor::PlainCannotRaise,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4387,6 +4404,7 @@ fn register_helper_fn_pointers(
         unpack_ex_fn,
         get_iter_fn,
         for_iter_next_fn,
+        for_iter_exception_match_fn,
         unary_positive_fn,
         load_common_constant_fn,
         set_add_fn,
@@ -6493,6 +6511,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: for_iter_next_fn_idx,
                     flavor: _for_iter_next_fn_flavor,
+                },
+            for_iter_exception_match_fn:
+                HelperHandle {
+                    idx: for_iter_exception_match_fn_idx,
+                    flavor: _for_iter_exception_match_fn_flavor,
                 },
             call_kw_fn_0:
                 HelperHandle {
@@ -11101,33 +11124,136 @@ impl CodeWriter {
                             let next_value = next_var
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            // `for_iter_next_fn` is `CallFlavor::MayForce`: a user
-                            // `__next__` may raise a non-StopIteration exception.
-                            // When the FOR_ITER sits inside a `try` range the
-                            // residual's `GUARD_NO_EXCEPTION` needs a byte-adjacent
-                            // `catch_exception/L`, else a real raise deopts and the
-                            // blackhole's `handle_exception_in_frame`
-                            // (`blackhole.py:396`) finds no catch and escapes the
-                            // enclosing `try` (`ExitFrameWithExceptionRef`).  The
-                            // generic per-PC catch emission below is skipped here
-                            // because the exhaustion branch closes this block
-                            // first, so split off a dedicated residual block now:
-                            // block A holds the call + the exception edge to the
-                            // handler + a normal fallthrough to a fresh block B;
-                            // the ptr_nonzero two-way exhaustion split then emits
-                            // into B.  Both blocks keep the orthodox single-
-                            // bool-or-single-exception exit shape `flatten.py:
-                            // 275-296 insert_switch_exits` requires.  StopIteration
-                            // still returns null and takes the exhaustion arm on B
-                            // — the catch fires only on a non-null backend
-                            // exception.
-                            if let Some(catch_label) = catch_for_pc[py_pc] {
-                                emit_catch_exception_and_split!(
-                                    catch_label,
-                                    py_pc,
-                                    [next_value.clone()]
+                            // `pyopcode.py:1303-1316` catches the interpreter-level
+                            // OperationError and then tests
+                            // `e.match(space, space.w_StopIteration)`. Pyre's raised
+                            // object is already the Python exception, so materialize
+                            // the catch unconditionally and perform the Python-level
+                            // MRO match in its landing block. The matched edge
+                            // supplies NULL and rejoins the existing `ptr_nonzero`
+                            // exhaustion split below.
+                            let stop_match = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+                            all_walker_blocks.push(stop_match.clone());
+                            let stop_match_edge_state =
+                                exception_landing_state(&mut graph, &current_state);
+                            attach_materialized_exception_edge(
+                                &mut graph,
+                                &current_block.block(),
+                                &stop_match,
+                                &stop_match_edge_state,
+                            );
+
+                            // `guessexception` closes the can-raise block at the
+                            // residual and puts the normal exhaustion branch in a
+                            // fresh successor.  Thread the residual result through
+                            // that successor exactly like `split_block`; the matched
+                            // handler predecessor substitutes NULL for it.
+                            let next_result = next_value
+                                .as_variable()
+                                .expect("FOR_ITER residual result must be a Ref Variable");
+                            let mut next_state = current_state.clone();
+                            next_state.next_offset = py_pc;
+                            next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                            let next_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(next_state.clone()),
+                            );
+                            all_walker_blocks.push(next_block.clone());
+                            let mut inputargs = next_state.getvariables();
+                            inputargs.push(next_result.into());
+                            next_block.block().borrow_mut().inputargs = inputargs.clone();
+                            append_exit(
+                                &current_block.block(),
+                                super::flow::Link::new(inputargs, Some(next_block.block()), None)
+                                    .into_ref(),
+                            );
+                            restore_canraise_exit_order(&current_block.block());
+
+                            let stop_match_state = stop_match
+                                .framestate()
+                                .expect("FOR_ITER catch must have a FrameState");
+                            let (_, stop_exc_value) = exception_edge_extravars(&stop_match_state);
+                            let stop_iteration = pyre_interpreter::builtins::lookup_exc_class(
+                                "StopIteration",
+                            )
+                            .expect("StopIteration class must be initialized before JIT codegen");
+                            let matched = record_residual_call_graph_op(
+                                &mut graph,
+                                &stop_match.block(),
+                                for_iter_exception_match_fn_idx,
+                                CallFlavor::PlainCannotRaise,
+                                majit_ir::PyreHelperKind::ForIterExceptionMatch,
+                                vec![],
+                                vec![
+                                    stop_exc_value.into(),
+                                    pyobject_const_ref_value(stop_iteration),
+                                ],
+                                vec![],
+                                vec![Kind::Ref, Kind::Ref],
+                                ResKind::Int,
+                                py_pc as i64,
+                            )
+                            .expect("FOR_ITER exception match must return an Int Variable");
+                            stop_match.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(matched.into()));
+
+                            // False keeps the standing exception. Route it into
+                            // the Python handler covering this PC, or through the
+                            // existing reraise shape when no handler covers it.
+                            let mismatch_link = if let Some(catch_label) = catch_for_pc[py_pc] {
+                                let site = catch_sites
+                                    .iter()
+                                    .find(|site| site.landing_label == catch_label)
+                                    .expect("catch_sites entry for catch_label")
+                                    .clone();
+                                let handler_state = handler_entry_state_from_catch_site(
+                                    code,
+                                    &mut graph,
+                                    &stop_match_state,
+                                    &site,
                                 );
+                                attach_materialized_exception_edge(
+                                    &mut graph,
+                                    &stop_match.block(),
+                                    &site.landing,
+                                    &handler_state,
+                                )
+                            } else {
+                                let (exc_type, exc_value) =
+                                    exception_edge_extravars(&stop_match_state);
+                                let mut link = super::flow::Link::new(
+                                    vec![exc_type.into(), exc_value.into()],
+                                    Some(graph.exceptblock.clone()),
+                                    None,
+                                );
+                                link.extravars(Some(exc_type), Some(exc_value));
+                                let link = link.into_ref();
+                                append_exit(&stop_match.block(), link.clone());
+                                link
+                            };
+                            {
+                                let false_case: super::flow::FlowValue =
+                                    super::flow::Constant::bool(false).into();
+                                let mut link = mismatch_link.borrow_mut();
+                                link.exitcase = Some(false_case.clone());
+                                link.llexitcase = Some(false_case);
                             }
+
+                            // True consumes StopIteration and converges on the
+                            // existing exhaustion split with a NULL next result.
+                            let mut stop_match_args =
+                                stop_match_state.getoutputargs(&current_state);
+                            stop_match_args.push(null_stack_sentinel());
+                            let matched_link = super::flow::Link::new(
+                                stop_match_args,
+                                Some(next_block.block()),
+                                None,
+                            )
+                            .with_exitcase(super::flow::Constant::bool(true).into())
+                            .with_llexitcase(super::flow::Constant::bool(true).into())
+                            .into_ref();
+                            append_exit(&stop_match.block(), matched_link);
+                            current_block = next_block;
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
                             // push next, fall to PC+1) and the exhaustion arm
@@ -16210,6 +16336,83 @@ mod tests {
                 _ => None,
             })
             .expect("expected nested function code object")
+    }
+
+    #[test]
+    fn for_iter_jitcode_emits_stop_iteration_catch_arm() {
+        let code = first_nested_function_code(
+            "def f(it):\n    count = 0\n    for _ in it:\n        count += 1\n    return count\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("FOR_ITER portal must produce a jitcode");
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let catch_positions: Vec<_> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| (op.key == "catch_exception/L").then_some(index))
+            .collect();
+        assert_eq!(
+            catch_positions.len(),
+            1,
+            "a loop outside a Python try has exactly the internal FOR_ITER catch"
+        );
+        let catch_index = catch_positions[0];
+        assert_eq!(ops[catch_index - 1].key, "live/");
+        assert!(
+            ops[catch_index - 2].key.starts_with("residual_call_"),
+            "catch_exception must be adjacent to the FOR_ITER residual call"
+        );
+
+        let ptr_nonzero_index = ops
+            .iter()
+            .position(|op| op.key == "ptr_nonzero/r>i")
+            .expect("FOR_ITER must retain its existing exhaustion split");
+        let last_exc_value_index = ops
+            .iter()
+            .position(|op| op.key == "last_exc_value/>r")
+            .expect("FOR_ITER catch must materialize the caught exception value");
+        let match_call_index = ops
+            .iter()
+            .enumerate()
+            .skip(last_exc_value_index + 1)
+            .find_map(|(index, op)| {
+                (op.key.starts_with("residual_call_") && op.key.ends_with(">i")).then_some(index)
+            })
+            .expect("FOR_ITER catch must call the Python-level exception matcher");
+        let bool_split_index = ops
+            .iter()
+            .enumerate()
+            .skip(match_call_index + 1)
+            .find_map(|(index, op)| (op.key == "goto_if_not/iL").then_some(index))
+            .expect("FOR_ITER exception match must feed an ordinary bool split");
+        let reraise_index = ops
+            .iter()
+            .position(|op| op.key == "reraise/")
+            .expect("a FOR_ITER outside a Python try must reraise mismatches");
+        assert!(catch_index < ptr_nonzero_index);
+        assert!(ptr_nonzero_index < last_exc_value_index);
+        assert!(last_exc_value_index < match_call_index);
+        assert!(match_call_index < bool_split_index);
+        assert!(bool_split_index < reraise_index);
+        assert!(
+            !ops.iter()
+                .any(|op| op.key == "goto_if_exception_mismatch/iL"),
+            "FOR_ITER must not use the RPython-class typed catch opcode"
+        );
     }
 
     // Minimal `ExceptionCatchSite` for the `attach_catch_exception_edge`
