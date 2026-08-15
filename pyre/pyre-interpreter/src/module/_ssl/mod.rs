@@ -2459,15 +2459,27 @@ mod cert_store {
         free: unsafe extern "system" fn(*const T) -> BOOL,
         convert: impl Fn(&T) -> Result<PyObjectRef, crate::PyError>,
     ) -> Result<Vec<PyObjectRef>, crate::PyError> {
-        let mut items = Vec::new();
+        // A store such as `ROOT` holds hundreds of entries and every `convert`
+        // allocates, so the items walked so far are live values across the
+        // conversions that follow them.  A plain `Vec` is invisible to the
+        // collector, so they are accumulated on the shadow stack and read back
+        // from their slots once the walk is over.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::shadow_stack_len();
+        let mut count = 0usize;
         let mut context: *mut T = std::ptr::null_mut();
         loop {
             context = next(store, context);
             if context.is_null() {
-                return Ok(items);
+                return Ok((0..count)
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                    .collect());
             }
             match convert(&*context) {
-                Ok(item) => items.push(item),
+                Ok(item) => {
+                    pyre_object::gc_roots::pin_root(item);
+                    count += 1;
+                }
                 Err(error) => {
                     free(context);
                     return Err(error);
@@ -2524,13 +2536,24 @@ mod cert_store {
                             Some(oids) => Some(oids),
                             None => enhanced_key_usage(cert, CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG)?,
                         };
-                    Ok(w_tuple_new(vec![
-                        w_bytes_from_bytes(std::slice::from_raw_parts(
+                    // The trust value and the certificate bytes are each built
+                    // before a further allocation, so both stay pinned until
+                    // the tuple that consumes them roots them itself.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let trust_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(trust.unwrap_or_else(|| w_bool_from(true)));
+                    let cert_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(w_bytes_from_bytes(
+                        std::slice::from_raw_parts(
                             cert.pbCertEncoded,
                             cert.cbCertEncoded as usize,
-                        )),
-                        encoding_type(cert.dwCertEncodingType),
-                        trust.unwrap_or_else(|| w_bool_from(true)),
+                        ),
+                    ));
+                    let encoding = encoding_type(cert.dwCertEncodingType);
+                    Ok(w_tuple_new(vec![
+                        pyre_object::gc_roots::shadow_stack_get(cert_slot),
+                        encoding,
+                        pyre_object::gc_roots::shadow_stack_get(trust_slot),
                     ]))
                 },
             )
@@ -2542,12 +2565,17 @@ mod cert_store {
     pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         enum_store(args, |store| unsafe {
             walk_store(store, CertEnumCRLsInStore, CertFreeCRLContext, |crl| {
+                // The CRL bytes are live across the encoding value's allocation.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let crl_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_bytes_from_bytes(std::slice::from_raw_parts(
+                    crl.pbCrlEncoded,
+                    crl.cbCrlEncoded as usize,
+                )));
+                let encoding = encoding_type(crl.dwCertEncodingType);
                 Ok(w_tuple_new(vec![
-                    w_bytes_from_bytes(std::slice::from_raw_parts(
-                        crl.pbCrlEncoded,
-                        crl.cbCrlEncoded as usize,
-                    )),
-                    encoding_type(crl.dwCertEncodingType),
+                    pyre_object::gc_roots::shadow_stack_get(crl_slot),
+                    encoding,
                 ]))
             })
         })
