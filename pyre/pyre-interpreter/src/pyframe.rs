@@ -2234,9 +2234,15 @@ impl PyFrame {
     #[inline]
     fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
         if self.debugdata.is_null() {
-            let allocation = self.aux_allocation();
-            let value = FrameDebugData::new(self.pycode, init_lineno);
-            self.debugdata = if allocation == FrameLocalsArrayAllocation::OldGenGc {
+            // The stable allocation below is still a collection point.  Keep
+            // the owning frame rooted and reload it before publishing the new
+            // debugdata pointer, mirroring the translated RPython shadow-stack
+            // reload around `getorcreatedebug`.
+            let frame_anchor = crate::eval::FrameAnchor::new(self);
+            let current = unsafe { &*frame_anchor.live() };
+            let allocation = current.aux_allocation();
+            let value = FrameDebugData::new(current.pycode, init_lineno);
+            let debugdata = if allocation == FrameLocalsArrayAllocation::OldGenGc {
                 let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
                     FRAME_DEBUG_DATA_GC_TYPE_ID,
                     std::mem::size_of::<FrameDebugData>(),
@@ -2250,6 +2256,10 @@ impl PyFrame {
             } else {
                 pyre_object::lltype::malloc_raw(value)
             };
+            unsafe { (*frame_anchor.live()).debugdata = debugdata };
+            let debugdata = unsafe { (*frame_anchor.live()).debugdata };
+            remember_frame_debug_data(debugdata);
+            return unsafe { &mut *debugdata };
         }
         // Callers mutate the returned payload directly. Remember the container
         // immediately before exposing it so old debugdata keeps any young refs
@@ -2326,7 +2336,8 @@ impl PyFrame {
     /// it never disturbs `CO_FAST_HIDDEN` slots.
     #[inline]
     pub fn get_or_create_w_locals(&mut self) -> PyObjectRef {
-        let existing = self.get_w_locals();
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        let existing = unsafe { (&*frame_anchor.live()).get_w_locals() };
         if !existing.is_null() {
             return existing;
         }
@@ -2335,9 +2346,12 @@ impl PyFrame {
         // bind one in `initialize_frame_scopes` / `setdictscope`).
         // Allocate a fresh dict so the write still lands somewhere
         // observable instead of faulting.
-        let w_locals = unsafe { pyre_object::w_dict_new() };
-        self.getorcreate_debug_data(-1).w_locals = w_locals;
-        w_locals
+        let roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = roots.base();
+        roots.pin_root(unsafe { pyre_object::w_dict_new() });
+        let frame = unsafe { &mut *frame_anchor.live() };
+        frame.getorcreate_debug_data(-1).w_locals = roots.get(locals_slot);
+        roots.get(locals_slot)
     }
 
     /// PyPy-compatible `__init__` hook.
@@ -3966,8 +3980,16 @@ impl PyFrame {
     /// allocates a fresh dict (pyframe.py:557 `self.space.newdict(instance=True)`)
     /// and caches it, so `locals() is locals()` holds.  Errors propagate.
     pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
-        let w_locals = self.get_or_create_w_locals();
-        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        // `space.setitem_str` / `space.delitem` allocate one key per slot and
+        // can collect.  RPython's GC transform keeps both the frame and its
+        // `w_locals` mapping live across the whole loop; do the same rather
+        // than retaining either pre-move Rust pointer between iterations.
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        let w_locals = unsafe { (&mut *frame_anchor.live()).get_or_create_w_locals() };
+        let locals_roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = locals_roots.base();
+        locals_roots.pin_root(w_locals);
+        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
         let code = unsafe { &*code_ptr };
         let varnames = &code.varnames;
         let numlocals = varnames.len();
@@ -3980,7 +4002,8 @@ impl PyFrame {
                 continue;
             }
             let name = &varnames[i];
-            let slot = locals_w!(self)[i];
+            let frame = unsafe { &*frame_anchor.live() };
+            let slot = locals_w!(frame)[i];
             let is_cell_slot = i < code.localspluskinds.len()
                 && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
             let w_value =
@@ -3990,9 +4013,9 @@ impl PyFrame {
                     slot
                 };
             if !w_value.is_null() {
-                setitem_str_object(w_locals, name, w_value)?;
+                setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
             } else {
-                delitem_str_object(w_locals, name)?;
+                delitem_str_object(locals_roots.get(locals_slot), name)?;
             }
         }
 
@@ -4021,15 +4044,16 @@ impl PyFrame {
                 code.freevars[i - npure].as_ref()
             };
             let idx = numlocals + i;
-            if idx < locals_w!(self).len() {
-                let slot = locals_w!(self)[idx];
+            let frame = unsafe { &*frame_anchor.live() };
+            if idx < locals_w!(frame).len() {
+                let slot = locals_w!(frame)[idx];
                 let w_value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_get(slot) }
                 } else {
                     slot
                 };
                 if !w_value.is_null() {
-                    setitem_str_object(w_locals, name, w_value)?;
+                    setitem_str_object(locals_roots.get(locals_slot), name, w_value)?;
                 } else if code.flags.contains(CodeFlags::OPTIMIZED) {
                     // Optimized (function) frames own their cellvars in the
                     // cell, so an empty cell means the local is unbound and its
@@ -4038,7 +4062,7 @@ impl PyFrame {
                     // `w_locals` via STORE_NAME while its cell stays empty
                     // (`__conditional_annotations__`), so an empty cell there
                     // must not erase the STORE_NAME binding.
-                    delitem_str_object(w_locals, name)?;
+                    delitem_str_object(locals_roots.get(locals_slot), name)?;
                 }
             }
         }
@@ -4707,15 +4731,29 @@ fn setitem_str_object(
     name: &str,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    let key = unsafe { pyre_object::w_str_new(name) };
-    crate::baseobjspace::setitem(w_obj, key, value).map(|_| ())
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = roots.base();
+    roots.pin_root(w_obj);
+    roots.pin_root(value);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    crate::baseobjspace::setitem(
+        roots.get(object_slot),
+        roots.get(key_slot),
+        roots.get(object_slot + 1),
+    )
+    .map(|_| ())
 }
 
 /// `space.delitem(w_obj, w_str_new(name))` — `pyframe.py:571-574 /
 /// 589-593` ignores `KeyError` only; other errors propagate.
 fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyError> {
-    let key = unsafe { pyre_object::w_str_new(name) };
-    match crate::baseobjspace::delitem(w_obj, key) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = roots.base();
+    roots.pin_root(w_obj);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(unsafe { pyre_object::w_str_new(name) });
+    match crate::baseobjspace::delitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind == crate::PyErrorKind::KeyError => Ok(()),
         Err(e) => Err(e),
