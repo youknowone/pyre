@@ -403,6 +403,90 @@ static PyObject *m_caught(PyObject *self, PyObject *unused)
                          cleared, text);
 }
 
+/* Drive every call entry point at one callable and hand back what each
+   returned, so the test can compare them against the same call made from
+   Python.  `args` is (callable, one_arg, keyword_value). */
+static PyObject *m_call_surface(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *callable, *one, *kwvalue;
+    if (!PyArg_ParseTuple(args, "OOO", &callable, &one, &kwvalue)) {
+        return NULL;
+    }
+
+    PyObject *vector[3];
+    PyObject *kwnames = NULL;
+    PyObject *noargs = NULL, *onearg = NULL, *vec = NULL, *vec_kw = NULL;
+    PyObject *objargs = NULL, *fmt = NULL, *meth_obj = NULL, *meth_fmt = NULL;
+    PyObject *name = NULL, *meth_no = NULL, *meth_one = NULL, *result = NULL;
+    PyObject *text = NULL;
+
+    noargs = PyObject_CallNoArgs(callable);
+    if (noargs == NULL) goto done;
+    onearg = PyObject_CallOneArg(callable, one);
+    if (onearg == NULL) goto done;
+
+    vector[0] = one;
+    vector[1] = one;
+    vec = PyObject_Vectorcall(callable, vector, 2, NULL);
+    if (vec == NULL) goto done;
+
+    /* One positional and one named, the name in a `kwnames` tuple. */
+    kwnames = PyTuple_New(1);
+    if (kwnames == NULL) goto done;
+    {
+        PyObject *key = PyUnicode_FromString("kw");
+        if (key == NULL) goto done;
+        PyTuple_SetItem(kwnames, 0, key);
+    }
+    vector[0] = one;
+    vector[1] = kwvalue;
+    vec_kw = PyObject_Vectorcall(callable, vector, 1, kwnames);
+    if (vec_kw == NULL) goto done;
+
+    objargs = PyObject_CallFunctionObjArgs(callable, one, one, one, NULL);
+    if (objargs == NULL) goto done;
+    fmt = PyObject_CallFunction(callable, "OO", one, one);
+    if (fmt == NULL) goto done;
+
+    /* The method spellings, against a str the test can predict. */
+    text = PyUnicode_FromString("abc");
+    if (text == NULL) goto done;
+    name = PyUnicode_FromString("upper");
+    if (name == NULL) goto done;
+    meth_no = PyObject_CallMethodNoArgs(text, name);
+    if (meth_no == NULL) goto done;
+    meth_one = PyObject_CallMethodOneArg(text, name, NULL);
+    /* `upper` takes no argument, so that call must have failed. */
+    if (meth_one != NULL) {
+        PyErr_SetString(PyExc_AssertionError, "upper() accepted an argument");
+        goto done;
+    }
+    PyErr_Clear();
+    meth_obj = PyObject_CallMethodObjArgs(text, name, NULL);
+    if (meth_obj == NULL) goto done;
+    meth_fmt = PyObject_CallMethod(text, "count", "s", "b");
+    if (meth_fmt == NULL) goto done;
+
+    result = Py_BuildValue("(OOOOOOOO)", noargs, onearg, vec, vec_kw,
+                           objargs, fmt, meth_no, meth_fmt);
+
+done:
+    Py_XDECREF(noargs);
+    Py_XDECREF(onearg);
+    Py_XDECREF(vec);
+    Py_XDECREF(vec_kw);
+    Py_XDECREF(kwnames);
+    Py_XDECREF(objargs);
+    Py_XDECREF(fmt);
+    Py_XDECREF(meth_no);
+    Py_XDECREF(meth_obj);
+    Py_XDECREF(meth_fmt);
+    Py_XDECREF(name);
+    Py_XDECREF(text);
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"bump", (PyCFunction)m_bump, METH_NOARGS, "bump the module counter"},
     {"wrap", (PyCFunction)m_wrap, METH_O, NULL},
@@ -423,6 +507,7 @@ static PyMethodDef methods[] = {
     {"predicates", (PyCFunction)m_predicates, METH_VARARGS, NULL},
     {"fail", (PyCFunction)m_fail, METH_VARARGS, NULL},
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
+    {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {NULL, NULL, 0, NULL},
 };
 

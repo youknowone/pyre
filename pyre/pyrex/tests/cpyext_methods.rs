@@ -155,6 +155,27 @@ assert not hasattr(again, 'runtime_only')
 assert again.ANSWER == 42
 assert again.bump() == 1
 
+# ── the call entry points ──────────────────────────────────────────────
+# `record` answers with exactly what it was given, so each spelling's result
+# states the argument vector that reached it.
+def record(*args, **kwargs):
+    return (args, kwargs)
+
+noargs, onearg, vec, vec_kw, objargs, fmt, meth_no, meth_fmt = \
+    m.call_surface(record, 7, 'v')
+
+assert noargs == ((), {}), noargs
+assert onearg == ((7,), {}), onearg
+assert vec == ((7, 7), {}), vec
+# One positional and one named: the name comes from the `kwnames` tuple and
+# names the entry *after* the positional run.
+assert vec_kw == ((7,), {'kw': 'v'}), vec_kw
+assert objargs == ((7, 7, 7), {}), objargs
+assert fmt == ((7, 7), {}), fmt
+# The method spellings, against 'abc'.
+assert meth_no == 'ABC', meth_no
+assert meth_fmt == 1, meth_fmt
+
 print('cpyext-methods-ok')
 "#;
 

@@ -344,3 +344,203 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyObject_IsInstance as *const ());
     std::hint::black_box(PyObject_Type as *const ());
 }
+
+// ── The vectorcall protocol ───────────────────────────────────────────────
+//
+// A vectorcall passes its arguments as a flat C array rather than a tuple and
+// a dict: `args[..nargs]` are positional and `args[nargs..]` are the values
+// for the names in `kwnames`, in order.  Pyre answers these by unpacking that
+// array and going through its own call path -- the type's `tp_vectorcall` slot
+// is an optimisation the caller may not assume was taken, which is why
+// `PyVectorcall_Call` falls back to `tp_call` when a type declares no offset
+// (`cpyext/src/call.c:120-129`).
+
+/// The bit a caller sets in `nargsf` to say it left a spare slot before
+/// `args[0]` that a callee may overwrite with its own receiver.
+///
+/// Pyre reads the array and never writes it, so the bit only has to be
+/// stripped before the count is used.
+const VECTORCALL_ARGUMENTS_OFFSET: usize = 1 << (usize::BITS - 1);
+
+/// The positional count carried by an `nargsf`.
+fn vectorcall_nargs(nargsf: usize) -> usize {
+    nargsf & !VECTORCALL_ARGUMENTS_OFFSET
+}
+
+/// Call `callable` with a vectorcall argument vector.
+///
+/// # Safety
+/// `args` must name `vectorcall_nargs(nargsf) + len(kwnames)` readable
+/// pointers, and `kwnames` must be NULL or a tuple of `str`.
+unsafe fn call_vector(
+    callable: PyObjectRef,
+    args: *const *mut CPyObject,
+    nargsf: usize,
+    kwnames: *mut CPyObject,
+) -> Result<PyObjectRef, crate::PyError> {
+    let nargs = vectorcall_nargs(nargsf);
+    let kwnames = unsafe { pyobject::from_ref(kwnames) };
+    if !kwnames.is_null() && !unsafe { pyre_object::is_tuple(kwnames) } {
+        return Err(crate::PyError::type_error(
+            "vectorcall keyword names must be a tuple",
+        ));
+    }
+
+    // Every incoming value is pinned before anything below can collect, and
+    // read back from the shadow stack afterwards.
+    let roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(callable);
+    let kwnames_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(kwnames);
+    let named = if kwnames.is_null() {
+        0
+    } else {
+        unsafe { pyre_object::tupleobject::w_tuple_len(kwnames) }
+    };
+    let value_base = pyre_object::gc_roots::shadow_stack_len();
+    for index in 0..nargs + named {
+        let value = unsafe { pyobject::from_ref(*args.add(index)) };
+        if value.is_null() {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "vectorcall argument vector holds a NULL",
+            ));
+        }
+        roots.pin_root(value);
+    }
+    let value_at = |index: usize| pyre_object::gc_roots::shadow_stack_get(value_base + index);
+
+    // The names come out before the values are read back, so that the
+    // allocation each one makes cannot move an address already copied.
+    let mut names: Vec<rustpython_wtf8::Wtf8Buf> = Vec::with_capacity(named);
+    if named != 0 {
+        let items = unsafe {
+            pyre_object::tupleobject::w_tuple_items_copy_as_vec(
+                pyre_object::gc_roots::shadow_stack_get(kwnames_slot),
+            )
+        };
+        for name in items {
+            if !unsafe { pyre_object::is_str(name) } {
+                return Err(crate::PyError::type_error(
+                    "vectorcall keyword name is not a string",
+                ));
+            }
+            names.push(rustpython_wtf8::Wtf8Buf::from_string(
+                unsafe { pyre_object::w_str_get_value(name) }.to_owned(),
+            ));
+        }
+    }
+
+    let positional: Vec<PyObjectRef> = (0..nargs).map(value_at).collect();
+    if named == 0 {
+        return crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+            &positional,
+        );
+    }
+    let keywords: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name, value_at(nargs + index)))
+        .collect();
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "cpyext keyword call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(
+            unsafe { &mut *frame },
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+            &positional,
+            &keywords,
+        )
+    })
+}
+
+/// `PyObject_Vectorcall(callable, args, nargsf, kwnames)`.
+///
+/// # Safety
+/// See [`call_vector`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_Vectorcall(
+    callable: *mut CPyObject,
+    args: *const *mut CPyObject,
+    nargsf: usize,
+    kwnames: *mut CPyObject,
+) -> *mut CPyObject {
+    let Some(callable) = argument(callable) else {
+        return std::ptr::null_mut();
+    };
+    result(unsafe { call_vector(callable, args, nargsf, kwnames) })
+}
+
+/// `PyObject_VectorcallMethod(name, args, nargsf, kwnames)` — `args[0]` is the
+/// object the method is looked up on, and stays the call's first argument.
+///
+/// # Safety
+/// See [`call_vector`]; `args` must additionally hold at least one entry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_VectorcallMethod(
+    name: *mut CPyObject,
+    args: *const *mut CPyObject,
+    nargsf: usize,
+    kwnames: *mut CPyObject,
+) -> *mut CPyObject {
+    let (Some(name), true) = (argument(name), vectorcall_nargs(nargsf) >= 1) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    let Some(receiver) = argument(unsafe { *args }) else {
+        return std::ptr::null_mut();
+    };
+    // The bound method carries the receiver, so the remaining vector is the
+    // argument list and the offset bit no longer describes it.
+    let Some(method) = trap(crate::baseobjspace::getattr(receiver, name)) else {
+        return std::ptr::null_mut();
+    };
+    let nargs = vectorcall_nargs(nargsf) - 1;
+    result(unsafe { call_vector(method, args.add(1), nargs, kwnames) })
+}
+
+/// `PyVectorcall_Call(callable, tuple, dict)` — the tuple/dict spelling of a
+/// vectorcall, which is what a type's `tp_call` is set to when it declares one
+/// (`cpyext/src/call.c:114-161`).
+///
+/// # Safety
+/// `tuple` must be a tuple and `dict` NULL or a dict.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyVectorcall_Call(
+    callable: *mut CPyObject,
+    tuple: *mut CPyObject,
+    dict: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { PyObject_Call(callable, tuple, dict) }
+}
+
+/// `PyObject_CallNoArgs(callable)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_CallNoArgs(callable: *mut CPyObject) -> *mut CPyObject {
+    let Some(callable) = argument(callable) else {
+        return std::ptr::null_mut();
+    };
+    result(crate::call::call_function_impl_result(callable, &[]))
+}
+
+/// `PyObject_CallOneArg(callable, arg)`.
+///
+/// # Safety
+/// `arg` must be a live reference.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_CallOneArg(
+    callable: *mut CPyObject,
+    arg: *mut CPyObject,
+) -> *mut CPyObject {
+    let Some(callable) = argument(callable) else {
+        return std::ptr::null_mut();
+    };
+    let argument_vector = [arg];
+    result(unsafe { call_vector(callable, argument_vector.as_ptr(), 1, std::ptr::null_mut()) })
+}
