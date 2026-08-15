@@ -820,9 +820,8 @@ pub fn dict_merge_value(
     )?;
     let keys_obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(keys_obj);
-    let keys = crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(
-        keys_obj_slot,
-    ))?;
+    let keys =
+        crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
     let keys_base = pyre_object::gc_roots::shadow_stack_len();
     for &key in &keys {
         pyre_object::gc_roots::pin_root(key);

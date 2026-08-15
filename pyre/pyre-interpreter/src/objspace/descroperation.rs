@@ -4989,9 +4989,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(root_base + 1));
             let mut equal = la == lb;
             if equal {
-                let items = pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(
-                    root_base,
-                ));
+                let items =
+                    pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
                 let items_base = pyre_object::gc_roots::shadow_stack_len();
                 for &(k, v) in &items {
                     pyre_object::gc_roots::pin_root(k);
@@ -5012,9 +5011,8 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                         Some(other_v) => {
                             // dictmultiobject.py:664 `if not space.eq_w(w_val,
                             // w_rightval): return space.w_False`
-                            let v = pyre_object::gc_roots::shadow_stack_get(
-                                items_base + index * 2 + 1,
-                            );
+                            let v =
+                                pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1);
                             if !crate::baseobjspace::eq_w(v, other_v)? {
                                 equal = false;
                                 break;

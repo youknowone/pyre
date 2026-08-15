@@ -6512,15 +6512,13 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     match hashed {
-                        Some(key) => {
-                            pyre_object::dictmultiobject::w_dict_store_hashed_checked(
-                                dict(),
-                                k,
-                                v,
-                                key.hash,
-                            )
-                            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?
-                        }
+                        Some(key) => pyre_object::dictmultiobject::w_dict_store_hashed_checked(
+                            dict(),
+                            k,
+                            v,
+                            key.hash,
+                        )
+                        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(k))?,
                         None => dict_store_checked(dict(), k, v)?,
                     }
                     if orig_size
