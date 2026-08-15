@@ -176,6 +176,23 @@ assert fmt == ((7, 7), {}), fmt
 assert meth_no == 'ABC', meth_no
 assert meth_fmt == 1, meth_fmt
 
+# ── the set protocol and the raw allocators ────────────────────────────
+(empty_size, after_add, after_readd, has_key,
+ first, second, after_pop, after_clear,
+ is_set, is_frozen, is_any, typed) = m.set_ops([1, 2, 3], 9)
+
+assert empty_size == 0, empty_size
+# 9 is not in {1,2,3}, so adding it grows the set and re-adding does not.
+assert (after_add, after_readd) == (4, 4), (after_add, after_readd)
+assert has_key == 1
+# `discard` finds it once, then reports absence rather than raising.
+assert (first, second) == (1, 0), (first, second)
+assert after_pop == 2, after_pop
+assert after_clear == 0, after_clear
+assert (is_set, is_frozen, is_any) == (1, 1, 1), (is_set, is_frozen, is_any)
+# PyMem_Calloc zeroed, PyMem_Realloc kept the bytes, PyMem_New sized right.
+assert typed == 1234, typed
+
 print('cpyext-methods-ok')
 "#;
 

@@ -487,6 +487,73 @@ done:
     return result;
 }
 
+/* Drive the set protocol and the raw allocators.  `args` is (iterable, key). */
+static PyObject *m_set_ops(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *iterable, *key;
+    if (!PyArg_ParseTuple(args, "OO", &iterable, &key)) {
+        return NULL;
+    }
+
+    PyObject *empty = PySet_New(NULL);
+    PyObject *built = PySet_New(iterable);
+    PyObject *frozen = PyFrozenSet_New(iterable);
+    PyObject *popped = NULL, *result = NULL;
+    if (empty == NULL || built == NULL || frozen == NULL) {
+        goto done;
+    }
+
+    /* A key added once is present; adding it again does not grow the set. */
+    if (PySet_Add(built, key) < 0) goto done;
+    Py_ssize_t after_add = PySet_Size(built);
+    if (PySet_Add(built, key) < 0) goto done;
+    Py_ssize_t after_readd = PySet_Size(built);
+    int has_key = PySet_Contains(built, key);
+
+    /* Discard answers 1 the first time and 0 the second, without raising. */
+    int first = PySet_Discard(built, key);
+    int second = PySet_Discard(built, key);
+    if (first < 0 || second < 0) goto done;
+
+    popped = PySet_Pop(built);
+    if (popped == NULL) goto done;
+    Py_ssize_t after_pop = PySet_Size(built);
+    if (PySet_Clear(built) < 0) goto done;
+
+    /* The raw allocators: write a pattern, grow, and read it back. */
+    unsigned char *block = (unsigned char *)PyMem_Calloc(8, 1);
+    if (block == NULL) goto done;
+    int was_zero = 1;
+    for (int i = 0; i < 8; i++) { was_zero = was_zero && block[i] == 0; }
+    for (int i = 0; i < 8; i++) { block[i] = (unsigned char)(i + 1); }
+    block = (unsigned char *)PyMem_Realloc(block, 64);
+    if (block == NULL) goto done;
+    int kept = 1;
+    for (int i = 0; i < 8; i++) { kept = kept && block[i] == (unsigned char)(i + 1); }
+    PyMem_Free(block);
+
+    long *typed = PyMem_New(long, 4);
+    if (typed == NULL) goto done;
+    typed[3] = 1234;
+    long typed_read = typed[3];
+    PyMem_Del(typed);
+
+    result = Py_BuildValue(
+        "(nnnininniiil)",
+        PySet_Size(empty), after_add, after_readd, has_key,
+        first, second, after_pop, PySet_Size(built),
+        PySet_Check(built), PyFrozenSet_Check(frozen), PyAnySet_Check(frozen),
+        was_zero && kept ? typed_read : -1);
+
+done:
+    Py_XDECREF(empty);
+    Py_XDECREF(built);
+    Py_XDECREF(frozen);
+    Py_XDECREF(popped);
+    return result;
+}
+
 static PyMethodDef methods[] = {
     {"bump", (PyCFunction)m_bump, METH_NOARGS, "bump the module counter"},
     {"wrap", (PyCFunction)m_wrap, METH_O, NULL},
@@ -508,6 +575,7 @@ static PyMethodDef methods[] = {
     {"fail", (PyCFunction)m_fail, METH_VARARGS, NULL},
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
+    {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
     {NULL, NULL, 0, NULL},
 };
 

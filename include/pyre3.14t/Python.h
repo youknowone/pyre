@@ -550,6 +550,32 @@ PyAPI_FUNC(PyObject *) PyType_GetQualName(PyTypeObject *type);
 #define PyObject_New(type, tp) ((type *)PyType_GenericAlloc((tp), 0))
 #define PyObject_GC_New(type, tp) PyObject_New(type, tp)
 PyAPI_FUNC(void) PyObject_Free(void *ob);
+
+/* The raw allocators.  The `PyMem_*` and `PyMem_Raw*` halves are the same
+   functions, as they are upstream (`cpyext/src/pymem.c:57`).  Memory from
+   these never holds an interpreter object. */
+PyAPI_FUNC(void *) PyMem_Malloc(size_t size);
+PyAPI_FUNC(void *) PyMem_Calloc(size_t nelem, size_t elsize);
+PyAPI_FUNC(void *) PyMem_Realloc(void *ptr, size_t size);
+PyAPI_FUNC(void) PyMem_Free(void *ptr);
+PyAPI_FUNC(void *) PyMem_RawMalloc(size_t size);
+PyAPI_FUNC(void *) PyMem_RawCalloc(size_t nelem, size_t elsize);
+PyAPI_FUNC(void *) PyMem_RawRealloc(void *ptr, size_t size);
+PyAPI_FUNC(void) PyMem_RawFree(void *ptr);
+
+#define PyMem_New(type, n) \
+    ((type *)((size_t)(n) > (size_t)PY_SSIZE_T_MAX / sizeof(type) \
+              ? NULL : PyMem_Malloc((n) * sizeof(type))))
+#define PyMem_Resize(p, type, n) \
+    ((p) = ((size_t)(n) > (size_t)PY_SSIZE_T_MAX / sizeof(type) \
+            ? NULL : (type *)PyMem_Realloc((p), (n) * sizeof(type))))
+#define PyMem_Del PyMem_Free
+#define PyMem_DEL PyMem_Free
+#define PyMem_MALLOC PyMem_Malloc
+#define PyMem_REALLOC PyMem_Realloc
+#define PyMem_FREE PyMem_Free
+/* No `PyObject_Malloc` alias: `PyObject_Free` releases an object block, which
+   is not what these hand out, so the two would not pair. */
 PyAPI_FUNC(void) PyObject_Del(void *ob);
 #define PyObject_GC_Del(ob) PyObject_Del(ob)
 #define PyObject_GC_Track(ob) ((void)(ob))
@@ -832,6 +858,21 @@ PyAPI_FUNC(int) PyBuffer_FromContiguous(const Py_buffer *view, const void *buf,
                                         Py_ssize_t length, char order);
 
 /* memoryview. */
+/* The set protocol (`cpyext/setobject.py`).  The `Check` spellings are
+   functions here, as pyre's other type checks are. */
+PyAPI_FUNC(PyObject *) PySet_New(PyObject *iterable);
+PyAPI_FUNC(PyObject *) PyFrozenSet_New(PyObject *iterable);
+PyAPI_FUNC(int) PySet_Add(PyObject *set, PyObject *key);
+PyAPI_FUNC(int) PySet_Discard(PyObject *set, PyObject *key);
+PyAPI_FUNC(PyObject *) PySet_Pop(PyObject *set);
+PyAPI_FUNC(int) PySet_Clear(PyObject *set);
+PyAPI_FUNC(Py_ssize_t) PySet_Size(PyObject *set);
+PyAPI_FUNC(int) PySet_Contains(PyObject *set, PyObject *key);
+PyAPI_FUNC(int) PySet_Check(PyObject *object);
+PyAPI_FUNC(int) PyFrozenSet_Check(PyObject *object);
+PyAPI_FUNC(int) PyAnySet_Check(PyObject *object);
+#define PySet_GET_SIZE(ob) PySet_Size((PyObject *)(ob))
+
 PyAPI_FUNC(int) PyMemoryView_Check(PyObject *object);
 PyAPI_FUNC(PyObject *) PyMemoryView_FromObject(PyObject *object);
 PyAPI_FUNC(PyObject *) PyMemoryView_FromMemory(char *memory, Py_ssize_t size, int flags);
