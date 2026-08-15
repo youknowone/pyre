@@ -15740,7 +15740,24 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             fileio_clear_stat_atopen(self_obj);
             return Ok(index);
         }
-        #[cfg(any(not(unix), feature = "sandbox"))]
+        #[cfg(all(windows, not(feature = "sandbox")))]
+        {
+            // rposix.py:597 binds `_chsize_s` where the posix branch binds
+            // `ftruncate`. It reports failure as its return value rather than
+            // through -1, so the errno comes from the call itself; `crt_call!`
+            // supplies the invalid-parameter suppression `ftruncate` gets from
+            // `SuppressIPH` at rposix.py:606.
+            unsafe extern "C" {
+                fn _chsize_s(fd: i32, size: i64) -> i32;
+            }
+            let rc = crt_call!(_chsize_s(fd, size as i64));
+            if rc != 0 {
+                return Err(fd_errno_err(rc));
+            }
+            fileio_clear_stat_atopen(self_obj);
+            return Ok(index);
+        }
+        #[cfg(any(all(not(unix), not(windows)), feature = "sandbox"))]
         {
             let _ = (fd, size);
             return Err(crate::PyError::not_implemented(
