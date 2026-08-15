@@ -532,6 +532,30 @@ pub(crate) fn show_warning(
     Ok(())
 }
 
+/// One-word residual-call ABI for [`show_warning`].
+pub extern "C" fn show_warning_jit_abi(
+    message: PyObjectRef,
+    text: PyObjectRef,
+    category: PyObjectRef,
+    filename: PyObjectRef,
+    lineno: i64,
+    source_line: PyObjectRef,
+    source: PyObjectRef,
+) -> i64 {
+    match show_warning(
+        message,
+        text,
+        category,
+        filename,
+        lineno,
+        source_line,
+        source,
+    ) {
+        Ok(()) => 0,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectRef, PyError> {
     if module_globals.is_null() || unsafe { is_none(module_globals) } {
         return Ok(PY_NULL);

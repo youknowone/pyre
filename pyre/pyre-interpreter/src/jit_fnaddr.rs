@@ -459,10 +459,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::listobject::jit_drain_list_append as *const (),
     );
 
-    // The drain's prologue (`w_list_new_empty`) and epilogue
-    // (`drain_collect_items`) wrap the `Vec`/`Range`/`Option` host plumbing
-    // that RPython does not have; both are `#[dont_look_inside]` residuals and
-    // bind their `fn` directly (`-> PyObjectRef` / `-> Vec<PyObjectRef>`).
+    // The drain's prologue (`w_list_new_empty`) wraps opaque host plumbing and
+    // has a one-word return, so publish it as a residual-call target.
     // `w_list_new_object` is residualized (`#[dont_look_inside]`) but was
     // unregistered; bind it too so any direct residual site resolves.
     let w_list_new_empty: fn() -> pyre_object::PyObjectRef =
@@ -493,14 +491,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::w_list_new_object",
         w_list_new_object as *const (),
     );
-    let drain_collect_items: fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
-        crate::baseobjspace::drain_collect_items;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::drain_collect_items",
-        "pyre_interpreter::drain_collect_items",
-        drain_collect_items as *const (),
-    );
+    // `drain_collect_items` deliberately remains unpublished: its multiword
+    // `Vec<PyObjectRef>` return has no one-word residual-call ABI.
 
     push_alias_pair(
         &mut entries,
@@ -997,41 +989,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::objspace::std::mapdict::_obj_getdict",
         crate::objspace::std::mapdict::_obj_getdict as *const (),
     );
-    // #346: the C3 linearization core `compute_mro` carries `#[dont_look_inside]`
-    // — MRO computation is opaque, MRO iteration stays traced. The self-recursive
-    // C3 walk bottoms out in the `vec![w_type]` foreign alloc intrinsic, so it
-    // residualizes; its public wrapper `compute_default_mro` residualizes with
-    // it. Both are Vec-returning residuals with no build-time constant, so bind
-    // their `fn` directly by qualified path.
-    let compute_mro: unsafe fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
-        crate::baseobjspace::compute_mro;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::compute_mro",
-        "pyre_interpreter::compute_mro",
-        compute_mro as *const (),
-    );
-    let compute_default_mro: unsafe fn(pyre_object::PyObjectRef) -> Vec<pyre_object::PyObjectRef> =
-        crate::baseobjspace::compute_default_mro;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::compute_default_mro",
-        "pyre_interpreter::compute_default_mro",
-        compute_default_mro as *const (),
-    );
-    // #346: `memoryview_gather_bytes` is the sole `.gather()` call surface —
-    // the buffer-protocol copy leaf whose geometry walk + `Vec<u8>` growth
-    // + `Range`-indexed sub-slices are opaque host plumbing. Residualized
-    // (`#[dont_look_inside]`), it is a `Vec`-returning residual like
-    // `compute_mro`; bind its `fn` directly by qualified path.
-    let memoryview_gather_bytes: unsafe fn(pyre_object::PyObjectRef) -> Vec<u8> =
-        crate::builtins::memoryview_gather_bytes;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::builtins::memoryview_gather_bytes",
-        "pyre_interpreter::memoryview_gather_bytes",
-        memoryview_gather_bytes as *const (),
-    );
+    // `compute_mro` deliberately remains unpublished: its multiword
+    // `Vec<PyObjectRef>` return has no one-word residual-call ABI.
+    // `compute_default_mro` deliberately remains unpublished for the same
+    // multiword `Vec<PyObjectRef>` return ABI.
+    // `memoryview_gather_bytes` deliberately remains unpublished: its
+    // multiword `Vec<u8>` return has no one-word residual-call ABI.
     // #346: the `not hasmro` subtype fallback for a partially-initialised type
     // (`_issubtype_slow_and_wrong`, typeobject.py:1646).  Its cold best-base
     // walk bottoms out in an opaque `Vec` iteration and returns a single-word
@@ -2132,20 +2095,11 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::arm_async_eval_breaker",
         crate::executioncontext::arm_async_eval_breaker as *const (),
     );
-    let show_warning: fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        i64,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> Result<(), crate::PyError> = crate::module::_warnings::show_warning;
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::module::_warnings::show_warning",
         "pyre_interpreter::show_warning",
-        show_warning as *const (),
+        crate::module::_warnings::show_warning_jit_abi as *const (),
     );
     push_alias_pair(
         &mut entries,
@@ -2296,26 +2250,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyframe_pop as *const (),
     );
 
-    // `pop_value`'s underflow guard returns `stack_underflow_error(...)`
-    // when the value stack is empty (`eval.rs:840-845` +
-    // `eval.rs:847-852 peek_at`). The codewriter follows that call edge
-    // into the `stack_underflow_error` helper jitcode, whose `constants_i[0]`
-    // is the function pointer the walker invokes at residual_call time.
-    // Without this binding the codewriter falls back to
-    // `symbolic_fnaddr_for_path`, which is a deterministic hash and
-    // SEGVs when called.  `lib.rs:72 pub use shared_opcode::*` re-exports
-    // the helper at the crate root, so the codewriter resolves
-    // `stack_underflow_error` to `pyre_interpreter::stack_underflow_error`
-    // when it appears as a bare identifier in `eval.rs`; register both
-    // the module-qualified path and the root re-export path via
-    // [`push_alias_pair`].
-    let stack_underflow: fn(&str) -> crate::PyError = crate::shared_opcode::stack_underflow_error;
-    push_alias_pair(
-        &mut entries,
-        "pyre_interpreter::shared_opcode::stack_underflow_error",
-        "pyre_interpreter::stack_underflow_error",
-        stack_underflow as *const (),
-    );
+    // `stack_underflow_error` deliberately remains unpublished: its `&str`
+    // argument is a two-word aggregate with no one-word residual-call ABI.
 
     // `get_current_exception` / `set_current_exception` — the named TLS
     // accessors `PyFrame::push_exc_info` / `pop_except` (`eval.rs`) call
@@ -2385,12 +2321,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::set_call_error",
         set_call_error as *const (),
     );
-    let take_call_error: fn() -> Option<crate::PyError> = crate::call::take_call_error;
-    push_fnaddr(
-        &mut entries,
-        "pyre_interpreter::call::take_call_error",
-        take_call_error as *const (),
-    );
+    // `take_call_error` deliberately remains unpublished: it returns an error
+    // as a value, so routing it through `BH_LAST_EXC_VALUE` would convert the
+    // returned value into a raise.
     let clear_call_error: fn() = crate::call::clear_call_error;
     push_fnaddr(
         &mut entries,
@@ -2408,13 +2341,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::call::take_last_exec_ctx",
         take_last_exec_ctx as *const (),
     );
-    let take_pending_hash_error: fn() -> crate::PyError =
-        crate::baseobjspace::take_pending_hash_error;
-    push_fnaddr(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::take_pending_hash_error",
-        take_pending_hash_error as *const (),
-    );
+    // `take_pending_hash_error` deliberately remains unpublished: it returns
+    // an error as a value, so routing it through `BH_LAST_EXC_VALUE` would
+    // convert the returned value into a raise.
     let proxy_type: fn() -> pyre_object::PyObjectRef =
         crate::module::_weakref::interp__weakref::proxy_type;
     push_fnaddr(
@@ -2442,18 +2371,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::stack_check::pyre_stack_too_big_slowpath",
         stack_slowpath as *const (),
     );
-    let stack_check: fn() -> Result<(), crate::PyError> = crate::stack_check::stack_check;
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::stack_check::stack_check",
-        stack_check as *const (),
+        crate::stack_check::stack_check_jit_abi as *const (),
     );
-    let drain_jit_pending: fn() -> Result<(), crate::PyError> =
-        crate::stack_check::drain_jit_pending_exception;
     push_fnaddr(
         &mut entries,
         "pyre_interpreter::stack_check::drain_jit_pending_exception",
-        drain_jit_pending as *const (),
+        crate::stack_check::drain_jit_pending_exception_jit_abi as *const (),
     );
 
     // `pyframe_get_pycode` / `ncells` / `npure_cellvars` / `PyFrame::ncells`
@@ -2747,18 +2673,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         raise_kind_arg_as_usize as *const (),
     );
 
-    // `PyError::type_error` — invoked by `stack_underflow_error`'s body
-    // (`shared_opcode.rs:181-183`). The codewriter resolves it to the
-    // 2-segment CallPath `["PyError", "type_error"]` (impl-method shape:
-    // type segment + method segment).  `register_macro_helper_trace_fnaddr`
-    // strips the leading crate segment, so the input string must have
-    // exactly 3 segments to produce the desired 2-segment canonical form.
-    let pyerror_type_error: fn(String) -> crate::PyError = |msg| crate::PyError::type_error(msg);
-    push_fnaddr(
-        &mut entries,
-        "pyre_interpreter::PyError::type_error",
-        pyerror_type_error as *const (),
-    );
+    // `PyError::type_error` deliberately remains unpublished: its by-value
+    // `String` argument is a three-word aggregate with no one-word
+    // residual-call ABI.
 
     // `PyError::to_exc_object` — residual exception materialization emitted by
     // the two-phase rtyper for `PyError.to_exc_object()` call sites.  This uses

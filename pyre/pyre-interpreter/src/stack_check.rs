@@ -625,6 +625,14 @@ pub fn drain_jit_pending_exception() -> Result<(), PyError> {
     }
 }
 
+/// One-word residual-call ABI for [`drain_jit_pending_exception`].
+pub extern "C" fn drain_jit_pending_exception_jit_abi() -> i64 {
+    match drain_jit_pending_exception() {
+        Ok(()) => 0,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 /// Peek whether an overflow exception is pending without draining it.
 /// Used by tests and by codegen helpers that want to know whether to
 /// skip work without claiming responsibility for surfacing it.
@@ -791,6 +799,14 @@ pub fn stack_check() -> Result<(), PyError> {
         return Err(PyError::recursion_error("maximum recursion depth exceeded"));
     }
     Ok(())
+}
+
+/// One-word residual-call ABI for [`stack_check`].
+pub extern "C" fn stack_check_jit_abi() -> i64 {
+    match stack_check() {
+        Ok(()) => 0,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
 }
 
 /// rpython/rlib/rstack.py:75-90 `stack_almost_full` parity.

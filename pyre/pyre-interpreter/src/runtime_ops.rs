@@ -223,6 +223,16 @@ pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
     }
 }
 
+/// Publish a residual-call error through both exception channels and return
+/// the one-word sentinel required by the residual-call ABI.
+#[inline]
+pub(crate) fn jit_publish_residual_error(mut error: PyError) -> i64 {
+    let exc_obj = error.to_exc_object();
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(exc_obj as i64));
+    jit_publish_exception(exc_obj);
+    0
+}
+
 /// Widest `jit_call_known_builtin_N` published by [`known_builtin_call_helper`],
 /// plus the leading code slot.
 const MAX_KNOWN_BUILTIN_ARGS: usize = 9;

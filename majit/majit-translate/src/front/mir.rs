@@ -14585,12 +14585,9 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         // The `ref` token collapses every non-`*mut PyObject` ADT onto one
         // GC-reference word, so on its own it would also admit a by-value
         // aggregate — `w_tuple_items_copy_as_vec` returns
-        // `Vec<PyObjectRef>`, three words returned through `sret`.  The
-        // hand-written residuals that do return a `Vec` (`compute_mro`,
-        // `memoryview_gather_bytes`) work because each carries an explicit
-        // `jit_fnaddr` `push_alias_pair` row arranging that ABI; a stub
-        // this collector mints has no such row, so a caller would annotate
-        // the one-word shell against a multiword ABI.  Admit `ref` only
+        // `Vec<PyObjectRef>`, three words returned through `sret`. The
+        // residual-call ABI has only a one-word return and no `sret` path,
+        // so a multiword return cannot be published at all. Admit `ref` only
         // for returns that genuinely are one word.
         if token.as_deref() == Some("ref")
             && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
