@@ -17118,8 +17118,31 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let flags = open_flags_for_mode(&mode);
         // `interp_fileio.py` wraps the resolved `w_name`, not the PathLike
         // wrapper from which it came.
-        let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
+        //
+        // `_open_fd` (`interp_fileio.py:135-147`) sits in a `while True` with
+        // `eintr_retry=True`: opening a FIFO waits for a peer, so an alarm
+        // arriving meanwhile runs its handler and the open is re-issued.
+        let fd = loop {
+            match crate::host_seam::ops::open(path_bytes, flags, 0o666) {
+                Ok(fd) => break fd,
+                // Only an errno can be the interruption; the seam's other
+                // variants are not OS failures and are reported as they stand.
+                Err(crate::host_seam::SeamError::Os(errno)) => {
+                    eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
+                        crate::host_seam::seam_os_err_with_filename(
+                            crate::host_seam::SeamError::Os(e.raw_os_error().unwrap_or(0)),
+                            resolved_path.w_path(),
+                        )
+                    })?
+                }
+                Err(e) => {
+                    return Err(crate::host_seam::seam_os_err_with_filename(
+                        e,
+                        resolved_path.w_path(),
+                    ));
+                }
+            }
+        };
         if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);

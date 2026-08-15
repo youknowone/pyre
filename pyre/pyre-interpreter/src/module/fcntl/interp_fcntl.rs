@@ -21,15 +21,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "fcntl() takes 2 or 3 arguments",
                     ));
                 }
-                if !unsafe { pyre_object::is_int(args[0]) }
-                    || !unsafe { pyre_object::is_int(args[1]) }
+                if !unsafe { pyre_object::is_int(args[1]) }
                     || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
                 {
                     return Err(crate::PyError::type_error(
                         "fcntl() arguments must be integers",
                     ));
                 }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
+                // `space.c_filedescriptor_w`, so an open file answers for the
+                // number it wraps.
+                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let arg = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) as i32 }
@@ -37,16 +39,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     0
                 };
                 // F_SETLKW waits for the lock, so this is a blocking call.
-                let outcome = {
-                    let _blocked = crate::module::thread::before_external_block();
-                    rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg)
-                };
-                match outcome {
-                    Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
-                    Err(e) => Err(crate::PyError::os_error_with_errno(
-                        e.raw_os_error().unwrap_or(0),
-                        format!("fcntl: {e}"),
-                    )),
+                // `_raise_error_maybe` is `eintr_retry=True`: an interrupted
+                // wait runs the pending handlers and goes back to waiting.
+                loop {
+                    let outcome = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg)
+                    };
+                    match outcome {
+                        Ok(v) => return Ok(pyre_object::w_int_new(v as i64)),
+                        Err(e) => crate::builtins::eintr_retry_with(e, |e| {
+                            crate::PyError::os_error_with_errno(
+                                e.raw_os_error().unwrap_or(0),
+                                format!("fcntl: {e}"),
+                            )
+                        })?,
+                    }
                 }
             }
             #[cfg(not(all(unix, feature = "host_env")))]
@@ -69,15 +77,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "ioctl() takes 2 or 3 arguments",
                     ));
                 }
-                if !unsafe { pyre_object::is_int(args[0]) }
-                    || !unsafe { pyre_object::is_int(args[1]) }
+                if !unsafe { pyre_object::is_int(args[1]) }
                     || (args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) })
                 {
                     return Err(crate::PyError::type_error(
                         "ioctl() arguments must be integers",
                     ));
                 }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // `ioctl` reads its descriptor the same way the rest of the
+                // module does.  It alone raises through `_raise_error_always`,
+                // so an interrupted call surfaces rather than being re-issued.
+                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let raw_req = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i64;
                 let request = rustpython_host_env::fcntl::normalize_ioctl_request(raw_req);
                 let arg = if args.len() >= 3 {
@@ -117,26 +127,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("flock() requires 2 arguments"));
                     }
-                    if !unsafe { pyre_object::is_int(args[0]) }
-                        || !unsafe { pyre_object::is_int(args[1]) }
-                    {
+                    if !unsafe { pyre_object::is_int(args[1]) } {
                         return Err(crate::PyError::type_error(
                             "flock() arguments must be integers",
                         ));
                     }
-                    let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                    // `flock(space, w_fd, op)` unwraps through
+                    // `space.c_filedescriptor_w`, so `fcntl.flock(f, LOCK_EX)`
+                    // on an open file is the documented spelling.
+                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                     let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                    // Without LOCK_NB this waits for the lock.
-                    let outcome = {
-                        let _blocked = crate::module::thread::before_external_block();
-                        rustpython_host_env::fcntl::flock(fd, op)
-                    };
-                    match outcome {
-                        Ok(_) => Ok(pyre_object::w_none()),
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("flock: {e}"),
-                        )),
+                    // Without LOCK_NB this waits for the lock, and
+                    // `_raise_error_maybe` is `eintr_retry=True`: the wait runs
+                    // the pending handlers and resumes rather than surfacing.
+                    loop {
+                        let outcome = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            rustpython_host_env::fcntl::flock(fd, op)
+                        };
+                        match outcome {
+                            Ok(_) => return Ok(pyre_object::w_none()),
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("flock: {e}"),
+                                )
+                            })?,
+                        }
                     }
                 }
                 #[cfg(not(all(unix, feature = "host_env")))]
@@ -161,15 +178,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "lockf() takes from 2 to 5 arguments",
                     ));
                 }
-                for (i, &a) in args.iter().enumerate().take(5) {
+                for &a in args.iter().take(5).skip(1) {
                     if !unsafe { pyre_object::is_int(a) } {
-                        let _ = i;
                         return Err(crate::PyError::type_error(
                             "lockf() arguments must be integers",
                         ));
                     }
                 }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // `lockf(space, w_fd, op, length, start, whence)` unwraps its
+                // descriptor through `space.c_filedescriptor_w`.
+                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let len = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) }
@@ -186,27 +204,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 } else {
                     0
                 };
-                // F_LOCK waits for the lock.
-                let outcome = {
-                    let _blocked = crate::module::thread::before_external_block();
-                    rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence)
-                };
-                match outcome {
-                    // `interp_fcntl.py:226 fcntl_lockf` returns
-                    // space.w_None; the integer return value of the C
-                    // helper was an internal pyre detail.
-                    Ok(_) => Ok(pyre_object::w_none()),
-                    Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
-                        Err(crate::PyError::value_error("lockf: invalid cmd"))
-                    }
-                    Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => {
-                        Err(crate::PyError::value_error(format!("lockf: overflow: {s}")))
-                    }
-                    Err(rustpython_host_env::fcntl::LockfError::Io(e)) => {
-                        Err(crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            format!("lockf: {e}"),
-                        ))
+                // F_LOCK waits for the lock, and `lockf` reports through
+                // `_raise_error_maybe`, which is `eintr_retry=True`.
+                loop {
+                    let outcome = {
+                        let _blocked = crate::module::thread::before_external_block();
+                        rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence)
+                    };
+                    match outcome {
+                        // `interp_fcntl.py:226 fcntl_lockf` returns
+                        // space.w_None; the integer return value of the C
+                        // helper was an internal pyre detail.
+                        Ok(_) => return Ok(pyre_object::w_none()),
+                        Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
+                            return Err(crate::PyError::value_error("lockf: invalid cmd"));
+                        }
+                        Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => {
+                            return Err(crate::PyError::value_error(format!(
+                                "lockf: overflow: {s}"
+                            )));
+                        }
+                        Err(rustpython_host_env::fcntl::LockfError::Io(e)) => {
+                            crate::builtins::eintr_retry_with(e, |e| {
+                                crate::PyError::os_error_with_errno(
+                                    e.raw_os_error().unwrap_or(0),
+                                    format!("lockf: {e}"),
+                                )
+                            })?
+                        }
                     }
                 }
             }
