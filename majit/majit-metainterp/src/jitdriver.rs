@@ -2259,7 +2259,14 @@ impl<S: JitState> JitDriver<S> {
     /// `Some(resume_pc)` the same call produced: that pc is the back edge, and
     /// resuming there re-runs the loop the compiled run already completed.
     pub fn take_back_edge_finish(&mut self) -> Option<Vec<Value>> {
-        self.meta.back_edge_finish.take()
+        // The latch holds the exit values in their decoded storage, which is
+        // inline for the widths a finish actually returns. Handing them out
+        // as a vector copies them once, on a call no compiled entry makes on
+        // its own: the projecting siblings below are what the portal drains.
+        self.meta
+            .back_edge_finish
+            .take()
+            .map(|values| values.to_vec())
     }
 
     /// [`Self::take_back_edge_finish`] projected onto one integer word — the
@@ -5991,7 +5998,7 @@ impl<S: JitState> JitDriver<S> {
         };
 
         if result.is_finish {
-            let typed_values = result.typed_values.clone();
+            let typed_values = result.typed_values.to_vec();
             let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
             drop(result);
             return DetailedDriverRunOutcome::Finished {
@@ -6144,8 +6151,8 @@ impl<S: JitState> JitDriver<S> {
         let trace_id = result.trace_id;
         let descr_arc = std::sync::Arc::clone(&result.descr_arc);
         let exit_layout = result.exit_layout.clone();
-        let typed_values = result.typed_values.clone();
-        let raw_values = result.values.clone();
+        let typed_values = result.typed_values.to_vec();
+        let raw_values = result.values.to_vec();
         // llmodel.py:240 grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).

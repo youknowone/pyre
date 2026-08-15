@@ -590,17 +590,15 @@ fn main() {
 /// really a configuration difference. The figure was briefly one number for
 /// both, before cranelift's frame moved to the nursery.
 ///
-/// Six of the allocations are shared by both backends:
+/// Four of the allocations are shared by both backends:
 ///
 /// | n | site |
 /// |---|------|
 /// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `extract_live_values`'s default (`jit_state.rs:186-187`) calls it and then `live_value_types`, whose default (`jit_state.rs:194`) calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
 /// | 1 | `JitState::extract_live_values` default body, `jit_state.rs:190` — the `Vec<Value>` it collects into |
 /// | 1 | `JitState::live_value_types` default body, `jit_state.rs:194` — the `Vec<Type>` it collects into |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key` — `values` (the run result's own output vector; find it by symbol, the line drifts) |
-/// | 1 | `run_compiled_detailed_with_values_at_dispatch_key` — `typed_values` (ditto) |
 ///
-/// Two shared rows have gone since:
+/// Four shared rows have gone since:
 ///
 /// - `<[Type]>::to_vec`, the exit's type list copied out of the failing descr
 ///   into the exit layout. `CompiledExitLayout::exit_types` is now inline
@@ -609,15 +607,23 @@ fn main() {
 /// - `<[Value]>::to_vec`, the FINISH values copied out of the run result. The
 ///   FINISH arm returns immediately after publishing them, so nothing reads
 ///   the source and the values are moved instead.
+/// - `run_compiled_detailed_with_values_at_dispatch_key` — `values`, the run
+///   result's own machine-word output buffer.
+/// - the same function's `typed_values`, its typed twin. Both are now inline
+///   storage on the result, sized to the exit widths a steady entry returns,
+///   so decoding an exit asks the allocator for nothing. The buffers could not
+///   be pooled and reused instead: each one leaves the function owned — into
+///   the finish latch, into the public run outcome, into the guard arm's own
+///   copy — so there is nothing to hand back.
 ///
-/// ⚠ THE FIRST FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
+/// ⚠ ALL FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
 /// entry path in general. `codegen_state.rs:1731` emits the non-allocating
 /// `extract_live_values_into` / `live_value_types_into` overrides only when the
 /// state has a ref scalar, a float scalar or a virt array; a state of int
 /// scalars only — which `CounterState` is — gets neither, and falls back to the
 /// allocating `JitState` defaults. A state that clears that gate pays 4 fewer.
 ///
-/// `dynasm` adds two, for 8:
+/// `dynasm` adds two, for 6:
 ///
 /// | n | site |
 /// |---|------|
@@ -630,7 +636,7 @@ fn main() {
 /// so the copy had no upstream counterpart; the frame now lives as long as the
 /// deadframe does and the accessors read it in place.
 ///
-/// `cranelift` adds ONE, for 7:
+/// `cranelift` adds ONE, for 5:
 ///
 /// | n | site |
 /// |---|------|
@@ -662,4 +668,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 7 } else { 8 };
+const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 5 } else { 6 };

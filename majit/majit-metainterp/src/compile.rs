@@ -127,6 +127,36 @@ fn derive_slot_types(
 /// the heap and pays exactly what it paid before.
 pub type ExitTypes = smallvec::SmallVec<[Type; 16]>;
 
+/// Inline width of the two decoded-exit buffers below.
+///
+/// Chosen from the exit arities a compiled entry actually returns, not from
+/// the widest one possible. Two shapes account for the steady path: a FINISH
+/// handing back the traced function's single result, and a guard handing back
+/// a frame's worth of live values — a handful, not a frame's full extent,
+/// because the exit carries only what the guard's fail arguments name. Eight
+/// covers both.
+///
+/// The width is bounded from above by the exits that do *not* fit. They exist,
+/// but they sit far above eight rather than just past it, so nothing is gained
+/// by inching this number up: the next size that would capture them costs more
+/// per entry, on every entry, than the allocations it saves on the few.
+const EXIT_VALUE_INLINE: usize = 8;
+
+/// Storage for one exit's decoded values, as machine words.
+///
+/// Both this and [`ExitValues`] are written once per exit from a compiled
+/// entry and read by the guard, blackhole and finish arms downstream. Holding
+/// them inline keeps the ordinary entry from asking the allocator for a buffer
+/// it will free before the next one; an exit wider than [`EXIT_VALUE_INLINE`]
+/// spills to the heap and pays exactly what it paid before.
+pub type ExitRawValues = smallvec::SmallVec<[i64; EXIT_VALUE_INLINE]>;
+
+/// Storage for one exit's decoded values, typed — see [`ExitRawValues`].
+///
+/// A `Value` is two words, so this array is the more expensive half of the
+/// pair and is what bounds [`EXIT_VALUE_INLINE`] from above.
+pub type ExitValues = smallvec::SmallVec<[Value; EXIT_VALUE_INLINE]>;
+
 /// Static exit metadata for a compiled guard or finish point.
 #[derive(Debug, Clone)]
 pub struct CompiledExitLayout {
@@ -156,8 +186,8 @@ pub struct CompiledExitLayout {
 
 /// Typed result from running compiled code.
 pub struct CompileResult<M> {
-    pub values: Vec<i64>,
-    pub typed_values: Vec<Value>,
+    pub values: ExitRawValues,
+    pub typed_values: ExitValues,
     /// Snapshot of the compiled entry's metadata taken *before*
     /// `execute_token`, mirroring `warmstate.py:398`'s hold on the
     /// `loop_token` object across the run: the exit values being unpacked
@@ -195,8 +225,8 @@ pub struct CompileResult<M> {
 
 /// Raw (lightweight) result from running compiled code.
 pub struct RawCompileResult<M> {
-    pub values: Vec<i64>,
-    pub typed_values: Vec<Value>,
+    pub values: ExitRawValues,
+    pub typed_values: ExitValues,
     /// Pre-run metadata snapshot — see `CompileResult::meta`.
     pub meta: std::sync::Arc<M>,
     pub fail_index: u32,

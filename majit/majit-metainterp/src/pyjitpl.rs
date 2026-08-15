@@ -95,7 +95,7 @@ use crate::compile;
 use crate::compile::make_jitcell_token;
 pub use crate::compile::{
     CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
-    DeadFrameArtifacts, ExitTypes, RawCompileResult,
+    DeadFrameArtifacts, ExitRawValues, ExitTypes, ExitValues, RawCompileResult,
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
@@ -1392,7 +1392,7 @@ pub struct MetaInterp<M: Clone> {
     /// `Option<resume_pc>` back-edge signature cannot express the outcome —
     /// this carries the result value out of band instead. Set by
     /// `back_edge_internal`, `take`n by `JitDriver::take_back_edge_finish*`.
-    pub(crate) back_edge_finish: Option<Vec<Value>>,
+    pub(crate) back_edge_finish: Option<ExitValues>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -10303,8 +10303,10 @@ impl<M: Clone> MetaInterp<M> {
         let descr_arc = result.descr_arc.clone();
 
         Some(RawCompileResult {
-            values: result.outputs,
-            typed_values: result.typed_outputs,
+            // The backend already owns these as heap vectors, so the inline
+            // spelling adopts the buffers rather than re-decoding into them.
+            values: ExitRawValues::from_vec(result.outputs),
+            typed_values: ExitValues::from_vec(result.typed_outputs),
             meta,
             fail_index,
             trace_id,
@@ -10438,8 +10440,8 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
-        let mut values = Vec::with_capacity(exit_arity);
-        let mut typed_values = Vec::with_capacity(exit_arity);
+        let mut values = ExitRawValues::with_capacity(exit_arity);
+        let mut typed_values = ExitValues::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
             match tp {
                 Type::Int => {
@@ -10630,8 +10632,8 @@ impl<M: Clone> MetaInterp<M> {
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
         }
-        let mut values = Vec::with_capacity(exit_arity);
-        let mut typed_values = Vec::with_capacity(exit_arity);
+        let mut values = ExitRawValues::with_capacity(exit_arity);
+        let mut typed_values = ExitValues::with_capacity(exit_arity);
         for (i, &tp) in exit_types.iter().enumerate() {
             match tp {
                 Type::Int => {
@@ -13975,7 +13977,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         let is_finish = result.is_finish;
-        let values = result.values.clone();
+        let values = result.values.to_vec();
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
