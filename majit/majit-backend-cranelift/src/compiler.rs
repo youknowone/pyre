@@ -6069,23 +6069,6 @@ fn mark_ref_roots_fresh(stale_ref_vars: &mut IndexSet<u32>, ref_root_slots: &[(u
     }
 }
 
-fn mark_ref_roots_after_selective_reload(
-    stale_ref_vars: &mut IndexSet<u32>,
-    live_ref_root_slots: &[(u32, usize)],
-    reloaded_ref_root_slots: &[(u32, usize)],
-) {
-    for &(var_idx, _) in live_ref_root_slots {
-        if reloaded_ref_root_slots
-            .iter()
-            .any(|(idx, _)| *idx == var_idx)
-        {
-            stale_ref_vars.swap_remove(&var_idx);
-        } else {
-            stale_ref_vars.insert(var_idx);
-        }
-    }
-}
-
 fn ptr_arg_as_i64(
     builder: &mut FunctionBuilder,
     ptr: CValue,
@@ -6240,39 +6223,6 @@ fn live_ref_root_slots_at(
                 && longevity
                     .get(var_idx)
                     .is_some_and(|last_usage| *last_usage >= position)
-        })
-        .copied()
-        .collect()
-}
-
-fn ref_root_slots_with_future_regular_uses(
-    position: usize,
-    ops: &[Op],
-    ref_root_slots: &[(u32, usize)],
-    defined_ref_vars: &IndexSet<u32>,
-) -> Vec<(u32, usize)> {
-    // RPython regalloc reloads values that remain live after a collecting
-    // call. Guard failargs are live uses too: failure recovery reads them
-    // after the call, and majit's failarg emission resolves OpRefs through
-    // the same variable/root-slot machinery as normal op args. Excluding
-    // failargs here leaves a Ref marked stale even though a later guard will
-    // use it, so the guard exit can copy an old frame-resident root slot into
-    // the deadframe instead of the post-GC value.
-    ref_root_slots
-        .iter()
-        .filter(|(var_idx, _)| {
-            defined_ref_vars.contains(var_idx)
-                && ops
-                    .iter()
-                    .skip(position + 1)
-                    .flat_map(|op| {
-                        op.getarglist()
-                            .into_iter()
-                            .chain(op.getfailargs().into_iter().flatten())
-                    })
-                    // Const operands carry value inline (history.py:227/268/314)
-                    // — not a body-namespace var_idx match.
-                    .any(|arg| !arg.is_constant() && arg.to_opref().raw() == *var_idx)
         })
         .copied()
         .collect()
@@ -11833,26 +11783,27 @@ impl CraneliftBackend {
                         jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                         builder.ins().set_pinned_reg(jf_ptr);
                         emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                        let post_call_reload_ref_root_slots =
-                            ref_root_slots_with_future_regular_uses(
-                                op_idx,
-                                ops,
-                                &live_ref_root_slots,
-                                &defined_ref_vars,
-                            );
+                        // `_pop_all_regs_from_frame` (assembler.py:1369-1377)
+                        // reloads every saved root, and the two sibling paths
+                        // below do the same. Reloading a subset here and
+                        // recording the rest in `stale_ref_vars` cannot work:
+                        // that set is one linear compile-time set, while the
+                        // three paths are a diamond into `ca_merge_block`, so
+                        // whichever path is emitted last decides what the code
+                        // after the merge believes. A var left unreloaded on
+                        // this path then reads as fresh, `spill_ref_roots`
+                        // copies its pre-call SSA value over a root slot the
+                        // collection has since forwarded, and a guard exit
+                        // publishes that address into the deadframe.
                         reload_ref_roots(
                             &mut builder,
                             jf_ptr,
-                            &post_call_reload_ref_root_slots,
+                            &live_ref_root_slots,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
-                        mark_ref_roots_after_selective_reload(
-                            &mut stale_ref_vars,
-                            &live_ref_root_slots,
-                            &post_call_reload_ref_root_slots,
-                        );
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
                         // _call_assembler_check_descr (assembler.py:2274-2278):
                         //   CMP [eax + jf_descr_ofs], done_with_this_frame_descr
                         let fail_idx_raw = builder.ins().load(
