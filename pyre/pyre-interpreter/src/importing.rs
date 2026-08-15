@@ -928,6 +928,18 @@ pub(crate) fn multiarch() -> &'static str {
     }
 }
 
+/// Whether this build has an extension loader — the predicate `create_dynamic`
+/// is gated on (`imp/interp_imp.py:49-51`), and therefore the one that decides
+/// whether `_imp.extension_suffixes()` answers anything.  A build that cannot
+/// load an extension must not name the files one would be compiled against.
+pub(crate) const fn extension_loader_present() -> bool {
+    cfg!(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))
+}
+
 /// The name `EXT_SUFFIX` and `SO` publish.
 ///
 /// A `cpyext` build has an extension loader, and the suffix it builds its
@@ -999,6 +1011,33 @@ fn sysconfigdata_base_prefix() -> PathBuf {
     {
         PathBuf::new()
     }
+}
+
+/// Spell `path` so that it survives as one word in `CFLAGS`.
+///
+/// Both readers of that variable split it the way a shell does:
+/// `customize_compiler` hands `cc + ' ' + cflags` to `distutils.util.split_quoted`,
+/// and a build backend that pastes the variable into a command line hands it to
+/// the shell.  A prefix with a space in it would reach either of them as two
+/// arguments.  Double quotes are the form they agree on; a path that needs none
+/// is left alone so the variable reads the way it always has.
+fn quote_for_cflags(path: &str) -> String {
+    let bare = |b: u8| b.is_ascii_alphanumeric() || b"-_./+=:,@~".contains(&b);
+    if path.bytes().all(bare) {
+        return path.to_owned();
+    }
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for ch in path.chars() {
+        // The two characters that would otherwise end the quoted region or
+        // start an escape inside it.
+        if matches!(ch, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// `_sysconfigdata` — `build_time_vars`, the mapping `sysconfig._init_posix`
@@ -1084,6 +1123,25 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     let base_prefix_str = pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(
         base_prefix.as_os_str(),
     ));
+    // `include/{implementation_lower}{py_version_short}{abi_thread}`, the
+    // directory the posix_prefix scheme resolves `get_paths()['include']` to.
+    // An interpreter that publishes no base prefix has nowhere to name.
+    //
+    // The predicate is the loader's own, the one `extension_abi_suffix` and
+    // `has_so_extension` are built on rather than the `cpyext` feature alone:
+    // under `sandbox`, or on a platform with no `create_dynamic`,
+    // `_imp.extension_suffixes()` is empty, and naming a header directory
+    // there would let a build backend compile an extension this interpreter
+    // can never load.
+    let include_py = if extension_loader_present() && !base_prefix.as_os_str().is_empty() {
+        base_prefix
+            .join("include")
+            .join("pyre3.14t")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        String::new()
+    };
 
     let vars = pyre_object::w_dict_new();
     // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
@@ -1099,7 +1157,20 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_str(vars, "CC", &cc);
     store_str(vars, "CXX", &cxx);
     store_str(vars, "OPT", "-DNDEBUG -O2");
-    store_str(vars, "CFLAGS", "-DNDEBUG -O2");
+    // `setuptools`' vendored `_distutils.sysconfig._get_python_inc_posix_prefix`
+    // builds the include directory as `include/<impl><version><abiflags>` with
+    // `<impl>` chosen by `IS_PYPY = '__pypy__' in sys.builtin_module_names`.
+    // Pyre answers that test and spells its own tree `pyre3.14t`, so the `-I`
+    // that `build_ext` appends names a directory pyre never installs.  `CFLAGS`
+    // is the path that cannot be displaced: `configure_system` builds every
+    // extension compile as `cc + ' ' + cflags`, and the unusable `-I` alongside
+    // it is inert.
+    let mut cflags = String::from("-DNDEBUG -O2");
+    if !include_py.is_empty() {
+        cflags.push_str(" -I");
+        cflags.push_str(&quote_for_cflags(&include_py));
+    }
+    store_str(vars, "CFLAGS", &cflags);
     store_str(vars, "CCSHARED", "-fPIC");
     store_str(vars, "LDFLAGS", &ldflags);
     store_str(vars, "LDSHARED", &ldshared);
@@ -1117,9 +1188,9 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_int(vars, "Py_DEBUG", 0);
     store_int(vars, "Py_GIL_DISABLED", 1);
     store_int(vars, "Py_ENABLE_SHARED", 0);
-    // Pyre currently has neither a CPython-compatible C API nor a separately
-    // linkable runtime library.  Keep the build ABI metadata above for wheel
-    // tags, but never invent files that are absent from the installation.
+    // Pyre has no separately linkable runtime library.  Keep the build ABI
+    // metadata above for wheel tags, but never invent files that are absent
+    // from the installation.
     for key in [
         "LIBRARY",
         "LDLIBRARY",
@@ -1129,6 +1200,15 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         "LIBDIR",
     ] {
         store_str(vars, key, "");
+    }
+    // The headers are the one entry above a build can have: they exist in a
+    // `cpyext` build and nowhere else, so the empty default stands until there
+    // is a directory to name.  Build backends that do not go through
+    // `_distutils` — meson-python, scikit-build, CMake's FindPython — read
+    // `INCLUDEPY` directly.
+    if !include_py.is_empty() {
+        store_str(vars, "INCLUDEPY", &include_py);
+        store_str(vars, "CONFINCLUDEPY", &include_py);
     }
     store_int(vars, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
     if gnuld {
@@ -5418,6 +5498,22 @@ mod tests {
         let cached = check_sys_modules("test_cached");
         assert!(cached.is_some());
         assert_eq!(cached.unwrap(), sentinel);
+    }
+
+    #[test]
+    fn cflags_include_path_survives_word_splitting() {
+        // An ordinary prefix keeps reading the way it always has.
+        assert_eq!(
+            quote_for_cflags("/opt/pyre/include/pyre3.14t"),
+            "/opt/pyre/include/pyre3.14t"
+        );
+        // Anything a shell would split on, or that would end the region, is
+        // spelled so `split_quoted` and a shell both return one word.
+        assert_eq!(
+            quote_for_cflags("/Volumes/My Disk/include"),
+            "\"/Volumes/My Disk/include\""
+        );
+        assert_eq!(quote_for_cflags("/a\"b\\c"), "\"/a\\\"b\\\\c\"");
     }
 
     #[test]
