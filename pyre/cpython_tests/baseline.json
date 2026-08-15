@@ -276,7 +276,7 @@
       "dynasm": "PASS"
     },
     "test.test_coroutines": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_cppext": {
       "dynasm": "SKIP",

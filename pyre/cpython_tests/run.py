@@ -63,6 +63,7 @@ import concurrent.futures
 import json
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -435,6 +436,13 @@ def is_package(module: str) -> bool:
     return (TESTDIR / name / "__init__.py").exists()
 
 
+# The guard as the language accepts it, not as it is usually typed:
+# `test_coroutines.py:2527`, `test_posixpath.py:1169` and
+# `test_robotparser.py:819` all spell it `if __name__=="__main__":` with no
+# spaces, and a fixed-string test reads those three as guardless.
+MAIN_GUARD = re.compile(r"^\s*if\s+__name__\s*==\s*(['\"])__main__\1\s*:", re.MULTILINE)
+
+
 def runs_its_own_tests(module: str) -> bool:
     """Whether running the module's file as `__main__` runs its tests.
 
@@ -450,7 +458,7 @@ def runs_its_own_tests(module: str) -> bool:
         source = module_path(module).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    return 'if __name__ == "__main__"' in source or "if __name__ == '__main__'" in source
+    return MAIN_GUARD.search(source) is not None
 
 
 # Driver that imports a test *package* with real package context (so its
