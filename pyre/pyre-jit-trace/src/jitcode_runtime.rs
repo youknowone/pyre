@@ -2298,6 +2298,17 @@ mod tests {
     /// handler but no opname→byte entry, so the blackhole took
     /// `dispatch_step: unwired opcode=0xd9` on the abort path.  Both are now
     /// registered.
+    ///
+    /// The three `getinteriorfield_gc_*` loads left without the emitted set
+    /// growing: they are registered pre-emptively, not in response to an
+    /// observed panic naming one of them.  Their
+    /// `bhimpl_getinteriorfield_gc_*` handlers already existed and only the
+    /// opname→byte entry was missing — the same shape `new_array/id>r` was in
+    /// when it did panic, and the shape that surfaces as `dispatch_step:
+    /// unwired opcode` rather than a decode.  `BUILD_EMITTED_INSNS` records
+    /// only what the assembler emitted while analyzing this build's source
+    /// set, so absence from it is not by itself proof that no jitcode carries
+    /// the byte.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();
@@ -2326,9 +2337,6 @@ mod tests {
             "convert_longlong_bytes_to_float/i>f",
             "gc_load_indexed_f/riiii>f",
             "gc_load_indexed_i/riiii>i",
-            "getinteriorfield_gc_f/rid>f",
-            "getinteriorfield_gc_i/rid>i",
-            "getinteriorfield_gc_r/rid>r",
             "getlistitem_gc_f/ridd>f",
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",

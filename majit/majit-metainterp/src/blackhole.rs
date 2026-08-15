@@ -1536,9 +1536,7 @@ impl BlackholeInterpreter {
             }
             let pos_before = self.position;
             self.last_opcode_position = pos_before;
-            if check_startpoints
-                && let Some(startpoints) = self.jitcode.startpoints.as_ref()
-            {
+            if check_startpoints && let Some(startpoints) = self.jitcode.startpoints.as_ref() {
                 assert!(
                     startpoints.contains(&pos_before),
                     "run_inner: position {pos_before} is in the middle of an instruction \
@@ -1644,8 +1642,7 @@ impl BlackholeInterpreter {
                 self.dispatch_table.len(),
                 self.jitcode.name,
                 self.jitcode.try_index(),
-                self.jitcode
-                    .is_valid_startpoint(self.last_opcode_position),
+                self.jitcode.is_valid_startpoint(self.last_opcode_position),
             );
         };
         // Clone the Arc to detach the `code` borrow from `self`, so the

@@ -2347,7 +2347,10 @@ fn try_adopt_single_frame_blackhole(
             latched.miframe.jitcode.index(),
             latched.miframe.jitcode.name,
             latched.miframe.pc,
-            latched.miframe.jitcode.is_valid_startpoint(latched.miframe.pc),
+            latched
+                .miframe
+                .jitcode
+                .is_valid_startpoint(latched.miframe.pc),
         );
     }
     let jitcode_index = match i32::try_from(latched.miframe.jitcode.index()) {
