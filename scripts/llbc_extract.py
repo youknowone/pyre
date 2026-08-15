@@ -2650,6 +2650,16 @@ def run_cli(
     external_inputs: tuple[Path, ...] = (),
 ) -> None:
     """Argparse UX shared by every driver (positional crates, --force, …)."""
+    # This file writes en/em dashes and arrows in its diagnostics, and Windows
+    # hands a console the ANSI codepage (cp949 here), which cannot encode them.
+    # A print then raises UnicodeEncodeError from inside the extraction, which
+    # is how a "REFUSING to stamp" notice became a traceback that also skipped
+    # the crates queued behind it. Encode as UTF-8 and never let a character
+    # class decide whether an artefact gets built.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     all_crates = " ".join(specs)
     parser = argparse.ArgumentParser(
         description="Extract Charon ULLBC artefacts with source-fingerprint skip logic."
