@@ -8796,13 +8796,11 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         );
         // `optimizer.py:464-480` reaches for `descr.get_parent_descr()` only
         // when arg0 carries no pointer info yet; a preceding `GUARD_CLASS`
-        // gives it `info.InstancePtrInfo()` and that lookup never runs.  The
-        // code descrs are deliberately standalone rather than a positional
-        // group (see `descr.rs` on `PYCODE_CODE_PTR_FIELD_DESCR`: a `PyCode` is
-        // never allocated from a trace, and a partial layout under the live
-        // `W_CODE_GC_TYPE_ID` would double-answer the collector's registry), so
-        // their weak `parent_descr` is `None` by design and the guard is what
-        // makes this read legal — the same order the code-field arm of
+        // gives it `info.InstancePtrInfo()` and that lookup does not run here.
+        // The PyCode field group also carries its parent for paths that reach
+        // the read without pointer info.  Keep the guard in this path because
+        // it validates the concrete pointer before the hidden flag is read —
+        // the same order the code-field arm of
         // [`try_walker_specialize_traceback_walk`] uses.
         let code_type_addr = &pyre_interpreter::pycode::CODE_TYPE as *const _ as i64;
         if code_ptr.is_null()

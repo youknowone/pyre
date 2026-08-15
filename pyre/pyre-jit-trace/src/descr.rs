@@ -491,6 +491,28 @@ struct PyreObjectDescrGroup {
     field_descrs: Vec<Arc<majit_ir::descr::SimpleFieldDescr>>,
 }
 
+trait FieldDescrGroup {
+    fn field_descrs(&self) -> &[Arc<majit_ir::descr::SimpleFieldDescr>];
+}
+
+impl FieldDescrGroup for PyreObjectDescrGroup {
+    fn field_descrs(&self) -> &[Arc<majit_ir::descr::SimpleFieldDescr>] {
+        &self.field_descrs
+    }
+}
+
+impl FieldDescrGroup for majit_ir::descr::SimpleDescrGroup {
+    fn field_descrs(&self) -> &[Arc<majit_ir::descr::SimpleFieldDescr>] {
+        &self.field_descrs
+    }
+}
+
+impl<T: FieldDescrGroup> FieldDescrGroup for LazyLock<T> {
+    fn field_descrs(&self) -> &[Arc<majit_ir::descr::SimpleFieldDescr>] {
+        (**self).field_descrs()
+    }
+}
+
 /// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
 /// PyType (`name = "object"`). All `PyObject`-layout subclasses chain
 /// their `parent` field to this id so `assign_inheritance_ids`
@@ -657,9 +679,9 @@ pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 // PYFRAME_GC_TYPE_ID for the runtime registration census.
 pub use pyre_interpreter::pyframe::{FRAME_BLOCK_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID};
 
-fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
+fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef {
     group
-        .field_descrs
+        .field_descrs()
         .get(index)
         .expect("field descriptor index out of bounds")
         .clone() as DescrRef
@@ -3438,93 +3460,99 @@ pub fn str_len_descr() -> DescrRef {
 /// through (`code_get_field` -> `require_code`).  Read only to prove it is
 /// non-null, which is the check the getter would have run.
 ///
-/// The three code descrs below are standalone rather than a positional group:
-/// a `PyCode` is never allocated from a trace, so the group's size / GC-edge
-/// half would have no consumer, and publishing a partial layout under the
-/// live `W_CODE_GC_TYPE_ID` would put a second answer in the registry for a
-/// type the collector already describes.
-static PYCODE_CODE_PTR_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: pyre_interpreter::pycode::CODE_PTR_OFFSET,
-        field_size: std::mem::size_of::<*const ()>(),
-        field_type: Type::Int,
-        signed: false,
-        immutable: false,
-        quasi_immutable: false,
-        name: "code_ptr",
+/// These four read-only fields form one positional group so every `getfield_gc`
+/// can recover the owning SizeDescr at `optimizer.py:478`.  The unkeyed group
+/// factory publishes only into the JIT descriptor snapshot; the collector's
+/// `TypeInfo` table remains solely owned by `eval::initialize_gc`.  The parent
+/// can therefore carry the real GC-managed PyCode type id, allowing
+/// `StructPtrInfo.make_guards` to emit the correct `GUARD_GC_TYPE(code, 43)`,
+/// without registering a second collector layout.
+static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
+    use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+    let field = |field_key: &str,
+                 offset: usize,
+                 field_size: usize,
+                 field_type: Type,
+                 flag: ArrayFlag| SimpleFieldDescrSpec {
+        index: stable_field_index(offset, field_size, field_type, flag == ArrayFlag::Signed),
+        field_key: field_key.to_string(),
+        name: field_key.to_string(),
+        offset,
+        field_size,
+        field_type,
+        is_immutable: false,
+        is_quasi_immutable: false,
+        flag,
+        virtualizable: false,
         index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+    };
+    let mut specs = vec![
+        field(
+            "code_ptr",
+            pyre_interpreter::pycode::CODE_PTR_OFFSET,
+            std::mem::size_of::<*const ()>(),
+            Type::Int,
+            ArrayFlag::Unsigned,
+        ),
+        field(
+            "co_firstlineno_raw",
+            pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+            std::mem::size_of::<i32>(),
+            Type::Int,
+            ArrayFlag::Signed,
+        ),
+        field(
+            "hidden_applevel",
+            pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+            std::mem::size_of::<bool>(),
+            Type::Int,
+            ArrayFlag::Unsigned,
+        ),
+        field(
+            "w_name",
+            pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+            std::mem::size_of::<pyre_object::PyObjectRef>(),
+            Type::Ref,
+            ArrayFlag::Pointer,
+        ),
+    ];
+    specs.sort_by_key(|spec| spec.offset);
+    for (index_in_parent, spec) in specs.iter_mut().enumerate() {
+        spec.index_in_parent = index_in_parent;
+    }
+    majit_ir::descr::make_simple_descr_group_with_flags(
+        u32::MAX,
+        std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
+        pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
+        0,
+        true,
+        false,
+        &specs,
+    )
 });
 
 pub fn pycode_code_ptr_descr() -> DescrRef {
-    PYCODE_CODE_PTR_FIELD_DESCR.clone() as DescrRef
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, 0)
 }
 
 /// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
 /// it on first demand and retains it, so the slot IS the getter's value once
 /// it is non-null; a null slot declines to the residual, which realizes it.
-static PYCODE_W_NAME_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
-        field_size: std::mem::size_of::<pyre_object::PyObjectRef>(),
-        field_type: Type::Ref,
-        signed: false,
-        immutable: false,
-        quasi_immutable: false,
-        name: "w_name",
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-});
-
 pub fn pycode_w_name_descr() -> DescrRef {
-    PYCODE_W_NAME_FIELD_DESCR.clone() as DescrRef
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, 3)
 }
 
 /// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
 /// `CodeType` constructor accepts zero and negative first lines that
 /// `CodeObject.first_line_number` cannot hold.
-static PYCODE_CO_FIRSTLINENO_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
-        field_size: std::mem::size_of::<i32>(),
-        field_type: Type::Int,
-        signed: true,
-        immutable: false,
-        quasi_immutable: false,
-        name: "co_firstlineno_raw",
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-});
-
 pub fn pycode_co_firstlineno_descr() -> DescrRef {
-    PYCODE_CO_FIRSTLINENO_FIELD_DESCR.clone() as DescrRef
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, 1)
 }
 
 /// `PyCode.hidden_applevel` — the frame-hidden flag read by
 /// `PyFrame.hide()`.
-static PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
-        field_size: std::mem::size_of::<bool>(),
-        field_type: Type::Int,
-        signed: false,
-        immutable: false,
-        quasi_immutable: false,
-        name: "hidden_applevel",
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-});
-
 pub fn pycode_hidden_applevel_descr() -> DescrRef {
-    PYCODE_HIDDEN_APPLEVEL_FIELD_DESCR.clone() as DescrRef
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, 2)
 }
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
@@ -4497,6 +4525,81 @@ mod tests {
         assert_eq!(size.type_id(), W_UNICODE_GC_TYPE_ID);
         let parent_field = size.all_fielddescrs()[2].clone() as DescrRef;
         assert!(std::sync::Arc::ptr_eq(&parent_field, &descr));
+    }
+
+    #[test]
+    fn pycode_field_descrs_share_parent_and_preserve_specs() {
+        let expected = [
+            (
+                pycode_code_ptr_descr(),
+                "code_ptr",
+                pyre_interpreter::pycode::CODE_PTR_OFFSET,
+                std::mem::size_of::<*const ()>(),
+                Type::Int,
+                false,
+                0,
+            ),
+            (
+                pycode_co_firstlineno_descr(),
+                "co_firstlineno_raw",
+                pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+                std::mem::size_of::<i32>(),
+                Type::Int,
+                true,
+                1,
+            ),
+            (
+                pycode_hidden_applevel_descr(),
+                "hidden_applevel",
+                pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                2,
+            ),
+            (
+                pycode_w_name_descr(),
+                "w_name",
+                pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                3,
+            ),
+        ];
+        let mut shared_parent = None;
+        for (descr, name, offset, field_size, field_type, signed, index_in_parent) in expected {
+            let field = descr.as_field_descr().expect("PyCode FieldDescr");
+            assert_eq!(field.field_name(), name);
+            assert_eq!(field.offset(), offset);
+            assert_eq!(field.field_size(), field_size);
+            assert_eq!(field.field_type(), field_type);
+            assert_eq!(field.is_field_signed(), signed);
+            assert!(!descr.is_always_pure());
+            assert!(!descr.is_quasi_immutable());
+            assert_eq!(field.index_in_parent(), index_in_parent);
+            let parent = field
+                .get_parent_descr()
+                .expect("PyCode fields must carry a parent_descr");
+            if let Some(expected_parent) = &shared_parent {
+                assert!(Arc::ptr_eq(expected_parent, &parent));
+            } else {
+                shared_parent = Some(parent);
+            }
+        }
+
+        let parent = shared_parent.expect("PyCode group has fields");
+        let size = parent
+            .as_size_descr()
+            .expect("PyCode field parent must be a SizeDescr");
+        assert_eq!(
+            size.size(),
+            std::mem::size_of::<pyre_interpreter::pycode::PyCode>()
+        );
+        assert_eq!(size.type_id(), pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
+        assert!(size.is_gc_managed());
+        assert!(!size.headerless());
+        assert_eq!(size.all_fielddescrs().len(), 4);
     }
 
     #[test]
