@@ -381,6 +381,31 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         can_move: Some(can_move_via_active_runtime),
         supports_guard_gc_type,
     });
+    // No `set_active_gc_deadframe_hooks` call here, and the omission is the
+    // decision, not an oversight.
+    //
+    // That table exists because a backend whose jitframes are libc blocks
+    // outside both generations has no way to make a held deadframe's interior
+    // refs visible to the collector once the compiled epilogue has popped the
+    // frame off the JF shadow stack; it must publish the set and have the
+    // collector walk it (`majit_gc::ActiveGcDeadFrameHooks`, and note the
+    // walk goes through `trace_libc_jitframe`). This backend's frames are
+    // ordinary GC objects — `run_compiled_code_inner` allocates them from the
+    // nursery under the registered JITFRAME type id — and
+    // `JitFrameDeadFrame::register_roots` registers the `jf_gcref` SLOT with
+    // `add_root` for exactly the window the deadframe is held. The collector
+    // then reaches the frame as it reaches any rooted object, and gets the
+    // moving case for free: a walker yields an address and cannot update the
+    // holder if the frame is copied, whereas a registered slot is rewritten.
+    // Publishing a walker as well would root the same frames twice through
+    // two mechanisms with different invariants.
+    //
+    // `ACTIVE_LIVE_DEADFRAME_WALKER` is ONE process-global slot, so leaving it
+    // untouched is also what lets a dynasm backend compiled into the same
+    // process keep its walker installed across a cranelift GC install. A
+    // future cranelift walker would have to reckon with that: installing one
+    // here would silently drop dynasm's, and the frames it dropped would go
+    // untraced rather than fail loudly.
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         alloc_nursery_headerless_no_collect_via_active_runtime,
@@ -3012,17 +3037,29 @@ fn take_call_assembler_deadframe_from_outputs(outputs: &[i64]) -> DeadFrame {
         .copied()
         .unwrap_or_else(|| panic!("missing call_assembler deadframe handle slot"))
         as u64;
+    take_call_assembler_deadframe_from_handle(handle)
+}
+
+fn take_call_assembler_deadframe_from_handle(handle: u64) -> DeadFrame {
     assert!(handle != 0, "missing call_assembler deadframe handle");
     take_call_assembler_deadframe(handle)
         .unwrap_or_else(|| panic!("unknown call_assembler deadframe handle {handle}"))
 }
 
-fn maybe_take_call_assembler_deadframe(fail_index: u32, outputs: &[i64]) -> Option<DeadFrame> {
+/// Takes the run's `JitExecResult` rather than an extracted output vector: the
+/// handle lives in exit slot 0 and the slots are still in the frame the run
+/// returned, so `llmodel.py:240-250`'s read-through-the-frame answers this
+/// without materialising the other slots first. The dispatch loops that call
+/// this reach it on every exit, and all but the sentinel one discard the
+/// vector unread.
+fn maybe_take_call_assembler_deadframe(fail_index: u32, exec: &JitExecResult) -> Option<DeadFrame> {
     if fail_index != CALL_ASSEMBLER_DEADFRAME_SENTINEL {
         return None;
     }
 
-    Some(take_call_assembler_deadframe_from_outputs(outputs))
+    Some(take_call_assembler_deadframe_from_handle(
+        exec.get_jf_int(0) as u64,
+    ))
 }
 
 fn actual_call_assembler_result_kind(descr: &dyn FailDescr) -> Result<u64, BackendError> {
@@ -3194,15 +3231,14 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             &cur_fail_descrs,
             cur_num_ref_roots,
             cur_max_output_slots,
-            &current_inputs,
+            &FrameInputs::Ints(&current_inputs),
             attachments,
             cur_dispatch_key,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
-        let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
             // `RegisteredLoopTarget` is always a root-loop entry; root
             // registers never set `source_guard`, so pass `None` directly.
             // Bridges carry their own `BridgeData.source_guard` and never
@@ -3219,6 +3255,11 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let fail_descr_fd = as_fd(fail_descr);
         maybe_increment_fail_count(fail_descr_fd);
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
+            // Extracted here rather than beside `fail_index`: the exits that
+            // reach the two returns below never read a slot vector, and the
+            // frame the slots live in stays valid for the whole arm
+            // (`llmodel.py:240-250`).
+            let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
@@ -7436,6 +7477,75 @@ fn find_fail_descr_by_ptr(
     Some(cell.descr.clone())
 }
 
+/// The entry arguments, in whichever form the caller already holds them.
+///
+/// `llmodel.py:306-315` writes each argument straight into the fresh jitframe,
+/// unwrapping it per its kind at the point of the store — there is no list
+/// standing between the caller's arguments and the frame slots. `Values` is
+/// that loop: the metainterp hands `execute_token` its live values, and
+/// unwrapping them into an owned `Vec<i64>` first is a copy of every argument
+/// that upstream never makes. `Ints` is the already-raw form — a bridge's
+/// parent outputs, an external JUMP's carried slots, the int-only entries —
+/// which is raw precisely because it was read out of a frame.
+/// `OwnedInts` exists for the re-entry step of the dispatch loops, which reads
+/// the carried slots out of the frame it is leaving and must keep them past
+/// that frame.
+enum FrameInputs<'a> {
+    Ints(&'a [i64]),
+    OwnedInts(Vec<i64>),
+    Values(&'a [Value]),
+}
+
+impl FrameInputs<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            FrameInputs::Ints(ints) => ints.len(),
+            FrameInputs::OwnedInts(ints) => ints.len(),
+            FrameInputs::Values(values) => values.len(),
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The raw word argument `index` occupies in a frame slot.
+    #[inline]
+    fn raw(&self, index: usize) -> i64 {
+        match self {
+            FrameInputs::Ints(ints) => ints[index],
+            FrameInputs::OwnedInts(ints) => ints[index],
+            FrameInputs::Values(values) => match values[index] {
+                Value::Int(v) => v,
+                Value::Float(v) => v.to_bits() as i64,
+                Value::Ref(r) => r.0 as i64,
+                Value::Void => 0,
+            },
+        }
+    }
+
+    /// `llmodel.py:306-315` — store every argument into consecutive frame
+    /// slots starting at `dst`.
+    ///
+    /// # Safety
+    /// `dst` must be writable for `self.len()` words.
+    #[inline]
+    unsafe fn write_into(&self, dst: *mut i64) {
+        for i in 0..self.len() {
+            unsafe { *dst.add(i) = self.raw(i) };
+        }
+    }
+
+    /// Materialise the raw words. For the rare paths that keep the arguments
+    /// past the call — the CALL_ASSEMBLER caller context — rather than only
+    /// storing them into the frame.
+    fn to_ints(&self) -> Vec<i64> {
+        (0..self.len()).map(|i| self.raw(i)).collect()
+    }
+}
+
 /// Result of `run_compiled_code` — RPython llmodel.py:328 parity.
 ///
 /// Instead of copying values out of jf_frame into Vec<i64>,
@@ -7490,7 +7600,7 @@ fn run_compiled_code(
     fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
-    inputs: &[i64],
+    inputs: &FrameInputs<'_>,
     attachments: &CpuDescrAttachments,
     dispatch_key: u32,
 ) -> JitExecResult {
@@ -7516,7 +7626,7 @@ fn run_compiled_code_inner(
     fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
-    inputs: &[i64],
+    inputs: &FrameInputs<'_>,
     attachments: &CpuDescrAttachments,
     dispatch_key: u32,
 ) -> JitExecResult {
@@ -7602,16 +7712,14 @@ fn run_compiled_code_inner(
     let jf_ptr = jf_gcref.0 as *mut i64;
 
     // llmodel.py:306-315: set arguments in frame
-    for (i, &val) in inputs.iter().enumerate() {
-        unsafe { *jf_ptr.add(header_words + i) = val };
-    }
+    unsafe { inputs.write_into(jf_ptr.add(header_words)) };
     if majit_ir::debug::have_debug_prints() {
-        let preview: Vec<i64> = inputs.iter().copied().take(10).collect();
+        let preview: Vec<i64> = (0..inputs.len().min(10)).map(|i| inputs.raw(i)).collect();
         majit_ir::debug::log_one("jit-running", &format!("pre-call-inputs {preview:?}"));
     }
     // Debug: verify first input (frame ptr) is valid
     if majit_verify_enabled() && !inputs.is_empty() {
-        let frame_ptr = inputs[0];
+        let frame_ptr = inputs.raw(0);
         if frame_ptr != 0 && (frame_ptr < 0x1000 || (frame_ptr as usize & 0x7) != 0) {
             majit_ir::debug::log_one(
                 "jit-backend",
@@ -8603,7 +8711,7 @@ impl CraneliftBackend {
     /// fails with a bridge, switch to the bridge trace and continue.
     /// When a bridge FINISH with loop_reentry fires, switch back to the
     /// main loop.
-    fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
+    fn execute_with_inputs(compiled: &CompiledLoop, inputs: FrameInputs<'_>) -> DeadFrame {
         Self::execute_with_inputs_at_dispatch_key(compiled, inputs, 0)
     }
 
@@ -8614,7 +8722,7 @@ impl CraneliftBackend {
     /// the jitframe slots and skips the preamble.
     fn execute_with_inputs_at_dispatch_key(
         compiled: &CompiledLoop,
-        inputs: &[i64],
+        inputs: FrameInputs<'_>,
         dispatch_key: u32,
     ) -> DeadFrame {
         slice_x2_probe::arm_reporter();
@@ -8629,13 +8737,14 @@ impl CraneliftBackend {
         let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
-        // Borrowed for the same reason `cur_fail_descrs` is: the loop only
-        // READS the entry inputs, and the one writer is the external-JUMP
-        // re-entry below, which brings its own owned vector. `run_compiled_code`
-        // copies these into the jitframe (`llmodel.py:306-315 set arguments in
-        // frame`), which is the copy upstream makes; the caller's slice already
-        // is the argument list, so copying it first was a second one.
-        let mut cur_inputs: Cow<'_, [i64]> = Cow::Borrowed(inputs);
+        // Held in whatever form the caller already has, for the same reason
+        // `cur_fail_descrs` is borrowed: the loop only READS the entry inputs,
+        // and the one writer is the external-JUMP re-entry below, which brings
+        // its own owned words. `run_compiled_code` stores these into the
+        // jitframe (`llmodel.py:306-315 set arguments in frame`), which is the
+        // one copy upstream makes; unwrapping the caller's values into a raw
+        // vector on the way in was a second one.
+        let mut cur_inputs: FrameInputs<'_> = inputs;
         // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
         // 0 only for the initial entry — every external-JUMP re-entry,
         // including the first LABEL, selects its loader (label_block_id + 1).
@@ -8660,12 +8769,11 @@ impl CraneliftBackend {
             );
             let fail_index = exec.fail_index;
             let direct_descr = exec.direct_descr.clone();
-            let outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
             // CALL_ASSEMBLER deadframe interception.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
                 let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
-                    CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
+                    CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs.to_ints()),
                 );
                 return wrap_call_assembler_deadframe_with_caller_prefix(frame);
             }
@@ -8714,8 +8822,14 @@ impl CraneliftBackend {
                 cur_code_ptr = target_entry.code_ptr;
                 cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
                 cur_num_ref_roots = target_entry.num_ref_roots;
+                // Extracted here, on the one arm that consumes it. Every other
+                // exit out of this loop returns the frame itself as the
+                // deadframe and reads its slots through the accessors
+                // (`llmodel.py:240-250`), so a vector taken beside `fail_index`
+                // was built and dropped unread on each of them.
+                cur_inputs =
+                    FrameInputs::OwnedInts(exec.extract_outputs(cur_max_output_slots.max(1)));
                 cur_max_output_slots = target_entry.max_output_slots;
-                cur_inputs = Cow::Owned(outputs);
                 continue;
             }
             // llgraph/runner.py:1200-1201 execute_finish → ExecutionFinished.
@@ -8766,15 +8880,14 @@ impl CraneliftBackend {
             &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
-            bridge_inputs,
+            &FrameInputs::Ints(bridge_inputs),
             attachments,
             0, // bridge entry (br_table preamble slot)
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
-        let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
 
-        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+        if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
             let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
                 CallAssemblerCallerContext::from_bridge_data(bridge, bridge_inputs),
             );
@@ -8797,6 +8910,9 @@ impl CraneliftBackend {
         maybe_increment_fail_count(fail_descr_fd);
 
         if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
+            // Extracted on the one arm that feeds it forward; the FINISH and
+            // no-bridge exits above and below return the frame itself.
+            let outputs = exec.extract_outputs(bridge.max_output_slots.max(1));
             return Self::execute_bridge(
                 &next_bridge,
                 &outputs,
@@ -16484,17 +16600,8 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
-        let mut inputs: Vec<i64> = Vec::with_capacity(compiled.num_inputs);
-        for arg in args {
-            inputs.push(match arg {
-                Value::Int(v) => *v,
-                Value::Float(v) => v.to_bits() as i64,
-                Value::Ref(r) => r.0 as i64,
-                Value::Void => 0,
-            });
-        }
 
-        Self::execute_with_inputs(compiled, &inputs)
+        Self::execute_with_inputs(compiled, FrameInputs::Values(args))
     }
 
     fn execute_token_with_dispatch_key(
@@ -16509,17 +16616,12 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("token has no compiled code")
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
-        let mut inputs: Vec<i64> = Vec::with_capacity(compiled.num_inputs);
-        for arg in args {
-            inputs.push(match arg {
-                Value::Int(v) => *v,
-                Value::Float(v) => v.to_bits() as i64,
-                Value::Ref(r) => r.0 as i64,
-                Value::Void => 0,
-            });
-        }
 
-        Self::execute_with_inputs_at_dispatch_key(compiled, &inputs, dispatch_key)
+        // `llmodel.py:306-315` unwraps each argument at the store into the
+        // frame slot, so the values go from the caller's list to the frame in
+        // one step. Handing them down as-is keeps that: the unwrapping now
+        // happens in `FrameInputs::write_into`, against the frame.
+        Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), dispatch_key)
     }
 
     fn supports_dispatch_key_entry(&self) -> bool {
@@ -16534,7 +16636,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
-        Self::execute_with_inputs(compiled, args)
+        Self::execute_with_inputs(compiled, FrameInputs::Ints(args))
     }
 
     fn execute_token_ints_raw(
@@ -16586,16 +16688,19 @@ impl majit_backend::Backend for CraneliftBackend {
                 &cur_fail_descrs,
                 cur_num_ref_roots,
                 cur_max_output_slots,
-                &cur_inputs,
+                &FrameInputs::Ints(&cur_inputs),
                 attachments,
                 cur_dispatch_key,
             );
             let fail_index = exec.fail_index;
             let direct_descr = exec.direct_descr.clone();
+            // Kept eager here, unlike the dispatch loops above: this entry's
+            // whole contract is to hand back the raw exit slots, so every exit
+            // out of it reads the vector.
             let mut outputs = exec.extract_outputs(cur_max_output_slots.max(1));
 
             // CALL_ASSEMBLER deadframe interception — exits raw dispatch.
-            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &outputs) {
+            if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
                 let _caller_ctx_guard = CallAssemblerCallerContextGuard::push(
                     CallAssemblerCallerContext::from_compiled_loop(compiled, &cur_inputs),
                 );

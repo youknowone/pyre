@@ -521,10 +521,12 @@ fn main() {
 
 /// Heap allocations per warm compiled-code entry, as measured by this file.
 ///
-/// **PER BACKEND, and the two disagree.** The backend is part of the key
-/// because it owns three of the rows below; pinning one number for both would
-/// make whichever leg ran second fail with a message about a regression that
-/// is really a configuration difference.
+/// The two backends now agree, so this is one number. It was two — `dynasm`
+/// 10, `cranelift` 12 — and the difference was the two cranelift-only rows
+/// named at the bottom, both since removed. The per-backend tables below stay
+/// split anyway: the backends reach 10 through rows that only *correspond*,
+/// and a table that pretended they were the same code would misname whichever
+/// row moved.
 ///
 /// Eight of the allocations are shared by both backends:
 ///
@@ -558,12 +560,24 @@ fn main() {
 /// so the copy had no upstream counterpart; the frame now lives as long as the
 /// deadframe does and the accessors read it in place.
 ///
-/// `cranelift` adds four, for 12:
+/// `cranelift` adds two, for 10 — the same two roles, in its own spelling:
 ///
 /// | n | site |
 /// |---|------|
-/// | 1 | `<i64 as SpecFromElem>::from_elem` — `JitFrameDeadFrame::_heap_owner`, the jitframe's backing `Vec<i64>` |
-/// | 1 | `CraneliftBackend::execute_token_with_dispatch_key`, `compiler.rs:16512` |
-/// | 1 | `JitExecResult::extract_outputs`, `compiler.rs:7465` — the copy of the frame's output slots |
-/// | 1 | `deadframe_from_jitframe`, `compiler.rs:3073` — the `Box<JitFrameDeadFrame>` inside `DeadFrame` |
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 12 } else { 10 };
+/// | 1 | `<i64 as SpecFromElem>::from_elem` — `JitFrameDeadFrame::_heap_owner`, the jitframe's backing `Vec<i64>` (`llmodel.py:298 malloc_jitframe`). This is the no-GC-registry branch of `run_compiled_code_inner`; with a JITFRAME type id registered the frame comes from the nursery and this row goes away |
+/// | 1 | `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside `DeadFrame`, the `llmodel.py:240` `cast_opaque_ptr` |
+///
+/// It used to add four. The two that went:
+///
+/// - `CraneliftBackend::execute_token_with_dispatch_key` unwrapped the
+///   metainterp's `&[Value]` into an owned `Vec<i64>` before the frame
+///   existed. `llmodel.py:306-315` unwraps each argument *at* the store into
+///   its frame slot, so upstream never holds a second list; the arguments are
+///   now handed down as `FrameInputs::Values` and unwrapped against the frame.
+/// - `JitExecResult::extract_outputs` copied every exit slot out of the frame
+///   on every exit, and the only two consumers are branches — the
+///   CALL_ASSEMBLER sentinel, which reads slot 0, and external-JUMP re-entry.
+///   `llmodel.py:240-250` reads slots out of the frame through the accessors,
+///   so the copy is now taken only where it is consumed. This is the same
+///   removal `raw_values` got on dynasm.
+const ALLOCS_PER_ENTRY: usize = 10;
