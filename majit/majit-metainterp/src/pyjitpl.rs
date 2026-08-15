@@ -10454,7 +10454,15 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
-        let exit_types = descr.fail_arg_types().to_vec();
+        // Borrowed, not copied. `warmstate.py:405-419 execute_assembler` reads
+        // the descr straight off the deadframe, and for a DoneWithThisFrame it
+        // goes to `fail_descr.get_result(cpu, deadframe)` without building any
+        // per-exit description; only the general `handle_fail` case needs one.
+        // Every reader below either only reads this list or says explicitly
+        // that it takes ownership, and this is the steady entry path, so the
+        // copy was paid on every call for the benefit of the guard-failure arm
+        // alone.
+        let exit_types: &[Type] = descr.fail_arg_types();
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -10492,11 +10500,13 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 fail_index,
                 source_op_index: None,
-                exit_types: exit_types.clone(),
+                exit_types: exit_types.to_vec(),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                gc_ref_slots: gc_ref_slots.clone(),
-                force_token_slots: force_token_slots.clone(),
+                // Moved rather than cloned: the `else` arm below is the only
+                // other consumer and it is mutually exclusive with this one.
+                gc_ref_slots,
+                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
@@ -10519,7 +10529,7 @@ impl<M: Clone> MetaInterp<M> {
                     trace_id,
                     fail_index,
                     source_op_index: None,
-                    exit_types: exit_types.clone(),
+                    exit_types: exit_types.to_vec(),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,

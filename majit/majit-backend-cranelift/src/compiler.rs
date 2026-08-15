@@ -8629,7 +8629,13 @@ impl CraneliftBackend {
         let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
-        let mut cur_inputs = inputs.to_vec();
+        // Borrowed for the same reason `cur_fail_descrs` is: the loop only
+        // READS the entry inputs, and the one writer is the external-JUMP
+        // re-entry below, which brings its own owned vector. `run_compiled_code`
+        // copies these into the jitframe (`llmodel.py:306-315 set arguments in
+        // frame`), which is the copy upstream makes; the caller's slice already
+        // is the argument list, so copying it first was a second one.
+        let mut cur_inputs: Cow<'_, [i64]> = Cow::Borrowed(inputs);
         // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
         // 0 only for the initial entry — every external-JUMP re-entry,
         // including the first LABEL, selects its loader (label_block_id + 1).
@@ -8709,7 +8715,7 @@ impl CraneliftBackend {
                 cur_fail_descrs = Cow::Owned(target_entry.fail_descrs.into_vec());
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
-                cur_inputs = outputs;
+                cur_inputs = Cow::Owned(outputs);
                 continue;
             }
             // llgraph/runner.py:1200-1201 execute_finish → ExecutionFinished.

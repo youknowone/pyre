@@ -194,6 +194,47 @@ pub trait JitState: Sized {
         self.extract_live(meta).iter().map(|_| Type::Int).collect()
     }
 
+    /// Append this state's live values to `out` instead of returning a fresh
+    /// `Vec`.
+    ///
+    /// `warmstate.py:503-507 maybe_compile_and_run` builds the assembler's
+    /// arguments by unspecializing reds that are already unboxed locals, so
+    /// the upstream entry path allocates nothing to describe them. The
+    /// `Vec`-returning form above cannot express that: the caller entering
+    /// compiled code has a buffer whose shape the compiled artifact fixed, and
+    /// a return-by-value forces a new allocation per entry regardless.
+    ///
+    /// `raw` and `types` are the caller's scratch for the two halves the pair
+    /// is built from — cleared on arrival, unread on return, and reused across
+    /// entries. An implementation that needs neither may ignore them.
+    ///
+    /// The default defers to [`Self::extract_live_values`], so a state that
+    /// overrides neither — or that overrides only the `Vec`-returning form —
+    /// keeps exactly today's values and today's allocations. Overriding this
+    /// method is what removes them.
+    fn extract_live_values_into(
+        &self,
+        meta: &Self::Meta,
+        out: &mut Vec<Value>,
+        raw: &mut Vec<i64>,
+        types: &mut Vec<Type>,
+    ) {
+        let _ = (raw, types);
+        out.extend(self.extract_live_values(meta));
+    }
+
+    /// Append-to-buffer form of [`Self::extract_live`], for
+    /// [`Self::extract_live_values_into`] implementations.
+    fn extract_live_into(&self, meta: &Self::Meta, out: &mut Vec<i64>) {
+        out.extend(self.extract_live(meta));
+    }
+
+    /// Append-to-buffer form of [`Self::live_value_types`], for
+    /// [`Self::extract_live_values_into`] implementations.
+    fn live_value_types_into(&self, meta: &Self::Meta, out: &mut Vec<Type>) {
+        out.extend(self.live_value_types(meta));
+    }
+
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym;
 
     /// Seed tracing-time concrete mirrors in the symbolic state.
@@ -652,6 +693,43 @@ pub trait JitState: Sized {
         _info: &VirtualizableInfo,
     ) -> Option<(Vec<i64>, Vec<Vec<i64>>)> {
         None
+    }
+
+    /// Buffer-filling form of [`Self::export_virtualizable_boxes`], for the
+    /// compiled-entry path that re-reads the virtualizable on every call.
+    ///
+    /// `warmstate.py:394-396 execute_assembler` passes the virtualizable to
+    /// the assembler as a single pointer argument and only clears its token;
+    /// it never copies the fields out, so upstream has no per-entry cost here
+    /// to mirror. majit's entry flattens the fields into scalar inputargs
+    /// instead, which is a real per-entry read — but the *storage* for that
+    /// read is fixed by the artifact's inputarg shape and so need not be
+    /// reallocated each time.
+    ///
+    /// `statics` arrives cleared with whatever capacity previous entries left
+    /// it. `arrays` arrives with each inner `Vec` cleared but the outer length
+    /// left as it was, so an implementation that resizes the outer to the
+    /// field count and extends each inner in place reuses both levels of
+    /// storage. Returns whether the export succeeded, matching the `Option` of
+    /// the owning form; on `false` the buffers' contents are unspecified and
+    /// the caller discards them.
+    ///
+    /// The default defers to [`Self::export_virtualizable_boxes`] so existing
+    /// implementations keep working unchanged.
+    fn export_virtualizable_boxes_into(
+        &self,
+        meta: &Self::Meta,
+        virtualizable: &str,
+        info: &VirtualizableInfo,
+        statics: &mut Vec<i64>,
+        arrays: &mut Vec<Vec<i64>>,
+    ) -> bool {
+        let Some((s, a)) = self.export_virtualizable_boxes(meta, virtualizable, info) else {
+            return false;
+        };
+        *statics = s;
+        *arrays = a;
+        true
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;

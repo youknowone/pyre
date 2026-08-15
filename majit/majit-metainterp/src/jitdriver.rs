@@ -1313,6 +1313,45 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
+    /// Reusable buffers for the compiled-entry argument walk.
+    ///
+    /// `warmstate.py:387-398 execute_assembler` builds the entry arguments
+    /// with no allocation at all: the reds are already unboxed locals, and
+    /// `func_execute_token` writes them straight into the jitframe the backend
+    /// owns. Here the same walk minted a fresh `Vec` per entry — one for the
+    /// raw live values, one for their types, one for the typed pair, and one
+    /// more for each virtualizable box list — so a call-heavy program paid
+    /// several malloc/free pairs per entry for buffers whose shape is fixed by
+    /// the compiled artifact and therefore identical on every call.
+    ///
+    /// The driver outlives every entry through it, so the buffers are cleared
+    /// and refilled rather than reallocated; after the first entry their
+    /// capacity already covers the artifact's inputarg count. Same motivation
+    /// as [`Self::descriptor_cache`], one layer further in.
+    ///
+    /// One set is enough even though a compiled run can re-enter the driver:
+    /// the taker holds its buffers as a local for the whole entry, so a nested
+    /// entry finds this slot empty and starts from fresh ones. Nesting
+    /// therefore costs what it costs today and never aliases; only the
+    /// outermost entry's buffers survive to be reused.
+    entry_scratch: EntryScratch,
+}
+
+/// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
+#[derive(Default)]
+struct EntryScratch {
+    /// The typed live values handed to the backend as the entry's inputargs.
+    live_values: Vec<Value>,
+    /// `JitState::extract_live` output, before it is paired with its types.
+    raw: Vec<i64>,
+    /// `JitState::live_value_types` output.
+    types: Vec<Type>,
+    /// `JitState::export_virtualizable_boxes_into` static-field output.
+    vable_static: Vec<i64>,
+    /// `JitState::export_virtualizable_boxes_into` array-field output. The
+    /// inner `Vec`s are retained across entries too, so a virtualizable whose
+    /// array lengths are stable reuses their storage as well.
+    vable_arrays: Vec<Vec<i64>>,
 }
 
 thread_local! {
@@ -1423,6 +1462,7 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
+            entry_scratch: EntryScratch::default(),
             #[expect(
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
@@ -4366,35 +4406,55 @@ impl<S: JitState> JitDriver<S> {
             if !self.sync_before(state, &compiled_meta, descriptor.as_deref()) {
                 return None;
             }
+            // The entry arguments are assembled in buffers the driver keeps
+            // across calls, so a warm entry reuses the capacity the artifact's
+            // inputarg shape fixed instead of minting one `Vec` per call —
+            // `warmstate.py:503-511 maybe_compile_and_run` reaches
+            // `execute_assembler` with the reds already in hand and allocates
+            // nothing to describe them. Taken out of `self` for the duration
+            // because assembling them calls back into `self`; every exit below
+            // hands it back, and `entry_scratch_out` names that.
+            let mut scratch = self.take_entry_scratch();
             // `direct_live_values` arrive already in the target LABEL's argument
             // order; state-extracted ones are in state-field order and have to be
             // mapped before a dispatch-key entry can use them.
             let values_are_label_ordered = direct_live_values.is_some();
-            let mut live_values = if let Some(values) = direct_live_values {
-                values
+            if let Some(values) = direct_live_values {
+                scratch.live_values.extend(values);
             } else {
-                let live_values = state.extract_live_values(&compiled_meta);
+                state.extract_live_values_into(
+                    &compiled_meta,
+                    &mut scratch.live_values,
+                    &mut scratch.raw,
+                    &mut scratch.types,
+                );
                 if !Self::live_values_match_descriptor(
                     descriptor.as_deref(),
-                    &live_values,
+                    &scratch.live_values,
                     state.state_field_layout().total_live_values(),
                 ) {
+                    self.entry_scratch_out(scratch);
                     return None;
                 }
 
-                self.extend_compiled_live_values(
+                if !self.extend_compiled_live_values_into(
                     green_key,
                     state,
                     &compiled_meta,
                     descriptor.as_deref(),
-                    live_values,
-                )?
-            };
+                    &mut scratch.live_values,
+                    &mut scratch.vable_static,
+                    &mut scratch.vable_arrays,
+                ) {
+                    self.entry_scratch_out(scratch);
+                    return None;
+                }
+            }
             if dispatch_key.is_some() && !values_are_label_ordered {
-                let full_len = live_values.len();
+                let full_len = scratch.live_values.len();
                 let Some(packed) = self
                     .meta
-                    .pack_front_target_live_values(green_key, &live_values)
+                    .pack_front_target_live_values(green_key, &scratch.live_values)
                 else {
                     if crate::callee_rca_enabled() {
                         eprintln!(
@@ -4404,6 +4464,7 @@ impl<S: JitState> JitDriver<S> {
                             dispatch_key,
                         );
                     }
+                    self.entry_scratch_out(scratch);
                     return None;
                 };
                 if crate::callee_rca_enabled() {
@@ -4415,17 +4476,21 @@ impl<S: JitState> JitDriver<S> {
                         packed.len()
                     );
                 }
-                live_values = packed;
+                scratch.live_values.clear();
+                scratch.live_values.extend(packed);
             }
             if dispatch_key.is_some() && values_are_label_ordered {
                 // The compact values are LABEL-ordered by construction, but the
                 // same unchecked Ref dereference is downstream of them, so the
                 // types are confirmed here as well.
-                let types = self.meta.front_target_inputarg_types(green_key)?;
-                if types.len() != live_values.len()
+                let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
+                    self.entry_scratch_out(scratch);
+                    return None;
+                };
+                if types.len() != scratch.live_values.len()
                     || types
                         .iter()
-                        .zip(live_values.iter())
+                        .zip(scratch.live_values.iter())
                         .any(|(want, value)| value.get_type() != *want)
                 {
                     if crate::callee_rca_enabled() {
@@ -4434,12 +4499,18 @@ impl<S: JitState> JitDriver<S> {
                              dispatch_key={:?} source=compact-label label_types={types:?} \
                              value_types={:?} -> decline",
                             dispatch_key,
-                            live_values.iter().map(|v| v.get_type()).collect::<Vec<_>>(),
+                            scratch
+                                .live_values
+                                .iter()
+                                .map(|v| v.get_type())
+                                .collect::<Vec<_>>(),
                         );
                     }
+                    self.entry_scratch_out(scratch);
                     return None;
                 }
             }
+            let live_values = &scratch.live_values;
 
             if crate::callee_rca_enabled() {
                 let layout = state.state_field_layout();
@@ -4492,13 +4563,17 @@ impl<S: JitState> JitDriver<S> {
             let result = if let Some(dispatch_key) = dispatch_key {
                 self.meta.run_compiled_detailed_with_values_at_dispatch_key(
                     green_key,
-                    &live_values,
+                    live_values,
                     dispatch_key,
                 )
             } else {
                 self.meta
-                    .run_compiled_detailed_with_values(green_key, &live_values)
+                    .run_compiled_detailed_with_values(green_key, live_values)
             };
+            // The compiled body has run and nothing below reads the entry
+            // arguments, so the buffers go back before the first exit past
+            // this point.
+            self.entry_scratch_out(scratch);
             let result = result?;
             if portal_rca_enabled() {
                 eprintln!(
@@ -5246,6 +5321,33 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Borrow [`Self::entry_scratch`] for the duration of one compiled entry.
+    ///
+    /// Handed out by value rather than by reference because assembling the
+    /// entry arguments calls back into `self`; every caller must return it
+    /// through [`Self::entry_scratch_out`] before leaving, or the next entry
+    /// starts from empty buffers (correct, just slower).
+    ///
+    /// The buffers arrive with their previous contents dropped and their
+    /// capacity kept. `vable_arrays` keeps its outer elements so the inner
+    /// buffers survive too — see `JitState::export_virtualizable_boxes_into`.
+    fn take_entry_scratch(&mut self) -> EntryScratch {
+        let mut scratch = std::mem::take(&mut self.entry_scratch);
+        scratch.live_values.clear();
+        scratch.raw.clear();
+        scratch.types.clear();
+        scratch.vable_static.clear();
+        for array in &mut scratch.vable_arrays {
+            array.clear();
+        }
+        scratch
+    }
+
+    /// Return the buffers [`Self::take_entry_scratch`] handed out.
+    fn entry_scratch_out(&mut self, scratch: EntryScratch) {
+        self.entry_scratch = scratch;
+    }
+
     /// The driver's static data, resolved once and then shared.
     ///
     /// See [`Self::descriptor_cache`] for why the answer is memoized rather
@@ -5311,16 +5413,15 @@ impl<S: JitState> JitDriver<S> {
             .all(|(var, value)| var.tp == value.get_type())
     }
 
-    fn flatten_virtualizable_values(
+    fn flatten_virtualizable_values_into(
         info: &VirtualizableInfo,
         static_boxes: &[i64],
         array_boxes: &[Vec<i64>],
-    ) -> Vec<Value> {
-        let mut values = Vec::with_capacity(
-            static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>(),
-        );
+        out: &mut Vec<Value>,
+    ) {
+        out.reserve(static_boxes.len() + array_boxes.iter().map(Vec::len).sum::<usize>());
         for (field, &raw) in info.static_fields.iter().zip(static_boxes.iter()) {
-            values.push(match field.field_type {
+            out.push(match field.field_type {
                 Type::Int => Value::Int(raw),
                 Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
                 Type::Float => Value::Float(f64::from_bits(raw as u64)),
@@ -5329,7 +5430,7 @@ impl<S: JitState> JitDriver<S> {
         }
         for (array, items) in info.array_fields.iter().zip(array_boxes.iter()) {
             for &raw in items {
-                values.push(match array.item_type {
+                out.push(match array.item_type {
                     Type::Int => Value::Int(raw),
                     Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
                     Type::Float => Value::Float(f64::from_bits(raw as u64)),
@@ -5337,7 +5438,6 @@ impl<S: JitState> JitDriver<S> {
                 });
             }
         }
-        values
     }
 
     /// warmstate.py:482-511: extend live values with virtualizable fields
@@ -5345,6 +5445,61 @@ impl<S: JitState> JitDriver<S> {
     /// RPython always has jitdriver_sd available; pyre may have descriptor=None
     /// when re-entering from guard failure, so fall back to virtualizable_info
     /// directly.
+    ///
+    /// Appends in place and reports success, so the compiled-entry path can
+    /// hand it a buffer that already has the artifact's capacity instead of a
+    /// freshly minted one. `statics` and `arrays` are scratch for the export;
+    /// they arrive cleared and their contents are not read on return. On
+    /// `false` `live_values` is restored to the length it arrived with, so a
+    /// declining caller sees the buffer it passed.
+    fn extend_compiled_live_values_into(
+        &self,
+        green_key: u64,
+        state: &S,
+        meta: &S::Meta,
+        descriptor: Option<&JitDriverStaticData>,
+        live_values: &mut Vec<Value>,
+        statics: &mut Vec<i64>,
+        arrays: &mut Vec<Vec<i64>>,
+    ) -> bool {
+        // `warmstate.py:188 cell.loop_token` is the single PyPy source of
+        // truth for the entry-path inputarg shape; route through
+        // `warm_state.get_compiled` so this site never consults pyre's
+        // `compiled_loops` side table (the F.7-orthodox retirement target).
+        let Some(compiled) = self.meta.warm_state_ref().get_compiled(green_key) else {
+            return false;
+        };
+        let compiled_inputs = compiled.inputarg_types().len();
+        if compiled_inputs <= live_values.len() {
+            return true;
+        }
+        // Fall back to virtualizable_info's default name if no descriptor.
+        let Some(info) = self.meta.virtualizable_info() else {
+            return false;
+        };
+        // Try descriptor path first (RPython jitdriver_sd.virtualizable), else
+        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25). Borrowed
+        // rather than cloned: both spellings outlive this call, and the export
+        // below only reads the name.
+        let name: &str = match descriptor.and_then(|d| d.virtualizable()) {
+            Some(virtualizable) => &virtualizable.name,
+            None => &info.name,
+        };
+        if !state.export_virtualizable_boxes_into(meta, name, info, statics, arrays) {
+            return false;
+        }
+        let base = live_values.len();
+        Self::flatten_virtualizable_values_into(info, statics, arrays, live_values);
+        if live_values.len() != compiled_inputs {
+            live_values.truncate(base);
+            return false;
+        }
+        true
+    }
+
+    /// Owning form of [`Self::extend_compiled_live_values_into`], for the
+    /// bridge-setup and diagnostic paths that hold a `Vec` of their own and
+    /// run far from the steady entry path.
     fn extend_compiled_live_values(
         &self,
         green_key: u64,
@@ -5353,34 +5508,18 @@ impl<S: JitState> JitDriver<S> {
         descriptor: Option<&JitDriverStaticData>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
-        // `warmstate.py:188 cell.loop_token` is the single PyPy source of
-        // truth for the entry-path inputarg shape; route through
-        // `warm_state.get_compiled` so this site never consults pyre's
-        // `compiled_loops` side table (the F.7-orthodox retirement target).
-        let compiled_inputs = self
-            .meta
-            .warm_state_ref()
-            .get_compiled(green_key)?
-            .inputarg_types()
-            .len();
-        if compiled_inputs <= live_values.len() {
-            return Some(live_values);
-        }
-        // Try descriptor path first (RPython jitdriver_sd.virtualizable).
-        let vable_name = descriptor
-            .and_then(|d| d.virtualizable())
-            .map(|v| v.name.clone());
-        // Fall back to virtualizable_info's default name if no descriptor.
-        let info = self.meta.virtualizable_info()?;
-        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25)
-        let name = vable_name.unwrap_or_else(|| info.name.clone());
-        let (static_boxes, array_boxes) = state.export_virtualizable_boxes(meta, &name, info)?;
-        let extra_values = Self::flatten_virtualizable_values(info, &static_boxes, &array_boxes);
-        if live_values.len() + extra_values.len() != compiled_inputs {
-            return None;
-        }
-        live_values.extend(extra_values);
-        Some(live_values)
+        let mut statics = Vec::new();
+        let mut arrays = Vec::new();
+        self.extend_compiled_live_values_into(
+            green_key,
+            state,
+            meta,
+            descriptor,
+            &mut live_values,
+            &mut statics,
+            &mut arrays,
+        )
+        .then_some(live_values)
     }
 
     fn sync_before(

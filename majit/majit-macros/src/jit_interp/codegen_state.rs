@@ -1724,6 +1724,36 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
+    // Pairs the two halves above straight into the driver's entry buffer.
+    // Emitted under the same condition as `live_value_types_into` — without
+    // that override the type half falls back to an allocating default, which
+    // would leave this one allocating anyway.
+    let extract_live_values_into_override: TokenStream =
+        if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
+            quote! {
+                fn extract_live_values_into(
+                    &self,
+                    _meta: &#meta_ty,
+                    out: &mut ::std::vec::Vec<majit_ir::Value>,
+                    raw: &mut ::std::vec::Vec<i64>,
+                    types: &mut ::std::vec::Vec<majit_ir::Type>,
+                ) {
+                    self.extract_live_into(_meta, raw);
+                    self.live_value_types_into(_meta, types);
+                    out.extend(raw.iter().zip(types.iter()).map(|(&__v, &__t)| match __t {
+                        majit_ir::Type::Float => {
+                            majit_ir::Value::Float(f64::from_bits(__v as u64))
+                        }
+                        majit_ir::Type::Ref => {
+                            majit_ir::Value::Ref(majit_ir::GcRef(__v as usize))
+                        }
+                        _ => majit_ir::Value::Int(__v),
+                    }));
+                }
+            }
+        } else {
+            quote! {}
+        };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -1732,7 +1762,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // and that lint is deny-by-default in every consumer of this
                 // macro, so a state of arrays only would not compile there.
                 #[allow(clippy::reversed_empty_ranges)]
-                fn live_value_types(&self, _meta: &#meta_ty) -> Vec<majit_ir::Type> {
+                fn live_value_types_into(
+                    &self,
+                    _meta: &#meta_ty,
+                    types: &mut ::std::vec::Vec<majit_ir::Type>,
+                ) {
                     // Value-routing types in `extract_live` order: int scalars,
                     // int array elements, then the ONE virtualizable identity
                     // (Ref), then appended ref scalars (Ref), then appended float
@@ -1741,7 +1775,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // failarg (TAGBOX), which the resume reader decodes through
                     // `decode_ref` in both the vable section and the frame
                     // ref-liveness.
-                    let mut types: Vec<majit_ir::Type> = Vec::new();
                     for _ in 0..#num_scalars {
                         types.push(majit_ir::Type::Int);
                     }
@@ -1753,6 +1786,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     for _ in 0..#num_float_scalars {
                         types.push(majit_ir::Type::Float);
                     }
+                }
+
+                fn live_value_types(&self, _meta: &#meta_ty) -> Vec<majit_ir::Type> {
+                    let mut types: Vec<majit_ir::Type> = Vec::new();
+                    self.live_value_types_into(_meta, &mut types);
                     types
                 }
             }
@@ -2032,6 +2070,23 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             })
             .collect();
+        // The same reads appended into a caller-owned slot rather than
+        // collected into a fresh `Vec`. Indexed by position so the two forms
+        // fill the outer list in the identical order.
+        let virt_array_export_into_parts: Vec<TokenStream> = virt_arrays
+            .iter()
+            .enumerate()
+            .map(|(i, (_, f))| {
+                let fname = &f.name;
+                let source = match &f.kind {
+                    StateFieldKind::VirtArray(tp) if tp == "float" => {
+                        quote! { self.#fname.iter().map(|&__x| __x.to_bits() as i64) }
+                    }
+                    _ => quote! { self.#fname.iter().map(|&__x| __x as i64) },
+                };
+                quote! { arrays[#i].extend(#source); }
+            })
+            .collect();
         // `extract_live` pushes int scalars, then every fixed array's items,
         // then the one identity slot. With no fixed arrays that position is a
         // constant — `num_scalars` — so the identity can be DECLARED the way
@@ -2139,6 +2194,23 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     #( #virt_array_export_parts ),*
                 ];
                 Some((__static_boxes, __array_boxes))
+            }
+
+            // Same export into buffers the driver reuses. Statics stays empty
+            // for the reason above, so only the arrays are written; the outer
+            // `Vec` is resized rather than rebuilt so the inner element
+            // storage survives across entries.
+            fn export_virtualizable_boxes_into(
+                &self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+                _statics: &mut ::std::vec::Vec<i64>,
+                arrays: &mut ::std::vec::Vec<::std::vec::Vec<i64>>,
+            ) -> bool {
+                arrays.resize_with(#num_virt_arrays, ::std::vec::Vec::new);
+                #( #virt_array_export_into_parts )*
+                true
             }
         }
     } else {
@@ -2583,17 +2655,28 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn extract_live(&self, _meta: &#meta_ty) -> Vec<i64> {
-                let mut values = Vec::new();
+            // The buffer-filling form is the primary one and the owning form
+            // wraps it: `warmstate.py:503-511 maybe_compile_and_run` hands
+            // `execute_assembler` reds that are already unboxed locals, so the
+            // entry path allocates nothing to describe them. The driver keeps
+            // these buffers across calls, so a warm entry refills them.
+            fn extract_live_into(&self, _meta: &#meta_ty, values: &mut ::std::vec::Vec<i64>) {
                 #(#extract_scalar_parts)*
                 #(#extract_array_parts)*
                 #extract_vable_identity_part
                 #(#extract_ref_scalar_parts)*
                 #(#extract_float_scalar_parts)*
+            }
+
+            fn extract_live(&self, _meta: &#meta_ty) -> Vec<i64> {
+                let mut values = Vec::new();
+                self.extract_live_into(_meta, &mut values);
                 values
             }
 
             #live_value_types_override
+
+            #extract_live_values_into_override
 
             fn create_sym(meta: &#meta_ty, header_pc: usize) -> #sym_ty {
                 let mut __offset: usize = 0;
