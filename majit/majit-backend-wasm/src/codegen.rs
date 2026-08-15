@@ -2472,6 +2472,12 @@ fn build_function(
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
+    let guard_dispatch = BridgeDispatch {
+        cells_base,
+        fail_index_base,
+        bridge_slot_local,
+        enabled: bridge_dispatch,
+    };
     let mut locals = Vec::new();
     let mut start = 0;
     while start < value_types.types().len() {
@@ -2823,6 +2829,7 @@ fn build_function(
                         guard_idx,
                         guard,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                     guard_idx += 1;
                     fused_guard_at = Some(op_idx + 1);
@@ -2951,6 +2958,9 @@ fn build_function(
 
             OpCode::Finish => {
                 emit_guard_spill(&mut sink, constants, value_types, guard_idx, op);
+                if guard_dispatch.enabled {
+                    emit_guard_bridge_dispatch(&mut sink, guard_idx, guard_dispatch);
+                }
                 sink.br(block_exit_depth);
                 guard_idx += 1;
             }
@@ -2964,6 +2974,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -2975,6 +2986,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -2996,6 +3008,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3009,6 +3022,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3023,6 +3037,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3084,6 +3099,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3106,6 +3122,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3121,6 +3138,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3145,6 +3163,7 @@ fn build_function(
                         guard_idx,
                         op,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                 }
                 guard_idx += 1;
@@ -3172,6 +3191,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3193,6 +3213,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
                 // Success path: capture the caught exception into the result
@@ -3770,6 +3791,7 @@ fn build_function(
                         guard_idx,
                         op,
                         block_exit_depth,
+                        guard_dispatch,
                     );
                 }
                 guard_idx += 1;
@@ -3845,6 +3867,7 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
@@ -3971,13 +3994,23 @@ fn build_function(
                     guard_idx,
                     op,
                     block_exit_depth,
+                    guard_dispatch,
                 );
                 guard_idx += 1;
             }
             OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
-                // GuardAlwaysFails always exits.
-                sink.i32_const(guard_idx as i32);
-                sink.local_set(bridge_slot_local);
+                // GuardAlwaysFails always exits. This arm writes neither the
+                // fail args nor `frame[0]`, so it keeps branching to the shared
+                // epilogue — giving it the ordinary guard spill would change
+                // what the exit reports, not just how it gets there. The
+                // epilogue takes a cell address when bridge dispatch is on;
+                // otherwise retain the unused index write unchanged.
+                if guard_dispatch.enabled {
+                    emit_guard_bridge_dispatch(&mut sink, guard_idx, guard_dispatch);
+                } else {
+                    sink.i32_const(guard_idx as i32);
+                    sink.local_set(bridge_slot_local);
+                }
                 sink.br(block_exit_depth);
                 guard_idx += 1;
             }
@@ -5402,30 +5435,17 @@ fn build_function(
     sink.return_();
     sink.end(); // end A $hot_exit
 
-    // Epilogue bridge dispatch. Control reaches here only
-    // after a guard `br`'d out of the exit block, having written its
-    // `fail_index` into `frame[0]`. Look up that guard's bridge slot in the
-    // shared cell array; if a bridge has been compiled (slot != 0), tail into
-    // it via `call_indirect` through the shared table — staying inside wasm —
-    // and return its result. Otherwise fall through to the host round-trip
-    // (return `frame_ptr`, the metainterp reads `frame[0]`). With every cell 0
-    // (no bridge yet) this is inert and behavior is unchanged.
+    // Epilogue bridge dispatch for exits that branch out of the hot exit
+    // block. Their arms have already placed the exit's constant cell address
+    // in `bridge_slot_local`; load the table slot from that cell. If a bridge
+    // has been compiled (slot != 0), tail into it via `call_indirect` through
+    // the shared table and return its result. Otherwise fall through to the
+    // host round-trip (return `frame_ptr`, whose `frame[0]` was written by the
+    // ordinary guard or Finish arm). With every cell 0 (no bridge yet) this is
+    // inert and behavior is unchanged.
     if bridge_dispatch {
-        // slot = *(cells_base + (fail_index - fail_index_base) * 4)
-        // The cell array is local to this trace (one i32 per local guard);
-        // `frame[0]` carries the GLOBAL fail index, so subtract this trace's
-        // base back to a local cell index.
-        sink.i32_const(cells_base as i32);
-        sink.local_get(0);
-        sink.i64_load(mem64(0)); // frame[0] = fail_index
-        sink.i32_wrap_i64();
-        if fail_index_base != 0 {
-            sink.i32_const(fail_index_base as i32);
-            sink.i32_sub();
-        }
-        sink.i32_const(4);
-        sink.i32_mul();
-        sink.i32_add();
+        // slot = *(bridge_slot_local), where the local holds a cell address.
+        sink.local_get(bridge_slot_local);
         sink.i32_load(memarg(0, 2));
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
@@ -5833,6 +5853,14 @@ fn emit_array_addr(
 
 // ── Guard emission helpers ──
 
+#[derive(Clone, Copy)]
+struct BridgeDispatch {
+    cells_base: u32,
+    fail_index_base: u32,
+    bridge_slot_local: u32,
+    enabled: bool,
+}
+
 fn emit_guard_true(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -5840,6 +5868,7 @@ fn emit_guard_true(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_eqz();
@@ -5850,6 +5879,7 @@ fn emit_guard_true(
         guard_idx,
         op,
         block_exit_depth,
+        dispatch,
     );
 }
 
@@ -5860,6 +5890,7 @@ fn emit_guard_false(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(0);
@@ -5871,6 +5902,7 @@ fn emit_guard_false(
         guard_idx,
         op,
         block_exit_depth,
+        dispatch,
     );
 }
 
@@ -5943,7 +5975,7 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
     matches!(next.opcode, OpCode::GuardNoOverflow | OpCode::GuardOverflow).then_some(next)
 }
 
-/// Common guard exit: condition is on stack (i32), spill and branch on failure.
+/// Common guard exit: condition is on stack (i32), spill and leave on failure.
 ///
 /// The spill belongs in this arm rather than in one shared exit handler after
 /// the trace. x86/assembler.py:835-846 `write_pending_failure_recoveries` can
@@ -5961,7 +5993,9 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
 /// `block_exit_depth` is the statement-level depth of the enclosing exit
 /// `block` (preamble = 0, loop body = 1); the `+ 1` accounts for the `if`
 /// this opens. The stores run only on the failing edge, so the fallthrough
-/// carries no frame traffic.
+/// carries no frame traffic. With bridge dispatch enabled, the failing arm
+/// writes its fail index to `frame[0]`, records its constant bridge-cell
+/// address in a local, and branches to the shared dispatch epilogue.
 fn emit_guard_if_exit(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -5969,11 +6003,47 @@ fn emit_guard_if_exit(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
+    dispatch: BridgeDispatch,
 ) {
     sink.if_(BlockType::Empty);
-    emit_guard_spill(sink, constants, value_types, guard_idx, op);
-    sink.br(block_exit_depth + 1);
+    emit_guard_exit(
+        sink,
+        constants,
+        value_types,
+        guard_idx,
+        op,
+        block_exit_depth + 1,
+        dispatch,
+    );
     sink.end();
+}
+
+fn emit_guard_exit(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    guard_idx: u32,
+    op: &Op,
+    block_exit_depth: u32,
+    dispatch: BridgeDispatch,
+) {
+    emit_guard_spill(sink, constants, value_types, guard_idx, op);
+    if dispatch.enabled {
+        emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
+    }
+    sink.br(block_exit_depth);
+}
+
+fn emit_guard_bridge_dispatch(
+    sink: &mut PeepSink<'_, '_>,
+    guard_idx: u32,
+    dispatch: BridgeDispatch,
+) {
+    debug_assert!(guard_idx >= dispatch.fail_index_base);
+    let cell_addr = dispatch.cells_base
+        + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
+    sink.i32_const(cell_addr as i32);
+    sink.local_set(dispatch.bridge_slot_local);
 }
 
 fn emit_guard_spill(
@@ -5981,6 +6051,16 @@ fn emit_guard_spill(
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     guard_idx: u32,
+    op: &Op,
+) {
+    emit_guard_fail_args_spill(sink, constants, value_types, op);
+    emit_guard_fail_index_store(sink, guard_idx);
+}
+
+fn emit_guard_fail_args_spill(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
     op: &Op,
 ) {
     let fail_args: Vec<OpRef> = op
@@ -5994,7 +6074,9 @@ fn emit_guard_spill(
         emit_resolve(sink, constants, value_types, arg_ref);
         sink.i64_store(mem64(offset));
     }
+}
 
+fn emit_guard_fail_index_store(sink: &mut PeepSink<'_, '_>, guard_idx: u32) {
     sink.local_get(0);
     sink.i64_const(guard_idx as i64);
     sink.i64_store(mem64(0));
