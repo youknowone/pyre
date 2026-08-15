@@ -10610,26 +10610,6 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if execution_context.is_null() {
         return Err(crate::PyError::runtime_error("super(): no current frame"));
     }
-    if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-        let top = unsafe { (*execution_context).topframeref };
-        let is_vref = unsafe {
-            majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8)
-        };
-        let referent = crate::executioncontext::vref_referent(top);
-        if referent.is_null() {
-            eprintln!(
-                "[builtin-super-ec] ec={execution_context:p} top={top:p} \
-                 is_vref={is_vref} referent={referent:p} code=<null>"
-            );
-        } else {
-            let code = unsafe { &*(*referent).code() };
-            eprintln!(
-                "[builtin-super-ec] ec={execution_context:p} top={top:p} is_vref={is_vref} \
-                 referent={referent:p} code={} freevars={:?}",
-                code.obj_name, code.freevars,
-            );
-        }
-    }
     let frame_ptr = unsafe { (*execution_context).gettopframe() };
     {
         if frame_ptr.is_null() {

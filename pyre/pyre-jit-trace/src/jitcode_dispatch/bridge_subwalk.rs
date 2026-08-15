@@ -1256,18 +1256,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     }
 
     let outcome = {
-        if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-            let frame = concrete_callee_frame as *const pyre_interpreter::PyFrame;
-            let frame_code = unsafe {
-                pyre_interpreter::w_code_get_ptr((*frame).pycode as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
-            eprintln!(
-                "[mframe-carrier] frame={frame:p} frame_code={frame_code:p} expected={:p} freevars={:?}",
-                callee_pjc.code_ptr,
-                unsafe { &(*frame_code).freevars },
-            );
-        }
         let mut sub_wc = WalkContext {
             callee_shadow: Some(super::CalleeLocalsShadow {
                 code_ptr: callee_pjc.code_ptr,

@@ -1193,16 +1193,10 @@ impl ResidualFrameChainGuard {
     fn enter(frame: usize) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
         if frame.is_null() {
-            if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-                eprintln!("[mframe-chain] no inline concrete frame");
-            }
             return None;
         }
         let ec = unsafe { (*frame).execution_context } as *mut pyre_interpreter::PyExecutionContext;
         if ec.is_null() {
-            if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-                eprintln!("[mframe-chain] frame={frame:p} has no execution context");
-            }
             return None;
         }
         let saved_topframeref = unsafe { (*ec).topframeref };
@@ -1215,19 +1209,6 @@ impl ResidualFrameChainGuard {
             pyre_interpreter::executioncontext::vref_referent(saved_topframeref),
             frame,
         );
-        if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-            let saved_referent =
-                pyre_interpreter::executioncontext::vref_referent(saved_topframeref);
-            let frame_code = unsafe {
-                pyre_interpreter::w_code_get_ptr((*frame).pycode as pyre_object::PyObjectRef)
-                    as *const pyre_interpreter::CodeObject
-            };
-            eprintln!(
-                "[mframe-chain] frame={frame:p} pycode={:p} raw={frame_code:p} freevars={:?} ec={ec:p} saved={saved_topframeref:p} saved_ref={saved_referent:p} entered={entered}",
-                unsafe { (*frame).pycode },
-                unsafe { &(*frame_code).freevars },
-            );
-        }
         if entered {
             // Same barrier obligation as the inline-call push: `f_backref` is
             // a traced `Type::Ref` field, `frame` can be old-generation, and
