@@ -681,6 +681,11 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
     (178, Some(0)),
+    // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
+    // retained Python buffers.  pyre-interpreter supplies the vtable alias;
+    // the object layer owns only the append-only hierarchy slot.
+    #[cfg(windows)]
+    (179, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

@@ -42,6 +42,9 @@ pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _opcode;
 #[allow(non_snake_case)]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub mod _overlapped;
+#[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

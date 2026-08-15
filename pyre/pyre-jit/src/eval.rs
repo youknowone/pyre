@@ -741,6 +741,15 @@ unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
     };
 }
 
+#[cfg(all(windows, not(feature = "sandbox")))]
+unsafe fn overlapped_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_overlapped::w_overlapped_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
@@ -3824,6 +3833,17 @@ fn build_gc() -> Box<MiniMarkGC> {
             mmap_descr.pytype_ptr as usize,
             mmap_descr.ptr_offsets,
         );
+    }
+    // `lib_pypy/_overlapped.py Overlapped`: the object owns its native
+    // OVERLAPPED record and pending buffers until cancellation/completion.
+    // Its three Python fields are ordinary generated trace offsets; sweep
+    // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    {
+        let descr = <pyre_interpreter::module::_overlapped::W_Overlapped
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+        gc.types.set_destructor(tid, overlapped_destructor);
     }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an

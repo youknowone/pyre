@@ -1149,6 +1149,12 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         subclass_range_alias(178, typed::<crate::module::mmap::W_MMap>()),
+        // Windows asyncio's Overlapped owner follows mmap at the native tail.
+        // It is a non-subclassable builtin in Python, but still participates
+        // in the rclass hierarchy because its managed header and retained
+        // buffer/result fields are traced by the ordinary object marker.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        subclass_range_alias(179, typed::<crate::module::_overlapped::W_Overlapped>()),
     ]
 }
 
@@ -1167,7 +1173,14 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]
         const MMAP_HIERARCHY_SLOTS: usize = 0;
-        &hierarchy[..hierarchy.len() - SSL_HIERARCHY_SLOTS - MMAP_HIERARCHY_SLOTS]
+        #[cfg(windows)]
+        const OVERLAPPED_HIERARCHY_SLOTS: usize = 1;
+        #[cfg(not(windows))]
+        const OVERLAPPED_HIERARCHY_SLOTS: usize = 0;
+        &hierarchy[..hierarchy.len()
+            - SSL_HIERARCHY_SLOTS
+            - MMAP_HIERARCHY_SLOTS
+            - OVERLAPPED_HIERARCHY_SLOTS]
     }
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
     {

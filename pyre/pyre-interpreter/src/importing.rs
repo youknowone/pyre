@@ -594,6 +594,11 @@ pub fn install_builtin_modules() {
     // `_winapi` import even though the Windows build installs `posix`.
     #[cfg(windows)]
     pyre_install_module!(_winapi);
+    // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
+    // OVERLAPPED record per operation and reaches the Win32/WinSock calls
+    // through this Windows-only builtin.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pyre_install_module!(_overlapped);
     // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
     // module must exist for the import machinery (and `import site`) to start.
     #[cfg(windows)]

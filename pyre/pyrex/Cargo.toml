@@ -32,7 +32,8 @@ name = "allocsites"
 path = "examples/allocsites.rs"
 
 [features]
-default = ["dynasm", "mimalloc"]
+default = ["dynasm", "host_env", "mimalloc"]
+host_env = ["pyre-interpreter/host_env"]
 jit = []  # meta feature: enabled by cranelift or dynasm
 cranelift = ["jit", "pyre-jit/cranelift"]
 dynasm = ["jit", "pyre-jit/dynasm"]
