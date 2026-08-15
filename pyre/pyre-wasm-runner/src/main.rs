@@ -97,6 +97,8 @@ struct Host {
     /// trampoline invocations). Compare against `jit_execute_count` to test
     /// whether per-op crossings or per-guard-exit crossings dominate.
     jit_call_count: u64,
+    /// Wall time inside `jit_call_trampoline`, in nanoseconds.
+    jit_call_time_ns: u128,
     /// Diagnostic (PYRE_WASM_EXEC_TRACE=1): histogram of (trace func_id,
     /// guard-exit fail_index) over every host round-trip, so we can see which
     /// guard keeps returning to the host instead of chaining in-module.
@@ -861,12 +863,14 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             .ok();
         let host = store.data();
         eprintln!(
-            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} linear_mem={} gc_oldgen={} gc_nursery={} \
+            "[jit-stats] compiles={} compile_ms={:.1} executes={} jit_calls={} jit_call_ms={:.1} \
+             linear_mem={} gc_oldgen={} gc_nursery={} \
              gc_minors={} gc_majors={} heap_live_bytes={} heap_live_count={}",
             host.jit_compile_count,
             host.jit_compile_time_ns as f64 / 1.0e6,
             guest_jit_execute_count.unwrap_or(host.jit_execute_count),
             host.jit_call_count,
+            host.jit_call_time_ns as f64 / 1.0e6,
             lin_mem,
             gc_oldgen,
             gc_nursery,
@@ -1516,8 +1520,19 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
 static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
     std::sync::Mutex::new(None);
 
+/// Whether `PYRE_WASM_CALL_HIST` was set, read once.
+///
+/// `jit_call_trampoline` runs per residual call -- 15168 of them on
+/// fib_recursive -- and `std::env::var_os` takes the process-wide environment
+/// lock and scans it, so reading the variable there put that cost on every
+/// crossing whether or not the probe was wanted.
+fn probe_call_hist_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_WASM_CALL_HIST").is_some())
+}
+
 pub(crate) fn probe_call_hist_dump() {
-    if std::env::var_os("PYRE_WASM_CALL_HIST").is_none() {
+    if !probe_call_hist_enabled() {
         return;
     }
     let g = PROBE_CALL_HIST.lock().unwrap();
@@ -1536,7 +1551,21 @@ pub(crate) fn probe_call_hist_dump() {
     }
 }
 
+/// Time every residual crossing, including the paths that return early, so the
+/// share of a run spent leaving the guest is measured rather than inferred from
+/// `jit_call_count` alone.
 fn jit_call_trampoline(
+    caller: &mut Caller<'_, Host>,
+    frame_ptr: u32,
+    call_area_ofs: u32,
+) -> Result<()> {
+    let entered = std::time::Instant::now();
+    let r = jit_call_trampoline_inner(caller, frame_ptr, call_area_ofs);
+    caller.data_mut().jit_call_time_ns += entered.elapsed().as_nanos();
+    r
+}
+
+fn jit_call_trampoline_inner(
     caller: &mut Caller<'_, Host>,
     frame_ptr: u32,
     call_area_ofs: u32,
@@ -1547,7 +1576,7 @@ fn jit_call_trampoline(
     let call_area = frame_ptr as usize + call_area_ofs as usize;
 
     let func_ptr = read_u32(&memory, &*caller, call_area + 8);
-    if std::env::var_os("PYRE_WASM_CALL_HIST").is_some() {
+    if probe_call_hist_enabled() {
         let mut g = PROBE_CALL_HIST.lock().unwrap();
         *g.get_or_insert_with(Default::default)
             .entry(func_ptr)
