@@ -146,12 +146,28 @@ fn degraded_arms() -> Vec<String> {
         .collect()
 }
 
-/// The subject. Read the denominator first: without the control arm in the
-/// registry, "the subject is absent" is what a registry nobody wrote to also
-/// looks like.
+/// The subject. Read the denominator first: without it, "the subject is
+/// absent" is what a registry nobody wrote to also looks like.
+///
+/// Two denominators, and they answer different questions.
+/// `dispatch_arm_census()` says the portal was installed at all — that is the
+/// one `assert_no_degraded_dispatch_arms` consults, and the one every machine
+/// gets for free. `OP_ENCLOSED_BREAK` says the degraded registry itself is
+/// reachable from this fixture, which the census cannot say.
 #[test]
 fn a_discarded_inline_int_call_does_not_degrade_its_arm() {
     let degraded = degraded_arms();
+
+    let census = majit_metainterp::dispatch_arm_census();
+    let counted = census
+        .iter()
+        .find(|e| e.interp == "PopState")
+        .unwrap_or_else(|| panic!("the portal must record its arm count; census={census:?}"));
+    assert_eq!(
+        counted.arms, 4,
+        "the census must count the four opcode arms and not the `_` default; \
+         census={census:?}"
+    );
 
     assert!(
         degraded.iter().any(|arm| arm == "OP_ENCLOSED_BREAK"),
@@ -231,4 +247,49 @@ fn the_discarded_call_still_pops_on_the_concrete_path() {
         22,
         "the discarded pop must still advance head past the popped node"
     );
+}
+
+/// `assert_no_degraded_dispatch_arms` must distinguish its two failures.
+///
+/// This machine has a degraded arm on purpose, so the helper must reject it —
+/// and it must reject a machine that was never installed with a *different*
+/// message, because the two are the same empty list. A gate that only reads
+/// `degraded_dispatch_arms()` passes the second case silently, which is the
+/// whole reason the census exists.
+#[test]
+fn the_gate_separates_a_degraded_arm_from_an_uninstalled_portal() {
+    let _ = install();
+
+    let degraded =
+        std::panic::catch_unwind(|| majit_metainterp::assert_no_degraded_dispatch_arms("PopState"))
+            .expect_err("this fixture degrades OP_ENCLOSED_BREAK on purpose");
+    let degraded = panic_message(&degraded);
+    assert!(
+        degraded.contains("lowered to an abort stub"),
+        "an installed portal with a degraded arm must fail on the arm; \
+         got {degraded:?}"
+    );
+
+    let uninstalled = std::panic::catch_unwind(|| {
+        majit_metainterp::assert_no_degraded_dispatch_arms("NoSuchState")
+    })
+    .expect_err("a machine that was never installed cannot be graded");
+    let uninstalled = panic_message(&uninstalled);
+    assert!(
+        uninstalled.contains("never installed"),
+        "an absent portal must fail on the denominator, not silently pass \
+         because its degraded list is empty; got {uninstalled:?}"
+    );
+    assert_ne!(
+        degraded, uninstalled,
+        "the two failures must not read the same, or the census bought nothing"
+    );
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default()
 }

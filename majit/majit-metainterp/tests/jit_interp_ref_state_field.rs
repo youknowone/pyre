@@ -132,3 +132,28 @@ fn ref_state_field_live_value_types_tags_ref_slot() {
         "the appended ref scalar slot must be tagged Type::Ref"
     );
 }
+
+/// The success case for `assert_no_degraded_dispatch_arms`.
+///
+/// A gate that panicked unconditionally would satisfy the two failure cases
+/// pinned in `jit_interp_discarded_inline_result.rs`; this machine lowers every
+/// arm, so it is the one that says the gate can also pass. It also pins the
+/// census denominator against this fixture's own arm list.
+#[test]
+fn a_fully_lowered_machine_passes_the_degraded_arm_gate() {
+    let mut asm = Assembler::new();
+    let _ = build_ref_dispatch_jitcode(&mut asm);
+
+    let census = majit_metainterp::dispatch_arm_census();
+    let counted = census
+        .iter()
+        .find(|e| e.interp == "RefTestState")
+        .unwrap_or_else(|| panic!("the portal must record its arm count; census={census:?}"));
+    assert_eq!(
+        counted.arms, 3,
+        "OP_NOP, OP_INC_A and OP_TOUCH_SEL are counted; the `_` default is not; \
+         census={census:?}"
+    );
+
+    majit_metainterp::assert_no_degraded_dispatch_arms("RefTestState");
+}

@@ -529,6 +529,91 @@ pub fn degraded_dispatch_arms() -> Vec<DegradedDispatchArm> {
         .clone()
 }
 
+/// How many dispatch arms one machine's portal emitted, recorded whether or
+/// not any of them degraded.
+///
+/// [`degraded_dispatch_arms`] is a numerator. On its own an empty result reads
+/// as "no arm degraded" and is indistinguishable from "no portal was ever
+/// built" — the same shape as the defect it exists to report, one level up. A
+/// consumer's gate therefore has to supply its own proof that the portal was
+/// installed, and every one of them supplies a different one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DispatchArmCensus {
+    /// The machine's declared `state = T` type name, matching
+    /// [`DegradedDispatchArm::interp`].
+    pub interp: &'static str,
+    /// Arms the portal emitted a body for. The `_` wildcard and a lowercase
+    /// binding pattern are excluded: both are the default edge rather than an
+    /// opcode, and neither can degrade.
+    pub arms: usize,
+}
+
+static DISPATCH_ARM_CENSUS: std::sync::Mutex<Vec<DispatchArmCensus>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `interp`'s portal emitted `arms` dispatch arms.
+///
+/// Called from the `__dispatch_jitcode_*` body alongside
+/// [`record_degraded_dispatch_arm`], so the denominator and the numerator are
+/// written in the same install. Deduplicated by content for the same reason:
+/// a portal may be built more than once per process and the fact is per
+/// machine, not per build.
+pub fn record_dispatch_arm_census(interp: &'static str, arms: usize) {
+    let entry = DispatchArmCensus { interp, arms };
+    let mut census = DISPATCH_ARM_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if census.contains(&entry) {
+        return;
+    }
+    census.push(entry);
+}
+
+/// Snapshot of every portal's arm count recorded so far.
+pub fn dispatch_arm_census() -> Vec<DispatchArmCensus> {
+    DISPATCH_ARM_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Panic unless `interp`'s portal was installed AND none of its arms degraded.
+///
+/// This is the gate every consumer would otherwise write, denominator and all.
+/// Reading `degraded_dispatch_arms()` alone cannot be that gate: it passes on
+/// an empty registry, and an empty registry is also what a portal that was
+/// never built produces. The census settles which one happened, so the two
+/// failures get two different messages instead of one silent pass.
+///
+/// Call it after whatever installs the portal. `#[jit_interp]` records both
+/// facts at install, not at trace time, so running the machine is not required
+/// — but nothing is recorded until the portal is built at least once.
+pub fn assert_no_degraded_dispatch_arms(interp: &str) {
+    let census = dispatch_arm_census();
+    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
+        panic!(
+            "no dispatch-arm census for `{interp}`: its portal was never \
+             installed in this process, so an empty degraded list says nothing \
+             about it. Build the dispatch JitCode (or run the machine) first. \
+             Recorded machines: {:?}",
+            census.iter().map(|e| e.interp).collect::<Vec<_>>()
+        );
+    };
+    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
+        .into_iter()
+        .filter(|e| e.interp == interp)
+        .collect();
+    assert!(
+        degraded.is_empty(),
+        "{} of `{interp}`'s {} dispatch arms lowered to an abort stub. Every \
+         trace that reaches one of these opcodes aborts, once per threshold, \
+         forever: {:#?}",
+        degraded.len(),
+        entry.arms,
+        degraded
+    );
+}
+
 /// The shape of a compiled loop body, as a tier gate needs to read it.
 ///
 /// A compile counter says a trace was *compiled*; an op count says the body is

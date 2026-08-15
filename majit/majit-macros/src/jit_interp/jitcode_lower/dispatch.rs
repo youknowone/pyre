@@ -2498,6 +2498,22 @@ pub(super) fn lower_dispatch_chain(
         lowerer.emit_jump(&default_label);
     }
 
+    // The denominator for `record_degraded_dispatch_arm` below, staged from the
+    // same loop's own admission test so the two cannot drift: an arm is counted
+    // here exactly when the loop emits a body for it.  Without it an empty
+    // degraded registry reads as "nothing degraded" and as "no portal was
+    // built" at once, and only the first is a pass.
+    {
+        let census_interp = config.state_type_name.clone();
+        let census_arms = classified_arms
+            .iter()
+            .filter(|arm| !matches!(arm.pat, Pat::Wild(_)) && !is_lowercase_binding_pat(&arm.pat))
+            .count();
+        lowerer.emit_aux(quote::quote! {
+            majit_metainterp::record_dispatch_arm_census(#census_interp, #census_arms);
+        });
+    }
+
     for (arm_idx, arm) in classified_arms.iter().enumerate() {
         // `_` wildcard: skip here; handled by the default GOTO below.
         // All other patterns (including Pat::Ident like `OP_NOP`) are
