@@ -29,7 +29,21 @@ use majit_metainterp::{Assembler, JitDriver};
 struct PointerFieldStack {
     data: *mut i64,
     size: usize,
+    /// An eight-byte field that is not `Copy`, named in the write set below but
+    /// declared in none of the field maps, so it takes the undeclared default
+    /// and the macro emits its width witness over it.
+    ///
+    /// A witness written as `|s| s.field` returns the field by value and so
+    /// moves out of a shared borrow, which only compiles when the field is
+    /// `Copy`. This member is the standing check that it is not written that
+    /// way: if it regresses, this crate stops compiling rather than quietly
+    /// refusing a struct that has nothing wrong with it.
+    generation: Generation,
 }
+
+/// Deliberately not `Copy` and deliberately eight bytes.
+#[repr(transparent)]
+struct Generation(i64);
 
 /// An opaque in-place mutator.  The body is irrelevant — the JIT never looks
 /// inside a residual — but it has to exist for the concrete path.
@@ -40,6 +54,7 @@ extern "C" fn jit_scramble_pointer_field(stack: usize) {
     }
     unsafe {
         (*stack).size = (*stack).size;
+        (*stack).generation = Generation((*stack).generation.0 + 1);
     }
 }
 
@@ -61,7 +76,13 @@ struct PointerFieldState {
     array_fields = { PointerFieldStack::data => i64 },
     calls = { jit_scramble_pointer_field => residual_void },
     residual_writes = {
+        // `size` is here only so the scalar control below has a descr to read.
+        // Naming a field in a write-set layout is what mints its descr, and
+        // without one the control skips: it asserted nothing, which is the
+        // failure mode it exists to rule out for the pointer field.
         sel.data => [jit_scramble_pointer_field],
+        sel.size => [jit_scramble_pointer_field],
+        sel.generation => [jit_scramble_pointer_field],
     },
 )]
 #[allow(unused_assignments, unused_variables)]
@@ -165,15 +186,19 @@ fn a_scalar_field_of_the_same_struct_is_still_a_scalar() {
         .get(&majit_ir::descr::LLType::Struct(type_id))
         .and_then(|fields| fields.get("size"))
         .cloned();
-    // `size` is not named by any declaration or access here, so the control is
-    // only meaningful if something registered it.  Skipping when nothing did is
-    // honest; asserting on an absent slot would pass for the wrong reason.
-    if let Some(descr) = size_field {
-        assert_eq!(
-            descr.field_type(),
-            majit_ir::Type::Int,
-            "`size` is a scalar; only the field a pointer declaration names may \
-             become a Ref",
-        );
-    }
+    // Require the slot rather than skipping when it is absent. This test read
+    // `if let Some(..)` and `size` was in no declaration, so the assertion below
+    // never ran once — a control that does not execute rules nothing out, which
+    // is exactly what it was written to prevent for the pointer field. The
+    // fixture now names `size` in its write set so the descr exists.
+    let descr = size_field.expect(
+        "`size` must be registered for this control to assert anything; the \
+         fixture's `residual_writes` names it",
+    );
+    assert_eq!(
+        descr.field_type(),
+        majit_ir::Type::Int,
+        "`size` is a scalar; only the field a pointer declaration names may \
+         become a Ref",
+    );
 }
