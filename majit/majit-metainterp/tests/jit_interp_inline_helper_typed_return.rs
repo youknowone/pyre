@@ -104,6 +104,14 @@ fn inline_typed_stack_swap_caller(stack: usize) {
     inline_typed_stack_swap(stack);
 }
 
+/// The same `inline_int` helper as `inline_typed_stack_pop_caller`, called for
+/// its effect with the result discarded. This is what a "pop and throw away"
+/// opcode looks like, and it is a statement, not a value.
+#[jit_inline(calls = { inline_typed_stack_pop => inline_int })]
+fn inline_typed_stack_pop_discarding_caller(stack: usize) {
+    inline_typed_stack_pop(stack);
+}
+
 #[dont_look_inside]
 fn wrapped_ref_identity(ptr: *const i64) -> *const i64 {
     ptr
@@ -796,4 +804,89 @@ fn jit_inline_array_field_keeps_interpreter_behavior() {
     assert_eq!(stack.sp, 1);
     assert_eq!(inline_array_stack_pop(stack_ptr), 10);
     assert_eq!(stack.sp, 0);
+}
+
+/// A result-returning inline helper called for its effect alone must still be
+/// spliced into the caller.
+///
+/// Statement position and value position are lowered by two different
+/// functions, and only the value one had arms for `inline_int` / `inline_ref` /
+/// `inline_float`. In statement position they reached the trailing
+/// `_ => return None`, and the helper below did not compile at all:
+/// `#[jit_inline] could not lower this helper into JitCode`. The workaround is
+/// to bind the result to a `let _x` nothing reads, which is a source change the
+/// declaration never asked for.
+///
+/// The loudness is specific to `#[jit_inline]`. The same input inside a
+/// `#[jit_interp]` dispatch arm degrades the arm to an abort stub and builds
+/// clean — `jit_interp_discarded_inline_result.rs` pins that half, which is the
+/// one with no diagnostic.
+#[test]
+fn a_discarded_inline_int_result_still_splices_the_helper() {
+    let inline_call = majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    let residual_calls = [
+        majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_R_I,
+        majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IR_I,
+        majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IRF_I,
+    ];
+
+    let mut asm = majit_metainterp::Assembler::new();
+    let caller = __majit_inline_jitcode_inline_typed_stack_pop_discarding_caller_with_asm(&mut asm);
+
+    assert!(
+        caller.code.contains(&inline_call),
+        "a discarded `inline_int` call must still emit BC_INLINE_CALL; \
+         code={:?}",
+        caller.code
+    );
+    assert!(
+        residual_calls
+            .iter()
+            .all(|opcode| !caller.code.contains(opcode)),
+        "the discarded call must stay an inline splice, not fall back to a \
+         residual; code={:?}",
+        caller.code
+    );
+
+    // The value-position caller over the same helper is the control: if it
+    // ever stops emitting an inline_call, the assertion above is measuring the
+    // lowerer having changed rather than the discarded arm working.
+    let value_caller = __majit_inline_jitcode_inline_typed_stack_pop_caller_with_asm(&mut asm);
+    assert!(
+        value_caller.code.contains(&inline_call),
+        "control: the value-position caller over the same helper must splice \
+         it too; code={:?}",
+        value_caller.code
+    );
+}
+
+/// …and the concrete (non-JIT) path must perform the same mutation, so the two
+/// halves of the discarded call agree.
+#[test]
+fn a_discarded_inline_int_result_still_pops_on_the_concrete_path() {
+    let mut second = InlineTypedNode {
+        value: 22,
+        next: std::ptr::null_mut(),
+    };
+    let mut first = InlineTypedNode {
+        value: 11,
+        next: &mut second,
+    };
+    let mut stack = InlineTypedStack {
+        head: &mut first,
+        size: 2,
+    };
+    let stack_ptr = &mut stack as *mut InlineTypedStack as usize;
+
+    inline_typed_stack_pop_discarding_caller(stack_ptr);
+
+    assert_eq!(
+        stack.size, 1,
+        "the discarded pop must still shrink the stack"
+    );
+    assert_eq!(
+        unsafe { (*stack.head).value },
+        22,
+        "the discarded pop must still advance head past the popped node"
+    );
 }

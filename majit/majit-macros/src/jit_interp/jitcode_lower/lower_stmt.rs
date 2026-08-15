@@ -1494,6 +1494,52 @@ impl<'c> Lowerer<'c> {
                     );
                     self.emit_op(OpMeta::live_marker(), post_live);
                 }
+                // A result-returning inline helper whose result the statement
+                // discards. The sub-jitcode still ends in a typed return
+                // opcode, so it needs a destination even though nothing reads
+                // it; `alloc_reg` mints one, the same way the discarded
+                // `ResidualInt` family below does. Everything else is the
+                // value-position lowering verbatim.
+                //
+                // Without this arm the call reaches `_ => return None` and the
+                // statement is dropped: `explicit_call_emits_post_live` already
+                // answers for these kinds, so the accounting says the policy is
+                // handled while the lowering says it is not, and the effect the
+                // helper performs leaves the trace with no diagnostic. The
+                // workaround is to bind the result to `let _x = ...`, which is
+                // a source change the declaration does not ask for.
+                crate::jit_interp::CallPolicyKind::InlineInt
+                | crate::jit_interp::CallPolicyKind::InlineRef
+                | crate::jit_interp::CallPolicyKind::InlineFloat => {
+                    let result_kind = binding_kind_for_inline_policy(kind)
+                        .expect("the arm's own patterns are the inline result policies");
+                    let throwaway_reg = self.alloc_reg();
+                    let builder_path = inline_builder_path(&call.func)?;
+                    let prebuild_path = inline_prebuild_path(&call.func)?;
+                    let (inline_call, post_live) = inline_call_tokens(&arg_bindings, throwaway_reg);
+                    let __arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        #prebuild_path(__asm);
+                    });
+                    self.emit_op(
+                        OpMeta::linear(
+                            OpKind::InlineCall,
+                            __arg_regs,
+                            vec![Register::new(result_kind, throwaway_reg)],
+                        ),
+                        quote! {
+                            use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
+                            let __sub_jitcode = #builder_path(__asm);
+                            let (__sub_return_kind, _) = __sub_jitcode
+                                .trailing_return_info()
+                                .expect("inline helper jitcode must end in a typed return opcode");
+                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
+                }
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
                         let typed_args = quote! {
