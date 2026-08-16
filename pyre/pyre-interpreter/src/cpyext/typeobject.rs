@@ -285,20 +285,54 @@ const fn immortal_type() -> CPyTypeObject {
 /// never entered in the census.
 pub static mut CPY_MODULE_DEF_TYPE: CPyTypeObject = immortal_type();
 
+/// The name a synthesized mirror hands out as `tp_name`.
+///
+/// `tp_name` is a `const char *` an extension may keep for as long as it holds
+/// the type, so the string has to outlive every read of the field and die with
+/// the mirror rather than with this call.  Keyed by the mirror's address, which
+/// is fixed for its life; [`forget_type_name`] is what releases it.
+type NameTable = std::collections::HashMap<
+    usize,
+    CString,
+    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
+>;
+static TYPE_NAMES: super::ForkMutex<NameTable> =
+    super::ForkMutex::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
+
+pub(super) fn forget_type_name(mirror: usize) {
+    TYPE_NAMES.lock().remove(&mirror);
+}
+
 /// Fill a synthesized mirror for an interpreter type.
 ///
 /// `tp_basicsize` stays 0 on purpose: an instance of a pyre type is exactly a
 /// `PyObject` mirror, and `make_ref` reads this field to size the block.
+///
+/// The refcount is left as [`pyobject::attach`] set it: a synthesized mirror
+/// carries the ordinary link share and is released with the type it stands for,
+/// which is what keeps a class the extension merely observed collectable.
 pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     let name = unsafe { pyre_object::typeobject::w_type_get_name(w_type) };
-    // Leaked because `tp_name` is a `const char *` the extension may keep; the
-    // type it names is itself immortal, so the string's lifetime matches.
-    let name = CString::new(name).unwrap_or_default().into_raw();
+    let name = CString::new(name).unwrap_or_default();
+    // The bytes are boxed, so moving the `CString` into the table below leaves
+    // this pointer valid.
+    let pointer = name.as_ptr();
+    let heaptype = match unsafe { pyre_object::typeobject::w_type_is_heaptype(w_type) } {
+        true => PY_TPFLAGS_HEAPTYPE,
+        false => 0,
+    };
     unsafe {
-        (*mirror).ob_base.ob_base.ob_refcnt = REFCNT_IMMORTAL;
-        (*mirror).tp_name = name;
-        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_BASETYPE;
+        (*mirror).tp_name = pointer;
+        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_BASETYPE | heaptype;
     }
+    TYPE_NAMES.lock().insert(mirror as usize, name);
+}
+
+/// `true` when `tp` is a type whose storage is the mirror layer's to release —
+/// the predicate `type_dealloc` and `_dealloc` both branch on
+/// (`typeobject.py:716`, `object.py:72`).
+pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
+    !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0
 }
 
 /// `true` when a mirror is a `PyModuleDef` rather than a linked object.
@@ -2438,8 +2472,12 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             &raw mut (*tp).ob_base.ob_base,
         );
-        (*tp).ob_base.ob_base.ob_type =
-            pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
+        // Written rather than moved: whatever the static declared as its
+        // metatype is discarded here, so there is no reference of this layer's
+        // to release off it.
+        let metatype = pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
+        (*tp).ob_base.ob_base.ob_type = metatype;
+        pyobject::own_heap_type(metatype);
         (*tp).tp_flags = ((*tp).tp_flags & !PY_TPFLAGS_READYING) | PY_TPFLAGS_READY;
     }
     set_fast_subclass_flags(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
@@ -2777,6 +2815,7 @@ pub(super) unsafe fn after_fork_child() {
     unsafe {
         TYPE_MODULES.reinit_after_fork();
         TYPE_TOKENS.reinit_after_fork();
+        TYPE_NAMES.reinit_after_fork();
     }
 }
 
@@ -3073,7 +3112,7 @@ pub unsafe extern "C" fn PyObject_Init(
     if object.is_null() {
         return unsafe { super::pyerrors::PyErr_NoMemory() };
     }
-    unsafe { (*object).ob_type = tp };
+    unsafe { pyobject::set_ob_type(object, tp) };
     if unsafe { !(*object).ob_pyre_link.is_null() } {
         return object;
     }

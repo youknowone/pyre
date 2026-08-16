@@ -1321,6 +1321,18 @@ static PyObject *m_new_ref(PyObject *self, PyObject *arg)
     return Py_BuildValue("(NN)", Py_NewRef(Py_True), Py_XNewRef(arg));
 }
 
+/* The type mirror behind `Py_TYPE`: its name, and whether it is a heap type.
+   A class written in Python is one and a built-in is not, which is what
+   decides whose storage the mirror is and whether this block holds a
+   reference to it. */
+static PyObject *m_type_mirror(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    PyTypeObject *tp = Py_TYPE(arg);
+    return Py_BuildValue("(si)", tp->tp_name,
+                         PyType_HasFeature(tp, Py_TPFLAGS_HEAPTYPE) ? 1 : 0);
+}
+
 /* The object allocator, whose blocks go back through `PyObject_Free`. */
 static PyObject *m_object_blocks(PyObject *self, PyObject *unused)
 {
@@ -1593,6 +1605,7 @@ static PyMethodDef methods[] = {
     {"bytes_pairs", m_bytes_pairs, METH_NOARGS, "a filled buffer as a dict key and value"},
     {"bytes_empty", m_bytes_empty, METH_NOARGS, "the empty allocation and the size check"},
     {"new_ref", m_new_ref, METH_O, "Py_NewRef and Py_XNewRef"},
+    {"type_mirror", m_type_mirror, METH_O, "Py_TYPE's name and heap-type flag"},
     {"object_blocks", m_object_blocks, METH_NOARGS, "the object allocator"},
     {"int_convert", m_int_convert, METH_O, "the int conversions"},
     {"module_ops", m_module_ops, METH_NOARGS, "the module constructors"},

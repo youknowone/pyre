@@ -432,6 +432,38 @@ assert m.new_ref(marker)[1] is marker
 # wrapping product is refused.
 assert m.object_blocks() == (1, 1, 1), m.object_blocks()
 
+# ── the type mirror behind Py_TYPE ─────────────────────────────────────
+# A built-in type is not a heap type; a class written in Python is.
+assert m.type_mirror(1) == ('int', 0), m.type_mirror(1)
+assert m.type_mirror('x') == ('str', 0), m.type_mirror('x')
+
+class Named:
+    pass
+
+assert m.type_mirror(Named()) == ('Named', 1), m.type_mirror(Named())
+# A mirror is minted once and read back the same however many times it is
+# asked for, and an instance keeps its own type's mirror readable.
+kept = Named()
+assert m.type_mirror(kept) == m.type_mirror(Named())
+# Classes minted and dropped in a loop: each one's mirror is released with the
+# class rather than pinning it, so the name read here is this class's own.
+for index in range(64):
+    made = type('T%d' % index, (), {})
+    assert m.type_mirror(made()) == ('T%d' % index, 1)
+assert m.type_mirror(kept) == ('Named', 1)
+# The mirror carries the ordinary link share, so having been read from C does
+# not make the class outlive the last reference to it.  Two collections: the
+# instance's mirror holds a reference to its heap type's mirror, and it is the
+# first collection's drain that gives that one back.
+import gc, weakref
+gone = type('Gone', (), {})
+assert m.type_mirror(gone()) == ('Gone', 1)
+watch = weakref.ref(gone)
+del gone
+gc.collect()
+gc.collect()
+assert watch() is None, watch()
+
 # ── the int conversions ────────────────────────────────────────────────
 (from_small, from_wide, narrow, wide, overflow, too_big, needed,
  restored, unsigned_restored, digit_bits) = m.int_convert(1 << 200)

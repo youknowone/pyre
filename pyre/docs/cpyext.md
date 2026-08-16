@@ -107,6 +107,15 @@ the header below.
   references owned by their container, the per-mirror byte cache behind
   `PyUnicode_AsUTF8` / `PyBytes_AsString`, and the immortal singletons
   `Py_None` / `Py_True` / `Py_False` / `Py_Ellipsis` / `Py_NotImplemented`;
+- the type mirror `Py_TYPE(x)` answers with. A type an extension defined is its
+  own `PyTypeObject` static, which `PyType_Ready` links in place and which is
+  immortal because that storage is the library's; a type pyre defines gets a
+  synthesized block carrying the ordinary link share, so a class the extension
+  merely observed dies with the interpreter's own last reference to it. Its
+  `tp_flags` carry `Py_TPFLAGS_HEAPTYPE` for a heap type, which is what decides
+  whether a block holds a reference to its own type (`pyobject.py:91-93`,
+  `object.py:72-73`) and whose storage the mirror is
+  (`typeobject.py:716-722`);
 - the two forms a mirror is handed out in before its interpreter object exists
   (`cpyext/unicodeobject.rs`, `cpyext/bytesobject.rs`): `PyUnicode_New(size,
   maxchar)` and `PyBytes_FromStringAndSize(NULL, size)` return an unlinked

@@ -126,7 +126,7 @@ pub(super) unsafe fn after_fork_child() {
 /// The mirror of an interpreter object's type.
 ///
 /// A type a C extension defined already has one — its own `PyTypeObject`
-/// static, entered by `PyType_Ready` — and every other type gets an immortal
+/// static, entered by `PyType_Ready` — and every other type gets a synthesized
 /// block of the same shape so that `Py_TYPE(x)->tp_name` reads something.
 pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
     match crate::typedef::r#type(w_obj) {
@@ -152,17 +152,54 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         // second call finds this mirror in the table and terminates.
         let mirror = attach(
             w_obj,
-            REFCNT_IMMORTAL,
+            REFCNT_FROM_PYRE,
             std::ptr::null_mut(),
             size_of::<CPyTypeObject>(),
         ) as *mut CPyTypeObject;
         super::typeobject::describe_interpreter_type(mirror, w_obj);
+        // `typeobject.py:727-732`: the metatype is referenced from here only
+        // when it is itself a heap type.
         let of_type = type_mirror(w_obj);
-        unsafe { (*mirror).ob_base.ob_base.ob_type = of_type };
+        unsafe { set_ob_type(&raw mut (*mirror).ob_base.ob_base, of_type) };
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
     attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type))
+}
+
+/// `pyobject.py:91-93` — a block references its type's mirror only when that
+/// type is a heap type.
+///
+/// A static type's mirror outlives every block of it, so counting the
+/// references to it would be counting to a number nothing reads;
+/// [`release_heap_type`] is the other half.
+pub(super) fn own_heap_type(ob_type: *mut CPyTypeObject) {
+    if super::typeobject::is_heap_type(ob_type) {
+        unsafe { incref(&raw mut (*ob_type).ob_base.ob_base) };
+    }
+}
+
+/// `object.py:72-73` — the `finally` half of [`own_heap_type`], run once the
+/// block that held the reference is gone.
+fn release_heap_type(ob_type: *mut CPyTypeObject) {
+    if super::typeobject::is_heap_type(ob_type) {
+        unsafe { decref(&raw mut (*ob_type).ob_base.ob_base) };
+    }
+}
+
+/// Point a block at `ob_type`, moving the reference [`own_heap_type`] records
+/// off whatever it named before.
+///
+/// # Safety
+/// `raw` must be a live block whose `ob_type` is either null or a live mirror.
+pub(super) unsafe fn set_ob_type(raw: *mut CPyObject, ob_type: *mut CPyTypeObject) {
+    let previous = unsafe { (*raw).ob_type };
+    unsafe { (*raw).ob_type = ob_type };
+    // The new reference is taken first: the two can name the same mirror, and
+    // releasing it to the bare link share and back would trip the floor a
+    // linked mirror's count has.
+    own_heap_type(ob_type);
+    release_heap_type(previous);
 }
 
 /// Allocate a zero-filled mirror block of `size` bytes and enter it into the
@@ -183,6 +220,7 @@ pub(super) fn attach(
         (*raw).ob_pyre_link = w_obj;
         (*raw).ob_type = ob_type;
     }
+    own_heap_type(ob_type);
     enter(w_obj, raw, size);
     raw
 }
@@ -396,6 +434,9 @@ pub unsafe fn decref(raw: *mut CPyObject) {
 unsafe fn dealloc(raw: *mut CPyObject) {
     let address = raw as usize;
     debug_assert_eq!(unsafe { (*raw).ob_refcnt }, 0, "dealloc below zero");
+    // `object.py:67`, read before `tp_free` can hand the block back: the
+    // reference this block owns in its type is released at the end.
+    let ob_type = unsafe { (*raw).ob_type };
     // object.c:77, the same thing as `rawrefcount.mark_deallocating()`: the
     // link is dead but `tp_dealloc` may still ask for it.
     majit_gc::gc_rawrefcount_mark_deallocating(deallocating_marker(), address);
@@ -408,8 +449,9 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
+    super::typeobject::forget_type_name(address);
     let block = block_at(address);
-    if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
+    let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
         unsafe { call(raw) };
         // A `tp_dealloc` ends in `tp_free`, which returns the block through
@@ -417,11 +459,14 @@ unsafe fn dealloc(raw: *mut CPyObject) {
         // The generation and not just the address decides it: a `tp_dealloc`
         // that allocates after freeing can be handed the address back, and
         // what sits there then is somebody else's live block.
-        if block_at(address) != block {
-            return;
-        }
+        block_at(address) != block
+    } else {
+        false
+    };
+    if !returned {
+        unsafe { free_block(raw) };
     }
-    unsafe { free_block(raw) };
+    release_heap_type(ob_type);
 }
 
 /// A block for the object allocator, entered in the same census as a mirror so
@@ -434,6 +479,11 @@ unsafe fn dealloc(raw: *mut CPyObject) {
 /// The size is floored at a whole [`CPyObject`] because [`free_block`] clears
 /// that header before releasing the block.  A caller asking for less still gets
 /// what it asked for; the floor only makes the block larger.
+///
+/// The header is cleared even when the caller did not ask for zeroed memory:
+/// `PyObject_Init` reads `ob_pyre_link` to tell a block that is already an
+/// object from one that is still bytes, so those three words have to mean
+/// something before anything is stamped into them.
 pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
     if size > isize::MAX as usize {
         return std::ptr::null_mut();
@@ -449,6 +499,15 @@ pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
     };
     if raw.is_null() {
         return std::ptr::null_mut();
+    }
+    if !zeroed {
+        unsafe {
+            (raw as *mut CPyObject).write(CPyObject {
+                ob_refcnt: 0,
+                ob_pyre_link: PY_NULL,
+                ob_type: std::ptr::null_mut(),
+            })
+        };
     }
     record_block(raw as usize, size);
     raw as *mut std::ffi::c_void
@@ -684,11 +743,11 @@ pub fn init_singletons() {
         attach_foreign(w_obj, raw);
     }
     // Deferred until the links are in the table: `type_mirror` takes the same
-    // lock, and a singleton's type mirror is an ordinary immortal mirror.
+    // lock, and a singleton's type mirror is an ordinary synthesized mirror.
     for (raw, _) in bound {
         if unsafe { (*raw).ob_type.is_null() } {
             let of_type = type_mirror(unsafe { (*raw).ob_pyre_link });
-            unsafe { (*raw).ob_type = of_type };
+            unsafe { set_ob_type(raw, of_type) };
         }
     }
 }
