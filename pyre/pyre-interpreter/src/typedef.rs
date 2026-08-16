@@ -24002,8 +24002,12 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let other = args[1];
     // Materialize the new bytes before mutating so `x.extend(x)` is safe.
     let appended: Vec<u8> = unsafe {
-        if pyre_object::bytesobject::is_bytes_like(other) {
-            pyre_object::bytesobject::bytes_like_data(other).to_vec()
+        // bytearrayobject.py:561-569 `makebytearraydata_w` asks for
+        // `BUF_FULL_RO` before falling back to the integer iterator.  This
+        // matters for exporters such as `array('i')`: iteration yields ten
+        // integers, while its buffer contains forty bytes.
+        if let Some(buffer) = buffer_as_bytes_like(other)? {
+            pyre_object::bytesobject::bytes_like_data(buffer).to_vec()
         } else {
             // `PyObject_GetIter` — a non-iterable operand is the "can't extend" case.
             let it = crate::baseobjspace::iter(other).map_err(|e| {

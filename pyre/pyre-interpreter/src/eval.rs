@@ -2203,6 +2203,9 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // no-tracer hot path is a single null-check + ticker decrement.
         let ec = frame.execution_context as *mut crate::PyExecutionContext;
         if !ec.is_null() {
+            if frame.take_failed_attr_before_opcode() {
+                unsafe { (*ec).run_failed_attr_finalizers() };
+            }
             let trace_result = unsafe {
                 (*ec).bytecode_trace(
                     frame as *mut PyFrame,
@@ -2273,39 +2276,10 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
 /// `_pyio` streams. A reachability pass, rather than an IO/type shortcut,
 /// decides whether the receiver is actually dead.
 #[majit_macros::dont_look_inside]
-pub(crate) fn finalize_failed_attr_receiver_now(
-    obj: PyObjectRef,
-    execution_context: *mut crate::PyExecutionContext,
-) {
-    let has_finalizer = crate::typedef::r#type(obj).is_some_and(|w_type| unsafe {
+pub(crate) fn finalize_failed_attr_receiver_now(obj: PyObjectRef) -> bool {
+    crate::typedef::r#type(obj).is_some_and(|w_type| unsafe {
         crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__").is_some()
-    });
-    if !has_finalizer || execution_context.is_null() {
-        return;
-    }
-    // The popped temporary normally lives in the nursery.  This boundary has
-    // rooted the pending exception and has no other live managed temporary;
-    // run the same full reachability pass exposed by `gc.collect()` so the
-    // nursery object can actually become unreachable before the handler.
-    pyre_object::gc_hook::try_gc_collect();
-    unsafe { (*execution_context)._run_finalizers_now() };
-}
-
-fn finalize_failed_attr_receiver(
-    obj: PyObjectRef,
-    mut error: PyError,
-    execution_context: *mut crate::PyExecutionContext,
-) -> PyError {
-    // The reachability pass must not keep `obj` alive, but the pending
-    // AttributeError is still interpreter state and has to survive the same
-    // collection while an unrelated finalizer reports an unraisable error.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc = error.to_exc_object();
-    pyre_object::gc_roots::pin_root(exc);
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    finalize_failed_attr_receiver_now(obj, execution_context);
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-    error
+    })
 }
 
 impl SharedOpcodeHandler for PyFrame {
@@ -2400,7 +2374,14 @@ impl SharedOpcodeHandler for PyFrame {
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
         getattr_str(obj, name).map_err(|error| {
-            finalize_failed_attr_receiver(obj, error, self.execution_context as *mut _)
+            if finalize_failed_attr_receiver_now(obj) {
+                // Keep this write on the live virtualizable red frame.  The
+                // opaque helper only answers the semantic type question;
+                // writing `frame.flags` inside it would race the JIT's
+                // register-resident copy of the same field.
+                self.defer_failed_attr_until_pop_except();
+            }
+            error
         })
     }
 
@@ -3408,6 +3389,12 @@ pub fn with_except_start_values(
 }
 
 impl OpcodeStepExecutor for PyFrame {
+    fn pop_top(&mut self) -> Result<(), PyError> {
+        let _ = self.pop_value()?;
+        self.failed_attr_after_stack_pop();
+        Ok(())
+    }
+
     /// SETUP_ANNOTATIONS — ensure `__annotations__` exists in the
     /// current locals namespace. PyPy: pyopcode.py SETUP_ANNOTATIONS
     /// (typeobject.py auto-fills the slot at class creation, but the
@@ -4063,6 +4050,7 @@ impl OpcodeStepExecutor for PyFrame {
         // the same codewriter-resolvability reason as `push_exc_info`.
         let prev_exc = self.pop();
         set_current_exception(prev_exc);
+        self.failed_attr_after_pop_except();
         Ok(())
     }
 
@@ -4756,7 +4744,10 @@ impl OpcodeStepExecutor for PyFrame {
             )
         }
         .map_err(|error| {
-            finalize_failed_attr_receiver(obj, error, self.execution_context as *mut _)
+            if finalize_failed_attr_receiver_now(obj) {
+                self.defer_failed_attr_until_pop_except();
+            }
+            error
         })?;
         self.push(w_value);
         Ok(())

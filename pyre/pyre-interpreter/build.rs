@@ -40,6 +40,39 @@ const RE_CLOSURE: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // PyPy's `_multibytecodec` uses the cjkcodecs engine and mapping tables
+    // verbatim (`pypy/module/_multibytecodec/c_codecs.py` ECI). Compile the
+    // Japanese codec unit together with the shared stateful buffer engine;
+    // Rust only provides the interpreter wrappers around this ABI.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !target.starts_with("wasm32-") {
+        let cjk_root = Path::new("src/module/_multibytecodec");
+        let cjk_sources = [
+            "src/module/_multibytecodec/src/cjkcodecs/_codecs_jp.c",
+            "src/module/_multibytecodec/src/cjkcodecs/multibytecodec.c",
+        ];
+        for source in cjk_sources {
+            println!("cargo:rerun-if-changed={source}");
+        }
+        for header in [
+            "src/precommondefs.h",
+            "src/cjkcodecs/alg_jisx0201.h",
+            "src/cjkcodecs/cjkcodecs.h",
+            "src/cjkcodecs/emu_jisx0213_2000.h",
+            "src/cjkcodecs/fixnames.h",
+            "src/cjkcodecs/mappings_jisx0213_pair.h",
+            "src/cjkcodecs/mappings_jp.h",
+            "src/cjkcodecs/multibytecodec.h",
+        ] {
+            println!("cargo:rerun-if-changed={}", cjk_root.join(header).display());
+        }
+        cc::Build::new()
+            .files(cjk_sources)
+            .include(cjk_root)
+            .warnings(false)
+            .compile("pyre_cjkcodecs_jp");
+    }
+
     // Only do work for the wasm_vfs feature; native builds need nothing here.
     if std::env::var_os("CARGO_FEATURE_WASM_VFS").is_none() {
         return;

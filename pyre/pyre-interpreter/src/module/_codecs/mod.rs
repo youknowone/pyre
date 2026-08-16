@@ -591,6 +591,11 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(crate::PyError::type_error("lookup() argument must be str"));
     }
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
+    // PyPy's `space.text0_w` gateway rejects this before normalization.  A
+    // NUL must not be folded away into a valid codec name.
+    if encoding.contains('\0') {
+        return Err(crate::PyError::value_error("embedded null character"));
+    }
     let normalized_encoding = normalize(&encoding);
 
     with_codec_state(|state| {

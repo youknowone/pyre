@@ -31,10 +31,9 @@ majit_macros::virtualizable! {
     },
 
     // Layout: [frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
-    //          valuestackdepth:Int, debugdata:Ref, w_globals:Ref,
-    //          array...]
+    //          valuestackdepth:Int, debugdata:Ref, w_globals:Ref, array...]
     // Mirrors `pypy/module/pypyjit/interp_jit.py:25-30`'s
-    // `_virtualizable_` declaration line by line; `ec` is from
+    // `_virtualizable_` declaration line by line. `ec` is from
     // `interp_jit.py:67 reds = ['frame', 'ec']` (extra_reds above).
     inputargs = {
         last_instr: Int,

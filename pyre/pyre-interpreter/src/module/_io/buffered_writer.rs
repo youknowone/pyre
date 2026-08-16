@@ -378,7 +378,7 @@ impl W_BufferedWriter {
 
     fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
         Err(crate::PyError::type_error(format!(
-            "cannot serialize '{}' object",
+            "cannot pickle '{}' object",
             crate::type_methods::arg_type_name(self.self_obj())
         )))
     }

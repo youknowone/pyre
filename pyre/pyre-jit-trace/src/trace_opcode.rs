@@ -1955,7 +1955,7 @@ impl MIFrame {
     /// `merge_point_shape_assert_prerequisite_2026_05_03.md`).
     ///
     /// Shape derivation matches `close_loop_args_at`:
-    /// `1 (frame) + extra_reds (ec) + 5 (vable scalars) + target_array_capacity`
+    /// `1 (frame) + extra_reds (ec) + NUM_VABLE_SCALARS + target_array_capacity`
     /// where the vable scalars are
     /// `[next_instr, code, stack_depth, debugdata, namespace]`
     /// and `target_array_capacity` is either the virtualizable array
@@ -1977,8 +1977,7 @@ impl MIFrame {
             .map(|lengths| lengths.iter().copied().sum::<usize>())
             .filter(|&len| len >= nlocals)
             .unwrap_or(nlocals + stack_only);
-        // 1 (frame) + extra_reds + 5 (vable_scalars) + target_array_capacity
-        6 + extra_reds + target_array_capacity
+        1 + extra_reds + crate::virtualizable_gen::NUM_VABLE_SCALARS + target_array_capacity
     }
 
     /// TODO: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`

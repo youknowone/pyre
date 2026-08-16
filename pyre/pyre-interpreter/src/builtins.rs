@@ -152,6 +152,15 @@ pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), cra
         // does.  Make non-moving major progress before rejecting the resize:
         // dead stable-allocated views run `memoryview_object_destructor` and
         // release their backing export, while a live view remains counted.
+        //
+        // The collector reads `PyFrame.valuestackdepth` to exclude popped
+        // operand slots.  When this check is reached from assembler that
+        // virtualizable field is still register-resident, so materialize the
+        // current red frame first.  This is the explicit counterpart of
+        // RPython `rvirtualizable.py:49-53 hook_access_field`: an opaque
+        // consumer which reads a redirected field receives
+        // `force_virtualizable_if_necessary` before the read.
+        crate::executioncontext::force_frame(crate::eval::current_frame());
         // `collect_oldgen` is essential here: callers still hold `obj` in a
         // by-value interpreter local, so this check must not move it.
         pyre_object::gc_hook::try_gc_collect_oldgen();
@@ -14930,7 +14939,14 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__iter__",
-            make_builtin_function_with_arity("__iter__", |args| Ok(args[0]), 1),
+            make_builtin_function_with_arity(
+                "__iter__",
+                |args| {
+                    file_check_closed(args[0])?;
+                    Ok(args[0])
+                },
+                1,
+            ),
         )
     };
     unsafe {
@@ -16033,7 +16049,7 @@ fn seam_to_io(e: crate::host_seam::SeamError) -> std::io::Error {
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     #[cfg(feature = "sandbox")]
     {
         // The controller services one read per request; copy the reply (at most
@@ -16045,12 +16061,27 @@ fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
     #[cfg(not(feature = "sandbox"))]
     {
-        // `count` is `size_t` on Unix but `c_uint` on Windows; `as _` casts
-        // to whichever the platform's `libc::read` expects.
+        let count = buf.len().min(i32::MAX as usize);
+        #[cfg(windows)]
+        unsafe extern "C" {
+            fn __doserrno() -> *mut u32;
+        }
         let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
-            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as _)
+            #[cfg(windows)]
+            {
+                // CPython `_Py_read`: the UCRT maps an empty nonblocking pipe
+                // to EINVAL plus ERROR_NO_DATA in `_doserrno`.
+                *__doserrno() = 0;
+            }
+            libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, count as _)
         });
         if n < 0 {
+            #[cfg(windows)]
+            let errno = if errno == libc::EINVAL && unsafe { *__doserrno() } == 232 {
+                libc::EAGAIN
+            } else {
+                errno
+            };
             // `EINTR` travels to the caller, the way `os.read`'s `OSError`
             // does: only the caller can run the pending signal handlers
             // before re-issuing the call ([`eintr_retry`]).
@@ -16096,7 +16127,7 @@ fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
 
 /// Read up to `n` bytes (or until EOF when `n` is `None`) from `fd`.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn fd_read(fd: i32, n: Option<usize>) -> Result<Vec<u8>, crate::PyError> {
+fn fd_read(fd: i32, n: Option<usize>) -> Result<Option<Vec<u8>>, crate::PyError> {
     let mut out = Vec::new();
     let mut buf = [0u8; 65536];
     loop {
@@ -16111,6 +16142,13 @@ fn fd_read(fd: i32, n: Option<usize>) -> Result<Vec<u8>, crate::PyError> {
         };
         let got = match fd_read_into(fd, &mut buf[..want]) {
             Ok(got) => got,
+            Err(err)
+                if err
+                    .raw_os_error()
+                    .is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) =>
+            {
+                return Ok((!out.is_empty()).then_some(out));
+            }
             Err(err) => {
                 eintr_retry(err)?;
                 continue;
@@ -16121,7 +16159,7 @@ fn fd_read(fd: i32, n: Option<usize>) -> Result<Vec<u8>, crate::PyError> {
         }
         out.extend_from_slice(&buf[..got]);
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -16243,7 +16281,10 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             return match n {
-                Some(n) => fd_bytes_to_obj(args[0], fd_read(fd, Some(n))?),
+                Some(n) => match fd_read(fd, Some(n))? {
+                    Some(data) => fd_bytes_to_obj(args[0], data),
+                    None => Ok(w_none()),
+                },
                 None => match fileio_readall(args[0], fd)? {
                     Some(data) => fd_bytes_to_obj(args[0], data),
                     None => Ok(w_none()),
@@ -16397,6 +16438,60 @@ pub(crate) unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>
     }
 }
 
+/// One CPython `_Py_write_impl` attempt, including its Windows nonblocking
+/// pipe handling. The caller owns EINTR retry and the distinction between
+/// `os.write` (raise EAGAIN) and `FileIO.write` (return None on EAGAIN).
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+pub(crate) fn crt_write_once(fd: libc::c_int, data: &[u8]) -> (i64, i32) {
+    let mut count = data.len().min(i32::MAX as usize);
+    #[cfg(windows)]
+    if count > 32_767 && crt_call!(libc::isatty(fd)) != 0 {
+        // CPython `_Py_write_impl`, issue #11395: the Windows console cannot
+        // reliably accept a larger binary write.
+        count = 32_767;
+    }
+
+    #[cfg(windows)]
+    {
+        unsafe extern "C" {
+            fn __doserrno() -> *mut u32;
+        }
+        let mut write_count = count;
+        loop {
+            let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+                // CPython writes `_doserrno = 0` immediately before `write`.
+                // This thread-local CRT slot distinguishes a full
+                // nonblocking pipe from a real device/disk ENOSPC.
+                *__doserrno() = 0;
+                libc::write(fd, data.as_ptr() as *const libc::c_void, write_count as _)
+            });
+            let doserrno = unsafe { *__doserrno() };
+            if ret >= 0 || errno != libc::ENOSPC || doserrno != 0 {
+                return (ret as i64, errno);
+            }
+            write_count /= 2;
+            if write_count == 0 {
+                // CPython assigns `errno = EAGAIN` before returning -1.
+                // BufferedWriter reads that saved CRT errno after FileIO has
+                // translated the syscall result to None.
+                rustpython_host_env::os::set_errno(libc::EAGAIN);
+                return (ret as i64, libc::EAGAIN);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+            libc::write(fd, data.as_ptr() as *const libc::c_void, count as _)
+        });
+        (ret as i64, errno)
+    }
+}
+
 fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Err(crate::PyError::type_error("write() requires (self, data)"));
@@ -16420,10 +16515,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         {
             #[cfg(not(feature = "sandbox"))]
             let n = loop {
-                // `count` is `size_t` on Unix but `c_uint` on Windows.
-                let (n, errno) = crate::module::thread::call_external_function(|| unsafe {
-                    libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len() as _)
-                });
+                let (n, errno) = crt_write_once(fd, &bytes);
                 if n >= 0 {
                     break n as i64;
                 }
@@ -16979,11 +17071,14 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
         }
 
+        // This native open call does not add a Python frame between the user
+        // and `_io.text_encoding`; one frame of warning stack depth is enough.
+        let resolved_encoding = crate::module::_io::text_encoding(w_encoding, 1)?;
         let wrapper = crate::call::call_function_impl_result(
             text_io_wrapper_type(),
             &[
                 pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-                w_encoding,
+                resolved_encoding,
                 w_errors,
                 w_newline,
                 w_bool_from(line_buffering),

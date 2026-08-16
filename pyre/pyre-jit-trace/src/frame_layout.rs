@@ -22,6 +22,10 @@ pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 /// the way the getter's `mark_as_escaped()` does.
 pub const PYFRAME_FLAGS_OFFSET: usize = std::mem::offset_of!(PyFrame, flags);
 
+/// Byte offset of the CPython-observable failed-attribute cleanup state.
+pub const PYFRAME_FAILED_ATTR_CLEANUP_OFFSET: usize =
+    std::mem::offset_of!(PyFrame, failed_attr_cleanup);
+
 /// Byte offset of `debugdata` in `PyFrame`.
 pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugdata);
 

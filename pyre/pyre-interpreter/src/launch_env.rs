@@ -24,6 +24,7 @@ pub struct LaunchFlags {
     pub ignore_environment: bool,
     pub isolated: bool,
     pub dev_mode: bool,
+    pub warn_default_encoding: bool,
     /// `None` until [`finalize`] resolves it; a command line that named
     /// `-X utf8` carries that value through instead.
     pub utf8_mode: Option<i64>,

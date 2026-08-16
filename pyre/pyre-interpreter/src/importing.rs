@@ -616,6 +616,10 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_jp);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a
     // module literally named `posix` does not exist. os.py picks `os.name` and
@@ -2829,6 +2833,7 @@ static SYS_WARNOPTIONS: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
 static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -2853,6 +2858,7 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_IGNORE_ENVIRONMENT.store(flags.ignore_environment, Ordering::Relaxed);
     SYS_ISOLATED.store(flags.isolated, Ordering::Relaxed);
     SYS_DEV_MODE.store(flags.dev_mode, Ordering::Relaxed);
+    SYS_WARN_DEFAULT_ENCODING.store(flags.warn_default_encoding, Ordering::Relaxed);
     SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
     SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);
@@ -2926,6 +2932,10 @@ pub fn dev_mode_flag() -> bool {
 
 pub fn utf8_mode_flag() -> i64 {
     SYS_UTF8_MODE.load(Ordering::Relaxed)
+}
+
+pub fn warn_default_encoding_flag() -> bool {
+    SYS_WARN_DEFAULT_ENCODING.load(Ordering::Relaxed)
 }
 
 /// `#[dont_look_inside]`: reads the runtime-mutable `SYS_SAFE_PATH` global

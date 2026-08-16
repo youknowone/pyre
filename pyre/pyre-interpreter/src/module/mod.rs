@@ -17,6 +17,9 @@ pub mod _blake2;
 #[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_jp;
+#[allow(non_snake_case)]
 pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
@@ -36,6 +39,9 @@ pub mod _io;
 pub mod _json;
 #[allow(non_snake_case)]
 pub mod _locale;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _multiprocessing;

@@ -884,6 +884,17 @@ impl ExecutionContext {
         }
     }
 
+    /// Consume a failed-attribute finalization request after the live red
+    /// frame has cleared its own dispatch flag.  This boundary has no live
+    /// opcode temporaries outside the published PyFrame roots.
+    pub fn run_failed_attr_finalizers(&self) {
+        let action = space_user_del_action();
+        if !action.is_null() {
+            pyre_object::gc_hook::try_gc_collect_oldgen();
+            unsafe { (*action)._run_finalizers() };
+        }
+    }
+
     /// pypy/interpreter/executioncontext.py:185-200 `run_trace_func`.
     ///
     /// ```python

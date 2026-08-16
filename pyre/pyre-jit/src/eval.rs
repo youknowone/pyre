@@ -4532,6 +4532,11 @@ fn install_pyre_object_hooks() {
             (T, fl::PYFRAME_VALUESTACKDEPTH_OFFSET, "valuestackdepth"),
             (T, fl::PYFRAME_LAST_INSTR_OFFSET, "last_instr"),
             (T, fl::PYFRAME_FLAGS_OFFSET, "flags"),
+            (
+                T,
+                fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+                "failed_attr_cleanup",
+            ),
             (T, fl::PYFRAME_DEBUGDATA_OFFSET, "debugdata"),
             (T, fl::PYFRAME_LASTBLOCK_OFFSET, "lastblock"),
             (T, fl::PYFRAME_VABLE_TOKEN_OFFSET, "vable_token"),
@@ -8539,6 +8544,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // pending the actionflag port.
         let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
+            // Keep the JIT portal's concrete dispatch in lockstep with
+            // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
+            // failed-attribute request is ordinary state on this concrete red
+            // frame, so both warm execution and generated traces must consume
+            // it here, before the next opcode runs.  Running finalizers may
+            // collect and move the frame; re-resolve it from the shadow-stack
+            // root before any further access.
+            if unsafe { &mut *f }.take_failed_attr_before_opcode() {
+                unsafe { (*ec_ptr).run_failed_attr_finalizers() };
+            }
+            let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A compiled back-edge deopts when the process breaker is armed.
             // On resume, run the live frame's ordinary bytecode_trace so its

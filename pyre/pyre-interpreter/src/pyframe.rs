@@ -570,6 +570,15 @@ pub struct PyFrame {
     /// `escaped()`/`set_escaped()`/`frame_finished_execution()`/
     /// `set_frame_finished_execution()` methods.
     pub flags: u8,
+    /// CPython 3.14 observable finalizer timing adaptation for a temporary
+    /// receiver consumed by a failing `LOAD_ATTR`.  PyPy's tracing GC does
+    /// not need this state, but pyre must retain it on the owning red frame
+    /// until the exception stack has discarded the receiver.  It is a
+    /// separate ordinary frame word rather than extra bits in `flags`. PyPy
+    /// leaves frame state that is not named by `_virtualizable_` on the
+    /// concrete red frame; traced accesses therefore remain ordinary
+    /// getfield/setfield operations on this frame's identity.
+    pub failed_attr_cleanup: usize,
     /// pyframe.py:82 debugdata — lazily allocated tracing/debug payload.
     /// Virtualizable static field (interp_jit.py:28).
     pub debugdata: *mut FrameDebugData,
@@ -2927,6 +2936,7 @@ impl PyFrame {
             valuestackdepth: self.valuestackdepth,
             last_instr: self.last_instr,
             flags: self.flags,
+            failed_attr_cleanup: self.failed_attr_cleanup,
             debugdata: unsafe { clone_debugdata_ptr(self.debugdata, allocation) },
             lastblock: unsafe { clone_block_chain(self.lastblock, allocation) },
             vable_token: self.vable_token,
@@ -3445,6 +3455,10 @@ impl PyFrame {
     pub const FLAG_ESCAPED: u8 = 0b01;
     /// `frame_finished_execution` status bit.
     pub const FLAG_FRAME_FINISHED: u8 = 0b10;
+    /// A failed LOAD_ATTR is waiting for this frame's POP_EXCEPT cleanup.
+    const FAILED_ATTR_AFTER_POP_EXCEPT: usize = 4;
+    /// The next dispatch boundary must collect the failed LOAD_ATTR receiver.
+    const FAILED_ATTR_BEFORE_OPCODE: usize = usize::MAX;
 
     /// pyframe.py:80 `escaped`.
     #[inline]
@@ -3474,6 +3488,47 @@ impl PyFrame {
         } else {
             self.flags &= !Self::FLAG_FRAME_FINISHED;
         }
+    }
+
+    /// Keep CPython-refcount compatibility cleanup on the exact red frame
+    /// that owns the exception handler.  A process-global frame slot loses a
+    /// request when another inlined/nested frame fails an attribute lookup.
+    #[inline]
+    pub fn defer_failed_attr_until_pop_except(&mut self) {
+        self.failed_attr_cleanup = Self::FAILED_ATTR_AFTER_POP_EXCEPT;
+    }
+
+    #[inline]
+    pub fn failed_attr_after_pop_except(&mut self) {
+        if self.failed_attr_cleanup != Self::FAILED_ATTR_AFTER_POP_EXCEPT {
+            return;
+        }
+        self.failed_attr_cleanup = 3;
+    }
+
+    #[inline]
+    pub fn failed_attr_after_stack_pop(&mut self) {
+        if !(1..=3).contains(&self.failed_attr_cleanup) {
+            return;
+        }
+        self.failed_attr_cleanup -= 1;
+        if self.failed_attr_cleanup == 0 {
+            self.failed_attr_cleanup = Self::FAILED_ATTR_BEFORE_OPCODE;
+        }
+    }
+
+    #[inline]
+    pub fn take_failed_attr_before_opcode(&mut self) -> bool {
+        // This state is normally zero for the lifetime of a hot loop.  Promote
+        // it just like PyPy promotes frame dispatch state: a failed LOAD_ATTR
+        // changes the word and invalidates the compiled path, so exception
+        // cleanup resumes on the concrete per-frame red state.
+        let cleanup = majit_metainterp::jit::promote(self.failed_attr_cleanup);
+        if cleanup != Self::FAILED_ATTR_BEFORE_OPCODE {
+            return false;
+        }
+        self.failed_attr_cleanup = 0;
+        true
     }
 
     /// pyframe.py:183 mark_as_escaped
@@ -4471,6 +4526,7 @@ impl PyFrame {
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
             flags: 0,
+            failed_attr_cleanup: 0,
             debugdata: std::ptr::null_mut(),
             lastblock: std::ptr::null_mut(),
             vable_token: 0,
@@ -4777,6 +4833,7 @@ pub fn createframe_obj(
         valuestackdepth: num_locals + num_cells,
         last_instr: -1,
         flags: 0,
+        failed_attr_cleanup: 0,
         debugdata: std::ptr::null_mut(),
         lastblock: std::ptr::null_mut(),
         vable_token: 0,

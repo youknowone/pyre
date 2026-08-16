@@ -102,6 +102,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -111,6 +112,7 @@ windows-sys = { version = "0.61", features = [
 widestring = "1.2"
 
 [build-dependencies]
+cc = "1.2"
 # Compresses the embedded stdlib VFS blob at build time (only does work when the
 # wasm_vfs feature is enabled; otherwise build.rs returns early).
 lz4_flex = "0.13"

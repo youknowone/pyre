@@ -1158,10 +1158,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::current_ident",
         current_ident as *const (),
     );
-    let finalize_failed_attr_receiver_now: fn(
-        pyre_object::PyObjectRef,
-        *mut crate::PyExecutionContext,
-    ) = crate::eval::finalize_failed_attr_receiver_now;
+    let finalize_failed_attr_receiver_now: fn(pyre_object::PyObjectRef) -> bool =
+        crate::eval::finalize_failed_attr_receiver_now;
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::eval::finalize_failed_attr_receiver_now",

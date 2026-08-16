@@ -142,10 +142,7 @@ fn sysconf_names() -> &'static [(&'static str, i32)] {
         ),
         ("SC_THREAD_PRIO_INHERIT", libc::_SC_THREAD_PRIO_INHERIT),
         ("SC_THREAD_PRIO_PROTECT", libc::_SC_THREAD_PRIO_PROTECT),
-        (
-            "SC_THREAD_PROCESS_SHARED",
-            libc::_SC_THREAD_PROCESS_SHARED,
-        ),
+        ("SC_THREAD_PROCESS_SHARED", libc::_SC_THREAD_PROCESS_SHARED),
         ("SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
         ("SC_THREAD_STACK_MIN", libc::_SC_THREAD_STACK_MIN),
         ("SC_THREAD_THREADS_MAX", libc::_SC_THREAD_THREADS_MAX),
@@ -578,7 +575,13 @@ fn split_root(path: &rustpython_wtf8::Wtf8) -> (&rustpython_wtf8::Wtf8, &rustpyt
     // all ASCII, so the scan runs over the code-point values.
     let norm: Vec<u32> = path
         .code_points()
-        .map(|c| if c.to_u32() == '/' as u32 { SEP } else { c.to_u32() })
+        .map(|c| {
+            if c.to_u32() == '/' as u32 {
+                SEP
+            } else {
+                c.to_u32()
+            }
+        })
         .collect();
     let byte_at = |index: usize| {
         path.code_point_indices()
@@ -655,16 +658,11 @@ mod win_nt {
         io_err_with_filename(error, filename)
     }
 
-    fn io_err_with_filename(
-        error: &std::io::Error,
-        filename: PyObjectRef,
-    ) -> crate::PyError {
+    fn io_err_with_filename(error: &std::io::Error, filename: PyObjectRef) -> crate::PyError {
         match error.raw_os_error() {
-            Some(winerror) => crate::PyError::os_error_win32_syscall2(
-                winerror,
-                filename,
-                pyre_object::PY_NULL,
-            ),
+            Some(winerror) => {
+                crate::PyError::os_error_win32_syscall2(winerror, filename, pyre_object::PY_NULL)
+            }
             None => crate::PyError::os_error_syscall(
                 crate::builtins::io_error_posix_errno(error, 0),
                 filename,
@@ -857,8 +855,7 @@ mod win_nt {
                 "_remove_dll_directory() missing required argument 'cookie'",
             ));
         };
-        let cookie =
-            (crate::baseobjspace::int_w(arg)? as usize) as *mut std::ffi::c_void;
+        let cookie = (crate::baseobjspace::int_w(arg)? as usize) as *mut std::ffi::c_void;
         let ok = unsafe { RemoveDllDirectory(cookie) };
         Ok(pyre_object::w_bool_from(ok != 0))
     }
@@ -1623,7 +1620,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let major = crate::baseobjspace::c_int_w(major)?;
                     let minor = crate::baseobjspace::c_int_w(minor)?;
                     Ok(pyre_object::w_int_new(
-                        libc::makedev(major as _, minor as _) as i64
+                        libc::makedev(major as _, minor as _) as i64,
                     ))
                 },
                 2,
@@ -1653,7 +1650,54 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0))
         }
-        #[cfg(any(not(unix), feature = "sandbox"))]
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+
+            // CPython 3.14 `_Py_get_blocking`: translate the CRT descriptor
+            // through the host seam, then read PIPE_NOWAIT from the pipe's
+            // current mode.  GetNamedPipeHandleStateW is one of the narrow nt
+            // calls host_env does not wrap, like the other windows-sys calls
+            // owned by this crate.
+            let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
+                .map_err(|error| {
+                    crate::PyError::os_error_syscall(
+                        crate::builtins::io_error_posix_errno(&error, libc::EBADF),
+                        pyre_object::PY_NULL,
+                    )
+                })?;
+            let handle = rustpython_host_env::crt_fd::as_handle(borrowed).map_err(|error| {
+                crate::PyError::os_error_syscall(
+                    crate::builtins::io_error_posix_errno(&error, libc::EBADF),
+                    pyre_object::PY_NULL,
+                )
+            })?;
+            let mut mode = 0;
+            let success = unsafe {
+                GetNamedPipeHandleStateW(
+                    handle.as_raw_handle() as _,
+                    &mut mode,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if success == 0 {
+                return Err(crate::PyError::os_error_win32_syscall2(
+                    rustpython_host_env::winapi::get_last_error() as i32,
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                ));
+            }
+            Ok(pyre_object::w_bool_from(mode & PIPE_NOWAIT == 0))
+        }
+        #[cfg(any(
+            feature = "sandbox",
+            all(not(unix), not(all(windows, feature = "host_env")))
+        ))]
         {
             let _ = fd;
             Err(crate::PyError::not_implemented(
@@ -1704,7 +1748,76 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             Ok(pyre_object::w_none())
         }
-        #[cfg(any(not(unix), feature = "sandbox"))]
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+
+            // CPython 3.14 `_Py_set_blocking` maps a CRT descriptor back to
+            // its pipe HANDLE and flips PIPE_NOWAIT with
+            // SetNamedPipeHandleState.  rustpython-host_env owns both unsafe
+            // host boundaries; keep the PyPy `set_blocking` entry point and
+            // argument conversion around them.
+            let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
+                .map_err(|error| {
+                    crate::PyError::os_error_syscall(
+                        crate::builtins::io_error_posix_errno(&error, libc::EBADF),
+                        pyre_object::PY_NULL,
+                    )
+                })?;
+            let handle = rustpython_host_env::crt_fd::as_handle(borrowed).map_err(|error| {
+                crate::PyError::os_error_syscall(
+                    crate::builtins::io_error_posix_errno(&error, libc::EBADF),
+                    pyre_object::PY_NULL,
+                )
+            })?;
+            let mut mode = 0;
+            let success = unsafe {
+                GetNamedPipeHandleStateW(
+                    handle.as_raw_handle() as _,
+                    &mut mode,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if success == 0 {
+                return Err(crate::PyError::os_error_win32_syscall2(
+                    rustpython_host_env::winapi::get_last_error() as i32,
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                ));
+            }
+            if blocking {
+                mode &= !PIPE_NOWAIT;
+            } else {
+                mode |= PIPE_NOWAIT;
+            }
+            rustpython_host_env::winapi::set_named_pipe_handle_state(
+                handle.as_raw_handle(),
+                Some(mode),
+                None,
+                None,
+            )
+            .map_err(|error| match error.raw_os_error() {
+                Some(winerror) => crate::PyError::os_error_win32_syscall2(
+                    winerror,
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
+                ),
+                None => crate::PyError::os_error_syscall(
+                    crate::builtins::io_error_posix_errno(&error, libc::EINVAL),
+                    pyre_object::PY_NULL,
+                ),
+            })?;
+            Ok(pyre_object::w_none())
+        }
+        #[cfg(any(
+            feature = "sandbox",
+            all(not(unix), not(all(windows, feature = "host_env")))
+        ))]
         {
             let _ = (fd, blocking);
             Err(crate::PyError::not_implemented(
@@ -1991,17 +2104,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         if pos.len() < required || pos.len() > total {
             let plural = if total == 1 { "" } else { "s" };
             let text = if !kwonly.is_empty() {
-                let limit = if required == total { "exactly" } else { "at most" };
+                let limit = if required == total {
+                    "exactly"
+                } else {
+                    "at most"
+                };
                 format!(
                     "{name}() takes {limit} {total} positional argument{plural} ({} given)",
                     pos.len()
                 )
             } else if required == total {
-                format!("{name} expected {total} argument{plural}, got {}", pos.len())
+                format!(
+                    "{name} expected {total} argument{plural}, got {}",
+                    pos.len()
+                )
             } else {
                 let bound = if pos.len() > total { total } else { required };
                 let plural = if bound == 1 { "" } else { "s" };
-                let at = if pos.len() > total { "at most" } else { "at least" };
+                let at = if pos.len() > total {
+                    "at most"
+                } else {
+                    "at least"
+                };
                 format!(
                     "{name} expected {at} {bound} argument{plural}, got {}",
                     pos.len()
@@ -2054,7 +2178,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )));
             }
         } else if pos.len() > count {
-            let limit = if required == count { "exactly" } else { "at most" };
+            let limit = if required == count {
+                "exactly"
+            } else {
+                "at most"
+            };
             return Err(crate::PyError::type_error(format!(
                 "{name}() takes {limit} {count} positional argument{plural} ({} given)",
                 pos.len()
@@ -2082,14 +2210,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "open",
         crate::make_builtin_function("open", |args| {
-            let (bound, kwargs) = bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
+            let (bound, kwargs) =
+                bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
             let path = crate::gateway::fsencode_path_or_fd_w(
                 bound[0].expect("path is required"),
                 "open",
                 false,
             )?;
-            let flags = crate::baseobjspace::c_int_w(bound[1].expect("flags is required"))?
-                as libc::c_int;
+            let flags =
+                crate::baseobjspace::c_int_w(bound[1].expect("flags is required"))? as libc::c_int;
             let mode: u32 = match bound[2] {
                 Some(value) => crate::baseobjspace::c_int_w(value)? as u32,
                 None => 0o777,
@@ -2326,6 +2455,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let target = unsafe { buffer.as_mut_slice() };
                 #[cfg(not(feature = "sandbox"))]
                 let result = loop {
+                    #[cfg(all(windows, feature = "host_env"))]
+                    let read_result = crate::builtins::fd_read_into(fd, &mut *target);
+                    #[cfg(not(all(windows, feature = "host_env")))]
                     let (result, errno) =
                         crate::module::thread::call_external_function(|| unsafe {
                             libc::read(
@@ -2334,6 +2466,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 target.len() as _,
                             )
                         });
+                    #[cfg(all(windows, feature = "host_env"))]
+                    let (result, errno) = match read_result {
+                        Ok(result) => (result as i64, 0),
+                        Err(error) => (-1, error.raw_os_error().unwrap_or(libc::EIO)),
+                    };
                     if result >= 0 {
                         break result as i64;
                     }
@@ -2383,14 +2520,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // surfacing as `InterruptedError`.  The blocking guard is
                     // scoped to the syscall alone: `checksignals` runs Python.
                     loop {
-                        let (ret, errno) =
-                            crate::module::thread::call_external_function(|| unsafe {
-                                libc::write(
-                                    fd,
-                                    data.as_ptr() as *const libc::c_void,
-                                    data.len() as _,
-                                )
-                            });
+                        let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {
                             break ret as i64;
                         }
@@ -2461,10 +2591,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         rustpython_host_env::nt::remove(path_from_bytes(&path.as_bytes).as_ref())
             .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
-        #[cfg(all(
-            not(all(windows, feature = "host_env")),
-            not(feature = "sandbox")
-        ))]
+        #[cfg(all(not(all(windows, feature = "host_env")), not(feature = "sandbox")))]
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
@@ -2557,10 +2684,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
             rustpython_host_env::nt::mkdir(&wide_path(&path.as_bytes)?, _mode as i32)
                 .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
-            #[cfg(all(
-                not(all(windows, feature = "host_env")),
-                not(feature = "sandbox")
-            ))]
+            #[cfg(all(not(all(windows, feature = "host_env")), not(feature = "sandbox")))]
             {
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
@@ -2771,7 +2895,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn timespec_of(t: UTime, now: bool) -> libc::timespec {
         libc::timespec {
             tv_sec: t.sec as libc::time_t,
-            tv_nsec: if now { libc::UTIME_NOW as _ } else { t.nsec as _ },
+            tv_nsec: if now {
+                libc::UTIME_NOW as _
+            } else {
+                t.nsec as _
+            },
         }
     }
 
@@ -2911,10 +3039,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // is a second that fits. Dividing after the narrowing turned away
             // the whole range instead. `divmod` is also what answers for a
             // value that is not a number at all.
-            let split = crate::builtins::builtin_divmod(&[
-                v,
-                pyre_object::w_int_new(1_000_000_000),
-            ])?;
+            let split =
+                crate::builtins::builtin_divmod(&[v, pyre_object::w_int_new(1_000_000_000)])?;
             let (w_sec, w_nsec) = unsafe {
                 (
                     pyre_object::w_tuple_getitem(split, 0),
@@ -3259,11 +3385,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // `__fspath__` runs exactly once. The omitted argument is the same
             // `None` the signature names, which resolves to `"."` there.
             let arg = bound[0].unwrap_or(pyre_object::w_none());
-            let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(
-                arg,
-                "listdir",
-                HAVE_FDOPENDIR,
-            )?;
+            let resolved =
+                crate::gateway::fsencode_path_or_fd_nullable_w(arg, "listdir", HAVE_FDOPENDIR)?;
             // A descriptor names no directory to prefix and is not `bytes`, so
             // its names come back as `str` whatever the caller held
             // (`interp_posix.py:1112-1121`).
@@ -3450,23 +3573,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if let Some(pt) = path_type
                     && let Some(fspath_fn) =
                         unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
-                    {
-                        let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
-                        // The protocol is only satisfied by what a path can be,
-                        // so an answer that is neither names the object that
-                        // gave it and the type it gave.
-                        if unsafe {
-                            pyre_object::is_str(result)
-                                || pyre_object::bytesobject::is_bytes(result)
-                        } {
-                            return Ok(result);
-                        }
-                        return Err(crate::PyError::type_error(format!(
-                            "expected {}.__fspath__() to return str or bytes, not {}",
-                            crate::gateway::short_type_name(arg),
-                            crate::gateway::short_type_name(result)
-                        )));
+                {
+                    let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
+                    // The protocol is only satisfied by what a path can be,
+                    // so an answer that is neither names the object that
+                    // gave it and the type it gave.
+                    if unsafe {
+                        pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result)
+                    } {
+                        return Ok(result);
                     }
+                    return Err(crate::PyError::type_error(format!(
+                        "expected {}.__fspath__() to return str or bytes, not {}",
+                        crate::gateway::short_type_name(arg),
+                        crate::gateway::short_type_name(result)
+                    )));
+                }
                 Err(crate::PyError::type_error(format!(
                     "expected str, bytes or os.PathLike object, not {}",
                     crate::gateway::short_type_name(arg)
@@ -3605,8 +3727,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             let atime_secs = (meta.last_access_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let mtime_secs = (meta.last_write_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let ctime_secs = (meta.creation_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let atime_ns = whole_ns(atime_secs, (meta.last_access_time() as i64 % 10_000_000) * 100);
-            let mtime_ns = whole_ns(mtime_secs, (meta.last_write_time() as i64 % 10_000_000) * 100);
+            let atime_ns = whole_ns(
+                atime_secs,
+                (meta.last_access_time() as i64 % 10_000_000) * 100,
+            );
+            let mtime_ns = whole_ns(
+                mtime_secs,
+                (meta.last_write_time() as i64 % 10_000_000) * 100,
+            );
             let ctime_ns = whole_ns(ctime_secs, (meta.creation_time() as i64 % 10_000_000) * 100);
             (
                 mode, 0i64, // st_ino — not available on Windows
@@ -3714,19 +3842,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             st_mtime_ns,
             st_ctime_ns,
         ) = (
-            f.mode,
-            f.ino,
-            f.dev,
-            f.nlink,
-            f.uid,
-            f.gid,
-            f.size,
-            f.atime,
-            f.mtime,
-            f.ctime,
-            f.atime_ns,
-            f.mtime_ns,
-            f.ctime_ns,
+            f.mode, f.ino, f.dev, f.nlink, f.uid, f.gid, f.size, f.atime, f.mtime, f.ctime,
+            f.atime_ns, f.mtime_ns, f.ctime_ns,
         );
         #[cfg(unix)]
         let (st_blksize, st_blocks, st_rdev) = (f.blksize, f.blocks, f.rdev);
@@ -3974,9 +4091,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// always held here; `StatStruct` keeps that under `st_birthtime` and
     /// leaves its own `st_ctime` at zero.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    fn stat_fields_from_statstruct(
-        st: &rustpython_host_env::fileutils::StatStruct,
-    ) -> StatFields {
+    fn stat_fields_from_statstruct(st: &rustpython_host_env::fileutils::StatStruct) -> StatFields {
         StatFields {
             mode: st.st_mode as i64,
             ino: st.st_ino as i64,
@@ -4223,10 +4338,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 )),
             };
         }
-        #[cfg(all(
-            not(feature = "sandbox"),
-            not(all(windows, feature = "host_env"))
-        ))]
+        #[cfg(all(not(feature = "sandbox"), not(all(windows, feature = "host_env"))))]
         {
             let meta = if follow_symlinks {
                 host_fs::metadata(path_from_bytes(&path.as_bytes).as_ref())
@@ -4435,9 +4547,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // with no stat; `-1` means it has none and the stat paths below answer
         // instead.
         if let Some(de) = W_DirEntry::from_obj(args[0])
-            && de.enum_ino != -1 {
-                return Ok(pyre_object::w_int_new(de.enum_ino));
-            }
+            && de.enum_ino != -1
+        {
+            return Ok(pyre_object::w_int_new(de.enum_ino));
+        }
         let (w_path, path) = dir_entry_path(args[0])?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
@@ -4696,7 +4809,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // The type carries an instance dict, so `_index` is writable from
         // Python and cannot be assumed to still hold the int this iterator
         // stored.
-        let idx = crate::baseobjspace::int_w(crate::baseobjspace::getattr_str(self_obj, "_index")?)?;
+        let idx =
+            crate::baseobjspace::int_w(crate::baseobjspace::getattr_str(self_obj, "_index")?)?;
         let entries = crate::baseobjspace::getattr_str(self_obj, "_entries")?;
         let len = unsafe { pyre_object::w_list_len(entries) } as i64;
         if idx >= len {
@@ -4841,7 +4955,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::value_error("embedded null byte"))?;
                 let dirp = unsafe { libc::opendir(c_path.as_ptr()) };
                 if dirp.is_null() {
-                    return Err(errno_err_with_filename(crate::builtins::crt_errno(), w_path()));
+                    return Err(errno_err_with_filename(
+                        crate::builtins::crt_errno(),
+                        w_path(),
+                    ));
                 }
                 let errno = readdir_collect(dirp, |name, ino, d_type| {
                     let full = join_dir_name(path, name);
@@ -5370,9 +5487,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let value_obj = crate::baseobjspace::getitem(args[2], key_obj)?;
                         let key = extract_path(key_obj)?;
                         let value = extract_path(value_obj)?;
-                        if key.is_empty()
-                            || key.get(1..).is_some_and(|tail| tail.contains(&b'='))
-                        {
+                        if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
                             return Err(crate::PyError::value_error(
                                 "illegal environment variable name",
                             ));
@@ -5720,9 +5835,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let policy = loop {
                             match host_posix::sched_getscheduler(pid) {
                                 Ok(policy) => break policy,
-                                Err(e) => {
-                                    crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?
-                                }
+                                Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                             }
                         };
                         Ok(pyre_object::w_int_new(policy as i64))
@@ -5751,9 +5864,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let param = loop {
                             match host_posix::sched_getparam(pid) {
                                 Ok(param) => break param,
-                                Err(e) => {
-                                    crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?
-                                }
+                                Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                             }
                         };
                         Ok(crate::_structseq::new_instance(
@@ -5922,9 +6033,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 return Err(crate::PyError::value_error("negative CPU number"));
                             }
                             if cpu > libc::c_int::MAX as i64 {
-                                return Err(crate::PyError::overflow_error(
-                                    "CPU number too large",
-                                ));
+                                return Err(crate::PyError::overflow_error("CPU number too large"));
                             }
                             if cpu >= libc::CPU_SETSIZE as i64 {
                                 return Err(io_err(
@@ -6490,9 +6599,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // that reports nothing does not write it.
                     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
                     loop {
-                        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-                            libc::waitid(idtype, id, &mut si, options)
-                        });
+                        let (ret, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::waitid(idtype, id, &mut si, options)
+                            });
                         if ret >= 0 {
                             break;
                         }
@@ -6505,8 +6615,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // process fields in are read through the accessors that
                     // name which arm is meant; `si_signo` and `si_code` are
                     // outside it.
-                    let (pid, uid, status) =
-                        unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+                    let (pid, uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
                     if pid == 0 {
                         return Ok(pyre_object::w_none());
                     }
@@ -6636,10 +6745,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                     // interp_posix.py:433-441 `fsync`: retry on EINTR.
                     loop {
-                        let (r, errno) =
-                            crate::module::thread::call_external_function(|| unsafe {
-                                libc::fsync(fd)
-                            });
+                        let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                            libc::fsync(fd)
+                        });
                         if r >= 0 {
                             break;
                         }
@@ -6673,17 +6781,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                     // interp_posix.py:443-452 `fdatasync`: retry on EINTR.
                     loop {
-                        let (r, errno) =
-                            crate::module::thread::call_external_function(|| unsafe {
-                                #[cfg(any(target_os = "linux", target_os = "android"))]
-                                {
-                                    libc::fdatasync(fd)
-                                }
-                                #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                                {
-                                    libc::fsync(fd)
-                                }
-                            });
+                        let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+                            #[cfg(any(target_os = "linux", target_os = "android"))]
+                            {
+                                libc::fdatasync(fd)
+                            }
+                            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                            {
+                                libc::fsync(fd)
+                            }
+                        });
                         if r >= 0 {
                             break;
                         }
@@ -6718,13 +6825,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     return Ok(());
                 }
                 let errno = crate::builtins::crt_errno();
-                crate::builtins::eintr_retry_with(
-                    std::io::Error::from_raw_os_error(errno),
-                    |e| wrap(e.raw_os_error().unwrap_or(0)),
-                )?;
+                crate::builtins::eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
+                    wrap(e.raw_os_error().unwrap_or(0))
+                })?;
             }
         }
-
 
         // os.truncate(path, length) -> None
         //
@@ -6745,11 +6850,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             args.len(),
                         )));
                     }
-                    let path = crate::gateway::fsencode_path_or_fd_w(
-                        args[0],
-                        "truncate",
-                        HAVE_FTRUNCATE,
-                    )?;
+                    let path =
+                        crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", HAVE_FTRUNCATE)?;
                     let length = truncate_length_w(args[1])?;
                     if path.as_fd != -1 {
                         ftruncate_retry(path.as_fd, length, |e| errno_err(e, ""))?;
@@ -6765,15 +6867,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // interrupted open re-issued after the signal handler has
                     // run rather than reported as `InterruptedError`.
                     let fd = loop {
-                        let (fd, errno) = crate::module::thread::call_external_function(|| unsafe {
-                            libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
-                        });
+                        let (fd, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
+                            });
                         if fd >= 0 {
                             break fd;
                         }
                         crate::builtins::eintr_retry_with(
                             std::io::Error::from_raw_os_error(errno),
-                            |e| errno_err_with_filename(e.raw_os_error().unwrap_or(0), path.w_path()),
+                            |e| {
+                                errno_err_with_filename(
+                                    e.raw_os_error().unwrap_or(0),
+                                    path.w_path(),
+                                )
+                            },
                         )?;
                     };
                     let truncated =
@@ -6865,9 +6973,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let cmd = crate::baseobjspace::c_int_w(args[1])?;
                     let length = truncate_length_w(args[2])?;
                     loop {
-                        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-                            libc::lockf(fd, cmd, length)
-                        });
+                        let (ret, errno) =
+                            crate::module::thread::call_external_function(|| unsafe {
+                                libc::lockf(fd, cmd, length)
+                            });
                         if ret == 0 {
                             break;
                         }
@@ -6891,7 +7000,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "mkfifo",
             crate::make_builtin_function("mkfifo", |args| {
-                let (bound, kwargs) = bind_path_args(args, "mkfifo", &["path", "mode"], 1, &["dir_fd"])?;
+                let (bound, kwargs) =
+                    bind_path_args(args, "mkfifo", &["path", "mode"], 1, &["dir_fd"])?;
                 let path = crate::gateway::fsencode_path_or_fd_w(
                     bound[0].expect("path is required"),
                     "mkfifo",
@@ -6911,10 +7021,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // (`rposix.py:2784-2786`).
                 // interp_posix.py:1323-1343 `mkfifo`: retry on EINTR.
                 loop {
-                    let (r, errno) = crate::module::thread::call_external_function(|| match dir_fd {
-                        Some(dir_fd) => unsafe { libc::mkfifoat(dir_fd, c_path.as_ptr(), mode) },
-                        None => unsafe { libc::mkfifo(c_path.as_ptr(), mode) },
-                    });
+                    let (r, errno) =
+                        crate::module::thread::call_external_function(|| match dir_fd {
+                            Some(dir_fd) => unsafe {
+                                libc::mkfifoat(dir_fd, c_path.as_ptr(), mode)
+                            },
+                            None => unsafe { libc::mkfifo(c_path.as_ptr(), mode) },
+                        });
                     if r >= 0 {
                         break;
                     }
@@ -6963,12 +7076,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // (`rposix.py:2793-2795`).
                 // interp_posix.py:1346-1370 `mknod`: retry on EINTR.
                 loop {
-                    let (r, errno) = crate::module::thread::call_external_function(|| match dir_fd {
-                        Some(dir_fd) => unsafe {
-                            libc::mknodat(dir_fd, c_path.as_ptr(), mode, device)
-                        },
-                        None => unsafe { libc::mknod(c_path.as_ptr(), mode, device) },
-                    });
+                    let (r, errno) =
+                        crate::module::thread::call_external_function(|| match dir_fd {
+                            Some(dir_fd) => unsafe {
+                                libc::mknodat(dir_fd, c_path.as_ptr(), mode, device)
+                            },
+                            None => unsafe { libc::mknod(c_path.as_ptr(), mode, device) },
+                        });
                     if r >= 0 {
                         break;
                     }
@@ -7332,9 +7446,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `linkat` is reached only for what plain `link` cannot say:
                 // a name to resolve against a descriptor, or a source symlink
                 // to link rather than follow.
-                let ret = if src_dir_fd != libc::AT_FDCWD
-                    || dst_dir_fd != libc::AT_FDCWD
-                    || !follow
+                let ret = if src_dir_fd != libc::AT_FDCWD || dst_dir_fd != libc::AT_FDCWD || !follow
                 {
                     let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
                     unsafe {
@@ -7477,9 +7589,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(argument_unavailable(name, "follow_symlinks"));
                     }
                 }
-                crate::builtins::eintr_retry_with(err, |e| {
-                    io_err_with_filename(e, path.w_path())
-                })?;
+                crate::builtins::eintr_retry_with(err, |e| io_err_with_filename(e, path.w_path()))?;
             }
             Ok(pyre_object::w_none())
         }
@@ -7529,9 +7639,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     loop {
                         match host_posix::fchmod(bfd, mode) {
                             Ok(()) => break,
-                            Err(e) => {
-                                crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?
-                            }
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                         }
                     }
                     Ok(pyre_object::w_none())
@@ -7582,8 +7690,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ))),
                 }
             };
-            let (path_obj, uid_obj, gid_obj) =
-                (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
+            let (path_obj, uid_obj, gid_obj) = (arg(0, "path")?, arg(1, "uid")?, arg(2, "gid")?);
             // `posixmodule.c path_converter` calls `__fspath__` and lets what it
             // raises out: a `RuntimeError` from a user `__fspath__` is that
             // object's error, not a statement that the argument was the wrong
@@ -7735,9 +7842,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     loop {
                         match host_posix::fchown(bfd, uid, gid) {
                             Ok(()) => break,
-                            Err(e) => {
-                                crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?
-                            }
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
                         }
                     }
                     Ok(pyre_object::w_none())
@@ -8179,7 +8284,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // The two entry points share this body and have an argument
                 // clinic declaration each, so the one the caller reached is the
                 // name its rejected path reports.
-                let func = if spawnp { "posix_spawnp" } else { "posix_spawn" };
+                let func = if spawnp {
+                    "posix_spawnp"
+                } else {
+                    "posix_spawn"
+                };
                 // `(path, argv, env, /, *, file_actions=(), ...)` — the three
                 // names are positional-only and everything else is
                 // keyword-only, so there is no positional-or-keyword slot at
@@ -8375,8 +8484,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `int` subclass or a plain non-int would otherwise be
                 // reinterpreted as a descriptor, flag set or mode.
                 let field = |entry: PyObjectRef, index: i64| -> Result<i32, crate::PyError> {
-                    let value = unsafe { pyre_object::w_tuple_getitem(entry, index) }
-                        .ok_or_else(|| {
+                    let value =
+                        unsafe { pyre_object::w_tuple_getitem(entry, index) }.ok_or_else(|| {
                             crate::PyError::value_error("posix_spawn: file_actions entry too short")
                         })?;
                     crate::baseobjspace::c_int_w(value)
@@ -8415,12 +8524,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             let path_obj =
                                 unsafe { pyre_object::w_tuple_getitem(entry, 2).unwrap() };
                             let path = extract_path(path_obj)?;
-                            let cpath =
-                                std::ffi::CString::new(path).map_err(|_| {
-                                    crate::PyError::value_error(
-                                        "posix_spawn: embedded null in OPEN path",
-                                    )
-                                })?;
+                            let cpath = std::ffi::CString::new(path).map_err(|_| {
+                                crate::PyError::value_error(
+                                    "posix_spawn: embedded null in OPEN path",
+                                )
+                            })?;
                             let oflag = field(entry, 3)?;
                             let mode = field(entry, 4)? as u32;
                             out.push(PosixSpawnFileAction::Open {
@@ -8701,9 +8809,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             .find(|(known, _)| *known == name)
                             .map(|(_, value)| *value)
                     })
-                    .ok_or_else(|| {
-                        crate::PyError::value_error("unrecognized configuration name")
-                    });
+                    .ok_or_else(|| crate::PyError::value_error("unrecognized configuration name"));
             }
             // `conv_confname` gates on `PyIndex_Check` before converting, so an
             // object that is neither a str nor index-able is this TypeError,
@@ -8721,10 +8827,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // an `int_w` that fails did so on width.
             let too_large =
                 || crate::PyError::overflow_error("Python int too large to convert to C int");
-            let value =
-                crate::baseobjspace::int_w(crate::baseobjspace::space_index(w)?).map_err(
-                    |_| too_large(),
-                )?;
+            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(w)?)
+                .map_err(|_| too_large())?;
             i32::try_from(value).map_err(|_| too_large())
         }
 
@@ -8801,9 +8905,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             .iter()
                             .find_map(|(name, value)| (*name == key).then_some(*value))
                             .ok_or_else(|| {
-                                crate::PyError::value_error(
-                                    "unrecognized configuration name",
-                                )
+                                crate::PyError::value_error("unrecognized configuration name")
                             })?
                     } else {
                         // Narrowed, not truncated — see `confname_arg`.
@@ -9132,9 +9234,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         /// no handle never reaches such a call, and `ERROR_INVALID_HANDLE` is
         /// what the caller reports in its place.
         fn handle_err(e: &std::io::Error) -> crate::PyError {
-            let winerror = e.raw_os_error().unwrap_or(
-                windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
-            );
+            let winerror = e
+                .raw_os_error()
+                .unwrap_or(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32);
             crate::PyError::os_error_win32_syscall2(
                 winerror,
                 pyre_object::PY_NULL,
@@ -9145,8 +9247,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         /// The descriptor's handle, or `None` when it names none.
         fn fd_handle(fd: i32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
             let handle = host_nt::handle_from_fd(fd);
-            (!handle.is_null()
-                && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
+            (!handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
                 .then_some(handle)
         }
 
@@ -9249,7 +9350,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "truncate",
                 |args| {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error("truncate() requires 2 arguments"));
+                        return Err(crate::PyError::type_error(
+                            "truncate() requires 2 arguments",
+                        ));
                     }
                     let path = crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", true)?;
                     let length = truncate_length_w(args[1])?;
@@ -9376,12 +9479,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // argument of the call, so the caller-less message is the one
                 // it reports — the same for the environment below.
                 let value = extract_path(item)?;
-                argv.push(widestring::WideCString::from_os_str(&*os_str_from_bytes(&value))
-                    .map_err(|_| {
-                        crate::PyError::value_error(format!(
-                            "{function}() arg 2 contains an embedded null byte"
-                        ))
-                    })?);
+                argv.push(
+                    widestring::WideCString::from_os_str(&*os_str_from_bytes(&value)).map_err(
+                        |_| {
+                            crate::PyError::value_error(format!(
+                                "{function}() arg 2 contains an embedded null byte"
+                            ))
+                        },
+                    )?,
+                );
             }
             if argv[0].is_empty() {
                 return Err(crate::PyError::value_error(format!(
@@ -9605,8 +9711,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 link_positional(args)?;
                 let src = crate::gateway::fsencode_path_named_w(args[0], "link", "src")?;
                 let dst = crate::gateway::fsencode_path_named_w(args[1], "link", "dst")?;
-                let (wide_src, wide_dst) =
-                    (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
+                let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
                 let ok = unsafe {
                     windows_sys::Win32::Storage::FileSystem::CreateHardLinkW(
                         wide_dst.as_ptr(),
@@ -9812,9 +9917,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     match given(index, name) {
                         Some(w) => {
                             let text = crate::baseobjspace::text_w(w)?;
-                            Ok(Some(widestring::WideCString::from_str(text).map_err(|_| {
-                                crate::PyError::value_error("embedded null character")
-                            })?))
+                            Ok(Some(widestring::WideCString::from_str(text).map_err(
+                                |_| crate::PyError::value_error("embedded null character"),
+                            )?))
                         }
                         None => Ok(None),
                     }
@@ -9941,11 +10046,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "times",
                 |_| {
-                    let times = rustpython_host_env::time::get_process_times_100ns()
-                        .ok_or_else(|| fs_err_with_filename(
-                            std::io::Error::last_os_error(),
-                            pyre_object::PY_NULL,
-                        ))?;
+                    let times =
+                        rustpython_host_env::time::get_process_times_100ns().ok_or_else(|| {
+                            fs_err_with_filename(
+                                std::io::Error::last_os_error(),
+                                pyre_object::PY_NULL,
+                            )
+                        })?;
                     // `GetProcessTimes` counts in hundreds of nanoseconds.
                     let seconds = |ticks: u64| pyre_object::w_float_new(ticks as f64 * 1e-7);
                     Ok(crate::_structseq::new_instance(
@@ -10004,7 +10111,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "listmounts",
                 |args| {
                     if args.is_empty() {
-                        return Err(crate::PyError::type_error("listmounts() requires 1 argument"));
+                        return Err(crate::PyError::type_error(
+                            "listmounts() requires 1 argument",
+                        ));
                     }
                     let volume = crate::gateway::fsencode_path_w(args[0])?;
                     name_list(host_nt::listmounts(
