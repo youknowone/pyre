@@ -3878,7 +3878,15 @@ impl<'a> Assembler386<'a> {
                     let dst_loc = if i < target_arglocs.len() {
                         target_arglocs[i]
                     } else {
-                        let dst_ofs = crate::regalloc::get_ebp_ofs(0, i);
+                        // The canonical base for a frame position, the
+                        // one `FrameManager` was built with
+                        // (`get_baseofs_of_frame_field`). Passing 0 here named
+                        // a slot `FIRST_ITEM_OFFSET` bytes below the one the
+                        // regalloc means by the same position, so a source and
+                        // this destination could denote the same value and
+                        // different storage.
+                        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
+                        let dst_ofs = crate::regalloc::get_ebp_ofs(base_ofs, i);
                         Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
                     };
                     match src_loc {
