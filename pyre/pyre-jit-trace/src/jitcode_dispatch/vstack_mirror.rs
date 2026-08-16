@@ -958,10 +958,34 @@ pub(crate) fn vstack_step_py_pc(
     // block (for example its RETURN_VALUE); applying that opcode here corrupts
     // the live caller stack before the destination block is entered.
     if metadata_block_head_py_pc(metadata, jit_pc).is_some() {
-        current_py_pc
-    } else {
-        vstack_containing_py_pc(metadata, jit_pc)
+        return current_py_pc;
     }
+    // Prefer the per-emission segmentation over the floor tier.  The floor
+    // table keys each Python PC to its FIRST jitcode offset, so a PC that
+    // emits in two disjoint regions is collapsed onto the earlier one and the
+    // later region reads as belonging to whichever PC last opened a segment.
+    // The mirror then sees a boundary the walk never crossed and replays that
+    // opcode's stack effect against a stack it does not describe — the same
+    // shape as applying a SWAP at a boundary that did not retire it.
+    //
+    // `py_exact_by_jit_pc` records the owning PC at every point the emitted
+    // stream changes owner, so it answers directly.  Empty for skeleton /
+    // fixture metadata, where the floor tier remains the only source.
+    if let Some(exact) =
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&metadata.py_exact_by_jit_pc, jit_pc)
+        && !exact_segmentation_disabled()
+    {
+        return exact;
+    }
+    vstack_containing_py_pc(metadata, jit_pc)
+}
+
+/// `PYRE_VSTACK_NO_EXACT`: fall back to the floor tier for the mirror's
+/// coordinate. The escape hatch for A/B-ing the segmentation switchover
+/// against the tier it replaces.
+fn exact_segmentation_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("PYRE_VSTACK_NO_EXACT").is_some())
 }
 
 /// #73: step the walk-level operand-stack box mirror at
