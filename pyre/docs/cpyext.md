@@ -58,9 +58,14 @@ describe the same call. That check is `scripts/cpyext-abi.py check`, and it is
 a CI gate:
 
 ```sh
-python3 pyre/scripts/cpyext-abi.py check          # every export vs. CPython
+python3 pyre/scripts/cpyext-abi.py check          # every entry point vs. CPython
 python3 pyre/scripts/cpyext-abi.py generate --check
 ```
+
+An *entry point* is either an export or a `static inline` function in the
+header. Both reach the extension as a call it compiles against, so both are
+checked; a header inline is the one an export cannot catch, because it is
+written by hand rather than generated.
 
 It compares ABI slots rather than spellings, resolving CPython's typedefs, so
 `Py_hash_t` and `Py_ssize_t` agree and `long` and `Py_ssize_t` do not. The

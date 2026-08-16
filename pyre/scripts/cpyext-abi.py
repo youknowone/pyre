@@ -173,6 +173,30 @@ ENUM = re.compile(r"typedef\s+enum\b[^;{]*\{.*?\}\s*([A-Za-z_]\w*)\s*;", re.S)
 ALIAS = re.compile(r"typedef\s+([A-Za-z_][\w \t]*?)\s+([A-Za-z_]\w*)\s*;")
 
 
+INLINE = re.compile(
+    r"^static\s+inline\s+(?P<ret>[A-Za-z_][\w\s]*?)\s*(?P<stars>\**)\s*"
+    r"(?P<name>[A-Za-z_]\w*)\s*\((?P<params>[^;{]*?)\)\s*\{",
+    re.M | re.S)
+
+
+def read_header_inlines():
+    """The entry points implemented in the header rather than exported.
+
+    `PyArg_ParseTuple`, `Py_BuildValue` and the other variadics are C in
+    `Python.h`, because pyre ships no companion library and rustc's
+    `c_variadic` is unstable. They are entry points an extension calls by the
+    same name and the same convention as any export, so they are checked
+    against the record the same way -- otherwise the gate reports "every export
+    matches" while the half of the ABI it cannot see drifts.
+    """
+    for path in sorted(HEADER_DIR.glob("*.h")):
+        text = strip_comments(path.read_text(errors="replace"))
+        for match in INLINE.finditer(text):
+            params = [param_type(p) for p in split_commas(match.group("params"))]
+            ret = tidy(match.group("ret") + " " + match.group("stars"))
+            yield path.name, match.group("name"), params or ["void"], ret
+
+
 def read_typedefs(paths):
     """name -> what it stands for, so an alias is not read as a distinct type."""
     table = {}
@@ -257,30 +281,35 @@ def command_snapshot(args):
 def command_check(args):
     declarations, typedefs = load_record()
     disagree, converted = [], []
-    checked = 0
-    for module, name, params, ret in read_exports():
+    checked = {"export": 0, "header inline": 0}
+    entry_points = [("export", f"cpyext/{m}.rs", n, p, r)
+                    for m, n, p, r in read_exports()]
+    entry_points += [("header inline", f"{HEADER_DIR.name}/{h}", n, p, r)
+                     for h, n, p, r in read_header_inlines()]
+    for kind, where_defined, name, params, ret in entry_points:
         if name not in declarations:
-            converted.append((module, name))
+            converted.append((where_defined, name))
             continue
         theirs, their_ret = declarations[name]
-        checked += 1
+        checked[kind] += 1
         ours = [abi_slot(p, typedefs) for p in params]
         wanted = [abi_slot(p, typedefs) for p in theirs]
         if ours != wanted:
-            disagree.append((module, name, params, theirs, "arguments"))
+            disagree.append((where_defined, name, params, theirs, "arguments"))
         elif abi_slot(ret, typedefs) != abi_slot(their_ret, typedefs):
-            disagree.append((module, name, [ret], [their_ret], "return"))
-    print(f"{checked} exports checked against the recorded CPython ABI; "
+            disagree.append((where_defined, name, [ret], [their_ret], "return"))
+    print(f"{checked['export']} exports and {checked['header inline']} header "
+          f"inlines checked against the recorded CPython ABI; "
           f"{len(converted)} have no CPython declaration")
-    for module, name, ours, theirs, where in disagree:
-        print(f"\n{name} disagrees on its {where}  [cpyext/{module}.rs]")
+    for where_defined, name, ours, theirs, where in disagree:
+        print(f"\n{name} disagrees on its {where}  [{where_defined}]")
         print(f"    pyre    ({', '.join(ours)})")
         print(f"    cpython ({', '.join(theirs)})")
     if disagree:
-        print(f"\n{len(disagree)} export(s) do not match the C declaration an "
-              f"extension is compiled against.")
+        print(f"\n{len(disagree)} entry point(s) do not match the C declaration "
+              f"an extension is compiled against.")
         return 1
-    print("every export matches.")
+    print("every entry point matches.")
     return 0
 
 
