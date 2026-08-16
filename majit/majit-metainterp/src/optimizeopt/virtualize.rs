@@ -966,7 +966,9 @@ impl OptVirtualize {
             // known_class (info.py:324-325 get_known_class).
             if let PtrInfo::Virtual(ref vinfo) = info
                 && is_typeptr
-                && let Some(class_val) = vinfo.known_class
+                // A stored class of 0 means the allocation's vtable address was unavailable at
+                // build time, so the value reads as no known class while the flag stays valid.
+                && let Some(class_val) = vinfo.known_class.filter(|&c| c != 0)
             {
                 let b = ctx.materialize_operand_at(op.pos.get());
                 ctx.make_constant_box(&b, majit_ir::Value::Int(class_val));
@@ -4128,6 +4130,74 @@ mod tests {
         assign_positions(&mut ops);
         let result = run_pass(&ops);
         assert!(result.is_empty(), "NEW_WITH_VTABLE should be removed");
+    }
+
+    #[test]
+    fn test_typeptr_read_with_zero_vtable_is_not_folded() {
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, 0);
+        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            majit_ir::ArrayFlag::Signed,
+            "object.typeptr".to_string(),
+            "typeptr".to_string(),
+        ));
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                typeptr_descr,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "a zero-vtable typeptr read must remain instead of folding to constant 0: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_ob_type_read_with_zero_vtable_is_not_folded() {
+        let sd: DescrRef = majit_ir::make_size_descr_with_vtable(1, 8, 0, 0);
+        let typeptr_descr: DescrRef = Arc::new(majit_ir::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Ref,
+            false,
+            majit_ir::ArrayFlag::Pointer,
+            "PyObject.ob_type".to_string(),
+            "ob_type".to_string(),
+        ));
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::GetfieldGcR,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Ref,
+                    0,
+                )],
+                typeptr_descr,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::GetfieldGcR),
+            "a zero-vtable ob_type read must remain instead of folding to null: {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
     }
 
     #[test]

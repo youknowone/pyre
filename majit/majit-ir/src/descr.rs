@@ -4497,19 +4497,17 @@ pub trait FieldDescr: Descr {
         self.field_name()
     }
 
-    /// heaptracker.py:66: `if name == 'typeptr': continue`
-    ///
-    /// RPython filters typeptr by raw field name BEFORE creating
-    /// descriptors (heaptracker.py:60-67). In majit, descriptors are
-    /// already created, so we check the name at use time.
-    ///
-    /// Handles both formats:
-    /// - `"STRUCT.typeptr"` (codewriter format, descr.py:227), which
-    ///   `make_vtable_field_descr` spells `"object.typeptr"`
-    /// - a bare `"typeptr"`, which no producer mints today
+    /// The class pointer is the object-header field at offset 0
+    /// (`rpython/rtyper/rclass.py:167-174`, `OBJECT.typeptr`). Its
+    /// descriptors use two field spellings, each bare or struct-qualified:
+    /// - `"typeptr"` / `"STRUCT.typeptr"` (codewriter format, descr.py:227)
+    /// - `"ob_type"` / `"STRUCT.ob_type"` (e.g. `"PyObject.ob_type"`)
     fn is_typeptr(&self) -> bool {
         let name = self.field_name();
-        name == "typeptr" || name.ends_with(".typeptr")
+        name == "typeptr"
+            || name.ends_with(".typeptr")
+            || name == "ob_type"
+            || name.ends_with(".ob_type")
     }
 
     /// Pyre object-model: `PyObject.w_class` (offset 8) carries the

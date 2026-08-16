@@ -469,8 +469,10 @@ impl PtrInfoExt for PtrInfo {
     /// - Everything else: `None`.
     fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<i64> {
         match self {
-            PtrInfo::Instance(v) => v.known_class,
-            PtrInfo::Virtual(v) => v.known_class,
+            // A stored class of 0 means the allocation's vtable address was unavailable at
+            // build time, so the value reads as no known class while the flag stays valid.
+            PtrInfo::Instance(v) => v.known_class.filter(|&c| c != 0),
+            PtrInfo::Virtual(v) => v.known_class.filter(|&c| c != 0),
             PtrInfo::Constant(gcref) => {
                 // info.py:764: `if not self._const.nonnull(): return None`
                 if gcref.is_null() {

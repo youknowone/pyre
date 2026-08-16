@@ -1029,7 +1029,12 @@ impl HeapCache {
         if !self._check_flag(opref, HF_KNOWN_CLASS) {
             return None;
         }
-        self.known_class.get(opref.raw() as usize).and_then(|v| *v)
+        // A stored class of 0 means the allocation's vtable address was unavailable at build
+        // time, so the value reads as no known class while the flag stays valid.
+        self.known_class
+            .get(opref.raw() as usize)
+            .and_then(|v| *v)
+            .filter(|&c| c != 0)
     }
 
     /// Walk every cached *value* slot so a `ConstPtr` ref survives a moving
@@ -2418,6 +2423,17 @@ mod tests {
         cache.class_now_known(obj, cls);
         assert!(cache.is_class_known(obj));
         assert_eq!(cache.get_known_class(obj), Some(cls));
+    }
+
+    #[test]
+    fn test_zero_known_class_keeps_flag_but_has_no_value() {
+        let mut cache = HeapCache::new();
+        let obj = OpRef::ref_op(0);
+
+        cache.class_now_known(obj, 0);
+
+        assert!(cache.is_class_known(obj));
+        assert_eq!(cache.get_known_class(obj), None);
     }
 
     #[test]
