@@ -15324,6 +15324,12 @@ impl CraneliftBackend {
         // Compile
         let mut ctx = Context::for_function(func);
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            // Emitted-code text alongside the IR below. Two dumps that agree on
+            // the IR can still disagree on the code: register allocation runs
+            // over the whole function, so a change confined to one block moves
+            // spills in the blocks that survive it, and only the emitted form
+            // shows that.
+            ctx.set_disasm(true);
             // Independent debug toggle — not gated by MAJIT_LOG.
             eprintln!(
                 "[jit][clif-dump] trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}\n{}",
@@ -15350,6 +15356,12 @@ impl CraneliftBackend {
             .compiled_code()
             .map(|code| code.code_info().total_size as usize)
             .unwrap_or(0);
+        if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
+            eprintln!("[jit][code-size] trace_id={trace_id} body_bytes={body_code_bytes}");
+            if let Some(text) = ctx.compiled_code().and_then(|code| code.vcode.as_deref()) {
+                eprintln!("[jit][disasm-body] trace_id={trace_id}\n{text}");
+            }
+        }
         self.module.clear_context(&mut ctx);
 
         // Build trace_N_entry wrapper: forwards jf_ptr to body via call_indirect,
