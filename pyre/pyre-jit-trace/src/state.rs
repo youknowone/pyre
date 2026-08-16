@@ -1102,6 +1102,111 @@ pub fn publish_last_instr_at_live_marker(
     });
 }
 
+/// Drop every Ref register the `-live-` marker at `marker_pc` does not name.
+///
+/// `cleanup_registers` (`blackhole.py:385`) clears `registers_r` "to avoid
+/// keeping references alive", but it runs from `release_interp`
+/// (`blackhole.py:253`) — after the run, not during it. Inside a run the only
+/// thing that ends a register's hold on its object is a later write to the
+/// same register, which `rpython/tool/algo/regalloc.py:28-75` makes near-certain
+/// by colouring on liveranges and reusing a dead value's colour. This
+/// codewriter walks one Python function per jitcode rather than one giant
+/// `dispatch_bytecode` graph, so a colour whose only definition sits inside a
+/// loop is never redefined afterwards: the loop's iterable stays in its
+/// register for the whole remainder of the frame, and `walk_bh_regs` roots the
+/// bank unconditionally. A resumed frame that then calls `gc.collect()` keeps
+/// the iterable and everything it reaches.
+///
+/// The marker's Ref set is a sound bound to clear against. It is the SSA-live
+/// set — "written before and read afterwards" — computed by the backward pass
+/// in `liveness.rs` (`liveness.py:5-12`), so a register missing from it is
+/// re-written before any read. `filter_liveness_in_place` only ever adds to it
+/// (the FOR_ITER frame-live re-add, the portal reds, a residual call's result
+/// register), and a folded marker carries the union over its group's PCs.
+///
+/// The clear stops at `num_regs_r()`: the slots above it are the constants
+/// window `copy_constants` preloads, which `cleanup_registers` also leaves
+/// alone. Anything unresolvable — a pc that anchors no marker, a liveness
+/// table that does not cover the offset, a length that cannot describe this
+/// bank — clears nothing, which is exactly the behaviour without this hook.
+fn clear_dead_ref_registers_at_live_marker(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    marker_pc: usize,
+) {
+    let num_regs_r = bh.jitcode.num_regs_r().min(bh.registers_r.len());
+    if num_regs_r == 0 {
+        return;
+    }
+    // `get_live_vars_info` panics on a pc that anchors no `-live-`; the
+    // blackhole reaches this hook only from `handler_live`, but the marker
+    // still has to resolve against this jitcode's own code stream.
+    if !bh.jitcode.can_decode_live_vars(marker_pc, bh.op_live) {
+        return;
+    }
+    let info = bh.jitcode.get_live_vars_info(marker_pc, bh.op_live);
+    // Read the pool through the store rather than `liveness_info_snapshot`:
+    // this runs once per replayed instruction, and that accessor re-runs
+    // `ensure_finish_setup` and takes a reference count each time. A borrow
+    // already held (a reentrant walker path) declines, the same way the
+    // `last_instr` publish above does, instead of panicking.
+    METAINTERP_SD.with(|r| {
+        let Ok(sd) = r.try_borrow() else {
+            return;
+        };
+        let all_liveness: &[u8] = &sd.liveness_info;
+        // `enumerate_vars` indexes the three length bytes unguarded.
+        if info + 3 > all_liveness.len() {
+            return;
+        }
+        // A live set cannot name more Ref registers than the bank holds; a
+        // wider count means the offset is not describing this jitcode.
+        let length_r = all_liveness[info + 1] as usize;
+        if length_r > num_regs_r {
+            return;
+        }
+        // An empty Ref set is not a claim that nothing is live. A marker whose
+        // Python PCs are all unreachable is emitted with no registers at all
+        // (`filter_liveness_in_place`'s `any_reachable` arm), while a reachable
+        // portal marker always names at least the `frame` red
+        // (`interp_jit.py:67 reds = ['frame', 'ec']`). Decline rather than
+        // clear the whole bank on the one shape that cannot be told apart.
+        if length_r == 0 {
+            return;
+        }
+        // Register indices are single bytes (`assembler.py:127-138` asserts
+        // `0 <= val < 256`), so the live set fits a fixed 256-bit mask and the
+        // hook allocates nothing.
+        let mut live_r: [u64; 4] = [0; 4];
+        majit_translate::codewriter::jitcode::enumerate_vars(
+            info,
+            all_liveness,
+            |_| {},
+            |index| {
+                let index = index as usize;
+                if index < 256 {
+                    live_r[index / 64] |= 1u64 << (index % 64);
+                }
+            },
+            |_| {},
+        );
+        for index in 0..num_regs_r.min(256) {
+            if live_r[index / 64] & (1u64 << (index % 64)) == 0 {
+                bh.registers_r[index] = 0;
+            }
+        }
+    });
+}
+
+/// `-live-` marker hook: stamp the frame's `last_instr`, then drop the Ref
+/// registers the marker does not name.
+pub fn on_live_marker(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    marker_pc: usize,
+) {
+    publish_last_instr_at_live_marker(bh, marker_pc);
+    clear_dead_ref_registers_at_live_marker(bh, marker_pc);
+}
+
 /// Whether a JitCode exception exit came from the Python bare-reraise
 /// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
 /// RaiseWithExplicitTraceback and skip record_application_traceback.

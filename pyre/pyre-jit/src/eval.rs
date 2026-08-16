@@ -4935,10 +4935,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // source-level one upstream and rides in the jitcode; this codewriter
     // unrolls the bytecode, so the same store would need one int pool
     // constant per instruction. The blackhole publishes it at the `-live-`
-    // marker instead.
-    majit_metainterp::blackhole::register_live_marker_hook(
-        pyre_jit_trace::state::publish_last_instr_at_live_marker,
-    );
+    // marker instead, and clears the Ref registers the marker leaves out —
+    // the marker is the one program point that names the live set.
+    majit_metainterp::blackhole::register_live_marker_hook(pyre_jit_trace::state::on_live_marker);
     // warmspot.py:1039 handle_jitexception_from_blackhole parity:
     // portal_runner is called when ContinueRunningNormally is raised
     // at a recursive portal level during blackhole execution.

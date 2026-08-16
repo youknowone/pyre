@@ -6066,7 +6066,15 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// because the value is a distinct compile-time constant per instruction and
 /// `check_result`'s 256-entry per-kind cap rejects one pool entry per
 /// instruction — registers this hook and writes the field itself.
-pub type LiveMarkerHook = fn(&BlackholeInterpreter, usize);
+/// The hook also owns the register file, because the marker names the live
+/// set: `cleanup_registers` (`blackhole.py:385`) clears `registers_r` "to
+/// avoid keeping references alive", but it only runs at `release_interp`
+/// (`blackhole.py:253`), so a register whose live range ended keeps its
+/// object for the rest of the run. RPython is insulated by liverange-based
+/// colouring reusing that register almost immediately
+/// (`rpython/tool/algo/regalloc.py:28-75`); a codewriter whose colours are
+/// not reused that densely needs the same clear at marker granularity.
+pub type LiveMarkerHook = fn(&mut BlackholeInterpreter, usize);
 
 static LIVE_MARKER_HOOK: std::sync::OnceLock<LiveMarkerHook> = std::sync::OnceLock::new();
 
