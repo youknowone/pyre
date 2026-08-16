@@ -3003,12 +3003,16 @@ where
             // `assembler_call = True` (pyjitpl.py:1417) →
             // `direct_assembler_call` → `get_assembler_token`, which
             // synthesises the callee token on demand via `compile_tmp_callback`
-            // (warmstate.py:714-722); it is NOT a residual call.  There is no
-            // `compile_tmp_callback` here (pyjitpl.rs `should_inline_core`),
-            // so the on-demand token cannot be built at this point: abort and
-            // retry until the callee compiles on its own, after which a later
-            // attempt takes the wired `CallAssembler` leg
-            // (`exec_recursive_call_assembler`).  pyjitpl.py's true residual
+            // (warmstate.py:714-722); it is NOT a residual call.
+            // `compile_tmp_callback` is ported (`compile.rs`), but reaching it
+            // here needs a `Runtime::recursive_call_assembler_target` that
+            // synthesises rather than reporting the tokens it already holds, and
+            // the decision itself arrives from a predicate with no synthesiser
+            // in reach (`decide_recursive_inline`).  So the on-demand token
+            // cannot be built at this point: abort and retry until the callee
+            // compiles on its own, after which a later attempt takes the wired
+            // `CallAssembler` leg (`exec_recursive_call_assembler`).
+            // pyjitpl.py's true residual
             // path (`assembler_call = False`, do_residual_call) is reachable
             // only when `inlining` is false, which is never the case here, so
             // it is intentionally unmodelled.

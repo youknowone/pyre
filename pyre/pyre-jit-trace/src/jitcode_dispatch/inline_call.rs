@@ -740,13 +740,13 @@ fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> b
     // itself, and `containing_py_pc_for_jitcode_pc` gives the CALL's own
     // Python instruction index — so the offset is `py_pc * 2`, without the
     // `next_instr` back-step a resume coordinate would need.
-    let call_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc);
+    let call_py_pc =
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc);
     matches!(
         pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, call_py_pc * 2),
         Some((_target, depth, lasti)) if depth != 0 || !lasti
     )
 }
-
 
 /// Whether a callee that is not the walk's own code carries a body this fold
 /// can represent.
@@ -900,9 +900,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // result), no InputArg, and was foldable either way.
     if ctx.vstack_valid {
         let kept_below = ctx.vstack_boxes.len().saturating_sub(r_args.len());
-        if ctx.vstack_boxes[..kept_below].iter().any(|slot| {
-            slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot)
-        }) {
+        if ctx.vstack_boxes[..kept_below]
+            .iter()
+            .any(|slot| slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot))
+        {
             if p2_diag_enabled() {
                 eprintln!(
                     "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
@@ -953,11 +954,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // is resolved / synthesised per `callee_key` via `get_assembler_token`.
     //
     // Any other callee is admitted only through
-    // [`foreign_callee_admits_call_assembler`], which reproduces the condition
-    // `_opimpl_recursive_call` (`pyjitpl.py`) puts on `assembler_call`.  Without
-    // that test an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would
-    // fold to CALL_ASSEMBLER, building and entering a frame the callee's own
-    // loop was never traced against.
+    // [`foreign_callee_admits_call_assembler`].  That screen is this fold's own
+    // precondition and has no counterpart in `_opimpl_recursive_call`
+    // (`pyjitpl.py`), which puts no condition at all on `assembler_call` — once
+    // control reaches the fall-through it emits unconditionally.  Without the
+    // screen an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would fold
+    // to CALL_ASSEMBLER, building and entering a frame the callee's own loop
+    // was never traced against.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
