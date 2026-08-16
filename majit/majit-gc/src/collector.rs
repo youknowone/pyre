@@ -2011,12 +2011,16 @@ impl MiniMarkGC {
             return;
         }
         // How many distinct classes to gather before reporting, and how many
-        // minors to keep scanning if fewer than that ever appear.
-        const CLASS_BUDGET: usize = 10;
-        const REPORT_AT_MINOR: usize = 120;
+        // minors to keep scanning if fewer than that ever appear. Both are
+        // overridable, because the interpreter fills the old generation long
+        // before the JIT compiles anything: reporting at minor #1 can only ever
+        // show pre-JIT allocations.
+        let class_budget = read_uint_from_env("MAJIT_GC_BH_PROBE_CLASSES").unwrap_or(10);
+        let report_at_minor = read_uint_from_env("MAJIT_GC_BH_PROBE_MINOR").unwrap_or(120);
+        const WORD: usize = std::mem::size_of::<usize>();
         let mut fresh: Vec<crate::BhProbeViolation> = Vec::new();
         crate::with_bh_objects(|objects| {
-            for &(addr, payload_size, origin) in objects {
+            for &(addr, payload_size, origin, phase) in objects {
                 if self.nursery.contains(addr) || !self.oldgen.contains(addr) {
                     continue;
                 }
@@ -2036,6 +2040,7 @@ impl MiniMarkGC {
                     fresh.push(crate::BhProbeViolation {
                         minor: self.minor_collections,
                         origin,
+                        phase,
                         holder: addr,
                         tid,
                         payload_size,
@@ -2046,8 +2051,44 @@ impl MiniMarkGC {
                         item_size: info.item_size,
                         length_offset: info.length_offset,
                         gc_ptr_offsets: info.gc_ptr_offsets.to_vec(),
+                        items_have_gc_ptrs: info.items_have_gc_ptrs,
                         custom_trace: info.custom_trace.is_some(),
                         is_object: info.is_object,
+                        // Only an `rclass.OBJECT` layout has a type pointer in
+                        // its first word, and only a *registered* vtable is
+                        // safe to dereference — a born-old block the allocator
+                        // has handed out but its caller has not filled yet
+                        // carries whatever the zero-fill left there.
+                        holder_name: if info.is_object
+                            && self
+                                .vtable_to_type_id
+                                .contains_key(&unsafe { *(addr as *const usize) })
+                        {
+                            crate::bh_probe_type_name(addr)
+                        } else {
+                            None
+                        },
+                        // The value moved, so its copy is a live object whose
+                        // type names the field far better than an offset does.
+                        value_name: {
+                            let hdr = unsafe { header_of(word) };
+                            let moved = unsafe { (*hdr).is_forwarded() }
+                                .then(|| unsafe { GcHeader::forwarding_address(hdr) });
+                            moved
+                                .filter(|&m| {
+                                    self.vtable_to_type_id
+                                        .contains_key(&unsafe { *(m as *const usize) })
+                                })
+                                .and_then(crate::bh_probe_type_name)
+                        },
+                        neighbourhood: {
+                            let lo = offset.saturating_sub(2 * WORD);
+                            let hi = (offset + 3 * WORD).min(payload_size);
+                            (lo..hi)
+                                .step_by(WORD)
+                                .map(|o| (o, unsafe { *((addr + o) as *const usize) }))
+                                .collect()
+                        },
                         track_young_ptrs: unsafe {
                             (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS)
                         },
@@ -2060,7 +2101,7 @@ impl MiniMarkGC {
             }
         });
         let total = crate::bh_probe_record_violations(fresh);
-        if total >= CLASS_BUDGET || (total > 0 && self.minor_collections >= REPORT_AT_MINOR) {
+        if total >= class_budget || (total > 0 && self.minor_collections >= report_at_minor) {
             panic!(
                 "{}",
                 crate::bh_probe_violation_report(self.minor_collections)

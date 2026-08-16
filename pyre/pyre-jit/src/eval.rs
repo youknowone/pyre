@@ -4540,6 +4540,11 @@ fn install_pyre_object_hooks() {
             (T, fl::PYFRAME_W_BUILTIN_OFFSET, "w_builtin"),
             (T, fl::PYFRAME_W_GLOBALS_OFFSET, "w_globals"),
         ]);
+        majit_gc::bh_probe_set_type_namer(|addr| {
+            let obj = addr as pyre_object::PyObjectRef;
+            let ob_type = unsafe { (*obj).ob_type };
+            (!ob_type.is_null()).then(|| unsafe { (*ob_type).name })
+        });
     }
     pyre_object::gc_hook::register_gc_identity_hash_hook(pyre_object_gc_identity_hash_trampoline);
     // Let a born-old allocation that crosses the next-major threshold request

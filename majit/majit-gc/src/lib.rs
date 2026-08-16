@@ -3118,13 +3118,19 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
 
 // ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──
 //
-// Enabled by `MAJIT_GC_BH_PROBE`. Records every block a backend's `bh_new*`
-// hands out so `do_collect_nursery` can check, at the end of a minor, that
-// none of them still names a nursery address. Remove with the investigation.
+// Enabled by `MAJIT_GC_BH_PROBE`. Records every old-generation birth — the
+// registration sits in `finish_alloc_in_oldgen`, so it covers the interpreter's
+// own stable allocations as well as anything a backend's `bh_new*` hands out —
+// so `do_collect_nursery` can check, at the end of a minor, that none of them
+// still names a nursery address. `born_in` names the phase that allocated the
+// block, because "born old" alone does not mean "materialized by the
+// blackhole". Remove with the investigation.
 
 thread_local! {
-    /// (address, payload size, origin) — origin 1 = born old, 2 = promoted.
-    static BH_PROBE_OBJECTS: std::cell::RefCell<Vec<(usize, usize, u8)>> =
+    /// (address, payload size, origin, allocating phase) — origin 1 = born
+    /// old, 2 = promoted. The phase distinguishes a block the interpreter
+    /// allocated stable from one a resume or the blackhole materialized.
+    static BH_PROBE_OBJECTS: std::cell::RefCell<Vec<(usize, usize, u8, &'static str)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -3132,6 +3138,9 @@ thread_local! {
 pub struct BhProbeViolation {
     pub minor: usize,
     pub origin: u8,
+    /// `bh_probe_phase()` at the holder's allocation — "interp", "resume",
+    /// "blackhole" or "compiled".
+    pub phase: &'static str,
     pub holder: usize,
     pub tid: u32,
     pub payload_size: usize,
@@ -3142,8 +3151,19 @@ pub struct BhProbeViolation {
     pub item_size: usize,
     pub length_offset: usize,
     pub gc_ptr_offsets: Vec<usize>,
+    pub items_have_gc_ptrs: bool,
     pub custom_trace: bool,
     pub is_object: bool,
+    /// Type name resolved through [`bh_probe_type_name`] at record time, while
+    /// the holder is still intact; the report can run many minors later.
+    pub holder_name: Option<&'static str>,
+    /// Type name of the value's post-move copy. A forwarded value names a live
+    /// object, so this is what actually identifies the undeclared field.
+    pub value_name: Option<&'static str>,
+    /// The four payload words around the violating offset, so a slot inside a
+    /// Rust container (a `Vec`'s ptr/cap/len triple) is distinguishable from a
+    /// genuine reference field.
+    pub neighbourhood: Vec<(usize, usize)>,
     pub track_young_ptrs: bool,
     pub remembered: bool,
     pub barriered_ever: bool,
@@ -3185,18 +3205,21 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
         for e in v.borrow().iter() {
             let _ = writeln!(
                 out,
-                "  minor#{} {} holder={:#x} tid={} payload={} offset={}({}) value={:#x} \
+                "  minor#{} {} born_in={} holder={:#x} tid={} name={} payload={} offset={}({}) value={:#x} \
                  forwarded={} | type: size={} item_size={} length_offset={} gc_ptr_offsets={:?} \
-                 custom_trace={} is_object={} | holder: track_young={} remembered={} \
-                 barriered_ever={} traced_this_minor={} store_sites={:#b} | layout={:?}",
+                 items_have_gc_ptrs={} custom_trace={} is_object={} | holder: track_young={} \
+                 remembered={} barriered_ever={} traced_this_minor={} store_sites={:#b} \
+                 | value_type={} around={:x?} | layout={:?}",
                 e.minor,
                 if e.origin == BH_PROBE_ORIGIN_PROMOTED {
                     "promoted"
                 } else {
                     "born-old"
                 },
+                e.phase,
                 e.holder,
                 e.tid,
+                e.holder_name.unwrap_or("?"),
                 e.payload_size,
                 e.offset,
                 bh_probe_field_name(e.tid, e.offset),
@@ -3206,6 +3229,7 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
                 e.item_size,
                 e.length_offset,
                 e.gc_ptr_offsets,
+                e.items_have_gc_ptrs,
                 e.custom_trace,
                 e.is_object,
                 e.track_young_ptrs,
@@ -3213,6 +3237,8 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
                 e.barriered_ever,
                 e.traced_this_minor,
                 e.store_sites,
+                e.value_name.unwrap_or("?"),
+                e.neighbourhood,
                 bh_probe_layout(e.tid),
             );
         }
@@ -3264,11 +3290,12 @@ pub fn note_bh_object(addr: usize, payload_size: usize, origin: u8) {
     if addr == 0 || !bh_probe_enabled() {
         return;
     }
-    let _ = BH_PROBE_OBJECTS.try_with(|v| v.borrow_mut().push((addr, payload_size, origin)));
+    let phase = bh_probe_phase();
+    let _ = BH_PROBE_OBJECTS.try_with(|v| v.borrow_mut().push((addr, payload_size, origin, phase)));
 }
 
 /// Visit every recorded old-generation block.
-pub fn with_bh_objects<R>(f: impl FnOnce(&[(usize, usize, u8)]) -> R) -> Option<R> {
+pub fn with_bh_objects<R>(f: impl FnOnce(&[(usize, usize, u8, &'static str)]) -> R) -> Option<R> {
     BH_PROBE_OBJECTS.try_with(|v| f(&v.borrow())).ok()
 }
 
@@ -3379,7 +3406,7 @@ pub fn bh_probe_scan(reason: &str) {
         return;
     }
     let hit = with_bh_objects(|objects| {
-        for &(addr, payload_size, origin) in objects {
+        for &(addr, payload_size, origin, _phase) in objects {
             // Promoted blocks are the minor's own output; this scan is about
             // what a blackhole store just left behind in a born-old block.
             if origin != BH_PROBE_ORIGIN_BORN_OLD || (addr >= lo && addr < hi) {
@@ -3451,6 +3478,24 @@ pub fn bh_probe_field_name(type_id: u32, offset: usize) -> &'static str {
                 .map(|&(_, _, n)| n)
         })
         .unwrap_or("?")
+}
+
+/// Resolves an `rclass.OBJECT`-layout payload address to its type's name.
+/// Published by the crate that owns the layouts, because the collector's
+/// `TypeInfo` carries no name and a numeric type id names nothing on its own.
+///
+/// # Safety
+/// The installed function is called only for an address the collector has
+/// already established is a live object of an `is_object` type.
+static BH_PROBE_TYPE_NAMER: std::sync::OnceLock<fn(usize) -> Option<&'static str>> =
+    std::sync::OnceLock::new();
+
+pub fn bh_probe_set_type_namer(f: fn(usize) -> Option<&'static str>) {
+    let _ = BH_PROBE_TYPE_NAMER.set(f);
+}
+
+pub fn bh_probe_type_name(addr: usize) -> Option<&'static str> {
+    BH_PROBE_TYPE_NAMER.get().and_then(|f| f(addr))
 }
 
 #[cfg(test)]
