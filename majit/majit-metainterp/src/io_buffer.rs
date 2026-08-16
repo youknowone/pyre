@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_ir::{OpCode, Type};
 
@@ -20,8 +21,42 @@ thread_local! {
     static JIT_IO_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
 }
 
+/// Set the first time anything is written to the buffer, and never cleared.
+///
+/// Every compiled run is bracketed by a discard on the way in and a commit on
+/// the way out, so a program whose traces emit no I/O still pays two
+/// thread-local lookups and two `RefCell` borrows per entry for a buffer that
+/// is empty at both ends. Clearing an empty buffer and flushing an empty
+/// buffer are both no-ops, so the bracket can be skipped outright as long as
+/// the buffer is known to be empty — which it is, on every thread, until some
+/// write has happened.
+///
+/// The flag is process-global while the buffer is per-thread, and monotone for
+/// exactly that reason. It carries no data between threads: a thread that
+/// reads `false` while another thread is mid-write is reading about *its own*
+/// buffer, which that other thread did not touch, so `Relaxed` is the whole
+/// requirement. Making the flag track emptiness instead (cleared on commit)
+/// would let one thread's clear cancel another thread's pending output, and
+/// making it per-thread would reintroduce the lookup it exists to avoid.
+static IO_BUFFER_USED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn mark_io_buffer_used() {
+    if !IO_BUFFER_USED.load(Ordering::Relaxed) {
+        IO_BUFFER_USED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// True once any write has reached the buffer; while false, every thread's
+/// buffer is still empty.
+#[inline]
+fn io_buffer_possibly_nonempty() -> bool {
+    IO_BUFFER_USED.load(Ordering::Relaxed)
+}
+
 /// Write raw bytes to the JIT I/O buffer.
 pub fn io_buffer_write(data: &[u8]) {
+    mark_io_buffer_used();
     JIT_IO_BUFFER.with(|buf| {
         buf.borrow_mut().extend_from_slice(data);
     });
@@ -29,6 +64,7 @@ pub fn io_buffer_write(data: &[u8]) {
 
 /// Write formatted output to the JIT I/O buffer.
 pub fn io_buffer_write_fmt(args: fmt::Arguments<'_>) {
+    mark_io_buffer_used();
     JIT_IO_BUFFER.with(|buf| {
         let _ = buf.borrow_mut().write_fmt(args);
     });
@@ -36,6 +72,9 @@ pub fn io_buffer_write_fmt(args: fmt::Arguments<'_>) {
 
 /// Flush the JIT I/O buffer to stdout.
 pub fn io_buffer_commit() {
+    if !io_buffer_possibly_nonempty() {
+        return;
+    }
     JIT_IO_BUFFER.with(|buf| {
         let mut b = buf.borrow_mut();
         if !b.is_empty() {
@@ -50,6 +89,9 @@ pub fn io_buffer_commit() {
 
 /// Discard the JIT I/O buffer contents.
 pub fn io_buffer_discard() {
+    if !io_buffer_possibly_nonempty() {
+        return;
+    }
     JIT_IO_BUFFER.with(|buf| {
         buf.borrow_mut().clear();
     });
