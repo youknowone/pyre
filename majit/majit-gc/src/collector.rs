@@ -3342,12 +3342,27 @@ impl MiniMarkGC {
                     *word = unsafe { *((holder_addr as *const usize).add(index)) };
                 }
             }
+            let mut child_words = [0usize; 8];
+            for (index, word) in child_words.iter_mut().enumerate() {
+                *word = unsafe { *((obj_addr as *const usize).add(index)) };
+            }
+            let holder_hdr_tid_and_flags = if holder_addr == 0 {
+                0
+            } else {
+                unsafe { (*header_of(holder_addr)).tid_and_flags }
+            };
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
                  (header_addr={:#x}, nursery_start={:#x}, site={}, \
                  parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
-                 holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?})",
+                 holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?}, \
+                 child_tid_and_flags={:#x}, child_flag_complement={:#x}, \
+                 child_words={:#x?}, child_vtable_type_id={:?}, \
+                 nearest_header={}, \
+                 child_nursery_offset={:#x}, child_gen={}, holder_gen={}, \
+                 holder_tid_and_flags={:#x}, holder_in_remembered={}, \
+                 enclosing={}, gc_state={:?}, minors={}, majors={})",
                 type_id,
                 obj_addr,
                 obj_addr - GcHeader::SIZE,
@@ -3360,6 +3375,22 @@ impl MiniMarkGC {
                 holder_type_id,
                 slot_addr.checked_sub(holder_addr),
                 holder_words,
+                unsafe { (*hdr_ptr).tid_and_flags },
+                // FORWARDED_MARKER sets every flag bit, so a corpse whose
+                // 64-bit equality no longer holds names the cleared bit here.
+                (!unsafe { (*hdr_ptr).flags() }) as u32,
+                child_words,
+                self.vtable_to_type_id.get(&child_words[0]).copied(),
+                self.describe_nearest_header(obj_addr),
+                obj_addr.wrapping_sub(self.nursery.start_ptr() as usize),
+                self.describe_generation(obj_addr),
+                self.describe_generation(holder_addr),
+                holder_hdr_tid_and_flags,
+                self.remembered_set.contains(&holder_addr),
+                self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
+                self.gc_state,
+                self.minor_collections,
+                self.major_collections,
             );
         }
         // Compute the actual payload size (for varsize objects, read the length).
@@ -3531,6 +3562,15 @@ impl MiniMarkGC {
 
         // custom_trace_hook parity: use custom trace function if registered.
         if let Some(trace_fn) = custom_trace {
+            // A custom trace names its own slots — for a JITFRAME, `jf_gcmap`
+            // decides them, not the type table. When one of those slots does
+            // not decode as an object, the discriminating question is whether
+            // the *rest* of the same trace is sound: one bad slot among sound
+            // ones is a bad published value, while a trace whose slots are
+            // mostly unsound is a map that no longer describes the object.
+            // Defer the first undecodable slot so the whole walk completes and
+            // the panic can report both.
+            let mut deferred: Option<(usize, usize)> = None;
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
                     let field_ref = *slot_ptr;
@@ -3542,6 +3582,10 @@ impl MiniMarkGC {
                         site,
                     );
                     if self.is_nursery_object_start(field_ref.0) {
+                        if deferred.is_none() && !self.nursery_start_decodes(field_ref.0) {
+                            deferred = Some((slot_ptr as usize, field_ref.0));
+                            return;
+                        }
                         let new_ref = self.copy_nursery_object(
                             field_ref.0,
                             "minor_custom_trace_target",
@@ -3552,6 +3596,17 @@ impl MiniMarkGC {
                         *slot_ptr = new_ref;
                     }
                 });
+            }
+            if let Some((slot_addr, field)) = deferred {
+                let walk = self.describe_custom_trace_slots(obj_addr, trace_fn);
+                eprintln!("GC BUG: custom-trace slot walk for holder={obj_addr:#x}: {walk}");
+                self.copy_nursery_object(
+                    field,
+                    "minor_custom_trace_target",
+                    site,
+                    obj_addr,
+                    slot_addr,
+                );
             }
             return;
         }
@@ -4613,6 +4668,97 @@ impl MiniMarkGC {
         } else {
             "outside"
         }
+    }
+
+    /// Whether the header in front of a nursery address decodes at all.
+    ///
+    /// `is_nursery_object_start` is a range check, so it answers "could be an
+    /// object", not "is one". This is the cheap half of the question the
+    /// `copy_nursery_object` panic answers in full.
+    fn nursery_start_decodes(&self, obj_addr: usize) -> bool {
+        let hdr = unsafe { *header_of(obj_addr) };
+        hdr.is_forwarded() || (hdr.type_id() as usize) < self.types.len()
+    }
+
+    /// Every slot a custom trace names, with the state of the value in it.
+    ///
+    /// For a JITFRAME the slot set is whatever `jf_gcmap` says, so this is the
+    /// only way to see the map the collector actually acted on.
+    fn describe_custom_trace_slots(
+        &self,
+        obj_addr: usize,
+        trace_fn: crate::trace::CustomTraceFn,
+    ) -> String {
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        unsafe {
+            trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                slots.push((slot_ptr as usize, (*slot_ptr).0));
+            });
+        }
+        let mut out = format!("{} slots:", slots.len());
+        for (slot_addr, value) in slots {
+            let offset = slot_addr.wrapping_sub(obj_addr);
+            let tag = if value == 0 {
+                "null".to_string()
+            } else if !self.is_managed_heap_object(value) {
+                "unmanaged".to_string()
+            } else if !self.nursery_start_decodes(value) {
+                format!("{}-BAD", self.describe_generation(value))
+            } else {
+                let hdr = unsafe { *header_of(value) };
+                if hdr.is_forwarded() {
+                    format!("{}-forwarded", self.describe_generation(value))
+                } else {
+                    format!("{}-tid{}", self.describe_generation(value), hdr.type_id())
+                }
+            };
+            out.push_str(&format!(" [+{offset}]={value:#x}:{tag}"));
+        }
+        out
+    }
+
+    /// The nearest preceding word that decodes as an object header whose
+    /// extent covers `obj_addr`.
+    ///
+    /// `is_nursery_object_start` is a bare range check, so a slot holding an
+    /// *interior* address passes it and the collector then reads a payload
+    /// word as a header. That is a different defect from a header that was
+    /// genuinely clobbered, and the header word alone does not separate them:
+    /// finding a real object that contains the address settles it, and its
+    /// `interior_offset` names the field the slot actually points at.
+    fn describe_nearest_header(&self, obj_addr: usize) -> String {
+        let word = std::mem::size_of::<usize>();
+        let floor = self.nursery.start_ptr() as usize;
+        for back in 1..=64usize {
+            let Some(candidate) = obj_addr.checked_sub(back * word) else {
+                break;
+            };
+            if candidate <= floor + GcHeader::SIZE {
+                break;
+            }
+            let hdr = unsafe { *header_of(candidate) };
+            if hdr.is_forwarded() {
+                let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
+                return format!("forwarded back={back}w candidate={candidate:#x} fwd={fwd:#x}");
+            }
+            let tid = hdr.type_id();
+            if tid as usize >= self.types.len() {
+                continue;
+            }
+            let Some(size) = self.try_size_for_typeid(candidate, tid) else {
+                continue;
+            };
+            if candidate + size <= obj_addr {
+                continue;
+            }
+            return format!(
+                "tid={tid} back={back}w candidate={candidate:#x} size={size} \
+                 interior_offset={} custom_trace={}",
+                obj_addr - candidate,
+                self.types.get(tid).custom_trace.is_some(),
+            );
+        }
+        "none".to_string()
     }
 
     /// Which object actually owns `slot_addr`.
