@@ -1909,30 +1909,22 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     index_of_virtualizable: usize,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
-    // TODO (Rust language constraint, not a logic
-    // divergence): RPython `compile.py:425-461` calls
-    // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
-    // forwarding pointers, which `emit_op`'s default `get_box_replacement`
-    // walks transitively when later body ops reference the original box.
-    // Pyre uses a flat-`OpRef` IR (no per-Box mutable forwarding cell),
-    // so the equivalent rewrite uses a function-local
-    // `forwarding: Vec<OpRef>` indexed by source `OpRef.0`. The Vec is
-    // discarded when the function returns; its lifetime mirrors the
-    // single in-place loop rewrite that RPython's `_forwarded` model
-    // accomplishes via Box mutation. No semantic divergence.
+    // `compile.py:425-461` redirects each entry inputarg at its own
+    // `_forwarded` slot — `box.set_forwarded(extra_ops[-1])` — and `emit_op`
+    // walks those slots through `get_box_replacement` as it copies the body.
+    // The rewrite below is that walk over a function-local table instead,
+    // keyed by source `OpRef`.
+    //
+    // Not for want of the slots: `InputArg` carries one and `Operand` walks it.
+    // They are unobservable HERE. The entry args this function rewrites against
+    // are fresh copies (`fresh_value_copy` deliberately clears the slot), the
+    // caller's own `Vec<InputArg>` is value-typed and truncated below, and the
+    // ops name their arguments by flat `OpRef` rather than by shared inputarg
+    // identity — so a chain rooted at any of them would have no reader. The
+    // table is dropped only after the rewrite is fully materialized into `ops`,
+    // which is what makes the two constructions equivalent.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    // TODO (Rust language constraint, not a logic
-    // divergence): RPython `compile.py:425-461` calls
-    // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
-    // forwarding pointers, which `emit_op`'s default `get_box_replacement`
-    // walks transitively when later body ops reference the original box.
-    // Pyre uses a flat-`OpRef` IR (no per-Box mutable forwarding cell),
-    // so the equivalent rewrite uses a function-local
-    // `forwarding: Vec<OpRef>` indexed by source `OpRef.0`. The Vec is
-    // discarded when the function returns; its lifetime mirrors the
-    // single in-place loop rewrite that RPython's `_forwarded` model
-    // accomplishes via Box mutation. No semantic divergence.
     fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
         if source.is_none() || source.is_constant() {
             return;
@@ -2553,9 +2545,14 @@ pub fn compile_tmp_callback(
     // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
     // so they are written through the shared `Arc` directly.
     jitcell_token.green_key.set(green_key);
+    // Red-arg space, not entry space: this token's signature is `nb_red_args`
+    // wide (asserted below), and `direct_assembler_call` selects the vable out
+    // of a list of exactly that width. A driver whose compiled entry is a flat
+    // state-field prefix numbers its virtualizable in the entry instead, and
+    // that number would name the wrong red — or a red that is not there.
     jitcell_token
         .virtualizable_arg_index
-        .set(jitdriver_sd.virtualizable_arg_index());
+        .set(jitdriver_sd.red_arg_virtualizable_index());
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  TODO: `rpython/rlib/jit.py`'s `jl`

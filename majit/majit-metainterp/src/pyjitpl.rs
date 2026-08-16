@@ -16169,6 +16169,17 @@ impl<M: Clone> MetaInterp<M> {
             target_sd.num_reds(),
             "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
         );
+        // `args` is that red list, and the vable is picked out of it below by
+        // the index the target token carries, so the token's index has to be a
+        // position among the reds (`warmspot.py:537`). A driver whose compiled
+        // entry is a flat state-field prefix numbers its virtualizable in the
+        // entry instead; the two coordinate systems have never met because no
+        // such driver mints a CALL_ASSEMBLER token, and this says so.
+        debug_assert!(
+            target_sd.flat_entry_contract().is_none(),
+            "a flat-entry driver's virtualizable index is not a position in \
+             the reds, but direct_assembler_call selects out of the red list",
+        );
         // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs).
         //
         // Pull `arg_types` from `target_sd.red_args_types`

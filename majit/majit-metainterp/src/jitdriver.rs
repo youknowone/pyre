@@ -1234,20 +1234,32 @@ impl JitDriverStaticData {
 
     /// rewrite.py:684 `jd.index_of_virtualizable` parity.
     ///
-    /// Returns the index inside the entry arglist — the red-arg list /
-    /// original CALL_ASSEMBLER arglist — not the absolute index in `vars`.
+    /// Returns the index inside the ENTRY arglist — the values the compiled
+    /// entry is invoked with — not the absolute index in `vars`. When the reds
+    /// ARE the entry, that is a position among the reds and this agrees with
+    /// [`Self::red_arg_virtualizable_index`]. When the entry is a flat
+    /// state-field prefix the two part company: the reds describe the
+    /// merge-point payload, where the whole state is a single red, so the same
+    /// number picks out a different value in each list. The declared contract
+    /// takes precedence here; see [`FlatEntryContract`].
     ///
-    /// Every caller reads this as a position in the values the compiled entry
-    /// is invoked with, so a driver whose entry is a flat state-field prefix
-    /// must be answered in THAT list: its reds describe the merge-point
-    /// payload, where the whole state is a single red, and a position in the
-    /// reds picks out a different value than the same position in the entry.
-    /// The declared contract therefore takes precedence over the red-name
-    /// lookup; see [`FlatEntryContract`].
+    /// A consumer indexing an original CALL_ASSEMBLER red arglist wants the
+    /// other accessor, whichever driver it holds.
     pub fn virtualizable_arg_index(&self) -> Option<usize> {
         if let Some(flat) = self.flat_entry {
             return Some(flat.index_of_virtualizable);
         }
+        self.red_arg_virtualizable_index()
+    }
+
+    /// `warmspot.py:537 jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
+    ///
+    /// The virtualizable's position among the REDS, and only that — a flat
+    /// entry contract does not override it, because the list this indexes is
+    /// the red arglist a CALL_ASSEMBLER carries rather than the compiled
+    /// entry's. Upstream has one coordinate system and spells it this way;
+    /// a consumer whose list is `num_red_args` wide has to as well.
+    pub fn red_arg_virtualizable_index(&self) -> Option<usize> {
         let name = self.virtualizable.as_deref()?;
         self.reds().iter().position(|var| var.name == name)
     }
@@ -1833,7 +1845,26 @@ impl<S: JitState> JitDriver<S> {
         // index, not a position in the reds, because the entry it describes is
         // not the red list.
         descriptor.index_of_virtualizable = contract.index_of_virtualizable as i32;
+        let registered_index = descriptor.index;
         self.descriptor_cache = None;
+        // Registration files a CLONE of the descriptor, so after it there are
+        // two copies and the consumers are split between them: a trace start
+        // reads the driver's, while `initialize_virtualizable` reads the
+        // registered one. Writing only the first is a silent disagreement
+        // about whether this driver has a virtualizable at all.
+        //
+        // Upstream has no such split to keep in step — `warmspot.py:259`
+        // builds the static data and `warmspot.py:537` stamps
+        // `jd.index_of_virtualizable` on the very object the table holds — so
+        // declaring after registration stays a supported order here too, and
+        // the registered copy is brought along rather than left behind.
+        if let Some(index) = registered_index
+            && let Some(registered) = self.meta.jitdriver_sd_mut(index)
+        {
+            registered.virtualizable = Some(virtualizable.to_string());
+            registered.flat_entry = Some(contract);
+            registered.index_of_virtualizable = contract.index_of_virtualizable as i32;
+        }
     }
 
     /// Declare `contract` if — and only if — this driver's virtualizable is one
@@ -2391,13 +2422,13 @@ impl<S: JitState> JitDriver<S> {
     /// resuming there re-runs the loop the compiled run already completed.
     pub fn take_back_edge_finish(&mut self) -> Option<Vec<Value>> {
         // The latch holds the exit values in their decoded storage, which is
-        // inline for the widths a finish actually returns. Handing them out
-        // as a vector copies them once, on a call no compiled entry makes on
-        // its own: the projecting siblings below are what the portal drains.
+        // inline for the widths a finish actually returns. Taken rather than
+        // copied: the buffer is owned here and has no reader left, so a width
+        // that did spill hands its allocation over instead of duplicating it.
         self.meta
             .back_edge_finish
             .take()
-            .map(|values| values.to_vec())
+            .map(smallvec::SmallVec::into_vec)
     }
 
     /// [`Self::take_back_edge_finish`] projected onto one integer word — the
@@ -6234,7 +6265,7 @@ impl<S: JitState> JitDriver<S> {
             self.meta
                 .run_compiled_detailed_with_values(green_key, &live_values)
         };
-        let Some(result) = result else {
+        let Some(mut result) = result else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -6242,7 +6273,9 @@ impl<S: JitState> JitDriver<S> {
         };
 
         if result.is_finish {
-            let typed_values = result.typed_values.to_vec();
+            // Taken, not copied: this arm returns below, so the exit values in
+            // `result` have no reader past this point.
+            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
             let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
             drop(result);
             return DetailedDriverRunOutcome::Finished {
@@ -6373,7 +6406,7 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         pre_run();
-        let Some(result) = self
+        let Some(mut result) = self
             .meta
             .run_compiled_detailed_with_values(green_key, &live_values)
         else {
@@ -6396,8 +6429,10 @@ impl<S: JitState> JitDriver<S> {
         let trace_id = result.trace_id;
         let descr_arc = std::sync::Arc::clone(&result.descr_arc);
         let exit_layout = result.exit_layout.clone();
-        let typed_values = result.typed_values.to_vec();
-        let raw_values = result.values.to_vec();
+        // Taken, not copied: every field this arm needs is read out here and
+        // `result` is dropped just below, so neither buffer has a reader left.
+        let typed_values = std::mem::take(&mut result.typed_values).into_vec();
+        let raw_values = std::mem::take(&mut result.values).into_vec();
         // llmodel.py:240 grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).

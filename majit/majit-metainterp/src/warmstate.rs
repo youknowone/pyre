@@ -1839,6 +1839,9 @@ impl WarmEnterState {
     /// to fail and forcing a retrace.
     ///
     /// `qmut_key` should be a hash of (object_id, field_index) or similar.
+    /// `cell_key` is a resolved cell identity, not a raw green-key hash: it is
+    /// what names one cell among a bucket's occupants, so it is what the
+    /// invalidation below can resolve back to the dependent it was recorded for.
     pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, cell_key: u64) {
         let deps = self.quasiimmut_deps.entry(qmut_key).or_default();
         if !deps.contains(&cell_key) {
@@ -1855,19 +1858,19 @@ impl WarmEnterState {
     ///
     /// Returns the number of loops invalidated.
     ///
-    /// No typed twin, and unlike the other two abstainers this one is not a
-    /// choice. Its green keys arrive as the *values* of `quasiimmut_deps`,
-    /// which stores them as `u64` hashes, so there is no caller that holds a
-    /// `GreenKey` to hand one down: a twin cannot be given a key to take until
-    /// that table is widened. Dead in production today — its only registrar,
+    /// No typed twin, and this one needs none. Its dependents arrive as the
+    /// *values* of `quasiimmut_deps`, which records a `cell_key` each — the
+    /// identity [`Self::cell_by_key_mut`] resolves, and that resolve walks the
+    /// whole chain rather than answering with the bucket head. So a colliding
+    /// neighbour cannot be invalidated in a dependent's place, and a dependent
+    /// sitting behind a chained head cannot be skipped: the property
+    /// [`Self::invalidate_all`] below is written for — *skipping a cell is a
+    /// WRONG ANSWER rather than a leak* — holds here for the same reason,
+    /// without a `GreenKey` having to reach this far.
+    ///
+    /// Dead in production today: its only registrar,
     /// `register_quasiimmut_dependency`, has no production caller either, so
     /// `quasiimmut_deps` is empty and this returns 0 at the first line.
-    ///
-    /// That is what makes it a trap rather than a bug: [`Self::invalidate_all`]
-    /// below was fixed to walk chains because *"skipping a cell is a WRONG
-    /// ANSWER rather than a leak"*, and this targeted sibling still reads the
-    /// bucket head. Whoever wires the registrar inherits that, and a sweep
-    /// selecting whole-map `.values()` walks will not see it.
     pub fn invalidate_quasiimmut(&mut self, qmut_key: u64) -> usize {
         let deps = match self.quasiimmut_deps.swap_remove(&qmut_key) {
             Some(deps) => deps,
@@ -2390,6 +2393,27 @@ impl WarmEnterState {
     /// that cell — no `GreenKey` has to be built to prove it. Normally the
     /// answer is `hash` itself; it differs only when the cell that held the
     /// raw hash has been evicted out from under a minted sibling.
+    ///
+    /// **Why no comparator is consulted.** `warmstate.py:458-464` accepts a
+    /// cell only after `comparekey` matches, because upstream buckets are
+    /// indexed slots of a sized table (`counter.py:239-240`) and genuinely mix
+    /// unrelated green keys. This table is keyed by the FULL `get_uhash`, so
+    /// short of a 64-bit collision a bucket holds one green key's cells and
+    /// nothing else — the several occupants of a chained bucket are that one
+    /// key's hash-written cell and its typed twin, which a comparator would
+    /// only tell apart from each other. Two consequences:
+    ///
+    /// * the sole occupant of an unchained bucket IS this key's cell, and
+    /// * where it is not — an occupant a hash-written creator installed with no
+    ///   comparator — the full typed resolve reaches the same key anyway:
+    ///   [`Self::cell_key_for`] misses the chain, finds `hash` taken, and
+    ///   `unwrap_or(hash)` lands back on that same cell. So the shortcut is not
+    ///   trading a typed miss for a wrong cell; there is no typed miss to take.
+    ///
+    /// A 64-bit `get_uhash` collision breaks the invariant, and then this can
+    /// answer with a neighbour's cell. That is the condition under which a
+    /// comparator-less cell is unresolvable rather than resolvable-but-unsound
+    /// (see [`BaseJitCell::comparekey`]) — no accept rule fixes it here.
     #[inline]
     pub fn sole_cell_key(&self, hash: u64) -> Option<u64> {
         let head = self.cells.get(&hash)?;
