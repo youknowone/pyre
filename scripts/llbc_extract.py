@@ -687,6 +687,22 @@ def is_repo_relative_name(value: str) -> bool:
     return not windows.is_absolute() and not windows.drive
 
 
+def normalized_local_name(value: str) -> PurePosixPath:
+    """A file-table name as a normalised repo-relative POSIX path.
+
+    Charon separates with backslashes on Windows, and `posixpath` does not read
+    those as separators: the whole spelling arrives as ONE component, so a
+    `../` chain survives normalisation and the name never equals the
+    forward-slash path `git ls-files` reports for the same file. The live
+    instance is `_immutables_map/mod.rs`, whose `include_str!` climbs five
+    levels to `lib_pypy/_immutables_map.py`; unnormalised, it failed the
+    coverage assertion on the windows leg alone. `PureWindowsPath` reads both
+    separators, so canonicalise through it first. Nothing else changes shape —
+    no file in this repository carries a backslash in its name.
+    """
+    return PurePosixPath(posixpath.normpath(PureWindowsPath(value).as_posix()))
+
+
 def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
     """Repo-relative `Local` files in an artefact, grouped by crate name."""
     by_crate: dict[str, set[Path]] = {}
@@ -699,7 +715,7 @@ def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
             raise SystemExit(f"extract-llbc.py: {path} has a non-string Local filename")
         if not is_repo_relative_name(value):
             continue
-        normal = PurePosixPath(posixpath.normpath(value))
+        normal = normalized_local_name(value)
         if normal == PurePosixPath("..") or normal.parts[:1] == ("..",):
             raise SystemExit(
                 f"extract-llbc.py: {path} has a Local filename outside the repository: {value}"
@@ -729,7 +745,7 @@ def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
         return None
     result: set[Path] = set()
     for value in path.read_text(encoding="utf-8").splitlines():
-        normal = PurePosixPath(posixpath.normpath(value))
+        normal = normalized_local_name(value)
         escapes = normal == PurePosixPath("..") or normal.parts[:1] == ("..",)
         if not is_repo_relative_name(value) or escapes:
             raise SystemExit(f"extract-llbc.py: invalid path in {path}: {value!r}")
@@ -2540,6 +2556,17 @@ def self_test_ullbc_files_table() -> None:
             "crate_name": "core",
             "contents": "",
         },
+        # A repo-relative name separated the way the windows leg spells it,
+        # carrying the `../` chain `_immutables_map/mod.rs` uses to reach
+        # `lib_pypy/`. `posixpath` reads no separator here, so before
+        # `normalized_local_name` the whole thing stayed one component and the
+        # `..` survived into the read set, where it matched nothing git lists.
+        {
+            "id": 5,
+            "name": {"Local": r"crate\src\module\m\..\..\..\..\shared\app.py"},
+            "crate_name": "crate",
+            "contents": "",
+        },
     ]
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "probe.ullbc"
@@ -2548,7 +2575,8 @@ def self_test_ullbc_files_table() -> None:
         )
         parsed = ullbc_files_table(path, chunk_size=7)
         local = artefact_local_readfiles(path)
-    if parsed != table or local != {"crate": {Path("crate/src/lib.rs")}}:
+    expected = {"crate": {Path("crate/src/lib.rs"), Path("shared/app.py")}}
+    if parsed != table or local != expected:
         raise SystemExit(
             f"self-test FAILED: files-table parser returned parsed={parsed!r}, local={local!r}"
         )
