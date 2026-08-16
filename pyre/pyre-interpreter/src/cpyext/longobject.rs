@@ -566,6 +566,104 @@ unsafe fn from_native_bytes(
     }
 }
 
+/// `_PyLong_FromByteArray(bytes, n, little_endian, signed)` — the `int` `n`
+/// bytes spell in the named order.
+///
+/// # Safety
+/// `bytes` must name `n` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyLong_FromByteArray(
+    bytes: *const u8,
+    n: usize,
+    little_endian: c_int,
+    signed: c_int,
+) -> *mut CPyObject {
+    if bytes.is_null() && n != 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let order = if little_endian != 0 { "little" } else { "big" };
+    let bytes = unsafe { std::slice::from_raw_parts(bytes, n) };
+    match BigInt::frombytes(bytes, order, signed != 0) {
+        Ok(value) => pyobject::make_ref(from_bigint(value)),
+        Err(_) => {
+            super::pyerrors::set_pending_error(crate::PyError::value_error(
+                "cannot read an int from these bytes",
+            ));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `_PyLong_AsByteArray(v, bytes, n, little_endian, is_signed, with_exceptions)`
+/// — write the low `n` bytes of the value in the named order.
+///
+/// A value too large for `n` still fills all `n` bytes and then answers -1:
+/// `PyLong_AsNativeBytes` reads the truncated copy out of the same buffer.  A
+/// negative value asked for as unsigned writes nothing.  `with_exceptions` says
+/// whether either failure also raises.
+///
+/// # Safety
+/// `bytes` must name `n` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyLong_AsByteArray(
+    object: *mut CPyObject,
+    bytes: *mut u8,
+    n: usize,
+    little_endian: c_int,
+    is_signed: c_int,
+    with_exceptions: c_int,
+) -> c_int {
+    if bytes.is_null() && n != 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let signed = is_signed != 0;
+    let Some(placed) = as_bigint(object, |value| {
+        let negative = value.get_sign() < 0;
+        if negative && !signed {
+            return Err("can't convert negative int to unsigned");
+        }
+        let needed = required_bytes(value, signed) as usize;
+        // The narrowest form is built first and then placed, so a short
+        // destination takes the low bytes rather than failing before it is
+        // written.
+        let narrow = value
+            .tobytes(needed.max(1) as i64, "little", signed || negative)
+            .map_err(|_| "int too large to convert")?;
+        let mut written = vec![if negative { 0xFF } else { 0x00 }; n];
+        let taken = n.min(narrow.len());
+        written[..taken].copy_from_slice(&narrow[..taken]);
+        if little_endian == 0 {
+            written.reverse();
+        }
+        Ok((needed > n, written))
+    }) else {
+        return -1;
+    };
+    let (overflowed, written) = match placed {
+        Ok(placed) => placed,
+        Err(message) => {
+            if with_exceptions != 0 {
+                super::pyerrors::set_pending_error(crate::PyError::overflow_error(message));
+            }
+            return -1;
+        }
+    };
+    if n != 0 {
+        unsafe { std::ptr::copy_nonoverlapping(written.as_ptr(), bytes, n) };
+    }
+    if overflowed {
+        if with_exceptions != 0 {
+            super::pyerrors::set_pending_error(crate::PyError::overflow_error(
+                "int too large to convert",
+            ));
+        }
+        return -1;
+    }
+    0
+}
+
 /// `PyLong_GetInfo()` — `sys.int_info`, which is where the same numbers are
 /// already published.
 #[unsafe(no_mangle)]
@@ -647,6 +745,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyLong_AsNativeBytes as *const ());
     std::hint::black_box(PyLong_FromNativeBytes as *const ());
     std::hint::black_box(PyLong_FromUnsignedNativeBytes as *const ());
+    std::hint::black_box(_PyLong_FromByteArray as *const ());
+    std::hint::black_box(_PyLong_AsByteArray as *const ());
     std::hint::black_box(PyLong_GetInfo as *const ());
     std::hint::black_box(PyLong_Check as *const ());
     std::hint::black_box(PyLong_CheckExact as *const ());

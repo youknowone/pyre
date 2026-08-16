@@ -170,6 +170,17 @@ pub unsafe extern "C" fn PyBytes_FromObject(object: *mut CPyObject) -> *mut CPyO
     super::object::result(bytes_of(object))
 }
 
+/// `PyBytes_AS_STRING(object)` — the unchecked spelling of
+/// [`PyBytes_AsString`], which takes `void *` so a caller may hand it a
+/// `PyBytesObject *` without a cast.
+///
+/// # Safety
+/// `object` must be a live `bytes` mirror.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyBytes_AS_STRING(object: *mut std::ffi::c_void) -> *mut c_char {
+    unsafe { PyBytes_AsString(object as *mut CPyObject) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -188,6 +199,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyBytes_AsStringAndSize as *const ());
     std::hint::black_box(PyBytes_Size as *const ());
     std::hint::black_box(PyBytes_FromObject as *const ());
+    std::hint::black_box(PyBytes_AS_STRING as *const ());
     std::hint::black_box(PyBytes_Check as *const ());
     std::hint::black_box(PyBytes_CheckExact as *const ());
 }

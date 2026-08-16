@@ -35,6 +35,14 @@ extern "C" {
 #  define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
 #endif
 
+/* Names an argument a function does not read, so the compiler stops warning
+   about it: `int func(int a, int Py_UNUSED(b))`. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define Py_UNUSED(name) _unused_##name __attribute__((unused))
+#else
+#  define Py_UNUSED(name) _unused_##name
+#endif
+
 typedef intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
@@ -1022,6 +1030,14 @@ PyAPI_FUNC(PyObject *) PyLong_FromNativeBytes(const void *buffer, size_t n_bytes
 PyAPI_FUNC(PyObject *) PyLong_FromUnsignedNativeBytes(const void *buffer,
                                                       size_t n_bytes, int flags);
 PyAPI_FUNC(PyObject *) PyLong_GetInfo(void);
+/* An `int` here is an ordinary mirror with no digit array of its own, so the
+   name exists only so these two declarations read as they do upstream. */
+typedef PyObject PyLongObject;
+PyAPI_FUNC(PyObject *) _PyLong_FromByteArray(const unsigned char *bytes, size_t n,
+                                             int little_endian, int is_signed);
+PyAPI_FUNC(int) _PyLong_AsByteArray(PyLongObject *v, unsigned char *bytes, size_t n,
+                                    int little_endian, int is_signed,
+                                    int with_exceptions);
 PyAPI_FUNC(int) PyLong_Check(PyObject *object);
 PyAPI_FUNC(int) PyLong_CheckExact(PyObject *object);
 PyAPI_FUNC(PyObject *) PyNumber_Long(PyObject *object);
@@ -1041,6 +1057,9 @@ PyAPI_FUNC(const char *) PyUnicode_AsUTF8AndSize(PyObject *object, Py_ssize_t *s
 PyAPI_FUNC(Py_ssize_t) PyUnicode_GetLength(PyObject *object);
 PyAPI_FUNC(int) PyUnicode_Check(PyObject *object);
 PyAPI_FUNC(int) PyUnicode_CheckExact(PyObject *object);
+/* A `str` here is a mirror rather than a compact object with a readable
+   `length` field, so the fast spelling is the call. */
+#define PyUnicode_GET_LENGTH(op) PyUnicode_GetLength((PyObject *)(op))
 
 /* bytes. */
 PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *text);
@@ -1049,8 +1068,12 @@ PyAPI_FUNC(char *) PyBytes_AsString(PyObject *object);
 PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *object, char **buffer, Py_ssize_t *size);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *object);
 PyAPI_FUNC(PyObject *) PyBytes_FromObject(PyObject *object);
+PyAPI_FUNC(char *) PyBytes_AS_STRING(void *object);
 PyAPI_FUNC(int) PyBytes_Check(PyObject *object);
 PyAPI_FUNC(int) PyBytes_CheckExact(PyObject *object);
+/* The storage a `bytes` mirror hands out is a cached copy, not a field, so
+   the size answer is the same call the checked spelling makes. */
+#define PyBytes_GET_SIZE(op) PyBytes_Size((PyObject *)(op))
 
 /* tuple. */
 PyAPI_FUNC(PyObject *) PyTuple_New(Py_ssize_t size);
@@ -1238,7 +1261,40 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
         }
         return 1;
     }
-    case 's': case 'z': case 'y': {
+    case 's': case 'z': case 'y': case 'w': {
+        if (**format == '*') {
+            /* Fill a `Py_buffer` the caller releases.  A `str` is its own
+               UTF-8 storage, so the view borrows that rather than encoding
+               into a temporary; everything else goes through the buffer
+               protocol. */
+            (*format)++;
+            Py_buffer *view = va_arg(*va, Py_buffer *);
+            if (code == 'z' && Py_IsNone(arg)) {
+                return PyBuffer_FillInfo(view, NULL, NULL, 0, 1, 0) == 0;
+            }
+            if ((code == 's' || code == 'z') && PyUnicode_Check(arg)) {
+                Py_ssize_t length = 0;
+                const char *text = PyUnicode_AsUTF8AndSize(arg, &length);
+                if (text == NULL) {
+                    return 0;
+                }
+                return PyBuffer_FillInfo(view, arg, (void *)text, length, 1, 0) == 0;
+            }
+            if (PyObject_GetBuffer(arg, view,
+                                   code == 'w' ? PyBUF_WRITABLE : PyBUF_SIMPLE) < 0) {
+                return 0;
+            }
+            if (!PyBuffer_IsContiguous(view, 'C')) {
+                PyBuffer_Release(view);
+                _PyPyre_ArgError(fname, "argument must be a contiguous buffer");
+                return 0;
+            }
+            return 1;
+        }
+        if (code == 'w') {
+            _PyPyre_ArgError(fname, "'w' argument format requires a '*'");
+            return 0;
+        }
         int with_size = (**format == '#');
         if (with_size) {
             (*format)++;
@@ -1346,9 +1402,11 @@ static inline void _PyPyre_ArgSkip(const char **format, va_list *va)
     char code = **format;
     (*format)++;
     switch (code) {
-    case 's': case 'z': case 'y':
+    case 's': case 'z': case 'y': case 'w':
         (void)va_arg(*va, void *);
-        if (**format == '#') {
+        if (**format == '*') {
+            (*format)++;
+        } else if (**format == '#') {
             (*format)++;
             (void)va_arg(*va, void *);
         }
@@ -1385,7 +1443,7 @@ static inline void _PyPyre_ArgCount(const char *format, Py_ssize_t *total,
                 *fname = cursor + 1;
             }
             goto done;
-        case '#': case '!': case '&':
+        case '#': case '!': case '&': case '*':
             break;
         default:
             count++;

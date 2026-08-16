@@ -413,6 +413,44 @@ assert restored == -7, restored
 assert unsigned_restored == (1 << 64) - 7, unsigned_restored
 assert digit_bits == sys.int_info.bits_per_digit, (digit_bits, sys.int_info)
 
+# ── the private byte-array conversions ─────────────────────────────────
+big, little, negative, roundtrip, kept_low, raised = m.byte_arrays()
+assert big == 0x01020304, big
+assert little == 0x04030201, little
+# The same bytes read as two's complement: 0x01020304 has a clear sign bit.
+assert negative == 0x01020304, negative
+assert roundtrip == 1, roundtrip
+# A destination too small keeps the low bytes and reports -1 without raising.
+assert kept_low == 1, kept_low
+# A negative value asked for as unsigned leaves the destination alone.
+assert raised == 1, raised
+
+# ── the unchecked accessors ────────────────────────────────────────────
+points, raw = m.fast_accessors(b'abc')
+# PyUnicode_GET_LENGTH counts code points, not the UTF-8 bytes behind them.
+assert points == 5, points
+assert raw == b'abc', raw
+
+# ── the buffer-filling argument formats ────────────────────────────────
+text, data, maybe_len, maybe_null, readonly = m.buffer_formats(
+    'naïve', b'\x00\xff', None)
+# 's*' encodes a str to UTF-8, so the view is longer than the string.
+assert text == 'naïve'.encode() and len(text) == 6, text
+assert data == b'\x00\xff', data
+# 'z*' takes None as an empty view over no object.
+assert (maybe_len, maybe_null) == (0, 1), (maybe_len, maybe_null)
+assert readonly == 1, readonly
+# 's*' also accepts a bytes-like object; 'y*' refuses a str.
+assert m.buffer_formats(b'raw', b'\x01', None)[0] == b'raw'
+try:
+    m.buffer_formats('t', 'not bytes', None)
+except TypeError:
+    pass
+else:
+    raise AssertionError("'y*' accepted a str")
+# 'w*' asks for a writable view, which an interpreter object never exports.
+assert m.writable_buffer(bytearray(b'ab')) == 'read-only'
+
 print('cpyext-methods-ok')
 "#;
 

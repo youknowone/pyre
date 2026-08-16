@@ -178,7 +178,14 @@ Known divergences, each documented at its definition:
 - `PyObject_GetBuffer` of an *interpreter* object hands C a read-only snapshot,
   the collector being free to move the storage a `Py_buffer` would otherwise
   name; a `PyBUF_WRITABLE` request for one is refused rather than answered with
-  a copy whose writes go nowhere;
+  a copy whose writes go nowhere. The `w*` argument format therefore reaches
+  only a C exporter's own `bf_getbuffer`, and raises `BufferError` for a
+  `bytearray`;
+- `PyBytes_AS_STRING` and `PyBytes_GET_SIZE` are the calls their checked
+  spellings make, and `PyUnicode_GET_LENGTH` is `PyUnicode_GetLength`: neither
+  a `bytes` nor a `str` mirror carries the field the reference header reads,
+  the storage being a cached copy rather than a tail allocated with the
+  object;
 - a C exporter's view must be C-contiguous and free of suboffsets: a strided or
   indirect export is refused. The `Py_buffer` a `bf_getbuffer` filled in is kept
   and handed back to `bf_releasebuffer` unchanged -- `internal` is the
@@ -210,7 +217,9 @@ Known divergences, each documented at its definition:
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like
    aliases on the other; on the same header the corrected count is 293, so
-   this figure moved by 49.);
+   this figure moved by 49.) The figure counts only that population, so the
+   private `_PyLong_*ByteArray` pair and the unchecked accessor macros the
+   extensions below need do not appear in it;
 6. Windows API DLL/import-library packaging.
 
 A type built from a spec carries the module it was created from and the
@@ -230,6 +239,22 @@ at.
 The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
 binary would falsely claim that CPython's private object layouts and symbols
 are ABI-compatible with pyre.
+
+## A published extension
+
+`mmh3` 5.2.1 -- MurmurHash3 bindings, hand-written C, no code generator -- was
+compiled against this header and run. It builds three static types through
+`PyType_Ready`, publishes them with `PyModule_AddObject` from a single-phase
+`PyInit_mmh3`, and reaches the interpreter through `METH_FASTCALL`,
+`METH_NOARGS`, `METH_O` and `METH_VARARGS | METH_KEYWORDS` methods, `tp_new` /
+`tp_init` / `tp_dealloc` / `tp_getset`, the `s*` argument format, and
+`_PyLong_FromByteArray`. Its module-level functions and all three hashers --
+one-shot, streaming across several `update` calls, and `copy` -- answer what
+CPython 3.14.6 answers for the same inputs.
+
+Nothing in the tree builds it: the sources are not vendored, and the fixtures
+under `pyrex/tests/fixtures` cover the entry points it needed rather than the
+package itself.
 
 ## PyPy reference map
 

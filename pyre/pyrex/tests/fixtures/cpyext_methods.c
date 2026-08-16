@@ -1306,7 +1306,120 @@ static PyObject *m_int_convert(PyObject *self, PyObject *arg)
                          restored, unsigned_restored, digit_bits);
 }
 
+/* `_PyLong_FromByteArray` / `_PyLong_AsByteArray`, including the two ways the
+   write half fails.  `Py_UNUSED` names the argument neither half reads. */
+static PyObject *m_byte_arrays(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    (void)self;
+    const unsigned char be[4] = {0x01, 0x02, 0x03, 0x04};
+    PyObject *big = _PyLong_FromByteArray(be, sizeof(be), 0, 0);
+    PyObject *little = _PyLong_FromByteArray(be, sizeof(be), 1, 0);
+    PyObject *negative = _PyLong_FromByteArray(be, sizeof(be), 0, 1);
+    if (big == NULL || little == NULL || negative == NULL) {
+        Py_XDECREF(big);
+        Py_XDECREF(little);
+        Py_XDECREF(negative);
+        return NULL;
+    }
+
+    unsigned char out[4] = {0, 0, 0, 0};
+    if (_PyLong_AsByteArray((PyLongObject *)big, out, sizeof(out), 0, 0, 1) < 0) {
+        Py_DECREF(big);
+        Py_DECREF(little);
+        Py_DECREF(negative);
+        return NULL;
+    }
+    int roundtrip = memcmp(out, be, sizeof(out)) == 0;
+
+    /* A value too wide for the destination still fills it with the low bytes,
+       which is what PyLong_AsNativeBytes reads back out. */
+    unsigned char low[2] = {0, 0};
+    int truncated = _PyLong_AsByteArray((PyLongObject *)big, low, sizeof(low), 1, 0, 0);
+    int kept_low = truncated == -1 && !PyErr_Occurred() && low[0] == 0x04 && low[1] == 0x03;
+
+    /* A negative value asked for as unsigned writes nothing and raises. */
+    PyObject *below = PyLong_FromLong(-1);
+    if (below == NULL) {
+        Py_DECREF(big);
+        Py_DECREF(little);
+        Py_DECREF(negative);
+        return NULL;
+    }
+    unsigned char untouched[2] = {0xAA, 0xAA};
+    int refused = _PyLong_AsByteArray((PyLongObject *)below, untouched, sizeof(untouched),
+                                      1, 0, 1);
+    int raised = refused == -1 && PyErr_ExceptionMatches(PyExc_OverflowError) &&
+                 untouched[0] == 0xAA && untouched[1] == 0xAA;
+    PyErr_Clear();
+    Py_DECREF(below);
+
+    return Py_BuildValue("(NNNiii)", big, little, negative, roundtrip, kept_low, raised);
+}
+
+/* The unchecked accessors, which are calls here rather than field reads. */
+static PyObject *m_fast_accessors(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    PyObject *text = PyUnicode_FromString("na\303\257ve");
+    if (text == NULL) {
+        return NULL;
+    }
+    Py_ssize_t points = PyUnicode_GET_LENGTH(text);
+    Py_DECREF(text);
+
+    const char *raw = PyBytes_AS_STRING(arg);
+    if (raw == NULL) {
+        return NULL;
+    }
+    Py_ssize_t size = PyBytes_GET_SIZE(arg);
+    return Py_BuildValue("(ny#)", points, raw, size);
+}
+
+/* The argument formats that fill a `Py_buffer` the callee releases. */
+static PyObject *m_buffer_formats(PyObject *self, PyObject *args, PyObject *keywords)
+{
+    (void)self;
+    static char *names[] = {"text", "data", "maybe", NULL};
+    Py_buffer text;
+    Py_buffer data;
+    Py_buffer maybe;
+    if (!PyArg_ParseTupleAndKeywords(args, keywords, "s*y*z*", names,
+                                     &text, &data, &maybe)) {
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue("(y#y#nii)", (const char *)text.buf, text.len,
+                                     (const char *)data.buf, data.len, maybe.len,
+                                     maybe.buf == NULL, text.readonly);
+    PyBuffer_Release(&text);
+    PyBuffer_Release(&data);
+    PyBuffer_Release(&maybe);
+    return result;
+}
+
+/* `w*` asks for a writable view.  An interpreter object only ever exports a
+   read-only snapshot, so the request is refused rather than handing back a
+   pointer whose writes would go nowhere. */
+static PyObject *m_writable_buffer(PyObject *self, PyObject *args)
+{
+    (void)self;
+    Py_buffer target;
+    if (PyArg_ParseTuple(args, "w*", &target)) {
+        PyBuffer_Release(&target);
+        Py_RETURN_NONE;
+    }
+    if (!PyErr_ExceptionMatches(PyExc_BufferError)) {
+        return NULL;
+    }
+    PyErr_Clear();
+    return PyUnicode_FromString("read-only");
+}
+
 static PyMethodDef methods[] = {
+    {"byte_arrays", m_byte_arrays, METH_NOARGS, "the private byte-array conversions"},
+    {"fast_accessors", m_fast_accessors, METH_O, "the unchecked bytes and str accessors"},
+    {"buffer_formats", (PyCFunction)(void (*)(void))m_buffer_formats,
+     METH_VARARGS | METH_KEYWORDS, "the buffer-filling argument formats"},
+    {"writable_buffer", m_writable_buffer, METH_VARARGS, "the 'w*' argument format"},
     {"object_attrs", m_object_attrs, METH_VARARGS, "the generic attribute protocol"},
     {"object_values", m_object_values, METH_VARARGS, "comparison, hashing and formatting"},
     {"object_bytes", m_object_bytes, METH_O, "PyObject_Bytes"},
