@@ -3185,6 +3185,17 @@ pub struct BhProbeViolation {
     pub barriered_ever: bool,
     pub traced_this_minor: bool,
     pub store_sites: u32,
+    /// The object the root walk reached this holder through, `None` when the
+    /// holder is itself a root. A block that carries no header of its own —
+    /// an items block, a mapdict storage — is only ever traced through its
+    /// owner, so the owner is what has to be on the remembered set and the
+    /// only place a missing barrier can live.
+    pub parent: Option<usize>,
+    pub parent_tid: Option<u32>,
+    pub parent_name: Option<&'static str>,
+    pub parent_remembered: bool,
+    pub parent_barriered_ever: bool,
+    pub parent_traced_this_minor: bool,
 }
 
 thread_local! {
@@ -3225,7 +3236,8 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
                  forwarded={} | type: size={} item_size={} length_offset={} gc_ptr_offsets={:?} \
                  items_have_gc_ptrs={} custom_trace={} is_object={} | holder: track_young={} \
                  remembered={} barriered_ever={} traced_this_minor={} store_sites={:#b} \
-                 | value_type={} around={:x?} | layout={:?}",
+                 | value_type={} around={:x?} | layout={:?} \
+                 | parent={:#x} tid={} name={} remembered={} barriered_ever={} traced_this_minor={}",
                 e.minor,
                 if e.origin == BH_PROBE_ORIGIN_PROMOTED {
                     "promoted"
@@ -3256,6 +3268,12 @@ pub fn bh_probe_violation_report(minor: usize) -> String {
                 e.value_name.unwrap_or("?"),
                 e.neighbourhood,
                 bh_probe_layout(e.tid),
+                e.parent.unwrap_or(0),
+                e.parent_tid.map(|t| t as i64).unwrap_or(-1),
+                e.parent_name.unwrap_or("?"),
+                e.parent_remembered,
+                e.parent_barriered_ever,
+                e.parent_traced_this_minor,
             );
         }
     });

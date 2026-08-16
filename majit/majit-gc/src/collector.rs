@@ -1997,15 +1997,182 @@ impl MiniMarkGC {
         }
     }
 
+    /// Walk everything reachable from the roots at the end of a minor and
+    /// report each traced slot that still names an unpinned nursery address.
+    ///
+    /// Reachability is what makes the answer usable: a block the mutator
+    /// abandoned — a grown-out-of mapdict storage, a replaced items block —
+    /// keeps whatever it last held until the sweep frees it, and those stale
+    /// words are not violations. Only declared slots are read, so a word of
+    /// padding or a non-reference field that happens to fall inside the
+    /// nursery range cannot be mistaken for one either.
+    ///
+    /// Returns `(holder, slot offset, value, parent)` per bad slot, where the
+    /// parent is the object the holder was first reached through: a block with
+    /// no header of its own is traced only via its owner's custom trace, so
+    /// the owner is what the remembered set has to carry.
+    fn bh_probe_stale_young_slots(&self) -> Vec<(usize, usize, usize, Option<usize>)> {
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut stale: Vec<(usize, usize, usize, Option<usize>)> = Vec::new();
+        let mut pending: Vec<(GcRef, Option<usize>)> = self
+            .enumerate_all_root_values()
+            .into_iter()
+            .map(|gcref| (gcref, None))
+            .collect();
+        while let Some((gcref, parent)) = pending.pop() {
+            if gcref.is_null()
+                || !self.is_managed_heap_object(gcref.0)
+                || self.nursery.contains(gcref.0)
+                || !seen.insert(gcref.0)
+            {
+                continue;
+            }
+            let here = gcref.0;
+            self.visit_referent_slots(here, &mut |slot| {
+                let value = unsafe { *slot }.0;
+                if value == 0 {
+                    return;
+                }
+                if self.nursery.contains(value) && !self.pinned_objects.contains(&value) {
+                    stale.push((here, slot as usize - here, value, parent));
+                    return;
+                }
+                pending.push((GcRef(value), Some(here)));
+            });
+        }
+        stale
+    }
+
+    /// TEMPORARY DIAGNOSTIC (`MAJIT_GC_BH_PROBE`), run before a minor starts.
+    ///
+    /// A minor traces the roots and the remembered set and nothing else, so an
+    /// old-generation object holding a young reference while off that set has
+    /// its slot left behind: the value moves and the slot keeps the dead
+    /// address. That is a missing write barrier, and the moment before the
+    /// collection is the only one at which the evidence still exists — after
+    /// it the slot is indistinguishable from one that was never written.
+    ///
+    /// Panics naming the holder, the slot, and the object the holder was first
+    /// reached through, since a block with no header of its own is traced only
+    /// through its owner and it is the owner that has to carry the barrier.
+    fn bh_probe_check_barriers_before_minor(&mut self) {
+        if !crate::bh_probe_enabled()
+            || self.minor_collections < read_uint_from_env("MAJIT_GC_BH_PROBE_FROM").unwrap_or(0)
+        {
+            return;
+        }
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut pending: Vec<(GcRef, Option<usize>)> = self
+            .enumerate_all_root_values()
+            .into_iter()
+            .map(|gcref| (gcref, None))
+            .collect();
+        let mut bad: Vec<String> = Vec::new();
+        while let Some((gcref, parent)) = pending.pop() {
+            if gcref.is_null() || !self.is_managed_heap_object(gcref.0) || !seen.insert(gcref.0) {
+                continue;
+            }
+            let here = gcref.0;
+            // A young holder needs no barrier: the minor traces the nursery in
+            // full, so only an old-generation slot can be left behind.
+            let holder_is_old = self.oldgen.contains(here);
+            let remembered = self.remembered_set.contains(&here);
+            let parent_remembered = parent.is_some_and(|p| self.remembered_set.contains(&p));
+            self.visit_referent_slots(here, &mut |slot| {
+                let value = unsafe { *slot }.0;
+                if value == 0 {
+                    return;
+                }
+                // Two ways a traced slot can already be wrong here: it names a
+                // managed address whose header is not a type at all (the value
+                // died and its memory was handed out again), or it names a
+                // young object from an old holder the barrier never remembered.
+                let managed = self.nursery.contains(value) || self.oldgen.contains(value);
+                let bad_target = managed
+                    && (unsafe { (*header_of(value)).type_id() } as usize) >= self.types.len();
+                let unbarriered = holder_is_old
+                    && !remembered
+                    && !parent_remembered
+                    && self.nursery.contains(value)
+                    && !self.pinned_objects.contains(&value);
+                if bad_target || unbarriered {
+                    let tid = unsafe { (*header_of(here)).type_id() };
+                    let parent_tid = parent.map(|p| unsafe { (*header_of(p)).type_id() });
+                    bad.push(format!(
+                        "{} holder={here:#x} tid={tid} old={holder_is_old} slot={:#x} \
+                         offset={} value={value:#x} young={} track_young={} remembered={} \
+                         barriered_ever={} | parent={:#x} tid={parent_tid:?} remembered={} \
+                         barriered_ever={}",
+                        if bad_target {
+                            "BAD-TARGET"
+                        } else {
+                            "UNBARRIERED"
+                        },
+                        slot as usize,
+                        slot as usize - here,
+                        self.nursery.contains(value),
+                        unsafe { (*header_of(here)).has_flag(flags::TRACK_YOUNG_PTRS) },
+                        remembered,
+                        crate::bh_probe_was_barriered(here),
+                        parent.unwrap_or(0),
+                        parent_remembered,
+                        parent.is_some_and(crate::bh_probe_was_barriered),
+                    ));
+                }
+                if !bad_target {
+                    pending.push((GcRef(value), Some(here)));
+                }
+            });
+        }
+        // The root walk only covers what `enumerate_all_root_values` names, and
+        // an object the mutator is writing to is live whether or not that
+        // enumeration reaches it. Sweep every recorded old-generation block of
+        // the type under investigation instead, since the population that
+        // matters is "old holders with a young reference and no barrier".
+        // The remembered set is traced whether or not anything still points at
+        // its entries, so it is its own population: an entry the root walk
+        // never reached is a dead object the minor will still read.
+        for index in 0..self.remembered_set.len() {
+            let here = self.remembered_set[index];
+            let root_reachable = seen.contains(&here);
+            self.visit_referent_slots(here, &mut |slot| {
+                let value = unsafe { *slot }.0;
+                if value == 0 || !(self.nursery.contains(value) || self.oldgen.contains(value)) {
+                    return;
+                }
+                if (unsafe { (*header_of(value)).type_id() } as usize) < self.types.len() {
+                    return;
+                }
+                let tid = unsafe { (*header_of(here)).type_id() };
+                bad.push(format!(
+                    "REMEMBERED-BAD-TARGET holder={here:#x} tid={tid} \
+                     root_reachable={root_reachable} slot={:#x} offset={} value={value:#x} \
+                     young={} barriered_ever={}",
+                    slot as usize,
+                    slot as usize - here,
+                    self.nursery.contains(value),
+                    crate::bh_probe_was_barriered(here),
+                ));
+            });
+        }
+        if !bad.is_empty() {
+            panic!(
+                "BH PROBE: {} unbarriered old->young slot(s) before minor #{}\n  {}",
+                bad.len(),
+                self.minor_collections,
+                bad.join("\n  ")
+            );
+        }
+    }
+
     /// TEMPORARY DIAGNOSTIC (`MAJIT_GC_BH_PROBE`).
     ///
     /// At the end of a minor every live nursery object has been forwarded and
     /// every traced slot rewritten, so no surviving object may still name a
-    /// nursery address. Scan every old-generation block for one and accumulate
-    /// the distinct `(type, offset)` classes, then panic once with the whole
-    /// table — the wasm runner recovers a guest panic message out of linear
-    /// memory, so this is the one diagnostic channel that reaches the console
-    /// from inside the module.
+    /// nursery address. Accumulate the distinct `(type, offset)` classes of
+    /// those that do, then panic once with the whole table — the wasm runner
+    /// recovers a guest panic message out of linear memory, so this is the one
+    /// diagnostic channel that reaches the console from inside the module.
     fn bh_probe_check_no_young_refs(&mut self) {
         if !crate::bh_probe_enabled() {
             return;
@@ -2017,22 +2184,38 @@ impl MiniMarkGC {
         // show pre-JIT allocations.
         let class_budget = read_uint_from_env("MAJIT_GC_BH_PROBE_CLASSES").unwrap_or(10);
         let report_at_minor = read_uint_from_env("MAJIT_GC_BH_PROBE_MINOR").unwrap_or(120);
+        // The reachability walk below is a whole-heap traversal per minor, far
+        // too slow to leave on for a whole run; skip the minors before the one
+        // being investigated.
+        if self.minor_collections < read_uint_from_env("MAJIT_GC_BH_PROBE_FROM").unwrap_or(0) {
+            return;
+        }
         const WORD: usize = std::mem::size_of::<usize>();
+        // The recorded allocation size and origin of each old-generation block,
+        // which the walk below does not carry.
+        let blocks: std::collections::HashMap<usize, (usize, u8, &'static str)> =
+            crate::with_bh_objects(|objects| {
+                objects
+                    .iter()
+                    .map(|&(addr, payload_size, origin, phase)| {
+                        (addr, (payload_size, origin, phase))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut fresh: Vec<crate::BhProbeViolation> = Vec::new();
-        crate::with_bh_objects(|objects| {
-            for &(addr, payload_size, origin, phase) in objects {
-                if self.nursery.contains(addr) || !self.oldgen.contains(addr) {
-                    continue;
-                }
+        {
+            for (addr, offset, word, parent) in self.bh_probe_stale_young_slots() {
+                let (payload_size, origin, phase) =
+                    blocks
+                        .get(&addr)
+                        .copied()
+                        .unwrap_or((0, crate::BH_PROBE_ORIGIN_BORN_OLD, "?"));
                 let tid = unsafe { (*header_of(addr)).type_id() };
                 if (tid as usize) >= self.types.len() || crate::bh_probe_tid_ignored(tid) {
                     continue;
                 }
-                for offset in (0..payload_size).step_by(std::mem::size_of::<usize>()) {
-                    let word = unsafe { *((addr + offset) as *const usize) };
-                    if !self.nursery.contains(word) || self.pinned_objects.contains(&word) {
-                        continue;
-                    }
+                {
                     if crate::bh_probe_violation_seen(tid, offset, origin) {
                         continue;
                     }
@@ -2083,7 +2266,7 @@ impl MiniMarkGC {
                         },
                         neighbourhood: {
                             let lo = offset.saturating_sub(2 * WORD);
-                            let hi = (offset + 3 * WORD).min(payload_size);
+                            let hi = (offset + 3 * WORD).min(payload_size.max(offset + WORD));
                             (lo..hi)
                                 .step_by(WORD)
                                 .map(|o| (o, unsafe { *((addr + o) as *const usize) }))
@@ -2096,10 +2279,21 @@ impl MiniMarkGC {
                         barriered_ever: crate::bh_probe_was_barriered(addr),
                         traced_this_minor: crate::bh_probe_was_traced(addr),
                         store_sites: crate::bh_probe_store_sites(addr, offset),
+                        parent,
+                        parent_tid: parent.map(|p| unsafe { (*header_of(p)).type_id() }),
+                        parent_name: parent
+                            .filter(|&p| {
+                                self.vtable_to_type_id
+                                    .contains_key(&unsafe { *(p as *const usize) })
+                            })
+                            .and_then(crate::bh_probe_type_name),
+                        parent_remembered: parent.is_some_and(|p| self.remembered_set.contains(&p)),
+                        parent_barriered_ever: parent.is_some_and(crate::bh_probe_was_barriered),
+                        parent_traced_this_minor: parent.is_some_and(crate::bh_probe_was_traced),
                     });
                 }
             }
-        });
+        }
         let total = crate::bh_probe_record_violations(fresh);
         if total >= class_budget || (total > 0 && self.minor_collections >= report_at_minor) {
             panic!(
@@ -2227,6 +2421,7 @@ impl MiniMarkGC {
             );
         }
         self.minor_collections += 1;
+        self.bh_probe_check_barriers_before_minor();
         // `bytes_made_old_since_cycle` is the running sum of every
         // `copy_nursery_object` payload, so its delta across this collection is
         // exactly what was promoted out of the nursery. The major-collection
@@ -3361,7 +3556,7 @@ impl MiniMarkGC {
             };
             panic!(
                 "GC BUG: invalid type_id={} at obj_addr={:#x} \
-                 (header_addr={:#x}, nursery_start={:#x}, site={}, \
+                 (minor={}, header_addr={:#x}, nursery_start={:#x}, site={}, \
                  parent_site={}, \
                  nursery_free={:#x}, nursery_top={:#x}, holder_addr={:#x}, \
                  holder_type_id={:?}, holder_offset={:?}, holder_words={:#x?}, \
@@ -3373,6 +3568,7 @@ impl MiniMarkGC {
                  enclosing={}, gc_state={:?}, minors={}, majors={})",
                 type_id,
                 obj_addr,
+                self.minor_collections,
                 obj_addr - GcHeader::SIZE,
                 self.nursery.start_ptr() as usize,
                 site,
@@ -4041,6 +4237,28 @@ impl MiniMarkGC {
     fn visit_referents(&self, obj_addr: usize, visitor: &mut dyn FnMut(GcRef)) {
         let type_id = unsafe { (*header_of(obj_addr)).type_id() };
         self.visit_referents_with_type_id(obj_addr, type_id, visitor);
+    }
+
+    /// `visit_referents`, but handing the visitor each slot's address instead
+    /// of its value, so a caller can report where a bad reference is stored.
+    fn visit_referent_slots(&self, obj_addr: usize, visitor: &mut dyn FnMut(*mut GcRef)) {
+        let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+        self.validate_type_id(type_id, obj_addr, "visit_referent_slots");
+        let type_info = self.types.get(type_id);
+        if let Some(trace_fn) = type_info.custom_trace {
+            unsafe { trace_fn(obj_addr, visitor) };
+            return;
+        }
+        for &offset in &type_info.gc_ptr_offsets {
+            visitor((obj_addr + offset) as *mut GcRef);
+        }
+        if type_info.items_have_gc_ptrs && type_info.item_size > 0 {
+            let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+            let items_start = obj_addr + type_info.size;
+            for i in 0..length {
+                visitor((items_start + i * type_info.item_size) as *mut GcRef);
+            }
+        }
     }
 
     /// `visit_referents` for a caller that already resolved the type id,
