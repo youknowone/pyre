@@ -1553,6 +1553,17 @@ impl JitCellToken {
         !self.target_tokens.lock().is_empty()
     }
 
+    /// The head of `token.target_tokens` — the descr `compile.py:290`
+    /// seeds the list with, and the one `pyjitpl.py:3007` closes a bridge
+    /// onto once `has_compiled_targets` has admitted the token.  Reading it
+    /// from the token rather than from a side table keeps the target and the
+    /// gate that admitted it the same object, which is what makes the
+    /// `warmstate.py:191-196` invalidation filter cover both.
+    #[inline]
+    pub fn first_target_token(&self) -> Option<majit_ir::DescrRef> {
+        self.target_tokens.lock().first().cloned()
+    }
+
     /// `compile.py:286-296` / `:312-323` — append a freshly minted
     /// TargetToken's descr to `token.target_tokens`.  Idempotent on
     /// `Arc::ptr_eq` so retrace paths that reuse `prior_front_target_tokens`

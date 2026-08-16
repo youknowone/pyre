@@ -7663,11 +7663,20 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr) = finish_descr {
             ctx.finish(finish_args, descr);
         } else {
+            // pyjitpl.py:3005-3007 reads the procedure token once, through
+            // the `warmstate.py:191-196` invalidation filter, and hands that
+            // same object to `compile_trace` — the loop a bridge closes onto
+            // is the loop `has_compiled_targets` admitted. `has_compiled_targets`
+            // here (`:7564`) already answers from the token, so taking the
+            // descr from the `compiled_loops` side table made one decision read
+            // two sources: the side table applies no invalidation filter, and
+            // `jitdriver.rs:6288` keeps an invalidated loop's target tokens on
+            // purpose. Reading both halves off the token is what makes the
+            // filter cover the target as well as the gate.
             let jump_descr = self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| compiled.front_target_tokens.first())
-                .map(|target_token| target_token.as_jump_target_descr());
+                .warm_state
+                .get_procedure_token(green_key)
+                .and_then(|token| token.first_target_token());
             let Some(jump_descr) = jump_descr else {
                 if crate::majit_log_enabled() {
                     eprintln!(
