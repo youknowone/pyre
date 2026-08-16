@@ -1489,10 +1489,16 @@ fn join_wtf8(parts: &[rustpython_wtf8::Wtf8Buf], sep: &str) -> rustpython_wtf8::
 /// after its predecessor's repr so mutation during a callback raises
 /// `IndexError` rather than reading stale storage.
 unsafe fn repr_items_list(list: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
-    let n = w_list_len(list);
+    // An element's repr runs Python, and a `W_ListObject` header moves, so the
+    // list is re-read from the shadow stack before every fetch.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(list);
+    let list = || pyre_object::gc_roots::shadow_stack_get(list_slot);
+    let n = w_list_len(list());
     let mut parts = Vec::with_capacity(n);
     for i in 0..n {
-        let item = w_list_getitem(list, i as i64)
+        let item = w_list_getitem(list(), i as i64)
             .ok_or_else(|| crate::PyError::index_error("list index out of range"))?;
         parts.push(repr_item(item)?);
     }

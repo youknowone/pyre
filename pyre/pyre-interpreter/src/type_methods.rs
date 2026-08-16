@@ -6413,10 +6413,25 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
         pyre_object::dictmultiobject::DictViewKind::Values => {
             items.into_iter().map(|(_, v)| v).collect()
         }
-        pyre_object::dictmultiobject::DictViewKind::Items => items
-            .into_iter()
-            .map(|(k, v)| w_tuple_new(vec![k, v]))
-            .collect(),
+        pyre_object::dictmultiobject::DictViewKind::Items => {
+            // `w_tuple_new` allocates, so a pair still waiting in this native
+            // Vec moves under the loop.  A pair already built into a tuple is
+            // just as exposed: that tuple's header is old-gen, but until
+            // something roots it the collector does not walk it and its two
+            // slots keep pre-move addresses.  Pin both sides of the loop.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let pair_base = pyre_object::gc_roots::pin_roots(&flat);
+            let mut built = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                let k = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
+                let v = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
+                let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
+                built.push(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
+            }
+            built
+        }
     }
 }
 

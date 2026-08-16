@@ -8093,7 +8093,16 @@ fn dict_view_all_contained_in(
     other: pyre_object::PyObjectRef,
 ) -> Result<bool, crate::PyError> {
     let snapshot = crate::type_methods::dict_view_snapshot(view);
-    for item in snapshot {
+    // `contains` runs a user `__contains__`/`__eq__`, so `other` and every
+    // item still waiting in this native Vec move under the loop.  Pin them and
+    // read each one back at its use.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let other_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(other);
+    let item_base = pyre_object::gc_roots::pin_roots(&snapshot);
+    for i in 0..snapshot.len() {
+        let other = pyre_object::gc_roots::shadow_stack_get(other_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
         if !crate::baseobjspace::contains(other, item)? {
             return Ok(false);
         }

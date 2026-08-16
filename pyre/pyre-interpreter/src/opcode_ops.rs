@@ -322,11 +322,26 @@ pub fn match_class_value(
     }
     let type_name = unsafe { pyre_object::w_type_get_name(cls) };
 
-    if !crate::baseobjspace::isinstance(subject, cls)? {
+    // `isinstance`, the `__match_args__` probe and each attribute fetch below
+    // run Python, so the subject moves under the pattern and so does every
+    // attribute extracted before it.  Pin the subject and read it back at each
+    // use; hold the extracted values as shadow-stack slots rather than as raw
+    // copies and read them back when the result tuple is built.  `cls` is a
+    // type, which is old-gen and never moves.  Pinning `kwd_attrs` is what
+    // makes the collector walk it, so its name slots are forwarded too.
+    let roots = pyre_object::gc_roots::push_roots();
+    let subject_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(subject);
+    let kwd_attrs_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(kwd_attrs);
+    let subject = || roots.get(subject_slot);
+    let kwd_attrs = || roots.get(kwd_attrs_slot);
+
+    if !crate::baseobjspace::isinstance(subject(), cls)? {
         return Ok(pyre_object::w_none());
     }
 
-    let mut extracted: Vec<PyObjectRef> = Vec::new();
+    let mut extracted: Vec<usize> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
     if count > 0 {
@@ -385,8 +400,11 @@ pub fn match_class_value(
                     )));
                 }
                 seen.push(attr_name.to_string());
-                match crate::baseobjspace::getattr_str(subject, attr_name) {
-                    Ok(v) => extracted.push(v),
+                match crate::baseobjspace::getattr_str(subject(), attr_name) {
+                    Ok(v) => {
+                        extracted.push(pyre_object::gc_roots::shadow_stack_len());
+                        roots.pin_root(v);
+                    }
                     Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                         return Ok(pyre_object::w_none());
                     }
@@ -423,7 +441,7 @@ pub fn match_class_value(
             };
             if is_self {
                 if count == 1 {
-                    extracted.push(subject);
+                    extracted.push(subject_slot);
                 } else {
                     return Err(PyError::type_error(format!(
                         "{type_name}() accepts 1 positional sub-pattern ({count} given)"
@@ -437,7 +455,7 @@ pub fn match_class_value(
         }
     }
 
-    let kwd_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(kwd_attrs) };
+    let kwd_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(kwd_attrs()) };
     for name_obj in kwd_items {
         let name = match unsafe { pyre_object::w_str_get_value_opt(name_obj) } {
             Some(s) => s,
@@ -449,8 +467,11 @@ pub fn match_class_value(
             )));
         }
         seen.push(name.to_string());
-        match crate::baseobjspace::getattr_str(subject, name) {
-            Ok(v) => extracted.push(v),
+        match crate::baseobjspace::getattr_str(subject(), name) {
+            Ok(v) => {
+                extracted.push(pyre_object::gc_roots::shadow_stack_len());
+                roots.pin_root(v);
+            }
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 return Ok(pyre_object::w_none());
             }
@@ -458,7 +479,8 @@ pub fn match_class_value(
         }
     }
 
-    Ok(pyre_object::w_tuple_new(extracted))
+    let values: Vec<PyObjectRef> = extracted.iter().map(|&slot| roots.get(slot)).collect();
+    Ok(pyre_object::w_tuple_new(values))
 }
 
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {

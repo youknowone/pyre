@@ -251,17 +251,26 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
         return Ok(Wtf8Buf::from_string("{...}".to_string()));
     };
     let entries = pyre_object::w_dict_items(obj);
+    // The pairs live in a native Vec the collector does not walk, and every
+    // key's and value's `__repr__` runs Python.  Pin them and read each one
+    // back at its use, the way `list_repr` re-reads its container: a copy
+    // taken before a collection addresses the pre-move object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+    let pair_base = pyre_object::gc_roots::pin_roots(&flat);
     let mut out = Wtf8Buf::new();
     out.push_str("{");
-    for (i, (k, v)) in entries.into_iter().enumerate() {
+    for i in 0..entries.len() {
         // `dictmultiobject.py:388` joins the pairs by position, so a key or
         // value whose `__repr__` answers `""` still gets its separator.
         if i != 0 {
             out.push_str(", ");
         }
-        out.push_wtf8(&py_repr_wtf8(k)?);
+        let key = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
+        out.push_wtf8(&py_repr_wtf8(key)?);
         out.push_str(": ");
-        out.push_wtf8(&py_repr_wtf8(v)?);
+        let value = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
+        out.push_wtf8(&py_repr_wtf8(value)?);
     }
     out.push_str("}");
     Ok(out)
@@ -897,13 +906,23 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj) };
             let mut inner = Wtf8Buf::new();
             if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
-                let n = pyre_object::w_tuple_len(args_obj);
+                // `w_exception_get_args` mints this tuple on every call.  Its
+                // header is old-gen and never moves, but nothing roots it, so
+                // the collector does not walk it and its element slots keep the
+                // pre-move addresses of any argument an item's `__repr__`
+                // relocates.  Pinning makes it traced, and the elements are
+                // read back through the pinned tuple.
+                let _args_roots = pyre_object::gc_roots::push_roots();
+                let args_slot = pyre_object::gc_roots::shadow_stack_len();
+                pyre_object::gc_roots::pin_root(args_obj);
+                let args_obj = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+                let n = pyre_object::w_tuple_len(args_obj());
                 if n == 1 {
-                    let item = pyre_object::w_tuple_getitem(args_obj, 0).unwrap_or(args_obj);
+                    let item = pyre_object::w_tuple_getitem(args_obj(), 0).unwrap_or(args_obj());
                     inner.push_wtf8(&py_repr_wtf8(item)?);
                 } else {
                     for i in 0..n {
-                        if let Some(item) = pyre_object::w_tuple_getitem(args_obj, i as i64) {
+                        if let Some(item) = pyre_object::w_tuple_getitem(args_obj(), i as i64) {
                             // `interp_exceptions.py:135-147` spells the args
                             // with `repr(tuple(args))`, which separates by
                             // position — an argument whose `__repr__` answers
@@ -1012,13 +1031,19 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 pyre_object::dictmultiobject::DictViewKind::Items => "dict_items",
             };
             let snapshot = crate::type_methods::dict_view_snapshot(obj);
+            // The snapshot is a native Vec the collector does not walk, and an
+            // item's `__repr__` runs Python.  Pin it and read each element back
+            // from the shadow stack.
+            let _snapshot_roots = pyre_object::gc_roots::push_roots();
+            let item_base = pyre_object::gc_roots::pin_roots(&snapshot);
             let mut out = Wtf8Buf::new();
             out.push_str(label);
             out.push_str("([");
-            for (i, &item) in snapshot.iter().enumerate() {
+            for i in 0..snapshot.len() {
                 if i != 0 {
                     out.push_str(", ");
                 }
+                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
                 out.push_wtf8(&py_repr_wtf8(item)?);
             }
             out.push_str("])");
