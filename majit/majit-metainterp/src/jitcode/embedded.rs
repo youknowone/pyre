@@ -41,11 +41,25 @@ pub struct EmbeddedJitCodeTable {
     descrs: &'static [RuntimeBhDescr],
 }
 
-// SAFETY: `materialize` builds only the `Descr` and `JitCode` variants. The
-// two variants that carry raw pointers — `Call`'s `JitCallTarget` and
-// `AssemblerToken` — are never constructed here, so nothing in either list is
-// a pointer this type could hand across a thread. A future arm that mints one
-// invalidates this, which is why the constructor is the only writer.
+/// The half of the impls below that does not need arguing. Both payloads
+/// `materialize` actually stores are thread-safe on their own terms —
+/// `Box<CanonicalBhDescr>` structurally, `Arc<JitCode>` through `JitCode`'s own
+/// manual impls — so a payload that stops being either fails the build instead
+/// of quietly hollowing out a comment.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Box<CanonicalBhDescr>>();
+    assert_send_sync::<Arc<JitCode>>();
+};
+
+// SAFETY: only the `descrs` field needs these; by the assertion above the
+// `jitcodes` field is already `Send + Sync` on its own. `RuntimeBhDescr` is
+// neither, because `AssemblerToken`'s `JitCallAssemblerTarget` holds a
+// `*const ()`. `materialize` is the sole writer of both lists and builds only
+// the `Descr` and `JitCode` variants, so neither raw-pointer variant — that one
+// and `Call`'s `JitCallTarget` — is ever constructed here: there is no pointer
+// in either list for this type to hand across a thread. A future arm that mints
+// one invalidates this.
 unsafe impl Send for EmbeddedJitCodeTable {}
 unsafe impl Sync for EmbeddedJitCodeTable {}
 
