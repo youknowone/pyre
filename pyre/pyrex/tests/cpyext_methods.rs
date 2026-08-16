@@ -143,6 +143,9 @@ raises('argument', TypeError, 'bad argument type for built-in operation')
 raises('other', RuntimeError, 'unknown failure kind')
 
 assert m.caught() == (1, 1, 0, 1, 'swallowed')
+# PyErr_Restore: (cleared by NULL class, bare instance matches, is an instance,
+# fetched pair round-trips, NULL class clears even with a value)
+assert m.restore() == (1, 1, 1, 1, 1), m.restore()
 # The swallowed exception must not leak into the caller.
 assert m.bump() == 4
 

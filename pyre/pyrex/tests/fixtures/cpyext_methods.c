@@ -410,6 +410,39 @@ static PyObject *m_caught(PyObject *self, PyObject *unused)
                          cleared, text);
 }
 
+/* `PyErr_Restore` puts back what `PyErr_Fetch` took, and its three degenerate
+   inputs: a NULL class clears whatever was set, a NULL value is built into a
+   bare instance, and a fetched pair goes back unchanged. */
+static PyObject *m_restore(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    /* A NULL class clears an indicator that is already set. */
+    PyErr_SetString(PyExc_IndexError, "dropped");
+    PyErr_Restore(NULL, NULL, NULL);
+    int cleared = PyErr_Occurred() == NULL;
+
+    /* A class with no value becomes a bare instance of that class. */
+    PyErr_Restore(Py_NewRef(PyExc_KeyError), NULL, NULL);
+    int bare_is_key = PyErr_ExceptionMatches(PyExc_KeyError);
+    PyObject *type = NULL, *value = NULL, *traceback = NULL;
+    PyErr_Fetch(&type, &value, &traceback);
+    int bare_instance = value != NULL && PyObject_IsInstance(value, PyExc_KeyError) == 1;
+
+    /* The fetched pair restores to the same indicator it came from. */
+    PyErr_Restore(type, value, traceback);
+    int round_trip = PyErr_ExceptionMatches(PyExc_KeyError);
+    PyErr_Clear();
+
+    /* A NULL class clears even when a value is handed along with it. */
+    PyErr_SetString(PyExc_TypeError, "also dropped");
+    PyErr_Restore(NULL, PyUnicode_FromString("orphan"), NULL);
+    int cleared_with_value = PyErr_Occurred() == NULL;
+
+    return Py_BuildValue("(iiiii)", cleared, bare_is_key, bare_instance,
+                         round_trip, cleared_with_value);
+}
+
 /* Drive every call entry point at one callable and hand back what each
    returned, so the test can compare them against the same call made from
    Python.  `args` is (callable, one_arg, keyword_value). */
@@ -1571,6 +1604,7 @@ static PyMethodDef methods[] = {
     {"predicates", (PyCFunction)m_predicates, METH_VARARGS, NULL},
     {"fail", (PyCFunction)m_fail, METH_VARARGS, NULL},
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
+    {"restore", (PyCFunction)m_restore, METH_NOARGS, "PyErr_Restore and its degenerate inputs"},
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
     {"dict_more", (PyCFunction)m_dict_more, METH_VARARGS, NULL},

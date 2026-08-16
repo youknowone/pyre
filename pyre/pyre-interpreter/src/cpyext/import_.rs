@@ -15,10 +15,12 @@ pub(super) fn import_module(name: &str) -> Result<PyObjectRef, crate::PyError> {
     })?;
     let import = crate::baseobjspace::getattr_str(builtins, "__import__")?;
     let roots = pyre_object::gc_roots::push_roots();
-    let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(name));
+    // `__import__` is pinned before the name is built: minting the string
+    // allocates, and a collection there would leave this a pre-move address.
     let import_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(import);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_str_new(name));
     // `__import__` answers with the top-level package, so the submodule is
     // read back out of `sys.modules` afterwards.
     crate::call::call_function_impl_result(

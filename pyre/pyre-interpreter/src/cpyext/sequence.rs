@@ -141,9 +141,24 @@ pub unsafe extern "C" fn PySequence_Index(object: *mut CPyObject, value: *mut CP
 }
 
 fn index_of(object: PyObjectRef, value: PyObjectRef) -> Result<isize, crate::PyError> {
-    let items = crate::baseobjspace::unpackiterable(object, -1)?;
-    for (index, &item) in items.iter().enumerate() {
-        if crate::baseobjspace::eq_w(item, value)? {
+    // `eq_w` runs the element's own `__eq__`, so every operand crosses a
+    // collection point on each turn.  A `Vec` is not somewhere the collector
+    // looks: the elements go on the shadow stack and are read back per turn.
+    let roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(value);
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(object);
+    let items = crate::baseobjspace::unpackiterable(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        -1,
+    )?;
+    let elements = pyre_object::gc_roots::pin_roots(&items);
+    for index in 0..items.len() {
+        if crate::baseobjspace::eq_w(
+            pyre_object::gc_roots::shadow_stack_get(elements + index),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )? {
             return Ok(index as isize);
         }
     }
@@ -177,6 +192,7 @@ pub unsafe extern "C" fn PySequence_GetSlice(
     start: isize,
     stop: isize,
 ) -> *mut CPyObject {
+    super::object::realize_all([object]);
     let slice = super::sliceobject::range_slice(start, stop);
     let Some(object) = argument(object) else {
         return std::ptr::null_mut();
@@ -192,6 +208,7 @@ pub unsafe extern "C" fn PySequence_SetSlice(
     high: isize,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, value]);
     let slice = super::sliceobject::range_slice(low, high);
     let Some([object, value]) = arguments([object, value]) else {
         return -1;
@@ -207,6 +224,7 @@ pub unsafe extern "C" fn PySequence_DelSlice(
     low: isize,
     high: isize,
 ) -> c_int {
+    super::object::realize_all([object]);
     let slice = super::sliceobject::range_slice(low, high);
     let Some(object) = argument(object) else {
         return -1;
@@ -231,10 +249,23 @@ pub unsafe extern "C" fn PySequence_Count(object: *mut CPyObject, value: *mut CP
 }
 
 fn count_of(object: PyObjectRef, value: PyObjectRef) -> Result<isize, crate::PyError> {
-    let items = crate::baseobjspace::unpackiterable(object, -1)?;
+    // The same shadow-stack discipline as [`index_of`], for the same reason.
+    let roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(value);
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(object);
+    let items = crate::baseobjspace::unpackiterable(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        -1,
+    )?;
+    let elements = pyre_object::gc_roots::pin_roots(&items);
     let mut seen = 0;
-    for &item in &items {
-        if crate::baseobjspace::eq_w(item, value)? {
+    for index in 0..items.len() {
+        if crate::baseobjspace::eq_w(
+            pyre_object::gc_roots::shadow_stack_get(elements + index),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )? {
             seen += 1;
         }
     }

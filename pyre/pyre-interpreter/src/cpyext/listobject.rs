@@ -191,6 +191,7 @@ pub unsafe extern "C" fn PyList_GetSlice(
     low: isize,
     high: isize,
 ) -> *mut CPyObject {
+    super::object::realize_all([object]);
     let slice = super::sliceobject::range_slice(low, high);
     let Some(value) = argument(object) else {
         return std::ptr::null_mut();

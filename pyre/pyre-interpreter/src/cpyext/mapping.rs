@@ -34,9 +34,11 @@ pub unsafe extern "C" fn PyMapping_Length(object: *mut CPyObject) -> isize {
 
 /// The `str` key a `*String` entry point names.
 ///
-/// Minting it allocates, so a caller resolves it *before* reading its receiver
-/// out of the mirror: a collection between the two would leave the receiver a
-/// pre-move address.
+/// Minting it allocates and reading a mirror can allocate too, so both ends
+/// need an order: a caller realizes every mirror it was handed first, then
+/// mints the key, then reads the receiver out. Once the mirrors are realized
+/// no conversion can allocate, so the key cannot be moved out from under the
+/// call that follows.
 fn key_of(pointer: *const c_char) -> Option<PyObjectRef> {
     if pointer.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
@@ -52,6 +54,7 @@ pub unsafe extern "C" fn PyMapping_GetItemString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> *mut CPyObject {
+    super::object::realize_all([object]);
     let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return std::ptr::null_mut();
     };
@@ -82,6 +85,7 @@ pub unsafe extern "C" fn PyMapping_DelItemString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> c_int {
+    super::object::realize_all([object]);
     let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return -1;
     };
@@ -109,6 +113,7 @@ pub unsafe extern "C" fn PyMapping_HasKeyString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> c_int {
+    super::object::realize_all([object]);
     let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         unsafe { super::pyerrors::PyErr_Clear() };
         return 0;

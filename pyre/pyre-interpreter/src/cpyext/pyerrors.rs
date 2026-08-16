@@ -370,8 +370,11 @@ pub unsafe extern "C" fn PyErr_Restore(
 ) {
     super::object::realize_all([ptype, pvalue]);
     unsafe { pyobject::decref(ptraceback) };
-    if pvalue.is_null() {
-        unsafe { pyobject::decref(ptype) };
+    // `errors.c:62-67` — a NULL class clears the indicator whatever the value
+    // is, so restoring what `PyErr_Fetch` handed back on a clear indicator
+    // cannot leave an older exception standing.
+    if ptype.is_null() {
+        unsafe { pyobject::decref(pvalue) };
         set_pending_raw(std::ptr::null_mut());
         return;
     }
@@ -381,12 +384,14 @@ pub unsafe extern "C" fn PyErr_Restore(
         unsafe { pyobject::decref(ptype) };
         return;
     }
-    // A non-instance value has to go back through normalization, so the
-    // restored pair is consumed rather than stored.
+    // `errors.c:77-86` — anything else, a NULL value included, is built into an
+    // instance by calling the class, so the restored pair is consumed rather
+    // than stored.  A class whose mirror no longer answers leaves nothing to
+    // raise, which is the clear indicator rather than the older exception.
     let class = unsafe { pyobject::from_ref(ptype) };
-    if !class.is_null()
-        && let Some(instance) = trap(normalized(class, value))
-    {
+    if class.is_null() {
+        set_pending_raw(std::ptr::null_mut());
+    } else if let Some(instance) = trap(normalized(class, value)) {
         set_pending_raw(pyobject::make_ref(instance));
     }
     unsafe {
