@@ -150,9 +150,13 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
         // the accessor's registered C ABI address (published through the
         // `PYRE_TYPE_OBJECT_FNADDRS` link-time slice into `jit_trace_fnaddrs`).
         // Gated on the exact accessor signature — leaf `type_object`, no inputs,
-        // `*mut PyObject` return — so the stamped set equals the funcptr set the
-        // macro registers, never a stray same-named function.  Skipped entirely
-        // on wasm, which has no funcptr slice to resolve the residual against.
+        // `*mut PyObject` return — never a stray same-named function.  Every
+        // `type_object` generator publishes a `PYRE_TYPE_OBJECT_FNADDRS` entry
+        // (`#[pyre_methods]`, `py_class!`, `py_class_typed!`, and the
+        // hand-written `_csv::dialect_class` accessor), so the stamped set
+        // equals the funcptr set and a stamped accessor always resolves to a
+        // real address.  Skipped entirely on wasm, which has no funcptr slice to
+        // resolve the residual against.
         if residualize_type_object {
             for fd in llbc.iter_local_fns() {
                 let path = strip_crate_prefix(&fd.item_meta.name_path());

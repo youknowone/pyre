@@ -512,6 +512,19 @@ macro_rules! py_class {
                 tp as usize
             }) as ::pyre_object::PyObjectRef
         }
+
+        // Publish this accessor's residual-call address so the JIT's
+        // `dont_look_inside` residual for `type_object` resolves through
+        // `jit_trace_fnaddrs` (which iterates this slice), mirroring the
+        // `#[pyre_methods]`-generated accessor.  Native only, matching the slice.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS)]
+        #[allow(non_upper_case_globals)]
+        static __PYRE_TYPE_OBJECT_FNADDR: ::pyre_object::lltype::TypeObjectFnDescriptor =
+            ::pyre_object::lltype::TypeObjectFnDescriptor {
+                path: ::core::concat!(::core::module_path!(), "::type_object"),
+                func: type_object,
+            };
     };
 }
 
@@ -605,6 +618,19 @@ macro_rules! py_class_typed {
                 tp as usize
             }) as ::pyre_object::PyObjectRef
         }
+
+        // Publish this accessor's residual-call address so the JIT's
+        // `dont_look_inside` residual for `type_object` resolves through
+        // `jit_trace_fnaddrs` (which iterates this slice), mirroring the
+        // `#[pyre_methods]`-generated accessor.  Native only, matching the slice.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[::linkme::distributed_slice(::pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS)]
+        #[allow(non_upper_case_globals)]
+        static __PYRE_TYPE_OBJECT_FNADDR: ::pyre_object::lltype::TypeObjectFnDescriptor =
+            ::pyre_object::lltype::TypeObjectFnDescriptor {
+                path: ::core::concat!(::core::module_path!(), "::type_object"),
+                func: type_object,
+            };
     };
 }
 
