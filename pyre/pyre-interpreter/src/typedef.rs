@@ -5409,6 +5409,16 @@ fn str_descr_mul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe { crate::objspace::descroperation::str_repeat(args[0], w_count) }
 }
 
+/// unicodeobject.py:436-437 `descr_mod` — the formatter, reached directly.
+///
+/// Going through the binary operation instead would re-enter the subclass
+/// `__mod__` that called up through here, so a subclass whose override ends in
+/// `str.__mod__(self, values)` would recurse until the stack limit.
+fn str_descr_mod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    unsafe { crate::objspace::std::formatting::str_format_percent(args[0], args[1]) }
+}
+
 fn str_descr_rmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
     // unicodeobject.py:439-443 — only a unicode left operand reaches the
@@ -5416,7 +5426,7 @@ fn str_descr_rmod(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Ok(pyre_object::w_not_implemented());
     }
-    crate::baseobjspace::mod_(args[1], args[0])
+    unsafe { crate::objspace::std::formatting::str_format_percent(args[1], args[0]) }
 }
 
 fn init_str_type(ns: PyObjectRef) {
@@ -6078,14 +6088,7 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mod__",
-            make_builtin_function_with_arity(
-                "__mod__",
-                |args| {
-                    crate::type_methods::arity_slot(args, 1)?;
-                    crate::baseobjspace::mod_(args[0], args[1])
-                },
-                2,
-            ),
+            make_builtin_function_with_arity("__mod__", str_descr_mod, 2),
         )
     };
     unsafe {

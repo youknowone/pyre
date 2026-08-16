@@ -3504,6 +3504,27 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// Call `dunder` on `obj` with `other` when `obj`'s type overrides it relative
+/// to `obj`'s builtin layout base, returning `None` when there is no override
+/// or the call answered `NotImplemented`.
+///
+/// The lookup happens immediately before the call, so no method reference is
+/// held across an operation that can collect.  An *inherited* slot is not an
+/// override ([`crate::baseobjspace::subclass_special_override`] rejects it):
+/// the builtin `str`/`bytes` `__mod__` re-enters [`mod_`], so dispatching it
+/// would recurse.
+unsafe fn try_subclass_binop_override(
+    obj: PyObjectRef,
+    other: PyObjectRef,
+    dunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let Some((method, w_type)) = crate::baseobjspace::subclass_special_override(obj, dunder) else {
+        return Ok(None);
+    };
+    let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[other])?;
+    Ok((!is_not_implemented(result)).then_some(result))
+}
+
 pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
@@ -3525,23 +3546,23 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         let is_str_lhs = is_str(a);
         let is_bytes_lhs = pyre_object::bytesobject::is_bytes_like(a);
-        // str/bytes % args — reflected-subclass priority: a subclass on the
-        // right overriding __rmod__ is tried before the built-in formatter.
+        // str/bytes % args — a subclass override runs before the built-in
+        // formatter: reflected first when `b` subclasses `type(a)`, then `a`'s
+        // own forward override.  The `is_exact_builtin_instance` test is the
+        // early-out `subclass_special_override` performs itself, kept here so
+        // an exact-builtin right operand (the usual format argument) skips the
+        // subtype probe.
         if is_str_lhs || is_bytes_lhs {
-            if let Some((method, w_type)) =
-                crate::baseobjspace::subclass_special_override(b, "__rmod__")
+            if !pyre_object::is_exact_builtin_instance(b)
+                && let (Some(at), Some(bt)) = (crate::typedef::r#type(a), crate::typedef::r#type(b))
+                && at != bt
+                && issubtype_cached(bt.as_ptr(), at.as_ptr())
+                && let Some(result) = try_subclass_binop_override(b, a, "__rmod__")?
             {
-                let priority = match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
-                    (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
-                    _ => false,
-                };
-                if priority {
-                    match crate::baseobjspace::get_and_call_function(method, b, w_type, &[a]) {
-                        Ok(result) if !is_not_implemented(result) => return Ok(result),
-                        Ok(_) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
+                return Ok(result);
+            }
+            if let Some(result) = try_subclass_binop_override(a, b, "__mod__")? {
+                return Ok(result);
             }
             return if is_str_lhs {
                 crate::objspace::std::formatting::str_format_percent(a, b)
