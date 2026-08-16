@@ -3272,7 +3272,7 @@ pub fn walk<Sym: WalkSym>(
                             exc_concrete,
                             recording_opcode_position,
                             true,
-                            true,
+                            false,
                         );
                     }
                     // The node reads the raise coordinate out of
@@ -3304,6 +3304,23 @@ pub fn walk<Sym: WalkSym>(
                     // `store_token_in_vable` takes on `vbox is
                     // self.forced_virtualizable`.
                     fbw_force_virtualizable_before_return(ctx);
+                    // The runtime half of the node, emitted here rather than
+                    // beside the recording half above: it is the only consumer
+                    // of the frame on this arm, and reading the frame before
+                    // the store-back moves the escape ahead of it, which costs
+                    // the trace bridges and guard failures for no gain.  The
+                    // publish above has already settled `last_instr`, which the
+                    // recorder falls back to.
+                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                        record_top_level_application_traceback(
+                            ctx,
+                            exc,
+                            exc_concrete,
+                            recording_opcode_position,
+                            false,
+                            true,
+                        );
+                    }
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
                     // Stash the exception the same way the value-return arms
