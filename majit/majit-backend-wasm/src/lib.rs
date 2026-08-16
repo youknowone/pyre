@@ -81,8 +81,9 @@ use std::sync::{Arc, Mutex};
 /// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
 /// bridge compiled with a parameter entry; 45 = parameter entry declined
 /// because the source module has frame-only dispatch; 46 = parameter entry
-/// declined because the source guard and bridge input arities disagree.
-pub static BRIDGE_DIAG: [AtomicU64; 47] = [const { AtomicU64::new(0) }; 47];
+/// declined because the source guard and bridge input arities disagree; 47 =
+/// LABEL publication suppressed because the bridge entry has nonzero parameters.
+pub static BRIDGE_DIAG: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
 
 /// The first three inline geometry failures, packed as `(needed, available)`.
 /// They expose a frozen-layout shortage without changing the compile result.
@@ -319,6 +320,7 @@ fn stamp_and_publish_label_targets(
     frame: codegen::FrameGeometry,
     inputargs: &[InputArg],
     ops: &[Op],
+    bridge_entry_arity: Option<usize>,
 ) -> (Vec<usize>, Vec<usize>) {
     // Stamp each LABEL's loop-target descr with its ordinal (0, 1, 2, …) so a
     // loop-closing bridge can recover which label its terminal JUMP targets:
@@ -361,6 +363,10 @@ fn stamp_and_publish_label_targets(
     let label_num_args = codegen::label_arg_counts(ops);
     let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
     let mut published_descrs = Vec::new();
+    // A parameter entry with no fail values remains structurally `(i32) ->
+    // i32`, so type-0 indirect calls may enter it. Only a nonzero parameter
+    // entry is incompatible with published LABEL targets.
+    let suppress_publication = matches!(bridge_entry_arity, Some(arity) if arity > 0);
 
     // Publish this loop's enterable labels so a loop-closing bridge from
     // ANY loop can chain into them in-module (jump-to-existing-trace). A
@@ -380,20 +386,24 @@ fn stamp_and_publish_label_targets(
             if id == 0 {
                 continue;
             }
-            diag_bump(19);
-            publish_label_target(
-                id,
-                LabelTarget {
-                    func_handle,
-                    key: j as u32 + 1,
-                    num_args: label_num_args[j],
-                    resume_safe: label_resume_info[j].0,
-                    requires_own_frame: label_resume_info[j].1,
-                    is_last_label: j == header,
-                    frame,
-                },
-            );
-            published_descrs.push(id);
+            if suppress_publication {
+                diag_bump(47);
+            } else {
+                diag_bump(19);
+                publish_label_target(
+                    id,
+                    LabelTarget {
+                        func_handle,
+                        key: j as u32 + 1,
+                        num_args: label_num_args[j],
+                        resume_safe: label_resume_info[j].0,
+                        requires_own_frame: label_resume_info[j].1,
+                        is_last_label: j == header,
+                        frame,
+                    },
+                );
+                published_descrs.push(id);
+            }
         }
     } else {
         // A LABEL with real work before it is not reachable through the plain
@@ -415,7 +425,9 @@ fn stamp_and_publish_label_targets(
         if !publishable && !label_descrs.is_empty() {
             diag_bump(21);
         }
-        if publishable {
+        if publishable && suppress_publication {
+            diag_bump(47);
+        } else if publishable {
             let id = label_descrs[0];
             diag_bump(20);
             publish_label_target(
@@ -1863,6 +1875,7 @@ impl WasmBackend {
             compiled.frame,
             &inputs.inputargs,
             &inputs.ops,
+            inputs.bridge_entry_arity,
         );
         let loop_finish_fi = descrs
             .iter()
@@ -2707,7 +2720,8 @@ impl majit_backend::Backend for WasmBackend {
         // the last LABEL. Computed through the same predicate codegen's wrapper
         // gates on, so the recorded field and the emitted wrapper cannot drift.
         let has_preamble = codegen::is_resumable_peeled(ops);
-        let (label_descrs, _) = stamp_and_publish_label_targets(func_handle, frame, inputargs, ops);
+        let (label_descrs, _) =
+            stamp_and_publish_label_targets(func_handle, frame, inputargs, ops, None);
         // Per-guard, per-fail-arg induction-advance flags for
         // `compile_bridge`'s livelock check (see `guard_fail_args_advanced`).
         let guard_fail_arg_advanced = guard_fail_args_advanced(ops, &guard_exits);
@@ -3390,8 +3404,13 @@ impl majit_backend::Backend for WasmBackend {
         // LABEL; the
         // existing `first_label_at_entry` / arity guard correctly leaves that
         // label unpublished, because key 0 would re-run the work before it.
-        let (_, published_label_descrs) =
-            stamp_and_publish_label_targets(bridge_slot, source_frame, inputargs, ops);
+        let (_, published_label_descrs) = stamp_and_publish_label_targets(
+            bridge_slot,
+            source_frame,
+            inputargs,
+            ops,
+            bridge_entry_arity,
+        );
 
         {
             let source_loop = original_token
@@ -3475,8 +3494,6 @@ impl majit_backend::Backend for WasmBackend {
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         if source_cells_base != 0 && bridge_slot != 0 {
-            // cells[source_fail_index] = bridge_slot — the loop epilogue now
-            // tails into this bridge instead of returning to the host.
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             if unsafe { core::ptr::read(cell) } != 0 {
                 diag_bump(29); // this guard already had a reachable bridge

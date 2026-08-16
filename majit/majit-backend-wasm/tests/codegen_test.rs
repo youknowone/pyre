@@ -1510,6 +1510,58 @@ fn function_type(
     panic!("module has no type section");
 }
 
+fn entry_function_type_index(bytes: &[u8]) -> usize {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::FunctionSection(functions) = payload.unwrap() {
+            return functions
+                .into_iter()
+                .next()
+                .expect("module has an entry function")
+                .expect("entry function type is valid") as usize;
+        }
+    }
+    panic!("module has no function section");
+}
+
+#[test]
+fn zero_arity_parameter_entry_is_structurally_type_zero() {
+    // A published LABEL target is entered through type 0, `(i32) -> i32`.
+    // The separate type index emitted for a zero-arity parameter bridge must
+    // retain that same structural signature.
+    let inputargs = Vec::new();
+    let ops = vec![Op::new(OpCode::Label, &[]), Op::new(OpCode::Finish, &[])];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 4,
+        bridge_entry_arity: Some(0),
+        bridge_param_dispatch: true,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+
+    validate_wasm(&bytes);
+    assert_eq!(
+        function_type(&bytes, entry_function_type_index(&bytes)),
+        function_type(&bytes, 0),
+        "a published LABEL target's module entry must be structurally `(i32) -> i32`"
+    );
+}
+
 #[test]
 fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];

@@ -727,6 +727,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "bridge_param_ok",
                 "bridge_param_decl_source_frame",
                 "bridge_param_decl_arity",
+                "bridge_param_label_suppressed",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
