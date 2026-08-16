@@ -11855,6 +11855,46 @@ fn handle<Sym: WalkSym>(
                 let already_declined = ctx.trace_ctx.cross_loop_close_declined(key);
                 if !has_partial && has_targets {
                     if !already_declined {
+                        // pyjitpl.py:2991-2993 reached_loop_header:
+                        //
+                        //     # generate a dummy guard just before the JUMP so
+                        //     # that unroll can use it when it's creating
+                        //     # artificial guards.
+                        //     self.generate_guard(rop.GUARD_FUTURE_CONDITION)
+                        //
+                        // Upstream emits it once at :2993, ahead of BOTH the
+                        // `get_procedure_token` / `compile_trace` pair at
+                        // :3001-3007 that closes into an ALREADY compiled loop
+                        // and the merge-point scan at :3018-3060 that closes a
+                        // loop of the trace's own. pyre splits those two
+                        // outcomes across different returns and had the guard on
+                        // only one of them: the own-loop leg gets it from
+                        // `close_loop_args_at`, which runs off
+                        // `DispatchOutcome::CloseLoop`, while this leg returns
+                        // `CompileTracePending` and never reached it. So every
+                        // bridge arrived at the optimizer carrying no
+                        // GUARD_FUTURE_CONDITION — measured across
+                        // `pyre/bench/synth`: 672 bridge compilations, 0 with
+                        // one. `Optimizer.patchguardop` was left to a stand-in
+                        // synthesized from one of the bridge's own body guards,
+                        // whose resume coordinate is mid-trace where upstream's
+                        // is the merge point's, and a bridge with no such guard
+                        // got none at all.
+                        //
+                        // `_jump_to_existing_trace` dereferences that
+                        // patchguardop for the extra virtual-state guards
+                        // (unroll.py:333-337) and hands it to
+                        // `inline_short_preamble`, which stamps it onto every
+                        // replayed short-preamble guard (unroll.py:409).
+                        //
+                        // Emitted on this leg only, so the own-loop leg is not
+                        // double-guarded. `next_instr` is the merge point being
+                        // crossed — the loop header the synthesized JUMP goes
+                        // to, matching `close_loop_args_at`'s `orgpc =
+                        // target_pc` rather than the back edge that got here.
+                        ctx.trace_ctx
+                            .record_guard(OpCode::GuardFutureCondition, &[], 0);
+                        walker_capture_snapshot_for_last_guard(ctx, next_instr)?;
                         // jitdriver.rs:2981-2988 states the rule the latch runs
                         // under: only latch what an attempt actually rejected.
                         // The give-up below returns without calling into
