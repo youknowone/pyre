@@ -242,6 +242,12 @@ pub(crate) fn fbw_executed_body_residual_reset() {
     FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(false));
 }
 
+/// Whether the `CALL_ASSEMBLER` fold's own concrete-stamp executor is on the
+/// stack (see [`SELFREC_CA_FOLD_ACTIVE`]).
+pub(crate) fn selfrec_ca_fold_active() -> bool {
+    SELFREC_CA_FOLD_ACTIVE.with(|c| c.get())
+}
+
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
 /// prints the structured reason (the `DispatchError` variant or the
 /// non-loop-closing `DispatchOutcome`) for every walk that maps to
@@ -1650,7 +1656,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
     // nested-decline guard, which is for FOREIGN unjournaled residuals.
-    let in_selfrec_fold = SELFREC_CA_FOLD_ACTIVE.with(|c| c.get());
+    let in_selfrec_fold = selfrec_ca_fold_active();
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
     // A FOR_ITER-body inline admitted under `CalleeReplaySafety::DeferredCall`
     // stands on the promise that the sub-walk commits nothing: the static scan

@@ -686,6 +686,90 @@ pub(crate) fn collect_callee_active_boxes(
     Ok(active)
 }
 
+/// Whether a loop-carried operand parked below the call keeps the fold
+/// worthwhile.
+///
+/// A numeric accumulator (`a` in `a += r(d)`) does: the fold's resume rebuilds
+/// it from the caller's own register writeback, and folding the call is what
+/// turns a residual recursion back into an assembler-to-assembler jump.
+///
+/// A live iterator does not.  Folding a self-call that sits under a `FOR_ITER`
+/// iterator costs the caller a compiled loop and a bridge — measured on
+/// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
+/// `loops_compiled 3 -> 2`, `bridges_compiled 3 -> 2` and 0.18s -> 0.22s.  The
+/// residual path keeps that loop, so leave the iterator-bearing shape to it.
+fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    slot: OpRef,
+) -> bool {
+    match ctx.trace_ctx.box_value(slot) {
+        Some(majit_ir::Value::Int(_)) | Some(majit_ir::Value::Float(_)) => true,
+        Some(majit_ir::Value::Ref(r)) => {
+            let obj = r.as_usize();
+            obj != 0 && unsafe { pyre_object::is_int(obj as pyre_object::PyObjectRef) }
+        }
+        _ => false,
+    }
+}
+
+/// Whether the call at `op_pc` in the walk's own code sits inside a protected
+/// region its `GUARD_NO_EXCEPTION` deopt would have to resume into.
+///
+/// Asked of the CALL's own coordinate, not of the whole body: the deopt
+/// resumes at this call site, so a `try` elsewhere in the function is not a
+/// handler it can reach.  `lookup_exceptiontable` answers exactly that question
+/// and returns the innermost covering entry.
+///
+/// The `depth != 0 || !lasti` test excludes the whole-body, depth-zero,
+/// `lasti` entry 3.14 wraps around every generator, which exists only to
+/// convert an escaping `StopIteration` at the generator boundary and catches
+/// nothing at a call site.  Same discrimination, same reason, as
+/// `code_yields_inside_try` (`pycode.rs`) applies to decide whether a
+/// generator really yields inside a `try`.
+fn call_site_inside_protected_region<Sym: WalkSym>(sym: &Sym, op_pc: usize) -> bool {
+    if sym.jitcode().is_null() {
+        return false;
+    }
+    let jitcode = unsafe { &*sym.jitcode() };
+    let raw = jitcode.payload.code_ptr;
+    if raw.is_null() {
+        return false;
+    }
+    let code = unsafe { &*raw };
+    // `lookup_exceptiontable` keys on the byte offset of the instruction
+    // itself, and `containing_py_pc_for_jitcode_pc` gives the CALL's own
+    // Python instruction index — so the offset is `py_pc * 2`, without the
+    // `next_instr` back-step a resume coordinate would need.
+    let call_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.payload.metadata, op_pc);
+    matches!(
+        pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, call_py_pc * 2),
+        Some((_target, depth, lasti)) if depth != 0 || !lasti
+    )
+}
+
+
+/// Whether a callee that is not the walk's own code carries a body this fold
+/// can represent.
+///
+/// This screen is the fold's own precondition, not upstream's.  The whole call
+/// collapses into one `CALL_ASSEMBLER` plus
+/// `GUARD_NOT_FORCED`/`GUARD_NO_EXCEPTION`, so a callee that leaves its frame
+/// by any route other than returning — a `raise` crossing the boundary, a
+/// protected region, an `abort_permanent` marker — has nowhere to put the
+/// unwind in the caller's trace.  Those are the same body facts the inline
+/// route screens on before it walks a callee body, and they answer in the same
+/// direction `look_inside_graph` (`codewriter/policy.py`) answers a "no" with:
+/// the call stays a residual.
+///
+/// Not asked of the walk's own code: `call_site_inside_protected_region` already
+/// read that body's table at this very call site.
+fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
+    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return false;
+    };
+    !facts.contains_raise && !facts.has_exception_table && !facts.has_abort_permanent
+}
+
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
 /// at the inline recursion-bound boundary.
 ///
@@ -748,14 +832,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if dst_bank != 'r' || r_args.len() < 3 {
         return Ok(None);
     }
-    // A self-recursive CALL_ASSEMBLER raising inside a `try` body must
-    // route its GUARD_NO_EXCEPTION deopt into the handler.  The concrete
-    // CALL_ASSEMBLER fold here cannot encode that resume in its snapshot;
-    // decline so the body takes the generic residual path, which walks the
-    // handler-bearing body and resumes the deopt into the handler.
-    if jitcode_has_exception_handler(code) {
-        return Ok(None);
-    }
+    // The handler test this fold needs is positional and lives below, once the
+    // caller's jitcode is in hand: see `call_site_inside_protected_region`.
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         return Ok(None);
@@ -809,23 +887,28 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // Loopless self-call shape only: the operand stack below the call's own
-    // operands (`r_args = [callable, null_or_self, arg0..]`) must hold no
-    // loop-carried input arg.  A self-call inside a `for`/`while` body keeps
-    // the loop's InputArg operands (the `FOR_ITER` iterator, an accumulator
-    // reloaded for `+=`) on the caller stack under the call; the concrete
-    // CALL_ASSEMBLER fold cannot carry them across the assembler call, so the
-    // loop-back-edge guard resumes the loop-carried iterator as NULL and the
-    // blackhole faults on the next `FOR_ITER`.  The residual path keeps those
-    // operands live, so decline the loop-bearing shape to it.  The loopless
-    // `fib` shape keeps only within-iteration temps (a prior call result), no
-    // InputArg, and stays foldable.
+    // The operand stack below the call's own operands (`r_args = [callable,
+    // null_or_self, arg0..]`) may hold loop-carried input args: the enclosing
+    // loop's `FOR_ITER` iterator, or an accumulator reloaded for `+=`.  Only
+    // the iterator disqualifies the fold — see
+    // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
+    // operand instead kept a recursion called from a `while` body on the
+    // residual path permanently: `r(8)` a million times over measured 1.23s
+    // against 0.07s for the same run with the numeric shape admitted, because
+    // every recursive call re-entered through the func-entry residency door.
+    // The loopless `fib` shape keeps only within-iteration temps (a prior call
+    // result), no InputArg, and was foldable either way.
     if ctx.vstack_valid {
         let kept_below = ctx.vstack_boxes.len().saturating_sub(r_args.len());
-        if ctx.vstack_boxes[..kept_below]
-            .iter()
-            .any(|slot| slot.is_input_arg())
-        {
+        if ctx.vstack_boxes[..kept_below].iter().any(|slot| {
+            slot.is_input_arg() && !loop_carried_slot_keeps_fold_profitable(ctx, *slot)
+        }) {
+            if p2_diag_enabled() {
+                eprintln!(
+                    "[p2-ca] decline pc={} reason=loop-carried-inputarg-below",
+                    op.pc
+                );
+            }
             return Ok(None);
         }
     }
@@ -840,6 +923,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     }
     let sym = unsafe { &*sym_ptr };
     let caller_frame = sym.frame();
+    // A CALL_ASSEMBLER raising inside a `try` body must route its
+    // GUARD_NO_EXCEPTION deopt into the handler, and this fold cannot encode
+    // that resume in its snapshot.  Ask whether THIS call site is protected
+    // rather than whether the body carries a handler anywhere: the latter
+    // reads a property of the function, not of the call, and it excludes
+    // every generator outright — 3.14 wraps each generator body in a
+    // whole-body entry, so a `while` loop in a generator that calls nothing
+    // protected was declining on a handler it can never reach.
+    if call_site_inside_protected_region(sym, op.pc) {
+        if p2_diag_enabled() {
+            eprintln!("[p2-ca] decline pc={} reason=call-inside-try", op.pc);
+        }
+        return Ok(None);
+    }
     // `is_self_recursive = callee code == portal code`. During
     // recording `we_are_jitted()` is false, so `function_get_code` (the
     // `w_code` already in hand) equals `getcode` — the pointer the
@@ -852,11 +949,15 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // additionally admits a *mutual*-recursive callee — one whose code is
     // already on the inline framestack, i.e. a
     // genuine recursion cycle (`is_even` → `is_odd` → `is_even` at the unroll
-    // cap).  It must NOT admit an arbitrary foreign call: folding a
-    // non-recursive callee (e.g. a CALL_KW-bearing leaf) to CALL_ASSEMBLER
-    // builds and enters a frame the callee's own loop was never traced against
-    // and faults.  The emit below keys on `w_code` (callee-agnostic); the token
+    // cap).  The emit below keys on `w_code` (callee-agnostic); the token
     // is resolved / synthesised per `callee_key` via `get_assembler_token`.
+    //
+    // Any other callee is admitted only through
+    // [`foreign_callee_admits_call_assembler`], which reproduces the condition
+    // `_opimpl_recursive_call` (`pyjitpl.py`) puts on `assembler_call`.  Without
+    // that test an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would
+    // fold to CALL_ASSEMBLER, building and entering a frame the callee's own
+    // loop was never traced against.
     if w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
@@ -864,7 +965,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             .framestack
             .iter()
             .any(|f| f.w_code == w_code as usize);
-        if !admit_mutual {
+        if !admit_mutual && !foreign_callee_admits_call_assembler(w_code) {
+            if p2_diag_enabled() {
+                eprintln!("[p2-ca] decline pc={} reason=not-self-nor-mutual", op.pc);
+            }
             return Ok(None);
         }
     }
@@ -875,6 +979,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // interpreter replays the region and double-applies that mutation.  Decline
     // to the plain residual path, which eagerly executes and commits the call.
     if fbw_executed_body_residual() {
+        if p2_diag_enabled() {
+            eprintln!("[p2-ca] decline pc={} reason=executed-body-residual", op.pc);
+        }
         return Ok(None);
     }
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.

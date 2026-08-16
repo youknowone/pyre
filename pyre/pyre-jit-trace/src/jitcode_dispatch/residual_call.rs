@@ -3373,7 +3373,15 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         fbw_mark_executed_nonpure_residual();
         // Count only a FOREIGN non-pure residual: a self-recursive call is the
         // fold target running because its fold declined, not a body side effect.
-        if !residual_callee_is_walk_self_recursive(ctx, allboxes, helper) {
+        // The executor the `CALL_ASSEMBLER` fold runs to stamp its concrete
+        // result is the same thing whatever the callee's identity — that
+        // execution IS the folded call, and the trace carries the
+        // CALL_ASSEMBLER standing for it.  Reading the fold scope rather than
+        // only the callee's code keeps the first successful fold in a body from
+        // latching the gate that then declines every later call in the walk.
+        if !selfrec_ca_fold_active()
+            && !residual_callee_is_walk_self_recursive(ctx, allboxes, helper)
+        {
             fbw_mark_executed_body_residual();
         }
     }
