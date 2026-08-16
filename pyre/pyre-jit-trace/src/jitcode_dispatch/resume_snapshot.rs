@@ -2418,41 +2418,15 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    after_residual_call: bool,
     parent_frames: Vec<InlineParentFrame>,
     guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
-    let helper_index = ctx
-        .fbw_mode
-        .transparent_helper_jitcode_index
-        .ok_or_else(|| DispatchError::callee_inline_unsupported(op_pc))?;
-    let helper = crate::state::ensure_build_time_jitcode_at(helper_index)
-        .ok_or_else(|| DispatchError::callee_inline_unsupported(op_pc))?;
-    let op_live = crate::state::op_live();
-    let helper_marker = if after_residual_call {
-        after_residual_guard_marker(&helper, op_pc, None)
-    } else {
-        (ctx.live_before_jit_pc != usize::MAX
-            && helper
-                .jitcode
-                .can_decode_live_vars(ctx.live_before_jit_pc, op_live))
-        .then_some(ctx.live_before_jit_pc)
-    }
-    .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
-    let helper_boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        helper_index as u32,
-        op_pc,
-        helper_marker as i32,
-    )?;
     publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
+    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len());
     for frame in &parent_frames {
         let word = frame
             .resume_marker_jit_pc
@@ -2467,16 +2441,6 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
         frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
     }
-    // Translated helpers are real RPython MIFrames but not Python frames, so
-    // retain their JitCode/pc section and use the no-Python-coordinate
-    // sentinel.  Blackhole return then delivers the helper result to the
-    // paused Python caller exactly like `MIFrame.perform_call` upstream.
-    frames.push((
-        helper_index as u32,
-        helper_marker as u32,
-        u32::MAX,
-        helper_boxes.as_slice(),
-    ));
     match guard_stamp {
         GuardStampTarget::GuardFromEnd(from_end) => ctx
             .trace_ctx
@@ -2520,7 +2484,6 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         return walker_capture_transparent_helper_snapshot(
             ctx,
             callee_op_pc,
-            after_residual_call,
             parent_frames,
             guard_stamp,
         );
