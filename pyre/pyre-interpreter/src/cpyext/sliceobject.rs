@@ -71,6 +71,7 @@ pub unsafe extern "C" fn PySlice_New(
     stop: *mut CPyObject,
     step: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([start, stop, step]);
     let start = or_none(unsafe { pyobject::from_ref(start) });
     let stop = or_none(unsafe { pyobject::from_ref(stop) });
     let step = or_none(unsafe { pyobject::from_ref(step) });

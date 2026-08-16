@@ -19,6 +19,39 @@ pub(super) fn argument(raw: *mut CPyObject) -> Option<PyObjectRef> {
     Some(value)
 }
 
+/// [`argument`] for an entry point taking several of them.
+///
+/// Converting a mirror can [`pyobject::realize`] it, and realizing allocates.
+/// A mirror never moves, but an interpreter object an earlier conversion
+/// answered with does — so every mirror is realized first, and only then read.
+pub(super) fn arguments<const N: usize>(raws: [*mut CPyObject; N]) -> Option<[PyObjectRef; N]> {
+    for raw in raws {
+        unsafe { pyobject::realize(raw) };
+    }
+    let mut values = [pyre_object::PY_NULL; N];
+    for (value, raw) in values.iter_mut().zip(raws) {
+        *value = unsafe { pyobject::from_ref(raw) };
+        if value.is_null() {
+            unsafe { super::pyerrors::PyErr_BadInternalCall() };
+            return None;
+        }
+    }
+    Some(values)
+}
+
+/// The realizing half of [`arguments`], for an entry point that converts its
+/// mirrors through something other than one call to it — a NULL that means
+/// "delete", a typed check, a C string beside them.
+///
+/// Stands at the head of such an entry point: once every mirror it was handed
+/// is realized, no conversion below can allocate, whatever order they run in.
+/// A null or already-realized mirror is nothing to do.
+pub(super) fn realize_all<const N: usize>(raws: [*mut CPyObject; N]) {
+    for raw in raws {
+        unsafe { pyobject::realize(raw) };
+    }
+}
+
 /// Whether `object`'s user-visible class is exactly the one `tp` describes.
 ///
 /// The layout an object carries is shared with its subclasses — an instance of
@@ -105,6 +138,7 @@ pub unsafe extern "C" fn PyObject_SetAttrString(
     name: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    realize_all([object, value]);
     let (Some(object), Some(name)) = (argument(object), name_of(name)) else {
         return -1;
     };
@@ -137,7 +171,7 @@ pub unsafe extern "C" fn PyObject_GetAttr(
     object: *mut CPyObject,
     name: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(object), Some(name)) = (argument(object), argument(name)) else {
+    let Some([object, name]) = arguments([object, name]) else {
         return std::ptr::null_mut();
     };
     result(crate::baseobjspace::getattr(object, name))
@@ -151,7 +185,8 @@ pub unsafe extern "C" fn PyObject_SetAttr(
     name: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(name)) = (argument(object), argument(name)) else {
+    realize_all([object, name, value]);
+    let Some([object, name]) = arguments([object, name]) else {
         return -1;
     };
     let value = unsafe { pyobject::from_ref(value) };
@@ -179,6 +214,7 @@ pub unsafe extern "C" fn PyObject_GenericGetAttr(
     object: *mut CPyObject,
     name: *mut CPyObject,
 ) -> *mut CPyObject {
+    realize_all([object, name]);
     let (Some(object), Some(w_name)) = (argument(object), attribute_name(name)) else {
         return std::ptr::null_mut();
     };
@@ -199,6 +235,7 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
     name: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
+    realize_all([object, name, value]);
     let (Some(object), Some(w_name)) = (argument(object), attribute_name(name)) else {
         return -1;
     };
@@ -248,6 +285,7 @@ pub unsafe extern "C" fn PyObject_GenericSetDict(
     value: *mut CPyObject,
     _context: *mut c_void,
 ) -> c_int {
+    realize_all([object, value]);
     let Some(object) = argument(object) else {
         return -1;
     };
@@ -331,6 +369,7 @@ pub unsafe extern "C" fn PyObject_Format(
     object: *mut CPyObject,
     spec: *mut CPyObject,
 ) -> *mut CPyObject {
+    realize_all([object, spec]);
     let Some(object) = argument(object) else {
         return std::ptr::null_mut();
     };
@@ -379,7 +418,7 @@ pub unsafe extern "C" fn PyObject_RichCompare(
     right: *mut CPyObject,
     opid: c_int,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     let Some(op) = comparison_of(opid) else {
@@ -398,7 +437,7 @@ pub unsafe extern "C" fn PyObject_RichCompareBool(
     right: *mut CPyObject,
     opid: c_int,
 ) -> c_int {
-    let (Some(w_left), Some(w_right)) = (argument(left), argument(right)) else {
+    let Some([w_left, w_right]) = arguments([left, right]) else {
         return -1;
     };
     if crate::baseobjspace::is_w(w_left, w_right) {
@@ -487,7 +526,7 @@ pub unsafe extern "C" fn PyObject_GetItem(
     object: *mut CPyObject,
     key: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(object), Some(key)) = (argument(object), argument(key)) else {
+    let Some([object, key]) = arguments([object, key]) else {
         return std::ptr::null_mut();
     };
     result(crate::baseobjspace::getitem(object, key))
@@ -499,7 +538,8 @@ pub unsafe extern "C" fn PyObject_SetItem(
     key: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), argument(key)) else {
+    realize_all([object, key, value]);
+    let Some([object, key]) = arguments([object, key]) else {
         return -1;
     };
     let Some(value) = argument(value) else {
@@ -522,7 +562,7 @@ pub unsafe extern "C" fn PyObject_Length(object: *mut CPyObject) -> isize {
 /// `PyObject_DelItem(object, key)` — `del object[key]` (`object.py:169-172`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_DelItem(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), argument(key)) else {
+    let Some([object, key]) = arguments([object, key]) else {
         return -1;
     };
     if trap(crate::baseobjspace::delitem(object, key)).is_none() {
@@ -559,7 +599,7 @@ pub unsafe extern "C" fn PyObject_DelItemString(
 /// `PyObject_DelAttr(object, name)` — `del object.name`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_DelAttr(object: *mut CPyObject, name: *mut CPyObject) -> c_int {
-    let (Some(object), Some(name)) = (argument(object), argument(name)) else {
+    let Some([object, name]) = arguments([object, name]) else {
         return -1;
     };
     if trap(crate::baseobjspace::delattr(object, name)).is_none() {
@@ -628,6 +668,7 @@ pub unsafe extern "C" fn PyObject_GetOptionalAttr(
     name: *mut CPyObject,
     out: *mut *mut CPyObject,
 ) -> c_int {
+    realize_all([object, name]);
     if out.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return -1;
@@ -675,6 +716,7 @@ pub unsafe extern "C" fn PyObject_HasAttrWithError(
     object: *mut CPyObject,
     name: *mut CPyObject,
 ) -> c_int {
+    realize_all([object, name]);
     let (Some(object), Some(name)) = (argument(object), attribute_name(name)) else {
         return -1;
     };
@@ -720,7 +762,8 @@ pub unsafe extern "C" fn PyObject_Call(
     args: *mut CPyObject,
     kwargs: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(callable), Some(args)) = (argument(callable), argument(args)) else {
+    realize_all([callable, args, kwargs]);
+    let Some([callable, args]) = arguments([callable, args]) else {
         return std::ptr::null_mut();
     };
     if !unsafe { pyre_object::is_tuple(args) } {
@@ -744,6 +787,7 @@ pub unsafe extern "C" fn PyObject_CallObject(
     callable: *mut CPyObject,
     args: *mut CPyObject,
 ) -> *mut CPyObject {
+    realize_all([callable, args]);
     let Some(callable) = argument(callable) else {
         return std::ptr::null_mut();
     };
@@ -825,7 +869,7 @@ pub unsafe extern "C" fn PyObject_IsInstance(
     object: *mut CPyObject,
     class: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(class)) = (argument(object), argument(class)) else {
+    let Some([object, class]) = arguments([object, class]) else {
         return -1;
     };
     match trap(crate::baseobjspace::isinstance(object, class)) {
@@ -842,7 +886,7 @@ pub unsafe extern "C" fn PyObject_IsSubclass(
     derived: *mut CPyObject,
     class: *mut CPyObject,
 ) -> c_int {
-    let (Some(derived), Some(class)) = (argument(derived), argument(class)) else {
+    let Some([derived, class]) = arguments([derived, class]) else {
         return -1;
     };
     match trap(crate::baseobjspace::issubclass(derived, class)) {
@@ -1056,18 +1100,19 @@ unsafe fn call_vector(
     kwnames: *mut CPyObject,
 ) -> Result<PyObjectRef, crate::PyError> {
     let nargs = vectorcall_nargs(nargsf);
+
+    // Every incoming value is pinned before anything below can collect, and
+    // read back from the shadow stack afterwards.  The callable is pinned
+    // first: converting a mirror below can realize it, which allocates.
+    let roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(callable);
     let kwnames = unsafe { pyobject::from_ref(kwnames) };
     if !kwnames.is_null() && !unsafe { pyre_object::is_tuple(kwnames) } {
         return Err(crate::PyError::type_error(
             "vectorcall keyword names must be a tuple",
         ));
     }
-
-    // Every incoming value is pinned before anything below can collect, and
-    // read back from the shadow stack afterwards.
-    let roots = pyre_object::gc_roots::push_roots();
-    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(callable);
     let kwnames_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(kwnames);
     let named = if kwnames.is_null() {
@@ -1172,6 +1217,7 @@ pub unsafe extern "C" fn PyObject_VectorcallMethod(
     }
     // `argument` reports a NULL itself, so the arity is the only condition
     // left to raise for.
+    realize_all([name, unsafe { *args }]);
     let (Some(name), Some(receiver)) = (argument(name), argument(unsafe { *args })) else {
         return std::ptr::null_mut();
     };
@@ -1196,6 +1242,7 @@ pub unsafe extern "C" fn PyVectorcall_Call(
     tuple: *mut CPyObject,
     dict: *mut CPyObject,
 ) -> *mut CPyObject {
+    realize_all([callable, tuple, dict]);
     unsafe { PyObject_Call(callable, tuple, dict) }
 }
 
@@ -1217,6 +1264,7 @@ pub unsafe extern "C" fn PyObject_CallOneArg(
     callable: *mut CPyObject,
     arg: *mut CPyObject,
 ) -> *mut CPyObject {
+    realize_all([callable, arg]);
     let Some(callable) = argument(callable) else {
         return std::ptr::null_mut();
     };

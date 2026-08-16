@@ -69,6 +69,7 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     index: isize,
     item: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, item]);
     let Some(value) = tuple_argument(object, "PyTuple_SetItem") else {
         unsafe { pyobject::decref(item) };
         return -1;

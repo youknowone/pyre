@@ -4,7 +4,7 @@
 //! same name, so a subclass that overrides one is honoured and either operand
 //! may be a pyre object.
 
-use super::object::{argument, result};
+use super::object::{argument, arguments, result};
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
@@ -122,7 +122,7 @@ fn add_frozen(set: PyObjectRef, key: PyObjectRef) -> Result<(), crate::PyError> 
 /// Both arguments must be live references.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySet_Add(set: *mut CPyObject, key: *mut CPyObject) -> c_int {
-    let (Some(set), Some(key)) = (argument(set), argument(key)) else {
+    let Some([set, key]) = arguments([set, key]) else {
         return -1;
     };
     let call = if unsafe { pyre_object::setobject::is_set(set) } {
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn PySet_Add(set: *mut CPyObject, key: *mut CPyObject) -> 
 /// Both arguments must be live references.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySet_Discard(set: *mut CPyObject, key: *mut CPyObject) -> c_int {
-    let (Some(set), Some(key)) = (argument(set), argument(key)) else {
+    let Some([set, key]) = arguments([set, key]) else {
         return -1;
     };
     let call = any_set(set, "PySet_Discard").and_then(|set| method(set, "remove", &[key]));
@@ -214,7 +214,7 @@ pub unsafe extern "C" fn PySet_Size(set: *mut CPyObject) -> isize {
 /// Both arguments must be live references.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySet_Contains(set: *mut CPyObject, key: *mut CPyObject) -> c_int {
-    let (Some(set), Some(key)) = (argument(set), argument(key)) else {
+    let Some([set, key]) = arguments([set, key]) else {
         return -1;
     };
     let call = any_set(set, "PySet_Contains")

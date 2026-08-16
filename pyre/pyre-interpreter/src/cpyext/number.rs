@@ -4,7 +4,7 @@
 //! the operand on either side may be a pyre object, and the binary-operator
 //! dispatch is what decides between the two.
 
-use super::object::{argument, result};
+use super::object::{argument, arguments, result};
 use super::pyerrors::trap;
 use super::pyobject::CPyObject;
 use crate::bytecode::BinaryOperator;
@@ -16,7 +16,7 @@ pub unsafe extern "C" fn PyNumber_Add(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::add(left, right))
@@ -27,7 +27,7 @@ pub unsafe extern "C" fn PyNumber_Subtract(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::sub(left, right))
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn PyNumber_Multiply(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::mul(left, right))
@@ -49,7 +49,7 @@ pub unsafe extern "C" fn PyNumber_MatrixMultiply(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::matmul(left, right))
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn PyNumber_FloorDivide(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::floordiv(left, right))
@@ -71,7 +71,7 @@ pub unsafe extern "C" fn PyNumber_TrueDivide(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::truediv(left, right))
@@ -82,7 +82,7 @@ pub unsafe extern "C" fn PyNumber_Remainder(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::mod_(left, right))
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn PyNumber_Divmod(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::divmod(left, right))
@@ -104,7 +104,7 @@ pub unsafe extern "C" fn PyNumber_Lshift(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::lshift(left, right))
@@ -115,7 +115,7 @@ pub unsafe extern "C" fn PyNumber_Rshift(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::rshift(left, right))
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn PyNumber_And(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::and_(left, right))
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn PyNumber_Xor(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::xor(left, right))
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn PyNumber_Or(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::or_(left, right))
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceAdd(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceSubtract(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceMultiply(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceMatrixMultiply(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceFloorDivide(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceTrueDivide(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceRemainder(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceLshift(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -283,7 +283,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceRshift(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -298,7 +298,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceAnd(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -313,7 +313,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceXor(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn PyNumber_InPlaceOr(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -382,7 +382,8 @@ pub unsafe extern "C" fn PyNumber_Power(
     exponent: *mut CPyObject,
     modulus: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(base), Some(exponent)) = (argument(base), argument(exponent)) else {
+    super::object::realize_all([base, exponent, modulus]);
+    let Some([base, exponent]) = arguments([base, exponent]) else {
         return std::ptr::null_mut();
     };
     let modulus = unsafe { super::pyobject::from_ref(modulus) };
@@ -403,7 +404,8 @@ pub unsafe extern "C" fn PyNumber_InPlacePower(
     exponent: *mut CPyObject,
     modulus: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(base), Some(exponent)) = (argument(base), argument(exponent)) else {
+    super::object::realize_all([base, exponent, modulus]);
+    let Some([base, exponent]) = arguments([base, exponent]) else {
         return std::ptr::null_mut();
     };
     let modulus = unsafe { super::pyobject::from_ref(modulus) };
@@ -494,6 +496,7 @@ pub unsafe extern "C" fn PyNumber_Float(object: *mut CPyObject) -> *mut CPyObjec
 /// what a NULL `exc` wants and what a non-NULL one must not get.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_AsSsize_t(object: *mut CPyObject, exc: *mut CPyObject) -> isize {
+    super::object::realize_all([object, exc]);
     let Some(object) = argument(object) else {
         return -1;
     };

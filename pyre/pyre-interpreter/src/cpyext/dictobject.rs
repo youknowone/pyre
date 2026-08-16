@@ -1,6 +1,6 @@
 //! `dict` -- PyPy `cpyext/dictobject.py`.
 
-use super::object::argument;
+use super::object::{argument, arguments};
 use super::pyerrors::trap;
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
@@ -40,10 +40,11 @@ pub unsafe extern "C" fn PyDict_SetItem(
     key: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, key, value]);
     let Some(dict) = dict_argument(object, "PyDict_SetItem") else {
         return -1;
     };
-    let (Some(key), Some(value)) = (argument(key), argument(value)) else {
+    let Some([key, value]) = arguments([key, value]) else {
         return -1;
     };
     if trap(crate::baseobjspace::setitem(dict, key, value)).is_none() {
@@ -58,6 +59,7 @@ pub unsafe extern "C" fn PyDict_SetItemString(
     key: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, value]);
     let Some(dict) = dict_argument(object, "PyDict_SetItemString") else {
         return -1;
     };
@@ -86,6 +88,7 @@ pub unsafe extern "C" fn PyDict_GetItem(
     object: *mut CPyObject,
     key: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([object, key]);
     let Some(dict) = dict_argument(object, "PyDict_GetItem") else {
         unsafe { super::pyerrors::PyErr_Clear() };
         return std::ptr::null_mut();
@@ -121,6 +124,7 @@ pub unsafe extern "C" fn PyDict_GetItemString(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_DelItem(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
+    super::object::realize_all([object, key]);
     let Some(dict) = dict_argument(object, "PyDict_DelItem") else {
         return -1;
     };
@@ -143,6 +147,7 @@ pub unsafe extern "C" fn PyDict_Size(object: *mut CPyObject) -> isize {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Contains(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
+    super::object::realize_all([object, key]);
     let Some(dict) = dict_argument(object, "PyDict_Contains") else {
         return -1;
     };
@@ -244,6 +249,7 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(
     object: *mut CPyObject,
     key: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([object, key]);
     let (Some(dict), Some(key)) = (
         dict_argument(object, "PyDict_GetItemWithError"),
         argument(key),
@@ -297,6 +303,7 @@ pub unsafe extern "C" fn PyDict_GetItemRef(
     key: *mut CPyObject,
     result: *mut *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, key]);
     let (Some(dict), Some(key)) = (dict_argument(object, "PyDict_GetItemRef"), argument(key))
     else {
         return -1;
@@ -398,6 +405,7 @@ pub unsafe extern "C" fn PyDict_Merge(
     from: *mut CPyObject,
     over: c_int,
 ) -> c_int {
+    super::object::realize_all([into, from]);
     let (Some(target), Some(source)) = (dict_argument(into, "PyDict_Merge"), argument(from)) else {
         return -1;
     };
@@ -498,6 +506,7 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     seq2: *mut CPyObject,
     over: c_int,
 ) -> c_int {
+    super::object::realize_all([into, seq2]);
     let (Some(target), Some(sequence)) =
         (dict_argument(into, "PyDict_MergeFromSeq2"), argument(seq2))
     else {

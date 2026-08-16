@@ -2886,6 +2886,7 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     spec: *mut CPyTypeSpec,
     bases: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([module, bases]);
     super::object::result(from_spec(spec, bases, module))
 }
 
@@ -3411,6 +3412,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     spec: *mut CPyTypeSpec,
     bases: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([module, bases]);
     if !metaclass.is_null() {
         let w_metaclass = interpreter_type(metaclass);
         if w_metaclass.is_null() || w_metaclass != crate::typedef::w_type() {
@@ -3436,6 +3438,7 @@ pub unsafe extern "C" fn PyErr_NewExceptionWithDoc(
     base: *mut CPyObject,
     dict: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([base, dict]);
     super::object::result(new_exception(name, doc, base, dict))
 }
 
@@ -3445,6 +3448,7 @@ pub unsafe extern "C" fn PyErr_NewException(
     base: *mut CPyObject,
     dict: *mut CPyObject,
 ) -> *mut CPyObject {
+    super::object::realize_all([base, dict]);
     super::object::result(new_exception(name, std::ptr::null(), base, dict))
 }
 

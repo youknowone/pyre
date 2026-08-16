@@ -112,14 +112,23 @@ pub unsafe extern "C" fn PyUnicode_GetLength(object: *mut CPyObject) -> isize {
     }
 }
 
+/// Both spellings of the type test answer for a string still being filled
+/// without reading it as a value: [`PyUnicode_New`] hands back an exact `str`,
+/// and converting it would build it out of what C has written so far.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Check(object: *mut CPyObject) -> c_int {
+    if is_pending(object) {
+        return 1;
+    }
     let object = unsafe { pyobject::from_ref(object) };
     (!object.is_null() && unsafe { pyre_object::unicodeobject::is_str(object) }) as c_int
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_CheckExact(object: *mut CPyObject) -> c_int {
+    if is_pending(object) {
+        return 1;
+    }
     let object = unsafe { pyobject::from_ref(object) };
     (!object.is_null() && super::object::is_exactly(object, &pyre_object::STR_TYPE)) as c_int
 }
@@ -154,6 +163,16 @@ pub(super) unsafe fn after_fork_child() {
 /// Drop what a dying mirror's canonical form occupied.
 pub(super) fn forget_block(mirror: usize) {
     BLOCKS.lock().remove(&mirror);
+}
+
+/// Whether `raw` is a string [`PyUnicode_New`] handed out and nothing has read
+/// as a value yet — so C may still be writing it.
+fn is_pending(raw: *mut CPyObject) -> bool {
+    !raw.is_null()
+        && BLOCKS
+            .lock()
+            .get(&(raw as usize))
+            .is_some_and(|block| block.pending)
 }
 
 /// The widest code point `kind` can hold, and the kind a code point needs.
@@ -285,13 +304,12 @@ pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: Py_UCS4) -> *mut CP
 }
 
 /// Give a mirror [`PyUnicode_New`] handed out the `str` its contents now
-/// describe, and link the two.
+/// describe, and link the two — `unicodeobject.py:118 unicode_realize`.
 ///
-/// Called from `from_c_result` and nowhere else.  `from_ref` is documented as
-/// allocation-free — an entry point converting two arguments in a row relies on
-/// the first result staying valid across the second conversion — and building
-/// the `str` allocates.  `from_c_result` is the one point where the mirror is
-/// the only live value.
+/// Reached from [`super::pyobject::realize`], so the string is built the first
+/// time the mirror is read as a value.  What C wrote up to that point is what
+/// the string holds; a later write reaches the block alone, as upstream's
+/// "the buffer must not be modified after this call" says.
 pub(super) fn realize_pending(raw: *mut CPyObject) {
     if raw.is_null() {
         return;

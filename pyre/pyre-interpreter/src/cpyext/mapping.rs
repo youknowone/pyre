@@ -1,6 +1,6 @@
 //! The mapping protocol -- PyPy `cpyext/mapping.py`.
 
-use super::object::{argument, result};
+use super::object::{argument, arguments, result};
 use super::pyerrors::trap;
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
@@ -64,6 +64,7 @@ pub unsafe extern "C" fn PyMapping_SetItemString(
     key: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, value]);
     let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return -1;
     };
@@ -93,7 +94,7 @@ pub unsafe extern "C" fn PyMapping_DelItemString(
 /// `PyMapping_HasKey` swallows the lookup's exception, as CPython's does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMapping_HasKey(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), argument(key)) else {
+    let Some([object, key]) = arguments([object, key]) else {
         unsafe { super::pyerrors::PyErr_Clear() };
         return 0;
     };

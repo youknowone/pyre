@@ -203,6 +203,7 @@ fn normalized(w_type: PyObjectRef, w_value: PyObjectRef) -> Result<PyObjectRef, 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_SetObject(w_type: *mut CPyObject, value: *mut CPyObject) {
+    super::object::realize_all([w_type, value]);
     let Some(class) = class_argument(w_type) else {
         return;
     };
@@ -307,6 +308,7 @@ pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
     given: *mut CPyObject,
     expected: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([given, expected]);
     let given = unsafe { pyobject::from_ref(given) };
     let expected = unsafe { pyobject::from_ref(expected) };
     if given.is_null() || expected.is_null() {
@@ -366,6 +368,7 @@ pub unsafe extern "C" fn PyErr_Restore(
     pvalue: *mut CPyObject,
     ptraceback: *mut CPyObject,
 ) {
+    super::object::realize_all([ptype, pvalue]);
     unsafe { pyobject::decref(ptraceback) };
     if pvalue.is_null() {
         unsafe { pyobject::decref(ptype) };
@@ -409,6 +412,7 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
         return;
     }
     let (was_type, was_value) = unsafe { (*ptype, *pvalue) };
+    super::object::realize_all([was_type, was_value]);
     let class = unsafe { pyobject::from_ref(was_type) };
     if class.is_null() {
         return;

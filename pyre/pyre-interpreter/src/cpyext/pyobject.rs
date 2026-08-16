@@ -289,7 +289,25 @@ fn deallocating_marker() -> usize {
     &raw const MARKER as usize
 }
 
-/// `pyobject.py:from_ref` — the interpreter object a mirror links to.
+/// `pyobject.py:330-337` — build the interpreter object of a mirror that has
+/// none yet.
+///
+/// Upstream reaches the `realize` of the mirror's own type descriptor; the one
+/// form pyre hands out unrealized is the `str` [`super::unicodeobject::PyUnicode_New`]
+/// allocates, whose contents C is still writing when it is handed over.
+///
+/// # Safety
+/// `raw` must be null or a live mirror.  Building the object allocates, so no
+/// unpinned interpreter object may be held across this.
+pub(super) unsafe fn realize(raw: *mut CPyObject) {
+    if raw.is_null() || !unsafe { (*raw).ob_pyre_link }.is_null() {
+        return;
+    }
+    super::unicodeobject::realize_pending(raw);
+}
+
+/// `pyobject.py:from_ref` — the interpreter object a mirror links to,
+/// [`realize`]d first if it has none yet.
 ///
 /// Null once the collector has cleared the link, and null while the mirror's
 /// deallocator runs: `tp_dealloc` calling back into an API that would rebuild
@@ -300,12 +318,18 @@ fn deallocating_marker() -> usize {
 /// # Safety
 /// `raw` must be null or a live mirror.  The result is only valid until the
 /// next operation that can collect; re-read it through the mirror (or pin it
-/// on the shadow stack) across anything that allocates.
+/// on the shadow stack) across anything that allocates.  Realizing allocates,
+/// so converting several mirrors in a row goes through
+/// [`super::object::arguments`], which realizes all of them first.
 pub unsafe fn from_ref(raw: *mut CPyObject) -> PyObjectRef {
     if raw.is_null() {
         return PY_NULL;
     }
     let link = unsafe { (*raw).ob_pyre_link };
+    if link.is_null() {
+        unsafe { realize(raw) };
+        return unsafe { (*raw).ob_pyre_link };
+    }
     if link as usize == deallocating_marker() {
         return PY_NULL;
     }

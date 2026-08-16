@@ -60,6 +60,13 @@ assert u.reverse('こんにちは') == 'はちにんこ'
 assert u.reverse('a\U0001f363b') == 'b\U0001f363a'
 assert u.reverse('') == ''
 
+# ── a new string handed to another entry point, not returned ───────────
+# Its value is built where it first crosses back into the interpreter, so
+# the pair below is an ordinary dict entry.
+assert u.pairs() == {'kk': 'あああ'}, u.pairs()
+assert u.join('ab') == 'ab\U0001f363\U0001f363', u.join('ab')
+assert u.shape(u.join('ab')) == (4, 0, 0x10ffff, 4)
+
 # ── an empty allocation, and the argument checks ───────────────────────
 assert u.empty() == ''
 assert u.out_of_range() is True

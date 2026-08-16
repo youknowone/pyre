@@ -1,6 +1,6 @@
 //! The sequence protocol -- PyPy `cpyext/sequence.py`.
 
-use super::object::{argument, result};
+use super::object::{argument, arguments, result};
 use super::pyerrors::trap;
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn PySequence_Concat(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::add(left, right))
@@ -47,7 +47,7 @@ pub unsafe extern "C" fn PySequence_InPlaceConcat(
     left: *mut CPyObject,
     right: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(left), Some(right)) = (argument(left), argument(right)) else {
+    let Some([left, right]) = arguments([left, right]) else {
         return std::ptr::null_mut();
     };
     result(crate::opcode_ops::binary_value(
@@ -100,7 +100,7 @@ pub unsafe extern "C" fn PySequence_SetItem(
     index: isize,
     value: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(value)) = (argument(object), argument(value)) else {
+    let Some([object, value]) = arguments([object, value]) else {
         return -1;
     };
     let assigned =
@@ -122,7 +122,7 @@ pub unsafe extern "C" fn PySequence_Contains(
     object: *mut CPyObject,
     value: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(value)) = (argument(object), argument(value)) else {
+    let Some([object, value]) = arguments([object, value]) else {
         return -1;
     };
     match trap(crate::baseobjspace::contains(object, value)) {
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn PySequence_Contains(
 /// The index of the first item equal to `value`, or -1 with `ValueError` set.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Index(object: *mut CPyObject, value: *mut CPyObject) -> isize {
-    let (Some(object), Some(value)) = (argument(object), argument(value)) else {
+    let Some([object, value]) = arguments([object, value]) else {
         return -1;
     };
     trap(index_of(object, value)).unwrap_or(-1)
@@ -193,7 +193,7 @@ pub unsafe extern "C" fn PySequence_SetSlice(
     value: *mut CPyObject,
 ) -> c_int {
     let slice = super::sliceobject::range_slice(low, high);
-    let (Some(object), Some(value)) = (argument(object), argument(value)) else {
+    let Some([object, value]) = arguments([object, value]) else {
         return -1;
     };
     let assigned = crate::baseobjspace::setitem(object, slice, value);
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn PySequence_In(object: *mut CPyObject, value: *mut CPyOb
 /// `PySequence_Count(o, value)` — how many items compare equal to `value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Count(object: *mut CPyObject, value: *mut CPyObject) -> isize {
-    let (Some(object), Some(value)) = (argument(object), argument(value)) else {
+    let Some([object, value]) = arguments([object, value]) else {
         return -1;
     };
     trap(count_of(object, value)).unwrap_or(-1)

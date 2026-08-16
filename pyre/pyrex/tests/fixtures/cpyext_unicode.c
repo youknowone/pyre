@@ -169,7 +169,81 @@ static PyObject *u_empty(PyObject *self, PyObject *arg)
     return PyUnicode_New(0, 0);
 }
 
+/* `size` copies of `fill`, written through the canonical representation. */
+static PyObject *filled(Py_ssize_t size, Py_UCS4 fill)
+{
+    PyObject *out = PyUnicode_New(size, fill);
+    if (out == NULL) {
+        return NULL;
+    }
+    int kind = PyUnicode_KIND(out);
+    void *data = PyUnicode_DATA(out);
+    for (Py_ssize_t index = 0; index < size; index++) {
+        PyUnicode_WRITE(kind, data, index, fill);
+    }
+    return out;
+}
+
+/* A new string handed to another entry point instead of being returned: two of
+   them at once, so the second conversion happens while the first is live. */
+static PyObject *u_pairs(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    (void)arg;
+    PyObject *dict = PyDict_New();
+    if (dict == NULL) {
+        return NULL;
+    }
+    /* The type tests and the length are answered while the string is still
+       being written, so asking them does not decide its contents early. */
+    PyObject *key = PyUnicode_New(2, 'k');
+    if (key != NULL
+        && (!PyUnicode_Check(key) || !PyUnicode_CheckExact(key)
+            || PyUnicode_GET_LENGTH(key) != 2)) {
+        Py_DECREF(key);
+        Py_DECREF(dict);
+        PyErr_SetString(PyExc_SystemError, "a string being filled reads as something else");
+        return NULL;
+    }
+    if (key != NULL) {
+        int kind = PyUnicode_KIND(key);
+        void *data = PyUnicode_DATA(key);
+        PyUnicode_WRITE(kind, data, 0, 'k');
+        PyUnicode_WRITE(kind, data, 1, 'k');
+    }
+    PyObject *value = filled(3, 0x3042);
+    if (key == NULL || value == NULL) {
+        Py_XDECREF(key);
+        Py_XDECREF(value);
+        Py_DECREF(dict);
+        return NULL;
+    }
+    int failed = PyDict_SetItem(dict, key, value);
+    Py_DECREF(key);
+    Py_DECREF(value);
+    if (failed < 0) {
+        Py_DECREF(dict);
+        return NULL;
+    }
+    return dict;
+}
+
+/* The same, as an operand of a binary operation. */
+static PyObject *u_join(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    PyObject *tail = filled(2, 0x1f363);
+    if (tail == NULL) {
+        return NULL;
+    }
+    PyObject *joined = PyNumber_Add(arg, tail);
+    Py_DECREF(tail);
+    return joined;
+}
+
 static PyMethodDef methods[] = {
+    {"pairs", u_pairs, METH_NOARGS, "a new string as a dict key and value"},
+    {"join", u_join, METH_O, "a new string as the right operand of +"},
     {"escape", u_escape, METH_O, "escape '<' through the canonical representation"},
     {"shape", u_shape, METH_O, "the kind/ascii/maxchar/length a string reports"},
     {"first_point", u_first_point, METH_O, "the first code point, read through the typed data"},

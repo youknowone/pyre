@@ -145,6 +145,7 @@ pub unsafe extern "C" fn PyIter_Send(
     value: *mut CPyObject,
     presult: *mut *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([iterator, value]);
     if presult.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return PYGEN_ERROR;

@@ -675,6 +675,7 @@ pub unsafe extern "C" fn PyObject_CopyData(
     destination: *mut CPyObject,
     source: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([destination, source]);
     let mut target = unsafe { std::mem::zeroed::<CPyBuffer>() };
     let mut origin = unsafe { std::mem::zeroed::<CPyBuffer>() };
     if unsafe { PyObject_GetBuffer(destination, &raw mut target, PY_BUF_WRITABLE | PY_BUF_ND) } < 0

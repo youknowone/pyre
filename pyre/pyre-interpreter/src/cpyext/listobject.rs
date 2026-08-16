@@ -1,6 +1,6 @@
 //! `list` -- PyPy `cpyext/listobject.py`.
 
-use super::object::{argument, result};
+use super::object::{argument, arguments, result};
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
@@ -61,6 +61,7 @@ pub unsafe extern "C" fn PyList_SetItem(
     index: isize,
     item: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, item]);
     let Some(value) = list_argument(object, "PyList_SetItem") else {
         unsafe { pyobject::decref(item) };
         return -1;
@@ -80,6 +81,7 @@ pub unsafe extern "C" fn PyList_SetItem(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Append(object: *mut CPyObject, item: *mut CPyObject) -> c_int {
+    super::object::realize_all([object, item]);
     let Some(value) = list_argument(object, "PyList_Append") else {
         return -1;
     };
@@ -141,8 +143,9 @@ pub unsafe extern "C" fn PyList_Insert(
     index: isize,
     item: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, item]);
     let index = pyre_object::w_int_new(index as i64);
-    let (Some(value), Some(item)) = (argument(object), argument(item)) else {
+    let Some([value, item]) = arguments([object, item]) else {
         return -1;
     };
     list_method(
@@ -204,6 +207,7 @@ pub unsafe extern "C" fn PyList_SetSlice(
     high: isize,
     sequence: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([object, sequence]);
     let slice = super::sliceobject::range_slice(low, high);
     let Some(value) = argument(object) else {
         return -1;

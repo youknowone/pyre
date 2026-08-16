@@ -679,10 +679,6 @@ pub(super) fn from_c_result(result: *mut CPyObject) -> Result<PyObjectRef, crate
             "cpyext function returned a result with an exception set",
         ));
     }
-    // A `PyUnicode_New` block has no interpreter object until here: this is the
-    // one point where the mirror is the only live value, so building the `str`
-    // cannot invalidate a caller's second argument.
-    unicodeobject::realize_pending(result);
     let value = unsafe { pyobject::from_ref(result) };
     unsafe { pyobject::decref(result) };
     Ok(value)

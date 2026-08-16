@@ -560,6 +560,7 @@ pub unsafe extern "C" fn PyModule_AddObject(
     name: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([module, value]);
     if unsafe { PyModule_AddObjectRef(module, name, value) } != 0 {
         return -1;
     }
@@ -573,6 +574,7 @@ pub unsafe extern "C" fn PyModule_AddObjectRef(
     name: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([module, value]);
     let Some(module) = module_argument(module, "PyModule_AddObjectRef") else {
         return -1;
     };
@@ -793,6 +795,7 @@ pub unsafe extern "C" fn PyModule_Add(
     name: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
+    super::object::realize_all([module, value]);
     let result = unsafe { PyModule_AddObjectRef(module, name, value) };
     if !value.is_null() {
         unsafe { pyobject::decref(value) };
