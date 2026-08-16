@@ -2249,6 +2249,50 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(self as *const Self as *mut u8)
             }
 
+            // warmstate.py:387-396 `execute_assembler`: all a compiled entry
+            // does to its virtualizable is `vinfo.clear_vable_token(virt)` —
+            // one store, before the call, and nothing after it. There is no
+            // copy in and no copy out, because the virtualizable IS the
+            // storage the compiled code reads and writes.
+            //
+            // The default hooks copy in and copy out instead, which is what a
+            // host needs when its interpreter-side storage is a separate
+            // mirror of the virtualizable object. This state is not such a
+            // host: `virtualizable_heap_ptr` above hands out its own address,
+            // and every array field is registered at its byte offset within
+            // it, so the boxes the default reads and the boxes it writes back
+            // address the same memory. The copy in is discarded outright —
+            // nothing here overrides `import_virtualizable_boxes`, whose
+            // default drops the boxes it is handed — and the copy out reads
+            // each element and writes it back unchanged. Both are no-ops that
+            // cost a pass over every array, plus the vectors to hold it, on
+            // every entry into compiled code.
+            //
+            // So keep the token store and drop the copies. The store is itself
+            // inert while the info carries no token field, which is the case
+            // for a state whose offset 0 is a live user field; it is written
+            // rather than omitted so that a state which later declares one
+            // gets the upstream behaviour without this having to be revisited.
+            fn sync_virtualizable_before_jit(
+                &mut self,
+                meta: &Self::Meta,
+                virtualizable: &str,
+                info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) -> bool {
+                if let Some(__obj) = self.virtualizable_heap_ptr(meta, virtualizable, info) {
+                    unsafe { info.reset_vable_token(__obj) };
+                }
+                true
+            }
+
+            fn sync_virtualizable_after_jit(
+                &mut self,
+                _meta: &Self::Meta,
+                _virtualizable: &str,
+                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+            ) {
+            }
+
             fn export_virtualizable_boxes(
                 &self,
                 _meta: &Self::Meta,
