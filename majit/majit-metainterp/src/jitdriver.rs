@@ -2521,6 +2521,7 @@ impl<S: JitState> JitDriver<S> {
         let r = self.back_edge_internal(
             key,
             None,
+            None,
             resume_pc,
             state,
             env,
@@ -4185,6 +4186,7 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(
             target_pc as u64,
             None,
+            None,
             target_pc,
             state,
             env,
@@ -4202,7 +4204,9 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<usize> {
-        self.back_edge_internal(green_key, None, target_pc, state, env, None, None, pre_run)
+        self.back_edge_internal(
+            green_key, None, None, target_pc, state, env, None, None, pre_run,
+        )
     }
 
     /// Takes the green key's hash eagerly and the key itself lazily.
@@ -4233,6 +4237,50 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(
             green_key_hash,
             Some(&make_green_key),
+            None,
+            target_pc,
+            state,
+            env,
+            None,
+            None,
+            pre_run,
+        )
+    }
+
+    /// [`Self::back_edge_structured`] for a caller that has already resolved
+    /// the cell and read its token — the resolve happens once, at that caller,
+    /// and its result travels here instead of being recomputed.
+    ///
+    /// `warmstate.py:509-511` is this shape: `maybe_compile_and_run` reads the
+    /// token at `:483`, decides on it, and passes that object to the executor
+    /// as an argument (`raise EnterJitAssembler(procedure_token,
+    /// *execute_args)`) rather than handing on a key for the executor to look
+    /// up again. A door that instead probes and then calls the hash-taking
+    /// entry point pays for two cell resolutions per warm call and, on a
+    /// chained bucket, can decide about one cell's token and enter another's.
+    ///
+    /// `cell_key` must be a [`Self::resolve_cell_key`] result and
+    /// `procedure_token` must be the token read from THAT key — normally
+    /// [`Self::runnable_procedure_token`] asked with this same `cell_key`.
+    /// Neither is re-derived here: the key is used as-is (re-resolving a
+    /// resolved key would also rebuild the caller's `GreenKey` on a chained
+    /// bucket, which is the allocation the carry exists to avoid), and the
+    /// token is entered as given.
+    #[cold]
+    #[inline(never)]
+    pub fn back_edge_resolved(
+        &mut self,
+        cell_key: u64,
+        procedure_token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<usize> {
+        self.back_edge_internal(
+            cell_key,
+            None,
+            Some(procedure_token),
             target_pc,
             state,
             env,
@@ -4390,6 +4438,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         green_key_hash: u64,
         structured_green_key: Option<&dyn Fn() -> GreenKey>,
+        carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -4409,9 +4458,19 @@ impl<S: JitState> JitDriver<S> {
         // let them (`warmstate.py:458-464` resolves once and :483/:511 carries
         // the resolved token onward for the same reason). Identity for every
         // unchained bucket, so the collision-free path is unchanged.
-        let green_key = self
-            .meta
-            .resolve_cell_key(green_key_hash, structured_green_key);
+        //
+        // A caller arriving with `carried_procedure_token` has already done
+        // this step and read its token from the result, so `green_key_hash` is
+        // that resolved key and is taken as-is: resolving a resolved key would
+        // rebuild the caller's `GreenKey` on a chained bucket, and the whole
+        // point of the carry is that the key, the token and the run come from
+        // one resolution.
+        let green_key = if carried_procedure_token.is_some() {
+            green_key_hash
+        } else {
+            self.meta
+                .resolve_cell_key(green_key_hash, structured_green_key)
+        };
         let single_pass_dispatch_key =
             self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         if !state.can_trace() {
@@ -4482,7 +4541,15 @@ impl<S: JitState> JitDriver<S> {
         // resolve-once discipline the cell key above already follows, one
         // level in: the token the gate said yes about IS the token executed,
         // and a warm entry pays for one cell lookup rather than two.
-        if let Some(procedure_token) = self.meta.entry_procedure_token(green_key)
+        //
+        // A caller that already took its own decision on this cell's token
+        // hands that same object in, and it is entered unread — the carry
+        // reaches one level further out, to that caller, exactly as
+        // `EnterJitAssembler` carries `:483`'s read past `maybe_compile_and_run`
+        // and into the executor. The meta below is still fetched here because
+        // its VALUE is needed, not just its presence.
+        if let Some(procedure_token) =
+            carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
@@ -6349,9 +6416,69 @@ impl<S: JitState> JitDriver<S> {
     /// be expressed. `warmstate::tests::
     /// the_entry_decision_and_the_entry_execution_resolve_through_one_cell_key`
     /// is the pin for that.
+    ///
+    /// The boolean form of [`Self::runnable_procedure_token`] and defined in
+    /// terms of it, so a caller that decides through this predicate and a
+    /// caller that runs through the token cannot be answering about different
+    /// cells or different tokens.
     #[inline]
     pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
-        self.has_compiled_loop(green_key) && self.meta.get_compiled_meta(green_key).is_some()
+        self.runnable_procedure_token(green_key).is_some()
+    }
+
+    /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
+    /// back so a door can carry it into the run instead of resolving the cell a
+    /// second time.
+    ///
+    /// `warmstate.py:483` reads `procedure_token = cell.get_procedure_token()`
+    /// once and `:509-511` carries that object out through `raise
+    /// EnterJitAssembler(procedure_token, *execute_args)`; the executor never
+    /// asks the cell again. This is the reader that makes the same carry
+    /// expressible for a caller outside this crate.
+    ///
+    /// How the predicate's two conjuncts divide here: `entry_procedure_token`
+    /// IS the `has_compiled_loop` half — that predicate is defined as this
+    /// token being present, not merely as something equivalent to it — so
+    /// binding the token subsumes the first conjunct exactly. It does NOT
+    /// subsume the second: `get_compiled_meta` reads the frontend
+    /// `compiled_loops` table, which a `compile_tmp_callback` token is never
+    /// filed in, so that test stays here explicitly. Everything the comment
+    /// above says about why the second conjunct exists applies unchanged.
+    ///
+    /// `green_key` must already name one cell — see [`Self::resolve_cell_key`],
+    /// whose result is what a door should ask this with. A raw bucket hash
+    /// answers for whichever cell heads the bucket.
+    #[inline]
+    pub fn runnable_procedure_token(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta
+            .entry_procedure_token(green_key)
+            .filter(|_| self.meta.get_compiled_meta(green_key).is_some())
+    }
+
+    /// Turn the raw green-key hash a door arrives with into the key that names
+    /// exactly one cell, so the door's decision, its token read and the run it
+    /// hands them to are all about that one cell.
+    ///
+    /// The producer-side half of `MetaInterp::resolve_cell_key`, exposed
+    /// because a door outside this crate carries the same obligation as the one
+    /// inside it: `warmstate.py:458-464` matches the greens with `comparekey`
+    /// before `:483` reads anything off the cell. A door that decides on a bare
+    /// hash and hands that hash on has matched nothing, and on a chained bucket
+    /// can decide about one cell and run another's code.
+    ///
+    /// `make_green_key` is called only when the bucket actually holds more than
+    /// one cell, so the common path builds no `GreenKey`.
+    #[inline]
+    pub fn resolve_cell_key(
+        &self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+    ) -> u64 {
+        self.meta
+            .resolve_cell_key(green_key_hash, Some(&make_green_key))
     }
 
     /// Typed twin of [`Self::has_compiled_loop`], and the shape upstream
