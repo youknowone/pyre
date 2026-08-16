@@ -3875,6 +3875,27 @@ impl<'a> Assembler386<'a> {
                     target_arglocs.len()
                 };
                 for (i, src_loc) in arglocs[..remap_count].iter().enumerate() {
+                    // One classification, two consumers. It picks the location
+                    // set the pair rides — set 2 carries the floats and gets
+                    // the float scratch — and, when the destination has to be
+                    // synthesized below, the kind of the slot itself.
+                    // Hard-coding the slot's kind instead described a slot the
+                    // value never lands in: `regalloc_push` / `regalloc_pop`
+                    // read exactly this field to choose their scratch
+                    // register, and `loc_width` reads it for the width.
+                    //
+                    // `ebp_loc_pat!` rather than `Loc::Frame` alone because a
+                    // frame-pointer location has two spellings and both carry
+                    // `is_float` (`regloc.py:113 class FrameLoc(RawEbpLoc)`);
+                    // naming one sent the other to the integer set.
+                    let is_float = match src_loc {
+                        Loc::Reg(r) => r.is_xmm,
+                        ebp_loc_pat!(e) => e.is_float,
+                        // An immediate is re-materialized into whichever set
+                        // its destination is in, and an address is not a legal
+                        // parallel-move operand at all.
+                        _ => false,
+                    };
                     let dst_loc = if i < target_arglocs.len() {
                         target_arglocs[i]
                     } else {
@@ -3887,22 +3908,15 @@ impl<'a> Assembler386<'a> {
                         // different storage.
                         let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
                         let dst_ofs = crate::regalloc::get_ebp_ofs(base_ofs, i);
-                        Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
+                        Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, is_float))
                     };
-                    match src_loc {
-                        Loc::Reg(r) if r.is_xmm => {
-                            src_locations2.push(*src_loc);
-                            dst_locations2.push(dst_loc);
-                        }
-                        Loc::Frame(f) if f.ebp_loc.is_float => {
-                            src_locations2.push(*src_loc);
-                            dst_locations2.push(dst_loc);
-                        }
-                        _ => {
-                            src_locations1.push(*src_loc);
-                            dst_locations1.push(dst_loc);
-                        }
-                    }
+                    let (srcs, dsts) = if is_float {
+                        (&mut src_locations2, &mut dst_locations2)
+                    } else {
+                        (&mut src_locations1, &mut dst_locations1)
+                    };
+                    srcs.push(*src_loc);
+                    dsts.push(dst_loc);
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
                 let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
