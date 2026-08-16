@@ -444,7 +444,38 @@ impl BlackholeInterpreter {
         }
     }
 
+    /// TEMPORARY DIAGNOSTIC (`MAJIT_BH_ROOT_CHECK`). Remove with the
+    /// investigation.
+    ///
+    /// `push_resume_ref_roots` and `push_bh_regs` root a ref bank by the raw
+    /// `(pointer, length)` of its `Vec` buffer, and both document one
+    /// precondition: the bank is sized once and only indexed afterwards. An
+    /// interpreter that comes back out of the pool while an earlier window
+    /// still names its buffer breaks that — `init_register_file_from_i64s`
+    /// resizes, and a growth past the capacity moves the buffer, so the
+    /// registration names freed memory while the live bank is rooted by
+    /// nothing. Report the collision here instead of leaving it to the
+    /// wrong-type dereference it becomes several opcodes later.
+    fn report_resize_under_registration(&self, new_len: usize) {
+        let regs = &self.registers_r;
+        if !crate::bh_root_check_enabled() || regs.capacity() == 0 {
+            return;
+        }
+        let ptr = regs.as_ptr();
+        let Some(rooted_len) = majit_gc::shadow_stack::ref_bank_registration_len(ptr) else {
+            return;
+        };
+        eprintln!(
+            "[bh-root] resize under registration: buf={ptr:?} rooted_len={rooted_len} \
+             live_len={} capacity={} new_len={new_len} reallocates={}",
+            regs.len(),
+            regs.capacity(),
+            new_len > regs.capacity(),
+        );
+    }
+
     fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
+        self.report_resize_under_registration(jitcode.num_regs_and_consts_r());
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
             jitcode.num_regs_and_consts_i(),
@@ -7700,6 +7731,38 @@ fn bh_null_arg_report(bh: &BlackholeInterpreter, ar: &[i64], position: usize) {
     }
 }
 
+/// TEMPORARY DIAGNOSTIC (`MAJIT_BH_CALL_ARGS`). Remove with the investigation.
+///
+/// Report the ref arguments of a residual call by the register index each one
+/// came out of, alongside the frame's own register geometry. `[bh-seed]` names
+/// the indices the resume filled, so an argument index that appears there is
+/// carrying what the guard's resume data said, one that does not is carrying
+/// whatever an opcode of this run wrote, and one at or above `num_regs_r` is
+/// reading the jitcode's constant pool rather than a register at all. Those
+/// three provenances need different fixes and the value alone cannot tell them
+/// apart.
+fn bh_call_arg_report(bh: &BlackholeInterpreter, code: &[u8], list_pos: usize, func: i64) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_CALL_ARGS").is_some()) {
+        return;
+    }
+    let count = code[list_pos] as usize;
+    let pairs: Vec<String> = (0..count)
+        .map(|i| {
+            let reg = code[list_pos + 1 + i];
+            format!("r{reg}={:#x}", bh.registers_r[reg as usize])
+        })
+        .collect();
+    eprintln!(
+        "[bh-call] jitcode={} pos={} func={func:#x} num_regs_r={} bank_len={} args=[{}]",
+        bh.jitcode.name(),
+        bh.last_opcode_position,
+        bh.jitcode.num_regs_r(),
+        bh.registers_r.len(),
+        pairs.join(" "),
+    );
+}
+
 // Call operations (`blackhole.py:1224-1276`)
 fn handler_residual_call_irf_i(
     bh: &mut BlackholeInterpreter,
@@ -7931,6 +7994,7 @@ fn handler_residual_call_r_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     bh_null_arg_report(bh, &ar, position);
+    bh_call_arg_report(bh, code, position + 1, func);
     // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
@@ -10088,7 +10152,8 @@ fn handler_getarrayitem_vable_r(
 ) -> Result<usize, DispatchError> {
     let nbody_debug = crate::nbody_debug_enabled();
     let vable = bh.registers_r[code[p] as usize];
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let p_index_reg = p + 1;
+    let index = bh.registers_i[code[p_index_reg] as usize] as usize;
     let vinfo = vable_clear_token_and_get_vinfo(bh, vable);
     let (field_descr, p) = read_descr(bh, code, p + 2);
     let array_idx = field_descr.as_vable_array_index();
@@ -10102,8 +10167,56 @@ fn handler_getarrayitem_vable_r(
             bh.position, bh.last_opcode_position, index, value as usize
         );
     }
+    bh_vable_index_report(
+        bh,
+        "get-r",
+        code[p_index_reg] as usize,
+        index,
+        vable,
+        ainfo,
+        code[p] as usize,
+        value,
+    );
     bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
+}
+
+/// TEMPORARY DIAGNOSTIC (`MAJIT_BH_VABLE`). Remove with the investigation.
+///
+/// Report a virtualizable array access by the *index register* it read, not
+/// only by the index value. The resume section seeds one register file entry
+/// per live variable; an index register that the section never named reads
+/// whatever `setposition` left there, which is zero for a plain register and
+/// the jitcode's own constant for a slot at or above `num_regs_i`. Both are
+/// in-bounds indices, so the existing bounds assert stays silent and the wrong
+/// stack slot travels to whatever consumes it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a diagnostic that names both operands, their registers, and the array it resolved to"
+)]
+fn bh_vable_index_report(
+    bh: &BlackholeInterpreter,
+    kind: &str,
+    index_reg: usize,
+    index: usize,
+    vable: i64,
+    ainfo: &crate::virtualizable::VableArrayInfo,
+    dst_reg: usize,
+    value: i64,
+) {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ARMED.get_or_init(|| std::env::var_os("MAJIT_BH_VABLE").is_some()) {
+        return;
+    }
+    let len = unsafe { crate::virtualizable::bhimpl_arraylen_vable(vable as *const u8, ainfo) };
+    eprintln!(
+        "[bh-vable-{kind}] jitcode={} pos={} vable={vable:#x} array={:?} len={len} \
+         index_reg=i{index_reg} index={index} num_regs_i={} dst=r{dst_reg} value={value:#x}",
+        bh.jitcode.name(),
+        bh.last_opcode_position,
+        ainfo.name,
+        bh.jitcode.num_regs_i(),
+    );
 }
 fn handler_setarrayitem_vable_i(
     bh: &mut BlackholeInterpreter,
