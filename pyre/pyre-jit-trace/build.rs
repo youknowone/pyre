@@ -472,21 +472,20 @@ fn llbc_fingerprint_output(mut child: std::process::Child) -> Option<Fingerprint
 /// Ask the extraction driver what the current inputs hash to.
 ///
 /// `scripts/llbc_extract.py` prints the same `key=value` lines it writes into
-/// the stamp, and its `source=` / `external=` fields are the same
-/// `source_fingerprint()` / `external_fingerprint()` calls `stamp_for` records
-/// — so there is one implementation of each digest and it is not this one.
+/// the stamp, and its `source=` / `closure=` / `external=` fields are the same
+/// calls `stamp_for` records, so there is one implementation of each digest
+/// and it is not this one.
 /// Parsed by `llbc_fingerprint::parse_fingerprint_fields`, which reads the
 /// fields by name. The driver may add more, as it did for `external=`; a
 /// reader that models the output as one bare value stops answering as soon as
 /// that happens.
 ///
-/// Both fields, because they cover disjoint input sets and only their
-/// conjunction says "current": `source=` stops at the repository boundary, so
-/// a package patched to a sibling checkout — or a proc macro built from one —
-/// moves `external=` alone.
+/// All fields are parsed. `source=` is authoritative for in-repository inputs,
+/// `closure=` is a conservative residual signal, and `external=` covers inputs
+/// outside the repository.
 ///
 /// `CARGO_FEATURES` and `LLBC_LAYOUT_TARGETS` are replayed out of the stamp:
-/// `fingerprint_inputs` (`scripts/llbc_extract.py:255-360`) walks the
+/// `fingerprint_inputs` in `scripts/llbc_extract.py` walks the
 /// dependency closure under the feature set and the cross-target layout set in
 /// force at extraction time, so recomputing under this build's defaults would
 /// report a difference the sources do not have.
@@ -527,17 +526,15 @@ fn llbc_current_fingerprint(
 /// `<crate>/src`, so a source edit reliably invalidates the codegen cache and
 /// re-runs the prepass — over the same unchanged artefact.
 ///
-/// The oracle is the extractor's own stamp.  `scripts/llbc_extract.py:643-652`
-/// already skips a crate whose stamp still matches, so this is the comparison
-/// the producer trusts, evaluated by the consumer.
+/// The oracle is the extractor's own stamp. The extraction engine already
+/// skips a crate whose stamp still matches, so this is the comparison the
+/// producer trusts, evaluated by the consumer.
 ///
-/// Both of the stamp's fingerprint fields are compared, not just `source=`.
-/// The two cover disjoint input sets: `source=` hashes what `git ls-files`
-/// reaches and stops at the repository boundary, `external=` hashes what the
-/// closure reaches outside it.  A package patched to a sibling checkout moves
-/// only the second, and comparing one field would consume a frozen artefact as
-/// current for exactly that edit — feeding stale bodies and layouts into
-/// codegen.  The standalone `--check` compares both; so does this.
+/// `source=` and `external=` remain stale gates. `closure=` preserves the old
+/// whole-cargo-closure hash, but a mismatch there alone warns: the artefact's
+/// declared inputs did not move, while a trait impl outside its file table can
+/// still affect method resolution. The standalone `--check` uses the same
+/// three-way verdict.
 ///
 /// A stale artefact fails the build.  It was warning-only, on the argument
 /// that the build still works for everything whose layout did not move; the
@@ -607,6 +604,7 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     // fields, and which one moved is the difference between "your own sources
     // changed" and "a dependency in another checkout changed".
     let mut stale: Vec<(&str, &'static str, String, String)> = Vec::new();
+    let mut closure_warnings: Vec<&str> = Vec::new();
     // Freshness has THREE outcomes, and the third used to be spelled the same
     // way as "fresh": silence.  A crate whose stamp is unreadable, or whose
     // oracle does not answer, is *unknown* — and "nobody checked" is not a
@@ -629,6 +627,10 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "stamp carries no source= line"));
             continue;
         };
+        let Some(recorded_closure) = stamp_field(&stamp, "closure=") else {
+            unknown.push((crate_name, "stamp carries no closure= line"));
+            continue;
+        };
         // Required, not defaulted: an empty `external=` is a positive claim
         // that nothing outside the repository was folded in, and a stamp too
         // old to carry the field never made it.
@@ -644,13 +646,15 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "the fingerprint oracle did not answer"));
             continue;
         };
-        for (field, recorded, current) in [
-            ("source", recorded_source, current.source),
-            ("external", recorded_external, current.external),
-        ] {
-            if recorded != current {
-                stale.push((crate_name, field, recorded, current));
-            }
+        let source_matches = recorded_source == current.source;
+        if !source_matches {
+            stale.push((crate_name, "source", recorded_source, current.source));
+        }
+        if recorded_external != current.external {
+            stale.push((crate_name, "external", recorded_external, current.external));
+        }
+        if source_matches && recorded_closure != current.closure {
+            closure_warnings.push(crate_name);
         }
     }
     // Reported as a warning and never promoted by `PYRE_LLBC_STRICT`: the
@@ -662,6 +666,13 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         println!(
             "cargo::warning=LLBC FRESHNESS UNKNOWN: {crate_name}.ullbc was not checked \
              ({reason}); it may or may not match the current sources"
+        );
+    }
+    for crate_name in &closure_warnings {
+        println!(
+            "cargo::warning=LLBC CLOSURE MOVED: {crate_name}.ullbc's declared inputs are \
+             unchanged, but something else in its dependency closure moved; if a trait impl \
+             or proc macro changed, re-extract"
         );
     }
     if stale.is_empty() {

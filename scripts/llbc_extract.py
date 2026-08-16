@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shlex
 import subprocess
@@ -22,14 +23,14 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
-# Domain separator for the bytes hashed by `source_fingerprint`. Bump this
+# Domain separator for the bytes hashed by the repository fingerprints. Bump this
 # only when the fingerprint algorithm or the meaning of its input set changes.
 # Ordinary refactors, diagnostics and comments in this file do not change what
 # Charon compiles and must not invalidate every multi-minute LLBC artefact.
-FINGERPRINT_SCHEMA = "2"
+FINGERPRINT_SCHEMA = "3"
 
 
 @dataclass
@@ -47,17 +48,9 @@ class CrateSpec:
       bodies of items in a foreign dependency instead of keeping them opaque).
       Same `{features}` placeholder substitution as `cargo_args`.
     - `fingerprint_pathspecs`: explicit git pathspecs (relative to the driver's
-      `root`) that fingerprint this crate's sources. `None` derives them from a
-      `cargo metadata` dependency walk instead.
-    - `excluded_deps`: path-dependency package names dropped from this crate's
-      fingerprint because the artefact holds zero references to them; the
-      extraction guard re-checks the artefact and fails loud if that drifts.
-      Naming a package drops its EXCLUSIVELY-REACHED SUBTREE too — anything
-      reachable only by going through it. A package some non-excluded parent
-      also reaches is kept, so listing a widely-shared package removes only
-      its own files. The guard checks the NAMED packages; the subtree is
-      covered by inheritance (see `_collect_inputs`), which is why the two
-      are not, and must not be, the same set.
+      `root`) used as the conservative bootstrap set when no artefact-derived
+      `.readfiles` sidecar exists. `None` derives that fallback from a `cargo
+      metadata` dependency walk instead.
     - `layout_targets`: target triples, besides the extraction host, this
       crate also emits a layout sidecar for (see `layout_sidecar_name`).
       `None` takes the driver's default; `()` opts out. Every listed target
@@ -74,7 +67,6 @@ class CrateSpec:
     cargo_args: list[str] = field(default_factory=list)
     charon_args: list[str] = field(default_factory=list)
     fingerprint_pathspecs: list[str] | None = None
-    excluded_deps: set[str] = field(default_factory=set)
     layout_targets: tuple[str, ...] | None = None
     layout_cargo_args: list[str] | None = None
 
@@ -122,17 +114,6 @@ class Engine:
             raise SystemExit(
                 f"extract-llbc.py: unknown crate '{crate}'\n  known: {known}"
             )
-
-
-def excluded_packages(eng: Engine, crates: list[str]) -> set[str]:
-    """Packages to drop from the combined fingerprint of `crates`.
-
-    A package is dropped only when EVERY requested crate excludes it, so a
-    multi-crate fingerprint (e.g. a combined `--fingerprint a b c` call) stays
-    conservative whenever any crate in the set still depends on it.
-    """
-    sets = [eng.spec(crate).excluded_deps for crate in crates]
-    return set.intersection(*sets) if sets else set()
 
 
 def platform_info() -> tuple[str, str]:
@@ -514,33 +495,13 @@ def _package_closure(
     target_ids: list[str],
     by_id: dict,
     resolve_nodes: dict,
-    exclude: set[str],
 ) -> list[dict]:
-    """Path-dependency packages reachable from `target_ids` avoiding `exclude`.
+    """Path-dependency packages reachable from `target_ids`.
 
     Pure graph reachability over cargo-metadata shapes: `by_id` maps package id
     to package, and `resolve_nodes` maps package id to its resolve node. Kept
-    separate from `_collect_inputs` so `--self-test` can drive it on a synthetic
-    graph. A fingerprint with extra files still compares equal to itself, so a
-    real repository cannot expose an over-inclusive walk.
-
-    The exclusion is applied here, in the walk, and not in the emission loop
-    in `_collect_inputs` — excluding a package drops its whole EXCLUSIVELY-
-    REACHED SUBTREE, not just its own files.
-
-    `continue` before appending is what makes it a subtree drop: the node is
-    neither emitted nor traversed. A package a non-excluded parent also reaches
-    is still pushed from that parent, so this computes "reachable by a path
-    avoiding every excluded package" — which is the property the safety
-    argument below needs, and it holds regardless of pop order. Both halves are
-    load-bearing and `--self-test`'s diamond case checks them together: drop
-    what only the excluded package reaches, keep what something else does.
-
-    Do not widen `extract`'s artefact guard to transitively dropped packages.
-    The guard searches for the explicitly excluded package's symbol, but a
-    transitive dependency may have no symbol that can serve as a positive
-    control. Its absence instead follows from the checked parent's absence: a
-    package reachable only through that parent cannot appear without it.
+    separate from `_collect_inputs` so its graph semantics stay testable
+    without invoking Cargo.
     """
     seen: set[str] = set()
     stack = list(target_ids)
@@ -551,8 +512,6 @@ def _package_closure(
             continue
         seen.add(package_id)
         package = by_id[package_id]
-        if package["name"] in exclude:
-            continue
         closure.append(package)
 
         for dep in resolve_nodes.get(package_id, {}).get("deps", []):
@@ -625,7 +584,7 @@ def refuse_nested_repos(entries: list[str]) -> None:
             " inside is"
         ),
         (
-            "absent from `source=` while the directory itself hashes to a single"
+            "absent from `closure=` while the directory itself hashes to a single"
             " constant"
         ),
         (
@@ -651,7 +610,113 @@ def refuse_nested_repos(entries: list[str]) -> None:
     raise SystemExit("\n".join(lines))
 
 
-_inputs_cache: dict[tuple, tuple[list[str], list[Path]]] = {}
+_inputs_cache: dict[tuple, tuple[list[Path], list[Path]]] = {}
+
+
+_FILES_KEY = b'"files":['
+
+
+def ullbc_files_table(path: Path, chunk_size: int = 1 << 22) -> list[dict]:
+    """Stream the `translated.files` array out of a large one-line artefact."""
+    buffer = b""
+    start: int | None = None
+    scan = 0
+    depth = 0
+    in_string = False
+    escaped = False
+    with path.open("rb") as artefact:
+        while True:
+            piece = artefact.read(chunk_size)
+            if not piece:
+                raise SystemExit(f"extract-llbc.py: {path} has no translated.files table")
+            buffer += piece
+            if start is None:
+                index = buffer.find(_FILES_KEY)
+                if index < 0:
+                    buffer = buffer[-(len(_FILES_KEY) - 1) :]
+                    continue
+                start = index + len(_FILES_KEY) - 1
+                scan = start
+            while scan < len(buffer):
+                byte = buffer[scan]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                elif byte == ord('"'):
+                    in_string = True
+                elif byte in (ord("["), ord("{")):
+                    depth += 1
+                elif byte in (ord("]"), ord("}")):
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            table = json.loads(buffer[start : scan + 1])
+                        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                            raise SystemExit(
+                                f"extract-llbc.py: cannot parse {path}'s files table: {exc}"
+                            ) from exc
+                        if not isinstance(table, list):
+                            raise SystemExit(
+                                f"extract-llbc.py: {path}'s translated.files is not a list"
+                            )
+                        return table
+                scan += 1
+
+
+def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
+    """Repo-relative `Local` files in an artefact, grouped by crate name."""
+    by_crate: dict[str, set[Path]] = {}
+    for entry in ullbc_files_table(path):
+        name = entry.get("name")
+        if not isinstance(name, dict) or "Local" not in name:
+            continue
+        value = name["Local"]
+        if not isinstance(value, str):
+            raise SystemExit(f"extract-llbc.py: {path} has a non-string Local filename")
+        pure = PurePosixPath(value)
+        if pure.is_absolute() or PureWindowsPath(value).is_absolute():
+            continue
+        normal = PurePosixPath(posixpath.normpath(value))
+        if normal == PurePosixPath("..") or normal.parts[:1] == ("..",):
+            raise SystemExit(
+                f"extract-llbc.py: {path} has a Local filename outside the repository: {value}"
+            )
+        crate_name = entry.get("crate_name")
+        if not isinstance(crate_name, str) or not crate_name:
+            raise SystemExit(
+                f"extract-llbc.py: {path} has a repo-local file with no crate_name: {value}"
+            )
+        by_crate.setdefault(crate_name, set()).add(Path(*normal.parts))
+    return by_crate
+
+
+def readfiles_path(eng: Engine, crate: str) -> Path:
+    """Sidecar carrying the artefact-declared repository read set."""
+    dest = Path(os.environ.get("LLBC_DEST", eng.out_dir))
+    if not dest.is_absolute():
+        dest = eng.root / dest
+    output = dest / eng.spec(crate).output_name
+    return output.with_suffix(output.suffix + ".readfiles")
+
+
+def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
+    """Read a persisted artefact read set, or request the wide fallback."""
+    path = readfiles_path(eng, crate)
+    if not path.is_file():
+        return None
+    result: set[Path] = set()
+    for value in path.read_text(encoding="utf-8").splitlines():
+        pure = PurePosixPath(value)
+        normal = PurePosixPath(posixpath.normpath(value))
+        escapes = normal == PurePosixPath("..") or normal.parts[:1] == ("..",)
+        if not value or pure.is_absolute() or PureWindowsPath(value).is_absolute() or escapes:
+            raise SystemExit(f"extract-llbc.py: invalid path in {path}: {value!r}")
+        result.add(Path(*normal.parts))
+    return result
 
 
 def forget_collected_inputs() -> None:
@@ -669,15 +734,14 @@ def forget_collected_inputs() -> None:
 
 
 def _collect_inputs(
-    eng: Engine, crates: list[str], cargo_features: str
-) -> tuple[list[str], list[Path]]:
+    eng: Engine, crates: list[str], cargo_features: str, *, derived: bool = False
+) -> tuple[list[Path], list[Path]]:
     """Split the fingerprint's inputs by which channel can carry them.
 
-    Returns `(pathspecs, external)`:
+    Returns `(repo-relative files, external inputs)`:
 
-    * `pathspecs` — repo-relative, resolved through `git ls-files` below, so
-      the working tree (including untracked-not-ignored files) is what gets
-      hashed.
+    * repo-relative files — the artefact-derived set for `source=`, or the
+      conservative cargo closure for `closure=` and bootstrap fallback.
     * `external` — absolute paths the git channel cannot carry: anything
       outside `eng.root`, which `git ls-files` refuses to name at all, plus
       whatever a driver declares in `external_inputs` (which is also how an
@@ -718,18 +782,33 @@ def _collect_inputs(
         eng.layout_targets,
         tuple(crates),
         cargo_features,
+        derived,
     )
     if key in _inputs_cache:
         return _inputs_cache[key]
 
     root = eng.root
     target_names: list[str] = []
-    pathspecs = list(eng.base_pathspecs)
+    pathspecs = ["Cargo.lock", "Cargo.toml"] if derived else list(eng.base_pathspecs)
+    direct_files: set[Path] = set()
     external: list[Path] = [Path(p).resolve() for p in eng.external_inputs]
 
     for crate in crates:
         spec = eng.spec(crate)
-        if spec.fingerprint_pathspecs is not None:
+        if derived:
+            readfiles = load_readfiles(eng, crate)
+            if readfiles is None:
+                return _collect_inputs(eng, crates, cargo_features, derived=False)
+            direct_files.update(readfiles)
+            if spec.fingerprint_pathspecs is None:
+                target_names.append(crate)
+            else:
+                manifest = (spec.crate_dir / "Cargo.toml").resolve()
+                if manifest.is_relative_to(root):
+                    pathspecs.append(manifest.relative_to(root).as_posix())
+                else:
+                    external.append(manifest)
+        elif spec.fingerprint_pathspecs is not None:
             pathspecs.extend(spec.fingerprint_pathspecs)
         else:
             target_names.append(crate)
@@ -757,9 +836,6 @@ def _collect_inputs(
                 )
         extra_features = tuple(sorted(layout_features))
 
-        # Never drop a requested target crate, only its excluded dependencies.
-        exclude = excluded_packages(eng, crates) - set(target_names)
-
         for platform in sorted(platforms):
             meta = metadata(eng, cargo_features, platform, extra_features)
             packages = meta["packages"]
@@ -779,7 +855,6 @@ def _collect_inputs(
                 [by_name[name]["id"] for name in target_names],
                 by_id,
                 resolve_nodes,
-                exclude,
             )
 
             for package in closure:
@@ -808,6 +883,8 @@ def _collect_inputs(
                     # re-extraction, never a wrong answer — the same direction
                     # the untracked-file leg below is deliberately biased in.
                     if kinds & {"example", "test", "bench"}:
+                        continue
+                    if derived and not kinds & {"proc-macro", "custom-build"}:
                         continue
                     src_path = Path(target["src_path"]).resolve()
                     if src_path.is_relative_to(root):
@@ -847,7 +924,15 @@ def _collect_inputs(
     #
     others = ls_files_raw("--others", "--exclude-standard")
     refuse_nested_repos(others)
-    files = ls_files() | {Path(entry) for entry in others}
+    files = ls_files() | {Path(entry) for entry in others} | direct_files
+    # Both modes. Charon does record an `include_str!` target that sits inside
+    # the crate — `_io_app.py` and its siblings arrive through `direct_files`
+    # like any source — so the derived set is not blind to those. What it is
+    # blind to is an argument that climbs OUT of the crate: `pyre-native`'s
+    # `include_bytes!("../../../lib-python/3/test/certdata/keycert3.pem")`
+    # reaches a file the artefact's file table never names and no pathspec
+    # covers, and dropping this leg left editing it invisible to `source=`.
+    # That is the same escape the walk was written for, one input set along.
     files |= include_closure(root, files)
     result = (sorted(files, key=lambda path: path.as_posix()), external)
     _inputs_cache[key] = result
@@ -855,7 +940,15 @@ def _collect_inputs(
 
 
 def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
-    """Repo-relative inputs hashed into `source=`."""
+    """Artefact-derived repo-relative inputs hashed into `source=`."""
+    combined: set[Path] = set()
+    for crate in crates:
+        combined.update(_collect_inputs(eng, [crate], cargo_features, derived=True)[0])
+    return sorted(combined, key=lambda path: path.as_posix())
+
+
+def closure_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+    """Conservative cargo-closure inputs hashed into `closure=`."""
     return _collect_inputs(eng, crates, cargo_features)[0]
 
 
@@ -1020,7 +1113,13 @@ def external_diff(crate: str, recorded: str, expected: str) -> list[str]:
     return lines
 
 
-def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+def _repo_fingerprint(
+    eng: Engine,
+    crates: list[str],
+    cargo_features: str,
+    inputs: list[Path],
+) -> str:
+    """Hash extraction configuration and one repository input set."""
     digest = hashlib.sha256()
     # Keep the cache/staleness key tied to extraction semantics rather than to
     # the implementation bytes of this driver. The driver-provided ABI covers
@@ -1057,7 +1156,7 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
         digest.update(b"\0")
         digest.update(value.encode("utf-8"))
         digest.update(b"\0")
-    for path in fingerprint_inputs(eng, crates, cargo_features):
+    for path in inputs:
         digest.update(path.as_posix().encode("utf-8"))
         digest.update(b"\0")
         full_path = eng.root / path
@@ -1084,6 +1183,20 @@ def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> s
             digest.update(b"<deleted>")
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+    """Hash the artefact-declared read set and mandatory generated-code inputs."""
+    return _repo_fingerprint(
+        eng, crates, cargo_features, fingerprint_inputs(eng, crates, cargo_features)
+    )
+
+
+def closure_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+    """Hash the former wide cargo-closure input set without changing its meaning."""
+    return _repo_fingerprint(
+        eng, crates, cargo_features, closure_inputs(eng, crates, cargo_features)
+    )
 
 
 def prepend_msvc_link(env: dict[str, str]) -> None:
@@ -1150,6 +1263,43 @@ def llbc_dest(out_dir: Path, root: Path) -> Path:
     return dest
 
 
+def invalidate_fingerprint(stamp_path: Path, readfiles: Path) -> None:
+    """Remove both parts of the certificate for an artefact's current bytes."""
+    stamp_path.unlink(missing_ok=True)
+    readfiles.unlink(missing_ok=True)
+
+
+def write_readfiles(path: Path, by_crate: dict[str, set[Path]]) -> None:
+    """Persist a sorted, LF-terminated artefact read set."""
+    files = sorted(
+        {item for crate_files in by_crate.values() for item in crate_files},
+        key=lambda item: item.as_posix(),
+    )
+    path.write_text("".join(f"{item.as_posix()}\n" for item in files), encoding="utf-8")
+
+
+def assert_artefact_readfiles_covered(
+    dest: Path,
+    by_crate: dict[str, set[Path]],
+    derived: set[Path],
+) -> None:
+    """Refuse an artefact whose file-table crates escape the derived input set."""
+    uncovered = {
+        crate_name: sorted(files - derived, key=lambda item: item.as_posix())
+        for crate_name, files in by_crate.items()
+        if files - derived
+    }
+    if not uncovered:
+        return
+    lines = [
+        f"extract-llbc.py: {dest.name} has file-table crates outside its derived fingerprint:"
+    ]
+    for crate_name, files in sorted(uncovered.items()):
+        lines.append(f"  {crate_name}:")
+        lines.extend(f"    {item.as_posix()}" for item in files)
+    raise SystemExit("\n".join(lines))
+
+
 def charon_version(charon_dest: Path) -> str:
     stamp = charon_dest / ".installed-version"
     return stamp.read_text().strip() if stamp.exists() else "unknown"
@@ -1183,6 +1333,10 @@ def stamp_for(
             f"layout_flags={' '.join(layout_flags)}",
             f"layout_rustflags={eng.layout_target_rustflags}",
             f"source={source_fingerprint(eng, [crate], cargo_features)}",
+            # The old wide source hash remains as a residual detector. A move
+            # here alone warns: the artefact's declared read set did not move,
+            # but a new trait impl outside that set can still affect resolution.
+            f"closure={closure_fingerprint(eng, [crate], cargo_features)}",
             # Inputs `source=` structurally cannot cover: everything outside
             # this repo. Kept as its own field rather than folded into
             # `source=` so `check`'s per-field diff can say WHICH side moved —
@@ -1210,6 +1364,7 @@ STAMP_KEYS = (
     "layout_flags",
     "layout_rustflags",
     "source",
+    "closure",
     "external",
 )
 
@@ -1255,21 +1410,17 @@ def file_mtime(path: Path) -> str:
 # the stamp answers "is this artefact current", the provenance answers "what
 # was going on when it was built". Only the first is allowed to fail a build.
 #
-# The first sidecars this code writes describe a tree that contains this
-# CODE, and that is not an anomaly. This file is one of the engine sources
-# listed in every driver's base pathspecs, so it is hashed into `source=` for
-# EVERY crate: editing it re-stales all artefacts by construction, and the only
-# run that can produce a provenance sidecar is one made from a tree that
-# already holds the change. Committing before extracting is therefore not a
-# nicety — it is what makes that first sidecar read `dirty_in_closure=0`. Run
-# it the other way round and the change lists ITSELF as an in-closure dirty
-# file, which is the correct report and looks like a defect.
+# The first sidecars this code writes may describe a tree containing the engine
+# change that introduced them. Extraction semantics are represented by
+# FINGERPRINT_SCHEMA and the driver ABI rather than by hashing this file's
+# implementation bytes, so ordinary diagnostic edits do not stale every large
+# artefact.
 #
 # More generally, a nonzero
 # `dirty_in_closure` IS A REPORT, NOT A DEFECT. An extraction is normally
 # batched into a window several people's work lands in, so a sidecar routinely
 # names files somebody else was editing. What it tells you is narrow and worth
-# saying exactly: `source=` hashes the WORKING TREE, so the artefact is correct
+# saying exactly: the repository fingerprints hash the WORKING TREE, so the artefact is correct
 # FOR THAT TREE and is not reproducible from any commit. Kill such a run only
 # if commit-reproducible artefacts are what you came for; the freshness
 # question was already answered, by the stamp, and the answer was yes.
@@ -1460,7 +1611,7 @@ def dirty_report_lines(fields: dict[str, str], in_closure: list[str]) -> list[st
     is omitted — so a run against the real tree cannot tell a correct branch
     from a dead one, and every sidecar this repository has ever written is
     healthy in exactly that way. Keeping it a pure function also keeps the
-    self-test off the disk, for the reason `self_test_exclusion_diamond` gives.
+    self-test off the disk, so a diagnostic check cannot perturb extraction.
 
     Two moments, on two lines. Printed as one line with the pre-build count in a
     parenthetical, this reads as a single measurement whose parts should sum,
@@ -1785,6 +1936,12 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
 
         dest = dest_dir / spec.output_name
         stamp_path = dest.with_suffix(dest.suffix + ".fingerprint")
+        readfiles = dest.with_suffix(dest.suffix + ".readfiles")
+        if args.force:
+            # A forced run bootstraps conservatively. The new artefact supplies
+            # the narrower read set only after Charon has successfully emitted it.
+            invalidate_fingerprint(stamp_path, readfiles)
+            forget_collected_inputs()
         layout_flags = crate_layout_flags(spec, cargo_features, flags)
         stamp = stamp_for(
             eng,
@@ -1820,7 +1977,9 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # successful extraction. This run may replace those bytes before any
         # of the validation below fails, so the old certificate must stop
         # being publishable before Charon can write to `dest`.
-        stamp_path.unlink(missing_ok=True)
+        if not args.force:
+            invalidate_fingerprint(stamp_path, readfiles)
+            forget_collected_inputs()
 
         # Opening half of the provenance pair, taken before the Charon build
         # that is about to run for minutes. See `provenance_for`.
@@ -1919,6 +2078,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             write_layout_sidecar(full, sidecar)
             full.unlink()
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
+        # Persist the read set before computing the stamp it governs. The
+        # artefact is the oracle: repo-relative Local entries are exactly the
+        # Rust sources Charon parsed, while proc macros, build scripts and
+        # manifests are added by the cargo-metadata walk.
+        file_table = artefact_local_readfiles(dest)
+        write_readfiles(readfiles, file_table)
+
         # Every walk from here on reports on the tree AFTER the builds above,
         # so the memoised pre-build input sets are dropped first. The three
         # readers below — the provenance closure, `window_writes` and the
@@ -1927,6 +2093,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # movement they are looking for. They still share one walk with each
         # other, which is the intent.
         forget_collected_inputs()
+        derived = set(fingerprint_inputs(eng, [crate], cargo_features))
+        try:
+            assert_artefact_readfiles_covered(dest, file_table, derived)
+        except BaseException:
+            invalidate_fingerprint(stamp_path, readfiles)
+            forget_collected_inputs()
+            raise
 
         # Closing half of the provenance pair, and the sidecar write.
         #
@@ -1970,28 +2143,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 f" the source-hash check below, not by this line."
             )
 
-        # Guard the fingerprint exclusion (CrateSpec.excluded_deps): a package
-        # dropped from this crate's fingerprint must not appear in its artefact,
-        # else a later edit to that package would silently serve a stale cache.
-        artefact_bytes = dest.read_bytes()
-        for pkg in spec.excluded_deps:
-            symbol = pkg.replace("-", "_").encode("utf-8")
-            if symbol in artefact_bytes:
-                raise SystemExit(
-                    f"extract-llbc.py: {dest.name} references '{pkg}', which is "
-                    f"excluded from its fingerprint.\n"
-                    f"  Remove '{pkg}' from the '{crate}' spec's excluded_deps"
-                    f" — its source now affects this artefact, so the artefact"
-                    f" must re-extract when it changes."
-                )
-        # `stamp` was computed at the top of this iteration, BEFORE the charon
-        # build that has just run for minutes. If the tree moved in between it
-        # names a source hash this artefact was not built from, and the wrong
-        # direction is a RETURN to the stamped state — a reverted edit, a branch
-        # switched back — where `check` then reports FRESH over an artefact
-        # built from other sources. Re-stamping with the post-build value would
-        # be equally untrue: the artefact straddles both trees and belongs to
-        # neither, and a stamp that looks authoritative is worse than none.
+        # `stamp` was computed before the Charon build. The post-build source
+        # hash legitimately adopts the new artefact's read set, so movement is
+        # checked through the unchanged wide closure and external channels. If
+        # either moved, the artefact straddles two trees and belongs to neither;
+        # a stamp that looks authoritative is worse than none.
         # Sited BEFORE the stamp decision so it reports on both branches:
         # when the stamp is refused, "the tree moved" is exactly when a reader
         # wants the file names, and when it is accepted this is the only check
@@ -2017,16 +2173,30 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 " built. Candidates, not an accusation, and blind to an"
                 " mtime-preserving restore."
             )
-        if source_fingerprint(eng, [crate], cargo_features) != parse_stamp(stamp)["source"]:
-            stamp_path.unlink(missing_ok=True)
+        current_stamp = stamp_for(
+            eng,
+            crate=crate,
+            platform_key=platform_key,
+            charon_stamp=charon_stamp,
+            cargo_features=cargo_features,
+            flags=flags,
+            charon_flags=charon_flags,
+            layout_targets=crate_layout_targets(eng, spec),
+            layout_flags=layout_flags,
+        )
+        before = parse_stamp(stamp)
+        after = parse_stamp(current_stamp)
+        if any(before[field] != after[field] for field in ("closure", "external")):
+            invalidate_fingerprint(stamp_path, readfiles)
+            forget_collected_inputs()
             unstamped.append(crate)
             print(
                 f"    REFUSING to stamp {dest.name}: the tree moved during its"
-                f" build, so no source hash describes this artefact. Left"
+                f" build, so no input hash describes this artefact. Left"
                 f" unstamped — reported as freshness UNKNOWN, not as fresh."
             )
             continue
-        stamp_path.write_text(stamp + "\n")
+        stamp_path.write_text(current_stamp + "\n")
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 
     print()
@@ -2068,51 +2238,20 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
         configuration; comparing it against this process's `CARGO_FEATURES`
         would refuse a byte-correct artefact whenever the caller left the
         default in place. Replaying keeps `flags=`, `charon_flags=`,
-        `layout_flags=`, `source=` and `external=` real comparisons — all
-        five are recomputed from the replayed value. (`external=` belongs on
+        `layout_flags=`, `source=`, `closure=` and `external=` real comparisons
+        — all six are recomputed from the replayed value. (`external=` belongs on
         that list because the dependency walk it feeds off is itself run
         per feature set, so a feature that pulls in a patched path dep
         changes which out-of-root inputs exist.)
+      * `closure=` is a residual warning when `source=` still matches. The
+        artefact's own file table, proc macros, build scripts and manifests are
+        unchanged, but something else in the cargo dependency closure moved.
+        A new trait impl outside the read set can still affect method
+        resolution, so the warning tells the reader when to re-extract without
+        making unrelated closure edits fail the build.
       * artefact and stamp mtimes are printed, never gated. `extract` writes
         both in one pass, and the source digest already answers the question a
         timestamp only approximates.
-      * the `excluded_deps` exclusion is not re-asked here, and MOSTLY DOES NOT
-        NEED TO BE — do not add a second checker without reading this first.
-        `extract` re-reads the artefact and refuses if a NAMED excluded
-        package is referenced by it; `stamp_path.write_text` is the
-        stamp's ONLY writer and sits immediately after that guard, so a
-        violation raises before any stamp exists. A matching stamp is therefore
-        the guard's certificate: it could only have been written by an
-        extraction the guard passed. The skip path inherits this — it fires on
-        `stamp == recorded`, and that recorded stamp had the same provenance.
-        The oracle discriminates rather than being vacuous: `majit_translate`
-        occurs 373 times in `pyre-jit.ullbc`, which excludes nothing, and 0
-        times in `pyre-interpreter.ullbc`, which excludes it.
-
-        Three narrow things the certificate does NOT carry:
-
-          - it does not distinguish "the guard passed" from "the guard was
-            vacuous". A spec with empty `excluded_deps` runs an empty loop and
-            writes an indistinguishable stamp.
-          - it does not cover the exclusively reached subtree the exclusion
-            also drops, and widening the loop to cover it would be worse
-            than leaving it uncovered, because the guard's power is per
-            symbol. A transitively dropped package may have no matching symbol
-            in any artefact, so no artefact can serve as its positive control.
-            The subtree is instead certified by inheritance: the walk drops a
-            package only when every path to it runs through
-            an excluded one, and the named package's absence is checked
-            here, so a package that cannot appear without it cannot appear.
-          - `--force` re-extracts with the skip bypassed, and an excluded
-            package's sources changing is BY CONSTRUCTION invisible to
-            `source=`. So a forced run can write a violating artefact, raise at
-            the guard, and leave the previous stamp in place still matching the
-            tree — after which this function passes. It fails loud once, at the
-            forced extraction, and is silent on every check after. (Read from
-            the code path, not reproduced: reproducing it needs a real
-            extraction. The half that IS demonstrated is that `check` never
-            looks at artefact content — a stamp-matching fixture holding
-            arbitrary bytes passes.)
 
     Nothing here re-extracts. Re-extraction runs a whole-crate Charon build and
     writes into the working tree, so it stays a human's scheduling decision and
@@ -2236,6 +2375,20 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
 
         want = parse_stamp(expected)
         differing = [key for key in STAMP_KEYS if recorded[key] != want.get(key)]
+        if "closure" in differing and "source" not in differing:
+            print(
+                f"    WARNING: {crate}.ullbc's declared inputs are unchanged, "
+                "but something else in its dependency closure moved; if a trait "
+                "impl or proc macro changed, re-extract"
+            )
+            differing.remove("closure")
+            expected_with_recorded_closure = "\n".join(
+                f"closure={recorded['closure']}" if line.startswith("closure=") else line
+                for line in expected.splitlines()
+            )
+            if not differing and text == expected_with_recorded_closure + "\n":
+                verified.add(crate)
+                continue
         if not differing:
             # The text differs while every modelled field agrees, so the stamp
             # carries content this engine does not write. Reporting nothing
@@ -2303,7 +2456,7 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     # banner is where someone learns they are blocked.
     print(
         "\n"
-        "  WARNING: re-extracting while a closure input is dirty re-stales the result\n"
+        "  WARNING: re-extracting while a declared input is dirty re-stales the result\n"
         "  the moment that edit changes again. The fingerprint is over the\n"
         "  WORKING TREE, so an uncommitted in-closure edit is invisible to\n"
         "  `git log` and to a --check taken a minute earlier. On a shared\n"
@@ -2329,104 +2482,40 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
     raise SystemExit(1)
 
 
-def self_test_exclusion_diamond() -> None:
-    """Drive `_package_closure` on a synthetic diamond; check BOTH its halves.
-
-    `excluded_deps` has to do two opposite things at once, and a real tree
-    cannot demonstrate either. Excluding a package must drop what only that
-    package reaches, and must NOT drop what something else also reaches — and a
-    fingerprint that gets this wrong still hashes to something, still compares
-    equal to itself, and still passes `--check`. The pre-fix engine filtered at
-    emission and carried four unreferenced files without making any check fail.
-    So the property is checked here on a graph built for it.
-
-    The graph, with `excluded` excluded:
-
-        root ──► keep_via_both ──► shared
-          └────► excluded ──┬────► shared           (also reached from above)
-                            └────► behind_excluded  (reached ONLY via excluded)
-
-    Two-sided, and neither side alone is sufficient:
-
-    * `behind_excluded` must be absent. An engine that filters at emission
-      keeps it, and this is the only assertion that sees that defect.
-    * `shared` must be PRESENT. An engine that prunes by ancestry instead
-      (dropping everything downstream of an excluded node) also passes the
-      first assertion, and drops a package the tree genuinely depends on. That
-      is a wrong answer in the unsafe direction — an under-fingerprinted crate
-      whose artefact goes stale silently.
-
-    The unexcluded control runs first and is not a formality: it establishes
-    that both nodes are reachable AT ALL. Without it, "absent" and "present"
-    are being read off a graph that might reach neither, and the excluded run
-    would pass for a reason unrelated to exclusion.
-
-    Not covered here: the `dep_kinds`/dev-edge filter in the same walk. It is
-    a different property with a different failure mode and no fixture yet.
-    """
-    def pkg(name, source=None):
-        return {"id": f"{name} 0.0.0", "name": name, "source": source}
-
-    def node(name, *deps):
-        return (
-            f"{name} 0.0.0",
-            {"deps": [{"pkg": f"{d} 0.0.0", "dep_kinds": []} for d in deps]},
+def self_test_ullbc_files_table() -> None:
+    """Exercise chunk boundaries, escapes and Local-file filtering."""
+    table = [
+        {
+            "id": 0,
+            "name": {"Local": "crate/src/lib.rs"},
+            "crate_name": "crate",
+            "contents": 'brackets ][ and an escaped quote: "',
+        },
+        {
+            "id": 1,
+            "name": {"Local": "/rustc/library/core/src/lib.rs"},
+            "crate_name": "core",
+            "contents": "",
+        },
+        {
+            "id": 2,
+            "name": {"Virtual": "generated.rs"},
+            "crate_name": "generated",
+            "contents": "",
+        },
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "probe.ullbc"
+        path.write_text(
+            json.dumps({"translated": {"files": table}, "tail": []}, separators=(",", ":"))
         )
-
-    names = ["root", "keep_via_both", "excluded", "shared", "behind_excluded"]
-    by_id = {p["id"]: p for p in (pkg(n) for n in names)}
-    resolve_nodes = dict(
-        [
-            node("root", "keep_via_both", "excluded"),
-            node("keep_via_both", "shared"),
-            node("excluded", "shared", "behind_excluded"),
-            node("shared"),
-            node("behind_excluded"),
-        ]
-    )
-    root_ids = ["root 0.0.0"]
-
-    def walk(exclude):
-        return sorted(
-            p["name"] for p in _package_closure(root_ids, by_id, resolve_nodes, exclude)
+        parsed = ullbc_files_table(path, chunk_size=7)
+        local = artefact_local_readfiles(path)
+    if parsed != table or local != {"crate": {Path("crate/src/lib.rs")}}:
+        raise SystemExit(
+            f"self-test FAILED: files-table parser returned parsed={parsed!r}, local={local!r}"
         )
-
-    control = walk(set())
-    excluded = walk({"excluded"})
-    print("  exclusion diamond")
-    print(f"    exclude {{}}            {control}")
-    print(f"    exclude {{excluded}}    {excluded}")
-
-    failures = []
-    # The control first: an unreachable node proves nothing by being absent.
-    for name in ("shared", "behind_excluded"):
-        if name not in control:
-            failures.append(
-                f"control walk does not reach {name!r} — the fixture graph is "
-                f"broken, and every verdict below it is vacuous"
-            )
-    if not failures:
-        if "behind_excluded" in excluded:
-            failures.append(
-                "'behind_excluded' survived the exclusion — the exclusion is "
-                "being applied at emission rather than in the walk, so a "
-                "package reachable ONLY through an excluded one still moves "
-                "the fingerprint"
-            )
-        if "shared" not in excluded:
-            failures.append(
-                "'shared' was dropped by the exclusion — the walk is pruning "
-                "by ancestry rather than by reachability-avoiding-the-excluded, "
-                "so a package the tree still depends on left the fingerprint "
-                "and its artefact can go stale unnoticed"
-            )
-        if "excluded" in excluded:
-            failures.append("the excluded package itself is in the closure")
-    if failures:
-        sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
-        for line in failures:
-            print(f"self-test FAILED: {line}", file=sys.stderr)
-        raise SystemExit(1)
+    print("  files-table streaming parser: ok")
 
 
 def self_test_provenance_rendering() -> None:
@@ -2578,8 +2667,42 @@ def self_test_nested_repo_detection() -> None:
     print("\nself-test passed: nested-repo refusal (hazard flagged, benign not)")
 
 
+def self_test_derived_include_closed(
+    eng: Engine, crates: list[str], cargo_features: str
+) -> None:
+    """Prove the derived input set is closed under `include*!`.
+
+    The derived set comes from the artefact's file table, and that table lists
+    SOURCE files. `include_str!` and `include_bytes!` embed a file's contents
+    as a constant without making it one, so the file carries no span and never
+    appears there — while editing it still changes what the crate compiles.
+    `include_closure` is what recovers those, and it is the only leg of
+    `_collect_inputs` the derived mode could drop without any hash moving,
+    which is why it gets an assertion of its own rather than a comment.
+
+    Not an A/B/A: there is nothing to mutate. The property is structural, so
+    it is read off the set itself, and it fails exactly when the closure stops
+    being applied to the derived inputs.
+    """
+    for crate in crates:
+        derived = set(fingerprint_inputs(eng, [crate], cargo_features))
+        missing = sorted(include_closure(eng.root, derived) - derived)
+        print(f"    include-closed  {crate}: {len(derived)} input(s)")
+        if missing:
+            sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
+            print(
+                f"self-test FAILED: {crate}'s derived input set is not closed under"
+                f" `include*!` — these are compiled in but unhashed:",
+                file=sys.stderr,
+            )
+            for path in missing:
+                print(f"    {path.as_posix()}", file=sys.stderr)
+            raise SystemExit(1)
+    print(f"self-test passed: derived inputs include-closed: {' '.join(crates)}")
+
+
 def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
-    """A/B/A the fingerprint against a new untracked `.rs` under a covered path.
+    """A/B/A the wide closure hash against a new untracked Rust source.
 
     The blind spot being guarded is silent by construction: `git ls-files` lists
     tracked paths only, so before `fingerprint_inputs` folded in `--others
@@ -2590,11 +2713,11 @@ def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     new file, and that removing the probe *restores* it, so a change which
     invalidated every stamp cannot pass by refusing everything.
 
-    The probe exists for one `source_fingerprint` call and is removed in a
+    The probe exists for one pair of fingerprint calls and is removed in a
     `finally`. On a shared worktree that is a real if brief mutation — anyone
-    fingerprinting the same crate in that instant sees the moved hash.
+    fingerprinting the same crate in that instant sees the moved closure hash.
     """
-    inputs = fingerprint_inputs(eng, crates, cargo_features)
+    inputs = closure_inputs(eng, crates, cargo_features)
     # Deepest `.rs`: exact-file pathspecs (Cargo.toml, target roots, build.rs)
     # sit shallow, so a deeply nested file was listed by a `dir/` pathspec and
     # its directory is therefore covered for new files too.
@@ -2604,7 +2727,9 @@ def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
     probe = eng.root / covered.parent / "__llbc_self_test_probe.rs"
     if probe.exists():
         raise SystemExit(f"self-test: {probe} already exists; refusing to clobber it")
-    before = source_fingerprint(eng, crates, cargo_features)
+    fallback = any(load_readfiles(eng, crate) is None for crate in crates)
+    source_before = source_fingerprint(eng, crates, cargo_features)
+    closure_before = closure_fingerprint(eng, crates, cargo_features)
     try:
         probe.write_text("// transient probe written by --self-test; safe to delete\n")
         # Both legs of this test are a deliberate change to the input SET, which
@@ -2612,21 +2737,31 @@ def self_test(eng: Engine, crates: list[str], cargo_features: str) -> None:
         # here would report the guard blind and the removal residual — a failure
         # printed by the cache rather than by the code under test.
         forget_collected_inputs()
-        moved = source_fingerprint(eng, crates, cargo_features)
-        listed = probe.relative_to(eng.root) in set(fingerprint_inputs(eng, crates, cargo_features))
+        source_moved = source_fingerprint(eng, crates, cargo_features)
+        closure_moved = closure_fingerprint(eng, crates, cargo_features)
+        listed = probe.relative_to(eng.root) in set(
+            closure_inputs(eng, crates, cargo_features)
+        )
     finally:
         probe.unlink(missing_ok=True)
         forget_collected_inputs()
-    after = source_fingerprint(eng, crates, cargo_features)
+    source_after = source_fingerprint(eng, crates, cargo_features)
+    closure_after = closure_fingerprint(eng, crates, cargo_features)
     print(f"    probe          {probe.relative_to(eng.root).as_posix()}")
-    print(f"    before         {before}")
-    print(f"    with probe     {moved}  (listed as an input: {listed})")
-    print(f"    after removal  {after}")
+    print(f"    source before  {source_before}")
+    print(f"    source +probe  {source_moved}  (wide fallback: {fallback})")
+    print(f"    closure before {closure_before}")
+    print(f"    closure +probe {closure_moved}  (listed as an input: {listed})")
     failures = []
-    if moved == before:
-        failures.append("a new untracked .rs did not move the fingerprint — the guard is blind")
-    if after != before:
-        failures.append("removing the probe did not restore the fingerprint — it left residue")
+    if closure_moved == closure_before:
+        failures.append("a new untracked .rs did not move closure= — the residual guard is blind")
+    if fallback != (source_moved != source_before):
+        failures.append(
+            "source= did not follow its bootstrap rule — it must use the wide set only "
+            "when a requested crate has no .readfiles"
+        )
+    if source_after != source_before or closure_after != closure_before:
+        failures.append("removing the probe did not restore both fingerprints — it left residue")
     if failures:
         sys.stdout.flush()  # as in check(): the verdict must not outrun its evidence
         for line in failures:
@@ -2746,16 +2881,13 @@ def run_cli(
         # three legs returned identical hashes that were consistent with every
         # hypothesis, because the field under test was not in the output.
         print(f"source={source_fingerprint(eng, crates, cargo_features)}")
+        print(f"closure={closure_fingerprint(eng, crates, cargo_features)}")
         print(f"external={external_fingerprint(eng, crates, cargo_features)}")
         return
     if args.self_test:
-        # The diamond runs first because it mutates nothing: on a shared
-        # worktree, a broken input-set computation should be reported without
-        # writing a probe file into the tree to find it out. It is also the
-        # case `self_test` structurally cannot cover — that one compares the
-        # fingerprint against itself, so it stays green over an input set that
-        # is silently wrong.
-        self_test_exclusion_diamond()
+        # The parser test runs first because it mutates only a temporary file;
+        # the live probe below briefly changes the shared working tree.
+        self_test_ullbc_files_table()
         # Same reason, one artefact along: `--check` renders provenance on every
         # run and exercises neither of its conditional lines, because ordinary
         # sidecars describe steady, complete extractions.
@@ -2763,6 +2895,8 @@ def run_cli(
         # Same reason again: this one builds its own repository in a
         # temporary directory and never touches the worktree.
         self_test_nested_repo_detection()
+        # Reads the worktree without writing to it, so it precedes the probe.
+        self_test_derived_include_closed(eng, crates, cargo_features)
         self_test(eng, crates, cargo_features)
         return
     if args.check:

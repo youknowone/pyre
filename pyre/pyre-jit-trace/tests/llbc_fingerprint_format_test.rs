@@ -8,14 +8,16 @@
 //! extended, after which every crate reports "not checked" and the build looks
 //! exactly like success.
 //!
-//! Adding the `external=` field turned one bare digest into two `key=value`
+//! Adding fingerprint fields turned one bare digest into multiple `key=value`
 //! lines, and the consumer's bare-sha256 test
 //! stopped matching.  The unit cases below would all have passed on that broken
 //! code had they been written beforehand — they encode whatever shape their
 //! author believed in.  **Only `real_driver_output_parses` could have caught it**,
 //! because it asks the producer instead of assuming.
 
-use pyre_jit_trace::llbc_fingerprint::{parse_fingerprint_stdout, stamp_field};
+use pyre_jit_trace::llbc_fingerprint::{
+    parse_fingerprint_fields, parse_fingerprint_stdout, stamp_field,
+};
 
 const HASH: &str = "d9b2992606c82b29c531f4f4d6a42e43808564620ab63d781eba135f9307c584";
 
@@ -59,7 +61,7 @@ fn real_driver_output_parses() {
     );
 
     let stdout = String::from_utf8(out.stdout).expect("driver stdout is not UTF-8");
-    let parsed = parse_fingerprint_stdout(&stdout);
+    let parsed = parse_fingerprint_fields(&stdout);
 
     assert!(
         parsed.is_some(),
@@ -70,7 +72,7 @@ fn real_driver_output_parses() {
         stdout.len(),
         stdout,
     );
-    let digest = parsed.unwrap();
+    let digest = parsed.unwrap().source;
     assert_eq!(digest.len(), 64, "digest is not a sha256: {digest:?}");
     assert!(
         digest.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -79,20 +81,21 @@ fn real_driver_output_parses() {
 }
 
 #[test]
-fn parses_the_current_two_field_output() {
-    let stdout = format!("source={HASH}\nexternal=\n");
+fn parses_the_current_three_field_output() {
+    let stdout = format!("source={HASH}\nclosure={HASH}\nexternal=\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
+    assert!(parse_fingerprint_fields(&stdout).is_some());
 }
 
 #[test]
 fn field_order_does_not_matter() {
-    let stdout = format!("external=\nsource={HASH}\n");
+    let stdout = format!("external=\nclosure={HASH}\nsource={HASH}\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
 }
 
 #[test]
 fn an_unknown_trailing_field_is_ignored() {
-    let stdout = format!("source={HASH}\nexternal=\nsomething_new=42\n");
+    let stdout = format!("source={HASH}\nclosure={HASH}\nexternal=\nsomething_new=42\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
 }
 
@@ -107,13 +110,13 @@ fn a_bare_hash_is_rejected() {
 
 #[test]
 fn a_short_digest_is_rejected() {
-    let stdout = format!("source={}\nexternal=\n", &HASH[..63]);
+    let stdout = format!("source={}\nclosure={HASH}\nexternal=\n", &HASH[..63]);
     assert_eq!(parse_fingerprint_stdout(&stdout), None);
 }
 
 #[test]
 fn a_non_hex_digest_is_rejected() {
-    let stdout = format!("source={}zz\nexternal=\n", &HASH[..62]);
+    let stdout = format!("source={}zz\nclosure={HASH}\nexternal=\n", &HASH[..62]);
     assert_eq!(parse_fingerprint_stdout(&stdout), None);
 }
 
@@ -123,9 +126,22 @@ fn empty_output_is_rejected() {
 }
 
 #[test]
+fn output_without_closure_is_rejected() {
+    let stdout = format!("source={HASH}\nexternal=\n");
+    assert_eq!(parse_fingerprint_fields(&stdout), None);
+}
+
+#[test]
+fn a_non_hash_closure_is_rejected() {
+    let stdout = format!("source={HASH}\nclosure=unknown\nexternal=\n");
+    assert_eq!(parse_fingerprint_fields(&stdout), None);
+}
+
+#[test]
 fn stamp_field_reads_one_key() {
-    let stamp = format!("crate=pyre-object\nsource={HASH}\nexternal=\n");
+    let stamp = format!("crate=pyre-object\nsource={HASH}\nclosure={HASH}\nexternal=\n");
     assert_eq!(stamp_field(&stamp, "source=").as_deref(), Some(HASH));
+    assert_eq!(stamp_field(&stamp, "closure=").as_deref(), Some(HASH));
     assert_eq!(stamp_field(&stamp, "external=").as_deref(), Some(""));
     assert_eq!(stamp_field(&stamp, "absent="), None);
 }

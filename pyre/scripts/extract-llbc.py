@@ -17,20 +17,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from llbc_extract import CrateSpec, run_cli  # noqa: E402
 
 
-# `pyre-object` / `pyre-interpreter` exclude `majit-translate` from their
-# fingerprint: their `.ullbc` holds zero references to it, so a pure edit there
-# reuses the cached artefact. The exclusion also drops dependencies reachable
-# only through `majit-translate`.
-#
-# Only `pyre-interpreter` is affected: `pyre-object` does not
-# depend on `majit-translate` at all, so its entry here is an inert
-# declaration and its input list is byte-identical with and without it. Do not
-# read that row as a second confirmation of anything.
-#
-# `pyre-jit` is deliberately ABSENT — its `.ullbc`
-# embeds majit-translate *type* layouts (translator::rtyper::lltypesystem,
-# model, flowspace::model, codewriter, tool::algo, …), so a type change there
-# must re-extract it.
+# Each successful extraction persists the repo-relative Local entries from the
+# artefact's own `translated.files` table. That set drives `source=` on later
+# checks, supplemented automatically with proc-macro sources, build scripts,
+# closure manifests and Cargo.lock. The full cargo closure remains separately
+# hashed as `closure=` so inputs the file table cannot prove irrelevant still
+# produce a diagnostic when they move.
 SPECS: dict[str, CrateSpec] = {
     # `corpus` lives outside the crate graph the metadata walk sees, so its
     # fingerprint inputs are explicit pathspecs.
@@ -64,7 +56,6 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-object",
         crate_dir=ROOT / "pyre" / "pyre-object",
         output_name="pyre-object.ullbc",
-        excluded_deps={"majit-translate"},
     ),
     "pyre-module": CrateSpec(
         name="pyre-module",
@@ -77,7 +68,6 @@ SPECS: dict[str, CrateSpec] = {
         crate_dir=ROOT / "pyre" / "pyre-interpreter",
         output_name="pyre-interpreter.ullbc",
         cargo_args=["--features", "{features}"],
-        excluded_deps={"majit-translate"},
     ),
     "pyre-jit": CrateSpec(
         name="pyre-jit",

@@ -153,19 +153,18 @@ pub fn parse_fingerprint_stdout(stdout: &str) -> Option<String> {
     is_hash.then_some(source)
 }
 
-/// Both fingerprint fields, as one answer.
+/// The fingerprint fields returned by the extraction oracle.
 ///
-/// They are separate fields because they answer different questions whose
-/// remedies differ: `source=` hashes this repository's tracked inputs,
-/// `external=` everything the dependency closure reaches outside it — a
-/// `[patch]`ed package in a sibling checkout, a proc macro built from another
-/// tree.  Editing one of those moves `external=` and leaves `source=` exactly
-/// where it was, so a reader of one field accepts a frozen artefact whose
-/// bodies and layouts came from source that has since changed.
+/// `source=` is the artefact-declared read set plus proc macros, build scripts
+/// and manifests. `closure=` preserves the former conservative whole-closure
+/// hash as a residual warning. `external=` covers closure inputs outside this
+/// repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FingerprintFields {
     /// `source=`, validated as a bare sha256.
     pub source: String,
+    /// `closure=`, validated as a bare sha256.
+    pub closure: String,
     /// `external=` verbatim: one `<root label>=<digest>` per out-of-repo
     /// group, space-separated, and empty when the whole closure lives in this
     /// repository — the common case.  Kept opaque; this side does not model
@@ -173,7 +172,7 @@ pub struct FingerprintFields {
     pub external: String,
 }
 
-/// Parse both fields out of `--fingerprint`'s stdout.
+/// Parse all required fields out of `--fingerprint`'s stdout.
 ///
 /// `external=` is required rather than defaulted to empty.  The driver prints
 /// it on every invocation, so an output without it is a shape this reader does
@@ -182,8 +181,12 @@ pub struct FingerprintFields {
 /// oracle did not answer — which is the same disposition an unparseable digest
 /// gets, and which a caller reports rather than passes over in silence.
 pub fn parse_fingerprint_fields(stdout: &str) -> Option<FingerprintFields> {
+    let closure = stamp_field(stdout, "closure=")?;
+    let closure_is_hash =
+        closure.len() == 64 && closure.bytes().all(|byte| byte.is_ascii_hexdigit());
     Some(FingerprintFields {
         source: parse_fingerprint_stdout(stdout)?,
+        closure: closure_is_hash.then_some(closure)?,
         external: stamp_field(stdout, "external=")?,
     })
 }
