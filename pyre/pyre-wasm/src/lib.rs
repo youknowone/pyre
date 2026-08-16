@@ -461,10 +461,16 @@ pub extern "C" fn pyre_jit_internal_compile_panics() -> u64 {
 }
 
 /// The rest of the native `[jit-stats]` line. These are not sign-stable, so
-/// each is gated on its own terms rather than against zero: `loops_compiled`
-/// fails on any FALL, `guard_failures` on a rise past a band, and
-/// `bridges_compiled` on neither direction, since it moves both ways under
-/// ordinary tuning.
+/// each is gated on its own terms rather than against zero, and the comparison
+/// is exact in both directions — a baseline that stopped describing the tree
+/// has to be re-recorded whichever way it moved. `loops_compiled` and
+/// `retraces_compiled` name a FALL as the regression and a rise as the gain;
+/// `guard_failures` is the other way round, with no band around it.
+/// `bridges_compiled` has no gain direction at all: a rise and a fall are both
+/// reported as regressions, because a fall is the dead-bridge class — guards
+/// that stop earning a bridge re-enter the metainterp forever, and a collapse
+/// to zero stayed invisible for as long as this counter was left ungated on
+/// the grounds that it moves both ways under ordinary tuning.
 ///
 /// They come out of the same `JitStats` the fields above read, and were simply
 /// never exported. Their absence was not neutral: a count-valued field missing
