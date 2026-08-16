@@ -80,8 +80,12 @@ fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyO
 ///
 /// Returns a pointer to a pre-allocated static singleton,
 /// avoiding heap allocation on every comparison/branch.
+/// Both singletons are immortal and their addresses never change after the
+/// first materialisation, so the result depends only on `value` and the
+/// call cannot raise.
+#[majit_macros::elidable_cannot_raise]
 #[inline]
-pub fn w_bool_from(value: bool) -> PyObjectRef {
+pub fn w_bool_from(value: bool) -> *mut PyObject {
     if value {
         bool_singleton(&TRUE_SINGLETON, 1)
     } else {
