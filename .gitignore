@@ -90,6 +90,11 @@ pyre-dynasm
 # `tools/ubuntu24-*-repro` bind-mounts the worktree, so the container's builds
 # need their own CARGO_TARGET_DIR or they overwrite the host binaries.
 /target-linux
+# rust-analyzer's own target directory, which it places beside whichever
+# manifest it checks rather than at the workspace root. These land inside the
+# LLBC fingerprint closure, where their lock and timestamp files move the
+# source digest on every flycheck run.
+target-ra/
 /dist-assets/
 
 # Build artefacts: Charon binary fetched via scripts/install-charon.py
