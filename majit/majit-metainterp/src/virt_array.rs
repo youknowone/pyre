@@ -44,6 +44,26 @@ const BLOCK_HEADER: usize = majit_gc::header::GcHeader::SIZE;
 const BLOCK_PREFIX: usize = BLOCK_SIZE_SLOT + BLOCK_HEADER;
 const _: () = assert!(BLOCK_SIZE_SLOT >= std::mem::size_of::<u64>());
 
+/// Alignment of a block's allocation, for an item type of `align`.
+///
+/// The prefix holds a `u64` size slot and a `GcHeader`, and the block starts
+/// with a `usize` length word, so the allocation must carry their alignments
+/// alongside the item's — as alignments, not as sizes: a size is not required
+/// to be a power of two, and `Layout` rejects one that is not.
+const fn block_align(align: usize) -> usize {
+    let mut result = align;
+    if std::mem::align_of::<u64>() > result {
+        result = std::mem::align_of::<u64>();
+    }
+    if std::mem::align_of::<usize>() > result {
+        result = std::mem::align_of::<usize>();
+    }
+    if majit_gc::header::GcHeader::ALIGN > result {
+        result = majit_gc::header::GcHeader::ALIGN;
+    }
+    result
+}
+
 /// Distance from the allocation base to the block pointer handed out, for an
 /// item type of `align`.
 ///
@@ -272,9 +292,7 @@ impl<T: Copy> VirtArray<T> {
             .checked_add(Self::ITEMS_OFFSET)
             .and_then(|prefix| prefix.checked_add(items))
             .expect("virtualizable array block size overflowed");
-        let align = std::mem::align_of::<T>()
-            .max(std::mem::align_of::<usize>())
-            .max(BLOCK_SIZE_SLOT);
+        let align = block_align(std::mem::align_of::<T>());
         Layout::from_size_align(total, align).expect("virtualizable array block layout")
     }
 
@@ -293,9 +311,7 @@ impl<T: Copy> Drop for VirtArray<T> {
         unsafe {
             let base = self.block.sub(Self::BASE_OFFSET);
             let total = *(self.block.sub(BLOCK_PREFIX) as *const u64) as usize;
-            let align = std::mem::align_of::<T>()
-                .max(std::mem::align_of::<usize>())
-                .max(BLOCK_SIZE_SLOT);
+            let align = block_align(std::mem::align_of::<T>());
             let layout = Layout::from_size_align(total, align)
                 .expect("virtualizable array block size slot was corrupted");
             std::alloc::dealloc(base, layout);
