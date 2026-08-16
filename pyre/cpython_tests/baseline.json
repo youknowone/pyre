@@ -737,7 +737,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_mmap": {
-      "dynasm": "IMPORTERROR"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_module": {
       "dynasm": "IMPORTERROR"
