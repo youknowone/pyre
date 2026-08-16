@@ -80,11 +80,14 @@ impl W_BufferedRandom {
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, crate::PyError>,
     ) -> Result<T, crate::PyError> {
-        if !super::acquire_buffered_lock(self.lock) {
+        // See `Buffered::with_lock`: bind the handle once so a re-`__init__`
+        // inside `body` cannot redirect the release.
+        let lock = self.lock;
+        if !super::acquire_buffered_lock(lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
         let result = body(self);
-        super::release_buffered_lock(self.lock);
+        super::release_buffered_lock(lock);
         result
     }
 

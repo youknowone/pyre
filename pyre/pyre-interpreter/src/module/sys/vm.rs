@@ -1472,7 +1472,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 w_int_new(i64::from(crate::importing::isolated_flag())),
                 w_bool_from(crate::importing::dev_mode_flag()),
                 w_int_new(crate::importing::utf8_mode_flag()),
-                w_bool_from(crate::importing::warn_default_encoding_flag()),
+                // sysmodule.c builds this one with `SetFlag` (PyLong_FromLong);
+                // only `dev_mode` and `safe_path` are PyBool_FromLong.
+                w_int_new(i64::from(crate::importing::warn_default_encoding_flag())),
                 w_bool_from(crate::importing::safe_path_flag()),
                 w_int_new(crate::module::sys::state::int_max_str_digits() as i64),
             ],

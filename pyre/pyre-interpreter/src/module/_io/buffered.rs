@@ -141,11 +141,15 @@ impl W_BufferedReader {
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, crate::PyError>,
     ) -> Result<T, crate::PyError> {
-        if !super::acquire_buffered_lock(self.lock) {
+        // Bind the handle once, the way `with self.lock:` does: `body` may run
+        // `__init__` again on the same object and install a different lock, and
+        // releasing that one trips `Lock.release`'s not-acquired check.
+        let lock = self.lock;
+        if !super::acquire_buffered_lock(lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
         let result = body(self);
-        super::release_buffered_lock(self.lock);
+        super::release_buffered_lock(lock);
         result
     }
 

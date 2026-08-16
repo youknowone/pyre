@@ -154,10 +154,14 @@ fn decode_impl(
             "no such codec is supported.",
         )
     })?;
-    let state = DecState(unsafe { pypy_cjk_dec_new(codec) });
-    if state.0.is_null() {
+    // `c_codecs.py:108-114` raises before binding the state, and
+    // `pypy_cjk_dec_free` (multibytecodec.c:41) dereferences its argument, so
+    // the null check has to happen before the RAII wrapper owns the pointer.
+    let raw = unsafe { pypy_cjk_dec_new(codec) };
+    if raw.is_null() {
         return Err(crate::PyError::memory_error(""));
     }
+    let state = DecState(raw);
     let mut owned_input = input.to_vec();
     if unsafe {
         pypy_cjk_dec_init(
@@ -239,10 +243,13 @@ fn encode_impl(
             "no such codec is supported.",
         )
     })?;
-    let state = EncState(unsafe { pypy_cjk_enc_new(codec) });
-    if state.0.is_null() {
+    // Same ownership order as `decode_impl`: `pypy_cjk_enc_free`
+    // (multibytecodec.c:174) dereferences its argument.
+    let raw = unsafe { pypy_cjk_enc_new(codec) };
+    if raw.is_null() {
         return Err(crate::PyError::memory_error(""));
     }
+    let state = EncState(raw);
     if unsafe { pypy_cjk_enc_init(state.0, units.as_mut_ptr(), units.len() as isize) } < 0 {
         return Err(crate::PyError::memory_error(""));
     }
@@ -332,8 +339,19 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
             "no such codec is supported.",
         ));
     }
-    let module = crate::importing::get_sys_module("_multibytecodec")
-        .ok_or_else(|| crate::PyError::runtime_error("_multibytecodec is not initialized"))?;
+    // `_codecs_jp` reaches this through `from _multibytecodec import
+    // __getcodec`, i.e. an import — so resolve the module the same way rather
+    // than requiring some earlier importer to have populated `sys.modules`.
+    let module = match crate::importing::get_sys_module("_multibytecodec") {
+        Some(module) => module,
+        None => crate::importing::importhook(
+            "_multibytecodec",
+            pyre_object::PY_NULL,
+            pyre_object::w_tuple_new(vec![pyre_object::w_str_new("MultibyteCodec")]),
+            0,
+            crate::call::getexecutioncontext(),
+        )?,
+    };
     let cls = crate::baseobjspace::getattr_str(module, "MultibyteCodec")?;
     crate::call::call_function_impl_result(cls, &[w_name])
 }

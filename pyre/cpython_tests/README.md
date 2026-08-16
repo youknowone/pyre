@@ -63,10 +63,12 @@ Key flags: `--backend dynasm|cranelift`, `--no-jit` (`PYRE_NO_JIT=1`),
 
 ## Result classes
 
-`PASS` (rc 0) · `FAIL` (unittest ran but failed) · `IMPORTERROR` (module could
-not even be imported/run — an interpreter or stdlib-compat gap) · `CRASH`
-(rust panic / nonzero `internal_compile_panics` / signal) · `TIMEOUT` ·
-`SKIP` (curated out in the baseline / `KNOWN_SKIPS`).
+`PASS` (rc 0, and unittest reported at least one case it did not skip) · `FAIL`
+(unittest ran but failed) · `IMPORTERROR` (module could not even be
+imported/run — an interpreter or stdlib-compat gap) · `CRASH` (rust panic /
+nonzero `internal_compile_panics` / signal) · `TIMEOUT` · `SKIP` (curated out in
+the baseline / `KNOWN_SKIPS`, or the run itself opted out: `unittest.SkipTest`
+before any test, a denied resource, or a suite whose every case was skipped).
 
 ## CI
 
