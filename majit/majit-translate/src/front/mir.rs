@@ -12047,12 +12047,6 @@ impl<'a> Lowering<'a> {
         {
             return true;
         }
-        // A direct tuple value is already a non-null heap-aggregate pointer;
-        // its element types live behind that pointer and do not change the
-        // nullable one-word representation of the enclosing Option.
-        if type_node_is_tuple(payload, self.llbc) {
-            return true;
-        }
         let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
         };
@@ -16352,40 +16346,6 @@ fn type_node_raw_ptr_pointee<'l>(
             .first();
     }
     None
-}
-
-/// Whether a type node is Charon's direct tuple ADT after serialization
-/// indirections. Element types are intentionally not inspected: tuple values
-/// are represented by their heap-aggregate pointer. A leading reference is
-/// not unwrapped, so `&Tuple` remains solely in the shared-reference arm.
-fn type_node_is_tuple<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> bool {
-    for _ in 0..24 {
-        let Some(obj) = node.as_object() else {
-            return false;
-        };
-        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            let Some(body) = llbc.dedup_body(id) else {
-                return false;
-            };
-            node = body;
-            continue;
-        }
-        if let Some(arr) = obj
-            .get("HashConsedValue")
-            .and_then(serde_json::Value::as_array)
-            && arr.len() == 2
-        {
-            node = &arr[1];
-            continue;
-        }
-        return obj
-            .get("Adt")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|adt| adt.get("id"))
-            .and_then(serde_json::Value::as_str)
-            == Some("Tuple");
-    }
-    false
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -24634,7 +24594,7 @@ mod tests {
     }
 
     #[test]
-    fn niche_option_tuple_none_is_null_some_is_identity() {
+    fn niche_option_tuple_remains_aggregate() {
         let payload = serde_json::json!({
             "Adt": {
                 "id": "Tuple",
@@ -24651,10 +24611,13 @@ mod tests {
         });
         let graph = lower_option_source_with_payload(payload);
         let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-        assert_eq!(null_muts, 1, "None must lower to one null pointer");
         assert_eq!(
-            transparent_ctors, 0,
-            "Some(tuple) must be the tuple-pointer identity, with no Option aggregate"
+            null_muts, 0,
+            "Option<(i64, bool)> must not collapse None to a payload null word"
+        );
+        assert!(
+            transparent_ctors >= 2,
+            "Option<(i64, bool)> must retain the tagged Some and None aggregates"
         );
     }
 
