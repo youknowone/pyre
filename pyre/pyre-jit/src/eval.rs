@@ -9728,25 +9728,28 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
 /// carry with zero in-loop tag ops.
 ///
 /// Only the locals region (`0..nlocals`) is scanned; cell/free vars and stack
-/// temps are left untouched. GC-safe: `w_int_new_unique` returns a managed heap
-/// box and the store lands in the frame's `locals_cells_stack_w` array, which
-/// is a GC root for the duration of the compiled run (`FrameLocalsRoot`) and is
-/// forwarded via the current-frame chain during any collection the allocation
-/// itself triggers.
+/// temps are left untouched.
+///
+/// `w_int_new_unique` allocates, so every iteration is a safepoint: the frame's
+/// `locals_cells_stack_w` is itself a GC object and a minor collection moves it,
+/// rewriting the field on the frame it forwards.  A borrow of the array taken
+/// before the call names the pre-move address, and the collection leaves that
+/// address free nursery space, so both the read and the store go through the
+/// frame each time.  The store is the barriered one: a fresh box is young and
+/// the array it lands in may be old, which is exactly the edge the remembered
+/// set exists to carry.
 #[inline]
 fn untag_tagged_frame_locals(frame: &mut PyFrame) {
     if !pyre_object::tagged_int::CAN_BE_TAGGED {
         return;
     }
-    let nlocals = frame.nlocals();
-    let locals = locals_w_mut!(frame);
-    let n = nlocals.min(locals.len());
+    let n = frame.nlocals().min(locals_w!(frame).len());
     for i in 0..n {
-        let slot = locals[i];
+        let slot = locals_w!(frame)[i];
         if !slot.is_null() && pyre_object::tagged_int::is_tagged_int(slot) {
             let value = pyre_object::tagged_int::untag_int(slot);
             let boxed = pyre_object::intobject::w_int_new_unique(value);
-            locals[i] = boxed;
+            frame.set_locals_w(i, boxed);
         }
     }
 }
