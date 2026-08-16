@@ -117,6 +117,9 @@ SCALARS = {
     "isize": "Py_ssize_t", "usize": "size_t",
     "u8": "unsigned char", "i8": "signed char",
     "i32": "int32_t", "u32": "uint32_t", "i64": "int64_t", "u64": "uint64_t",
+    # Named aliases the Rust side spells the same way the header does, so the
+    # comparison is against the reference name rather than its width.
+    "Py_UCS4": "Py_UCS4",
 }
 
 STRUCTS = {

@@ -40,6 +40,9 @@ typedef intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
 typedef Py_ssize_t Py_hash_t;
 typedef size_t Py_uhash_t;
+typedef uint32_t Py_UCS4;
+typedef uint16_t Py_UCS2;
+typedef uint8_t Py_UCS1;
 
 #ifdef __cplusplus
 }

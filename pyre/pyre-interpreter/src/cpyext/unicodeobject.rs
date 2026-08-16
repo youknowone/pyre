@@ -8,7 +8,15 @@
 
 use super::object::argument;
 use super::pyobject::{self, CPyObject};
-use std::ffi::{CStr, c_char, c_int};
+use pyre_object::PyObjectRef;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
+use std::collections::HashMap;
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+
+/// One code point, as `Include/unicodeobject.h:94` declares it.
+#[allow(non_camel_case_types)]
+pub type Py_UCS4 = u32;
+use std::hash::BuildHasherDefault;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_FromString(text: *const c_char) -> *mut CPyObject {
@@ -90,12 +98,18 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8AndSize(
 }
 
 /// The number of code points, which is what `len()` reports.
+///
+/// Answered from the canonical block, so a string still being filled through
+/// [`PyUnicode_New`] reports the width it was created with.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_GetLength(object: *mut CPyObject) -> isize {
-    let Some(value) = text_argument(object, "PyUnicode_GetLength") else {
-        return -1;
-    };
-    unsafe { pyre_object::unicodeobject::w_str_len(value) as isize }
+    match canonical(object) {
+        Some((_, length, _, _)) => length as isize,
+        None => {
+            let _ = text_argument(object, "PyUnicode_GetLength");
+            -1
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -110,6 +124,298 @@ pub unsafe extern "C" fn PyUnicode_CheckExact(object: *mut CPyObject) -> c_int {
     (!object.is_null() && super::object::is_exactly(object, &pyre_object::STR_TYPE)) as c_int
 }
 
+// ── the canonical representation (PEP 393) ──────────────────────────────
+
+/// The code points of a `str`, in the fixed-width form C reads and writes.
+///
+/// A mirror carries no storage, so this is a side-table entry keyed by the
+/// mirror address — the shape [`pyobject::cached_bytes`] already has for the
+/// UTF-8 view.  `data` holds `kind * (length + 1)` bytes: the code points, then
+/// the NUL a compact string carries.
+struct Block {
+    kind: c_int,
+    length: usize,
+    ascii: bool,
+    data: Box<[u8]>,
+    /// A block [`PyUnicode_New`] handed out and C has not finished writing.
+    /// No interpreter object mirrors it yet, so there is nothing to read the
+    /// contents back from and nothing for `from_ref` to answer with.
+    pending: bool,
+}
+
+type BlockTable = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
+static BLOCKS: super::ForkMutex<BlockTable> =
+    super::ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe { BLOCKS.reinit_after_fork() };
+}
+
+/// Drop what a dying mirror's canonical form occupied.
+pub(super) fn forget_block(mirror: usize) {
+    BLOCKS.lock().remove(&mirror);
+}
+
+/// The widest code point `kind` can hold, and the kind a code point needs.
+fn kind_for(maxchar: u32) -> c_int {
+    match maxchar {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
+        _ => 4,
+    }
+}
+
+fn write_unit(data: &mut [u8], kind: c_int, index: usize, value: u32) {
+    let at = index * kind as usize;
+    match kind {
+        1 => data[at] = value as u8,
+        2 => data[at..at + 2].copy_from_slice(&(value as u16).to_ne_bytes()),
+        _ => data[at..at + 4].copy_from_slice(&value.to_ne_bytes()),
+    }
+}
+
+fn read_unit(data: &[u8], kind: c_int, index: usize) -> u32 {
+    let at = index * kind as usize;
+    match kind {
+        1 => data[at] as u32,
+        2 => u16::from_ne_bytes([data[at], data[at + 1]]) as u32,
+        _ => u32::from_ne_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]),
+    }
+}
+
+/// The canonical form of an existing `str`.
+fn encode(w_obj: PyObjectRef) -> Block {
+    let points: Vec<u32> = unsafe { pyre_object::w_str_get_wtf8(w_obj) }
+        .code_points()
+        .map(|point| point.to_u32())
+        .collect();
+    let maxchar = points.iter().copied().max().unwrap_or(0);
+    let kind = kind_for(maxchar);
+    let mut data = vec![0u8; kind as usize * (points.len() + 1)].into_boxed_slice();
+    for (index, &point) in points.iter().enumerate() {
+        write_unit(&mut data, kind, index, point);
+    }
+    Block {
+        kind,
+        length: points.len(),
+        ascii: maxchar < 0x80,
+        data,
+        pending: false,
+    }
+}
+
+/// `(kind, length, ascii, data)` for a mirror, built from its `str` on first
+/// demand.  `None` for a mirror that is neither pending nor a `str`.
+fn canonical(raw: *mut CPyObject) -> Option<(c_int, usize, bool, *mut u8)> {
+    if raw.is_null() {
+        return None;
+    }
+    // The `str` is read outside the lock: `is_str` and the code point walk are
+    // interpreter operations, and this lock is held by the deallocator too.
+    let existing = BLOCKS.lock().contains_key(&(raw as usize));
+    if !existing {
+        let w_obj = unsafe { pyobject::from_ref(raw) };
+        if w_obj.is_null() || !unsafe { pyre_object::unicodeobject::is_str(w_obj) } {
+            return None;
+        }
+        let block = encode(w_obj);
+        BLOCKS.lock().entry(raw as usize).or_insert(block);
+    }
+    let mut table = BLOCKS.lock();
+    let block = table.get_mut(&(raw as usize))?;
+    // The box owns its bytes, so the address survives the map rehashing.
+    Some((
+        block.kind,
+        block.length,
+        block.ascii,
+        block.data.as_mut_ptr(),
+    ))
+}
+
+/// `PyUnicode_New(size, maxchar)` — an uninitialized string of `size` code
+/// points wide enough for `maxchar`, for the caller to fill through
+/// [`PyUnicode_DATA`].
+///
+/// There is no interpreter object yet: what its contents will be is not decided
+/// until C stops writing.  The mirror is handed out unlinked, and
+/// [`realize_pending`] builds the `str` at the one point where the result
+/// crosses back into the interpreter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: Py_UCS4) -> *mut CPyObject {
+    if size < 0 || maxchar > 0x10ffff {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let kind = kind_for(maxchar);
+    let Some(bytes) = (size as usize + 1).checked_mul(kind as usize) else {
+        return unsafe { super::pyerrors::PyErr_NoMemory() };
+    };
+    let mut data: Vec<u8> = Vec::new();
+    if data.try_reserve_exact(bytes).is_err() {
+        return unsafe { super::pyerrors::PyErr_NoMemory() };
+    }
+    data.resize(bytes, 0);
+    let w_str_type = crate::typedef::gettypeobject(&pyre_object::STR_TYPE);
+    if w_str_type.is_null() {
+        return unsafe { super::pyerrors::PyErr_NoMemory() };
+    }
+    let ob_type = pyobject::borrow_mirror(w_str_type) as *mut super::typeobject::CPyTypeObject;
+    let raw = pyobject::allocate_raw(size_of::<CPyObject>(), true) as *mut CPyObject;
+    if raw.is_null() {
+        return unsafe { super::pyerrors::PyErr_NoMemory() };
+    }
+    unsafe {
+        // One reference, the caller's; no link share, because there is nothing
+        // linked yet.
+        (*raw).ob_refcnt = 1;
+        (*raw).ob_pyre_link = pyre_object::PY_NULL;
+        (*raw).ob_type = ob_type;
+    }
+    BLOCKS.lock().insert(
+        raw as usize,
+        Block {
+            kind,
+            length: size as usize,
+            ascii: maxchar < 0x80,
+            data: data.into_boxed_slice(),
+            pending: true,
+        },
+    );
+    raw
+}
+
+/// Give a mirror [`PyUnicode_New`] handed out the `str` its contents now
+/// describe, and link the two.
+///
+/// Called from `from_c_result` and nowhere else.  `from_ref` is documented as
+/// allocation-free — an entry point converting two arguments in a row relies on
+/// the first result staying valid across the second conversion — and building
+/// the `str` allocates.  `from_c_result` is the one point where the mirror is
+/// the only live value.
+pub(super) fn realize_pending(raw: *mut CPyObject) {
+    if raw.is_null() {
+        return;
+    }
+    let text = {
+        let mut table = BLOCKS.lock();
+        match table.get_mut(&(raw as usize)) {
+            Some(block) if block.pending => {
+                block.pending = false;
+                let mut text = Wtf8Buf::with_capacity(block.length);
+                for index in 0..block.length {
+                    let point = read_unit(&block.data, block.kind, index);
+                    text.push(
+                        CodePoint::from_u32(point).unwrap_or(CodePoint::from_char('\u{fffd}')),
+                    );
+                }
+                text
+            }
+            _ => return,
+        }
+    };
+    // Outside the lock: the allocation below is a collection point, and the
+    // deallocator takes this lock.
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_str_from_wtf8_managed(text));
+    let refcnt = unsafe { (*raw).ob_refcnt };
+    pyobject::link_allocated(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        raw,
+        pyobject::REFCNT_FROM_PYRE + refcnt,
+    );
+}
+
+/// `PyUnicode_KIND` — 1, 2 or 4 bytes per code point.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_KIND(object: *mut CPyObject) -> c_int {
+    match canonical(object) {
+        Some((kind, _, _, _)) => kind,
+        None => {
+            unsafe { super::pyerrors::PyErr_BadInternalCall() };
+            0
+        }
+    }
+}
+
+/// `PyUnicode_DATA` — the code points, `PyUnicode_KIND` bytes each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DATA(object: *mut CPyObject) -> *mut c_void {
+    match canonical(object) {
+        Some((_, _, _, data)) => data as *mut c_void,
+        None => {
+            unsafe { super::pyerrors::PyErr_BadInternalCall() };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `PyUnicode_IS_ASCII` — whether every code point is below 128, which is what
+/// decides the narrower of the two one-byte forms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_IS_ASCII(object: *mut CPyObject) -> c_uint {
+    match canonical(object) {
+        Some((_, _, ascii, _)) => ascii as c_uint,
+        None => 0,
+    }
+}
+
+/// `PyUnicode_MAX_CHAR_VALUE` — the widest code point the representation can
+/// hold, not the widest it does hold.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_MAX_CHAR_VALUE(object: *mut CPyObject) -> c_uint {
+    match canonical(object) {
+        Some((_, _, true, _)) => 0x7f,
+        Some((1, _, _, _)) => 0xff,
+        Some((2, _, _, _)) => 0xffff,
+        Some(_) => 0x10ffff,
+        None => 0,
+    }
+}
+
+/// `PyUnicode_ReadChar(object, index)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_ReadChar(object: *mut CPyObject, index: isize) -> Py_UCS4 {
+    let Some((kind, length, _, data)) = canonical(object) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return Py_UCS4::MAX;
+    };
+    if index < 0 || index as usize >= length {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "string index out of range",
+        ));
+        return Py_UCS4::MAX;
+    }
+    let data = unsafe { std::slice::from_raw_parts(data, kind as usize * (length + 1)) };
+    read_unit(data, kind, index as usize)
+}
+
+/// `PyUnicode_WriteChar(object, index, value)` — only meaningful while the
+/// string is still being filled, which is the state `PyUnicode_New` leaves it
+/// in.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_WriteChar(
+    object: *mut CPyObject,
+    index: isize,
+    value: Py_UCS4,
+) -> c_int {
+    let Some((kind, length, _, data)) = canonical(object) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    };
+    if index < 0 || index as usize >= length {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "string index out of range",
+        ));
+        return -1;
+    }
+    let data = unsafe { std::slice::from_raw_parts_mut(data, kind as usize * (length + 1)) };
+    write_unit(data, kind, index as usize, value);
+    0
+}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_FromString as *const ());
     std::hint::black_box(PyUnicode_FromStringAndSize as *const ());
@@ -118,4 +424,11 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_GetLength as *const ());
     std::hint::black_box(PyUnicode_Check as *const ());
     std::hint::black_box(PyUnicode_CheckExact as *const ());
+    std::hint::black_box(PyUnicode_New as *const ());
+    std::hint::black_box(PyUnicode_KIND as *const ());
+    std::hint::black_box(PyUnicode_DATA as *const ());
+    std::hint::black_box(PyUnicode_IS_ASCII as *const ());
+    std::hint::black_box(PyUnicode_MAX_CHAR_VALUE as *const ());
+    std::hint::black_box(PyUnicode_ReadChar as *const ());
+    std::hint::black_box(PyUnicode_WriteChar as *const ());
 }

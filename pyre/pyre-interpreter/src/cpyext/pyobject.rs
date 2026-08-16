@@ -378,6 +378,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     BYTE_CACHE.lock().remove(&address);
     super::dictobject::forget_iteration(address);
     super::modsupport::forget_module_fields(address);
+    super::unicodeobject::forget_block(address);
     let block = block_at(address);
     if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };

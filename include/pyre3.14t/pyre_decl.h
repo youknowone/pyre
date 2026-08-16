@@ -413,9 +413,16 @@ PyAPI_FUNC(const char *) PyUnicode_AsUTF8(PyObject *);
 PyAPI_FUNC(const char *) PyUnicode_AsUTF8AndSize(PyObject *, Py_ssize_t *);
 PyAPI_FUNC(int) PyUnicode_Check(PyObject *);
 PyAPI_FUNC(int) PyUnicode_CheckExact(PyObject *);
+PyAPI_FUNC(void *) PyUnicode_DATA(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromStringAndSize(const char *, Py_ssize_t);
 PyAPI_FUNC(Py_ssize_t) PyUnicode_GetLength(PyObject *);
+PyAPI_FUNC(unsigned int) PyUnicode_IS_ASCII(PyObject *);
+PyAPI_FUNC(int) PyUnicode_KIND(PyObject *);
+PyAPI_FUNC(unsigned int) PyUnicode_MAX_CHAR_VALUE(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_New(Py_ssize_t, Py_UCS4);
+PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
 
 #ifdef __cplusplus
 }

@@ -8,11 +8,16 @@
 #ifndef PYRE_PYTHON_H
 #define PYRE_PYTHON_H
 
+#include <assert.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "patchlevel.h"
 #include "pyport.h"

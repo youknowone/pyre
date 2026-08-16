@@ -34,9 +34,11 @@ typedef struct PyGetSetDef PyGetSetDef;
 typedef struct PyType_Slot PyType_Slot;
 typedef struct PyType_Spec PyType_Spec;
 typedef struct Py_buffer Py_buffer;
-/* An `int` is not a distinct object here, so the reference header's
-   `PyLongObject` is the ordinary mirror under its upstream name. */
+/* Neither an `int` nor a `str` is a distinct object here, so the reference
+   header's `PyLongObject` and `PyUnicodeObject` are the ordinary mirror under
+   their upstream names. */
 typedef PyObject PyLongObject;
+typedef PyObject PyUnicodeObject;
 typedef void (*PyCapsule_Destructor)(PyObject *);
 
 #ifdef __cplusplus
