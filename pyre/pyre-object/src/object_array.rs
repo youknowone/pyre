@@ -34,10 +34,11 @@ pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 /// `Ptr(GcArray(OBJECTPTR))`). Distinct from `PY_OBJECT_ARRAY_GC_TYPE_ID` (9,
 /// list/tuple items) so the block keeps its own identity even though every slot
 /// is now a reference: a boxed attribute's value, or an
-/// `UnboxedPlainAttribute`'s longlong list as a varsize leaf GcArray. The tid is
-/// registered as a GC **leaf** (`items_have_gc_ptrs=false`) — the collector does
-/// not walk the block's interior; the owning instance's
-/// `object_object_custom_trace` walks it (`instance_walk_boxed_storage`).
+/// `UnboxedPlainAttribute`'s longlong list as a varsize leaf GcArray. The tid
+/// is registered `items_have_gc_ptrs=true`, so the collector walks the block's
+/// interior itself and a barrier naming the block records a real edge; the
+/// owning instance's `object_object_custom_trace` walks the same slots
+/// (`instance_walk_boxed_storage`), which is idempotent.
 /// Registered at the tail of the tid chain (after `W_COMPLEX_GC_TYPE_ID = 54`)
 /// so no hardcoded constant shifts.
 pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
@@ -241,11 +242,10 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // ─── mapdict instance-storage block: stable GcArray(OBJECTPTR) ────────────
 //
 // `W_ObjectObject.storage` (`mapdict.py:910` `self.storage`) is a
-// `Ptr(GcArray(OBJECTPTR))`. Unlike list/tuple item blocks (nursery,
-// `PY_OBJECT_ARRAY_GC_TYPE_ID`, inline-traced), the mapdict storage is a MIXED
-// boxed/unboxed array, so it is allocated `stable` (non-moving old-gen) under a
-// LEAF tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and its interior is walked only by
-// the instance's `object_object_custom_trace` (map-masked). Stable allocation
+// `Ptr(GcArray(OBJECTPTR))`. It carries the same inline-traced shape as
+// list/tuple item blocks (`PY_OBJECT_ARRAY_GC_TYPE_ID`) — every slot is a
+// reference — under its own tid (`W_MAPDICT_STORAGE_GC_TYPE_ID`) and differs
+// only in being allocated `stable` (non-moving old-gen). Stable allocation
 // mirrors the instance's own `try_gc_alloc_stable` (objectobject.rs) and the
 // `TypedItemsBlock` int/float backing blocks: a non-moving block means the
 // instance's `storage` pointer never needs rewriting on a minor GC, and the

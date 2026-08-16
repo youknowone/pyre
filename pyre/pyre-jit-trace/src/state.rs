@@ -3427,20 +3427,17 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
 /// `Ptr(GcArray(OBJECTPTR))` — `W_ObjectObject.storage`, the mapdict
 /// attribute-value block (`mapdict.py:910` `self.storage`).
 ///
-/// Structurally the same `ItemsBlock` as [`pyobject_gcarray_descr`] and
-/// differing only in the two properties the allocation shape turns on:
+/// Structurally the same `ItemsBlock` as [`pyobject_gcarray_descr`], with its
+/// own `W_MAPDICT_STORAGE_GC_TYPE_ID` and one property the allocation shape
+/// turns on: `non_moving`. Raw `*mut ItemsBlock` copies outlive allocation
+/// points in Rust locals and in `MapdictCarrier`, and the collector cannot
+/// rewrite those, so the block must never move.
 ///
-/// * `W_MAPDICT_STORAGE_GC_TYPE_ID` is a GC **leaf** — the block is a mixed
-///   boxed/unboxed array, so the collector must never walk its interior; the
-///   owning instance's `object_object_custom_trace` walks the boxed slots
-///   itself, masked by the map. Reusing the object-array tid would have the
-///   tracer read an unboxed slot as a reference.
-/// * `non_moving`, because the instance's `storage` field is a raw pointer the
-///   custom trace marks but never rewrites, so a moved block would leave the
-///   instance pointing at the pre-move copy.
-///
-/// Both match `alloc_mapdict_storage_block` (`object_array.rs`), the allocator
-/// the interpreter itself uses for this block.
+/// Every slot is a reference — a boxed attribute value, an unboxed attribute's
+/// longlong GcArray, or NULL — so the tid is an ordinary array of pointers and
+/// the barrier the GC rewrite emits for a `SetarrayitemGc` on this descr
+/// records a real edge. That matches `alloc_mapdict_storage_block`
+/// (`object_array.rs`), the allocator the interpreter itself uses.
 pub(crate) fn mapdict_storage_gcarray_descr() -> DescrRef {
     let token = &pyre_object::ITEMS_BLOCK_TOKEN;
     let descr = crate::descr::make_array_descr_with_type(

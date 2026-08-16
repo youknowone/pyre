@@ -2744,23 +2744,39 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_complex_tid,
     );
     // `W_ObjectObject.storage` block — the mapdict instance attribute-value
-    // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Registered as a
-    // varsize leaf: the custom trace on the W_ObjectObject instance walks
-    // every storage slot (`instance_walk_boxed_storage`) — each one is a
-    // reference, a boxed attribute value or an unboxed attribute's longlong
-    // GcArray — and forwards this block pointer to keep the (non-moving,
-    // stable-allocated) block marked live.  The block is
-    // an `ItemsBlock` (`W_ObjectObject.storage`), so its shape is that block's
-    // token — the same one tid 9 registers, differing only in the leaf flag.
-    // Registered here, immediately after `W_COMPLEX_GC_TYPE_ID = 54`, so it
-    // takes tid 55 before the runtime-numbered `#[pyre_class]` / per-ExcKind
-    // registrations below.
+    // array (`mapdict.py:910`, `Ptr(GcArray(OBJECTPTR))`).  Every slot is a
+    // reference: a boxed attribute value, an unboxed attribute's longlong
+    // GcArray (`erase_unboxed`, `mapdict.py:601/612`), or NULL — so the block
+    // is registered as an ordinary array of pointers, exactly the upstream
+    // shape, and the collector walks its interior itself.
+    //
+    // It must NOT be a leaf.  A leaf makes the standard write barrier a
+    // semantic no-op on this block: `remember_young_pointer` puts it on the
+    // remembered set, the minor's `trace_and_update_object` finds no pointers
+    // to forward, and TRACK_YOUNG_PTRS is restored with the young slot still
+    // stale.  Every writer that can only name the array — the compiled
+    // `SetarrayitemGc` the GC rewrite barriers, and the blackhole's
+    // `bh_setarrayitem_gc_r` — is then unable to record the edge at all,
+    // because only the owning instance is a usable remembered-set root.
+    //
+    // The instance's `object_object_custom_trace` still walks the same slots;
+    // the two visits are idempotent, since the minor acts only on a nursery
+    // address and the major sets VISITED at push time.
+    //
+    // Still non-moving/stable: raw `*mut ItemsBlock` copies outlive allocation
+    // points in Rust locals and in `MapdictCarrier`, and the collector cannot
+    // rewrite those.
+    //
+    // The block is an `ItemsBlock`, so its shape is that block's token — the
+    // same one tid 9 registers.  Registered here, immediately after
+    // `W_COMPLEX_GC_TYPE_ID = 54`, so it takes tid 55 before the
+    // runtime-numbered `#[pyre_class]` / per-ExcKind registrations below.
     let storage_token = &pyre_object::object_array::ITEMS_BLOCK_TOKEN;
     let w_mapdict_storage_tid = gc.register_type(TypeInfo::varsize(
         storage_token.base_size,
         storage_token.item_size,
         storage_token.len_offset,
-        false,
+        true,
         Vec::new(),
     ));
     debug_assert_eq!(
@@ -11530,6 +11546,21 @@ fn materialize_virtual_from_rd(
                                 Value::Int(n) => n as usize,
                                 _ => 0,
                             };
+                            // `resume.py:1512` reaches this store through
+                            // `cpu.bh_setfield_gc_r`, whose `write_ref_at_mem`
+                            // (llmodel.py:495) carries the framework GC
+                            // transformer's barrier. This materializer writes
+                            // the field itself, so it owes the same barrier:
+                            // `allocate_with_vtable` / `allocate_struct` build
+                            // the virtual straight in the non-moving old
+                            // generation, so a young `p` is an old -> young
+                            // edge that reaches `old_objects_pointing_to_young`
+                            // only from here. Per store, not once per object —
+                            // decoding a later field can materialize a nested
+                            // virtual, and the collection that runs there
+                            // drains the remembered set and restores
+                            // `TRACK_YOUNG_PTRS`.
+                            write_barrier_after_ref_store(obj_ptr as i64);
                             std::ptr::write(addr as *mut usize, p);
                         }
                         majit_ir::Type::Float => {
