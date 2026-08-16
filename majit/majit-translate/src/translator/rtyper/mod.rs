@@ -21,6 +21,8 @@
 //!   frozen-PBC/instance-repr lowering before `jtransform`.
 //! * `str_const_fold` resolves synthetic string-literal calls to the
 //!   prebuilt-string constant shape produced by `StringRepr.convert_const`.
+//! * `box_str_const_fold` removes redundant boxing calls whose string view is
+//!   proven to come from that prebuilt-string constant.
 //!
 //! `lltypesystem::ll2ctypes`, `lltypesystem::llarena`, and
 //! `tool::rffi_platform` are intentionally absent; their module roots
@@ -28,6 +30,7 @@
 //! permanently unused in pyre.
 
 pub mod annlowlevel;
+pub(crate) mod box_str_const_fold;
 pub mod callparse;
 pub mod controllerentry;
 pub(crate) mod cutover;

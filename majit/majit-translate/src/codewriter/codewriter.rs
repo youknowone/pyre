@@ -517,6 +517,10 @@ impl CodeWriter {
         // graph. Fold the synthetic `__str_const` calls the front lowers
         // literals to, so jtransform sees a constant rather than a call.
         crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph_owned);
+        // String view construction is an identity in the model graph. When a
+        // box call receives a proven literal, its interned result is that same
+        // prebuilt string constant.
+        crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
         let graph = &graph_owned;
 
         // RPython codewriter.py:37 `portal_jd =

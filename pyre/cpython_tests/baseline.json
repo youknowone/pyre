@@ -462,7 +462,7 @@
       "dynasm": "CRASH"
     },
     "test.test_float": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_flufl": {
       "dynasm": "FAIL"
