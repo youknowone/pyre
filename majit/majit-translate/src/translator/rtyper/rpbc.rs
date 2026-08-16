@@ -419,7 +419,13 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
         }
         let receiver_var = args
             .first()
-            .expect("dyn-Trait method call must have a receiver arg")
+            .unwrap_or_else(|| {
+                panic!(
+                    "dyn-Trait method call must have a receiver arg \
+                     (trait_root={trait_root:?} method={method_name:?} graph={:?})",
+                    graph.name,
+                )
+            })
             .clone();
         // RPython rclass.py:371-377 (condensed into a single op).
         let funcptr_var = rclass::class_get_method_ptr(
