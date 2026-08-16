@@ -3892,10 +3892,22 @@ impl PyFrame {
     /// / freevar from the mapping via `space.finditem_str` (KeyError →
     /// missing); a frame with no locals bound has nothing to copy.
     pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
-        if self.get_w_locals().is_null() {
+        // `pyframe.py:589` binds `w_locals` once, ahead of both loops, and
+        // every `space.finditem_str` below reads that one binding.  It
+        // allocates a key per slot and dispatches a `__getitem__` that may run
+        // Python, so it can collect, and the GC transform reloads both the
+        // binding and `self` from their root slots after each such call.
+        // Reproduce that rather than retaining either pre-move Rust pointer
+        // between iterations, exactly as the `fast2locals` twin does.
+        let frame_anchor = crate::eval::FrameAnchor::new(self);
+        let w_locals = unsafe { (*frame_anchor.live()).get_w_locals() };
+        if w_locals.is_null() {
             return Ok(());
         }
-        let code_ptr = unsafe { pyframe_get_pycode(self) };
+        let locals_roots = pyre_object::gc_roots::push_roots();
+        let locals_slot = locals_roots.base();
+        locals_roots.pin_root(w_locals);
+        let code_ptr = unsafe { pyframe_get_pycode(&*frame_anchor.live()) };
         let code = unsafe { &*code_ptr };
         let numlocals = code.varnames.len();
 
@@ -3907,19 +3919,16 @@ impl PyFrame {
                 continue;
             }
             let name = &code.varnames[i];
-            // `pyframe.py:576` reads `self.w_locals` per turn.  The lookup
-            // dispatches the mapping's `__getitem__`, so a hoisted copy names
-            // the address the mapping had before the previous turn ran.  The
-            // frame's own trace forwards the field, so re-reading it is the
-            // whole fix.
-            let w_value = finditem_str_object(self.get_w_locals(), name)?.unwrap_or(PY_NULL);
-            let slot = locals_w!(self)[i];
+            let w_value =
+                finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
+            let frame = unsafe { &mut *frame_anchor.live() };
+            let slot = locals_w!(frame)[i];
             let is_cell_slot = i < code.localspluskinds.len()
                 && code.localspluskinds[i] & crate::bytecode::CO_FAST_CELL != 0;
             if is_cell_slot && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                 unsafe { pyre_object::w_cell_set(slot, w_value) };
             } else {
-                self.set_locals_w(i, w_value);
+                frame.set_locals_w(i, w_value);
             }
         }
 
@@ -3948,13 +3957,16 @@ impl PyFrame {
                 code.freevars[i - npure].as_ref()
             };
             let idx = numlocals + i;
-            if idx < locals_w!(self).len() {
-                let w_value = finditem_str_object(self.get_w_locals(), name)?.unwrap_or(PY_NULL);
-                let slot = locals_w!(self)[idx];
+            let frame = unsafe { &*frame_anchor.live() };
+            if idx < locals_w!(frame).len() {
+                let w_value =
+                    finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
+                let frame = unsafe { &mut *frame_anchor.live() };
+                let slot = locals_w!(frame)[idx];
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
                     unsafe { pyre_object::w_cell_set(slot, w_value) };
                 } else {
-                    self.set_locals_w(idx, w_value);
+                    frame.set_locals_w(idx, w_value);
                 }
             }
         }
