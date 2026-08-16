@@ -24,12 +24,8 @@ struct _object {
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
 
-#define Py_INCREF(ob) Py_IncRef((PyObject *)(ob))
-#define Py_DECREF(ob) Py_DecRef((PyObject *)(ob))
-#define Py_XINCREF(ob) do { if ((ob) != NULL) Py_INCREF(ob); } while (0)
-#define Py_XDECREF(ob) do { if ((ob) != NULL) Py_DECREF(ob); } while (0)
-#define Py_CLEAR(ob) do { PyObject *_tmp = (PyObject *)(ob); (ob) = NULL; Py_XDECREF(_tmp); } while (0)
-#define Py_SETREF(ob, value) do { PyObject *_old = (PyObject *)(ob); (ob) = (value); Py_XDECREF(_old); } while (0)
+/* The reference-counting macros are in `refcount.h`, which `Python.h` includes
+   after the declarations they expand to. */
 
 /* The singletons.  Each is a mirror the runtime binds to its interpreter
    object before the first `PyInit_*` runs, so pointer comparison against them

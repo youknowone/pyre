@@ -47,7 +47,9 @@ declaration waits on a definition.
 `scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
 themselves, so a declaration cannot drift from its implementation. It is
 included after the headers that name the types it uses and before the ones
-defining `static inline` functions that call it.
+defining `static inline` functions that call it. `refcount.h` is the first of
+those: `Py_INCREF` expands to the `Py_IncRef` it declares, and `Py_NewRef` is an
+inline function calling that macro.
 
 The generator does not spell the declaration from the Rust signature where
 CPython has one of its own. It emits **CPython's** declaration -- `PyLongObject
@@ -93,6 +95,14 @@ the header below.
   references owned by their container, the per-mirror byte cache behind
   `PyUnicode_AsUTF8` / `PyBytes_AsString`, and the immortal singletons
   `Py_None` / `Py_True` / `Py_False` / `Py_Ellipsis` / `Py_NotImplemented`;
+- the two forms a mirror is handed out in before its interpreter object exists
+  (`cpyext/unicodeobject.rs`, `cpyext/bytesobject.rs`): `PyUnicode_New(size,
+  maxchar)` and `PyBytes_FromStringAndSize(NULL, size)` return an unlinked
+  mirror over a buffer the caller fills, and `pyobject::realize` builds the
+  `str` or `bytes` the first time it is read as a value, which is where
+  `pyobject.py:330-337` reaches the type descriptor's `realize`. The type tests
+  and the length are answered from the buffer, so asking them mid-fill does not
+  decide the contents early;
 - the C exception indicator (`cpyext/pyerrors.rs`): 37 `PyExc_*` class mirrors
   and `PyErr_SetString` / `SetObject` / `SetNone` / `Occurred` / `Clear` /
   `Fetch` / `Restore` / `ExceptionMatches` / `NoMemory` / `BadArgument` /
@@ -195,9 +205,6 @@ Known divergences, each documented at its definition:
   no container for the borrow to belong to;
 - the module state block is never released, pyre having no module deallocation
   path;
-- `PyBytes_FromStringAndSize(NULL, n)` is rejected: pyre's `bytes` is immutable
-  from construction and its storage is not the address `PyBytes_AsString`
-  returns;
 - `PyObject_GC_IsTracked` is the constant 1 and `PyObject_GC_IsFinalized` the
   constant 0: every object pyre holds is reachable by its collector, and
   nothing runs `tp_finalize`;

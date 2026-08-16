@@ -393,6 +393,26 @@ for converter in (m.object_bytes, m.bytes_from):
     else:
         raise AssertionError('a str was converted to bytes')
 
+# PyBytes_FromStringAndSize(NULL, size): the buffer is written through
+# PyBytes_AS_STRING and the result is an ordinary bytes.
+assert m.bytes_fill(3) == b'abc'
+assert type(m.bytes_fill(3)) is bytes
+assert m.bytes_fill(0) == b''
+assert m.bytes_fill(30) == bytes(ord('a') + i % 26 for i in range(30))
+# The written bytes are a bytes in every way, not just by value.
+assert len(m.bytes_fill(5)) == 5
+assert m.bytes_fill(5).upper() == b'ABCDE'
+assert {m.bytes_fill(2): 1}[b'ab'] == 1
+# A buffer handed to another entry point instead of returned. Its value is
+# built where it first crosses back into the interpreter.
+assert m.bytes_pairs() == {b'kk': b'vv\x00'}, m.bytes_pairs()
+assert m.bytes_empty() == b''
+
+# Py_NewRef / Py_XNewRef.
+marker = ['kept']
+assert m.new_ref(marker) == (True, marker)
+assert m.new_ref(marker)[1] is marker
+
 # The object allocator: contents survive a realloc, a calloc is zeroed, and a
 # wrapping product is refused.
 assert m.object_blocks() == (1, 1, 1), m.object_blocks()

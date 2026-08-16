@@ -292,9 +292,12 @@ fn deallocating_marker() -> usize {
 /// `pyobject.py:330-337` — build the interpreter object of a mirror that has
 /// none yet.
 ///
-/// Upstream reaches the `realize` of the mirror's own type descriptor; the one
-/// form pyre hands out unrealized is the `str` [`super::unicodeobject::PyUnicode_New`]
-/// allocates, whose contents C is still writing when it is handed over.
+/// Upstream reaches the `realize` of the mirror's own type descriptor; the two
+/// forms pyre hands out unrealized are the `str`
+/// [`super::unicodeobject::PyUnicode_New`] allocates and the `bytes`
+/// [`super::bytesobject::PyBytes_FromStringAndSize`] allocates for a NULL
+/// `text`, whose contents C is still writing when they are handed over.  Each
+/// call below returns at once for a mirror that is not its own.
 ///
 /// # Safety
 /// `raw` must be null or a live mirror.  Building the object allocates, so no
@@ -304,6 +307,7 @@ pub(super) unsafe fn realize(raw: *mut CPyObject) {
         return;
     }
     super::unicodeobject::realize_pending(raw);
+    super::bytesobject::realize_pending(raw);
 }
 
 /// `pyobject.py:from_ref` — the interpreter object a mirror links to,
@@ -403,6 +407,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::dictobject::forget_iteration(address);
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
+    super::bytesobject::forget_pending(address);
     let block = block_at(address);
     if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };

@@ -191,6 +191,7 @@ pub fn after_fork_child() {
         modsupport::after_fork_child();
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
+        bytesobject::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
     // half-finished import must not name the next module created here.

@@ -30,6 +30,7 @@
    name the types it uses, and the ones below define `static inline`
    functions that call it. */
 #include "pyre_decl.h"
+#include "refcount.h"
 #include "pymem.h"
 #include "objimpl.h"
 #include "methodobject.h"
