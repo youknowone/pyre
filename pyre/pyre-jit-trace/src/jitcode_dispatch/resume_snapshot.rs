@@ -591,7 +591,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // This is the same transition the following walk step would make;
             // it merely makes the guard's resume image observe it at the
             // required point.
-            if after_residual_call && ctx.vstack_valid {
+            //
+            // `py_pc == vstack_cur_pypc` is not that transition: the walk has
+            // not left the opcode the mirror already holds, so the following
+            // step makes no boundary at all — `step_vstack_mirror` returns on
+            // the same equality. Reconciling anyway replays that opcode's
+            // stack effect a second time, and the permutation classes are not
+            // idempotent: a `SWAP` applied twice is the identity, so the two
+            // slots it exchanged keep their pre-swap order for the rest of the
+            // walk and every later guard snapshot publishes them crossed.
+            if after_residual_call && ctx.vstack_valid && py_pc != ctx.vstack_cur_pypc {
                 let jc = unsafe { &*sym.jitcode() };
                 let code_ptr = jc.payload.code_ptr;
                 if !code_ptr.is_null() {
