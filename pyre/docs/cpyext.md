@@ -75,10 +75,17 @@ only on a platform where the widths differ. `PyModule_AddIntConstant` took a
 `Py_ssize_t` where the reference declaration says `long`, which is the same on
 LP64 and 32 bits against 64 on Windows.
 
-The 35 exports CPython does not declare are the macros it spells over struct
+The exports CPython does not declare are the macros it spells over struct
 fields -- `PyLong_Check`, `PySequence_Fast_GET_ITEM`, `PyBytes_AS_STRING` --
 which have to be calls here, plus the two `_PyPyre_*` helpers the header's own
 `static inline` functions use.
+
+`patchlevel.h` carries the version in parts -- `PY_MAJOR_VERSION`,
+`PY_RELEASE_LEVEL`, `PY_RELEASE_SERIAL` -- and computes `PY_VERSION_HEX` from
+them, so an extension testing any one of them reads the same number the runtime
+reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
+`PYPY_VERSION` fills upstream. `cpyext_methods` compares the whole set against
+`sys.version_info`, `sys.hexversion` and `sys.pyre_version_info`.
 
 ## What is implemented
 

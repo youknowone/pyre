@@ -410,6 +410,19 @@ static PyObject *m_caught(PyObject *self, PyObject *unused)
                          cleared, text);
 }
 
+/* The version macros, as an extension expands them: the string ones inside a
+   banner, the numeric ones as values. A mismatch against what the runtime
+   reports is a stale header. */
+static PyObject *m_version_macros(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    static const char banner[] = "python " PY_VERSION " / pyre " PYRE_VERSION;
+    return Py_BuildValue("(siiiiisi)", banner, PY_MAJOR_VERSION, PY_MINOR_VERSION,
+                         PY_MICRO_VERSION, PY_RELEASE_LEVEL, PY_RELEASE_SERIAL,
+                         PY_VERSION, PY_VERSION_HEX);
+}
+
 /* `PyErr_Restore` puts back what `PyErr_Fetch` took, and its three degenerate
    inputs: a NULL class clears whatever was set, a NULL value is built into a
    bare instance, and a fetched pair goes back unchanged. */
@@ -1605,6 +1618,7 @@ static PyMethodDef methods[] = {
     {"fail", (PyCFunction)m_fail, METH_VARARGS, NULL},
     {"caught", (PyCFunction)m_caught, METH_NOARGS, NULL},
     {"restore", (PyCFunction)m_restore, METH_NOARGS, "PyErr_Restore and its degenerate inputs"},
+    {"version_macros", (PyCFunction)m_version_macros, METH_NOARGS, "the patchlevel.h macros"},
     {"call_surface", (PyCFunction)m_call_surface, METH_VARARGS, NULL},
     {"set_ops", (PyCFunction)m_set_ops, METH_VARARGS, NULL},
     {"dict_more", (PyCFunction)m_dict_more, METH_VARARGS, NULL},
