@@ -111,15 +111,26 @@ pub fn unwrap_start_stop(
 /// the length must be consulted only afterwards (`_unpack_slice`). `None`
 /// endpoints map to the open-ended sentinels that [`slice_adjust_indices`]
 /// then clamps. A zero `step` raises `ValueError`.
+/// The three bounds are converted one at a time, and `__index__` is user code
+/// that can collect, so a bound not yet reached is read back from the shadow
+/// stack rather than carried in the argument it arrived in.  A caller that
+/// roots the slice keeps the bounds *reachable*, which is not the same as
+/// keeping its own copies of their addresses current.
 pub(crate) fn slice_unpack(
     w_start: PyObjectRef,
     w_stop: PyObjectRef,
     w_step: PyObjectRef,
 ) -> Result<(i64, i64, i64), crate::PyError> {
-    let step = if unsafe { is_none(w_step) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_start);
+    pyre_object::gc_roots::pin_root(w_stop);
+    pyre_object::gc_roots::pin_root(w_step);
+    let (start_slot, stop_slot, step_slot) = (base, base + 1, base + 2);
+    let step = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(step_slot)) } {
         1
     } else {
-        let step = eval_slice_index(w_step)?;
+        let step = eval_slice_index(pyre_object::gc_roots::shadow_stack_get(step_slot))?;
         if step == 0 {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
@@ -128,15 +139,15 @@ pub(crate) fn slice_unpack(
         }
         step
     };
-    let start = if unsafe { is_none(w_start) } {
+    let start = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(start_slot)) } {
         if step < 0 { i64::MAX } else { 0 }
     } else {
-        eval_slice_index(w_start)?
+        eval_slice_index(pyre_object::gc_roots::shadow_stack_get(start_slot))?
     };
-    let stop = if unsafe { is_none(w_stop) } {
+    let stop = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(stop_slot)) } {
         if step < 0 { i64::MIN } else { i64::MAX }
     } else {
-        eval_slice_index(w_stop)?
+        eval_slice_index(pyre_object::gc_roots::shadow_stack_get(stop_slot))?
     };
     Ok((start, stop, step))
 }

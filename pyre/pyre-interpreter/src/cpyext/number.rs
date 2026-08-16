@@ -470,25 +470,12 @@ pub unsafe extern "C" fn PyNumber_Check(object: *mut CPyObject) -> c_int {
     numeric as c_int
 }
 
-fn as_index(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { pyre_object::pyobject::is_int_or_long(object) } {
-        return Ok(object);
-    }
-    let method = crate::baseobjspace::getattr_str(object, "__index__").map_err(|_| {
-        crate::PyError::type_error(format!(
-            "'{}' object cannot be interpreted as an integer",
-            crate::baseobjspace::object_functionstr_type_name(object)
-        ))
-    })?;
-    crate::call::call_function_impl_result(method, &[])
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Index(object: *mut CPyObject) -> *mut CPyObject {
     let Some(object) = argument(object) else {
         return std::ptr::null_mut();
     };
-    result(as_index(object))
+    result(crate::baseobjspace::space_index(object))
 }
 
 #[unsafe(no_mangle)]

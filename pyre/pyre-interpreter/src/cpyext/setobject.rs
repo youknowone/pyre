@@ -84,7 +84,39 @@ pub unsafe extern "C" fn PyFrozenSet_New(iterable: *mut CPyObject) -> *mut CPyOb
     ))
 }
 
+/// Store into a frozenset still being built — `setobject.py:647`
+/// `W_FrozensetObject.cpyext_add_frozen`.
+///
+/// The element is hashed while both operands are rooted, because a user
+/// `__hash__` is a collection point, and the digest keys the store.
+fn add_frozen(set: PyObjectRef, key: PyObjectRef) -> Result<(), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(set);
+    roots.pin_root(key);
+    let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(base + 1))
+        .map_err(|error| {
+        crate::baseobjspace::wrap_set_element_hash_error(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            error,
+        )
+    })?;
+    unsafe {
+        pyre_object::setobject::w_set_add_hashed_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            hash,
+        )
+    }
+    .map_err(crate::baseobjspace::map_set_update_error)
+}
+
 /// `PySet_Add(set, key)` (`setobject.py:75-91`).
+///
+/// A frozenset is accepted while it is still being filled — the documented way
+/// to build one before it is exposed.  "Still being filled" is "has not
+/// answered `__hash__` yet": once the hash is cached, the value has been
+/// published and a store would invalidate it.
 ///
 /// # Safety
 /// Both arguments must be live references.
@@ -93,7 +125,17 @@ pub unsafe extern "C" fn PySet_Add(set: *mut CPyObject, key: *mut CPyObject) -> 
     let (Some(set), Some(key)) = (argument(set), argument(key)) else {
         return -1;
     };
-    let call = any_set(set, "PySet_Add").and_then(|set| method(set, "add", &[key]));
+    let call = if unsafe { pyre_object::setobject::is_set(set) } {
+        method(set, "add", &[key])
+    } else if unsafe {
+        pyre_object::setobject::is_frozenset(set)
+            && pyre_object::setobject::w_frozenset_cached_hash(set).is_none()
+    } {
+        add_frozen(set, key).map(|()| pyre_object::w_none())
+    } else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    };
     match super::pyerrors::trap(call) {
         Some(_) => 0,
         None => -1,

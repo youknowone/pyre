@@ -64,7 +64,16 @@ pub unsafe extern "C" fn PyLong_FromDouble(value: c_double) -> *mut CPyObject {
         ));
         return std::ptr::null_mut();
     }
-    pyobject::make_ref(pyre_object::w_int_new(value.trunc() as i64))
+    // A float wider than a machine word is an ordinary big integer, so the
+    // truncation goes through the exact constructor rather than an `as i64`
+    // cast, which would saturate at `i64::MAX`.
+    let Ok(value) = BigInt::fromfloat(value.trunc()) else {
+        // `is_finite` above already answered for the two cases `fromfloat`
+        // rejects.
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(from_bigint(value))
 }
 
 /// `PyLong_FromString`, base 0 or 2..=36.
@@ -88,41 +97,22 @@ pub unsafe extern "C" fn PyLong_FromString(
     if !end.is_null() {
         unsafe { *end = text.add(raw.to_bytes().len()) as *mut std::ffi::c_char };
     }
-    let text = raw.to_string_lossy().trim().to_string();
-    let (digits, radix) = split_digits(&text, base);
-    match i64::from_str_radix(&digits, radix) {
-        Ok(value) => pyobject::make_ref(pyre_object::w_int_new(value)),
-        Err(_) => {
-            super::pyerrors::set_pending_error(crate::PyError::value_error(format!(
-                "invalid literal for int() with base {base}: '{text}'"
-            )));
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// The digits `from_str_radix` parses, sign included, and the base they are in.
-///
-/// Base 0 reads the base from a `0x` / `0o` / `0b` prefix; an explicit 16, 8 or
-/// 2 also accepts the prefix that names it, which is what `PyLong_FromString`
-/// documents.
-fn split_digits(text: &str, base: c_int) -> (String, u32) {
-    let (sign, rest) = match text.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", text.strip_prefix('+').unwrap_or(text)),
-    };
-    let prefixed = match rest.get(..2).map(str::to_ascii_lowercase).as_deref() {
-        Some("0x") => Some(16),
-        Some("0o") => Some(8),
-        Some("0b") => Some(2),
-        _ => None,
-    };
-    match prefixed {
-        Some(detected) if base == 0 || base == detected => {
-            (format!("{sign}{}", &rest[2..]), detected as u32)
-        }
-        _ if base == 0 => (format!("{sign}{rest}"), 10),
-        _ => (format!("{sign}{rest}"), base as u32),
+    // `int(s, base)` is the parser: it reads the prefix a base of 0 asks for,
+    // accepts the underscores a literal may carry, and answers with a big
+    // integer for a literal too wide for a machine word.  Its ValueError
+    // already names the base and the source.
+    let text = raw.to_string_lossy().into_owned();
+    let roots = pyre_object::gc_roots::push_roots();
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(pyre_object::w_str_new(&text));
+    let parsed = crate::builtins::parse_int_from_str(
+        pyre_object::gc_roots::shadow_stack_get(source_slot),
+        &text,
+        base as u32,
+    );
+    match trap(parsed) {
+        Some(value) => pyobject::make_ref(value),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -685,7 +675,9 @@ pub unsafe extern "C" fn PyLong_AsDouble(object: *mut CPyObject) -> c_double {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyLong_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
-    (!object.is_null() && unsafe { pyre_object::is_int(object) }) as c_int
+    // A value too wide for a machine word is a `LONG_TYPE` object, which
+    // `is_int` alone does not admit.
+    (!object.is_null() && unsafe { pyre_object::pyobject::is_int_or_long(object) }) as c_int
 }
 
 #[unsafe(no_mangle)]

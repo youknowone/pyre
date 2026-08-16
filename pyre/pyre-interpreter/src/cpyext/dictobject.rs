@@ -408,10 +408,22 @@ pub unsafe extern "C" fn PyDict_Merge(
     let target = || pyre_object::gc_roots::shadow_stack_get(base);
     let source_now = pyre_object::gc_roots::shadow_stack_get(base + 1);
 
+    // The pairs go on the shadow stack rather than staying in the vector they
+    // arrive in: `contains` and `setitem` below run the target's own
+    // `__contains__` / `__setitem__` and re-hash the key, so either can
+    // collect, and a `Vec` is not somewhere the collector looks.  The
+    // containers are already re-read per iteration for exactly that reason.
+    //
     // A mapping that is not a dict is read through `keys()`, as upstream does
     // for the non-dict case (`dictobject.py:214-231`).
-    let items: Vec<(PyObjectRef, PyObjectRef)> = if unsafe { pyre_object::is_dict(source_now) } {
-        unsafe { pyre_object::dictmultiobject::w_dict_items(source_now) }
+    let (pairs, count) = if unsafe { pyre_object::is_dict(source_now) } {
+        let items: Vec<(PyObjectRef, PyObjectRef)> =
+            unsafe { pyre_object::dictmultiobject::w_dict_items(source_now) };
+        let flat: Vec<PyObjectRef> = items
+            .iter()
+            .flat_map(|&(key, value)| [key, value])
+            .collect();
+        (pyre_object::gc_roots::pin_roots(&flat), items.len())
     } else {
         let keys = match trap(call_keys(source_now)) {
             Some(keys) => keys,
@@ -425,23 +437,30 @@ pub unsafe extern "C" fn PyDict_Merge(
             Some(keys) => keys,
             None => return -1,
         };
-        let mut pairs = Vec::with_capacity(keys.len());
-        for key in keys {
+        // `getitem` runs the mapping's own `__getitem__`, so the keys are read
+        // back per iteration and each pair is published as it is produced.
+        let unpacked = pyre_object::gc_roots::pin_roots(&keys);
+        let pairs = pyre_object::gc_roots::shadow_stack_len();
+        for index in 0..keys.len() {
             let value = match trap(crate::baseobjspace::getitem(
                 pyre_object::gc_roots::shadow_stack_get(base + 1),
-                key,
+                pyre_object::gc_roots::shadow_stack_get(unpacked + index),
             )) {
                 Some(value) => value,
                 None => return -1,
             };
-            pairs.push((key, value));
+            roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
+            roots.pin_root(value);
         }
-        pairs
+        (pairs, keys.len())
     };
 
-    for (key, value) in items {
+    for index in 0..count {
         if over == 0 {
-            match crate::baseobjspace::contains(target(), key) {
+            match crate::baseobjspace::contains(
+                target(),
+                pyre_object::gc_roots::shadow_stack_get(pairs + index * 2),
+            ) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
@@ -450,6 +469,8 @@ pub unsafe extern "C" fn PyDict_Merge(
                 }
             }
         }
+        let key = pyre_object::gc_roots::shadow_stack_get(pairs + index * 2);
+        let value = pyre_object::gc_roots::shadow_stack_get(pairs + index * 2 + 1);
         if trap(crate::baseobjspace::setitem(target(), key, value)).is_none() {
             return -1;
         }
@@ -493,9 +514,16 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
     ))) else {
         return -1;
     };
-    for (index, pair) in pairs.into_iter().enumerate() {
+    // The unpacked sequence and each pair's two elements are read back out of
+    // the shadow stack, not carried in their vectors: `unpack_all`, `contains`
+    // and `setitem` all run user code, and a `Vec` is not somewhere the
+    // collector looks.  Each iteration opens its own scope so the pushes it
+    // makes are popped again rather than growing with the sequence.
+    let unpacked = pyre_object::gc_roots::pin_roots(&pairs);
+    for index in 0..pairs.len() {
+        let pair_roots = pyre_object::gc_roots::push_roots();
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-        roots.pin_root(pair);
+        pair_roots.pin_root(pyre_object::gc_roots::shadow_stack_get(unpacked + index));
         let Some(items) = trap(unpack_all(pyre_object::gc_roots::shadow_stack_get(
             pair_slot,
         ))) else {
@@ -508,9 +536,12 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
             )));
             return -1;
         }
-        let (key, value) = (items[0], items[1]);
+        let element = pyre_object::gc_roots::pin_roots(&items);
         if over == 0 {
-            match crate::baseobjspace::contains(target(), key) {
+            match crate::baseobjspace::contains(
+                target(),
+                pyre_object::gc_roots::shadow_stack_get(element),
+            ) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(error) => {
@@ -519,6 +550,8 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
                 }
             }
         }
+        let key = pyre_object::gc_roots::shadow_stack_get(element);
+        let value = pyre_object::gc_roots::shadow_stack_get(element + 1);
         if trap(crate::baseobjspace::setitem(target(), key, value)).is_none() {
             return -1;
         }

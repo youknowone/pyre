@@ -4829,15 +4829,6 @@ impl MiniMarkGC {
     /// reference to a white object. Walk the root sets once more here and turn
     /// the black ones gray again; this can only add survivors, never free a
     /// reachable object.
-    /// incminimark.py:2761-2763 `visit_all_objects`: mark until the worklist is
-    /// empty.  Every caller that seeds a root outside the incremental budget
-    /// finishes it here rather than leaving work for the next step.
-    fn drain_gray_stack(&mut self) {
-        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
-            self.mark_object(obj_addr);
-        }
-    }
-
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
         for gcref in self.enumerate_root_walker_values() {
             if gcref.is_null() {
@@ -4855,6 +4846,15 @@ impl MiniMarkGC {
                 self.seed_major_root(gcref, "marking_regray_root");
             }
         }
+        while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
+            self.mark_object(obj_addr);
+        }
+    }
+
+    /// incminimark.py:2761-2763 `visit_all_objects`: mark until the worklist is
+    /// empty.  Every caller that seeds a root outside the incremental budget
+    /// finishes it here rather than leaving work for the next step.
+    fn drain_gray_stack(&mut self) {
         while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
             self.mark_object(obj_addr);
         }

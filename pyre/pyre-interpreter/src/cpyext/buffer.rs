@@ -718,38 +718,54 @@ pub unsafe extern "C" fn PyObject_CopyData(
 
 // ── the legacy character-buffer entry points ────────────────────────────
 
-/// End a legacy export while leaving the address it handed out usable.
-///
-/// A C exporter's memory outlives the export, so the export is closed here as
-/// `buffer.py:179-195` closes it -- an exporter that counts its exports, or
-/// that allocated `internal`, otherwise never gets the balancing call.  A
-/// snapshot this layer took *is* the address, and releasing it would free what
-/// the caller was just handed, so only the reference the structure holds goes.
-unsafe fn close_legacy(view: *mut CPyBuffer) {
-    let snapshot = snapshots()
-        .lock()
-        .contains_key(&(unsafe { (*view).buf } as usize));
-    if snapshot {
-        unsafe { pyobject::decref((*view).obj) };
-    } else {
-        unsafe { PyBuffer_Release(view) };
-    }
-}
-
+/// These spellings hand out an address and have no release call at all, so the
+/// export is closed here as `buffer.py:179-195` closes it -- an exporter that
+/// counts its exports, or that allocated `internal`, otherwise never gets the
+/// balancing call, and its memory outlives the export either way.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_AsCharBuffer(
     object: *mut CPyObject,
     buffer: *mut *const c_char,
     size: *mut isize,
 ) -> c_int {
-    let mut view = unsafe { std::mem::zeroed::<CPyBuffer>() };
-    if unsafe { PyObject_GetBuffer(object, &raw mut view, 0) } < 0 {
+    let Some(w_obj) = argument(object) else {
         return -1;
+    };
+    if !slot_of(w_obj, getbuffer_of).is_null() {
+        let mut view = unsafe { std::mem::zeroed::<CPyBuffer>() };
+        if unsafe { PyObject_GetBuffer(object, &raw mut view, 0) } < 0 {
+            return -1;
+        }
+        unsafe {
+            *buffer = view.buf as *const c_char;
+            *size = view.len;
+            PyBuffer_Release(&raw mut view);
+        }
+        return 0;
     }
+    // An interpreter object has no exporter to hand an address back to, so the
+    // bytes C reads are this layer's own copy.  With no release call to free it
+    // by, the copy is the mirror's cached one, which dies with the mirror -- a
+    // per-call snapshot would have no owner at all.
+    let acquired = crate::baseobjspace::full_ro_buffer_bytes(w_obj);
+    let bytes = match super::pyerrors::trap(acquired) {
+        Some(Some(acquired)) => {
+            let bytes = acquired.as_bytes().to_vec();
+            acquired.release();
+            bytes
+        }
+        Some(None) => {
+            super::pyerrors::set_pending_error(crate::PyError::type_error(
+                "a bytes-like object is required",
+            ));
+            return -1;
+        }
+        None => return -1,
+    };
+    let (pointer, length) = unsafe { pyobject::cached_bytes(object, || bytes) };
     unsafe {
-        *buffer = view.buf as *const c_char;
-        *size = view.len;
-        close_legacy(&raw mut view);
+        *buffer = pointer;
+        *size = length as isize;
     }
     0
 }
@@ -781,7 +797,7 @@ pub unsafe extern "C" fn PyObject_AsWriteBuffer(
     unsafe {
         *buffer = view.buf;
         *size = view.len;
-        close_legacy(&raw mut view);
+        PyBuffer_Release(&raw mut view);
     }
     0
 }

@@ -1597,6 +1597,55 @@ fn set_builtin_module_spec(_name: &str, _module: PyObjectRef) -> Result<(), crat
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 ))]
+/// The `ModuleSpec` an extension file is loaded under, or `PY_NULL` when the
+/// importlib bootstrap is not wired up yet.
+///
+/// Built before the extension's init function runs, because a PEP 489
+/// `Py_mod_create` slot is handed the spec and reads its `name` and `origin`:
+/// a `Py_mod_create` given NULL dereferences it.
+///
+/// The caller must root the result before anything else allocates.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let Some(ext) = get_sys_module("importlib._bootstrap_external") else {
+        return pyre_object::PY_NULL;
+    };
+    let _roots = push_roots();
+    let ext_slot = shadow_stack_len();
+    pin_root(ext);
+    let Ok(from_location) =
+        crate::baseobjspace::getattr_str(shadow_stack_get(ext_slot), "spec_from_file_location")
+    else {
+        return pyre_object::PY_NULL;
+    };
+    let from_location_slot = shadow_stack_len();
+    pin_root(from_location);
+    let w_name = pyre_object::w_str_new(name);
+    let name_slot = shadow_stack_len();
+    pin_root(w_name);
+    let w_path = crate::gateway::fsdecode_os_str(pathname.as_os_str());
+    let path_slot = shadow_stack_len();
+    pin_root(w_path);
+    // A suffix `_get_supported_file_loaders` does not know yields `None`; that
+    // is the same "no spec" answer as a missing bootstrap.
+    let Ok(spec) = crate::call::call_function_impl_result(
+        shadow_stack_get(from_location_slot),
+        &[shadow_stack_get(name_slot), shadow_stack_get(path_slot)],
+    ) else {
+        return pyre_object::PY_NULL;
+    };
+    if unsafe { pyre_object::is_none(spec) } {
+        return pyre_object::PY_NULL;
+    }
+    spec
+}
+
 fn set_extension_module_spec(
     name: &str,
     pathname: &Path,
@@ -3933,12 +3982,21 @@ fn load_part(
             any(target_os = "macos", target_os = "linux")
         ))]
         FindInfo::ExtensionFile { pathname } => {
-            let module =
-                crate::cpyext::load_extension_module(modulename, &pathname, pyre_object::PY_NULL)?;
             let roots = pyre_object::gc_roots::push_roots();
+            let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(extension_module_spec(modulename, &pathname));
+            let module = crate::cpyext::load_extension_module(
+                modulename,
+                &pathname,
+                pyre_object::gc_roots::shadow_stack_get(spec_slot),
+            )?;
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(module);
-            set_extension_module_spec(modulename, &pathname, module)?;
+            set_extension_module_spec(
+                modulename,
+                &pathname,
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
+            )?;
             // `_imp.create_dynamic` leaves the second PEP 489 phase to
             // importlib's `_imp.exec_dynamic`; this importer runs both, so the
             // exec slots run here, after `__spec__` is in place.
@@ -3951,9 +4009,14 @@ fn load_part(
             any(target_os = "macos", target_os = "linux")
         ))]
         FindInfo::ExtensionPackage { dirpath, pathname } => {
-            let module =
-                crate::cpyext::load_extension_module(modulename, &pathname, pyre_object::PY_NULL)?;
             let roots = pyre_object::gc_roots::push_roots();
+            let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+            roots.pin_root(extension_module_spec(modulename, &pathname));
+            let module = crate::cpyext::load_extension_module(
+                modulename,
+                &pathname,
+                pyre_object::gc_roots::shadow_stack_get(spec_slot),
+            )?;
             let module_slot = pyre_object::gc_roots::shadow_stack_len();
             roots.pin_root(module);
             set_extension_module_spec(

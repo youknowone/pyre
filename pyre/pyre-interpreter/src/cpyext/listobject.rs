@@ -12,7 +12,9 @@ pub unsafe extern "C" fn PyList_New(size: isize) -> *mut CPyObject {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    let items = vec![pyre_object::w_none(); size as usize];
+    let Some(items) = super::object::item_slots(size, pyre_object::w_none()) else {
+        return std::ptr::null_mut();
+    };
     pyobject::make_ref(pyre_object::listobject::w_list_new_object(items))
 }
 

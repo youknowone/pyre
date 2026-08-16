@@ -11,7 +11,9 @@
 
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::hash::BuildHasherDefault;
 use std::sync::OnceLock;
 
 pub const METH_VARARGS: c_int = 0x0001;
@@ -40,6 +42,52 @@ const NAME_KEY: &str = "__name__";
 const QUALNAME_KEY: &str = "__qualname__";
 const DOC_KEY: &str = "__doc__";
 const MODULE_KEY: &str = "__module__";
+
+/// Every `PyMethodDef` row a carrier may name.
+///
+/// The carrier records an index into this table rather than the definition's
+/// address.  Its namespace is reachable from Python — `__dict__` is a mapping
+/// like any other — so whatever the carrier holds is under the writer's
+/// control; an index naming no row is refused, where an address would be
+/// transmuted to a function pointer and called.
+///
+/// The definitions live in the loaded extension's static storage, which the
+/// module cache keeps mapped, so the table only ever grows by one row per
+/// distinct method row converted.
+#[derive(Default)]
+struct MethodDefTable {
+    rows: Vec<usize>,
+    index_of: HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>,
+}
+
+static METHOD_DEFS: super::ForkMutex<MethodDefTable> = super::ForkMutex::new(MethodDefTable {
+    rows: Vec::new(),
+    index_of: HashMap::with_hasher(BuildHasherDefault::new()),
+});
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe { METHOD_DEFS.reinit_after_fork() };
+}
+
+/// The index `method` is filed under, entering it if it is new.
+fn intern_method_def(method: *mut CPyMethodDef) -> i64 {
+    let address = method as usize;
+    let mut table = METHOD_DEFS.lock();
+    if let Some(&index) = table.index_of.get(&address) {
+        return index as i64;
+    }
+    let index = table.rows.len();
+    table.rows.push(address);
+    table.index_of.insert(address, index);
+    index as i64
+}
+
+/// The definition an index names, or `None` for one that names no row.
+fn method_def_at(index: i64) -> Option<*mut CPyMethodDef> {
+    let table = METHOD_DEFS.lock();
+    let address = *table.rows.get(usize::try_from(index).ok()?)?;
+    Some(address as *mut CPyMethodDef)
+}
 
 static PYCFUNCTION_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
@@ -146,10 +194,7 @@ pub fn new_pycfunction(
         MODULE_KEY,
         pyre_object::gc_roots::shadow_stack_get(module_slot),
     );
-    // The definition lives in the extension's static storage, which the loaded
-    // library owns for as long as the module cache holds its handle, so the
-    // address is recorded rather than the table copied.
-    let ml = pyre_object::w_int_new(method as usize as i64);
+    let ml = pyre_object::w_int_new(intern_method_def(method));
     carrier_set(
         pyre_object::gc_roots::shadow_stack_get(carrier_slot),
         ML_KEY,
@@ -163,8 +208,7 @@ fn method_def(carrier: PyObjectRef) -> Option<*mut CPyMethodDef> {
     if !unsafe { pyre_object::is_int(ml) } {
         return None;
     }
-    let address = unsafe { pyre_object::w_int_get_value(ml) } as usize;
-    (address != 0).then_some(address as *mut CPyMethodDef)
+    method_def_at(unsafe { pyre_object::w_int_get_value(ml) })
 }
 
 fn method_name(carrier: PyObjectRef) -> String {
@@ -237,7 +281,11 @@ pub(super) fn call_method_def(
             positional.len()
         )));
     }
-    if flags & (METH_NOARGS | METH_O | METH_VARARGS | METH_FASTCALL) == 0 {
+    // Exactly one, not at least one: the flags select which signature
+    // `ml_meth` has, so a table declaring two of them names no signature at
+    // all and would otherwise be dispatched through whichever this layer
+    // happens to test for first.
+    if (flags & (METH_NOARGS | METH_O | METH_VARARGS | METH_FASTCALL)).count_ones() != 1 {
         return Err(crate::PyError::runtime_error(format!(
             "{name}() uses an unknown calling convention"
         )));

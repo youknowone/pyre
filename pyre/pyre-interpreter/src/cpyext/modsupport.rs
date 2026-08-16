@@ -6,6 +6,7 @@ use super::pyerrors::{self, trap};
 use super::pyobject::{self, CPyObject, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
 use std::ffi::{CStr, c_char, c_int, c_long, c_void};
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 /// `Py_mod_create`.
@@ -19,14 +20,67 @@ const PY_MOD_EXEC: c_int = 2;
 const PYTHON_API_VERSION: c_int = 1013;
 const PYTHON_ABI_VERSION: c_int = 3;
 
-/// Reserved module-dict keys.
+/// The `md_def` and `md_state` CPython keeps in the module object's own C
+/// struct.
 ///
-/// CPython keeps `md_def` and `md_state` in the module object's own C struct.
-/// Pyre's module has no such fields, so they ride the module dictionary under
-/// names a C module cannot produce through `PyModule_AddObject`; the values are
-/// addresses, held as ints.
-const MD_DEF_KEY: &str = "__pyre_md_def__";
-const MD_STATE_KEY: &str = "__pyre_md_state__";
+/// Pyre's module has no such fields.  The module dictionary is not a place to
+/// put them: it is the module's Python-visible namespace, so `vars(mod)` and
+/// `mod.__dict__[...] = 0` both reach it, and `PyModule_GetState` would then
+/// hand a C extension an address of the writer's choosing to dereference.  A
+/// mirror is the C-side half of the module, never moves, and dies with the
+/// module, so the pair is filed under the mirror's address instead.
+#[derive(Clone, Copy, Default)]
+struct ModuleFields {
+    md_def: usize,
+    md_state: usize,
+}
+
+type ModuleTable =
+    std::collections::HashMap<usize, ModuleFields, BuildHasherDefault<std::hash::DefaultHasher>>;
+static MODULE_FIELDS: super::ForkMutex<ModuleTable> = super::ForkMutex::new(
+    std::collections::HashMap::with_hasher(BuildHasherDefault::new()),
+);
+
+pub(super) unsafe fn after_fork_child() {
+    unsafe { MODULE_FIELDS.reinit_after_fork() };
+}
+
+/// The pair a module has recorded, all zero for one that has recorded none.
+///
+/// The read never builds a mirror: a module with none has nothing filed.
+fn fields(module: PyObjectRef) -> ModuleFields {
+    let mirror = pyobject::as_pyobj(module) as usize;
+    if mirror == 0 {
+        return ModuleFields::default();
+    }
+    MODULE_FIELDS
+        .lock()
+        .get(&mirror)
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Record one of the pair, building the module's mirror if it has none.
+///
+/// # Safety
+/// The caller must be holding `module` rooted, as [`pyobject::borrow_mirror`]
+/// requires.
+fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
+    // Outside the lock: building a mirror takes the census lock of its own.
+    let mirror = pyobject::borrow_mirror(module) as usize;
+    if mirror == 0 {
+        return;
+    }
+    update(MODULE_FIELDS.lock().entry(mirror).or_default());
+}
+
+/// Drop what a dying module mirror recorded.
+///
+/// The state block itself is not freed: pyre has no module deallocation path,
+/// and an extension may still hold the address.
+pub(super) fn forget_module_fields(mirror: usize) {
+    MODULE_FIELDS.lock().remove(&mirror);
+}
 
 static NEXT_MODULE_INDEX: AtomicIsize = AtomicIsize::new(1);
 
@@ -73,19 +127,6 @@ fn module_dict(module: PyObjectRef) -> PyObjectRef {
 
 fn store(module: PyObjectRef, name: &str, value: PyObjectRef) {
     crate::module_ns_store(module_dict(module), name, value);
-}
-
-fn stored_address(module: PyObjectRef, key: &str) -> usize {
-    let dict = module_dict(module);
-    if dict.is_null() {
-        return 0;
-    }
-    match unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(dict, key) } {
-        Some(value) if unsafe { pyre_object::is_int(value) } => unsafe {
-            pyre_object::w_int_get_value(value) as usize
-        },
-        _ => 0,
-    }
 }
 
 /// `modsupport.py:convert_method_defs`, module branch.
@@ -150,15 +191,7 @@ fn allocate_module_state(module: PyObjectRef, size: isize) -> Result<(), crate::
             "cannot allocate cpyext module state",
         ));
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
-    let value = pyre_object::w_int_new(block as usize as i64);
-    store(
-        pyre_object::gc_roots::shadow_stack_get(module_slot),
-        MD_STATE_KEY,
-        value,
-    );
+    set_field(module, |fields| fields.md_state = block as usize);
     Ok(())
 }
 
@@ -177,8 +210,7 @@ fn populate_module(
     roots.pin_root(module);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
 
-    let value = pyre_object::w_int_new(def as usize as i64);
-    store(reload(module_slot), MD_DEF_KEY, value);
+    set_field(reload(module_slot), |fields| fields.md_def = def as usize);
 
     if let Some(path) = path {
         let value = crate::gateway::fsdecode_os_str(path.as_os_str());
@@ -326,6 +358,17 @@ pub(super) fn create_module_from_def_and_spec(
         slot = unsafe { slot.add(1) };
     }
 
+    // The create slot is handed the spec as its first argument and reads
+    // `spec.name` out of it, so a NULL is dereferenced inside the extension.
+    // An import that reaches here before the importlib bootstrap can build a
+    // spec has none to hand over.
+    if !create.is_null() && spec.is_null() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("module {name}: the create slot needs a module spec"),
+        ));
+    }
+
     let roots = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(spec);
@@ -376,13 +419,13 @@ pub(super) fn create_module_from_def_and_spec(
 /// `true` once the module owns a state block, which is what
 /// `exec_extension_module` reads to tell an executed module from a fresh one.
 pub(super) fn has_module_state(module: PyObjectRef) -> bool {
-    stored_address(module, MD_STATE_KEY) != 0
+    fields(module).md_state != 0
 }
 
 /// `modsupport.py:exec_def` — the PEP 489 exec phase, on the definition the
 /// module recorded for itself.
 pub(super) fn exec_def(module: PyObjectRef) -> Result<(), crate::PyError> {
-    let address = stored_address(module, MD_DEF_KEY);
+    let address = fields(module).md_def;
     if address == 0 {
         return Ok(());
     }
@@ -473,7 +516,7 @@ pub unsafe extern "C" fn PyModule_GetState(module: *mut CPyObject) -> *mut c_voi
     let Some(module) = module_argument(module, "PyModule_GetState") else {
         return std::ptr::null_mut();
     };
-    stored_address(module, MD_STATE_KEY) as *mut c_void
+    fields(module).md_state as *mut c_void
 }
 
 #[unsafe(no_mangle)]
@@ -481,7 +524,7 @@ pub unsafe extern "C" fn PyModule_GetDef(module: *mut CPyObject) -> *mut CPyModu
     let Some(module) = module_argument(module, "PyModule_GetDef") else {
         return std::ptr::null_mut();
     };
-    stored_address(module, MD_DEF_KEY) as *mut CPyModuleDef
+    fields(module).md_def as *mut CPyModuleDef
 }
 
 /// Steals a reference to `value` on success, which is `PyModule_AddObject`'s

@@ -82,13 +82,38 @@ const _: () = {
 /// and 0 for a block it does not — a `static` in this crate or in the loaded
 /// extension.
 ///
+/// The `generation` distinguishes this block from a later one the allocator
+/// hands out at the same address, which an address alone cannot: a `tp_dealloc`
+/// that frees its block and allocates during the same call can be given the
+/// address it just released.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Block {
+    size: usize,
+    generation: u64,
+}
+
 /// The P list itself belongs to the collector, which is where every question
 /// about a link is now asked; this survives only because a mirror block's size
 /// is not something the collector has any reason to know.  Its keys are mirror
 /// addresses, which never move, so it needs no collection-time maintenance.
-type BlockSizes = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSizes = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
 static BLOCK_SIZES: ForkMutex<BlockSizes> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+
+/// Stamps every block with the order it was handed out in.
+static BLOCK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Enter a block this layer handed out, under a generation of its own.
+fn record_block(address: usize, size: usize) {
+    let generation = BLOCK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BLOCK_SIZES
+        .lock()
+        .insert(address, Block { size, generation });
+}
+
+fn block_at(address: usize) -> Option<Block> {
+    BLOCK_SIZES.lock().get(&address).copied()
+}
 
 pub(super) unsafe fn after_fork_child() {
     unsafe {
@@ -197,7 +222,7 @@ fn enter(w_obj: PyObjectRef, raw: *mut CPyObject, size: usize) {
         unsafe { (*raw).ob_refcnt } >= REFCNT_FROM_PYRE,
         "a linked mirror carries the link share"
     );
-    BLOCK_SIZES.lock().insert(raw as usize, size);
+    record_block(raw as usize, size);
     majit_gc::gc_rawrefcount_create_link_pyre(majit_ir::GcRef(w_obj as usize), raw as usize);
 }
 
@@ -352,12 +377,17 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     release_borrowed(raw);
     BYTE_CACHE.lock().remove(&address);
     super::dictobject::forget_iteration(address);
+    super::modsupport::forget_module_fields(address);
+    let block = block_at(address);
     if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
         unsafe { call(raw) };
         // A `tp_dealloc` ends in `tp_free`, which returns the block through
         // [`free_block`]; if it did, the address is no longer ours to touch.
-        if !BLOCK_SIZES.lock().contains_key(&address) {
+        // The generation and not just the address decides it: a `tp_dealloc`
+        // that allocates after freeing can be handed the address back, and
+        // what sits there then is somebody else's live block.
+        if block_at(address) != block {
             return;
         }
     }
@@ -390,7 +420,7 @@ pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
     if raw.is_null() {
         return std::ptr::null_mut();
     }
-    BLOCK_SIZES.lock().insert(raw as usize, size);
+    record_block(raw as usize, size);
     raw as *mut std::ffi::c_void
 }
 
@@ -408,17 +438,16 @@ pub(super) unsafe fn reallocate_raw(
     }
     // A block this layer did not hand out has no recorded size, so there is no
     // layout to hand `realloc` and no way to move it.
-    let Some(old) = BLOCK_SIZES.lock().get(&(raw as usize)).copied() else {
+    let Some(old) = block_at(raw as usize) else {
         return std::ptr::null_mut();
     };
     let size = size.max(size_of::<CPyObject>());
-    let moved = unsafe { std::alloc::realloc(raw as *mut u8, block_layout(old), size) };
+    let moved = unsafe { std::alloc::realloc(raw as *mut u8, block_layout(old.size), size) };
     if moved.is_null() {
         return std::ptr::null_mut();
     }
-    let mut sizes = BLOCK_SIZES.lock();
-    sizes.remove(&(raw as usize));
-    sizes.insert(moved as usize, size);
+    BLOCK_SIZES.lock().remove(&(raw as usize));
+    record_block(moved as usize, size);
     moved as *mut std::ffi::c_void
 }
 
@@ -430,15 +459,15 @@ pub(super) unsafe fn reallocate_raw(
 /// # Safety
 /// `raw` must be a block this module entered, and must not be used afterwards.
 pub(super) unsafe fn free_block(raw: *mut CPyObject) {
-    let Some(size) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
+    let Some(block) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
         return;
     };
     unsafe {
         (*raw).ob_pyre_link = PY_NULL;
         (*raw).ob_refcnt = 0;
     }
-    if size != 0 {
-        unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(size)) };
+    if block.size != 0 {
+        unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(block.size)) };
     }
 }
 
@@ -466,7 +495,19 @@ pub fn drain_dead() {
 /// `ob_item` array of owned references (`tupleobject.py:tuple_attach`); pyre
 /// records the same ownership here, keyed by the container's mirror, and
 /// releases it when that mirror is deallocated.
-type BorrowMap = HashMap<usize, Vec<usize>, BuildHasherDefault<std::hash::DefaultHasher>>;
+///
+/// The ownership is per *item*, where upstream's is per *slot*: a mutable
+/// container that has held many different items over its life keeps one
+/// reference to each of them until the container itself dies, so an item
+/// removed from a long-lived list is held here after the list stopped naming
+/// it.  Indexing this by slot the way `ob_item` does is what removes that
+/// retention, and needs the mutators to drop the slot's old entry.
+///
+/// A set, not a list: the membership test below runs once per item read, so a
+/// C loop over `PyTuple_GetItem` for every item of an n-item container would
+/// otherwise scan n/2 entries per step.
+type BorrowSet = std::collections::HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BorrowMap = HashMap<usize, BorrowSet, BuildHasherDefault<std::hash::DefaultHasher>>;
 static BORROWED: ForkMutex<BorrowMap> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -485,12 +526,13 @@ pub(super) fn borrow_from(container: *mut CPyObject, w_item: PyObjectRef) -> *mu
         return item;
     }
     let mut borrowed = BORROWED.lock();
-    let owned = borrowed.entry(container as usize).or_default();
-    if owned.contains(&(item as usize)) {
+    let fresh = borrowed
+        .entry(container as usize)
+        .or_default()
+        .insert(item as usize);
+    if !fresh {
         drop(borrowed);
         unsafe { decref(item) };
-    } else {
-        owned.push(item as usize);
     }
     item
 }

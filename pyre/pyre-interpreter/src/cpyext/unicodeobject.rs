@@ -73,11 +73,16 @@ pub unsafe extern "C" fn PyUnicode_AsUTF8AndSize(
     let Some(value) = text_argument(object, "PyUnicode_AsUTF8") else {
         return std::ptr::null();
     };
-    let (pointer, length) = unsafe {
-        pyobject::cached_bytes(object, || {
-            pyre_object::w_str_get_wtf8(value).as_bytes().to_vec()
-        })
+    // The interpreter buffer is WTF-8, so a lone surrogate has to be refused
+    // here rather than handed to C as invalid UTF-8.
+    let Some(encoded) = super::pyerrors::trap(crate::baseobjspace::str_utf8_w(value)) else {
+        if !size.is_null() {
+            unsafe { *size = -1 };
+        }
+        return std::ptr::null();
     };
+    let (pointer, length) =
+        unsafe { pyobject::cached_bytes(object, || encoded.as_bytes().to_vec()) };
     if !size.is_null() {
         unsafe { *size = length as isize };
     }

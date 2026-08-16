@@ -35,6 +35,25 @@ pub(super) fn is_exactly(object: PyObjectRef, tp: *const pyre_object::PyType) ->
     }
 }
 
+/// `size` slots holding `fill`, or `None` with `MemoryError` recorded.
+///
+/// A sequence constructor takes its length from C, so the request can be one
+/// no allocator can satisfy.  `tuple_alloc` answers that with `PyErr_NoMemory`,
+/// where the `vec![fill; size]` this replaces panics — an unwind out of an
+/// `extern "C"` frame, which aborts the process.
+pub(super) fn item_slots(size: isize, fill: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    let size = size.max(0) as usize;
+    let mut items: Vec<PyObjectRef> = Vec::new();
+    if size > isize::MAX as usize / std::mem::size_of::<PyObjectRef>()
+        || items.try_reserve_exact(size).is_err()
+    {
+        unsafe { super::pyerrors::PyErr_NoMemory() };
+        return None;
+    }
+    items.resize(size, fill);
+    Some(items)
+}
+
 /// A new reference to the result of an interpreter operation, or NULL with the
 /// error recorded.
 pub(super) fn result(value: Result<PyObjectRef, crate::PyError>) -> *mut CPyObject {
@@ -1147,11 +1166,13 @@ pub unsafe extern "C" fn PyObject_VectorcallMethod(
     nargsf: usize,
     kwnames: *mut CPyObject,
 ) -> *mut CPyObject {
-    let (Some(name), true) = (argument(name), vectorcall_nargs(nargsf) >= 1) else {
+    if vectorcall_nargs(nargsf) < 1 {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
-    };
-    let Some(receiver) = argument(unsafe { *args }) else {
+    }
+    // `argument` reports a NULL itself, so the arity is the only condition
+    // left to raise for.
+    let (Some(name), Some(receiver)) = (argument(name), argument(unsafe { *args })) else {
         return std::ptr::null_mut();
     };
     // The bound method carries the receiver, so the remaining vector is the
