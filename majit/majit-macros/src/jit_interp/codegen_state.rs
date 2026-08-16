@@ -898,7 +898,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             extern "C" fn #fresh_alloc_fn(__cap: i64) -> i64 {
                 let __fresh: ::std::boxed::Box<#state_type> = ::std::boxed::Box::new(#state_type {
                     #(#fresh_entry_scalar_inits)*
-                    #virt_name: ::std::vec![#virt_zero; __cap as usize],
+                    // Same backing-trait construction the fresh-reds path uses:
+                    // the field keeps whatever container it was declared with,
+                    // and the target type comes from the field being filled.
+                    #virt_name: majit_metainterp::virt_array::VirtArrayBacking::filled(
+                        #virt_zero,
+                        __cap as usize,
+                    ),
                 });
                 ::std::boxed::Box::into_raw(__fresh) as i64
             }
