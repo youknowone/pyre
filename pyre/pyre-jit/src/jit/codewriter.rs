@@ -4929,6 +4929,14 @@ fn filter_liveness_in_place(
     for (pos, _) in ssarepr.abort_permanent_insn_pos.iter_mut() {
         *pos = remap[*pos];
     }
+    // Same pre-merge stream, same rewrite.  `compute_liveness` DELETES repeated
+    // `-live-` ops, so an unremapped position does not merely drift, it can
+    // address past the shortened stream and trip
+    // `insn_pos_to_byte_offset`'s range check.  Collapsing two runs onto one
+    // position is expected here and is deduped when the byte table is built.
+    for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
+        *pos = remap[*pos];
+    }
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let nlocals = code.varnames.len();
     let live_markers_out = live_markers.clone();
@@ -14403,6 +14411,11 @@ impl CodeWriter {
         ssarepr.insns = spliced.insns;
         ssarepr.pc_first_insn_pos = spliced.pc_first_insn_pos;
         ssarepr.abort_permanent_insn_pos = spliced.abort_permanent_insn_pos;
+        // Every insn-index side table the splice rebuilt has to come back here.
+        // `stream_positions_mut` keeps a table in sync with the SHIFTS a pass
+        // applies, but this assignment replaces the stream wholesale, so a
+        // table left out silently keeps its pre-splice contents.
+        ssarepr.pc_run_insn_pos = spliced.pc_run_insn_pos;
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
@@ -14750,10 +14763,13 @@ impl CodeWriter {
         // sparse group: `finish_with_positions_from` consumes `ssarepr`, so the
         // owning Python PCs are read off it here, before the call.
         let abort_permanent_some: Vec<(usize, i64)> = ssarepr.abort_permanent_insn_pos.clone();
+        // PC-run starts ride the same translation as a fourth sparse group.
+        let pc_run_some: Vec<(usize, i64)> = ssarepr.pc_run_insn_pos.clone();
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(abort_permanent_some.iter().map(|(idx, _)| *idx));
+        combined_indices.extend(pc_run_some.iter().map(|(idx, _)| *idx));
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -14774,6 +14790,24 @@ impl CodeWriter {
             .collect();
         abort_permanent_py_pc_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         abort_permanent_py_pc_by_jit_pc.dedup_by_key(|&mut (off, _)| off);
+        // Exact jitcode-offset -> owning-Python-PC segmentation, one entry per
+        // contiguous emission run.  Unlike `py_floor_by_jit_pc` below this is
+        // NOT derived from the first-offset-per-PC table, so a PC that emits in
+        // two disjoint regions keeps both, and the byte range between two
+        // consecutive entries is exactly one opcode's emission.
+        let pc_run_base = abort_permanent_base + abort_permanent_some.len();
+        let mut py_exact_by_jit_pc: Vec<(u32, u32)> = pc_run_some
+            .iter()
+            .enumerate()
+            .filter_map(|(k, (_, py_pc))| {
+                let off = u32::try_from(combined_bytes[pc_run_base + k]).ok()?;
+                Some((off, u32::try_from(*py_pc).ok()?))
+            })
+            .collect();
+        py_exact_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        // A marker splice can land two runs on one offset; the later-emitted
+        // one owns it, matching the floor tier's later-py-wins tie break.
+        py_exact_by_jit_pc.dedup_by_key(|&mut (off, _)| off);
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
@@ -14838,6 +14872,23 @@ impl CodeWriter {
             .collect();
         if py_floor_by_jit_pc.first().is_none_or(|&(off, _)| off != 0) {
             py_floor_by_jit_pc.insert(0, (0, 0));
+        }
+        if std::env::var_os("PYRE_VSTACK_EXACT_AUDIT").is_some() {
+            eprintln!(
+                "[exact-build] runs_recorded={} translated={} floor_len={} n_py={} \
+                 first={:?} last={:?} maxoff_exact={:?} maxoff_floor={:?}",
+                pc_run_some.len(),
+                py_exact_by_jit_pc.len(),
+                py_floor_by_jit_pc.len(),
+                first_jit_pc_by_py_pc.len(),
+                py_exact_by_jit_pc.first(),
+                py_exact_by_jit_pc.last(),
+                py_exact_by_jit_pc.iter().map(|&(o, _)| o).max(),
+                first_jit_pc_by_py_pc
+                    .iter()
+                    .filter(|&&p| p != usize::MAX)
+                    .max(),
+            );
         }
 
         // Floor-only depth twin of the containing-opcode resolution
@@ -15312,6 +15363,7 @@ impl CodeWriter {
             n_py_instrs,
             block_head_py_by_jit_pc,
             py_floor_by_jit_pc,
+            py_exact_by_jit_pc,
             abort_permanent_py_pc_by_jit_pc,
             merge_entry_by_green,
             pcdep_by_jit_pc,

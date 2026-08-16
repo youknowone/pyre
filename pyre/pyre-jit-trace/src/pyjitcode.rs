@@ -89,6 +89,22 @@ pub struct PyJitCodeMetadata {
     /// predecessor op-start tier: exact block-head marker precedence remains in
     /// `block_head_py_by_jit_pc`. Empty for skeleton / fixture metadata.
     pub py_floor_by_jit_pc: Vec<(u32, u32)>,
+    /// JitCode byte-offset → owning Python PC, one entry per contiguous
+    /// emission run, sorted ascending by offset.
+    ///
+    /// `py_floor_by_jit_pc` above answers the same question from the
+    /// FIRST-offset-per-PC table, so it collapses a PC that emits in two
+    /// disjoint regions and its segment extent is not one opcode's byte range.
+    /// This table is recorded at emission instead, so consecutive entries
+    /// bracket exactly one opcode's bytes even when a block is drained out of
+    /// source order, a mid-opcode split reopens the same PC, or a can-raise
+    /// trailing marker is re-keyed to the call's fallthrough.
+    ///
+    /// That makes "did the walk leave the opcode it was in" answerable rather
+    /// than inferable: the PC owning `jit_pc` differing from the mirror's
+    /// current coordinate IS the opcode boundary. Empty for skeleton / fixture
+    /// metadata, in which case consumers must fall back to the floor tier.
+    pub py_exact_by_jit_pc: Vec<(u32, u32)>,
     /// Exact `abort_permanent` jitcode offset → the Python PC whose lowering
     /// emitted it, sorted ascending by offset for binary search.
     ///
@@ -472,6 +488,14 @@ pub fn derive_resume_marker(
 /// Return the floor segment containing `jit_pc` in a codewriter-built JitCode
 /// PC pivot. An empty table is deliberately distinguishable from the `(0, 0)`
 /// fallback segment carried by every drained install.
+/// Exact owning Python PC for a JitCode byte offset, from the per-emission
+/// run table. `None` when the table is empty (skeleton / fixture metadata) so
+/// the caller can fall back to the floor tier rather than read a bogus 0.
+pub fn exact_py_pc_for_jitcode_pc(py_exact_by_jit_pc: &[(u32, u32)], jit_pc: usize) -> Option<u32> {
+    let end = py_exact_by_jit_pc.partition_point(|&(off, _)| (off as usize) <= jit_pc);
+    end.checked_sub(1).map(|idx| py_exact_by_jit_pc[idx].1)
+}
+
 pub fn floor_segment_for_jitcode_pc(
     py_floor_by_jit_pc: &[(u32, u32)],
     jit_pc: usize,
@@ -1063,6 +1087,7 @@ impl PyJitCodeMetadata {
             n_py_instrs: 0,
             block_head_py_by_jit_pc: Vec::new(),
             py_floor_by_jit_pc: Vec::new(),
+            py_exact_by_jit_pc: Vec::new(),
             abort_permanent_py_pc_by_jit_pc: Vec::new(),
             merge_entry_by_green: Vec::new(),
             pcdep_by_jit_pc: Vec::new(),

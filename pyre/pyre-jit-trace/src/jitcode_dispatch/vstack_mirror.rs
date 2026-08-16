@@ -1047,6 +1047,30 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
             } else {
                 raw_depth()
             };
+            // Stage gate for the per-emission exact segmentation.  The
+            // boundary the mirror acts on is currently INFERRED — `py_pc` is
+            // the floor segment's owner, and whether an opcode retired is then
+            // guessed from (prev, new, depth).  `py_exact_by_jit_pc` answers it
+            // directly.  Compare the two at every step before any consumer
+            // trusts the new table: a disagreement is a boundary the floor tier
+            // reports differently from the emission record, and each one is a
+            // case the inference has to special-case.
+            if vstack_exact_audit_enabled() {
+                if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+                    &jc.payload.metadata.py_exact_by_jit_pc,
+                    jit_pc,
+                ) && exact != py_pc
+                {
+                    let code = &*jc.payload.code_ptr;
+                    eprintln!(
+                        "[vstack-exact] code={} jit_pc={jit_pc} floor_py={py_pc} \
+                         exact_py={exact} cur_py={} boundary={}",
+                        code.obj_name,
+                        ctx.vstack_cur_pypc,
+                        py_pc != ctx.vstack_cur_pypc,
+                    );
+                }
+            }
             (py_pc, jc.payload.code_ptr, depth)
         }
     };

@@ -126,6 +126,23 @@ pub struct SSARepr {
     /// are a handful per jitcode, so recording them exactly costs nothing that
     /// a dense per-op table would.
     pub abort_permanent_insn_pos: Vec<(usize, i64)>,
+    /// Pyre-only side-table: `(insns index, py_pc)` at every point the
+    /// emitted stream's owning Python PC CHANGES, in emission order.
+    ///
+    /// `pc_first_insn_pos` keeps only the first position per Python PC, so it
+    /// collapses a PC that emits in two places; the floor tier derived from it
+    /// therefore reports a segment extent that is not one opcode's byte range.
+    /// Three emission shapes make that gap real: a can-raise trailing `-live-`
+    /// re-keyed to the call's fallthrough PC, a block opened at an
+    /// already-merged PC and drained after later PCs, and a mid-opcode block
+    /// split that leaves one PC owning two disjoint regions.
+    ///
+    /// Recording the changes rather than every op keeps this the same order of
+    /// size as the floor table — one entry per contiguous run — while making
+    /// "which opcode owns this byte" exact, including for a re-entered PC.
+    /// Synthetic ops (`offset < 0`) start no run: they belong to whichever PC
+    /// was last anchored, which is what leaving the run open expresses.
+    pub pc_run_insn_pos: Vec<(usize, i64)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
     /// implicit identity and `regalloc.py` numbers them densely after
@@ -149,6 +166,7 @@ impl SSARepr {
             insns_pos: None,
             pc_first_insn_pos: Vec::new(),
             abort_permanent_insn_pos: Vec::new(),
+            pc_run_insn_pos: Vec::new(),
             next_var_idx: [0; 3],
         }
     }
@@ -163,6 +181,7 @@ impl SSARepr {
             .iter_mut()
             .map(|(_, pos)| pos)
             .chain(self.abort_permanent_insn_pos.iter_mut().map(|(pos, _)| pos))
+            .chain(self.pc_run_insn_pos.iter_mut().map(|(pos, _)| pos))
     }
 
     /// Allocate a fresh `(kind, index)` Variable for this SSARepr.
@@ -1386,6 +1405,16 @@ impl<'a> GraphFlattener<'a> {
             // what `loop_body_abort_permanent_pc` resolves a decline against.
             if op.opname == "abort_permanent" {
                 self.ssarepr.abort_permanent_insn_pos.push((pos, py_pc));
+            }
+            // Open a new run only where the owning PC actually changes, so the
+            // table stays one entry per contiguous region.
+            if self
+                .ssarepr
+                .pc_run_insn_pos
+                .last()
+                .is_none_or(|&(_, last_py)| last_py != py_pc)
+            {
+                self.ssarepr.pc_run_insn_pos.push((pos, py_pc));
             }
         }
         let insn = self.flatten_space_operation(op);

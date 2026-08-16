@@ -28,6 +28,17 @@ pub(crate) fn pcmap_containing_audit_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_PCMAP_CONTAINING_AUDIT").is_some())
 }
 
+/// `PYRE_VSTACK_EXACT_AUDIT`: report where the per-emission exact segmentation
+/// (`py_exact_by_jit_pc`) disagrees with the floor tier the vstack mirror
+/// currently resolves its boundary from. The mirror INFERS whether a Python
+/// opcode retired; the exact table states it. Every disagreement is a case the
+/// inference must special-case, so this is the gate that has to be quiet
+/// before any consumer switches over. Off in production.
+pub(crate) fn vstack_exact_audit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_VSTACK_EXACT_AUDIT").is_some())
+}
+
 /// `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`: assert the Slice-C after-residual depth
 /// twin (`depth_after_residual_for_jitcode_pc`) equals the raw
 /// `depth_at_py_pc[semantic_fallthrough_pc(containing_py_pc_for_jitcode_pc(jit_pc))]`

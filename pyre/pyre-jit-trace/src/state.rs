@@ -13655,6 +13655,7 @@ mod tests {
                 n_py_instrs: 0,
                 block_head_py_by_jit_pc: vec![(0, 0)],
                 py_floor_by_jit_pc: Vec::new(),
+                py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
