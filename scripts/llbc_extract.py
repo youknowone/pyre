@@ -667,6 +667,26 @@ def ullbc_files_table(path: Path, chunk_size: int = 1 << 22) -> list[dict]:
                 scan += 1
 
 
+def is_repo_relative_name(value: str) -> bool:
+    """Whether an artefact file-table name can be resolved against the root.
+
+    A Windows DRIVE disqualifies a name even with no root after it. `C:Users/x`
+    is drive-relative, so neither `PurePosixPath.is_absolute` nor
+    `PureWindowsPath.is_absolute` reports it absolute, while `root / value`
+    still DISCARDS `root` and resolves against that drive's working directory.
+    Charon spells the toolchain's own sources that way on Windows, and the
+    resolved file exists, so the walk read rustc's `std/src/lib.rs` and refused
+    the `include_str!` reaching out of it — after two absolute-path checks had
+    both passed the name through.
+    """
+    if not value:
+        return False
+    if PurePosixPath(value).is_absolute():
+        return False
+    windows = PureWindowsPath(value)
+    return not windows.is_absolute() and not windows.drive
+
+
 def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
     """Repo-relative `Local` files in an artefact, grouped by crate name."""
     by_crate: dict[str, set[Path]] = {}
@@ -677,8 +697,7 @@ def artefact_local_readfiles(path: Path) -> dict[str, set[Path]]:
         value = name["Local"]
         if not isinstance(value, str):
             raise SystemExit(f"extract-llbc.py: {path} has a non-string Local filename")
-        pure = PurePosixPath(value)
-        if pure.is_absolute() or PureWindowsPath(value).is_absolute():
+        if not is_repo_relative_name(value):
             continue
         normal = PurePosixPath(posixpath.normpath(value))
         if normal == PurePosixPath("..") or normal.parts[:1] == ("..",):
@@ -710,10 +729,9 @@ def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
         return None
     result: set[Path] = set()
     for value in path.read_text(encoding="utf-8").splitlines():
-        pure = PurePosixPath(value)
         normal = PurePosixPath(posixpath.normpath(value))
         escapes = normal == PurePosixPath("..") or normal.parts[:1] == ("..",)
-        if not value or pure.is_absolute() or PureWindowsPath(value).is_absolute() or escapes:
+        if not is_repo_relative_name(value) or escapes:
             raise SystemExit(f"extract-llbc.py: invalid path in {path}: {value!r}")
         result.add(Path(*normal.parts))
     return result
@@ -2501,6 +2519,25 @@ def self_test_ullbc_files_table() -> None:
             "id": 2,
             "name": {"Virtual": "generated.rs"},
             "crate_name": "generated",
+            "contents": "",
+        },
+        # The spellings Charon uses for the toolchain's own sources on Windows.
+        # Neither reads as absolute to `PurePosixPath`, and the drive-relative
+        # one does not read as absolute to `PureWindowsPath` either, so both
+        # reached the read set before `is_repo_relative_name` judged them by
+        # their drive instead. `root / value` then discards the root and
+        # resolves against that drive, which is how `std/src/lib.rs` came to be
+        # scanned for `include*!`.
+        {
+            "id": 3,
+            "name": {"Local": "C:Users/runner/.rustup/toolchains/x/std/src/lib.rs"},
+            "crate_name": "std",
+            "contents": "",
+        },
+        {
+            "id": 4,
+            "name": {"Local": "C:/Users/runner/.rustup/toolchains/x/core/src/lib.rs"},
+            "crate_name": "core",
             "contents": "",
         },
     ]
