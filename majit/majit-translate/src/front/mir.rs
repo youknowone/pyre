@@ -17812,6 +17812,14 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
 /// `CallKind::Trait` pointing at the declaration of `head`. When that
 /// declaration has no body, the direct `[Trait, method]` path has nothing to
 /// execute; the receiver's implementation family must select the target.
+///
+/// A bodyless declaration that takes no receiver is excluded. `rpbc.py`
+/// dispatches a methods-PBC on the instance the call is bound to, and the
+/// lowering below reads that instance off the call's first argument; an
+/// associated function has none, and the type it would be selected by is
+/// fixed at the call site rather than carried by a value. Classifying one
+/// here hands the lowering an argument list whose first entry is either
+/// absent or an ordinary parameter standing in for a receiver.
 fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String, String)> {
     let CallKind::Trait(value) = &reg.kind else {
         return None;
@@ -17821,6 +17829,7 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     if declaration.unstructured().is_some() {
         return None;
     }
+    declaration.signature.inputs.first()?;
     trait_method_owner(declaration)
 }
 
@@ -23777,7 +23786,9 @@ mod tests {
             },
             "signature": {
                 "is_unsafe": false,
-                "inputs": [],
+                // The `&self` the source text declares. Its shape does not
+                // matter to the classifier, only that the receiver is there.
+                "inputs": [{"Adt": {"id": "Tuple", "generics": {"types": []}}}],
                 "output": {"Tuple": []}
             },
             "body": "Missing"
@@ -23805,6 +23816,54 @@ mod tests {
             super::abstract_trait_call_target(&call, &llbc),
             Some(("Storage".to_string(), "head".to_string()))
         );
+    }
+
+    #[test]
+    fn receiverless_trait_associated_function_is_not_indirect() {
+        // `fn type_id() -> u64` on a trait: the implementation is chosen by
+        // the type argument at the call site, and there is no instance the
+        // dispatch could read it from. `lower_indirect_calls` would take the
+        // call's first argument for a receiver, so this has to stay direct.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["GcType", 0]}, {"Ident": ["type_id", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn type_id() -> u64;",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Literal": {"UInt": "U64"}}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
     }
 
     #[test]
