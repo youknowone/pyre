@@ -1063,7 +1063,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_stat": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_statistics": {
       "dynasm": "IMPORTERROR"

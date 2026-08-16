@@ -64,6 +64,8 @@ pub mod _sre;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod _ssl;
 #[allow(non_snake_case)]
+pub mod _stat;
+#[allow(non_snake_case)]
 pub mod _symtable;
 #[allow(non_snake_case)]
 pub mod _template;

@@ -609,6 +609,9 @@ pub fn install_builtin_modules() {
     pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
     pyre_install_module!(_bisect);
+    // Frozen importlib imports `_stat` while bootstrapping a sandbox that
+    // deliberately mounts no stdlib files, so it must stay a builtin.
+    pyre_install_module!(_stat);
     pyre_install_module!(_functools);
     pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
@@ -711,10 +714,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(unicodedata);
     pyre_install_module!(pyexpat);
 
-    // Empty C-extension stubs — `_opcode_metadata.py` etc. exist in the
-    // real stdlib and are loaded from disk, but their builtin shims here
-    // simply succeed at `import X`.
-    //
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub
     // makes the `import` succeed and the later access raise AttributeError
@@ -722,11 +721,6 @@ pub fn install_builtin_modules() {
     // ImportError` cannot recover from.  Leaving them unregistered lets the
     // pure-Python fallback take over: `_datetime` -> `_pydatetime`,
     // `_decimal` -> `_pydecimal`, `_asyncio` -> pure-Python asyncio.
-    // `_stat` is the exception: frozen importlib imports it while bootstrapping
-    // a sandbox that deliberately mounts no stdlib files.  `stat.py` already
-    // defines its portable constants before the optional accelerator import,
-    // so the empty builtin remains sufficient for both paths.
-    register_builtin_module("_stat", empty_module_init);
     register_builtin_module_with_startup(
         "array",
         crate::module::array::init_array_module,
@@ -1369,9 +1363,6 @@ fn init_scproxy(ns: PyObjectRef) {
         }),
     );
 }
-
-/// Empty module initializer for C-extension stubs.
-fn empty_module_init(_ns: PyObjectRef) {}
 
 /// Try to load a builtin module by name.
 ///
