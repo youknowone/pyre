@@ -1442,23 +1442,40 @@ pub(crate) unsafe fn set_name(
     // `space.get_and_call_function(w_meth, w_value, w_type, key)` — `w_value`
     // is the descriptor instance (bound as the receiver), and the call args
     // are `(owner, name)`: `__set_name__(self, owner, name)`.
+    //
+    // The hook is arbitrary Python, so the three operands cannot stay in Rust
+    // locals across it: the failure arm below names the descriptor, its type
+    // and the owner, and reading any of them from a pre-call address would
+    // build the note out of reclaimed memory.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let owner_slot = pyre_object::gc_roots::pin_roots(&[w_owner, w_name, w_value]);
+    let name_slot = owner_slot + 1;
+    let value_slot = owner_slot + 2;
     match unsafe {
         get_and_call_function(
             set_name_meth,
-            w_value,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
             w_valtype.as_ptr(),
-            &[w_owner, w_name],
+            &[
+                pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            ],
         )
     } {
         Ok(_) => Ok(()),
         Err(mut e) => {
+            let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+            let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
+            let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             let name_repr = if unsafe { is_str(w_name) } {
                 crate::display::format_wtf8_repr(unsafe { w_str_get_wtf8(w_name) })
             } else {
                 String::new()
             };
-            let val_type_name =
-                unsafe { pyre_object::w_type_get_name(w_valtype.as_ptr()) }.to_string();
+            let val_type_name = match crate::typedef::r#type(w_value) {
+                Some(t) => unsafe { pyre_object::w_type_get_name(t.as_ptr()) }.to_string(),
+                None => String::new(),
+            };
             let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
             add_internal_exception_note(
                 &mut e,

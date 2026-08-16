@@ -5907,17 +5907,25 @@ fn type_descr_new_with_metaclass(
         // The pairs sit in a native Vec the collector does not walk and every
         // `__set_name__` runs Python, so a class body's list and dict values
         // move out from under the entries still to come.  Pin them and read
-        // each back at the call that consumes it.
+        // each back at the call that consumes it.  The owner goes in the same
+        // scope: a type never moves, so the local stays a good address, but
+        // nothing refers to a class this young — the classcell is optional and
+        // `weak_subclasses` is weak — so a major cycle under a hook would
+        // sweep it.  The scope runs to the end of the branch, which is what
+        // keeps the owner alive through `__init_subclass__` as well.
         let _entry_roots = pyre_object::gc_roots::push_roots();
-        let flat: Vec<PyObjectRef> = set_name_entries
-            .iter()
-            .flat_map(|&(key, value)| [key, value])
-            .collect();
-        let entry_base = pyre_object::gc_roots::pin_roots(&flat);
+        let mut livevars = Vec::with_capacity(set_name_entries.len() * 2 + 1);
+        livevars.push(w_type);
+        livevars.extend(
+            set_name_entries
+                .iter()
+                .flat_map(|&(key, value)| [key, value]),
+        );
+        let owner_slot = pyre_object::gc_roots::pin_roots(&livevars);
         for index in 0..set_name_entries.len() {
-            let key = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2);
+            let key = pyre_object::gc_roots::shadow_stack_get(owner_slot + 1 + index * 2);
             if unsafe { pyre_object::is_str(key) } {
-                let value = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2 + 1);
+                let value = pyre_object::gc_roots::shadow_stack_get(owner_slot + 2 + index * 2);
                 unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
             }
         }
