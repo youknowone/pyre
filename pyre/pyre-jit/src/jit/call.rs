@@ -216,10 +216,9 @@ pub struct CallControl {
     /// region on every interpreted backedge.
     pub loop_region_jit_safe: HashMap<(usize, usize), bool>,
 
-    /// Immutable bytecode-derived facts used by the temporary FOR_ITER gate,
-    /// kept with the other per-graph codewriter metadata.
-    pub for_iter_bodies_jit_safe: HashMap<usize, bool>,
-    pub escaping_range_loop_regions: HashMap<(usize, usize), bool>,
+    /// Immutable bytecode-derived function-entry trace decision used by the
+    /// temporary FOR_ITER gate, kept with the other per-graph metadata.
+    pub function_entry_trace_jit_safe: HashMap<usize, bool>,
 
     /// Pyre-only per-graph result of `eval::unsupported_jit_shape`.
     ///
@@ -263,8 +262,7 @@ impl CallControl {
             callinfocollection: CallInfoCollection::new(),
             loop_header_pcs: HashMap::new(),
             loop_region_jit_safe: HashMap::new(),
-            for_iter_bodies_jit_safe: HashMap::new(),
-            escaping_range_loop_regions: HashMap::new(),
+            function_entry_trace_jit_safe: HashMap::new(),
             graph_jit_shapes: HashMap::new(),
         }
     }

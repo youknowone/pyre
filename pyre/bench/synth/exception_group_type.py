@@ -1,7 +1,7 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: the only loop here is the 2000-iteration warmup, and the
+# rest of the run is one-shot reporting, so a pypy ratio reads mostly the two
+# interpreters' startup and whatever the host's process spawn cost happens to
+# be that run. The jitstats baselines gate it.
 def m(label, value):
     print(label, "->", repr(value))
 

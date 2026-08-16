@@ -4,7 +4,7 @@
 # modules puts it first at 95 of 223 first-rejections, ahead of the documented
 # `LIST_APPEND`-with-`CALL` case.
 #
-# A declined frame runs fully interpreted, so it reports `loops_compiled=0`
+# A declined loop runs fully interpreted, so it reports `loops_compiled=0`
 # AND `loops_aborted=0` — the tracer never sees it. That invisibility is why
 # the shape needs a fixture of its own: the decline leaves no counter to
 # notice.
