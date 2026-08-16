@@ -101,26 +101,44 @@ fn a_block_backed_field_registers_the_storage_a_compiled_entry_can_reload() {
     let info = <Machine as majit_metainterp::JitState>::__build_virtualizable_info()
         .expect("a state with virt arrays builds a vinfo");
 
-    assert_eq!(info.array_fields.len(), 2);
-    for (index, field) in info.array_fields.iter().enumerate() {
+    // Each field is graded against the offsets of the container ITS OWN item
+    // type produces, so a divergence between the two item types is a failure
+    // rather than a coincidence, and the name is checked so a reordering of
+    // `array_fields` fails here instead of silently swapping the expectations.
+    let expected = [
+        (
+            "regs",
+            VirtArray::<i64>::LENGTH_OFFSET,
+            VirtArray::<i64>::ITEMS_OFFSET,
+            size_of::<i64>(),
+        ),
+        (
+            "fregs",
+            VirtArray::<f64>::LENGTH_OFFSET,
+            VirtArray::<f64>::ITEMS_OFFSET,
+            size_of::<f64>(),
+        ),
+    ];
+    assert_eq!(info.array_fields.len(), expected.len());
+    for (index, (field, (name, length_offset, items_offset, item_size))) in
+        info.array_fields.iter().zip(expected).enumerate()
+    {
+        assert_eq!(field.name, name, "array field {index} is out of order");
         assert_eq!(
             field.storage,
             VableArrayStorage::DirectPointer,
-            "array field {index} ({}) must be reachable through its pointer",
-            field.name,
+            "array field {index} ({name}) must be reachable through its pointer",
         );
-        assert_eq!(field.length_offset, VirtArray::<i64>::LENGTH_OFFSET);
-        assert_eq!(field.items_offset, VirtArray::<i64>::ITEMS_OFFSET);
+        assert_eq!(field.length_offset, length_offset, "{name} length offset");
+        assert_eq!(field.items_offset, items_offset, "{name} items offset");
         assert!(field.can_read_length_from_heap());
-    }
 
-    // The element descr addresses the payload straight off the pointer the
-    // field holds, so nothing sits between the two loads the entry emits.
-    for index in 0..info.array_fields.len() {
+        // The element descr addresses the payload straight off the pointer the
+        // field holds, so nothing sits between the two loads the entry emits.
         let descr = info.array_item_descr(index);
         let descr = descr.as_array_descr().expect("an array descr");
-        assert_eq!(descr.base_size(), VirtArray::<i64>::ITEMS_OFFSET);
-        assert_eq!(descr.item_size(), 8);
+        assert_eq!(descr.base_size(), items_offset, "{name} descr base size");
+        assert_eq!(descr.item_size(), item_size, "{name} descr item size");
     }
 }
 

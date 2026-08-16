@@ -36,9 +36,34 @@ use crate::virtualizable::VirtualizableInfo;
 const BLOCK_SIZE_SLOT: usize = majit_gc::header::GcHeader::SIZE;
 /// Bytes reserved for the zeroed header word in front of a block.
 const BLOCK_HEADER: usize = majit_gc::header::GcHeader::SIZE;
-/// Distance from the allocation base to the block pointer handed out.
+/// Distance from the block pointer back to the size slot.
+///
+/// The size slot and the header word sit immediately behind the block pointer,
+/// in that order, so a header-relative probe at a small negative offset lands
+/// inside the allocation.
 const BLOCK_PREFIX: usize = BLOCK_SIZE_SLOT + BLOCK_HEADER;
 const _: () = assert!(BLOCK_SIZE_SLOT >= std::mem::size_of::<u64>());
+
+/// Distance from the allocation base to the block pointer handed out, for an
+/// item type of `align`.
+///
+/// The allocation base carries the item's alignment, but the block pointer is
+/// the base advanced past the prefix, and the payload is the block pointer
+/// advanced by [`block_items_offset`]. Neither of those two steps can repair an
+/// alignment the first one broke, so the prefix — not the payload offset — is
+/// where an item needing more alignment than the size slot and header word
+/// provide is padded for. The padding goes in front of the size slot, leaving
+/// the header word adjacent to the block.
+///
+/// ```text
+///   base            block-16        block-8        block
+///   [ padding … ]   [ total size ]  [ header ]     [ length ][ payload … ]
+/// ```
+const fn block_base_offset(align: usize) -> usize {
+    let word = std::mem::align_of::<usize>();
+    let align = if align < word { word } else { align };
+    BLOCK_PREFIX.div_ceil(align) * align
+}
 
 /// Offset of the length word from the block pointer.
 ///
@@ -132,6 +157,14 @@ impl<T: Copy> VirtArray<T> {
     pub const LENGTH_OFFSET: usize = BLOCK_LENGTH_OFFSET;
     /// Offset of item 0 from the field's pointer value.
     pub const ITEMS_OFFSET: usize = block_items_offset(std::mem::align_of::<T>());
+    /// Distance from the allocation base to the field's pointer value.
+    const BASE_OFFSET: usize = block_base_offset(std::mem::align_of::<T>());
+
+    /// The payload lives at base + [`Self::BASE_OFFSET`] + [`Self::ITEMS_OFFSET`],
+    /// and the slice handed out over it is only sound when that address carries
+    /// the item's alignment. The base does, so the two offsets have to as well.
+    const _PAYLOAD_ALIGNED: () =
+        assert!((Self::BASE_OFFSET + Self::ITEMS_OFFSET).is_multiple_of(std::mem::align_of::<T>()));
 
     /// An empty array.
     pub fn new() -> Self {
@@ -195,7 +228,11 @@ impl<T: Copy> VirtArray<T> {
         *self = grown;
     }
 
-    /// Drop every item, keeping the array allocated as an empty one.
+    /// Discard every item, leaving a zero-length array.
+    ///
+    /// A block has no spare capacity, so this releases the old block and
+    /// allocates an empty one; a caller counting allocations sees both. An
+    /// array that is already zero-length keeps the block it has.
     pub fn clear(&mut self) {
         // `resize` needs an item to fill with and a shrink to zero never uses
         // one, so go straight to the empty block rather than invent a value.
@@ -207,6 +244,9 @@ impl<T: Copy> VirtArray<T> {
     /// Allocate a block for `len` items, off any collector, and write its
     /// length word. The items are left as the allocator returned them.
     fn alloc_block(len: usize) -> *mut u8 {
+        // An associated const is only evaluated where it is named, so naming it
+        // here is what makes the alignment assert run for this `T`.
+        let () = Self::_PAYLOAD_ALIGNED;
         let layout = Self::block_layout(len);
         // Zeroed rather than uninitialized: the header word in the prefix must
         // read as clear flags (see the module comment), and clearing the payload
@@ -217,8 +257,8 @@ impl<T: Copy> VirtArray<T> {
             std::alloc::handle_alloc_error(layout);
         }
         unsafe {
-            *(base as *mut u64) = layout.size() as u64;
-            let block = base.add(BLOCK_PREFIX);
+            let block = base.add(Self::BASE_OFFSET);
+            *(block.sub(BLOCK_PREFIX) as *mut u64) = layout.size() as u64;
             *(block.add(Self::LENGTH_OFFSET) as *mut usize) = len;
             block
         }
@@ -228,7 +268,7 @@ impl<T: Copy> VirtArray<T> {
         let items = std::mem::size_of::<T>()
             .checked_mul(len)
             .expect("virtualizable array payload size overflowed");
-        let total = BLOCK_PREFIX
+        let total = Self::BASE_OFFSET
             .checked_add(Self::ITEMS_OFFSET)
             .and_then(|prefix| prefix.checked_add(items))
             .expect("virtualizable array block size overflowed");
@@ -245,12 +285,14 @@ impl<T: Copy> VirtArray<T> {
 
 impl<T: Copy> Drop for VirtArray<T> {
     fn drop(&mut self) {
-        // The block pointer is not the allocation base — the size slot and the
-        // header word precede it — so the size slot is what says how much to
-        // release, exactly as `free_off_gc_jitframe` reads it.
+        // The block pointer is not the allocation base — the size slot, the
+        // header word and any alignment padding precede it — so the size slot
+        // is what says how much to release, exactly as `free_off_gc_jitframe`
+        // reads it, and the base is the block stepped back over the whole
+        // prefix rather than over the size slot alone.
         unsafe {
-            let base = self.block.sub(BLOCK_PREFIX);
-            let total = *(base as *const u64) as usize;
+            let base = self.block.sub(Self::BASE_OFFSET);
+            let total = *(self.block.sub(BLOCK_PREFIX) as *const u64) as usize;
             let align = std::mem::align_of::<T>()
                 .max(std::mem::align_of::<usize>())
                 .max(BLOCK_SIZE_SLOT);
