@@ -326,14 +326,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     after_residual_call: bool,
     scope: GuardCaptureScope<'_>,
 ) -> Result<(), DispatchError> {
-    if let Some(green_key) = ctx.fbw_mode.instance_next_foriter_green_key {
-        let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(green_key);
-        match scope.guard_stamp {
-            GuardStampTarget::LastOp => ctx.trace_ctx.set_last_op_descr(descr),
-            GuardStampTarget::GuardFromEnd(from_end) => {
-                ctx.trace_ctx.set_guard_op_descr_from_end(from_end, descr)
+    let instance_next_foriter_keyed =
+        if let Some(green_key) = ctx.fbw_mode.instance_next_foriter_green_key {
+            let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(green_key);
+            match scope.guard_stamp {
+                GuardStampTarget::LastOp => ctx.trace_ctx.set_last_op_descr(descr),
+                GuardStampTarget::GuardFromEnd(from_end) => {
+                    ctx.trace_ctx.set_guard_op_descr_from_end(from_end, descr)
+                }
             }
-        }
+            true
+        } else {
+            false
+        };
+    if ctx.fbw_mode.instance_next_foriter_census_active {
+        spec_census_record_instance_next_callee_guard(instance_next_foriter_keyed);
     }
     // A guard whose resume snapshot cannot be built must abort the trace,
     // not panic.  `build_vable_snapshot_boxes` requires every virtualizable
@@ -1559,7 +1566,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             // stack slot.  The live vstack/color sources above emit a genuine
             // null-or-self sentinel only where they hold a box for the slot at
             // all — the `PUSH_NULL` position has none, which is what the
-            // `call_null_or_self_slot` pass below exists to cover.  A slot that
+            // CALL operand resolution below exists to cover.  A slot that
             // reaches this shadow fallback with a NULL Ref is one the walk could
             // not resolve — e.g. an
             // unmaterialized `LOAD_CONST` operand whose concrete value was
@@ -1572,59 +1579,80 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             }
         }
     }
-    // The `null_or_self` operand a `PUSH_NULL` leaves under a `CALL` is the one
-    // stack slot NO source above can speak for: nothing pushes a value there,
-    // so the walk holds no box and no live color for it, and the shadow's NULL
-    // is the same NULL an unmirrored slot reads back as. It therefore stays
-    // absent and declines the outer-call flush — on a slot whose correct value
-    // is exactly that null. The CALL's own operand layout names it without
-    // guessing: `[callable, null_or_self, arg0 .. arg_{argc-1}]` ends at
-    // `stack_end`, so the sentinel sits `argc + 1` below it, right under the
-    // arguments and right above the callable.
-    let null_or_self_slot = call_null_or_self_slot(caller_sym, call_jitcode_pc, stack_end)?;
-    if null_or_self_slot >= nlocals
-        && !overrides
-            .iter()
-            .any(|&(present, _)| present == null_or_self_slot)
-    {
-        overrides.push((
-            null_or_self_slot,
-            std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef,
-        ));
+    // A CALL's `[callable, null_or_self, arg0 .. arg_{argc-1}]` operands end at
+    // `stack_end`.  The null_or_self slot is the one stack slot no source above
+    // can speak for, so synthesize its known null and require the callable
+    // immediately below it to prove that reconstruction reached the operand
+    // region.  FOR_ITER has only the iterator at `stack_end - 1`: it needs no
+    // synthesized sentinel, and that iterator itself is the proof slot.
+    let operand_slots = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end)?;
+    let (sentinel_slot, proof_slot) = match operand_slots {
+        CallerOperandSlots::Call {
+            null_or_self,
+            callable,
+        } => (Some(null_or_self), callable),
+        CallerOperandSlots::ForIter { iterator } => (None, iterator),
+    };
+    if let Some(sentinel_slot) = sentinel_slot {
+        if sentinel_slot >= nlocals
+            && !overrides
+                .iter()
+                .any(|&(present, _)| present == sentinel_slot)
+        {
+            overrides.push((
+                sentinel_slot,
+                std::ptr::null_mut::<u8>() as pyre_object::PyObjectRef,
+            ));
+        }
     }
-    // The slot immediately below null_or_self is the callable.  Ref(0) is a
-    // valid value only in the null_or_self slot above; in the callable slot it
-    // means the sparse vstack/color reconstruction is incomplete.  Decline
-    // the parent-frame image instead of publishing a CALL that will dispatch
-    // through a null object.
-    let callable_slot = null_or_self_slot.checked_sub(1)?;
+    // Ref(0) is valid only for the synthesized null_or_self sentinel.  A null
+    // proof value means the sparse vstack/color reconstruction is incomplete;
+    // decline instead of publishing an invalid operand region.
     overrides
         .iter()
-        .find_map(|&(slot, value)| (slot == callable_slot).then_some(value))
+        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value))
         .filter(|value| !value.is_null())?;
     Some(overrides)
 }
 
-/// Absolute frame slot holding the `null_or_self` operand of the `CALL` whose
-/// JitCode coordinate is `call_jitcode_pc`, for a caller whose operand stack
-/// ends at `stack_end`. `None` when that coordinate does not invert to a plain
-/// `CALL` — every other resume shape keeps the conservative decline.
-fn call_null_or_self_slot<Sym: WalkSym>(
+enum CallerOperandSlots {
+    Call {
+        null_or_self: usize,
+        callable: usize,
+    },
+    ForIter {
+        iterator: usize,
+    },
+}
+
+/// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
+/// caller whose operand stack ends at `stack_end`. CALL names its synthetic
+/// `null_or_self` sentinel and callable proof; FOR_ITER names its iterator
+/// proof. `None` keeps the conservative decline for every other resume shape.
+fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
     stack_end: usize,
-) -> Option<usize> {
+) -> Option<CallerOperandSlots> {
     let jc = unsafe { caller_sym.jitcode().as_ref()? };
     let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
     let py_pc =
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
             as usize;
-    let (pyre_interpreter::Instruction::Call { argc }, op_arg) =
-        pyre_interpreter::decode_instruction_at(code, py_pc)?
-    else {
-        return None;
-    };
-    stack_end.checked_sub(argc.get(op_arg) as usize + 1)
+    let (instruction, op_arg) = pyre_interpreter::decode_instruction_at(code, py_pc)?;
+    match instruction {
+        pyre_interpreter::Instruction::Call { argc } => {
+            let null_or_self = stack_end.checked_sub(argc.get(op_arg) as usize + 1)?;
+            Some(CallerOperandSlots::Call {
+                null_or_self,
+                callable: null_or_self.checked_sub(1)?,
+            })
+        }
+        pyre_interpreter::Instruction::ForIter { .. } => Some(CallerOperandSlots::ForIter {
+            iterator: stack_end.checked_sub(1)?,
+        }),
+        _ => None,
+    }
 }
 
 fn capture_inline_parent_blackhole<Sym: WalkSym>(

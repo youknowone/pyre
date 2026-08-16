@@ -3559,7 +3559,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
     // Replaying a live-heap mutation would double it, so a Dirty body stays on
-    // the residual call path.
+    // the residual call path.  The keyed instance-`__next__` route is excluded:
+    // it seeds the callee frame and resumes keyed guards through the multi-frame
+    // snapshot instead of replaying the caller boundary.
     //
     // A body whose only unproven ops are Python-level CALL residuals is
     // admitted too: this same gate re-runs for each callee the lever resolves
@@ -3568,9 +3570,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // deferred body commits nothing either.  Without that the whole nest
     // declines — `helper(i)` calling `add(i, 1, 2)` residualizes both calls
     // per iteration, though each body on its own is pure arithmetic.
+    let instance_next_seeded_route = instance_next_foriter_green_key.is_some();
+    // The keyed route bypasses the legacy caller-replay classification, but it
+    // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
-    if fbw_foriter_inflight_active() {
+    if fbw_foriter_inflight_active() && !instance_next_seeded_route {
         let safety = fbw_callee_body_replay_safety(
             body.code,
             &exact_numeric_args,
@@ -3866,14 +3871,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         fbw_max_multiframe_depth()
     };
-    // FOR_ITER must re-execute its iterator protocol as one unit when a body
-    // guard fails.  Its Clean-only admission above makes caller-boundary
-    // replay safe, and keeping the callee frame unseeded makes the terminating
-    // branch resume at FOR_ITER so the residual maps IndexError to exhaustion.
-    let force_caller_boundary_resume =
-        call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::ForIterNext;
-    let try_multiframe = !force_caller_boundary_resume
-        && multiframe_eligible
+    // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
+    // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
+    // conversion, so neither replay safety nor an unseeded caller-boundary
+    // resume is part of that route's deopt discipline.
+    let try_multiframe = multiframe_eligible
         && inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
@@ -3890,8 +3892,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // descr_call` owns the discard of `__init__`'s result, and the flattened
     // frame shape cannot reconstruct that discard from a two-frame in-callee
     // guard pause.
-    let strict_seed = !force_caller_boundary_resume
-        && strict_inlinable
+    let strict_seed = strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
         && callee_code.cellvars.is_empty()
         && constructor_result.is_none();
@@ -3914,7 +3915,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if foriter_dirty_bound && !try_multiframe {
         return resolved_inline_decline(op.pc, line!());
     }
-    if !strict_inlinable && !try_multiframe && !force_caller_boundary_resume {
+    if !strict_inlinable && !try_multiframe {
         // A non-self-recursive loop/branch callee that neither the strict nor
         // the multiframe fast path can serve declines to interpretation
         // (`FBW_DECLINED_KEYS`).  Self-recursive calls were already routed to
@@ -4900,6 +4901,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 inline_subwalk: true,
                 inline_caller_py_pc,
                 instance_next_foriter_green_key,
+                instance_next_foriter_census_active: instance_next_seeded_route,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -6994,11 +6996,10 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
 
 /// Inline a user instance's Python `__next__` directly under FOR_ITER.
 ///
-/// The instance arm of `space.next` forwards the method's exception directly
-/// to FOR_ITER, so caller-boundary resume retains the complete handler shape.
-/// A guard-failure bridge is tagged and deliberately takes the generic
-/// residual leg when it re-enters this site, preserving exhaustion conversion
-/// without attempting to walk an already-exhausted iterator.
+/// The instance arm of `space.next` forwards the method's exception to the
+/// FOR_ITER catch arm.  The callee is resumed through a seeded multi-frame
+/// snapshot, and every route/callee guard is keyed so failure resumes in the
+/// blackhole without compiling the unsafe mid-callee exhaustion bridge.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -7048,35 +7049,10 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     if body_facts.owns_loop_header || body_facts.has_exception_table {
         return Ok(None);
     }
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return Ok(None);
-    };
-    let Some((callee_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
-    else {
-        return Ok(None);
-    };
-    let replay_safety = fbw_callee_body_replay_safety(
-        body.code,
-        &[ExactNumericArg::default()],
-        body.num_regs_i,
-        body.constants_i,
-        body.num_regs_r,
-        body.constants_r,
-        callee_descr_refs,
-        false,
-    );
-    // `Clean` only, unlike the seqiter route's `Clean | DeferredCall`.  A
-    // deferred residual inside `__next__` can raise, and the caller-boundary
-    // resume this route uses delivers that exception to the caller as a frame
-    // exception rather than through FOR_ITER's own arms — so a delegating
-    // `def __next__(self): return next(self._it)`, whose exhaustion arrives
-    // from the residual `next` rather than a `RaiseVarargs`, leaks
-    // StopIteration out of the loop.  Admitting it needs the paused caller to
-    // map a callee outcome through `iter_next`'s trichotomy (item /
-    // exhaustion / propagate); until that exists, decline the shape.
-    if !matches!(replay_safety, CalleeReplaySafety::Clean)
-        || fbw_foriter_deferred_call_denied(w_code as usize)
-    {
+    // Preserve any deferred-call denial already attached to this callee.  The
+    // keyed route does not itself admit DeferredCall: its sub-walk leaves the
+    // deferred-inline guard unarmed.
+    if fbw_foriter_deferred_call_denied(w_code as usize) {
         return Ok(None);
     }
 
@@ -7102,8 +7078,11 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
         let type_const = ctx.trace_ctx.const_int(iter_layout);
+        let descr =
+            majit_metainterp::make_resume_guard_descr_instance_next_foriter(foriter_green_key);
         ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
+            .record_guard_with_descr(OpCode::GuardClass, &[iter_op, type_const], descr);
+        spec_census_record_instance_next_route_guard_keyed();
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
     ctx.trace_ctx

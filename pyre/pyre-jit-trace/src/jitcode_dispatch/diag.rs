@@ -328,6 +328,12 @@ static SPEC_SUPPRESSED: [std::sync::atomic::AtomicU64; SPEC_FOLD_COUNT] = {
 /// value means a typo at a call site; the summary reports it rather than
 /// silently dropping the row.
 static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `PYRE_FBW_SPEC_CENSUS`: per-fold consulted/fired tallies for the
 /// hand-written trace-time specializations.  Off by default; the gated branch
@@ -335,6 +341,23 @@ static SPEC_UNKNOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub(crate) fn fbw_spec_census_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_SPEC_CENSUS").is_some())
+}
+
+pub(crate) fn spec_census_record_instance_next_route_guard_keyed() {
+    if fbw_spec_census_enabled() {
+        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn spec_census_record_instance_next_callee_guard(keyed: bool) {
+    if !fbw_spec_census_enabled() {
+        return;
+    }
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.fetch_add(1, ordering);
+    if keyed {
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.fetch_add(1, ordering);
+    }
 }
 
 const FBW_DEPTH_HIST_BUCKETS: usize = 32;
@@ -595,6 +618,12 @@ pub fn spec_census_summary() -> String {
         rows.len(),
         SPEC_UNKNOWN.load(ordering),
     );
+    summary.push_str(&format!(
+        "[spec-census] instance_next_foriter route_guards_keyed={} callee_guards_captured={} callee_guards_keyed={}\n",
+        INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.load(ordering),
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_CAPTURED.load(ordering),
+        INSTANCE_NEXT_FORITER_CALLEE_GUARDS_KEYED.load(ordering),
+    ));
     for (label, site, parent, consulted, fired, suppressed) in rows {
         summary.push_str(&format!(
             "[spec-census] fold={label} consulted={consulted} fired={fired} suppressed={suppressed} site={site} parent={parent}\n"

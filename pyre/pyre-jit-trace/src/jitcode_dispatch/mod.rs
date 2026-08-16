@@ -1427,9 +1427,14 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// semantics.
     pub bridge_entry_merge_pc: Option<usize>,
     /// FOR_ITER key inherited only by the user-instance `__next__` sub-walk.
-    /// Every guard it emits is tagged so a guard-failure bridge re-entering
-    /// FOR_ITER retains the generic exception-to-exhaustion conversion.
+    /// Every guard it emits is tagged so failure resumes in the blackhole
+    /// instead of compiling a bridge from the middle of the callee.
     pub instance_next_foriter_green_key: Option<u64>,
+    /// Census marker paired with `instance_next_foriter_green_key`.  Keeping
+    /// the route identity separate from the optional descr key lets the
+    /// specialization census prove that every captured callee guard was
+    /// actually stamped.
+    pub instance_next_foriter_census_active: bool,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1475,6 +1480,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             class_of_last_exc_is_const: false,
             bridge_entry_merge_pc: None,
             instance_next_foriter_green_key: None,
+            instance_next_foriter_census_active: false,
         }
     }
 }
