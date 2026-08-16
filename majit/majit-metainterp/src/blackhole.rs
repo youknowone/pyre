@@ -2728,6 +2728,15 @@ pub fn run_forever_with_portal(
             }
         }
 
+        // Reaching here means this level's frame ran to its return: both arms
+        // above leave it finished, and the chain's last link raises out of
+        // `handle_jitexception` instead, so the outermost frame never arrives.
+        // `executioncontext.py leave` sits at this position; the callback also
+        // carries the interpreter-state transition a returning frame owns but
+        // the blackhole has no opcode for.
+        if let Some(on_leave_level) = on_leave_level {
+            on_leave_level(bh.virtualizable_ptr);
+        }
         // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
         // `pyopcode.py:239-241 RETURN_VALUE` (`frame_finished_execution = True`)

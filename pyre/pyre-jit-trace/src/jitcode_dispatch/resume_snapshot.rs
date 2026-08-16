@@ -1624,6 +1624,37 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         .iter()
         .find_map(|&(slot, value)| (slot == proof_slot).then_some(value))
         .filter(|value| !value.is_null())?;
+    // Report-only: a slot left absent here is what makes the outer-call flush
+    // decline, and the consumer can only say "not capturable". Name each source
+    // that passed on it so the gap is attributable to one of them.
+    if fbw_debug_abort_enabled() {
+        for slot in nlocals..stack_end {
+            if overrides.iter().any(|&(present, _)| present == slot) {
+                continue;
+            }
+            let vstack_box = (ctx.vstack_valid
+                && ctx.vstack_depth == depth
+                && ctx.vstack_boxes.len() >= depth)
+                .then(|| ctx.vstack_boxes[slot - nlocals]);
+            let vstack_concrete =
+                vstack_box.map(|opref| concrete_ref_for_opref(ctx, opref).is_some());
+            let pcdep_color = pcdep_entries
+                .iter()
+                .find_map(|&(bank, color, s)| (bank == 1 && s as usize == slot).then_some(color));
+            let shadow = ctx.trace_ctx.virtualizable_entry_at(base + slot).map(
+                |(_opref, value)| match value {
+                    Value::Ref(r) => r.as_usize(),
+                    _ => usize::MAX,
+                },
+            );
+            eprintln!(
+                "[call-overrides-absent] slot={slot} nlocals={nlocals} depth={depth} \
+                 vstack_box={vstack_box:?} vstack_concrete={vstack_concrete:?} \
+                 pcdep_color={pcdep_color:?} shadow={shadow:?} \
+                 null_or_self_slot={null_or_self_slot}"
+            );
+        }
+    }
     Some(overrides)
 }
 
