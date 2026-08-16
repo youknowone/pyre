@@ -919,7 +919,7 @@ def _jit_stats_merged(stderr):
     return fields if seen else None
 
 
-def _jit_stats_snapshot(stderr):
+def _jit_stats_snapshot(stderr, ungated=()):
     """Return every jit-stats line merged into normalized key/value text.
 
     The interpreter emits more than one `[jit-stats]` line — the counters, the
@@ -941,11 +941,21 @@ def _jit_stats_snapshot(stderr):
     a run may read and what a committed baseline may contain are two different
     questions: merging arms the floor, the filter keeps the recorded surface
     host-stable.
+
+    *ungated* names counters this fixture's header exempted
+    (`synth_ungated_jitstats`). They are dropped here rather than at the
+    comparison, so the recorded baseline never carries them either: a field
+    absent from both sides compares equal, which is what makes one filter serve
+    the record and the gate at once.
     """
     fields = _jit_stats_merged(stderr)
     if fields is None:
         return None
-    fields = {k: v for k, v in fields.items() if k in JITSTATS_SNAPSHOT_FIELDS}
+    fields = {
+        k: v
+        for k, v in fields.items()
+        if k in JITSTATS_SNAPSHOT_FIELDS and k not in ungated
+    }
     # This watches what the JIT compiles, never how well. A regression that
     # changes no structure (for example, an extra spill) is invisible here.
     return "".join(f"{key}={fields[key]}\n" for key in sorted(fields))
@@ -962,7 +972,9 @@ def _parse_jit_stats(snapshot):
 
 # Every counter a `.jitstats` baseline records is gated, in BOTH directions: the
 # recorded surface and the gated surface are the same set, so a baseline can
-# never carry a number nobody checks.
+# never carry a number nobody checks. A fixture header may drop a structural
+# counter from that set (`synth_ungated_jitstats`), and it leaves both halves at
+# once for exactly this reason.
 #
 # Both directions, because an improvement has to be recorded too. A counter that
 # falls is a real change in what the JIT compiles, and leaving the fall ungated
@@ -1636,6 +1648,62 @@ def synth_selfcheck(path):
     )
 
 
+def synth_ungated_jitstats(path):
+    """Read an optional per-fixture jit-stats exemption from its header:
+        # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
+
+    For a fixture whose named counters are demonstrably not a function of the
+    tree — the same binary, the same fixture and the same child environment
+    read two different values. The names are dropped from both sides of the
+    comparison and from the recorded baseline, so the file carries no number
+    nobody checks, which is the rule the recorded surface is built on.
+
+    Only the structural counters may be named. The badness fields are
+    assertions that must hold in every run (`internal_compile_panics` is an
+    internal compile bug, the descr-universe counters are invariants upstream
+    spells as `assert`), and a run that reaches one has a defect no
+    per-run input excuses, so naming one here is an error rather than an
+    exemption. An unknown name is an error too — a typo would otherwise read
+    as "exempted".
+
+    Like the other directives, one below the 20-line window is not honored:
+    the fixture simply stays gated, which is the safe direction. The header
+    must also carry what was measured, so the next reader can check the claim
+    rather than take it.
+
+    Read from `_apply_snapshot_gate`, so unlike the rest of this family it
+    reaches the regular benches too — the gate it exempts is the one they
+    share, and a counter that will not reproduce is not a synthetic-only
+    condition.
+    """
+    prefix = "# pyre-check: ungated-jitstats="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            names = [n.strip() for n in line[len(prefix):].split(",")]
+            names = [n for n in names if n]
+            if not names:
+                raise ValueError(f"empty jit-stats exemption in {path}: {line.strip()}")
+            unknown = [n for n in names if n not in JITSTATS_SNAPSHOT_FIELDS]
+            if unknown:
+                raise ValueError(
+                    f"unknown counter(s) {unknown} in jit-stats exemption in {path}: "
+                    f"{line.strip()}"
+                )
+            badness = [n for n in names if n in JITSTATS_BADNESS_FIELDS]
+            if badness:
+                raise ValueError(
+                    f"badness counter(s) {badness} cannot be exempted in {path}: "
+                    f"{line.strip()}"
+                )
+            return tuple(names)
+    return ()
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -1783,6 +1851,11 @@ class Check:
         # Benches whose gated counters moved only inside a declared per-fixture
         # band. Reported, never failed.
         self.jitstats_banded = []
+        # "<backend>/<bench>: <counters>" for fixtures whose header exempted a
+        # counter (`synth_ungated_jitstats`). An exempted counter and a matching
+        # one print the same green, so the exemptions are named in the summary:
+        # a gate nobody applied should not read as a gate nobody had to.
+        self.jitstats_ungated = []
         self.jitstats_missing = []
         # Benches whose run printed no `[jit-stats]` line at all. Tracked apart
         # from `jitstats_missing` because the two say opposite things: a missing
@@ -1930,12 +2003,16 @@ class Check:
     def _snapshot_path(self, backend, name, suffix):
         return Path(SNAP_DIR) / backend / f"{name}.{suffix}"
 
-    def _jitstats_repeats(self, backend, script, timeout):
+    def _jitstats_repeats(self, backend, script, timeout, ungated=()):
         """Re-run the fixture and return each repeat's jit-stats snapshot.
 
         Returns None if a repeat did not exit cleanly, so a crashing re-run
         cannot argue a real diff away — the caller then gates on the first run
         as if no repeat had happened.
+
+        *ungated* is the caller's, so a repeat is narrowed the same way the run
+        being compared was: narrowing one side only would report every exempted
+        counter as instability.
         """
         effective_timeout = scaled_timeout(timeout, self._timeout_scale(backend))
         snapshots = []
@@ -1946,7 +2023,7 @@ class Check:
             )
             if code != 0:
                 return None
-            snapshots.append(_jit_stats_snapshot(stderr))
+            snapshots.append(_jit_stats_snapshot(stderr, ungated))
         return snapshots
 
     def _jitstats_baseline_path(self, backend, script):
@@ -2019,7 +2096,10 @@ class Check:
         out_path = self._snapshot_path(backend, name, "out")
         time_path = self._snapshot_path(backend, name, "time")
         jitstats_path = self._jitstats_baseline_path(backend, script)
-        jitstats = _jit_stats_snapshot(stderr)
+        ungated = synth_ungated_jitstats(script)
+        if ungated:
+            self.jitstats_ungated.append(f"{backend}/{name}: {', '.join(ungated)}")
+        jitstats = _jit_stats_snapshot(stderr, ungated)
         jitstats_bands = synth_jitstats_bands(script)
 
         # The jit-stats gate — enforced on EVERY run, so a structural JIT change
@@ -2071,7 +2151,7 @@ class Check:
                 jitstats_path.read_text(encoding="utf-8"), jitstats, jitstats_bands
             )
             if regressions or improvements:
-                repeats = self._jitstats_repeats(backend, script, timeout)
+                repeats = self._jitstats_repeats(backend, script, timeout, ungated)
                 drifted = next(
                     (s for s in repeats or () if s != jitstats), None
                 )
@@ -3215,6 +3295,17 @@ class Check:
                     f"{len(self.wasm_ratio_ungated)} fixture(s): dynasm did not run "
                     f"them in this invocation, or its execution-only time stayed "
                     f"under {FLOOR_GATE_MIN_BASELINE_S * 1000:g}ms"
+                )
+            )
+        # Counters a fixture's header took out of its own gate. Named for the
+        # same reason as the two above: the fixture prints green either way, and
+        # the exemption is only reviewable if it is said out loud.
+        if self.jitstats_ungated:
+            print(
+                dim(
+                    f"jit-stats counters ungated by header for "
+                    f"{len(self.jitstats_ungated)}: "
+                    + "; ".join(self.jitstats_ungated)
                 )
             )
         # The same weaker baseline, asked for rather than discovered. Listed
