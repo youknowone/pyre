@@ -123,8 +123,8 @@ pub use jit_state::{
     bridge_decode_red,
 };
 pub use jitcode::{
-    BC_GOTO, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr, RuntimeDescrTable,
-    init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
+    BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
+    RuntimeDescrTable, init_global_build_descr_pool, insns, live_slots_for_state_field_jit,
 };
 pub use jitdriver::{
     DeclarativeJitDriver, JitDriver, JitDriverStaticData, MultiFrameBlackholeResult,
