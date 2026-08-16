@@ -2997,9 +2997,7 @@ impl Backend for DynasmBackend {
         // it drops rather than here. Every slot read, and `grab_exc_value`,
         // then goes straight into the frame the way `llmodel.py:240-250` does
         // — nothing is decoded eagerly and no copy of the frame is made.
-        DeadFrame {
-            data: Box::new(unsafe { FrameData::owning(jf_ptr, result_jf, num_slots, descr, None) }),
-        }
+        DeadFrame::boxed(unsafe { FrameData::owning(jf_ptr, result_jf, num_slots, descr, None) })
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -3131,7 +3129,10 @@ impl Backend for DynasmBackend {
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
-        let data = frame.data.downcast_ref::<FrameData>().unwrap();
+        let data = frame
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
+            .unwrap();
         data.fail_descr
             .as_fail_descr()
             .expect("FrameData::fail_descr must implement FailDescr")
@@ -3156,9 +3157,9 @@ impl Backend for DynasmBackend {
         // returns it — the forced frame IS the deadframe, and it belongs to
         // the compiled run that is still executing, so this deadframe borrows
         // it rather than taking the chain over.
-        Some(DeadFrame {
-            data: Box::new(unsafe { FrameData::borrowing(frame, num_slots, descr, None) }),
-        })
+        Some(DeadFrame::boxed(unsafe {
+            FrameData::borrowing(frame, num_slots, descr, None)
+        }))
     }
 
     fn is_force_token_armed(&self, force_token: GcRef) -> bool {
@@ -3176,7 +3177,10 @@ impl Backend for DynasmBackend {
         // *is* the metainterp Arc (production codegen + synthetic exits
         // both stamp it via DescrRef directly), so we just clone the
         // shared identity.
-        let data = frame.data.downcast_ref::<FrameData>().unwrap();
+        let data = frame
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
+            .unwrap();
         Arc::clone(&data.fail_descr)
     }
 
@@ -3186,7 +3190,11 @@ impl Backend for DynasmBackend {
     /// must_save_exception guards (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
     /// GUARD_NOT_FORCED); other guards leave it NULL.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
-        frame.data.downcast_ref::<FrameData>().unwrap().exc_value()
+        frame
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
+            .unwrap()
+            .exc_value()
     }
 
     fn clear_stored_exception(&self) {
@@ -3224,24 +3232,24 @@ impl Backend for DynasmBackend {
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         frame
-            .data
-            .downcast_ref::<FrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
             .unwrap()
             .get_int(index)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
         frame
-            .data
-            .downcast_ref::<FrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
             .unwrap()
             .get_float(index)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
         frame
-            .data
-            .downcast_ref::<FrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<FrameData>())
             .unwrap()
             .get_ref(index)
     }

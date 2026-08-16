@@ -16,9 +16,8 @@
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py:132)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
-use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
-use majit_ir::{DescrRef, GcRef, Type};
+use majit_ir::{DescrRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -161,118 +160,10 @@ pub(crate) unsafe fn drop_bridge_payload(ptr: *mut ()) {
 }
 
 // ── JitFrameDeadFrame (llmodel.py deadframe-as-jitframe parity) ─────
-
-/// RPython llmodel.py parity: the deadframe IS the JitFrame.
-///
-/// In RPython, `execute_token` returns the JitFrame GCREF directly as
-/// the deadframe. Values stay in `jf_frame[]` — no copying to `Vec<i64>`.
-/// `get_int_value(deadframe, index)` reads directly from `jf_frame[index]`.
-pub struct JitFrameDeadFrame {
-    /// GcRef pointing to the heap-allocated JitFrame.
-    pub jf_gcref: GcRef,
-    /// The fail descriptor for this exit.  Stored as `DescrRef`
-    /// (`Arc<dyn Descr>`) so the deadframe carries the same Arc identity
-    /// the metainterp stamps onto `op.descr` — matching PyPy's
-    /// `frame.jf_descr = descr` (llmodel.py:270) line-by-line.  The
-    /// backend wrapper `CraneliftFailDescr` is on its way out; this slot
-    /// already accepts the upcast forwarders so the eventual deletion
-    /// is a pure type substitution.
-    pub fail_descr: DescrRef,
-    /// Original attached `jf_descr` identity for finish exits emitted by
-    /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
-    pub latest_descr: Option<DescrRef>,
-    /// Side-channel: caller-prefix layout assembled from the
-    /// `CALL_ASSEMBLER_CALLER_STACK` top at deadframe interception
-    /// (`wrap_call_assembler_deadframe_with_caller_prefix`).  When `Some`,
-    /// `compiler.rs::deadframe_layout` prefixes the descr's own recovery
-    /// layout by this value before returning.  Replaces the old overlay
-    /// descr synthesis (`overlay_deadframe_fail_descr` + overlay registry)
-    /// — the deadframe's `fail_descr` now keeps the callee's own Arc
-    /// identity rather than being swapped for a synthetic one.
-    pub call_assembler_caller_layout: Option<ExitRecoveryLayout>,
-    /// True when `register_roots` has registered `jf_gcref` with the
-    /// active cranelift GC, so `Drop` knows to remove it. Replaces the
-    /// pre-removal `gc_runtime_id` field that paired registration with
-    /// a per-trace runtime id; the active GC is now a single thread-local
-    /// (`compiler.rs CRANELIFT_ACTIVE_GC`, mirroring `llmodel.py:58`).
-    pub roots_registered: bool,
-    /// Keeps the frame memory alive for non-GC allocations.
-    pub _heap_owner: Option<Vec<i64>>,
-}
-
-/// Byte offset from JitFrame start to jf_frame[0].
-const JF_FRAME_ITEM0_BYTES: usize = 64;
-/// Byte offset to jf_savedata field.
-const JF_SAVEDATA_BYTES: usize = 32;
-/// Byte offset to jf_guard_exc field.
-const JF_GUARD_EXC_BYTES: usize = 40;
-
-impl JitFrameDeadFrame {
-    pub fn new(
-        jf_gcref: GcRef,
-        fail_descr: DescrRef,
-        latest_descr: Option<DescrRef>,
-        heap_owner: Option<Vec<i64>>,
-    ) -> Self {
-        JitFrameDeadFrame {
-            jf_gcref,
-            fail_descr,
-            latest_descr,
-            call_assembler_caller_layout: None,
-            roots_registered: false,
-            _heap_owner: heap_owner,
-        }
-    }
-
-    pub fn register_roots(&mut self) {
-        self.roots_registered = register_gc_roots(std::slice::from_mut(&mut self.jf_gcref));
-    }
-
-    #[inline]
-    pub fn get_int(&self, index: usize) -> i64 {
-        unsafe { *((self.jf_gcref.0 + JF_FRAME_ITEM0_BYTES + index * 8) as *const i64) }
-    }
-
-    #[inline]
-    pub fn get_float(&self, index: usize) -> f64 {
-        f64::from_bits(self.get_int(index) as u64)
-    }
-
-    #[inline]
-    pub fn get_ref(&self, index: usize) -> GcRef {
-        GcRef(self.get_int(index) as usize)
-    }
-
-    pub fn take_ref_for_call_result(&mut self, index: usize) -> GcRef {
-        GcRef(self.get_int(index) as usize)
-    }
-
-    #[inline]
-    pub fn get_savedata_ref(&self) -> GcRef {
-        GcRef(unsafe { *((self.jf_gcref.0 + JF_SAVEDATA_BYTES) as *const usize) })
-    }
-
-    #[inline]
-    pub fn try_get_savedata_ref(&self) -> Option<GcRef> {
-        let r = self.get_savedata_ref();
-        if r.is_null() { None } else { Some(r) }
-    }
-
-    #[inline]
-    pub fn set_savedata_ref(&mut self, data: GcRef) {
-        unsafe { *((self.jf_gcref.0 + JF_SAVEDATA_BYTES) as *mut usize) = data.0 };
-    }
-
-    #[inline]
-    pub fn grab_exc_value(&self) -> GcRef {
-        GcRef(unsafe { *((self.jf_gcref.0 + JF_GUARD_EXC_BYTES) as *const usize) })
-    }
-}
-
-impl Drop for JitFrameDeadFrame {
-    fn drop(&mut self) {
-        if self.roots_registered {
-            unregister_gc_roots(std::slice::from_mut(&mut self.jf_gcref));
-        }
-    }
-}
+//
+// The type itself lives in `majit-backend` because `DeadFrame` holds it by
+// value: `llmodel.py:323` returns the JITFRAMEPTR as the deadframe, so the
+// jitframe-shaped deadframe is the shared shape and not this backend's private
+// one. Re-exported here because every use site in this crate names it through
+// `crate::guard`.
+pub use majit_backend::deadframe::JitFrameDeadFrame;

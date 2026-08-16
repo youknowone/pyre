@@ -10880,6 +10880,71 @@ cache size\t: 8192 kB\n";
         }
     }
 
+    /// A minor collection rewrites the SLOT, so reading through the position
+    /// yields the promoted address.
+    ///
+    /// `walk_stack_root` (`shadowstack.py:44-70`) hands the collector the slot
+    /// itself — `invoke(..., addr)` where `addr` is the stack address, not the
+    /// value — which is what lets the forwarded address be stored back into it.
+    /// Every holder that addresses its root by position therefore sees the move
+    /// without being told about it.
+    #[test]
+    fn minor_collection_rewrites_an_owner_root_slot() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(obj.0));
+        unsafe {
+            *(obj.0 as *mut u64) = 0xD00D_D00D;
+        }
+        let root = crate::shadow_stack::OwnerRootGuard::new(obj);
+
+        gc.do_collect_nursery();
+
+        let moved = root.get();
+        assert_ne!(
+            moved, obj,
+            "a surviving nursery object is promoted, so this run cannot tell a \
+             rewritten slot from an unmoved object"
+        );
+        assert!(gc.oldgen.contains(moved.0));
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD00D_D00D);
+    }
+
+    /// The HOLDER may move. Addressing a root by position is what makes that
+    /// true, and it is the whole difference from registering the address of the
+    /// field that holds the pointer: a registered field address is only valid
+    /// while its owner stays put, so an owner that can be returned by value has
+    /// to be pinned behind a heap allocation first.
+    #[test]
+    fn an_owner_root_survives_its_holder_being_moved() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(obj.0));
+        unsafe {
+            *(obj.0 as *mut u64) = 0xFEED_FEED;
+        }
+
+        // Three distinct addresses for the same guard, one of them the heap,
+        // with a collection between the last move and the read.
+        let root = crate::shadow_stack::OwnerRootGuard::new(obj);
+        let moved_once = root;
+        let mut holders = vec![moved_once];
+        gc.do_collect_nursery();
+
+        let moved = holders.pop().unwrap().get();
+        assert_ne!(moved, obj);
+        assert!(gc.oldgen.contains(moved.0));
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xFEED_FEED);
+    }
+
     #[test]
     fn test_incremental_cycle_marks_jitframe_shadow_stack_roots() {
         let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();

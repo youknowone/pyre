@@ -70,7 +70,7 @@ impl FailDescr for WasmFailDescr {
 
 /// Wasm-backend dead frame data.
 ///
-/// Stored inside `DeadFrame.data` after `execute_token` returns.
+/// Stored inside `DeadFrame::Boxed` after `execute_token` returns.
 pub struct WasmFrameData {
     pub raw_values: Vec<i64>,
     pub fail_descr: Arc<WasmFailDescr>,

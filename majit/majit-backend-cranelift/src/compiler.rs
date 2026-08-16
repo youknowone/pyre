@@ -452,11 +452,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     // walk goes through `trace_libc_jitframe`). This backend's frames are
     // ordinary GC objects — `run_compiled_code_inner` allocates them from the
     // nursery under the registered JITFRAME type id — and
-    // `JitFrameDeadFrame::register_roots` registers the `jf_gcref` SLOT with
-    // `add_root` for exactly the window the deadframe is held. The collector
-    // then reaches the frame as it reaches any rooted object, and gets the
-    // moving case for free: a walker yields an address and cannot update the
-    // holder if the frame is copied, whereas a registered slot is rewritten.
+    // `JitFrameDeadFrame` holds the frame in a root SLOT for exactly the window
+    // the deadframe is held. The collector then reaches the frame as it reaches
+    // any rooted object, and gets the moving case for free: a walker yields an
+    // address and cannot update the holder if the frame is copied, whereas a
+    // slot is rewritten in place by the walk that read it.
     // Publishing a walker as well would root the same frames twice through
     // two mechanisms with different invariants.
     //
@@ -800,7 +800,7 @@ fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
 }
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
-    let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
+    let jf = frame.as_jitframe()?;
     let descr_ref: DescrRef = jf.fail_descr.clone();
     let fd = jf
         .fail_descr
@@ -906,7 +906,7 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(mut frame: DeadFrame) -> Dea
     // the raw `jf_descr` slot still carries a `FailDescrCell` thin
     // pointer resolvable via `recover_fail_descr_cell`,
     // with no overlay descr needed.
-    let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() else {
+    let Some(jf) = frame.as_jitframe_mut() else {
         // Fallback: return as-is (should not happen after FrameData removal).
         return frame;
     };
@@ -2073,34 +2073,6 @@ fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
 }
 
-/// Returns true when the active GC was present and roots were
-/// registered; false when no GC is active and registration was a
-/// no-op. Callers pair the bool with `unregister_gc_roots` on Drop.
-pub(crate) fn register_gc_roots(roots: &mut [GcRef]) -> bool {
-    if roots.is_empty() {
-        return false;
-    }
-    with_cranelift_gc(|gc| {
-        for root in roots.iter_mut() {
-            unsafe {
-                gc.add_root(root as *mut GcRef);
-            }
-        }
-    })
-    .is_some()
-}
-
-pub(crate) fn unregister_gc_roots(roots: &mut [GcRef]) {
-    if roots.is_empty() {
-        return;
-    }
-    with_cranelift_gc(|gc| {
-        for root in roots.iter_mut() {
-            gc.remove_root(root as *mut GcRef);
-        }
-    });
-}
-
 struct GcRootSlotGuard {
     slots: Vec<*mut GcRef>,
     registered: bool,
@@ -3062,7 +3034,7 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
         [] => Ok(0),
         [Type::Int] => get_int_from_deadframe(frame, 0),
         [Type::Ref] => {
-            if let Some(jf) = frame.data.downcast_mut::<JitFrameDeadFrame>() {
+            if let Some(jf) = frame.as_jitframe_mut() {
                 return Ok(jf.take_ref_for_call_result(0).as_usize() as i64);
             }
             Err(BackendError::Unsupported(
@@ -3091,7 +3063,7 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
     // bumps the strong refcount before returning, so the local cell can
     // safely drop after BH completes.
     let (is_finish, fail_descr_arc, fail_arg_types) = {
-        let jf = frame.data.downcast_ref::<JitFrameDeadFrame>()?;
+        let jf = frame.as_jitframe()?;
         let fail_descr = jf.fail_descr.clone();
         let fd = as_fd(&fail_descr);
         let is_finish = fd.is_finish();
@@ -3197,11 +3169,9 @@ fn deadframe_from_jitframe(
     fail_descr: DescrRef,
     heap_owner: Option<Vec<i64>>,
 ) -> DeadFrame {
-    let mut frame = Box::new(JitFrameDeadFrame::new(
+    DeadFrame::JitFrame(JitFrameDeadFrame::new(
         jf_gcref, fail_descr, None, heap_owner,
-    ));
-    frame.register_roots();
-    DeadFrame { data: frame }
+    ))
 }
 
 pub fn set_savedata_ref_on_deadframe(
@@ -3209,8 +3179,7 @@ pub fn set_savedata_ref_on_deadframe(
     data: GcRef,
 ) -> Result<(), BackendError> {
     let jf = frame
-        .data
-        .downcast_mut::<JitFrameDeadFrame>()
+        .as_jitframe_mut()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     jf.set_savedata_ref(data);
     Ok(())
@@ -3220,8 +3189,7 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
     // llmodel.py:411-419 get_latest_descr: cast deadframe → JITFRAMEPTR,
     // read jf_descr, show() → AbstractFailDescr.
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(as_fd(&jf.fail_descr))
 }
@@ -3237,48 +3205,42 @@ pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.fail_descr.clone())
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.get_int(index))
 }
 
 pub fn get_float_from_deadframe(frame: &DeadFrame, index: usize) -> Result<f64, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.get_float(index))
 }
 
 pub fn get_ref_from_deadframe(frame: &DeadFrame, index: usize) -> Result<GcRef, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.get_ref(index))
 }
 
 pub fn get_savedata_ref_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.get_savedata_ref())
 }
 
 pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, BackendError> {
     let jf = frame
-        .data
-        .downcast_ref::<JitFrameDeadFrame>()
+        .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.grab_exc_value())
 }
@@ -25259,11 +25221,13 @@ mod tests {
     /// and `llmodel.py:298 malloc_jitframe` allocates it like any other object,
     /// so the frame itself is nursery-born and a minor collection promotes it
     /// to a different address — and every accessor on the deadframe reads
-    /// through `jf_gcref`, which is stale the moment that happens.
+    /// through `jf_gcref()`, which is stale the moment that happens.
     ///
-    /// What makes it not stale is that `register_roots` hands the collector the
-    /// ADDRESS OF THE SLOT (`add_root(&mut self.jf_gcref)`) rather than the
-    /// address of the frame, so the promotion rewrites the holder's pointer.
+    /// What makes it not stale is that the deadframe keeps the frame in a root
+    /// SLOT and reads it back by POSITION rather than holding a copy of the
+    /// address, so the walk that promoted the frame stored the new address into
+    /// the very slot the next read comes from
+    /// (`shadowstack.py:44-70 walk_stack_root`).
     /// The assertion that the frame moved is therefore load-bearing: without
     /// it a run where the frame happened to stay put would pass while proving
     /// nothing, which is exactly what the old-gen fixture next door does.
@@ -25301,10 +25265,9 @@ mod tests {
 
         let frame_addr = |frame: &DeadFrame| {
             frame
-                .data
-                .downcast_ref::<JitFrameDeadFrame>()
+                .as_jitframe()
                 .expect("cranelift deadframes are JitFrameDeadFrame")
-                .jf_gcref
+                .jf_gcref()
         };
         let before = frame_addr(&frame);
         assert!(
@@ -25331,6 +25294,82 @@ mod tests {
         assert!(!moved_root.is_null());
         assert_ne!(moved_root, root);
         assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0x5EED_5EED);
+    }
+
+    /// A deadframe that has MOVED still reads the frame the collector moved.
+    ///
+    /// The test above pins that the frame's address is rewritten while the
+    /// deadframe sits still. This one pins the other half, and it is the half
+    /// that decides how the deadframe may be stored: the deadframe is returned
+    /// by value and then moved again into a container, so its own address is
+    /// different at every step, and a collection between the last move and the
+    /// read still lands. Registering the address of the field that holds the
+    /// pointer cannot express this — that address stops being the frame's
+    /// holder the moment the holder moves, so the holder has to be pinned
+    /// first, which is what the per-exit heap allocation used to be for.
+    /// Addressing the root by its POSITION (`shadowstack.py:100-106`) is what
+    /// makes the holder's address irrelevant.
+    #[test]
+    fn test_moved_deadframe_still_reads_the_moved_jitframe() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+
+        let root = gc.alloc_with_type(0, 16);
+        assert!(gc.is_in_nursery(root.0));
+        unsafe {
+            *(root.0 as *mut u64) = 0xC0FF_EE00;
+        }
+
+        let mut backend = backend_with_gc(gc);
+
+        let inputargs = vec![InputArg::new_ref(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_ref(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+
+        let token = JitCellToken::new(1511);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        // Returned by value, then moved into a Vec: two more addresses for the
+        // same deadframe, neither of them the one it was built at.
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let mut held = vec![frame];
+
+        let before = held[0]
+            .as_jitframe()
+            .expect("cranelift deadframes are JitFrameDeadFrame")
+            .jf_gcref();
+        assert!(
+            with_cranelift_gc_required(|gc| gc.is_nursery_object(before.0)),
+            "the frame must be nursery-born, or the promotion this test is \
+             about cannot happen"
+        );
+
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
+
+        let after = held[0]
+            .as_jitframe()
+            .expect("cranelift deadframes are JitFrameDeadFrame")
+            .jf_gcref();
+        assert_ne!(
+            after, before,
+            "the frame must have been promoted, or a stale read would pass here"
+        );
+
+        let moved_root = backend.get_ref_value(&held[0], 0);
+        assert!(!moved_root.is_null());
+        assert_ne!(moved_root, root);
+        assert_eq!(unsafe { *(moved_root.0 as *const u64) }, 0xC0FF_EE00);
+        held.clear();
     }
 
     #[test]

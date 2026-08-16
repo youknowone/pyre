@@ -1648,6 +1648,33 @@ mod tests {
         assert_eq!(root, GcRef(0x1100));
     }
 
+    /// A thread that unregisters leaves nothing behind for the all-mutator
+    /// walk to reach, and a later thread can take its place.
+    ///
+    /// `thread_die` (`shadowstack.py:168-187`) drops the dying thread's entry
+    /// from `gcdata.thread_stacks` before the last GIL release, so no
+    /// subsequent collection walks a stack whose owner is gone. The registry
+    /// here is that table; `register_mutator` asserts a thread is not present
+    /// twice, so a second registration succeeding is what proves the first
+    /// entry was actually removed rather than merely emptied.
+    #[test]
+    fn test_mutator_teardown_releases_its_registry_entry() {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::thread::spawn(|| {
+            register_mutator();
+            {
+                let root = OwnerRootGuard::new(GcRef(0x4000));
+                assert_eq!(root.get(), GcRef(0x4000));
+            }
+            unregister_mutator();
+            // The entry is gone, so this thread can register again.
+            register_mutator();
+            unregister_mutator();
+        })
+        .join()
+        .expect("the registered thread must tear down without panicking");
+    }
+
     #[test]
     fn test_extern_c_interface() {
         let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());

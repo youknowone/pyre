@@ -636,11 +636,7 @@ fn main() {
 /// so the copy had no upstream counterpart; the frame now lives as long as the
 /// deadframe does and the accessors read it in place.
 ///
-/// `cranelift` adds ONE, for 5:
-///
-/// | n | site |
-/// |---|------|
-/// | 1 | `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside `DeadFrame`, the `llmodel.py:240` `cast_opaque_ptr` |
+/// `cranelift` adds NOTHING, and its four are the four shared rows above.
 ///
 /// There is no cranelift row for the frame itself, and that is the difference
 /// between the two backends. `run_compiled_code_inner` takes the JITFRAME from
@@ -650,8 +646,17 @@ fn main() {
 /// allocates its entry frame off the GC unconditionally, so it keeps paying
 /// for one; installing a GC does not move its figure.
 ///
-/// It used to add four. The three that went:
+/// It used to add four. The four that went:
 ///
+/// - `deadframe_from_jitframe` — the `Box<JitFrameDeadFrame>` inside
+///   `DeadFrame`. The box was not the `llmodel.py:240` `cast_opaque_ptr` it was
+///   annotated as; it was a PIN. The deadframe's frame pointer was rooted by
+///   registering the address of the field holding it, and a field address is
+///   only a valid root while its owner stays put, so the owner had to be given
+///   a fixed address before it could be returned. The pointer now lives in a
+///   root slot addressed by POSITION (`shadowstack.py:100-106`), which the
+///   collector rewrites in place, so the holder may move and `DeadFrame` holds
+///   the frame by value.
 /// - `CraneliftBackend::execute_token_with_dispatch_key` unwrapped the
 ///   metainterp's `&[Value]` into an owned `Vec<i64>` before the frame
 ///   existed. `llmodel.py:306-315` unwraps each argument *at* the store into
@@ -668,4 +673,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 5 } else { 6 };
+const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 4 } else { 6 };

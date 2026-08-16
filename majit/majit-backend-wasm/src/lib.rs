@@ -2060,9 +2060,7 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| unsafe { *frame.add(1 + i) })
         .collect();
-    DeadFrame {
-        data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
-    }
+    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
 }
 
 impl majit_backend::Backend for WasmBackend {
@@ -3354,9 +3352,7 @@ impl majit_backend::Backend for WasmBackend {
                 majit_gc::shadow_stack::pop_jf_to(saved);
                 drop(gcmap);
 
-                return DeadFrame {
-                    data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
-                };
+                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
 
             // Legacy host-Vec frame path (default, PYRE_WASM_CA off): fail_index
@@ -3396,9 +3392,7 @@ impl majit_backend::Backend for WasmBackend {
                 global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
             let num_outputs = fail_descr.fail_arg_types.len();
             let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
-            DeadFrame {
-                data: WasmFrameData::boxed(raw_values, fail_descr, exc_value),
-            }
+            DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
         }
     }
 
@@ -3409,8 +3403,8 @@ impl majit_backend::Backend for WasmBackend {
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         data.fail_descr.as_ref()
     }
@@ -3425,8 +3419,8 @@ impl majit_backend::Backend for WasmBackend {
         // fall back to the backend Arc upcast (synthetic backend-only
         // descrs).
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         if let Some(meta) = data.fail_descr.meta_descr.as_ref() {
             return Arc::clone(meta);
@@ -3436,24 +3430,24 @@ impl majit_backend::Backend for WasmBackend {
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         data.raw_values[index]
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         f64::from_bits(data.raw_values[index] as u64)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         GcRef(data.raw_values[index] as usize)
     }
@@ -3462,8 +3456,8 @@ impl majit_backend::Backend for WasmBackend {
     /// trace exited through a GuardNoException / GuardException.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         let data = frame
-            .data
-            .downcast_ref::<WasmFrameData>()
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
         GcRef(data.exc_value as usize)
     }
