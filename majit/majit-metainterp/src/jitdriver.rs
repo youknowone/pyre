@@ -4553,11 +4553,16 @@ impl<S: JitState> JitDriver<S> {
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
+            // Resolved here with the descriptor and carried to both ends of
+            // the run; see `sync_before` for why it is not asked for twice.
+            let vable = descriptor
+                .as_deref()
+                .and_then(JitDriverStaticData::virtualizable);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
                 return None;
             }
-            if !self.sync_before(state, &compiled_meta, descriptor.as_deref()) {
+            if !self.sync_before(state, &compiled_meta, vable) {
                 return None;
             }
             // The entry arguments are assembled in buffers the driver keeps
@@ -4595,7 +4600,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key,
                     state,
                     &compiled_meta,
-                    descriptor.as_deref(),
+                    vable,
                     &mut scratch.live_values,
                     &mut scratch.vable_static,
                     &mut scratch.vable_arrays,
@@ -4766,8 +4771,16 @@ impl<S: JitState> JitDriver<S> {
                 // portal — into slots indexed by the state's live-value
                 // layout, so a state with more than one live field indexes
                 // past the end of the list it was handed.
-                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                self.sync_after(state, &run_meta, run_descriptor.as_deref());
+                // The descriptor the entry decided on is the one the exit
+                // syncs through — resolved once above and carried here rather
+                // than asked for again. `warmstate.py:483/509-511` reads the
+                // cell once per `maybe_compile_and_run` and carries the read
+                // out to the executor for the same reason; the driver's static
+                // data is a configuration-time constant (see
+                // `descriptor_cache`), so a second consultation could only
+                // return the same object at the cost of one more refcount pair
+                // per compiled entry.
+                self.sync_after(state, &run_meta, vable);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -4781,8 +4794,10 @@ impl<S: JitState> JitDriver<S> {
                 if !result.typed_values.is_empty() {
                     state.restore_values(&run_meta, &result.typed_values);
                 }
-                let run_descriptor = self.driver_descriptor_for(state, &run_meta);
-                self.sync_after(state, &run_meta, run_descriptor.as_deref());
+                // Carried from the entry decision above, not re-resolved; see
+                // the FINISH arm for why one resolution serves both ends of a
+                // compiled entry.
+                self.sync_after(state, &run_meta, vable);
                 return Some(target_pc);
             }
 
@@ -5344,7 +5359,12 @@ impl<S: JitState> JitDriver<S> {
         self.republish_state_field_fvc();
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_deref()) {
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
+        if !self.sync_before(state, &meta, vable) {
             return;
         }
         let live_values = state.extract_live_values(&meta);
@@ -5389,7 +5409,12 @@ impl<S: JitState> JitDriver<S> {
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_deref()) {
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
+        if !self.sync_before(state, &meta, vable) {
             return;
         }
         let live_values = state.extract_live_values(&meta);
@@ -5440,7 +5465,12 @@ impl<S: JitState> JitDriver<S> {
         crate::mc_diag_bump(61); // mst_entered
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_deref()) {
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
+        if !self.sync_before(state, &meta, vable) {
             crate::mc_diag_bump(62); // mst_sync_before_false
             return false;
         }
@@ -5623,7 +5653,7 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         state: &S,
         meta: &S::Meta,
-        descriptor: Option<&JitDriverStaticData>,
+        virtualizable: Option<&JitDriverVar>,
         live_values: &mut Vec<Value>,
         statics: &mut Vec<i64>,
         arrays: &mut Vec<Vec<i64>>,
@@ -5643,11 +5673,14 @@ impl<S: JitState> JitDriver<S> {
         let Some(info) = self.meta.virtualizable_info() else {
             return false;
         };
-        // Try descriptor path first (RPython jitdriver_sd.virtualizable), else
-        // jitdriver_sd.virtualizable_info.name (interp_jit.py:25). Borrowed
-        // rather than cloned: both spellings outlive this call, and the export
-        // below only reads the name.
-        let name: &str = match descriptor.and_then(|d| d.virtualizable()) {
+        // Try the driver's declared virtualizable first (RPython
+        // jitdriver_sd.virtualizable), else jitdriver_sd.virtualizable_info.name
+        // (interp_jit.py:25). Borrowed rather than cloned: both spellings
+        // outlive this call, and the export below only reads the name. Arrives
+        // pre-resolved for the reason given on `sync_before` — this is the
+        // third consultation on one compiled entry, and the caller already
+        // holds the answer.
+        let name: &str = match virtualizable {
             Some(virtualizable) => &virtualizable.name,
             None => &info.name,
         };
@@ -5671,7 +5704,7 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         state: &S,
         meta: &S::Meta,
-        descriptor: Option<&JitDriverStaticData>,
+        virtualizable: Option<&JitDriverVar>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
         let mut statics = Vec::new();
@@ -5680,7 +5713,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             state,
             meta,
-            descriptor,
+            virtualizable,
             &mut live_values,
             &mut statics,
             &mut arrays,
@@ -5688,19 +5721,29 @@ impl<S: JitState> JitDriver<S> {
         .then_some(live_values)
     }
 
+    /// The declared virtualizable red of the driver this entry runs under,
+    /// or `None` for a driver that declares none.
+    ///
+    /// Taken pre-resolved rather than looked up here: the driver's static
+    /// data names its virtualizable by NAME, so asking it costs a scan of
+    /// the variable list with a string compare per variable, and both this
+    /// and [`Self::sync_after`] would pay it separately on one compiled
+    /// entry. `warmspot.py:529-538` resolves the virtualizable's position
+    /// once at driver setup (`jd.index_of_virtualizable`) and every runtime
+    /// reader indexes with it; the callers here resolve once at the entry
+    /// decision and carry the answer to both ends of the run for the same
+    /// reason.
     fn sync_before(
         &mut self,
         state: &mut S,
         meta: &S::Meta,
-        descriptor: Option<&JitDriverStaticData>,
+        virtualizable: Option<&JitDriverVar>,
     ) -> bool {
         // Descriptor-gated token-reset path — RPython
         // compile.py::sync_before_jit calls `vinfo.reset_vable_token(virt)`
         // when the JitDriver has a virtualizable declared.  Pyre routes
         // this through the interpreter's `sync_named_virtualizable_before_jit`.
-        if let Some(descriptor) = descriptor
-            && let Some(virtualizable) = descriptor.virtualizable()
-        {
+        if let Some(virtualizable) = virtualizable {
             let ok = state.sync_named_virtualizable_before_jit(
                 meta,
                 &virtualizable.name,
@@ -5737,11 +5780,10 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
-    fn sync_after(&self, state: &mut S, meta: &S::Meta, descriptor: Option<&JitDriverStaticData>) {
-        let Some(descriptor) = descriptor else {
-            return;
-        };
-        let Some(virtualizable) = descriptor.virtualizable() else {
+    /// Counterpart of [`Self::sync_before`]; takes the same pre-resolved
+    /// virtualizable red, and for the same reason.
+    fn sync_after(&self, state: &mut S, meta: &S::Meta, virtualizable: Option<&JitDriverVar>) {
+        let Some(virtualizable) = virtualizable else {
             return;
         };
         state.sync_named_virtualizable_after_jit(
@@ -5994,7 +6036,12 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, descriptor.as_deref()) {
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
+        if !state.is_compatible(&meta) || !self.sync_before(state, &meta, vable) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -6022,13 +6069,9 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let Some(live_values) = self.extend_compiled_live_values(
-            green_key,
-            state,
-            &meta,
-            descriptor.as_deref(),
-            live_values,
-        ) else {
+        let Some(live_values) =
+            self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
+        else {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -6081,7 +6124,7 @@ impl<S: JitState> JitDriver<S> {
 
         let exit_meta = result.meta.clone();
         state.restore_values(&exit_meta, &result.typed_values);
-        self.sync_after(state, &exit_meta, descriptor.as_deref());
+        self.sync_after(state, &exit_meta, vable);
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
             continue_running_normally_values: None,
@@ -6117,6 +6160,11 @@ impl<S: JitState> JitDriver<S> {
             };
         };
         let descriptor = self.driver_descriptor_for(state, &meta);
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
         // warmstate.py:482-511: RPython enters execute_token directly
         // when the green key matches — no is_compatible check.
         // pyre still needs this gate because compiled code reads
@@ -6136,7 +6184,7 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        if !self.sync_before(state, &meta, descriptor.as_deref()) {
+        if !self.sync_before(state, &meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=sync-before target_pc={}",
@@ -6179,13 +6227,9 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let Some(live_values) = self.extend_compiled_live_values(
-            green_key,
-            state,
-            &meta,
-            descriptor.as_deref(),
-            live_values,
-        ) else {
+        let Some(live_values) =
+            self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
+        else {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=extend-live-values target_pc={}",
@@ -6244,7 +6288,7 @@ impl<S: JitState> JitDriver<S> {
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &typed_values);
-            self.sync_after(state, &exit_meta, descriptor.as_deref());
+            self.sync_after(state, &exit_meta, vable);
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
                 continue_running_normally_values: None,
@@ -7462,7 +7506,12 @@ impl<S: JitState> JitDriver<S> {
         }
         let meta = meta.clone();
         let descriptor = self.driver_descriptor_for(state, &meta);
-        if !self.sync_before(state, &meta, descriptor.as_deref()) {
+        // Resolved here with the descriptor and carried to both ends of
+        // the run; see `sync_before` for why it is not asked for twice.
+        let vable = descriptor
+            .as_deref()
+            .and_then(JitDriverStaticData::virtualizable);
+        if !self.sync_before(state, &meta, vable) {
             return None;
         }
         let live_values = state.extract_live_values(&meta);
@@ -7473,13 +7522,8 @@ impl<S: JitState> JitDriver<S> {
         ) {
             return None;
         }
-        let live_values = self.extend_compiled_live_values(
-            key_hash,
-            state,
-            &meta,
-            descriptor.as_deref(),
-            live_values,
-        )?;
+        let live_values =
+            self.extend_compiled_live_values(key_hash, state, &meta, vable, live_values)?;
         let mut live_values = live_values;
         let mut dispatch_key = single_pass_dispatch_key;
         // `live_values` is in state-field order; a dispatch-key entry lands on a
@@ -7562,26 +7606,25 @@ impl<S: JitState> JitDriver<S> {
                     );
                 }
                 state.restore_values(&result_meta, &typed_values);
-                self.sync_after(state, &result_meta, descriptor.as_deref());
+                self.sync_after(state, &result_meta, vable);
                 // Re-enter compiled code if state is still compatible
                 if let Some(meta) = self.meta.get_compiled_meta(key_hash)
                     && state.is_compatible(meta)
                 {
                     let meta = meta.clone();
-                    let nd = self.driver_descriptor_for(state, &meta);
-                    if self.sync_before(state, &meta, nd.as_deref()) {
+                    // The re-entry runs under the same driver as the entry
+                    // this loop came in on, so it reuses that one resolution
+                    // instead of asking per iteration — the meta changes
+                    // between iterations, the driver's static data does not.
+                    if self.sync_before(state, &meta, vable) {
                         let nl = state.extract_live_values(&meta);
                         if Self::live_values_match_descriptor(
-                            nd.as_deref(),
+                            descriptor.as_deref(),
                             &nl,
                             state.state_field_layout().total_live_values(),
-                        ) && let Some(v) = self.extend_compiled_live_values(
-                            key_hash,
-                            state,
-                            &meta,
-                            nd.as_deref(),
-                            nl,
-                        ) {
+                        ) && let Some(v) =
+                            self.extend_compiled_live_values(key_hash, state, &meta, vable, nl)
+                        {
                             live_values = v;
                             continue;
                         }
@@ -7653,7 +7696,7 @@ impl<S: JitState> JitDriver<S> {
                 // Restore state for bridge tracing start point.
                 let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
                 let resume_pc = resume_pc.unwrap_or(guard_resume_pc);
-                self.sync_after(state, &result_meta, descriptor.as_deref());
+                self.sync_after(state, &result_meta, vable);
 
                 let bridge_ok =
                     self.start_bridge_tracing(&descr_arc, state, env, &raw_values, resume_pc);
@@ -7834,7 +7877,7 @@ impl<S: JitState> JitDriver<S> {
             self.prepare_exit_resume_heap_with_blackhole_allocator(&exit_layout, &raw_values);
             let resume_pc = on_guard_failure(state, &result_meta, &raw_values, &exit_layout);
             let resume_pc = resume_pc.unwrap_or(target_pc);
-            self.sync_after(state, &result_meta, descriptor.as_deref());
+            self.sync_after(state, &result_meta, vable);
             return Some(resume_pc);
         } // end loop { run_compiled ... }
     }
