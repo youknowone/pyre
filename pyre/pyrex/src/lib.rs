@@ -87,6 +87,66 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, le
     Ok(parser.raw_args()?.collect())
 }
 
+/// Remove the common space/tab prefix from nonblank `-c` source lines alone.
+fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
+    let mut prefix: Option<&[u8]> = None;
+    for line in source.split_inclusive('\n') {
+        let bytes = line.as_bytes();
+        let mut content_end = bytes.len();
+        if bytes.last() == Some(&b'\n') {
+            content_end -= 1;
+            if content_end > 0 && bytes[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+        }
+        let content = &bytes[..content_end];
+        let indent_len = content
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(content.len());
+        if indent_len == content.len() {
+            continue;
+        }
+        let indent = &content[..indent_len];
+        prefix = Some(match prefix {
+            None => indent,
+            Some(current) => {
+                let common_len = current
+                    .iter()
+                    .zip(indent)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &current[..common_len]
+            }
+        });
+        if prefix.is_some_and(|prefix| prefix.is_empty()) {
+            return std::borrow::Cow::Borrowed(source);
+        }
+    }
+
+    let Some(prefix) = prefix else {
+        return std::borrow::Cow::Borrowed(source);
+    };
+    let mut dedented = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let bytes = line.as_bytes();
+        let mut content_end = bytes.len();
+        if bytes.last() == Some(&b'\n') {
+            content_end -= 1;
+            if content_end > 0 && bytes[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+        }
+        let content = &bytes[..content_end];
+        if content.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+            dedented.push_str(line);
+        } else {
+            dedented.push_str(&line[prefix.len()..]);
+        }
+    }
+    std::borrow::Cow::Owned(dedented)
+}
+
 /// Emit the `preconfig_init_utf8_mode` fatal error for an invalid PYTHONUTF8 /
 /// `-X utf8` value and exit; the value is validated during pre-init config.
 fn fatal_utf8_config_error(detail: &str) -> ! {
@@ -655,7 +715,8 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_source(&cmd, Mode::Exec, "<string>", no_site);
+            let cmd = dedent_command(&cmd);
+            run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site);
             if inspect {
                 repl::run_repl(true, no_site);
             }
@@ -1970,7 +2031,63 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_heapsize, set_last_exec_ctx, setup_exec_context};
+    use super::{dedent_command, parse_heapsize, set_last_exec_ctx, setup_exec_context};
+
+    #[test]
+    fn command_dedent_removes_shared_space_prefix() {
+        let source = "\n    import sys\n    print(\"ok\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "\nimport sys\nprint(\"ok\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_leaves_extra_indentation() {
+        let source = "  print(\"first\")\n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n  print(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_treats_tabs_as_distinct_prefix_bytes() {
+        let source = "\tprint(\"first\")\n\tprint(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_handles_one_line_without_leading_newline() {
+        assert_eq!(dedent_command("    print(\"B\")").as_ref(), "print(\"B\")");
+    }
+
+    #[test]
+    fn command_dedent_ignores_and_preserves_whitespace_only_lines() {
+        let source = "    print(\"first\")\n  \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n  \nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_is_raw_text_and_stops_at_column_zero() {
+        let source = "    text = \"\"\"\n  inside\ninside\n\"\"\"\n";
+        assert_eq!(dedent_command(source).as_ref(), source);
+    }
+
+    #[test]
+    fn command_dedent_preserves_crlf_line_endings() {
+        let source = "\r\n    print(\"first\")\r\n  \r\n    print(\"second\")\r\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "\r\nprint(\"first\")\r\n  \r\nprint(\"second\")\r\n"
+        );
+    }
 
     #[test]
     fn heapsize_suffixes_and_validation() {
