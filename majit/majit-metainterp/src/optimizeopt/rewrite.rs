@@ -195,14 +195,22 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
-        // Strength reduction for constant divisor >= 2
+        // Strength reduction for constant divisor >= 2.
+        //
+        // Both arms below compute a FLOOR quotient, which `IntFloorDiv` is
+        // not: they are only equal to it for a non-negative dividend, so both
+        // are gated on that.
+        let known_nonneg = ctx
+            .resolve_operand_operand_opt(&arg0)
+            .and_then(|b| ctx.peek_intbound_box(&b))
+            .is_some_and(|bound| bound.known_nonnegative());
         if let Some(divisor) = ctx
             .resolve_operand_operand_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
+            && known_nonneg
         {
             if divisor > 1 && divisor.count_ones() == 1 {
-                // Power-of-2 floor division: x // (2^n) = x >> n
-                // Arithmetic right shift IS floor division for positive divisors.
+                // Power-of-2 division: x // (2^n) = x >> n
                 let shift = divisor.trailing_zeros();
                 let shift_ref = self.emit_constant_int(ctx, shift as i64);
                 let arg_shift = ctx.materialize_operand_at(shift_ref);
@@ -217,10 +225,6 @@ impl OptRewrite {
             if divisor >= 3 && ctx.supports_efficient_uint_mul_high {
                 // rewrite.py:770 `known_nonneg = b1.known_nonnegative()`:
                 // a non-negative dividend skips the sign-correction ops.
-                let known_nonneg = ctx
-                    .resolve_operand_operand_opt(&arg0)
-                    .and_then(|b| ctx.peek_intbound_box(&b))
-                    .is_some_and(|bound| bound.known_nonnegative());
                 let result = intdiv::division_operations(
                     arg0.to_opref(),
                     divisor,
@@ -303,20 +307,25 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
-        // Strength reduction for constant divisor >= 3 (non-power-of-2)
+        // Strength reduction for constant divisor >= 3 (non-power-of-2).
+        //
+        // `modulo_operations` computes a FLOOR remainder, which `IntMod` is
+        // not, so the rewrite holds only for a non-negative dividend — the
+        // case where the two agree.  rewrite.py:809
+        // `known_nonneg = b1.known_nonnegative()` reads the same bound to
+        // decide whether the expansion needs its sign-correction ops.
+        let known_nonneg = ctx
+            .resolve_operand_operand_opt(&arg0)
+            .and_then(|b| ctx.peek_intbound_box(&b))
+            .is_some_and(|bound| bound.known_nonnegative());
         if let Some(divisor) = ctx
             .resolve_operand_operand_opt(&arg1)
             .and_then(|b| ctx.get_constant_int_box(&b))
             && divisor >= 3
             && divisor.count_ones() != 1
+            && known_nonneg
             && ctx.supports_efficient_uint_mul_high
         {
-            // rewrite.py:809 `known_nonneg = b1.known_nonnegative()`:
-            // a non-negative dividend skips the sign-correction ops.
-            let known_nonneg = ctx
-                .resolve_operand_operand_opt(&arg0)
-                .and_then(|b| ctx.peek_intbound_box(&b))
-                .is_some_and(|bound| bound.known_nonnegative());
             let result = intdiv::modulo_operations(
                 arg0.to_opref(),
                 divisor,
@@ -1137,13 +1146,16 @@ impl OptRewrite {
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:797-805: intdiv.modulo_operations fallback, which emits
-        // UINT_MUL_HIGH.  A backend without one leaves the residual call in
-        // place, the same answer the IntMod arm gives.
-        if !ctx.supports_efficient_uint_mul_high {
-            return None;
-        }
+        // UINT_MUL_HIGH.  A backend that has to emulate that multiply expands
+        // through the native truncating remainder instead; either way the
+        // residual call goes away.
         let known_nonneg = b1.known_nonnegative();
-        let result_ref = crate::optimizeopt::intdiv::modulo_operations(
+        let expand = if ctx.supports_efficient_uint_mul_high {
+            crate::optimizeopt::intdiv::modulo_operations
+        } else {
+            crate::optimizeopt::intdiv::trunc_modulo_operations
+        };
+        let result_ref = expand(
             arg1.to_opref(),
             val,
             known_nonneg,
@@ -1245,13 +1257,16 @@ impl OptRewrite {
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:758-766: intdiv.division_operations fallback, which emits
-        // UINT_MUL_HIGH.  A backend without one leaves the residual call in
-        // place, the same answer the IntFloorDiv arm gives.
-        if !ctx.supports_efficient_uint_mul_high {
-            return None;
-        }
+        // UINT_MUL_HIGH.  A backend that has to emulate that multiply expands
+        // through the native truncating quotient instead; either way the
+        // residual call goes away.
         let known_nonneg = b1.known_nonnegative();
-        let result_ref = crate::optimizeopt::intdiv::division_operations(
+        let expand = if ctx.supports_efficient_uint_mul_high {
+            crate::optimizeopt::intdiv::division_operations
+        } else {
+            crate::optimizeopt::intdiv::trunc_division_operations
+        };
+        let result_ref = expand(
             arg1.to_opref(),
             val,
             known_nonneg,
@@ -2550,13 +2565,14 @@ mod tests {
         target: usize,
         constants: &[(OpRef, Value)],
     ) -> (OptimizationResult, OptContext) {
-        run_one_rewrite_only_with_mul_high(specs, target, constants, true)
+        run_one_rewrite_only_with_mul_high(specs, target, constants, &[], true)
     }
 
     fn run_one_rewrite_only_with_mul_high(
         specs: Vec<OpSpec>,
         target: usize,
         constants: &[(OpRef, Value)],
+        nonneg: &[OpRef],
         supports_efficient_uint_mul_high: bool,
     ) -> (OptimizationResult, OptContext) {
         let ops = build_specs(&specs);
@@ -2568,6 +2584,14 @@ mod tests {
         for &(opref, value) in constants {
             let b = ctx.materialize_operand_at(opref);
             ctx.make_constant_box(&b, value);
+        }
+        for &opref in nonneg {
+            let b = ctx.materialize_operand_at(opref);
+            let _ = ctx
+                .getintbound_handle(&b)
+                .borrow_mut()
+                .expect("a materialized int operand has a live bound cell")
+                .make_ge_const(0);
         }
         let mut pass = OptRewrite::new();
         let mut op = (*ops[target]).clone();
@@ -2795,15 +2819,20 @@ mod tests {
         assert_binop_self(OpCode::IntMod, Some(0));
     }
 
-    /// Whether the magic-number expansion ran.  `intdiv` queues its sequence
+    /// Whether the pass emitted `opcode`.  `intdiv` queues its sequence
     /// through `emit_extra`, so it is still in `extra_operations_after` when
     /// the pass returns.
-    fn emitted_uint_mul_high(ctx: &OptContext) -> bool {
+    fn emitted_opcode(ctx: &OptContext, opcode: OpCode) -> bool {
         ctx.new_operations
             .iter()
             .map(|op| op.opcode)
             .chain(ctx.extra_operations_after.iter().map(|(_, op)| op.opcode))
-            .any(|opcode| opcode == OpCode::UintMulHigh)
+            .any(|emitted| emitted == opcode)
+    }
+
+    /// Whether the magic-number expansion ran.
+    fn emitted_uint_mul_high(ctx: &OptContext) -> bool {
+        emitted_opcode(ctx, OpCode::UintMulHigh)
     }
 
     /// A `CALL_PURE_I` carrying one of the Python division oopspecs, with the
@@ -2848,6 +2877,31 @@ mod tests {
         (result, ctx)
     }
 
+    /// `IntFloorDiv` and `IntMod` truncate, while both strength reductions
+    /// below them compute a floor.  The two agree only for a non-negative
+    /// dividend, so an unknown-sign one keeps the native op no matter what
+    /// the backend can multiply.
+    #[test]
+    fn constant_division_and_modulo_keep_the_native_op_for_an_unknown_sign_dividend() {
+        for opcode in [OpCode::IntFloorDiv, OpCode::IntMod] {
+            for mul_high in [false, true] {
+                let (result, ctx) = run_one_rewrite_only_with_mul_high(
+                    vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
+                    2,
+                    &[(OpRef::int_op(1), Value::Int(100))],
+                    &[],
+                    mul_high,
+                );
+                assert_pass_on(&result);
+                assert!(
+                    !emitted_uint_mul_high(&ctx),
+                    "{opcode:?} took the floor expansion for a possibly-negative \
+                     dividend (mul_high={mul_high})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn backend_without_mul_high_keeps_native_constant_division_and_modulo() {
         for opcode in [OpCode::IntFloorDiv, OpCode::IntMod] {
@@ -2855,6 +2909,7 @@ mod tests {
                 vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
                 2,
                 &[(OpRef::int_op(1), Value::Int(100))],
+                &[OpRef::int_op(0)],
                 false,
             );
             assert_pass_on(&result);
@@ -2872,6 +2927,7 @@ mod tests {
                 vec![same_i(), same_i(), bin_i(opcode, 0, 1)],
                 2,
                 &[(OpRef::int_op(1), Value::Int(100))],
+                &[OpRef::int_op(0)],
                 true,
             );
             assert!(
@@ -2881,22 +2937,31 @@ mod tests {
         }
     }
 
-    /// The call-based helpers share the magic-number expansion with the
-    /// native opcodes, so they answer to the same capability.
+    /// The `int_py_div` / `int_py_mod` calls carry Python's floor semantics,
+    /// which no backend has an instruction for, so the call always goes away.
+    /// The capability picks the expansion: the magic-number sequence where
+    /// `UintMulHigh` is cheap, `intdiv::trunc_division_operations` /
+    /// `trunc_modulo_operations` — the native truncating primitive plus a
+    /// sign correction — where it is not.
     #[test]
-    fn call_int_py_div_and_mod_follow_the_mul_high_capability() {
-        for oopspecindex in [
-            majit_ir::OopSpecIndex::IntPyDiv,
-            majit_ir::OopSpecIndex::IntPyMod,
+    fn call_int_py_div_and_mod_expand_on_either_mul_high_setting() {
+        for (oopspecindex, primitive) in [
+            (majit_ir::OopSpecIndex::IntPyDiv, OpCode::IntFloorDiv),
+            (majit_ir::OopSpecIndex::IntPyMod, OpCode::IntMod),
         ] {
             let (result, ctx) = run_int_py_call(oopspecindex, 100, false);
-            assert_pass_on(&result);
+            assert_remove(&result);
             assert!(
                 !emitted_uint_mul_high(&ctx),
                 "{oopspecindex:?} expanded through UintMulHigh on a backend that lacks it"
             );
+            assert!(
+                emitted_opcode(&ctx, primitive),
+                "{oopspecindex:?} reached neither expansion on a backend without UintMulHigh"
+            );
 
-            let (_result, ctx) = run_int_py_call(oopspecindex, 100, true);
+            let (result, ctx) = run_int_py_call(oopspecindex, 100, true);
+            assert_remove(&result);
             assert!(
                 emitted_uint_mul_high(&ctx),
                 "{oopspecindex:?} left the residual call on a backend that has UintMulHigh"

@@ -520,14 +520,17 @@ impl OptIntBounds {
     fn postprocess_int_floordiv(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
-        let b = b0.py_div_bound(&b1);
+        let b = b0.trunc_div_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 
     fn postprocess_int_mod(&mut self, op: &Op, ctx: &mut OptContext) {
         let b0 = self.getintbound_arg(&op.arg(0), ctx);
         let b1 = self.getintbound_arg(&op.arg(1), ctx);
-        let b = b0.mod_bound(&b1);
+        // `IntMod` truncates, so `mod_bound`'s `0 <= x % pos < pos` does not
+        // hold for a negative dividend; that one belongs to the `int_py_mod`
+        // call, which `postprocess_call` still attaches it to.
+        let b = b0.trunc_mod_bound(&b1);
         self.intersect_bound(op.pos.get(), &b, ctx);
     }
 

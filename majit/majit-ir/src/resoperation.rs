@@ -1855,6 +1855,13 @@ pub enum OpCode {
     IntSub,
     IntMul,
     UintMulHigh,
+    /// `int_floordiv` / `int_mod`: the C-truncating division primitives, as
+    /// `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod` define them —
+    /// the quotient rounds toward zero and the remainder carries the
+    /// dividend's sign. Python's floor forms are separate: they reach the
+    /// optimizer as the `int_py_div` / `int_py_mod` oopspec calls that
+    /// `OptRewrite::optimize_call_int_py_div` / `_mod` expand, and those
+    /// expansions build the floor correction on top of these two.
     IntFloorDiv,
     IntMod,
     IntAnd,

@@ -423,14 +423,12 @@ pub fn execute_binary_int_const(opcode: OpCode, a: i64, b: i64) -> Option<i64> {
         OpCode::UintLe => ((a as u64) <= (b as u64)) as i64,
         OpCode::UintGe => ((a as u64) >= (b as u64)) as i64,
         OpCode::UintGt => ((a as u64) > (b as u64)) as i64,
-        OpCode::IntFloorDiv if b != 0 => {
-            let (q, r) = (a / b, a % b);
-            if (r != 0) && ((r ^ b) < 0) { q - 1 } else { q }
-        }
-        OpCode::IntMod if b != 0 => {
-            let r = a % b;
-            if (r != 0) && ((r ^ b) < 0) { r + b } else { r }
-        }
+        // Truncating, as `_ll_2_int_floordiv` / `_ll_2_int_mod` are and as the
+        // blackhole and every backend execute them. Wrapping keeps
+        // `i64::MIN / -1` off the panic path; the trace guards that corner out
+        // before it reaches either op.
+        OpCode::IntFloorDiv if b != 0 => a.wrapping_div(b),
+        OpCode::IntMod if b != 0 => a.wrapping_rem(b),
         OpCode::IntSignext if (1..=8).contains(&b) => {
             // `blackhole.bhimpl_int_signext` delegates to `support.int_signext`.
             crate::support::int_signext(a, b)

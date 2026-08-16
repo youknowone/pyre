@@ -66,6 +66,7 @@ pub fn bhimpl_int_mul_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue,
     }
 }
 
+/// The `int_py_div` residual call's target: Python's floor quotient.
 pub fn bhimpl_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) if y != 0 => {
@@ -76,9 +77,28 @@ pub fn bhimpl_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue 
     }
 }
 
+/// The `int_py_mod` residual call's target: Python's floor remainder.
 pub fn bhimpl_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(((x % y) + y) % y),
+        _ => ConcreteValue::Null,
+    }
+}
+
+/// `support.py:255-265 _ll_2_int_floordiv` — the truncating primitive the
+/// `IntFloorDiv` opcode is, as distinct from the floor helper above that the
+/// `int_py_div` call reaches.
+pub fn _ll_2_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
+    match (a.getint(), b.getint()) {
+        (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(x.wrapping_div(y)),
+        _ => ConcreteValue::Null,
+    }
+}
+
+/// `support.py:266-271 _ll_2_int_mod` — see [`_ll_2_int_floordiv`].
+pub fn _ll_2_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
+    match (a.getint(), b.getint()) {
+        (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(x.wrapping_rem(y)),
         _ => ConcreteValue::Null,
     }
 }
@@ -318,9 +338,11 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
                 (ConcreteValue::Null, false)
             }
         }
+        // The truncating primitives, not the floor helpers the `int_py_div` /
+        // `int_py_mod` calls reach.
         OpCode::IntFloorDiv => {
             let v = if args.len() >= 2 {
-                bhimpl_int_floordiv(args[0], args[1])
+                _ll_2_int_floordiv(args[0], args[1])
             } else {
                 ConcreteValue::Null
             };
@@ -328,7 +350,7 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
         }
         OpCode::IntMod => {
             let v = if args.len() >= 2 {
-                bhimpl_int_mod(args[0], args[1])
+                _ll_2_int_mod(args[0], args[1])
             } else {
                 ConcreteValue::Null
             };

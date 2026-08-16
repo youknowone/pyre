@@ -203,6 +203,139 @@ pub fn modulo_operations(
     )
 }
 
+/// Generate `n // m` for a positive constant `m` from the truncating
+/// `IntFloorDiv` primitive, for a backend that has no efficient
+/// `UintMulHigh`.
+///
+/// [`division_operations`] above is upstream's expansion and the better one
+/// wherever a 64x64->128 multiply is a single instruction. A backend that has
+/// to emulate one answers `supports_efficient_uint_mul_high = false`, and
+/// upstream has nothing to offer it: RPython expands unconditionally because
+/// every backend it targets has the multiply. Left alone, such a backend keeps
+/// the residual `int_py_div` call, which costs it an indirect call in the
+/// middle of the loop it was tracing.
+///
+/// `IntFloorDiv` truncates, so the quotient is one too high exactly when the
+/// dividend is negative and the division is inexact — which for `m > 0` is
+/// exactly when the truncating remainder is negative:
+///
+/// ```text
+///   q = IntFloorDiv(n, m)
+///   t = IntMod(n, m)          sign of n, zero iff m divides n
+///   s = t >> 63               -1 when t < 0, else 0
+///   result = q + s
+/// ```
+///
+/// A non-negative dividend cannot need the correction, so `known_nonneg`
+/// returns `q` itself.
+pub fn trunc_division_operations(
+    n_ref: OpRef,
+    m: i64,
+    known_nonneg: bool,
+    pass_idx: usize,
+    ctx: &mut OptContext,
+) -> OpRef {
+    debug_assert!(m > 0);
+    let m_ref = emit_constant_int(ctx, m);
+
+    let arg_n = ctx.materialize_operand_at(n_ref);
+    let arg_m = ctx.materialize_operand_at(m_ref);
+    let q_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntFloorDiv, &[arg_n.clone(), arg_m.clone()]),
+    );
+    if known_nonneg {
+        return q_ref;
+    }
+
+    let s_ref = emit_remainder_sign(n_ref, m_ref, pass_idx, ctx);
+    let arg_q = ctx.materialize_operand_at(q_ref);
+    let arg_s = ctx.materialize_operand_at(s_ref);
+    emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntAdd, &[arg_q.clone(), arg_s.clone()]),
+    )
+}
+
+/// Generate `n % m` for a positive constant `m` from the truncating `IntMod`
+/// primitive; the modulo counterpart of [`trunc_division_operations`], and
+/// used under the same condition.
+///
+/// The truncating remainder carries the dividend's sign, so it is exactly `m`
+/// short of Python's whenever it is negative:
+///
+/// ```text
+///   t = IntMod(n, m)          -(m-1) <= t <= m-1
+///   s = t >> 63               -1 when t < 0, else 0
+///   result = t + (s & m)      0 <= result < m
+/// ```
+pub fn trunc_modulo_operations(
+    n_ref: OpRef,
+    m: i64,
+    known_nonneg: bool,
+    pass_idx: usize,
+    ctx: &mut OptContext,
+) -> OpRef {
+    debug_assert!(m > 0);
+    let m_ref = emit_constant_int(ctx, m);
+
+    let arg_n = ctx.materialize_operand_at(n_ref);
+    let arg_m = ctx.materialize_operand_at(m_ref);
+    let t_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntMod, &[arg_n.clone(), arg_m.clone()]),
+    );
+    if known_nonneg {
+        return t_ref;
+    }
+
+    // s is 0 or -1, so `s & m` is m on exactly the negative side and 0 elsewhere.
+    let arg_t = ctx.materialize_operand_at(t_ref);
+    let shift63_ref = emit_constant_int(ctx, 63);
+    let arg_shift63 = ctx.materialize_operand_at(shift63_ref);
+    let s_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntRshift, &[arg_t.clone(), arg_shift63.clone()]),
+    );
+    let arg_s = ctx.materialize_operand_at(s_ref);
+    let arg_m = ctx.materialize_operand_at(m_ref);
+    let masked_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntAnd, &[arg_s.clone(), arg_m.clone()]),
+    );
+    let arg_t = ctx.materialize_operand_at(t_ref);
+    let arg_masked = ctx.materialize_operand_at(masked_ref);
+    emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntAdd, &[arg_t.clone(), arg_masked.clone()]),
+    )
+}
+
+/// `IntMod(n, m) >> 63`: -1 when the truncating remainder is negative, else 0.
+fn emit_remainder_sign(n_ref: OpRef, m_ref: OpRef, pass_idx: usize, ctx: &mut OptContext) -> OpRef {
+    let arg_n = ctx.materialize_operand_at(n_ref);
+    let arg_m = ctx.materialize_operand_at(m_ref);
+    let t_ref = emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntMod, &[arg_n.clone(), arg_m.clone()]),
+    );
+    let arg_t = ctx.materialize_operand_at(t_ref);
+    let shift63_ref = emit_constant_int(ctx, 63);
+    let arg_shift63 = ctx.materialize_operand_at(shift63_ref);
+    emit_op(
+        ctx,
+        pass_idx,
+        Op::new(OpCode::IntRshift, &[arg_t.clone(), arg_shift63.clone()]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +517,120 @@ mod tests {
 
         let final_op = &ctx.new_operations[result_ref.raw() as usize];
         assert_eq!(final_op.opcode, OpCode::IntSub);
+    }
+
+    // ── truncating expansions (backends without an efficient UintMulHigh) ──
+
+    /// What `trunc_modulo_operations` emits, evaluated on i64 with Rust's `%`
+    /// standing in for `IntMod` (both truncate).
+    fn apply_trunc_mod(n: i64, m: i64) -> i64 {
+        let t = n % m;
+        t + ((t >> 63) & m)
+    }
+
+    /// The same for `trunc_division_operations`.
+    fn apply_trunc_div(n: i64, m: i64) -> i64 {
+        (n / m) + ((n % m) >> 63)
+    }
+
+    #[test]
+    fn test_trunc_expansions_match_python_semantics() {
+        for m in [3i64, 5, 7, 10, 13, 100, 127, 1000] {
+            for n in [
+                0i64,
+                1,
+                m - 1,
+                m,
+                m + 1,
+                -1,
+                -(m - 1),
+                -m,
+                -(m + 1),
+                999,
+                -999,
+                i64::MAX,
+                i64::MIN,
+            ] {
+                assert_eq!(
+                    apply_trunc_mod(n, m),
+                    n.rem_euclid(m),
+                    "modulo failed: {n} % {m}"
+                );
+                assert_eq!(
+                    apply_trunc_div(n, m),
+                    floor_div(n, m),
+                    "division failed: {n} // {m}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_trunc_modulo_ops_emits_correct_sequence() {
+        let mut ctx = OptContext::new(12);
+        let n_ref = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+
+        let result_ref = trunc_modulo_operations(n_ref, 7, false, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
+
+        // IntMod + IntRshift + IntAnd + IntAdd after the input.
+        assert_eq!(ctx.new_operations.len(), 5);
+        assert_eq!(
+            ctx.new_operations[result_ref.raw() as usize].opcode,
+            OpCode::IntAdd
+        );
+        assert!(
+            ctx.new_operations
+                .iter()
+                .all(|op| op.opcode != OpCode::UintMulHigh),
+            "the truncating expansion exists to avoid UintMulHigh"
+        );
+    }
+
+    #[test]
+    fn test_trunc_modulo_ops_known_nonneg_is_the_bare_remainder() {
+        let mut ctx = OptContext::new(8);
+        let n_ref = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+
+        let result_ref = trunc_modulo_operations(n_ref, 7, true, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
+
+        assert_eq!(ctx.new_operations.len(), 2);
+        assert_eq!(
+            ctx.new_operations[result_ref.raw() as usize].opcode,
+            OpCode::IntMod
+        );
+    }
+
+    #[test]
+    fn test_trunc_division_ops_emits_correct_sequence() {
+        let mut ctx = OptContext::new(12);
+        let n_ref = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+
+        let result_ref = trunc_division_operations(n_ref, 7, false, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
+
+        // IntFloorDiv + IntMod + IntRshift + IntAdd after the input.
+        assert_eq!(ctx.new_operations.len(), 5);
+        assert_eq!(
+            ctx.new_operations[result_ref.raw() as usize].opcode,
+            OpCode::IntAdd
+        );
+    }
+
+    #[test]
+    fn test_trunc_division_ops_known_nonneg_is_the_bare_quotient() {
+        let mut ctx = OptContext::new(8);
+        let n_ref = ctx.emit(Op::new(OpCode::SameAsI, &[]));
+
+        let result_ref = trunc_division_operations(n_ref, 7, true, 0, &mut ctx);
+        drain_extra_ops(&mut ctx);
+
+        assert_eq!(ctx.new_operations.len(), 2);
+        assert_eq!(
+            ctx.new_operations[result_ref.raw() as usize].opcode,
+            OpCode::IntFloorDiv
+        );
     }
 
     // ── Edge cases ──
