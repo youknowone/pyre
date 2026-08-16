@@ -609,6 +609,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(msvcrt);
     pyre_install_module!(_abc);
     pyre_install_module!(_bisect);
+    pyre_install_module!(_heapq);
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // deliberately mounts no stdlib files, so it must stay a builtin.
     pyre_install_module!(_stat);

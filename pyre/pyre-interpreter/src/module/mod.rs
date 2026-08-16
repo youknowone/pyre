@@ -30,6 +30,8 @@ pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
 #[allow(non_snake_case)]
+pub mod _heapq;
+#[allow(non_snake_case)]
 pub mod _immutables_map;
 pub mod _io;
 #[allow(non_snake_case)]
