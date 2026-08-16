@@ -4451,6 +4451,10 @@ fn register_thread_root_areas() {
             mapdict_root_walker_area,
             pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
         );
+        register(
+            repr_active_root_walker_area,
+            pyre_interpreter::display::capture_repr_active_area(),
+        );
         #[cfg(not(target_arch = "wasm32"))]
         register(
             signal_handler_root_walker_area,
@@ -5178,6 +5182,18 @@ unsafe fn pyre_object_root_walker_area(
 
 unsafe fn pyframe_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     unsafe { pyre_interpreter::eval::walk_pyframe_roots_area(data, visitor) };
+}
+
+/// The mid-repr cycle-guard set holds the containers being walked, and a list
+/// or dict among them moves while an item's `__repr__` runs.
+unsafe fn repr_active_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let mut forward = |slot: &mut pyre_object::PyObjectRef| {
+        visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) });
+    };
+    unsafe { pyre_interpreter::display::walk_repr_active_area(data, &mut forward) };
 }
 
 unsafe fn jitcode_constants_root_walker_area(

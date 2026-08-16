@@ -1306,6 +1306,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // code, so a hook callable is young when it lands and cannot wait for
         // the prebuilt-roots scan below.
         crate::module::sys::vm::walk_audit_hooks_gc(&mut fwd);
+        // `space.fromcache(CodecState)` publishes a young list and two young
+        // dicts on first use and marks no prebuilt-roots dirty bit, so it
+        // belongs with these two rather than behind the gate below.
+        crate::module::_codecs::walk_codec_state_gc(&mut fwd);
     }
     // `space.fromcache(MethodCache)` is a live interpreter-global GC root,
     // not a write-once prebuilt object, and one cache serves every mutator.
@@ -1342,9 +1346,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_wrapped_function_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
-        // interp_codecs.CodecState is `space.fromcache(CodecState)` in PyPy:
-        // one process/interpreter-owned registry, not one copy per mutator.
-        crate::module::_codecs::walk_codec_state_gc(&mut forward);
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);

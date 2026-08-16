@@ -185,8 +185,38 @@ thread_local! {
     /// recursive container branches against unbounded recursion on a
     /// reference cycle (a list holding itself, a dict valued by itself).
     /// Mirrors the per-thread reprlist behind `Py_ReprEnter`/`Py_ReprLeave`.
-    static REPR_ACTIVE: std::cell::RefCell<Vec<usize>> =
+    /// Entries are the objects themselves, not their addresses: the guarded
+    /// container is a list or a dict on every interesting path, and both move.
+    /// `walk_repr_active_area` is registered per mutator so the collector
+    /// forwards these slots — a raw address recorded here would stop matching
+    /// its own object after the first collection, and the cycle would recurse
+    /// unbounded instead of emitting the `...` placeholder.
+    static REPR_ACTIVE: std::cell::RefCell<Vec<PyObjectRef>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// This thread's mid-repr set, for `register_mutator_extra_area`.
+pub fn capture_repr_active_area() -> *const () {
+    REPR_ACTIVE.with(|active| active as *const _ as *const ())
+}
+
+/// Forward the mid-repr set of the mutator that owns `data`.
+///
+/// # Safety
+/// `data` must be a pointer returned by [`capture_repr_active_area`] on a
+/// thread that is still registered.
+pub unsafe fn walk_repr_active_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut pyre_object::PyObjectRef),
+) {
+    let active = unsafe { &*(data as *const std::cell::RefCell<Vec<PyObjectRef>>) };
+    // A collection can be entered from inside `repr_enter`/`repr_leave`, which
+    // hold the borrow.  Skipping the walk then would drop the forwarding, so
+    // take the pointer to the buffer instead of a second borrow.
+    let entries = unsafe { &mut *active.as_ptr() };
+    for entry in entries.iter_mut() {
+        visitor(entry);
+    }
 }
 
 /// Record `obj` as mid-repr on this thread, or report `false` when it already
@@ -196,13 +226,12 @@ thread_local! {
 /// shape), the [`repr_leave`] twin.
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
-    let key = obj as usize;
     REPR_ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
-        if active.contains(&key) {
+        if active.contains(&obj) {
             false
         } else {
-            active.push(key);
+            active.push(obj);
             true
         }
     })
@@ -211,11 +240,24 @@ pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
 /// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_leave(obj: PyObjectRef) {
-    let key = obj as usize;
     REPR_ACTIVE.with(|active| {
         let mut active = active.borrow_mut();
-        if let Some(pos) = active.iter().rposition(|&k| k == key) {
+        if let Some(pos) = active.iter().rposition(|&entry| entry == obj) {
             active.remove(pos);
+        }
+    });
+}
+
+/// Drop the entry `repr_enter` pushed at `index` — see [`repr_leave`].
+///
+/// The guard leaves by position rather than by value because its own copy of
+/// the object is a Rust local the collector does not update, so matching on it
+/// would miss a forwarded entry and leave the set holding a finished repr.
+fn repr_leave_at(index: usize) {
+    REPR_ACTIVE.with(|active| {
+        let mut active = active.borrow_mut();
+        if index < active.len() {
+            active.remove(index);
         }
     });
 }
@@ -223,17 +265,17 @@ pub(crate) fn repr_leave(obj: PyObjectRef) {
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-pub(crate) struct ReprGuard(PyObjectRef);
+pub(crate) struct ReprGuard(usize);
 
 impl ReprGuard {
     pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        repr_enter(obj).then_some(ReprGuard(obj))
+        repr_enter(obj).then(|| ReprGuard(REPR_ACTIVE.with(|active| active.borrow().len() - 1)))
     }
 }
 
 impl Drop for ReprGuard {
     fn drop(&mut self) {
-        repr_leave(self.0);
+        repr_leave_at(self.0);
     }
 }
 

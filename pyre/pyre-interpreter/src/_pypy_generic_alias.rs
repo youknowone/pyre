@@ -365,10 +365,21 @@ fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate
 /// unpacked `tuple[...]` alias (one exposing `__typing_unpacked_tuple_args__`)
 /// into its members, unless those end in `...`.  Returns a fresh items tuple.
 fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let n = unsafe { w_tuple_len(items) };
-    let mut newargs: Vec<PyObjectRef> = Vec::new();
+    // The loop body runs Python at every turn, so the accumulator holds slot
+    // indices rather than values — the same shape `push_newarg` uses above —
+    // and `items` is read back before each element fetch.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let items_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(items);
+    let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
+    let n = unsafe { w_tuple_len(items()) };
+    let mut newarg_slots: Vec<usize> = Vec::new();
+    let mut push_newarg = |value: PyObjectRef, slots: &mut Vec<usize>| {
+        slots.push(pyre_object::gc_roots::shadow_stack_len());
+        pyre_object::gc_roots::pin_root(value);
+    };
     for i in 0..n {
-        let Some(arg) = (unsafe { w_tuple_getitem(items, i as i64) }) else {
+        let Some(arg) = (unsafe { w_tuple_getitem(items(), i as i64) }) else {
             continue;
         };
         let subargs = match crate::baseobjspace::getattr_str(arg, "__typing_unpacked_tuple_args__")
@@ -392,13 +403,21 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         };
         if do_unpack {
             // `newargs.extend(subargs)` — any iterable, not just a tuple.
-            for x in crate::builtins::collect_iterable(subargs)? {
-                newargs.push(x);
+            // Publish the collected members in one go: `collect_iterable`'s own
+            // scope has popped, so its Vec is untraced from here on.
+            let members = crate::builtins::collect_iterable(subargs)?;
+            let member_base = pyre_object::gc_roots::pin_roots(&members);
+            for index in 0..members.len() {
+                newarg_slots.push(member_base + index);
             }
         } else {
-            newargs.push(arg);
+            push_newarg(arg, &mut newarg_slots);
         }
     }
+    let newargs: Vec<PyObjectRef> = newarg_slots
+        .iter()
+        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+        .collect();
     Ok(w_tuple_new(newargs))
 }
 
@@ -719,27 +738,46 @@ fn subs_tvars(
         return Ok(obj);
     }
     let nsub = unsafe { w_tuple_len(subparams) };
-    let mut subargs: Vec<PyObjectRef> = Vec::with_capacity(nsub);
+    // `tuple_index` runs a user `__eq__` on every turn, so the operands and the
+    // arguments picked so far are held as shadow-stack slots and read back when
+    // the substitution tuple is built.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, params, argitems, subparams]);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(base);
+    let params = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let argitems = || pyre_object::gc_roots::shadow_stack_get(base + 2);
+    let subparams = || pyre_object::gc_roots::shadow_stack_get(base + 3);
+    let mut subarg_slots: Vec<usize> = Vec::with_capacity(nsub);
     for i in 0..nsub {
-        let Some(param) = (unsafe { w_tuple_getitem(subparams, i as i64) }) else {
+        let Some(param) = (unsafe { w_tuple_getitem(subparams(), i as i64) }) else {
             continue;
         };
         // `try: argitems[params.index(param)] except ValueError: param`.
-        let arg = match tuple_index(params, param)? {
-            Some(idx) => unsafe { w_tuple_getitem(argitems, idx as i64) }.unwrap_or(param),
+        let arg = match tuple_index(params(), param)? {
+            Some(idx) => unsafe { w_tuple_getitem(argitems(), idx as i64) }.unwrap_or(param),
             None => param,
         };
         // `if isinstance(param, TypeVarTuple): subargs.extend(arg)` — a
         // `TypeVarTuple` captures a sequence, so its bound `arg` is spliced.
         if is_typevartuple(param) {
-            for x in crate::builtins::collect_iterable(arg)? {
-                subargs.push(x);
+            let members = crate::builtins::collect_iterable(arg)?;
+            let member_base = pyre_object::gc_roots::pin_roots(&members);
+            for index in 0..members.len() {
+                subarg_slots.push(member_base + index);
             }
         } else {
-            subargs.push(arg);
+            subarg_slots.push(pyre_object::gc_roots::shadow_stack_len());
+            pyre_object::gc_roots::pin_root(arg);
         }
     }
-    crate::baseobjspace::getitem(obj, w_tuple_new(subargs))
+    let subargs: Vec<PyObjectRef> = subarg_slots
+        .iter()
+        .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot))
+        .collect();
+    // Build the substitution tuple before reading `obj` back: `w_tuple_new`
+    // allocates, so a receiver read ahead of it would be the pre-move one.
+    let subs = w_tuple_new(subargs);
+    crate::baseobjspace::getitem(obj(), subs)
 }
 
 /// `_make_starred(ga)` (`_pypy_generic_alias.py:118`) — a copy of the alias

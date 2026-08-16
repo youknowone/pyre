@@ -1682,9 +1682,26 @@ fn call_non_function_callable_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
+    // Binding an override below runs `baseobjspace::get`, whose property and
+    // general `__get__` arms execute Python.  Root the arguments first and
+    // dispatch each bound call from the forwarded roots — this native slice is
+    // not one the collector updates.
+    let _override_roots = pyre_object::gc_roots::push_roots();
+    let override_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_roots(args);
+    let reloaded_args = || {
+        let mut reloaded = Vec::with_capacity(args.len());
+        for index in 0..args.len() {
+            reloaded.push(pyre_object::gc_roots::shadow_stack_get(
+                override_base + index,
+            ));
+        }
+        reloaded
+    };
+
     if unsafe { pyre_object::is_type(callable) } {
         if let Some(bound) = metaclass_call_override(callable) {
-            return call_callable_with_mode(execution_context, bound, args, mode);
+            return call_callable_with_mode(execution_context, bound, &reloaded_args(), mode);
         }
         return type_descr_call_with_mode(execution_context, callable, args, mode);
     }
@@ -1696,10 +1713,10 @@ fn call_non_function_callable_with_mode(
         return call_callable_with_mode(execution_context, func, args, mode);
     }
     if let Some(bound) = staticmethod_call_override(callable)? {
-        return call_callable_with_mode(execution_context, bound, args, mode);
+        return call_callable_with_mode(execution_context, bound, &reloaded_args(), mode);
     }
     if let Some(bound) = classmethod_call_override(callable)? {
-        return call_callable_with_mode(execution_context, bound, args, mode);
+        return call_callable_with_mode(execution_context, bound, &reloaded_args(), mode);
     }
     // The base ClassMethod defines no descr_call (function.py), so a raw
     // classmethod object falls through to the not-callable error.
@@ -2506,13 +2523,31 @@ fn call_with_kwargs_in_ctx_impl(
         let func = unsafe { pyre_object::w_staticmethod_get_func(callable) };
         return call_with_kwargs_in_ctx(execution_context, func, pos_args, kwargs);
     }
+    // Binding any of the three overrides below runs Python, so each bound call
+    // is dispatched from the roots pinned above rather than from the incoming
+    // slices — the same rebuild the builtin ABI arms already do.
+    let overridden_args = || {
+        let mut current = Vec::with_capacity(pos_args.len());
+        extend_current_args(&mut current);
+        current
+    };
     if let Some(bound) = staticmethod_call_override(callable)? {
-        return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            bound,
+            &overridden_args(),
+            &current_kwargs(),
+        );
     }
 
     if unsafe { pyre_object::is_classmethod(callable) } {
         if let Some(bound) = classmethod_call_override(callable)? {
-            return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
+            return call_with_kwargs_in_ctx(
+                execution_context,
+                bound,
+                &overridden_args(),
+                &current_kwargs(),
+            );
         }
         let type_name = crate::typedef::r#type(callable)
             .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
@@ -2540,7 +2575,12 @@ fn call_with_kwargs_in_ctx_impl(
         && unsafe { pyre_object::is_type(callable) }
         && let Some(bound) = metaclass_call_override(callable)
     {
-        return call_with_kwargs_in_ctx(execution_context, bound, pos_args, kwargs);
+        return call_with_kwargs_in_ctx(
+            execution_context,
+            bound,
+            &overridden_args(),
+            &current_kwargs(),
+        );
     }
 
     if unsafe { crate::is_function_carrier(callable) } {
@@ -2591,7 +2631,7 @@ fn call_with_kwargs_in_ctx_impl(
                         .collect();
                     let keywords_w: Vec<pyre_object::PyObjectRef> =
                         kwargs.iter().map(|(_, v)| *v).collect();
-                    let arguments = crate::argument::Arguments::with_kw(
+                    let mut arguments = crate::argument::Arguments::with_kw(
                         pos_args,
                         &keyword_names_w,
                         &keywords_w,
@@ -2599,7 +2639,7 @@ fn call_with_kwargs_in_ctx_impl(
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_ptr },
                         callable,
-                        &arguments,
+                        &mut arguments,
                         &bound,
                     );
                     if w_res == pyre_object::PY_NULL {
@@ -2699,7 +2739,7 @@ fn call_with_kwargs_in_ctx_impl(
                         (0..kwargs.len()).map(current_kwarg).collect();
                     let refreshed_pos: Vec<pyre_object::PyObjectRef> =
                         (0..pos_args.len()).map(current_pos_arg).collect();
-                    let arguments = crate::argument::Arguments::with_kw(
+                    let mut arguments = crate::argument::Arguments::with_kw(
                         &refreshed_pos,
                         &keyword_names_w,
                         &keywords_w,
@@ -2712,7 +2752,7 @@ fn call_with_kwargs_in_ctx_impl(
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
                         unsafe { &mut *frame_ptr },
                         callable,
-                        &arguments,
+                        &mut arguments,
                         &full_args,
                     );
                     if w_res == pyre_object::PY_NULL {
@@ -3293,6 +3333,19 @@ pub fn call_function_impl_result(
         wide_args.as_slice()
     };
 
+    // Binding an override descriptor below runs `baseobjspace::get`, whose
+    // property and general `__get__` arms execute Python.  That updates the
+    // entry roots but not this native view, so the override arms rebuild it
+    // from the roots before dispatching, as the `user_call_slot` arm does.
+    let arg_count = args.len();
+    let reloaded_args = || {
+        let mut reloaded = Vec::with_capacity(arg_count);
+        for i in 0..arg_count {
+            reloaded.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+        }
+        reloaded
+    };
+
     unsafe {
         if pyre_object::is_method(callable) {
             let func = pyre_object::w_method_get_func(callable);
@@ -3342,7 +3395,7 @@ pub fn call_function_impl_result(
         // PyPy: typeobject.py descr_call → lookup __new__, call, then __init__
         if pyre_object::is_type(callable) {
             if let Some(bound) = metaclass_call_override(callable) {
-                return call_function_impl_result(bound, args);
+                return call_function_impl_result(bound, &reloaded_args());
             }
             clear_call_error();
             let result = type_descr_call_impl(callable, args);
@@ -3360,10 +3413,10 @@ pub fn call_function_impl_result(
             return call_function_impl_result(func, args);
         }
         if let Some(bound) = staticmethod_call_override(callable)? {
-            return call_function_impl_result(bound, args);
+            return call_function_impl_result(bound, &reloaded_args());
         }
         if let Some(bound) = classmethod_call_override(callable)? {
-            return call_function_impl_result(bound, args);
+            return call_function_impl_result(bound, &reloaded_args());
         }
         // ClassMethod has no descr_call (function.py:718-768; CPython 3.14
         // `PyClassMethod_Type.tp_call = 0`), so a raw wrapper falls through

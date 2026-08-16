@@ -684,8 +684,23 @@ pub fn map_add_value(
 pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_dict(source) {
-            for (k, v) in pyre_object::w_dict_items(source) {
-                pyre_object::w_dict_store(dict, k, v);
+            // `w_dict_store` allocates when the storage grows or the strategy
+            // is promoted, and `dict` is itself a moving `W_DictObject`, so
+            // neither it nor the pairs waiting in this native snapshot survive
+            // the loop unrooted.  The general mapping path below already roots
+            // its own loop for the same reason.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(dict);
+            let entries = pyre_object::w_dict_items(source);
+            let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let pair_base = pyre_object::gc_roots::pin_roots(&flat);
+            for index in 0..entries.len() {
+                pyre_object::w_dict_store(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2),
+                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2 + 1),
+                );
             }
             return Ok(());
         }

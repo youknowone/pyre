@@ -12724,8 +12724,8 @@ pub fn call_args_and_c_profile(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
-    let arguments = crate::argument::Arguments::positional_only(args);
-    call_args_and_c_profile_args(frame, callable, &arguments, args)
+    let mut arguments = crate::argument::Arguments::positional_only(args);
+    call_args_and_c_profile_args(frame, callable, &mut arguments, args)
 }
 
 /// `baseobjspace.py:1269-1278 call_args_and_c_profile` with a
@@ -12746,15 +12746,41 @@ pub fn call_args_and_c_profile(
 pub fn call_args_and_c_profile_args(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
-    arguments: &crate::argument::Arguments,
+    arguments: &mut crate::argument::Arguments,
     flat_args: &[PyObjectRef],
 ) -> PyObjectRef {
+    // Reaching here means a profile function is installed, so the tracer hooks
+    // below run Python — and the callee runs in between.  `callable`, the flat
+    // slice and the `Arguments` vectors are native storage no root walker
+    // updates.  Root them all, dispatch from the roots, and refresh the
+    // `Arguments` vectors before the return hook reads them again.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(callable);
+    let flat_base = pyre_object::gc_roots::pin_roots(flat_args);
+    let positional_base = pyre_object::gc_roots::pin_roots(&arguments.arguments_w);
+    let keyword_base = arguments
+        .keywords_w
+        .as_ref()
+        .map(|values| pyre_object::gc_roots::pin_roots(values));
+    let callable = || pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    let refresh = |arguments: &mut crate::argument::Arguments| {
+        for (index, slot) in arguments.arguments_w.iter_mut().enumerate() {
+            *slot = pyre_object::gc_roots::shadow_stack_get(positional_base + index);
+        }
+        if let (Some(base), Some(values)) = (keyword_base, arguments.keywords_w.as_mut()) {
+            for (index, slot) in values.iter_mut().enumerate() {
+                *slot = pyre_object::gc_roots::shadow_stack_get(base + index);
+            }
+        }
+    };
+
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if !ec.is_null()
         && let Err(err) = unsafe {
             (*ec).c_call_trace(
                 frame as *mut crate::pyframe::PyFrame,
-                callable,
+                callable(),
                 Some(arguments),
             )
         }
@@ -12762,7 +12788,10 @@ pub fn call_args_and_c_profile_args(
         crate::call::set_call_error(err);
         return pyre_object::PY_NULL;
     }
-    let w_res = call_function(callable, flat_args);
+    let flat_args: Vec<PyObjectRef> = (0..flat_args.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(flat_base + index))
+        .collect();
+    let w_res = call_function(callable(), &flat_args);
     if w_res == pyre_object::PY_NULL {
         if !ec.is_null() {
             // baseobjspace.py:1274-1276 — `except OperationError:
@@ -12773,19 +12802,24 @@ pub fn call_args_and_c_profile_args(
             // stash already holds the original OperationError; if
             // c_exception_trace raises, overwrite the stash so the
             // tracer error is what propagates.
-            if let Err(trace_err) =
-                unsafe { (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable) }
-            {
+            if let Err(trace_err) = unsafe {
+                (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
+            } {
                 crate::call::set_call_error(trace_err);
             }
         }
         return pyre_object::PY_NULL;
     }
+    refresh(arguments);
+    // The return hook runs Python too, so the callee's result is published
+    // before it and read back afterwards.
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_res);
     if !ec.is_null()
         && let Err(err) = unsafe {
             (*ec).c_return_trace(
                 frame as *mut crate::pyframe::PyFrame,
-                callable,
+                callable(),
                 Some(arguments),
             )
         }
@@ -12793,7 +12827,7 @@ pub fn call_args_and_c_profile_args(
         crate::call::set_call_error(err);
         return pyre_object::PY_NULL;
     }
-    w_res
+    pyre_object::gc_roots::shadow_stack_get(result_slot)
 }
 
 /// PyPy: baseobjspace.py `call_method`.

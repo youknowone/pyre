@@ -7093,6 +7093,11 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if !require_setstate_dict(w_state)? {
         return Ok(pyre_object::w_none());
     }
+    // Each `pop` runs `dict.pop`, and the state proven above is a dict — one of
+    // the two kinds the collector moves.  Root the receiver and the state the
+    // way `base_exception_setstate` does, and read both back per turn.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self, w_state]);
     type ExcSetter = unsafe fn(PyObjectRef, PyObjectRef);
     for (key, set) in [
         ("name", interp_exceptions::w_exception_set_name as ExcSetter),
@@ -7103,7 +7108,7 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         ),
     ] {
         let popped = crate::baseobjspace::call_method(
-            w_state,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
             "pop",
             &[pyre_object::w_str_new(key), pyre_object::w_none()],
         );
@@ -7112,10 +7117,17 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         {
             return Err(e);
         }
-        unsafe { set(w_self, popped) };
+        unsafe { set(pyre_object::gc_roots::shadow_stack_get(base), popped) };
     }
-    let w_olddict = unsafe { interp_exceptions::w_exception_getdict(w_self) };
-    if crate::baseobjspace::call_method(w_olddict, "update", &[w_state]).is_null()
+    let w_olddict = unsafe {
+        interp_exceptions::w_exception_getdict(pyre_object::gc_roots::shadow_stack_get(base))
+    };
+    if crate::baseobjspace::call_method(
+        w_olddict,
+        "update",
+        &[pyre_object::gc_roots::shadow_stack_get(base + 1)],
+    )
+    .is_null()
         && let Some(e) = crate::call::take_call_error()
     {
         return Err(e);

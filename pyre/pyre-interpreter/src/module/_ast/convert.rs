@@ -1749,15 +1749,25 @@ fn module_to_object(
             } else {
                 "Module"
             };
-            let body = converter.stmt_list(&module.body)?;
+            // `converter.list` allocates the `type_ignores` list, so read the
+            // body back from its own slot after that sibling is built.
+            let body_slot = converter.pin_slot(converter.stmt_list(&module.body)?);
             if root_name == "Module" {
+                let type_ignores = converter.list(Vec::new());
                 converter.node(
                     root_name,
                     None,
-                    &[("body", body), ("type_ignores", converter.list(Vec::new()))],
+                    &[
+                        ("body", pyre_object::gc_roots::shadow_stack_get(body_slot)),
+                        ("type_ignores", type_ignores),
+                    ],
                 )
             } else {
-                converter.node(root_name, None, &[("body", body)])
+                converter.node(
+                    root_name,
+                    None,
+                    &[("body", pyre_object::gc_roots::shadow_stack_get(body_slot))],
+                )
             }
         }
     }
@@ -1769,9 +1779,31 @@ struct Converter<'a> {
 }
 
 impl Converter<'_> {
+    /// Publish `value` as a root of `module_to_object`'s scope and hand back
+    /// the published slot's contents, not the caller's copy — the pin is what
+    /// makes the collector forward it, and reading the pre-pin local back would
+    /// discard that forwarding.
+    ///
+    /// STILL OPEN: the value is fresh when it is returned, but a caller that
+    /// builds a `&[(&str, PyObjectRef)]` field array allocates for the sibling
+    /// elements before [`Converter::node`] receives it, and only the shadow
+    /// slot is forwarded across that window.  Lists are the only movable field
+    /// values here (nodes are instances, and the rest are str/int/None), so
+    /// closing it means having the list-producing helpers return slots and
+    /// `node` take them — a change across all 77 `node` call sites, not a
+    /// rooting patch.  Reproduces only under `PYPY_GC_NURSERY=1`
+    /// (`ast.unparse` emits invalid source); the default nursery is unaffected.
     fn pin(&self, value: PyObjectRef) -> PyObjectRef {
+        let slot = self.pin_slot(value);
+        pyre_object::gc_roots::shadow_stack_get(slot)
+    }
+
+    /// `pin`, returning the slot index so a caller that runs Python between the
+    /// pin and the use can re-read the value at each use.
+    fn pin_slot(&self, value: PyObjectRef) -> usize {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(value);
-        value
+        slot
     }
 
     fn list(&self, values: Vec<PyObjectRef>) -> PyObjectRef {
@@ -1793,9 +1825,20 @@ impl Converter<'_> {
         fields: &[(&str, PyObjectRef)],
     ) -> crate::PyResult {
         let node_type = crate::baseobjspace::getattr_str(self.ast_module, name)?;
-        let node = self.pin(pyre_object::w_instance_new(node_type));
-        for &(field, value) in fields {
-            crate::baseobjspace::setattr_str(node, field, value)?;
+        // Every `setattr_str` below runs Python, so the node and the field
+        // values move under the loop.  Publish them and read each back at the
+        // store that consumes it.
+        let node_slot = self.pin_slot(pyre_object::w_instance_new(node_type));
+        let value_base = pyre_object::gc_roots::shadow_stack_len();
+        for &(_, value) in fields {
+            pyre_object::gc_roots::pin_root(value);
+        }
+        for (index, &(field, _)) in fields.iter().enumerate() {
+            crate::baseobjspace::setattr_str(
+                pyre_object::gc_roots::shadow_stack_get(node_slot),
+                field,
+                pyre_object::gc_roots::shadow_stack_get(value_base + index),
+            )?;
         }
         if let Some((start, end)) = range {
             let (lineno, col_offset) = self.location(start as usize);
@@ -1806,14 +1849,17 @@ impl Converter<'_> {
                 ("end_lineno", end_lineno),
                 ("end_col_offset", end_col_offset),
             ] {
+                // Box the position before reading the node back: `w_int_new`
+                // allocates, so a receiver read ahead of it is the pre-move one.
+                let w_value = pyre_object::w_int_new(value as i64);
                 crate::baseobjspace::setattr_str(
-                    node,
+                    pyre_object::gc_roots::shadow_stack_get(node_slot),
                     field,
-                    pyre_object::w_int_new(value as i64),
+                    w_value,
                 )?;
             }
         }
-        Ok(node)
+        Ok(pyre_object::gc_roots::shadow_stack_get(node_slot))
     }
 
     fn location(&self, offset: usize) -> (usize, usize) {

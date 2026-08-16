@@ -522,6 +522,31 @@ pub mod deque_rev_iter {
     }
 }
 
+/// Append every element of `iterable` to `self_obj` through `append`.
+///
+/// `collect_iterable`'s own root scope has popped by the time it returns, so
+/// the elements sit in a native Vec the collector does not walk while each
+/// append allocates the next block.  Publish the whole run up front and read
+/// the deque and each element back at the turn that consumes them.
+fn extend_from_iterable(
+    self_obj: PyObjectRef,
+    iterable: PyObjectRef,
+    append: fn(PyObjectRef, PyObjectRef),
+) -> Result<(), crate::PyError> {
+    let items = crate::builtins::collect_iterable(iterable)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let deque_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(self_obj);
+    let item_base = pyre_object::gc_roots::pin_roots(&items);
+    for index in 0..items.len() {
+        append(
+            pyre_object::gc_roots::shadow_stack_get(deque_slot),
+            pyre_object::gc_roots::shadow_stack_get(item_base + index),
+        );
+    }
+    Ok(())
+}
+
 /// `W_Deque.append` + `trimleft`, ported from `interp_deque.py`.
 fn append_right(self_obj: PyObjectRef, item: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -865,9 +890,7 @@ impl W_Deque {
             clear_blocks(self_obj);
         }
         if let Some(it) = iterable {
-            for item in crate::builtins::collect_iterable(it)? {
-                append_right(self_obj, item);
-            }
+            extend_from_iterable(self_obj, it, append_right)?;
         }
         Ok(())
     }
@@ -893,19 +916,13 @@ impl W_Deque {
     }
     fn extend(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        for item in crate::builtins::collect_iterable(iterable)? {
-            append_right(self_obj, item);
-        }
-        Ok(())
+        extend_from_iterable(self_obj, iterable, append_right)
     }
     fn extendleft(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         // Each element is appended on the left, so the result is
         // the reverse of `iterable`.
-        for item in crate::builtins::collect_iterable(iterable)? {
-            append_left(self_obj, item);
-        }
-        Ok(())
+        extend_from_iterable(self_obj, iterable, append_left)
     }
     fn count(&self, x: PyObjectRef) -> Result<i64, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
