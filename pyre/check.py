@@ -221,6 +221,8 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # whose baseline is real work is barely affected, while one whose baseline is
 # the same size as its own startup gets several times the slack -- which is
 # what its measurement can actually support.
+# The allowance applies only to the recorded-ratio gates; the wasm/dynasm gate
+# opts out at its call site.
 STARTUP_DRIFT_FRACTION = 0.5
 # A floor failure is only trustworthy when the baseline clears the execution
 # floor enough for small relative error: execution time is the difference
@@ -2589,6 +2591,7 @@ class Check:
     def _performance_gate_passed(
         self, backend, script, timeout, elapsed, limit, baseline_time,
         baseline_cmd, expected_output, baseline_key, minimum=None,
+        *, allow_startup_drift=True,
     ):
         """Check one performance ratio, retrying a failure by median.
 
@@ -2628,6 +2631,8 @@ class Check:
             compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
         else:
             compare_buffer += limit * EXEC_TIME_FLOOR_S
+
+        drift = self._startup_drift if allow_startup_drift else (lambda _key: 0.0)
 
         def failed_bound(measured, baseline_value):
             exec_measured = self._exec_time(backend, measured)
@@ -2679,7 +2684,7 @@ class Check:
             # 0.088s, which failed four ceilings and three floors while every
             # fixture's own measured time had gone down.
             if exec_measured > (
-                exec_baseline + self._startup_drift(baseline_key)
+                exec_baseline + drift(baseline_key)
             ) * limit + compare_buffer:
                 return "ceiling"
             # The measured side enters amplified by `limit / minimum`, so its
@@ -2688,7 +2693,7 @@ class Check:
             if (
                 minimum is not None
                 and exec_baseline >= FLOOR_GATE_MIN_BASELINE_S
-                and (exec_measured + self._startup_drift(backend))
+                and (exec_measured + drift(backend))
                 * (limit / minimum) + compare_buffer
                 < exec_baseline * limit
             ):
@@ -2917,11 +2922,27 @@ class Check:
             ):
                 self.wasm_ratio_ungated.append(name)
             else:
+                # The startup-drift allowance is calibrated on the recorded
+                # per-bench ratios, whose baseline is re-measured on every host
+                # while the ceiling stays fixed at what the fitting run saw.
+                # This gate's failures have not been shown to move that way,
+                # and widening it costs a red that names a real backend gap:
+                # `short_circuit_value_kept_stack` reads 5.3x here against a 4x
+                # ceiling and clears it only with the allowance. The denominator
+                # concern this gate does have is handled above by declining the
+                # gate outright and naming the fixture in the summary, not by
+                # quietly widening the bound.
+                #
+                # This ceiling is also meant to come back down as the backend
+                # closes the gap, so it has to mean the number it states. A
+                # standing allowance underneath it would be re-fitted along with
+                # it, and the tightening would buy less than it says it does.
                 passed, bound, checked_elapsed, checked_baseline, retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
                         ceiling, dynasm_elapsed,
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
+                        allow_startup_drift=False,
                     )
                 )
                 if not passed:
