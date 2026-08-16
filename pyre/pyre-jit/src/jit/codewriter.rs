@@ -3120,6 +3120,7 @@ fn emit_frontend_load_super_attr(
     global_super: super::flow::FlowValue,
     self_value: super::flow::FlowValue,
     cls_value: super::flow::FlowValue,
+    frame: super::flow::FlowValue,
     code: super::flow::FlowValue,
     name_idx: super::flow::FlowValue,
     is_two_arg: super::flow::FlowValue,
@@ -3133,6 +3134,7 @@ fn emit_frontend_load_super_attr(
             global_super.into(),
             self_value.into(),
             cls_value.into(),
+            frame.into(),
             code.into(),
             name_idx.into(),
             is_two_arg.into(),
@@ -12213,10 +12215,10 @@ impl CodeWriter {
                         // index, `oparg & 1` the is_method flag, and `oparg & 2`
                         // the two-argument-super flag (all compile-time
                         // constants). `load_super_attr(global_super, self, cls,
-                        // code, name_idx, is_two_arg)` HLOp →
+                        // frame, code, name_idx, is_two_arg)` HLOp →
                         // `residual_call_ir_r(load_super_attr_fn,
                         // ListI[name_idx, is_two_arg], ListR[global_super,
-                        // self, cls, code])` calls the actual global value and
+                        // self, cls, frame, code])` calls the actual global value and
                         // resolves the attribute (MayForce). The is_method form runs the
                         // runtime bound-method unwrap through two pure
                         // `super_attr_unwrap(raw, which)` residuals (which 0 =
@@ -12247,6 +12249,7 @@ impl CodeWriter {
                                 global_super,
                                 self_value,
                                 cls_value,
+                                frame_var.into(),
                                 code_const,
                                 name_idx_const,
                                 is_two_arg_const,

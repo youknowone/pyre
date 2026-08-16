@@ -29,6 +29,16 @@ assert "Gt" in str(n.body[0].value.ops[1])
 assert n.body[0].value.comparators[0].value == 4
 assert n.body[0].value.comparators[1].value == 5
 
+# Integer constants retain their value when the public AST boundary converts
+# source spellings with a radix prefix.  Exercise a value larger than i64 so
+# both radix inference and the bigint path are covered.
+huge_hex = 0x9E37C886A41621625A1AACD761C9129E
+radix_tree = ast.parse(
+    "values = (0b1010_0110, 0o755, 0x9E37C886A41621625A1AACD761C9129E)"
+)
+radix_values = radix_tree.body[0].value.elts
+assert [value.value for value in radix_values] == [0b1010_0110, 0o755, huge_hex]
+
 
 n = ast.parse("from ... import a\n")
 print(n)

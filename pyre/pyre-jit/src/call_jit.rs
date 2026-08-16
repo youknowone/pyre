@@ -5747,7 +5747,9 @@ pub extern "C" fn bh_import_from_fn(module: i64, w_code_ptr: i64, name_idx: i64)
 /// Resolves the attribute name from the jitcode's code object via `name_idx`
 /// (same `co_names` invariant as `bh_load_attr_fn`), calls the actual global
 /// `super` value with zero or two arguments, and runs `getattr` (both calls may
-/// run Python → `MayForce`). Returns the raw resolved attribute; the
+/// run Python → `MayForce`).  The zero-argument builtin path reads the
+/// explicitly threaded red `frame`, matching PyPy's traced
+/// `ec.gettopframe()` dependency. Returns the raw resolved attribute; the
 /// `is_method` form
 /// post-processes it through [`bh_super_attr_unwrap_fn`].  On error the
 /// exception is published through `BH_LAST_EXC_VALUE` for the trailing
@@ -5756,6 +5758,7 @@ pub extern "C" fn bh_load_super_attr_fn(
     global_super: i64,
     self_obj: i64,
     cls: i64,
+    frame: i64,
     w_code_ptr: i64,
     name_idx: i64,
     is_two_arg: i64,
@@ -5779,7 +5782,18 @@ pub extern "C" fn bh_load_super_attr_fn(
     let cls = cls as pyre_object::PyObjectRef;
     let proxy = if is_two_arg != 0 {
         pyre_interpreter::call::call_function_impl_result(global_super, &[cls, self_obj])
+    } else if pyre_interpreter::builtins::is_builtin_super_type(global_super) {
+        // `descriptor.py W_Super.descr_init` traces
+        // `space.getexecutioncontext().gettopframe()` into the active MIFrame.
+        // The JIT threads that frame as a red operand: an inlined callee must
+        // read its own `self` / `__class__` cells, never the outer portal's.
+        pyre_interpreter::builtins::builtin_super_from_frame(
+            frame as usize as *mut pyre_interpreter::PyFrame,
+        )
     } else {
+        // CPython 3.14 makes the global `super` binding authoritative.  A
+        // shadowing callable still receives zero arguments exactly as the
+        // interpreter path does.
         pyre_interpreter::call::call_function_impl_result(global_super, &[])
     };
     let result = proxy.and_then(|proxy| pyre_interpreter::baseobjspace::getattr_str(proxy, name));

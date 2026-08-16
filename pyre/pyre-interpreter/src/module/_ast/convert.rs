@@ -2735,12 +2735,13 @@ impl Converter<'_> {
     fn number(&self, value: &ast::Number) -> crate::PyResult {
         Ok(match value {
             ast::Number::Int(value) => {
-                let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
-                    .map_or(PY_NULL, |p| p.as_ptr());
-                crate::call::call_function_impl_result(
-                    int_type,
-                    &[self.string(&value.to_string())],
-                )?
+                // Ruff's Int stores an overflowing non-decimal literal by
+                // its original token spelling.  PyPy astbuilder.py:4-67
+                // routes that spelling through `_string_to_int_or_long`
+                // with the token's radix instead of decimal int().
+                let spelling = value.to_string();
+                let source = self.string(&spelling);
+                crate::builtins::parse_int_from_str(source, &spelling, 0)?
             }
             ast::Number::Float(value) => self.pin(pyre_object::w_float_new(*value)),
             ast::Number::Complex { real, imag } => {
@@ -2756,9 +2757,13 @@ impl Converter<'_> {
             ast::ConstantValue::Str(value) => self.string(value),
             ast::ConstantValue::Bytes(value) => self.pin(pyre_object::w_bytes_from_bytes(value)),
             ast::ConstantValue::Integer(value) => {
-                let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
-                    .map_or(PY_NULL, |p| p.as_ptr());
-                crate::call::call_function_impl_result(int_type, &[self.string(value)])?
+                // PyPy astbuilder.py:4-67 `parse_number` sends integer
+                // tokens to `_string_to_int_or_long` with the literal's
+                // radix. RustPython's ConstantValue retains the original
+                // spelling, so let the same internal parser infer that radix
+                // rather than feeding a hexadecimal token to decimal int().
+                let source = self.string(value);
+                crate::builtins::parse_int_from_str(source, value, 0)?
             }
             ast::ConstantValue::Float(value) => self.pin(pyre_object::w_float_new(*value)),
             ast::ConstantValue::Complex { real, imag } => {
