@@ -20,6 +20,10 @@ use pyre_jit_trace::llbc_fingerprint::{
 };
 
 const HASH: &str = "d9b2992606c82b29c531f4f4d6a42e43808564620ab63d781eba135f9307c584";
+// Distinct from HASH so a parse that filled `closure` from the source line, or
+// swapped the two, cannot pass. `fail_if_llbc_stale` splits stale from warning
+// on exactly that pair, so the binding is what these tests have to pin.
+const CLOSURE_HASH: &str = "1de0e0c0e50a19e0ea1eb03c8ed0da4b8f3c78dfd3a86d5f6f65f2d0d9f7c4a1";
 
 /// Walk up from this crate until the extraction driver is found.
 fn repo_root() -> Option<std::path::PathBuf> {
@@ -82,15 +86,21 @@ fn real_driver_output_parses() {
 
 #[test]
 fn parses_the_current_three_field_output() {
-    let stdout = format!("source={HASH}\nclosure={HASH}\nexternal=\n");
+    let stdout = format!("source={HASH}\nclosure={CLOSURE_HASH}\nexternal=\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
-    assert!(parse_fingerprint_fields(&stdout).is_some());
+    let fields = parse_fingerprint_fields(&stdout).expect("three-field output must parse");
+    assert_eq!(fields.source, HASH);
+    assert_eq!(fields.closure, CLOSURE_HASH);
+    assert_eq!(fields.external, "");
 }
 
 #[test]
 fn field_order_does_not_matter() {
-    let stdout = format!("external=\nclosure={HASH}\nsource={HASH}\n");
+    let stdout = format!("external=\nclosure={CLOSURE_HASH}\nsource={HASH}\n");
     assert_eq!(parse_fingerprint_stdout(&stdout).as_deref(), Some(HASH));
+    let fields = parse_fingerprint_fields(&stdout).expect("reordered output must parse");
+    assert_eq!(fields.source, HASH);
+    assert_eq!(fields.closure, CLOSURE_HASH);
 }
 
 #[test]

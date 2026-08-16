@@ -823,6 +823,11 @@ def _collect_inputs(
 
     root = eng.root
     target_names: list[str] = []
+    # The derived set names its two manifests outright rather than reading
+    # `base_pathspecs`, which today holds exactly those two. The base set is the
+    # conservative one: a caller widening it means "always hash this", which the
+    # wide channel already honours, and inheriting it here would let one broad
+    # entry undo the narrowing this whole path exists to produce.
     pathspecs = ["Cargo.lock", "Cargo.toml"] if derived else list(eng.base_pathspecs)
     direct_files: set[Path] = set()
     external: list[Path] = [Path(p).resolve() for p in eng.external_inputs]
@@ -1303,6 +1308,12 @@ def invalidate_fingerprint(stamp_path: Path, readfiles: Path) -> None:
     readfiles.unlink(missing_ok=True)
 
 
+def merge_readfiles(into: dict[str, set[Path]], other: dict[str, set[Path]]) -> None:
+    """Fold one artefact's read set into another's, keyed by file-table crate."""
+    for crate_name, files in other.items():
+        into.setdefault(crate_name, set()).update(files)
+
+
 def write_readfiles(path: Path, by_crate: dict[str, set[Path]]) -> None:
     """Persist a sorted, LF-terminated artefact read set."""
     files = sorted(
@@ -1310,6 +1321,37 @@ def write_readfiles(path: Path, by_crate: dict[str, set[Path]]) -> None:
         key=lambda item: item.as_posix(),
     )
     path.write_text("".join(f"{item.as_posix()}\n" for item in files), encoding="utf-8")
+
+
+def assert_readfiles_resolve(root: Path, dest: Path, by_crate: dict[str, set[Path]]) -> None:
+    """Refuse a read set whose entries do not name files in this repository.
+
+    Charon roots a `Local` name at the cargo workspace of the crate it
+    translated, which is the repository root only while that crate belongs to
+    the top-level workspace. A crate carrying its own `Cargo.lock` gets names
+    rooted at itself instead -- `majit/charon-corpus` reports `src/lib.rs` --
+    and those resolve against the repository root to paths that do not exist.
+    Such a set hashes nothing, so edits to the real sources would move
+    `closure=` alone and the artefact would keep reading fresh. Every entry was
+    a file Charon had just read, so any that cannot be found names a rooting
+    this function does not handle.
+    """
+    unresolved = {
+        crate_name: sorted(
+            (item for item in files if not (root / item).is_file()),
+            key=lambda item: item.as_posix(),
+        )
+        for crate_name, files in by_crate.items()
+    }
+    unresolved = {name: files for name, files in unresolved.items() if files}
+    if not unresolved:
+        return
+    lines = [f"extract-llbc.py: {dest.name} names read files that are not in the repository:"]
+    for crate_name, files in sorted(unresolved.items()):
+        lines.append(f"  {crate_name}:")
+        lines.extend(f"    {item.as_posix()}" for item in files)
+    lines.append("  a crate outside the top-level cargo workspace roots its Local names at itself")
+    raise SystemExit("\n".join(lines))
 
 
 def assert_artefact_readfiles_covered(
@@ -2075,6 +2117,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # artefact's bodies untouched, and dropping everything but
         # `type_decls` from the cross-target one leaves only what a
         # cross-target build actually lacks — its own field offsets.
+        layout_tables: dict[str, set[Path]] = {}
         for target in crate_layout_targets(eng, spec):
             if target not in prepared_std:
                 ensure_charon_std(charon_bin, [target], eng.root)
@@ -2110,13 +2153,25 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     f"extract-llbc.py: Charon emitted no {target} artefact at {full}"
                 )
             write_layout_sidecar(full, sidecar)
+            # This artefact was compiled on its own, so its file table names
+            # sources the host build never reaches: everything behind a
+            # `cfg(target_arch)`, such as the wasm backend `pyre-interpreter`
+            # picks up through `majit-metainterp` on wasm32. Only `type_decls`
+            # survive into the sidecar, so take the read set before the full
+            # artefact goes. Without it an edit to a wasm-only source moves
+            # `closure=` alone, which is a warning, and the layouts this
+            # sidecar froze are consumed as current.
+            merge_readfiles(layout_tables, artefact_local_readfiles(full))
             full.unlink()
             print(f"    wrote {sidecar} ({sidecar.stat().st_size} bytes)")
         # Persist the read set before computing the stamp it governs. The
-        # artefact is the oracle: repo-relative Local entries are exactly the
-        # Rust sources Charon parsed, while proc macros, build scripts and
-        # manifests are added by the cargo-metadata walk.
+        # artefacts are the oracle: repo-relative Local entries are exactly the
+        # Rust sources Charon parsed, across the host translation and every
+        # cross-target one folded in above, while proc macros, build scripts
+        # and manifests are added by the cargo-metadata walk.
         file_table = artefact_local_readfiles(dest)
+        merge_readfiles(file_table, layout_tables)
+        assert_readfiles_resolve(eng.root, dest, file_table)
         write_readfiles(readfiles, file_table)
 
         # Every walk from here on reports on the tree AFTER the builds above,
@@ -2583,6 +2638,44 @@ def self_test_ullbc_files_table() -> None:
     print("  files-table streaming parser: ok")
 
 
+def self_test_readfiles_rooting() -> None:
+    """Merge a cross-target read set, then refuse one rooted at a nested crate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "crate" / "src").mkdir(parents=True)
+        (root / "crate" / "src" / "lib.rs").write_text("")
+        (root / "crate" / "src" / "wasm.rs").write_text("")
+        dest = root / "probe.ullbc"
+
+        # What the layout passes contribute: a source only the cross-target
+        # translation reached, under a crate the host table already lists, plus
+        # a crate the host table does not mention at all.
+        merged = {"crate": {Path("crate/src/lib.rs")}}
+        merge_readfiles(
+            merged,
+            {"crate": {Path("crate/src/wasm.rs")}, "dep": {Path("crate/src/lib.rs")}},
+        )
+        expected = {
+            "crate": {Path("crate/src/lib.rs"), Path("crate/src/wasm.rs")},
+            "dep": {Path("crate/src/lib.rs")},
+        }
+        if merged != expected:
+            raise SystemExit(f"self-test FAILED: merge_readfiles produced {merged!r}")
+        assert_readfiles_resolve(root, dest, merged)
+
+        # `majit/charon-corpus` carries its own `Cargo.lock`, so Charon roots
+        # its names at that crate and reports `src/lib.rs`. Read from here the
+        # name resolves nowhere, and a set of those would hash nothing.
+        try:
+            assert_readfiles_resolve(root, dest, {"nested": {Path("src/lib.rs")}})
+        except SystemExit as refusal:
+            if "src/lib.rs" not in str(refusal):
+                raise SystemExit(f"self-test FAILED: refusal omits the entry: {refusal}") from None
+        else:
+            raise SystemExit("self-test FAILED: a crate-rooted read set was accepted")
+    print("  read-set rooting and cross-target merge: ok")
+
+
 def self_test_provenance_rendering() -> None:
     """Drive `dirty_report_lines` over cases the live sidecars cannot produce.
 
@@ -2953,6 +3046,10 @@ def run_cli(
         # The parser test runs first because it mutates only a temporary file;
         # the live probe below briefly changes the shared working tree.
         self_test_ullbc_files_table()
+        # Also temporary-file only, and it covers the two steps between the
+        # parser and the stamp: folding the cross-target tables in, and
+        # refusing names that do not resolve from the repository root.
+        self_test_readfiles_rooting()
         # Same reason, one artefact along: `--check` renders provenance on every
         # run and exercises neither of its conditional lines, because ordinary
         # sidecars describe steady, complete extractions.
