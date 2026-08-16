@@ -4825,6 +4825,19 @@ impl<M: Clone> MetaInterp<M> {
         let Some(driver) = driver_descriptor else {
             return input_types;
         };
+        // A driver that declares a flat entry contract has no red list to
+        // synthesise the shape from — its entry slots ARE the leading
+        // inputargs, in the order `extract_live_values()` emits them, so the
+        // contract is the prefix of the types already in hand. Take it before
+        // the red-list path below, which would answer with a red count that
+        // describes a different model.
+        if let Some(flat) = driver.flat_entry_contract() {
+            let mut input_types = input_types;
+            if input_types.len() > flat.len {
+                input_types.truncate(flat.len);
+            }
+            return input_types;
+        }
         let Some(_) = driver.virtualizable_arg_index() else {
             return input_types;
         };
@@ -5801,8 +5814,21 @@ impl<M: Clone> MetaInterp<M> {
         let Some(index_of_vable) = driver.virtualizable_arg_index() else {
             return;
         };
-        let num_red_args = driver.num_reds();
-        if inputargs.len() <= num_red_args {
+        // compile.py:431 spells the entry contract's width as
+        // `jitdriver_sd.num_red_args`, because upstream's compiled entry is
+        // invoked with the jitdriver's reds (`warmstate.py:387
+        // execute_assembler`). A driver whose entry is a flat state-field
+        // prefix has a different width — its reds describe the merge-point
+        // payload, in which the whole state is a single red — and the red
+        // count is neither an upper bound on nor a scaled version of it, so
+        // using it there would truncate in the middle of the live entry values
+        // and reinterpret the rest as virtualizable fields. Ask the descriptor
+        // which model it is in.
+        let entry_prefix_len = match driver.flat_entry_contract() {
+            Some(flat) => flat.len,
+            None => driver.num_reds(),
+        };
+        if inputargs.len() <= entry_prefix_len {
             // Trace was never expanded (no virtualizable fields live at entry).
             return;
         }
@@ -5837,7 +5863,7 @@ impl<M: Clone> MetaInterp<M> {
             inputargs,
             vinfo,
             &array_lengths,
-            num_red_args,
+            entry_prefix_len,
             index_of_vable,
             constants,
         );
@@ -19167,6 +19193,7 @@ mod metainterp_static_data_tests {
             index: None,
             vars: vec![],
             virtualizable: None,
+            flat_entry: None,
             result_type: majit_ir::Type::Ref,
             is_recursive: false,
             mainjitcode: None,

@@ -1922,6 +1922,29 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
     };
 
+    // Naming the virtualizable on the jitdriver static data
+    // (`warmspot.py:520-545 make_virtualizable_infos`) is what makes
+    // `compile.py:508-511`'s field-reload preamble run, which would retire the
+    // per-entry re-export of the virtualizable's array elements. Not declared
+    // here yet, and the missing piece is NOT the declaration: this state model
+    // backs its virtualizable arrays with `Vec`s embedded by value, and
+    // `compile.py:441-457`'s reconstruction needs to reach each array's data
+    // pointer with a load the trace IR can express. It cannot: a `Vec`'s data
+    // pointer is not at a specified offset within it, so there is no field
+    // load that portably finds it (see the `RustVec` arm of
+    // `patch_new_loop_to_load_virtualizable_fields`). Declaring the name
+    // without first giving that arm a reload it can emit turns every compile
+    // of such a driver into that arm's refusal.
+    //
+    // When it is declared, it must arrive through
+    // `JitDriver::declare_flat_entry_contract` together with the width of the
+    // entry it applies to: the flat live-value prefix, not the red count (the
+    // whole state is a single red in the merge-point payload). That prefix is
+    // `num_scalars + num_vable_identity_slots + num_ref_scalars +
+    // num_float_scalars` with the identity at flat index `num_scalars`, valid
+    // only while the state declares no fixed arrays — the same restriction
+    // `identity_live_index` below carries, and for the same reason.
+
     // pyjitpl.py:3443-3444 `rebuild_state_after_failure`:
     //     if vinfo is not None:
     //         self.virtualizable_boxes = virtualizable_boxes

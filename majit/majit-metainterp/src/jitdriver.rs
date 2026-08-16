@@ -768,6 +768,34 @@ fn build_jitcode_registry(
     (registry, dispatch_arc)
 }
 
+/// The width of a compiled loop's entry contract, and where the
+/// virtualizable sits inside it, for a driver whose entry is NOT a red list.
+///
+/// `compile.py:431` truncates `loop.inputargs` to `jitdriver_sd.num_red_args`
+/// and `compile.py:429` reads the virtualizable out of that prefix by
+/// `index_of_virtualizable`. Both spellings work upstream because the compiled
+/// entry is invoked with exactly the jitdriver's reds (`warmstate.py:387
+/// execute_assembler`) and the virtualizable is one of them
+/// (`warmspot.py:538 jd.index_of_virtualizable = jitdriver.reds.index(vname)`).
+///
+/// A driver that declares its runtime state as flat fields presents a
+/// different entry: one slot per declared field, in the order the state's live
+/// values are emitted, with the virtualizable occupying a single slot among
+/// them rather than being one of N reds. Its logical red list still exists —
+/// it is the merge-point payload schema, in which the whole state is one red —
+/// so the red count and the entry width are counts of different things and
+/// neither can be derived from the other. Such a driver states both numbers
+/// here instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlatEntryContract {
+    /// Number of leading inputargs that form the entry contract — the
+    /// `compile.py:431 i` the loop's inputargs are truncated to.
+    pub len: usize,
+    /// Index, within that prefix, of the slot holding the virtualizable
+    /// pointer (`compile.py:429 inputargs[index_of_virtualizable]`).
+    pub index_of_virtualizable: usize,
+}
+
 /// Descriptor for a JitDriver's variable layout.
 ///
 /// Mirrors RPython's `JitDriver(greens=[...], reds=[...])`:
@@ -788,6 +816,10 @@ pub struct JitDriverStaticData {
     pub vars: Vec<JitDriverVar>,
     /// Optional name of the virtualizable red variable.
     pub virtualizable: Option<String>,
+    /// Set when this driver's compiled entry contract is a flat state-field
+    /// prefix rather than the red list. See [`FlatEntryContract`]; `None`
+    /// keeps the upstream red-list spelling.
+    pub flat_entry: Option<FlatEntryContract>,
     /// warmspot.py:449 jd.result_type — portal function return type.
     /// Determined once at driver setup from the portal's return signature.
     pub result_type: Type,
@@ -990,6 +1022,7 @@ impl JitDriverStaticData {
             index: None,
             vars,
             virtualizable: virtualizable.map(str::to_string),
+            flat_entry: None,
             result_type: Type::Ref,
             is_recursive: false,
             mainjitcode: None,
@@ -1201,11 +1234,34 @@ impl JitDriverStaticData {
 
     /// rewrite.py:684 `jd.index_of_virtualizable` parity.
     ///
-    /// Returns the index inside the red-arg list / original
-    /// CALL_ASSEMBLER arglist, not the absolute index in `vars`.
+    /// Returns the index inside the entry arglist — the red-arg list /
+    /// original CALL_ASSEMBLER arglist — not the absolute index in `vars`.
+    ///
+    /// Every caller reads this as a position in the values the compiled entry
+    /// is invoked with, so a driver whose entry is a flat state-field prefix
+    /// must be answered in THAT list: its reds describe the merge-point
+    /// payload, where the whole state is a single red, and a position in the
+    /// reds picks out a different value than the same position in the entry.
+    /// The declared contract therefore takes precedence over the red-name
+    /// lookup; see [`FlatEntryContract`].
     pub fn virtualizable_arg_index(&self) -> Option<usize> {
+        if let Some(flat) = self.flat_entry {
+            return Some(flat.index_of_virtualizable);
+        }
         let name = self.virtualizable.as_deref()?;
         self.reds().iter().position(|var| var.name == name)
+    }
+
+    /// The flat entry contract, when this driver declares one.
+    ///
+    /// A consumer that needs the compiled loop's entry WIDTH must consult this
+    /// rather than `num_reds()`: the two count different things, so a flat
+    /// driver answered with a red count gets a truncation point in the middle
+    /// of its live entry values. The virtualizable's position inside that
+    /// width is already served model-aware by
+    /// [`Self::virtualizable_arg_index`].
+    pub fn flat_entry_contract(&self) -> Option<FlatEntryContract> {
+        self.flat_entry
     }
 }
 
@@ -1748,6 +1804,35 @@ impl<S: JitState> JitDriver<S> {
             return;
         }
         self.descriptor = Some(JitDriverStaticData::with_green_types(greens, reds));
+        self.descriptor_cache = None;
+    }
+
+    /// Name the descriptor's virtualizable and state its flat entry contract.
+    ///
+    /// `warmspot.py:520-545 make_virtualizable_infos` names the virtualizable
+    /// on the jitdriver static data, which is what makes
+    /// `compile.py:508-511`'s field-reload preamble run at all. A driver whose
+    /// entry is a flat state-field prefix cannot say it through the reds — see
+    /// [`FlatEntryContract`] — so both halves arrive together here, after
+    /// [`Self::declare_schema_typed`] has built the descriptor from the
+    /// merge-point payload schema.
+    ///
+    /// No-op when no descriptor exists yet: a virtualizable declaration with
+    /// no green/red schema behind it has nothing to index into.
+    pub fn declare_flat_entry_contract(
+        &mut self,
+        virtualizable: &str,
+        contract: FlatEntryContract,
+    ) {
+        let Some(descriptor) = self.descriptor.as_mut() else {
+            return;
+        };
+        descriptor.virtualizable = Some(virtualizable.to_string());
+        descriptor.flat_entry = Some(contract);
+        // warmspot.py:538 `jd.index_of_virtualizable` — the flat contract's
+        // index, not a position in the reds, because the entry it describes is
+        // not the red list.
+        descriptor.index_of_virtualizable = contract.index_of_virtualizable as i32;
         self.descriptor_cache = None;
     }
 
@@ -8292,6 +8377,41 @@ mod tests {
             driver.meta.on_back_edge(key, &[]),
             BackEdgeAction::StartedTracing
         ));
+    }
+
+    /// `declare_flat_entry_contract` fills in the two things a flat entry
+    /// cannot say through the red list, on the descriptor the schema call just
+    /// built — and re-answers `virtualizable_arg_index` in that model, so the
+    /// consumers that read it as a position in the entry arglist see the
+    /// virtualizable's slot rather than its position among the reds.
+    #[test]
+    fn declare_flat_entry_contract_states_the_entry_shape_the_reds_cannot() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema_typed(
+            vec![("pc", GreenType::Int), ("program", GreenType::Ref)],
+            vec![("state", Type::Ref)],
+        );
+        let before = driver
+            .descriptor
+            .as_ref()
+            .expect("schema builds a descriptor");
+        assert_eq!(before.flat_entry_contract(), None);
+        assert_eq!(before.virtualizable_arg_index(), None);
+
+        driver.declare_flat_entry_contract(
+            "state",
+            FlatEntryContract {
+                len: 2,
+                index_of_virtualizable: 1,
+            },
+        );
+        let after = driver.descriptor.as_ref().expect("descriptor survives");
+        assert_eq!(after.virtualizable.as_deref(), Some("state"));
+        assert_eq!(after.flat_entry_contract().map(|f| f.len), Some(2));
+        assert_eq!(after.virtualizable_arg_index(), Some(1));
+        assert_eq!(after.index_of_virtualizable, 1);
+        // The reds still describe the merge-point payload, unchanged.
+        assert_eq!(after.num_reds(), 1);
     }
 
     #[test]

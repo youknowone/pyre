@@ -1856,18 +1856,56 @@ pub(crate) fn normalize_closing_jump_args(
 /// virtualizable's static and array fields ride through the optimizer as
 /// expanded trace inputargs; this function strips them and reconstructs
 /// each field at loop entry with a `GETFIELD_GC` / `GETARRAYITEM_GC` op
-/// so the compiled loop's `len(inputargs) == num_red_args` matches
+/// so the compiled loop's `len(inputargs) == entry_prefix_len` matches
 /// `execute_token`'s `clt._debug_nbargs` and CA's `op.args.len()`.
+///
+/// `entry_prefix_len` is `compile.py:431 i = jitdriver_sd.num_red_args`: the
+/// number of leading inputargs that survive the truncation, and the position
+/// the field reconstruction starts from. Upstream can spell it as the red-arg
+/// count because upstream's entry contract IS the red list — `warmstate.py:387
+/// execute_assembler` is called with the reds, and the virtualizable is one of
+/// them. A caller whose entry contract is not a red list (one flat slot per
+/// declared state field, with the virtualizable occupying a single slot among
+/// them) has a different width and must state it here rather than let this
+/// helper re-derive one from a red count that describes a different model. It
+/// is a hard error for the two to be confused: truncating at the wrong point
+/// silently reinterprets live entry values as virtualizable fields.
+///
+/// `index_of_virtualizable` is `compile.py:429` — an index INTO that entry
+/// prefix, so it is expressed in whichever of the two models the caller used.
 ///
 /// `vable_array_lengths` mirrors RPython's `vinfo.get_array_length(vable, i)`
 /// reads: one length per array field (in `vinfo.array_fields` order), taken
 /// from the concrete virtualizable at trace-start time.
+///
+/// SOUNDNESS INVARIANT — baking the lengths in.
+/// `compile.py:443` reads each array length off the concrete virtualizable at
+/// compile time and burns that many `GETARRAYITEM` ops into the prologue, so
+/// the compiled entry is only valid for a virtualizable whose arrays still
+/// have those lengths. Nothing re-checks it later: the entry's compatibility
+/// test covers the FIXED array fields only, and reads their length off the
+/// live object rather than comparing it against a recorded one. What makes
+/// the baking safe is that the array lengths are a function of the trace's
+/// GREEN key — upstream the frame's array sizes come from the code object,
+/// which is green — so a virtualizable with different lengths cannot reach
+/// this compiled entry in the first place; it keys to a different trace. A
+/// caller whose array lengths can vary while the greens stay fixed must NOT
+/// route through this helper: it would hand such an entry a prologue that
+/// reads a stale length.
+///
+/// The assertion at the baking site below is what that invariant buys in
+/// code: `compile.py:458 assert i == len(inputargs)` requires the baked
+/// lengths to account for EXACTLY the inputargs the tracer expanded, so a
+/// length that has moved since trace-start fails the compile instead of
+/// producing a prologue that reads the wrong number of elements. It cannot
+/// catch a length that changes AFTER the compile — no assertion here can,
+/// which is why the green-key argument above has to hold.
 pub fn patch_new_loop_to_load_virtualizable_fields(
     ops: &mut Vec<majit_ir::OpRc>,
     inputargs: &mut Vec<InputArg>,
     vinfo: &crate::virtualizable::VirtualizableInfo,
     vable_array_lengths: &[usize],
-    num_red_args: usize,
+    entry_prefix_len: usize,
     index_of_virtualizable: usize,
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
@@ -1977,10 +2015,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     }
 
     assert!(
-        index_of_virtualizable < num_red_args,
-        "virtualizable must live inside the red args (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
+        index_of_virtualizable < entry_prefix_len,
+        "virtualizable must live inside the entry prefix (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
     );
-    if inputargs.len() <= num_red_args {
+    if inputargs.len() <= entry_prefix_len {
         // Already reduced or no virtualizable expansion in the trace.
         return;
     }
@@ -2026,10 +2064,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     let mut forwarding: Vec<Option<Operand>> =
         vec![None; (max_runtime_ref as usize).saturating_add(1)];
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
-    let mut i = num_red_args;
+    let mut i = entry_prefix_len;
 
-    // compile.py:432 — loop.inputargs = inputargs[:i].
-    inputargs.truncate(num_red_args);
+    // compile.py:431-432 — i = jitdriver_sd.num_red_args; loop.inputargs =
+    // inputargs[:i].  `entry_prefix_len` is that `i`, stated by the caller
+    // because the two entry models it can be in disagree about the number;
+    // see the SOUNDNESS INVARIANT on this function for what the reconstruction
+    // below is allowed to assume about the array lengths it bakes in.
+    inputargs.truncate(entry_prefix_len);
 
     // compile.py:433-440 — GETFIELD_GC per static field.
     let static_descrs = vinfo.static_field_descrs();
@@ -2066,6 +2108,16 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // compile.py:441-457 — GETFIELD_GC_R (array ptr) + GETARRAYITEM_GC per element.
     let array_descrs_list = vinfo.array_field_descrs();
     for (ai, array_field_descr) in array_descrs_list.iter().enumerate() {
+        // compile.py:443 `arraylen = vinfo.get_array_length(vable, arrayindex)`
+        // — the length is BAKED into the compiled prologue here, as a fixed
+        // count of `GETARRAYITEM` ops. No later check re-reads it: the entry
+        // compatibility test is built from the fixed array fields and takes
+        // their length off the live object, so it cannot notice that a
+        // virtualizable array has grown or shrunk since this compile. The
+        // baking is sound only because the array lengths are a function of
+        // this trace's GREENS, so a virtualizable with other lengths keys to
+        // a different trace and never reaches this entry. See the SOUNDNESS
+        // INVARIANT on this function.
         let array_len = vable_array_lengths.get(ai).copied().unwrap_or(0);
         assert!(
             i + array_len <= expanded_inputargs.len(),
@@ -2197,6 +2249,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
     }
 
+    // compile.py:458 `assert i == len(inputargs)`. This is also the only
+    // in-code check the baked array lengths get: the reconstruction consumed
+    // one expanded inputarg per baked element, so an equality here says the
+    // lengths passed in still describe the shape the tracer expanded at
+    // trace-start. A length that moves after this compile is outside its
+    // reach — see the SOUNDNESS INVARIANT on this function.
     assert!(
         i == expanded_inputargs.len(),
         "compile.py:458 assert i == len(inputargs) failed ({i} != {})",
@@ -2949,6 +3007,110 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![OpRef::input_arg_ref(0), ops[2].pos.get(), ops[3].pos.get()]
         );
+    }
+
+    /// The entry prefix is the caller's number, not `num_red_args`.
+    ///
+    /// A flat entry contract puts the virtualizable at some interior slot with
+    /// other live entry values around it — here one int scalar at slot 0, the
+    /// virtualizable at slot 1, and the array elements following from slot 2.
+    /// `compile.py:431-432` must truncate at 2 and start reconstructing there;
+    /// a helper that re-derived the point from a red count (this driver
+    /// declares one red, the whole state) would cut at 1 and reinterpret the
+    /// virtualizable itself as the first array element.
+    #[test]
+    fn test_patch_new_loop_truncates_at_the_callers_entry_prefix_not_a_red_count() {
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_embedded_array_field(
+            "regs",
+            Type::Int,
+            8,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Int),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(16));
+
+        let ops = vec![Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Int, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Int, 2),
+                rooted_inputarg_operand(Type::Int, 3),
+            ],
+        )];
+        let mut inputargs = vec![
+            InputArg::new_int(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_int(3),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(std::rc::Rc::new).collect();
+
+        patch_new_loop_to_load_virtualizable_fields(
+            &mut ops,
+            &mut inputargs,
+            &vinfo,
+            &[2],
+            2,
+            1,
+            &mut constants,
+        );
+
+        // The scalar at slot 0 survives the truncation alongside the
+        // virtualizable; only the two array elements are reconstructed.
+        assert_eq!(inputargs, vec![InputArg::new_int(0), InputArg::new_ref(1)]);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
+        // The array load reads through the virtualizable at slot 1, not the
+        // int scalar at slot 0.
+        assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(1));
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
+        assert_eq!(ops[2].opcode, OpCode::GetarrayitemRawI);
+        assert_eq!(ops[3].opcode, OpCode::GetarrayitemRawI);
+        assert_eq!(ops[4].opcode, OpCode::Label);
+        assert_eq!(
+            ops[4]
+                .getarglist()
+                .iter()
+                .map(|a| a.to_opref())
+                .collect::<Vec<_>>(),
+            vec![
+                OpRef::input_arg_int(0),
+                OpRef::input_arg_ref(1),
+                ops[2].pos.get(),
+                ops[3].pos.get()
+            ]
+        );
+    }
+
+    /// A declared flat contract is what every consumer of the entry shape must
+    /// see — both the width and the virtualizable's position inside it.
+    #[test]
+    fn test_flat_entry_contract_overrides_the_red_list_spelling() {
+        use crate::jitdriver::{FlatEntryContract, JitDriverStaticData};
+
+        // The merge-point payload schema: the whole state is a single red, so
+        // a red-list lookup would answer "slot 0" for the virtualizable.
+        let mut sd = JitDriverStaticData::with_virtualizable(
+            vec![("pc", Type::Int), ("program", Type::Ref)],
+            vec![("state", Type::Ref)],
+            Some("state"),
+        );
+        assert_eq!(sd.virtualizable_arg_index(), Some(0));
+        assert_eq!(sd.num_reds(), 1);
+
+        sd.flat_entry = Some(FlatEntryContract {
+            len: 2,
+            index_of_virtualizable: 1,
+        });
+        assert_eq!(sd.flat_entry_contract().map(|f| f.len), Some(2));
+        assert_eq!(sd.virtualizable_arg_index(), Some(1));
+        // The red count is untouched — it still describes the payload, which
+        // is why it cannot double as the entry width.
+        assert_eq!(sd.num_reds(), 1);
     }
 }
 /// Re-export the backend-owned resume payload under its historical
