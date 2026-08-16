@@ -154,6 +154,14 @@ Known divergences, each documented at its definition:
 - `PyBytes_FromStringAndSize(NULL, n)` is rejected: pyre's `bytes` is immutable
   from construction and its storage is not the address `PyBytes_AsString`
   returns;
+- `PyObject_GC_IsTracked` is the constant 1 and `PyObject_GC_IsFinalized` the
+  constant 0: every object pyre holds is reachable by its collector, and
+  nothing runs `tp_finalize`;
+- `PyObject_Malloc` / `Calloc` / `Realloc` hand out blocks from the same census
+  the mirror allocator uses, so `PyObject_Free` releases either kind; a block
+  from the `PyMem_*` family is a different allocator's and must go back to
+  `PyMem_Free`. A request smaller than a `PyObject` header is rounded up to
+  one, because freeing a block clears that header;
 - `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
   leaving them NULL as CPython does;
 - a type is built on a single base, so a `PyType_Spec` naming more than one is
@@ -194,10 +202,15 @@ Known divergences, each documented at its definition:
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 763
+   pyre does not take; and the remaining generated API. Of the 749 public
    `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
-   `Include/*.h`, 292 are present -- counting every form `Python.h` offers
-   one in, whether an export, a `static inline` or a function-like macro;
+   `Include/*.h` -- public meaning the declared name does not begin with an
+   underscore -- 342 are present, counting every form `Python.h` offers one
+   in: an export, a `static inline`, or a macro of either kind. (The
+   previously recorded 763/292 came from a pattern that missed the
+   declarations annotated `_Py_NO_RETURN` on one side and the object-like
+   aliases on the other; on the same header the corrected count is 293, so
+   this figure moved by 49.);
 6. Windows API DLL/import-library packaging.
 
 A type built from a spec carries the module it was created from and the
@@ -249,6 +262,18 @@ are ABI-compatible with pyre.
 - `pypy/module/cpyext/structmemberdefs.py`: the `T_*` member type codes.
 - `pypy/module/cpyext/number.py`, `sequence.py` and `mapping.py`: the
   `PyNumber_*`, `PySequence_*` and `PyMapping_*` entry points.
+- `pypy/module/cpyext/object.py`: the object protocol, the object allocator and
+  the `object.__getattribute__` / `__setattr__` / `__dict__` terminals.
+  `PyObject_Bytes` runs a `__bytes__` override and then falls back to
+  `PyBytes_FromObject`, which does not consult it -- so the two answer
+  differently for an object that defines one. `PyObject_Hash` reports a hash of
+  -1 as -2, -1 being the failure answer.
+- `pypy/module/cpyext/longobject.py`: the `int` conversions. `PyLong_AsInt32` /
+  `AsUInt32` / `AsInt64` / `AsUInt64` and their `From` counterparts are 3.14
+  additions upstream predates, as are `PyLong_AsNativeBytes`,
+  `PyLong_FromNativeBytes` and `PyLong_FromUnsignedNativeBytes`;
+  `PyLong_GetInfo` reads `sys.int_info`, which is where the same numbers are
+  already published.
 - `pypy/module/cpyext/pycapsule.py` and `import_.py`: capsules and the import
   entry points.
 - `pypy/module/cpyext/buffer.py` and `memoryobject.py`: `Py_buffer`, the

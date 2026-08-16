@@ -2,6 +2,7 @@
 
 use super::object::argument;
 use super::pyobject::{self, CPyObject};
+use pyre_object::PyObjectRef;
 use std::ffi::{CStr, c_char, c_int};
 
 #[unsafe(no_mangle)]
@@ -101,6 +102,74 @@ pub unsafe extern "C" fn PyBytes_Size(object: *mut CPyObject) -> isize {
     unsafe { pyre_object::bytesobject::w_bytes_len(value) as isize }
 }
 
+/// `bytesobject.py:261-268 PyBytes_FromObject` — the `bytes` an object's buffer
+/// or its elements make, without the `bytes(n)` count spelling and without a
+/// codec.
+///
+/// A `__bytes__` override is *not* consulted here.  That is
+/// `invoke_bytes_method`, and the only entry point that runs it is
+/// [`super::object::PyObject_Bytes`] (`object.py:199-201`).
+pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    if unsafe { pyre_object::bytesobject::is_bytes(object) } {
+        // An exact `bytes` is its own answer; a subclass instance is copied
+        // down to one.
+        if unsafe {
+            pyre_object::pyobject::is_exact_type(object, &pyre_object::bytesobject::BYTES_TYPE)
+        } {
+            return Ok(object);
+        }
+        let data = unsafe { pyre_object::bytesobject::w_bytes_data(object) }.to_vec();
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+    }
+    if unsafe { pyre_object::is_str(object) } {
+        return Err(crate::PyError::type_error(
+            "cannot convert 'str' object to bytes",
+        ));
+    }
+    // `_convert_from_buffer_or_iterable`: a read-only buffer if the object
+    // exports one, otherwise its elements as bytes.
+    if let Some(buffer) = crate::baseobjspace::full_ro_buffer_bytes(object)? {
+        let data = buffer.as_bytes().to_vec();
+        buffer.release();
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let iterator = match crate::baseobjspace::iter(object) {
+        Ok(iterator) => iterator,
+        Err(error) => {
+            if unsafe { crate::baseobjspace::lookup(object, "__iter__") }.is_none() {
+                return Err(crate::PyError::type_error(format!(
+                    "cannot convert '{}' object to bytes",
+                    crate::type_methods::arg_type_name(object)
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(iterator);
+    let mut data = Vec::new();
+    loop {
+        let item =
+            crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iterator_slot));
+        match item {
+            Ok(item) => data.push(unsafe { crate::baseobjspace::byte_w(item, "bytes") }?),
+            Err(error) if error.kind == crate::PyErrorKind::StopIteration => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+}
+
+/// `PyBytes_FromObject(object)` — [`bytes_of`] as an entry point.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyBytes_FromObject(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(object) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(bytes_of(object))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -118,6 +187,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyBytes_AsString as *const ());
     std::hint::black_box(PyBytes_AsStringAndSize as *const ());
     std::hint::black_box(PyBytes_Size as *const ());
+    std::hint::black_box(PyBytes_FromObject as *const ());
     std::hint::black_box(PyBytes_Check as *const ());
     std::hint::black_box(PyBytes_CheckExact as *const ());
 }

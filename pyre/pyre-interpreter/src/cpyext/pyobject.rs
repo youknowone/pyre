@@ -346,6 +346,64 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     unsafe { free_block(raw) };
 }
 
+/// A block for the object allocator, entered in the same census as a mirror so
+/// that [`free_block`] — which is what `PyObject_Free` calls — releases it.
+///
+/// Upstream reaches the same allocator from both directions: `_PyPy_Malloc`
+/// hands out an instance's block and `PyObject_Malloc` hands out a plain one,
+/// and `_PyPy_Free` takes either back (`object.py:18-23, 44-60`).
+///
+/// The size is floored at a whole [`CPyObject`] because [`free_block`] clears
+/// that header before releasing the block.  A caller asking for less still gets
+/// what it asked for; the floor only makes the block larger.
+pub(super) fn allocate_raw(size: usize, zeroed: bool) -> *mut std::ffi::c_void {
+    if size > isize::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    let size = size.max(size_of::<CPyObject>());
+    let layout = block_layout(size);
+    let raw = unsafe {
+        if zeroed {
+            std::alloc::alloc_zeroed(layout)
+        } else {
+            std::alloc::alloc(layout)
+        }
+    };
+    if raw.is_null() {
+        return std::ptr::null_mut();
+    }
+    BLOCK_SIZES.lock().insert(raw as usize, size);
+    raw as *mut std::ffi::c_void
+}
+
+/// Grow or shrink a block [`allocate_raw`] handed out, keeping its contents.
+///
+/// # Safety
+/// `raw` must be a live block from [`allocate_raw`], and must not be used
+/// afterwards if this returns a different address.
+pub(super) unsafe fn reallocate_raw(
+    raw: *mut std::ffi::c_void,
+    size: usize,
+) -> *mut std::ffi::c_void {
+    if size > isize::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    // A block this layer did not hand out has no recorded size, so there is no
+    // layout to hand `realloc` and no way to move it.
+    let Some(old) = BLOCK_SIZES.lock().get(&(raw as usize)).copied() else {
+        return std::ptr::null_mut();
+    };
+    let size = size.max(size_of::<CPyObject>());
+    let moved = unsafe { std::alloc::realloc(raw as *mut u8, block_layout(old), size) };
+    if moved.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut sizes = BLOCK_SIZES.lock();
+    sizes.remove(&(raw as usize));
+    sizes.insert(moved as usize, size);
+    moved as *mut std::ffi::c_void
+}
+
 /// Return a mirror block to the allocator this layer took it from.
 ///
 /// `cpyext/src/object.c:102-105 PyObject_Free`.  A block this layer did not

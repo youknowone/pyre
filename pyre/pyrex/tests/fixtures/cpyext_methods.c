@@ -1013,7 +1013,306 @@ static PyObject *m_module_from_def(PyObject *self, PyObject *spec)
     return made;
 }
 
+/* The attribute half of the object protocol: the generic terminals, the
+   optional lookup that reports an absence instead of raising, and the
+   deletions.  `args` is `(object, name)` where `object` carries a `__dict__`
+   and already has the named attribute. */
+static PyObject *m_object_attrs(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *object;
+    PyObject *name;
+    if (!PyArg_ParseTuple(args, "OO", &object, &name)) {
+        return NULL;
+    }
+    PyObject *got = PyObject_GenericGetAttr(object, name);
+    if (got == NULL) {
+        return NULL;
+    }
+    Py_DECREF(got);
+
+    PyObject *marker = PyUnicode_FromString("set-generically");
+    if (marker == NULL) {
+        return NULL;
+    }
+    int stored = PyObject_GenericSetAttr(object, name, marker);
+    Py_DECREF(marker);
+    if (stored < 0) {
+        return NULL;
+    }
+
+    /* The optional lookup answers 1/0 without leaving an indicator behind. */
+    PyObject *found = NULL;
+    int present = PyObject_GetOptionalAttr(object, name, &found);
+    Py_XDECREF(found);
+    if (present < 0) {
+        return NULL;
+    }
+    PyObject *absent = NULL;
+    int missing = PyObject_GetOptionalAttrString(object, "no_such_attribute", &absent);
+    if (missing < 0 || absent != NULL) {
+        Py_XDECREF(absent);
+        PyErr_SetString(PyExc_SystemError, "an absent attribute was reported present");
+        return NULL;
+    }
+    int has = PyObject_HasAttrWithError(object, name);
+    int has_string = PyObject_HasAttrStringWithError(object, "no_such_attribute");
+    int has_swallowed = PyObject_HasAttr(object, name);
+    if (has < 0 || has_string < 0) {
+        return NULL;
+    }
+
+    PyObject *dict = PyObject_GenericGetDict(object, NULL);
+    if (dict == NULL) {
+        return NULL;
+    }
+    Py_ssize_t entries = PyDict_Size(dict);
+    Py_DECREF(dict);
+
+    if (PyObject_DelAttr(object, name) < 0) {
+        return NULL;
+    }
+    int gone = PyObject_HasAttrWithError(object, name);
+    if (gone < 0) {
+        return NULL;
+    }
+
+    return Py_BuildValue("(iiiini)", present, missing, has, has_string,
+                         entries, has_swallowed && gone == 0);
+}
+
+/* Comparison, hashing and the string/format conversions.  `args` is
+   `(left, right, mapping, key)`. */
+static PyObject *m_object_values(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *left;
+    PyObject *right;
+    PyObject *mapping;
+    PyObject *key;
+    if (!PyArg_ParseTuple(args, "OOOO", &left, &right, &mapping, &key)) {
+        return NULL;
+    }
+    PyObject *less = PyObject_RichCompare(left, right, Py_LT);
+    if (less == NULL) {
+        return NULL;
+    }
+    int same = PyObject_RichCompareBool(left, left, Py_EQ);
+    int differs = PyObject_RichCompareBool(left, right, Py_NE);
+    if (same < 0 || differs < 0) {
+        Py_DECREF(less);
+        return NULL;
+    }
+    Py_hash_t hash = PyObject_Hash(left);
+    if (hash == -1 && PyErr_Occurred()) {
+        Py_DECREF(less);
+        return NULL;
+    }
+    PyObject *ascii_form = PyObject_ASCII(left);
+    PyObject *formatted = PyObject_Format(left, NULL);
+    PyObject *names = PyObject_Dir(left);
+    if (ascii_form == NULL || formatted == NULL || names == NULL) {
+        Py_DECREF(less);
+        Py_XDECREF(ascii_form);
+        Py_XDECREF(formatted);
+        Py_XDECREF(names);
+        return NULL;
+    }
+    Py_ssize_t name_count = PyObject_Length(names);
+    Py_DECREF(names);
+
+    if (PyObject_DelItem(mapping, key) < 0) {
+        Py_DECREF(less);
+        Py_DECREF(ascii_form);
+        Py_DECREF(formatted);
+        return NULL;
+    }
+    Py_ssize_t left_over = PyObject_Length(mapping);
+
+    int subclass = PyObject_IsSubclass((PyObject *)Py_TYPE(left), (PyObject *)Py_TYPE(left));
+    if (subclass < 0) {
+        Py_DECREF(less);
+        Py_DECREF(ascii_form);
+        Py_DECREF(formatted);
+        return NULL;
+    }
+    return Py_BuildValue("(NiiiNNnni)", less, same, differs, hash != -1,
+                         ascii_form, formatted, name_count, left_over, subclass);
+}
+
+/* `bytes(object)` — a `__bytes__` override first, then the buffer and the
+   iterable. */
+static PyObject *m_object_bytes(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    return PyObject_Bytes(arg);
+}
+
+/* The same conversion without the `__bytes__` step, which is the one
+   difference between the two entry points. */
+static PyObject *m_bytes_from(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    return PyBytes_FromObject(arg);
+}
+
+/* The object allocator, whose blocks go back through `PyObject_Free`. */
+static PyObject *m_object_blocks(PyObject *self, PyObject *unused)
+{
+    (void)self; (void)unused;
+    char *block = (char *)PyObject_Malloc(64);
+    if (block == NULL) {
+        return PyErr_NoMemory();
+    }
+    memset(block, 'a', 64);
+    char *grown = (char *)PyObject_Realloc(block, 256);
+    if (grown == NULL) {
+        PyObject_Free(block);
+        return PyErr_NoMemory();
+    }
+    int kept = grown[0] == 'a' && grown[63] == 'a';
+    PyObject_Free(grown);
+
+    int *zeroed = (int *)PyObject_Calloc(16, sizeof(int));
+    if (zeroed == NULL) {
+        return PyErr_NoMemory();
+    }
+    int clear = 1;
+    for (int index = 0; index < 16; index++) {
+        clear = clear && zeroed[index] == 0;
+    }
+    PyObject_Free(zeroed);
+
+    /* A count that would wrap is refused rather than under-allocated. */
+    void *refused = PyObject_Calloc((size_t)-1 / 2, 4);
+    if (refused != NULL) {
+        PyObject_Free(refused);
+        PyErr_SetString(PyExc_SystemError, "PyObject_Calloc accepted a wrapping product");
+        return NULL;
+    }
+    return Py_BuildValue("(iii)", kept, clear, PyObject_GC_IsTracked(self));
+}
+
+/* The int conversions: the fixed widths, the overflow reports, the masks and
+   the pointer and byte-buffer round trips.  `arg` is an int too large for a
+   C `long`. */
+static PyObject *m_int_convert(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    PyObject *from_small = PyLong_FromInt32(-7);
+    PyObject *from_wide = PyLong_FromUInt64((uint64_t)-1);
+    if (from_small == NULL || from_wide == NULL) {
+        Py_XDECREF(from_small);
+        Py_XDECREF(from_wide);
+        return NULL;
+    }
+
+    int32_t narrow = 0;
+    uint64_t wide = 0;
+    if (PyLong_AsInt32(from_small, &narrow) < 0 ||
+        PyLong_AsUInt64(from_wide, &wide) < 0) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        return NULL;
+    }
+    /* A value that does not fit reports the overflow rather than truncating. */
+    int32_t refused = 0;
+    int narrowed = PyLong_AsInt32(from_wide, &refused);
+    if (narrowed == 0 || !PyErr_ExceptionMatches(PyExc_OverflowError)) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        PyErr_SetString(PyExc_SystemError, "PyLong_AsInt32 accepted an out-of-range value");
+        return NULL;
+    }
+    PyErr_Clear();
+
+    int overflow = 0;
+    long fits = PyLong_AsLongAndOverflow(from_small, &overflow);
+    if (fits == -1 && PyErr_Occurred()) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        return NULL;
+    }
+    int too_big = 0;
+    (void)PyLong_AsLongLongAndOverflow(arg, &too_big);
+    if (PyErr_Occurred()) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        return NULL;
+    }
+
+    unsigned long masked = PyLong_AsUnsignedLongMask(from_small);
+    unsigned long long masked_wide = PyLong_AsUnsignedLongLongMask(from_small);
+    if (masked != (unsigned long)-7 || masked_wide != (unsigned long long)-7) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        PyErr_SetString(PyExc_SystemError, "a mask conversion dropped the low bits");
+        return NULL;
+    }
+
+    /* A pointer survives the round trip whether or not it sets the top bit. */
+    PyObject *address = PyLong_FromVoidPtr((void *)&moduledef);
+    if (address == NULL) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        return NULL;
+    }
+    int same_pointer = PyLong_AsVoidPtr(address) == (void *)&moduledef;
+    Py_DECREF(address);
+
+    /* The bytes of a C variable, in and out. */
+    unsigned char buffer[8];
+    Py_ssize_t needed = PyLong_AsNativeBytes(from_small, buffer, sizeof(buffer),
+                                             Py_ASNATIVEBYTES_DEFAULTS);
+    if (needed < 0) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        return NULL;
+    }
+    PyObject *restored = PyLong_FromNativeBytes(buffer, sizeof(buffer),
+                                                Py_ASNATIVEBYTES_DEFAULTS);
+    PyObject *unsigned_restored = PyLong_FromUnsignedNativeBytes(
+        buffer, sizeof(buffer), Py_ASNATIVEBYTES_DEFAULTS);
+    PyObject *info = PyLong_GetInfo();
+    if (restored == NULL || unsigned_restored == NULL || info == NULL) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        Py_XDECREF(restored);
+        Py_XDECREF(unsigned_restored);
+        Py_XDECREF(info);
+        return NULL;
+    }
+    PyObject *bits = PyObject_GetAttrString(info, "bits_per_digit");
+    Py_DECREF(info);
+    if (bits == NULL) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        Py_DECREF(restored);
+        Py_DECREF(unsigned_restored);
+        return NULL;
+    }
+    int digit_bits = PyLong_AsInt(bits);
+    Py_DECREF(bits);
+    if (digit_bits == -1 && PyErr_Occurred()) {
+        Py_DECREF(from_small);
+        Py_DECREF(from_wide);
+        Py_DECREF(restored);
+        Py_DECREF(unsigned_restored);
+        return NULL;
+    }
+
+    return Py_BuildValue("(NNiKiinNNi)", from_small, from_wide, (int)narrow,
+                         (unsigned long long)wide, overflow, too_big, needed,
+                         restored, unsigned_restored, digit_bits);
+}
+
 static PyMethodDef methods[] = {
+    {"object_attrs", m_object_attrs, METH_VARARGS, "the generic attribute protocol"},
+    {"object_values", m_object_values, METH_VARARGS, "comparison, hashing and formatting"},
+    {"object_bytes", m_object_bytes, METH_O, "PyObject_Bytes"},
+    {"bytes_from", m_bytes_from, METH_O, "PyBytes_FromObject"},
+    {"object_blocks", m_object_blocks, METH_NOARGS, "the object allocator"},
+    {"int_convert", m_int_convert, METH_O, "the int conversions"},
     {"module_ops", m_module_ops, METH_NOARGS, "the module constructors"},
     {"module_no_file", m_module_no_file, METH_NOARGS, "a module with no __file__"},
     {"module_from_def", m_module_from_def, METH_O, "PyModule_FromDefAndSpec"},

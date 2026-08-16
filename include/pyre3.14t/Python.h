@@ -441,6 +441,8 @@ PyAPI_FUNC(unsigned long) PyType_GetFlags(PyTypeObject *type);
 PyAPI_FUNC(PyObject *) PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 PyAPI_FUNC(PyObject *) PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
 PyAPI_FUNC(PyObject *) PyObject_Init(PyObject *object, PyTypeObject *type);
+PyAPI_FUNC(PyVarObject *) PyObject_InitVar(PyVarObject *object, PyTypeObject *type,
+                                           Py_ssize_t size);
 
 /* Heap types.  Only single inheritance is supported: a spec naming more than
    one base is rejected rather than silently losing the rest. */
@@ -593,8 +595,12 @@ PyAPI_FUNC(void) PyMem_RawFree(void *ptr);
 #define PyMem_MALLOC PyMem_Malloc
 #define PyMem_REALLOC PyMem_Realloc
 #define PyMem_FREE PyMem_Free
-/* No `PyObject_Malloc` alias: `PyObject_Free` releases an object block, which
-   is not what these hand out, so the two would not pair. */
+/* The object allocator.  `PyObject_Free` is the deallocator for all three, and
+   for a block `tp_alloc` handed out; the `PyMem_*` family above is a different
+   allocator and its blocks must go back to `PyMem_Free`. */
+PyAPI_FUNC(void *) PyObject_Malloc(size_t size);
+PyAPI_FUNC(void *) PyObject_Calloc(size_t nelem, size_t elsize);
+PyAPI_FUNC(void *) PyObject_Realloc(void *ptr, size_t new_size);
 PyAPI_FUNC(void) PyObject_Del(void *ob);
 #define PyObject_GC_Del(ob) PyObject_Del(ob)
 #define PyObject_GC_Track(ob) ((void)(ob))
@@ -730,9 +736,46 @@ PyAPI_FUNC(PyObject *) PyObject_Repr(PyObject *object);
 PyAPI_FUNC(int) PyObject_IsTrue(PyObject *object);
 PyAPI_FUNC(int) PyObject_Not(PyObject *object);
 PyAPI_FUNC(Py_ssize_t) PyObject_Size(PyObject *object);
-#define PyObject_Length PyObject_Size
+PyAPI_FUNC(Py_ssize_t) PyObject_Length(PyObject *object);
 PyAPI_FUNC(PyObject *) PyObject_GetItem(PyObject *object, PyObject *key);
 PyAPI_FUNC(int) PyObject_SetItem(PyObject *object, PyObject *key, PyObject *value);
+PyAPI_FUNC(int) PyObject_DelItem(PyObject *object, PyObject *key);
+PyAPI_FUNC(int) PyObject_DelItemString(PyObject *object, const char *key);
+PyAPI_FUNC(int) PyObject_DelAttr(PyObject *object, PyObject *name);
+PyAPI_FUNC(int) PyObject_DelAttrString(PyObject *object, const char *name);
+PyAPI_FUNC(int) PyObject_HasAttr(PyObject *object, PyObject *name);
+PyAPI_FUNC(int) PyObject_HasAttrWithError(PyObject *object, PyObject *name);
+PyAPI_FUNC(int) PyObject_HasAttrStringWithError(PyObject *object, const char *name);
+PyAPI_FUNC(int) PyObject_GetOptionalAttr(PyObject *object, PyObject *name,
+                                         PyObject **result);
+PyAPI_FUNC(int) PyObject_GetOptionalAttrString(PyObject *object, const char *name,
+                                               PyObject **result);
+
+/* The `object.__getattribute__` / `__setattr__` / `__dict__` terminals, which
+   are what `tp_getattro`, `tp_setattro` and the `__dict__` getset default to.
+   A NULL `value` is the deletion spelling for both setters. */
+PyAPI_FUNC(PyObject *) PyObject_GenericGetAttr(PyObject *object, PyObject *name);
+PyAPI_FUNC(int) PyObject_GenericSetAttr(PyObject *object, PyObject *name,
+                                        PyObject *value);
+PyAPI_FUNC(PyObject *) PyObject_GenericGetDict(PyObject *object, void *context);
+PyAPI_FUNC(int) PyObject_GenericSetDict(PyObject *object, PyObject *value,
+                                        void *context);
+
+PyAPI_FUNC(PyObject *) PyObject_ASCII(PyObject *object);
+PyAPI_FUNC(PyObject *) PyObject_Bytes(PyObject *object);
+PyAPI_FUNC(PyObject *) PyObject_Format(PyObject *object, PyObject *format_spec);
+PyAPI_FUNC(PyObject *) PyObject_Dir(PyObject *object);
+PyAPI_FUNC(PyObject *) PyObject_RichCompare(PyObject *left, PyObject *right, int opid);
+PyAPI_FUNC(int) PyObject_RichCompareBool(PyObject *left, PyObject *right, int opid);
+PyAPI_FUNC(Py_hash_t) PyObject_Hash(PyObject *object);
+PyAPI_FUNC(Py_hash_t) PyObject_HashNotImplemented(PyObject *object);
+PyAPI_FUNC(int) PyObject_IsSubclass(PyObject *derived, PyObject *class_);
+PyAPI_FUNC(int) PyObject_AsFileDescriptor(PyObject *object);
+
+/* Every object pyre holds is reachable by its collector and nothing runs
+   `tp_finalize`, so these two are constants. */
+PyAPI_FUNC(int) PyObject_GC_IsTracked(PyObject *object);
+PyAPI_FUNC(int) PyObject_GC_IsFinalized(PyObject *object);
 PyAPI_FUNC(PyObject *) PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
 PyAPI_FUNC(PyObject *) PyObject_CallObject(PyObject *callable, PyObject *args);
 PyAPI_FUNC(int) PyCallable_Check(PyObject *object);
@@ -943,6 +986,42 @@ PyAPI_FUNC(unsigned long) PyLong_AsUnsignedLong(PyObject *object);
 PyAPI_FUNC(unsigned long long) PyLong_AsUnsignedLongLong(PyObject *object);
 PyAPI_FUNC(size_t) PyLong_AsSize_t(PyObject *object);
 PyAPI_FUNC(double) PyLong_AsDouble(PyObject *object);
+PyAPI_FUNC(int) PyLong_AsInt(PyObject *object);
+PyAPI_FUNC(long) PyLong_AsLongAndOverflow(PyObject *object, int *overflow);
+PyAPI_FUNC(long long) PyLong_AsLongLongAndOverflow(PyObject *object, int *overflow);
+PyAPI_FUNC(unsigned long) PyLong_AsUnsignedLongMask(PyObject *object);
+PyAPI_FUNC(unsigned long long) PyLong_AsUnsignedLongLongMask(PyObject *object);
+PyAPI_FUNC(PyObject *) PyLong_FromVoidPtr(void *pointer);
+PyAPI_FUNC(void *) PyLong_AsVoidPtr(PyObject *object);
+
+/* The fixed-width conversions report failure through the `int` return and
+   write the value out, so a value that happens to be -1 is not an error. */
+PyAPI_FUNC(PyObject *) PyLong_FromInt32(int32_t value);
+PyAPI_FUNC(PyObject *) PyLong_FromUInt32(uint32_t value);
+PyAPI_FUNC(PyObject *) PyLong_FromInt64(int64_t value);
+PyAPI_FUNC(PyObject *) PyLong_FromUInt64(uint64_t value);
+PyAPI_FUNC(int) PyLong_AsInt32(PyObject *object, int32_t *value);
+PyAPI_FUNC(int) PyLong_AsUInt32(PyObject *object, uint32_t *value);
+PyAPI_FUNC(int) PyLong_AsInt64(PyObject *object, int64_t *value);
+PyAPI_FUNC(int) PyLong_AsUInt64(PyObject *object, uint64_t *value);
+
+/* Copying an int in and out of a C variable's bytes.  `Py_ASNATIVEBYTES_*`
+   select the byte order and how the sign is read; -1 is the default, which is
+   native order, a signed destination and no `__index__` call. */
+#define Py_ASNATIVEBYTES_DEFAULTS -1
+#define Py_ASNATIVEBYTES_BIG_ENDIAN 0
+#define Py_ASNATIVEBYTES_LITTLE_ENDIAN 1
+#define Py_ASNATIVEBYTES_NATIVE_ENDIAN 3
+#define Py_ASNATIVEBYTES_UNSIGNED_BUFFER 4
+#define Py_ASNATIVEBYTES_REJECT_NEGATIVE 8
+#define Py_ASNATIVEBYTES_ALLOW_INDEX 16
+PyAPI_FUNC(Py_ssize_t) PyLong_AsNativeBytes(PyObject *object, void *buffer,
+                                            Py_ssize_t n_bytes, int flags);
+PyAPI_FUNC(PyObject *) PyLong_FromNativeBytes(const void *buffer, size_t n_bytes,
+                                              int flags);
+PyAPI_FUNC(PyObject *) PyLong_FromUnsignedNativeBytes(const void *buffer,
+                                                      size_t n_bytes, int flags);
+PyAPI_FUNC(PyObject *) PyLong_GetInfo(void);
 PyAPI_FUNC(int) PyLong_Check(PyObject *object);
 PyAPI_FUNC(int) PyLong_CheckExact(PyObject *object);
 PyAPI_FUNC(PyObject *) PyNumber_Long(PyObject *object);
@@ -969,6 +1048,7 @@ PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *text, Py_ssize_t si
 PyAPI_FUNC(char *) PyBytes_AsString(PyObject *object);
 PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *object, char **buffer, Py_ssize_t *size);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *object);
+PyAPI_FUNC(PyObject *) PyBytes_FromObject(PyObject *object);
 PyAPI_FUNC(int) PyBytes_Check(PyObject *object);
 PyAPI_FUNC(int) PyBytes_CheckExact(PyObject *object);
 

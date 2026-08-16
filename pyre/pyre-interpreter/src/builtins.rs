@@ -9589,7 +9589,7 @@ pub(crate) fn py_ascii(obj: PyObjectRef) -> Result<String, crate::PyError> {
     Ok(ascii_escape_wtf8(&s))
 }
 
-fn py_ascii_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn py_ascii_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let r = unsafe { py_repr_obj(obj)? };
     let r_wtf8 = unsafe { pyre_object::w_str_get_wtf8(r) };
     let out = ascii_escape_wtf8(r_wtf8);

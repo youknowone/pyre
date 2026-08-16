@@ -333,6 +333,86 @@ assert again.VIA_DICT == 'through-dict'
 assert again.bump() == 1
 assert m.bump() == m.bump() - 1
 
+# ── the rest of the object protocol ────────────────────────────────────
+class _Holder:
+    def __init__(self):
+        self.tag = 'original'
+
+holder = _Holder()
+present, missing, has, has_string, entries, deleted = m.object_attrs(holder, 'tag')
+assert present == 1, present
+# The absent lookup reports 0 and leaves no exception behind.
+assert missing == 0, missing
+assert has == 1 and has_string == 0, (has, has_string)
+# PyObject_GenericGetDict is the instance's own __dict__.
+assert entries == 1, entries
+# PyObject_DelAttr removed it, and PyObject_HasAttr agreed.
+assert deleted == 1, deleted
+assert not hasattr(holder, 'tag')
+
+mapping = {'a': 1, 'b': 2}
+(less, same, differs, hashed, ascii_form, formatted,
+ name_count, left_over, subclass) = m.object_values(3, 5, mapping, 'a')
+assert less is True, less
+assert same == 1 and differs == 1, (same, differs)
+assert hashed == 1
+assert ascii_form == '3', ascii_form
+assert formatted == '3', formatted
+assert name_count == len(dir(3)), (name_count, len(dir(3)))
+# PyObject_DelItem removed one of the two keys.
+assert left_over == 1 and mapping == {'b': 2}, (left_over, mapping)
+assert subclass == 1
+
+# PyObject_Bytes: an exact bytes is itself, a buffer is copied, and an
+# iterable of ints is read element by element.
+raw = b'raw'
+assert m.object_bytes(raw) is raw
+assert m.object_bytes(bytearray(b'buf')) == b'buf'
+assert m.object_bytes([1, 2, 3]) == b'\x01\x02\x03'
+assert m.bytes_from(bytearray(b'buf')) == b'buf'
+
+class _Bytes:
+    def __bytes__(self):
+        return b'from-dunder'
+
+# Only PyObject_Bytes consults __bytes__; PyBytes_FromObject does not, and an
+# object with neither a buffer nor an __iter__ has nothing left to convert.
+assert m.object_bytes(_Bytes()) == b'from-dunder'
+try:
+    m.bytes_from(_Bytes())
+except TypeError:
+    pass
+else:
+    raise AssertionError('PyBytes_FromObject consulted __bytes__')
+
+for converter in (m.object_bytes, m.bytes_from):
+    try:
+        converter('text')
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('a str was converted to bytes')
+
+# The object allocator: contents survive a realloc, a calloc is zeroed, and a
+# wrapping product is refused.
+assert m.object_blocks() == (1, 1, 1), m.object_blocks()
+
+# ── the int conversions ────────────────────────────────────────────────
+(from_small, from_wide, narrow, wide, overflow, too_big, needed,
+ restored, unsigned_restored, digit_bits) = m.int_convert(1 << 200)
+assert from_small == -7, from_small
+# An unsigned value above the signed range is a positive int, not an overflow.
+assert from_wide == (1 << 64) - 1, from_wide
+assert narrow == -7 and wide == (1 << 64) - 1, (narrow, wide)
+# -7 fits a C long, so no overflow was reported; 1 << 200 does not.
+assert overflow == 0, overflow
+assert too_big == 1, too_big
+# -7 needs one byte, and the eight written spell it in both readings.
+assert needed == 1, needed
+assert restored == -7, restored
+assert unsigned_restored == (1 << 64) - 7, unsigned_restored
+assert digit_bits == sys.int_info.bits_per_digit, (digit_bits, sys.int_info)
+
 print('cpyext-methods-ok')
 "#;
 
