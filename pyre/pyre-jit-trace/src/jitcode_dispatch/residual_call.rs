@@ -5281,7 +5281,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.pyre_helper,
             majit_ir::PyreHelperKind::StoreName | majit_ir::PyreHelperKind::StoreGlobal
         )
-        && !jitcode_has_exception_handler(code)
+        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2))
@@ -6619,7 +6619,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // its 4x pypy gate, and four benches' jit-stats move (most visibly
     // `exception_reraise_tb_depth_hot`, `loops_aborted 0 -> 63`).
     //
-    // The scan is whole-body, so one `try` anywhere in a module also charges
+    // The gate is whole-body, so one `try` anywhere in a module also charges
     // every name access in it a live dict lookup (~83ns each, linear in the
     // count).  Measured on a 200k-iteration
     // `bench/synth/exc_info_module_loop_hot`, folding it is worth 1.87us ->
@@ -6627,7 +6627,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // sits under this box's noise floor.
     if ctx.is_authoritative_executor
         && ei.pyre_helper == majit_ir::PyreHelperKind::LoadName
-        && !jitcode_has_exception_handler(code)
+        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (

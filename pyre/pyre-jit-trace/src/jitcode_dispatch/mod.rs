@@ -1070,7 +1070,7 @@ fn finish_current_frame_execution<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sy
     }
 }
 
-fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
+fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opcode_position: usize,
 ) -> bool {
@@ -1080,7 +1080,7 @@ fn recording_instruction_is_bare_reraise<Sym: WalkSym>(
         ctx.inline_callee_consts
             .map_or(-1, |consts| consts.jitcode_index)
     };
-    crate::state::jitcode_pc_is_bare_reraise(jitcode_index, opcode_position as i32)
+    crate::state::jitcode_pc_raise_keeps_existing_traceback(jitcode_index, opcode_position as i32)
 }
 
 /// The frame identity, code object and instruction coordinate one
@@ -3336,7 +3336,7 @@ pub fn walk<Sym: WalkSym>(
                 if ctx.is_top_level {
                     let recording_opcode_position =
                         ctx.session.borrow().recording_opcode_position;
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         // Emit at runtime too, not only for the recording pass.
                         // Leaving the node to the interpreter holds only for a
                         // trace the interpreter entered: `CALL_ASSEMBLER` enters
@@ -3395,7 +3395,7 @@ pub fn walk<Sym: WalkSym>(
                     // the trace bridges and guard failures for no gain.  The
                     // publish above has already settled `last_instr`, which the
                     // recorder falls back to.
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         record_top_level_application_traceback(
                             ctx,
                             exc,
@@ -3417,7 +3417,7 @@ pub fn walk<Sym: WalkSym>(
                     fbw_terminate_with_raise(exc, exc_concrete);
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
-                    if !recording_instruction_is_bare_reraise(ctx, opcode_position) {
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
                         // Emit the node at runtime as well as applying it for
                         // the recording pass, for the same reason the top-level
                         // arm above does — here because an inlined callee has
@@ -4954,13 +4954,31 @@ fn funcptr_concrete_int<Sym: WalkSym>(
     }
 }
 
-/// Returns `true` when the jitcode body contains any `catch_exception/L`
-/// op — i.e. the source function has a `try`/`except` handler.  Used by
-/// the residual-call fast paths that conservatively decline a handler-
-/// bearing body to the generic walk (which resumes a `GUARD_NO_EXCEPTION`
-/// deopt into the handler correctly) rather than to their concrete fold.
-fn jitcode_has_exception_handler(code: &[u8]) -> bool {
-    crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+/// Returns `true` when the body being walked has a Python `try`/`except`
+/// handler.  Used by the residual-call fast paths that conservatively decline
+/// a handler-bearing body to the generic walk (which resumes a
+/// `GUARD_NO_EXCEPTION` deopt into the handler correctly) rather than to their
+/// concrete fold.
+///
+/// The question is about the source function, so it reads `co_exceptiontable`.
+/// Scanning the jitcode for `catch_exception` ops answers a different one: the
+/// codewriter also emits that op for can-raise sites it routes itself — the
+/// FOR_ITER exception-match arm emits one at every `for` loop — and those have
+/// no Python handler for a deopt to resume into.  Falls back to the scan when
+/// the walk's jitcode index resolves to no `CodeObject`.
+fn walk_body_has_exception_handler<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+) -> bool {
+    let jitcode_index = if ctx.is_top_level {
+        ctx.session.borrow().recording_jitcode_index
+    } else {
+        ctx.inline_callee_consts
+            .map_or(-1, |consts| consts.jitcode_index)
+    };
+    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
+        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+    })
 }
 
 /// Maps a freshly-boxed `W_Bool` opref (the `jit_bool_value_from_truth(t)`
@@ -11494,7 +11512,7 @@ fn handle<Sym: WalkSym>(
             ctx.last_exc_value_concrete = concrete_exc;
             ctx.fbw_mode.class_of_last_exc_is_const = true;
             let freshly_normalized = fbw_built_exc_take(exc);
-            if !recording_instruction_is_bare_reraise(ctx, op.pc) {
+            if !recording_raise_keeps_existing_traceback(ctx, op.pc) {
                 let caught_in_frame = try_catch_exception_at(code, op.next_pc).is_some();
                 if caught_in_frame {
                     // Unless this walk built the exception it may already

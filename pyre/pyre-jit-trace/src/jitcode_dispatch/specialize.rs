@@ -11888,7 +11888,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         // view of the field either way, and reusing its OpRef keeps the
         // save/store/restore triple balanced.
         let seed_answers_this_read = ctx.fbw_mode.current_exception_seed_from_walk_store
-            || super::recording_instruction_is_bare_reraise(ctx, op.pc);
+            || super::recording_raise_keeps_existing_traceback(ctx, op.pc);
         let (prev, prev_obj) = if let Some(seed) = ctx
             .fbw_mode
             .current_exception_seed

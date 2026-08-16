@@ -1239,10 +1239,26 @@ pub fn on_live_marker(
     clear_dead_ref_registers_at_live_marker(bh, marker_pc);
 }
 
-/// Whether a JitCode exception exit came from the Python bare-reraise
-/// instruction path. `RAISE_VARARGS 0` and `RERAISE` both use
-/// RaiseWithExplicitTraceback and skip record_application_traceback.
-pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
+/// Whether an exception exit emitted for the Python instruction at `py_pc`
+/// re-raises a value that already carries this frame's traceback node, so
+/// `record_application_traceback` must be skipped.
+///
+/// `RAISE_VARARGS 0` and `RERAISE` both use RaiseWithExplicitTraceback.
+/// FOR_ITER's exception-match mismatch arm re-raises the value its own
+/// `catch_exception` caught — `pyopcode.py:1310` re-raises `e` untouched —
+/// and this frame's node was already recorded when the `space.next` residual
+/// raised into the catch.
+pub fn raise_at_py_pc_keeps_existing_traceback(raw_code: &CodeObject, py_pc: usize) -> bool {
+    match unsafe { pyre_interpreter::decode_instruction_at(raw_code, py_pc) } {
+        Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
+        Some((Instruction::Reraise { .. }, _)) | Some((Instruction::ForIter { .. }, _)) => true,
+        _ => false,
+    }
+}
+
+/// [`raise_at_py_pc_keeps_existing_traceback`] resolved from a jitcode
+/// coordinate.
+pub fn jitcode_pc_raise_keeps_existing_traceback(jitcode_index: i32, offset: i32) -> bool {
     let Some(raw_code) = raw_code_for_jitcode_index(jitcode_index) else {
         return false;
     };
@@ -1251,11 +1267,19 @@ pub fn jitcode_pc_is_bare_reraise(jitcode_index: i32, offset: i32) -> bool {
     else {
         return false;
     };
-    match unsafe { pyre_interpreter::decode_instruction_at(&*raw_code, py_pc as usize) } {
-        Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
-        Some((Instruction::Reraise { .. }, _)) => true,
-        _ => false,
-    }
+    raise_at_py_pc_keeps_existing_traceback(unsafe { &*raw_code }, py_pc as usize)
+}
+
+/// Whether the source function behind `jitcode_index` carries a Python
+/// `try`/`except` handler, read from `co_exceptiontable` (`pycode.py:145`) —
+/// the same table the codewriter's `decode_exception_catch_sites` builds its
+/// `catch_for_pc` map from.
+///
+/// `None` when the index resolves to no `CodeObject`: a native drain portal
+/// carries a null `code_ptr`.
+pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> {
+    let raw_code = raw_code_for_jitcode_index(jitcode_index)?;
+    Some(!unsafe { &*raw_code }.exceptiontable.is_empty())
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`

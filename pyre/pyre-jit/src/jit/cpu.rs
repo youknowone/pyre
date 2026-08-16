@@ -256,6 +256,9 @@ pub struct Cpu {
     /// GuardNonnull catches it), or publishes a real exception into the
     /// backend exception cells on error.
     pub for_iter_next_fn: extern "C" fn(i64) -> i64,
+    /// MRO-aware Python exception match used by the FOR_ITER catch arm.
+    /// Returns a raw bool-as-int and cannot raise.
+    pub for_iter_exception_match_fn: extern "C" fn(i64, i64) -> i64,
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
     pub unary_negative_fn: extern "C" fn(i64) -> i64,
@@ -515,6 +518,7 @@ impl Cpu {
             set_function_attribute_fn: pyre_interpreter::runtime_ops::jit_set_function_attribute,
             get_iter_fn: crate::call_jit::bh_get_iter_fn,
             for_iter_next_fn: pyre_interpreter::runtime_ops::jit_next,
+            for_iter_exception_match_fn: pyre_interpreter::runtime_ops::jit_exception_match,
             unary_negative_fn: crate::call_jit::bh_unary_negative_fn,
             unary_invert_fn: crate::call_jit::bh_unary_invert_fn,
             unary_positive_fn: crate::call_jit::bh_unary_positive_fn,

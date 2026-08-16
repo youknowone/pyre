@@ -577,7 +577,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 // holding whatever its entry wrote, and a `tb_frame.f_locals`
                 // or `sys._getframe()` on the way out reads every
                 // post-entry local as unbound.
-                if !recording_instruction_is_bare_reraise(&mut wc, position) {
+                if !recording_raise_keeps_existing_traceback(&mut wc, position) {
                     record_top_level_application_traceback(
                         &mut wc,
                         seed.exc,
