@@ -947,14 +947,25 @@ Polarity below follows this file's rule, with one correction it needed: an
 **OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
 `PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
 
-### §6a — Live default-ON (4): the removal targets
+### §6a — Live default-ON (5): the removal targets
 
 | gate | what is ON by default | retire when |
 |---|---|---|
 | PYRE_JD1 | the jd1 compiled-loop experiment (`eval.rs jd1_experiment_enabled`); `PYRE_NO_JD1` or `PYRE_JD1=0` turns it off, and no-JIT implies off | the jd1 experiment concludes |
 | PYRE_JD1_NO_ENTER | entering the compiled jd1 loop directly rather than leaving the drain to the interpreter caller | with `PYRE_JD1` |
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
+| PYRE_WASM_BRIDGE_PARAMS | a wasm guard passing its fail args to the bridge as call parameters (`lib.rs bridge_params_enabled`); `=0`/`false`/`off` restores the jitframe spill crossing | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
+
+### §6a2 — Default-OFF experiments (2): the wasm re-emission A/Bs
+
+Both are measured to lose today and are kept as the switched-off arm of a
+one-binary comparison, not as latent defaults.
+
+| gate | what turning it ON does | retire when |
+|---|---|---|
+| PYRE_WASM_INLINE_BRIDGE | merges a bridge's ops into the loop module that guards into it, so `guard → bridge → loop` becomes a `br` | the wasm trace-crossing epic closes, or the shape is measured to win |
+| PYRE_WASM_REEMIT | re-emits a compiled loop's wasm module into its own table slot, which is what lets an inlined bridge reach live code | with `PYRE_WASM_INLINE_BRIDGE` |
 
 ### §6b — VALUE knobs (12): config, not gates
 
@@ -974,7 +985,7 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (65): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (66): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -1004,7 +1015,8 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
-`PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`.
+`PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`,
+`PYRE_WASM_TRACE_ENTRY_CENSUS`.
 
 `PYRE_ALLOCSITES` enables stack attribution in the standalone `allocsites`
 example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
@@ -1052,8 +1064,8 @@ input.
 | retired (§1 + §1b + §1c + §1d parity pass) | 5 + 4 + 17 + 1 |
 | not gates (identifiers) | 12 |
 | dead (no read site) | 10 |
-| live default-ON, kept until epic closes | 6 |
-| diagnostics (OFF) | ~34 |
-| default-OFF experiments | 0 |
+| live default-ON, kept until epic closes | 7 |
+| diagnostics (OFF) | ~35 |
+| default-OFF experiments | 2 |
 | config / value / master | ~17 |
 | test harness | 1 |

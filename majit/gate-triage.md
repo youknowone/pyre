@@ -371,6 +371,13 @@ Each entry records its reader, purpose, and retirement condition. `UNRECORDED` m
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_TRACE_ENTRY_CENSUS`
+
+- Read sites: 1 — `majit/majit-backend-wasm/src/lib.rs`
+- Accessor: `trace_entry_census_enabled()`; the wasm guest has no environment, so a host arms the same facility through `trace_entry_census_force()`
+- What it does: Counts entries into each emitted trace module per resume key, so a steady state can be attributed to the module and dispatch key it re-enters.
+- Retirement condition: Remove when the wasm trace-crossing epic closes and per-key entry counts are no longer the way that budget is attributed.
+
 ### `MAJIT_VERIFY`
 
 - Read sites: 1 — `majit/majit-backend-cranelift/src/compiler.rs`
