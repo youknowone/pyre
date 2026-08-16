@@ -1203,15 +1203,16 @@ JITSTATS_STABILITY_RUNS = 2
 
 
 def _jit_stats_change(saved, current, bands=None):
-    """Return `(regressions, improvements)`, each a list of "field a -> b".
+    """Return `(regressions, improvements, banded)` change descriptions.
 
     Both directions gate: a rise means the JIT started aborting traces, hitting
     internal compile panics or failing guards it did not before, and a fall
     means it stopped compiling something it used to compile. Neither may pass
     unrecorded — see the surface comment above.
 
-    A band suppresses an integer-valued move at or below its symmetric width,
-    whether that move is a regression or an improvement. It cannot suppress a
+    A band reclassifies an integer-valued move at or below its symmetric width,
+    whether that move would be a regression or an improvement. The move is
+    reported in `banded` rather than hidden. A band cannot reclassify a
     non-integer value or a move outside the band, and the fixture parser rejects
     bands on badness counters whose healthy value must remain exactly zero.
 
@@ -1226,7 +1227,7 @@ def _jit_stats_change(saved, current, bands=None):
     bands = bands or {}
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
-    regressions, improvements = [], []
+    regressions, improvements, banded = [], [], []
     for field in JITSTATS_SNAPSHOT_FIELDS:
         old, new = old_fields.get(field, "0"), new_fields.get(field, "0")
         if old == new:
@@ -1238,6 +1239,9 @@ def _jit_stats_change(saved, current, bands=None):
             rose = None
         else:
             if field in bands and abs(new_int - old_int) <= bands[field]:
+                banded.append(
+                    f"{field} {old} -> {new} (within band {bands[field]})"
+                )
                 continue
             rose = new_int > old_int
         if rose is not None and (
@@ -1247,7 +1251,7 @@ def _jit_stats_change(saved, current, bands=None):
             improvements.append(f"{field} {old} -> {new}")
         else:
             regressions.append(f"{field} {old} -> {new}")
-    return regressions, improvements
+    return regressions, improvements, banded
 
 
 def _jit_stats_vacuous(stderr):
@@ -1486,10 +1490,12 @@ def synth_jitstats_bands(path):
         # pyre-check: jitstats-band=guard_failures=8
 
     The band is symmetric around the recorded baseline and absorbs moves in
-    both directions: a delta smaller than the band is not signal either way.
-    It is only for schedule-sensitive counters; badness counters must remain
-    exactly zero. The directive must be followed by a comment describing the
-    measured variance, so the allowance is reviewable next to the workload.
+    both directions: a delta within the band is not signal either way. An
+    absorbed move is reported on that run rather than swallowed, so the
+    allowance is visible whenever it is used and not only in the fixture
+    header. It is only for schedule-sensitive counters; badness counters must
+    remain exactly zero. The directive must be followed by a comment describing
+    the measured variance, so the allowance is reviewable next to the workload.
     Unknown or duplicate fields and non-positive or non-integer widths are
     errors rather than silent no-ops. A directive below the 20-line window is
     simply not read, so the fixture gates normally in that case.
@@ -1755,6 +1761,9 @@ class Check:
         # Benches whose counters did not reproduce across repeats in this same
         # invocation. Reported, never failed — see JITSTATS_STABILITY_RUNS.
         self.jitstats_unstable = []
+        # Benches whose gated counters moved only inside a declared per-fixture
+        # band. Reported, never failed.
+        self.jitstats_banded = []
         self.jitstats_missing = []
         # Benches whose run printed no `[jit-stats]` line at all. Tracked apart
         # from `jitstats_missing` because the two say opposite things: a missing
@@ -2039,7 +2048,7 @@ class Check:
             if vacuous:
                 self.jitstats_vacuous.append(f"{backend}/{name}")
                 return "fail", vacuous
-            regressions, improvements = _jit_stats_change(
+            regressions, improvements, banded = _jit_stats_change(
                 jitstats_path.read_text(encoding="utf-8"), jitstats, jitstats_bands
             )
             if regressions or improvements:
@@ -2066,6 +2075,8 @@ class Check:
                     parts.append("regressed: " + ", ".join(regressions))
                 if improvements:
                     parts.append("improved: " + ", ".join(improvements))
+                if banded:
+                    parts.append("within band: " + ", ".join(banded))
                 reason = (
                     "jit-stats change — " + "; ".join(parts)
                     + _jit_stats_context(jitstats)
@@ -2077,6 +2088,12 @@ class Check:
                     return "regressed", reason
                 self.jitstats_improvements.append(f"{backend}/{name}")
                 return "improved", reason
+            if banded:
+                self.jitstats_banded.append(f"{backend}/{name}")
+                return "banded", (
+                    "jit-stats within band — " + ", ".join(banded)
+                    + _jit_stats_context(jitstats)
+                )
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2750,10 +2767,11 @@ class Check:
             backend, name, script, output, stderr, elapsed, timeout,
         )
         if snap_status != "ok":
-            if snap_status == "unstable":
-                # Warned, not failed: the counter did not reproduce itself in
-                # this invocation, so there is nothing to gate on.
-                unstable_line = f"{yellow('UNSTABLE')}  {snap_reason}"
+            if snap_status in ("unstable", "banded"):
+                # Warned, not failed: unstable counters cannot be gated, while
+                # banded counters stayed inside their declared allowance.
+                note_label = snap_status.upper()
+                note_line = f"{yellow(note_label)}  {snap_reason}"
             else:
                 # `improved` is still a failure; the label only tells the
                 # reader whether to investigate or just re-record.
@@ -2762,9 +2780,9 @@ class Check:
                 failures.append(
                     (f"{paint(label)}  {snap_reason}", snap_reason, label, None)
                 )
-                unstable_line = None
+                note_line = None
         else:
-            unstable_line = None
+            note_line = None
 
         if failures:
             self._record(
@@ -2773,8 +2791,8 @@ class Check:
             )
             for index, (line, _, _, _) in enumerate(failures):
                 print(f"{' ' * 14 if index else ''}{line}")
-            if unstable_line is not None:
-                print(f"{' ' * 14}{unstable_line}")
+            if note_line is not None:
+                print(f"{' ' * 14}{note_line}")
             _, _, comparison_cell, comparison_note = failures[0]
             self._append_comparison(
                 backend, name, t_cpython, t_pypy,
@@ -2782,10 +2800,10 @@ class Check:
             )
             return
 
-        if unstable_line is not None:
+        if note_line is not None:
             self._record(backend, True, name, f"{elapsed:.2f}s")
-            print(unstable_line)
-            self._append_comparison(backend, name, t_cpython, t_pypy, "UNSTABLE")
+            print(note_line)
+            self._append_comparison(backend, name, t_cpython, t_pypy, note_label)
             return
 
         self._record(backend, True, name, f"{elapsed:.2f}s")
@@ -3257,6 +3275,7 @@ class Check:
                 (red, "jit-stats regressed", self.jitstats_diffs),
                 (yellow, "jit-stats improved (re-record)", self.jitstats_improvements),
                 (yellow, "jit-stats unstable (not gated)", self.jitstats_unstable),
+                (yellow, "jit-stats within band (not gated)", self.jitstats_banded),
                 (red, "jit-stats baseline missing", self.jitstats_missing),
                 (red, "jit-stats line absent", self.jitstats_absent),
                 (red, "jit-stats census vacuous", self.jitstats_vacuous),
