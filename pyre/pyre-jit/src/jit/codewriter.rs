@@ -4932,8 +4932,12 @@ fn filter_liveness_in_place(
     // Same pre-merge stream, same rewrite.  `compute_liveness` DELETES repeated
     // `-live-` ops, so an unremapped position does not merely drift, it can
     // address past the shortened stream and trip
-    // `insn_pos_to_byte_offset`'s range check.  Collapsing two runs onto one
-    // position is expected here and is deduped when the byte table is built.
+    // `insn_pos_to_byte_offset`'s range check.  The rewrite cannot collapse two
+    // of these onto one position: the merge is many-to-one only over the
+    // `-live-` positions it folds together, every other index takes its own
+    // fresh slot, and a run start is never a `-live-` op.  So the remapped
+    // positions stay strictly increasing, which is what keeps the byte-offset
+    // table below one entry per emission run.
     for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
         *pos = remap[*pos];
     }
@@ -14788,7 +14792,12 @@ impl CodeWriter {
                 Some((off, u32::try_from(*py_pc).ok()?))
             })
             .collect();
-        abort_permanent_py_pc_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+        // Every marker emits its own opcode byte, so two of them never land on
+        // one offset and the dedup is a no-op.  The sort key is still the whole
+        // entry: keying on `off` alone would leave a tie in an unspecified
+        // order, and an unspecified order is what turns a broken invariant into
+        // an arbitrary owner rather than a visible one.
+        abort_permanent_py_pc_by_jit_pc.sort_unstable_by_key(|&(off, py)| (off, py));
         abort_permanent_py_pc_by_jit_pc.dedup_by_key(|&mut (off, _)| off);
         // Exact jitcode-offset -> owning-Python-PC segmentation, one entry per
         // contiguous emission run.  Unlike `py_floor_by_jit_pc` below this is
@@ -14796,18 +14805,44 @@ impl CodeWriter {
         // two disjoint regions keeps both, and the byte range between two
         // consecutive entries is exactly one opcode's emission.
         let pc_run_base = abort_permanent_base + abort_permanent_some.len();
-        let mut py_exact_by_jit_pc: Vec<(u32, u32)> = pc_run_some
+        // `(offset, emission index, py_pc)`.  The emission index is carried
+        // into the sort key because the run order is what decides the owner
+        // below, and it is NOT recoverable from the py_pc: a run that opens a
+        // lower PC than the one before it is exactly what this table exists to
+        // record.  The floor tier can only break a tie by py magnitude — its
+        // source is a py-indexed first-offset table that has no run order in it
+        // at all — so the two tiers do not share a tie rule.
+        let mut pc_runs: Vec<(u32, u32, u32)> = pc_run_some
             .iter()
             .enumerate()
             .filter_map(|(k, (_, py_pc))| {
                 let off = u32::try_from(combined_bytes[pc_run_base + k]).ok()?;
-                Some((off, u32::try_from(*py_pc).ok()?))
+                Some((off, u32::try_from(k).ok()?, u32::try_from(*py_pc).ok()?))
             })
             .collect();
-        py_exact_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-        // A marker splice can land two runs on one offset; the later-emitted
-        // one owns it, matching the floor tier's later-py-wins tie break.
-        py_exact_by_jit_pc.dedup_by_key(|&mut (off, _)| off);
+        pc_runs.sort_unstable_by_key(|&(off, k, _)| (off, k));
+        // Two runs on one offset would mean the earlier one emitted no bytes,
+        // so the later-emitted run owns them.  `dedup_by_key` cannot say that —
+        // it keeps the FIRST entry of each run — hence the explicit collapse.
+        //
+        // The collapse is unreachable as the tree stands, and the assert is
+        // what keeps it that way: a run start always addresses a non-`-live-`
+        // op, every one of those emits at least one byte, the `-live-` merge is
+        // many-to-one only over the positions it folds, and the marker splices
+        // only insert.  A future pass that deletes an ordinary op, or an
+        // encoder arm that emits nothing, breaks that chain — loudly here
+        // rather than silently in the walk mirror's coordinate.
+        debug_assert!(
+            pc_runs.windows(2).all(|w| w[0].0 != w[1].0),
+            "pc-run starts must land on distinct jitcode offsets: {pc_runs:?}"
+        );
+        let mut py_exact_by_jit_pc: Vec<(u32, u32)> = Vec::with_capacity(pc_runs.len());
+        for (off, _, py) in pc_runs {
+            match py_exact_by_jit_pc.last_mut() {
+                Some((last_off, last_py)) if *last_off == off => *last_py = py,
+                _ => py_exact_by_jit_pc.push((off, py)),
+            }
+        }
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
         let mut first_jit_pc_by_py_pc: Vec<usize> = vec![usize::MAX; pc_map.len()];
