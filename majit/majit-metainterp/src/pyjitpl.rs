@@ -363,8 +363,8 @@ impl StoredExitLayout {
             is_exception_exit: self.resolve_is_exception_exit(),
             gc_ref_slots: self.gc_ref_slots.clone(),
             force_token_slots: self.force_token_slots.clone(),
-            recovery_layout: self.recovery_layout.clone(),
-            resume_layout: self.resume_layout.clone(),
+            recovery_layout: self.recovery_layout.clone().map(Box::new),
+            resume_layout: self.resume_layout.clone().map(Box::new),
             storage: self.storage.clone(),
         }
     }
@@ -2842,7 +2842,7 @@ impl<M: Clone> MetaInterp<M> {
                     is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout,
+                    recovery_layout: layout.recovery_layout.map(Box::new),
                     resume_layout: None,
                     storage,
                 }
@@ -2867,7 +2867,7 @@ impl<M: Clone> MetaInterp<M> {
                 is_exception_exit: layout.is_exception_exit,
                 gc_ref_slots: layout.gc_ref_slots,
                 force_token_slots: layout.force_token_slots,
-                recovery_layout: layout.recovery_layout,
+                recovery_layout: layout.recovery_layout.map(Box::new),
                 resume_layout: None,
                 storage: None,
             })
@@ -2914,7 +2914,7 @@ impl<M: Clone> MetaInterp<M> {
                         is_exception_exit: layout.is_exception_exit,
                         gc_ref_slots: layout.gc_ref_slots,
                         force_token_slots: layout.force_token_slots,
-                        recovery_layout: layout.recovery_layout,
+                        recovery_layout: layout.recovery_layout.map(Box::new),
                         resume_layout: merged
                             .get(&layout.fail_index)
                             .and_then(|existing| existing.resume_layout.clone()),
@@ -2970,7 +2970,7 @@ impl<M: Clone> MetaInterp<M> {
                             is_exception_exit: layout.is_exception_exit,
                             gc_ref_slots: layout.gc_ref_slots,
                             force_token_slots: layout.force_token_slots,
-                            recovery_layout: layout.recovery_layout,
+                            recovery_layout: layout.recovery_layout.map(Box::new),
                             resume_layout: merged
                                 .get(&layout.op_index)
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
@@ -10220,7 +10220,7 @@ impl<M: Clone> MetaInterp<M> {
                 let trace_layout_ref = trace_layout.as_ref();
                 let mut resume_layout = trace_layout
                     .as_ref()
-                    .and_then(|tl| tl.resume_layout.clone());
+                    .and_then(|tl| tl.resume_layout.as_deref().cloned());
                 compile::enrich_resume_layout_with_frame_stack(
                     &mut resume_layout,
                     layout.frame_stack.as_deref(),
@@ -10237,10 +10237,10 @@ impl<M: Clone> MetaInterp<M> {
                     is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
-                    recovery_layout: layout.recovery_layout.or_else(|| {
+                    recovery_layout: layout.recovery_layout.map(Box::new).or_else(|| {
                         trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
                     }),
-                    resume_layout,
+                    resume_layout: resume_layout.map(Box::new),
                     storage: trace_layout_ref.and_then(|layout| layout.storage.clone()),
                 }
             })
@@ -12014,7 +12014,7 @@ impl<M: Clone> MetaInterp<M> {
             self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)?;
         Some(Self::recovery_slot_types_from_exit_types_and_layout(
             &exit_layout.exit_types,
-            exit_layout.recovery_layout.as_ref(),
+            exit_layout.recovery_layout.as_deref(),
         ))
     }
 
@@ -12105,7 +12105,7 @@ impl<M: Clone> MetaInterp<M> {
             storage,
             Self::recovery_slot_types_from_exit_types_and_layout(
                 &layout.exit_types,
-                layout.recovery_layout.as_ref(),
+                layout.recovery_layout.as_deref(),
             ),
         ))
     }
@@ -13988,7 +13988,7 @@ impl<M: Clone> MetaInterp<M> {
             .resume_layout
             .as_ref()
             .map(|layout| layout.reconstruct_state(fail_values));
-        let resume_layout = exit_layout.resume_layout.clone();
+        let resume_layout = exit_layout.resume_layout.as_deref().cloned();
         let reconstructed = reconstructed_state
             .as_ref()
             .map(|state| state.frames.clone());

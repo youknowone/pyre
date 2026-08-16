@@ -177,8 +177,22 @@ pub struct CompiledExitLayout {
     pub is_exception_exit: bool,
     pub gc_ref_slots: Vec<usize>,
     pub force_token_slots: Vec<usize>,
-    pub recovery_layout: Option<ExitRecoveryLayout>,
-    pub resume_layout: Option<ResumeLayoutSummary>,
+    /// Held behind a pointer, not inline. Both this and [`Self::resume_layout`]
+    /// describe how to REBUILD interpreter state after a guard failed, so both
+    /// are `None` on the two exits the steady path actually takes — a FINISH
+    /// and a loop-carried JUMP. Held inline they added 120 and 176 bytes to a
+    /// struct that is 120 bytes without them, and this layout is in turn a
+    /// field of the [`CompileResult`] every compiled entry returns by value,
+    /// so those 296 bytes were copied on every warm entry to carry two absent
+    /// values.
+    ///
+    /// The indirection costs an allocation only where the layout EXISTS, which
+    /// is the guard-failure arm — already several allocations deep building
+    /// the vectors these hold, and off the steady path by construction. A
+    /// FINISH or JUMP exit stores two null words and allocates nothing, so the
+    /// per-entry allocation count is unchanged.
+    pub recovery_layout: Option<Box<ExitRecoveryLayout>>,
+    pub resume_layout: Option<Box<ResumeLayoutSummary>>,
     /// compile.py:853 `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
