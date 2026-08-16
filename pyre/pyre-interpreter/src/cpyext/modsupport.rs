@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 const PY_MOD_CREATE: c_int = 1;
 /// `Py_mod_exec`.
 const PY_MOD_EXEC: c_int = 2;
+/// `Py_mod_multiple_interpreters`.
+const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
+/// `Py_mod_gil`.
+const PY_MOD_GIL: c_int = 4;
 
 /// The two versions a module may declare: the full API version an extension
 /// built against `Python.h` carries, and the stable-ABI one a limited-API
@@ -335,19 +339,40 @@ pub(super) fn create_module_from_def_and_spec(
     }
     let mut create: *mut c_void = std::ptr::null_mut();
     let mut has_execution_slots = false;
+    // `moduleobject.c:322-343` records each of the two declarations once and
+    // rejects a repeat.  What either one selects is guarded by
+    // `!_Py_IsMainInterpreter` or by the per-interpreter GIL, neither of which
+    // pyre has, so recording is the whole of it here.
+    let mut declared_interpreters = false;
+    let mut declared_gil = false;
     let mut slot = unsafe { (*def).m_slots };
     while !slot.is_null() && unsafe { (*slot).slot } != 0 {
+        let repeated = |what: &str| {
+            Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("module {name} has multiple {what} slots"),
+            ))
+        };
         match unsafe { (*slot).slot } {
             PY_MOD_CREATE => {
                 if !create.is_null() {
-                    return Err(crate::PyError::new(
-                        crate::PyErrorKind::SystemError,
-                        format!("module {name} has multiple create slots"),
-                    ));
+                    return repeated("create");
                 }
                 create = unsafe { (*slot).value };
             }
             PY_MOD_EXEC => has_execution_slots = true,
+            PY_MOD_MULTIPLE_INTERPRETERS => {
+                if declared_interpreters {
+                    return repeated("Py_mod_multiple_interpreters");
+                }
+                declared_interpreters = true;
+            }
+            PY_MOD_GIL => {
+                if declared_gil {
+                    return repeated("Py_mod_gil");
+                }
+                declared_gil = true;
+            }
             other => {
                 return Err(crate::PyError::new(
                     crate::PyErrorKind::SystemError,
