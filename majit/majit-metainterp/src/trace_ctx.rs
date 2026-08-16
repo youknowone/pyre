@@ -2351,6 +2351,30 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
+    /// history.py:809-816 `record_same_as`:
+    ///
+    /// ```python
+    /// def record_same_as(self, box):
+    ///     if box.type == 'i':
+    ///         return self.record1(rop.SAME_AS_I, box, box.getint())
+    ///     elif box.type == 'r':
+    ///         return self.record1(rop.SAME_AS_R, box, box.getref_base())
+    ///     else:
+    ///         assert box.type == 'f'
+    ///         return self.record1(rop.SAME_AS_F, box, box.getfloatstorage())
+    /// ```
+    /// `record1`'s third argument is the value, so the wrapper carries the
+    /// source box's observed value; the closing JUMP's `runtime_boxes` deliver
+    /// it to `_jump_to_existing_trace`'s runtime fallbacks.
+    pub fn record_same_as(&mut self, opref: OpRef, tp: majit_ir::Type) -> OpRef {
+        let value = self.concrete_of_opref(opref);
+        let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
+        if let Some(value) = value {
+            self.try_set_opref_concrete(same_as, value);
+        }
+        same_as
+    }
+
     /// pyjitpl.py:2958-2964 `remove_consts_and_duplicates`:
     ///
     /// ```python
@@ -2394,7 +2418,7 @@ impl TraceCtx {
                 tp == declared || opref.is_constant(),
                 "loop-carried slot declared {declared:?} but its box is {tp:?}",
             );
-            let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
+            let same_as = self.record_same_as(opref, tp);
             *slot = (same_as, declared);
         }
     }
@@ -5567,6 +5591,41 @@ mod tests {
         ctx.remove_consts_and_duplicates(&mut again);
         assert_eq!(again, boxes, "a normalized list is unchanged");
         assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
+    }
+
+    /// history.py:809-816 `record_same_as` carries the source box's value on
+    /// the freshly recorded `SAME_AS` result.
+    #[test]
+    fn remove_consts_and_duplicates_carries_the_source_box_value() {
+        let mut recorder = Trace::new();
+        let b1 = recorder.record_input_arg(Type::Int);
+        let b2 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.set_opref_concrete(b1, majit_ir::Value::Int(7));
+        let c3 = ctx.const_int(3);
+        let mut boxes = [
+            (b1, Type::Int),
+            (b2, Type::Int),
+            (b1, Type::Int),
+            (c3, Type::Int),
+        ];
+
+        ctx.remove_consts_and_duplicates(&mut boxes);
+
+        assert_eq!(
+            ctx.concrete_of_opref(boxes[2].0),
+            Some(Value::Int(7)),
+            "the duplicate's wrapper carries the source box's value"
+        );
+        assert_eq!(
+            ctx.concrete_of_opref(boxes[3].0),
+            Some(Value::Int(3)),
+            "the constant's wrapper carries the constant's value"
+        );
     }
 
     /// vable_getfield_ref cache-hit (pyjitpl.py:939

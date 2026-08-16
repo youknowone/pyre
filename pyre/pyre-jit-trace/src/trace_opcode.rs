@@ -2443,8 +2443,7 @@ impl MIFrame {
                         .get_opref_type(opref)
                         .or_else(|| inputarg_types.get(i).copied())
                         .unwrap_or(majit_ir::Type::Ref);
-                    let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-                    let new_opref = ctx.record_op(same_as_op, &[opref]);
+                    let new_opref = ctx.record_same_as(opref, tp);
                     args[i] = new_opref;
                     dedup_changed.push((i, new_opref));
                 }

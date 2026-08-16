@@ -11841,8 +11841,7 @@ fn handle<Sym: WalkSym>(
                             .trace_ctx
                             .get_opref_type(opref)
                             .unwrap_or(majit_ir::Type::Ref);
-                        let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
-                        let new_opref = ctx.trace_ctx.record_op(same_as_op, &[opref]);
+                        let new_opref = ctx.trace_ctx.record_same_as(opref, tp);
                         live_args[i] = new_opref;
                         // live_args = [frame, ec, vable_boxes[0..len-1]];
                         // frame/ec are first-occurrence runtime boxes and
