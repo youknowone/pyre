@@ -6493,6 +6493,23 @@ impl<M: Clone> MetaInterp<M> {
             .map(|compiled| compiled.front_target_tokens.clone())
             .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
             .unwrap_or_default();
+        // `compile.py:245` / `:290` assign `jitcell_token.target_tokens` a fresh
+        // single-element list, so a token-minting compile carries only its own
+        // labels; only `compile.py:341`'s retrace, which appends to the *same*
+        // token, accumulates labels across compiles. This path mints a new
+        // token, and carrying the prior loop's labels into it is what lets a
+        // close resolve into that loop after it has been invalidated: the
+        // `warmstate.py:191-196` filter guards the token, and the labels arrive
+        // on a fresh one that the filter admits. Apply the same filter here, so
+        // a prior loop lends its labels only while it is still enterable.
+        // Carrying them across a *valid* recompile is the standing adaptation
+        // for a backend that cannot patch a jump in place.
+        let prior_front_target_tokens = if self.warm_state.get_procedure_token(green_key).is_some()
+        {
+            prior_front_target_tokens
+        } else {
+            Vec::new()
+        };
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
