@@ -61,7 +61,7 @@ pub struct W_BufferedWriter {
     write_end: i64,
     readable: bool,
     writable: bool,
-    locked: bool,
+    lock: usize,
 }
 
 impl Default for W_BufferedWriter {
@@ -80,7 +80,7 @@ impl Default for W_BufferedWriter {
             write_end: -1,
             readable: false,
             writable: false,
-            locked: false,
+            lock: 0,
         }
     }
 }
@@ -118,12 +118,11 @@ impl W_BufferedWriter {
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, crate::PyError>,
     ) -> Result<T, crate::PyError> {
-        if self.locked {
+        if !super::acquire_buffered_lock(self.lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
-        self.locked = true;
         let result = body(self);
-        self.locked = false;
+        super::release_buffered_lock(self.lock);
         result
     }
 
@@ -195,6 +194,7 @@ impl W_BufferedWriter {
 
     fn writer_flush_unlocked(&mut self) -> Result<(), crate::PyError> {
         if self.write_end == -1 || self.write_pos == self.write_end {
+            self.writer_reset_buf();
             return Ok(());
         }
         let rewind = self.raw_offset() + (self.pos - self.write_pos);
@@ -231,8 +231,8 @@ impl W_BufferedWriter {
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> Result<i64, crate::PyError> {
-        self.check_closed("write to closed file")?;
         self.with_lock(|this| {
+            this.check_closed("write to closed file")?;
             if !((this.readable && this.read_end != -1) || (this.writable && this.write_end != -1))
             {
                 this.pos = 0;
@@ -366,7 +366,7 @@ impl W_BufferedWriter {
         self.raw_pos = 0;
         self.read_end = -1;
         self.writer_reset_buf();
-        self.locked = false;
+        self.lock = super::allocate_buffered_lock();
         // Unknown rather than asked for, as in `buffered.rs`: `tell` always
         // asks the raw stream and `flush` only adjusts a position it already
         // knows, so construction owes no `lseek`.
@@ -384,6 +384,9 @@ impl W_BufferedWriter {
     }
 
     fn write(&mut self, w_data: PyObjectRef) -> Result<i64, crate::PyError> {
+        // PyPy `BufferedMixin.write_w`: initialization is checked before
+        // acquiring `self.lock` (which does not exist until `__init__`).
+        self.check_init()?;
         let data = input_bytes(w_data)?;
         self.write_bytes(&data)
     }
@@ -481,12 +484,13 @@ impl W_BufferedWriter {
 
     fn close(&mut self) -> Result<(), crate::PyError> {
         self.check_init()?;
-        if self.raw_closed()? {
+        if self.with_lock(|this| this.raw_closed())? {
             return Ok(());
         }
         let self_obj = self.self_obj();
         let flush_error = super::call_method_result(self_obj, "flush", &[]).err();
-        let close_result = super::call_method_result(self.w_raw, "close", &[]);
+        let close_result =
+            self.with_lock(|this| super::call_method_result(this.w_raw, "close", &[]).map(|_| ()));
         if let Err(mut close_error) = close_result {
             if let Some(mut flush_error) = flush_error {
                 let _roots = pyre_object::gc_roots::push_roots();

@@ -4628,6 +4628,41 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     if !majit_gc::can_move(majit_ir::GcRef(ns_ptr)) {
         return;
     }
+
+    // `pyframe.py:128-132 LOAD_GLOBAL` asks the current MIFrame for
+    // `self.get_w_globals()`.  An inline sub-walk therefore has to source the
+    // namespace through that level's own frame red, just as `setup_call`
+    // installs one frame per inlined call in `pyjitpl.py:1862-1874`.  The
+    // metainterp-wide virtualizable boxes below belong only to the portal/root
+    // frame; substituting their namespace here collapses caller and callee
+    // identity and makes a cross-module callee execute LOAD_GLOBAL against the
+    // caller's globals.
+    if let Some(consts) = ctx.inline_callee_consts {
+        let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+            return;
+        };
+        let Some(frame) = ctx
+            .registers_r
+            .get(jitcode.metadata.portal_frame_reg as usize)
+            .copied()
+            .filter(|frame| !frame.is_none())
+        else {
+            // The old single-frame inline path has no callee red to read.  Do
+            // not borrow the root frame: the residual's unbound callee-frame
+            // argument will decline this trace instead of compiling the wrong
+            // namespace.
+            return;
+        };
+        let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
+        // Recording-time residual execution needs the same concrete shadow;
+        // the compiled value remains the GETFIELD_GC_R result above and is
+        // therefore still sourced from the live callee frame.
+        ctx.trace_ctx
+            .try_set_opref_concrete(w_globals, Value::Ref(majit_ir::GcRef(consts.w_globals)));
+        *ns_box = w_globals;
+        return;
+    }
+
     if let Some(w_globals_op) = ctx
         .trace_ctx
         .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
@@ -6314,8 +6349,10 @@ pub(crate) struct MidBodyPayload {
     /// abort.  The rebuild is preferred, but it can still decline at the flush
     /// (an unsourceable outer local, a handler-bearing body); dropping to the
     /// legacy replay there would re-open the double-apply this carrier family
-    /// exists to close, so the entry rewind stands behind it.  `None` when the
-    /// entry latch's own gate refused.
+    /// exists to close, so the entry rewind stands behind it.  An effectful
+    /// loop-header handoff may also attach this only to source caller operands
+    /// below an expression-position CALL; its pre-effect odometer deliberately
+    /// keeps the entry rewind disabled.
     pub entry_fallback: Option<EntryFallback>,
 }
 
@@ -6470,6 +6507,13 @@ pub(crate) fn floor_segment_ops_before(
 /// and `live_locals` out of `concrete_registers_r` by color.  A clobbered color
 /// would be read back as a live value.
 ///
+/// A registered trace-entry marker may sit inside the preceding floor segment:
+/// `merge_entry_by_green` deliberately points at the block-head marker, while
+/// `py_floor_by_jit_pc` continues to describe the containing opcode.  Admit
+/// that seam only for an exact `(py_pc, jit_pc)` trace entry and only when the
+/// whole prefix still passes the own-frame bookkeeping whitelist below.  The
+/// rebuilt frame discards those stores just like same-floor spills.
+///
 /// Anything else, or a write aimed at another frame, declines.
 fn portal_vable_bookkeeping_anchor(
     metadata: &crate::PyJitCodeMetadata,
@@ -6484,6 +6528,11 @@ fn portal_vable_bookkeeping_anchor(
     if exact_floor_segment_anchor(metadata, py_pc, jit_pc) {
         return true;
     }
+    let is_trace_entry_marker = metadata
+        .merge_entry_by_green
+        .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+        .ok()
+        .is_some_and(|i| metadata.merge_entry_by_green[i].1 as usize == jit_pc);
     if !built_as_portal || portal_frame_reg > u8::MAX as u16 {
         return false;
     }
@@ -6492,7 +6541,7 @@ fn portal_vable_bookkeeping_anchor(
     else {
         return false;
     };
-    if floor_py_pc as usize != py_pc || pc >= jit_pc {
+    if (floor_py_pc as usize != py_pc && !is_trace_entry_marker) || pc >= jit_pc {
         return false;
     }
     while pc < jit_pc {
@@ -6500,7 +6549,7 @@ fn portal_vable_bookkeeping_anchor(
             return false;
         };
         if op.next_pc > jit_pc
-            || python_pc_for_op(op.pc) != py_pc
+            || (!is_trace_entry_marker && python_pc_for_op(op.pc) != py_pc)
             || code.get(op.pc + 1).copied() != Some(portal_frame_reg as u8)
         {
             return false;

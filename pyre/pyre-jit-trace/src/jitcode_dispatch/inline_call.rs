@@ -1512,6 +1512,62 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     Some(stack)
 }
 
+/// Reconstruct the caller's complete operand stack at a CALL from the same
+/// per-frame sources used by multi-frame resume data.
+///
+/// `reconstructed_all_ref_call_stack` is the cheap residual-operand path, but
+/// a CALL under `with` can retain context-manager operands below it after the
+/// simple vstack mirror became unavailable.  RPython copies the complete
+/// caller MIFrame register bank.  `collect_call_stack_overrides` is pyre's
+/// existing equivalent: vstack first, then the CALL-PC color map, then this
+/// frame's virtualizable shadow.  Preserve typed `ConstPtr(NULL)` values and
+/// name an otherwise boxless null-or-self slot from the CALL layout.  Require
+/// a value for every stack slot before publishing the ordered image.
+fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*sym_ptr };
+    let jc = unsafe { sym.jitcode().as_ref()? };
+    let depth = jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc)? as usize;
+    let nlocals = sym.nlocals();
+    let Some(overrides) = collect_call_stack_overrides(sym, ctx, call_jitcode_pc) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort-flush] resume stack source declined: call_jit_pc={call_jitcode_pc} \
+                 depth={depth} vstack_valid={} vstack_depth={} vstack_len={}",
+                ctx.vstack_valid,
+                ctx.vstack_depth,
+                ctx.vstack_boxes.len(),
+            );
+        }
+        return None;
+    };
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-abort-flush] resume stack source: call_jit_pc={call_jitcode_pc} \
+             nlocals={nlocals} depth={depth} slots={:?} vstack_valid={} vstack_depth={} \
+             vstack_len={}",
+            overrides.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
+            ctx.vstack_valid,
+            ctx.vstack_depth,
+            ctx.vstack_boxes.len(),
+        );
+    }
+    let mut ordered = vec![None; depth];
+    for (slot, value) in overrides {
+        let rel = slot.checked_sub(nlocals)?;
+        if rel >= depth || ordered[rel].replace(value).is_some() {
+            return None;
+        }
+    }
+    ordered.into_iter().collect()
+}
+
 /// `r_args` index of the `null_or_self` operand — the one slot of a residual
 /// call's Ref list whose correct value can be null.
 const NULL_OR_SELF_ARG_INDEX: usize = 1;
@@ -4754,6 +4810,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if let Some(jd_no) = subwalk_jd_no {
             crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
         }
+        let prologue_cannot_call_assembler = fbw_executed_effect_count() != prologue_effects_before
+            || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect());
         let midbody_abort = match &result {
             Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, MidBodyAbortKind::Marker))
@@ -4762,6 +4820,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 if fbw_structural_abort_opcode_is_effect_free(*pc) =>
             {
                 Some((*pc, MidBodyAbortKind::Structural))
+            }
+            // `run_blackhole_interp_to_cancel_tracing` keeps the live callee
+            // MIFrame and continues it at its own merge point.  When a callee
+            // prologue has already acquired a lock or committed another
+            // effect, rejecting CALL_ASSEMBLER below must use that same
+            // mid-body handoff.  Falling through without a carrier replays the
+            // callee from its entry and, for `_pyio.BufferedReader.read`, tries
+            // to acquire its non-reentrant `_read_lock` a second time.
+            Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
+                if prologue_cannot_call_assembler =>
+            {
+                crate::state::pyjitcode_for_code(w_code)
+                    .and_then(|pjc| pjc.merge_entry_for(*target_pc))
+                    .map(|pc| (pc, MidBodyAbortKind::Structural))
             }
             _ => None,
         };
@@ -4839,7 +4911,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             eprintln!(
                                 "[fbw-abort-flush] gh#467 inexact anchor at abort_pc={abort_pc} \
                                  callee_py_pc={callee_py_pc} kind={abort_kind:?} \
-                                 would re-run {:?}",
+                                 portal_frame_reg={} callee_portal_frame_reg={} would re-run {:?}",
+                                metadata.portal_frame_reg,
+                                callee_portal_frame_reg,
                                 floor_segment_ops_before(metadata, body.code, abort_pc),
                             );
                         }
@@ -5198,6 +5272,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             if fbw_executed_effect_count() != prologue_effects_before
                 || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
             {
+                // The mid-body carrier captured above resumes the live callee
+                // at this loop header, matching
+                // `run_blackhole_interp_to_cancel_tracing`.  For an
+                // expression-position CALL it also needs the caller operands
+                // below the call.  The ordinary entry latch cannot attach
+                // them here because the prologue effect delta correctly makes
+                // rewinding to the CALL unsafe; attach the stack with the
+                // pre-subwalk count so it can source the preferred rebuild
+                // while the fallback rewind remains provably disabled.
+                if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
+                    && let Some(stack) =
+                        reconstructed_all_ref_call_stack(code, op, ctx).or_else(|| {
+                            reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc)
+                        })
+                {
+                    fbw_attach_midbody_call_stack(
+                        outer_jitcode_index,
+                        call_jitcode_pc,
+                        stack,
+                        executed_effects_before,
+                    );
+                }
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
             emit_walker_loop_callee_call_assembler(

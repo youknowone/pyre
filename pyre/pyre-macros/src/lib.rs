@@ -1982,6 +1982,11 @@ fn expand_pyre_methods(
                 let receiver_slots = usize::from(matches!(kind, MethodKind::Instance));
                 let expected_total = receiver_slots;
                 let fn_name = mname.to_string();
+                let arity_name = if mname == "__init__" {
+                    quote! { <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME }
+                } else {
+                    quote! { #fn_name }
+                };
                 quote! {
                     // A method with no user-visible parameters has no keyword
                     // slots to bind.  Its valid-call fast path is the exact
@@ -1991,7 +1996,7 @@ fn expand_pyre_methods(
                     if args.len() != #expected_total {
                         return crate::gateway::method_noarg_failure(
                             args,
-                            #fn_name,
+                            #arity_name,
                             #receiver_slots,
                         );
                     }
@@ -2048,6 +2053,16 @@ fn expand_pyre_methods(
                 // surplus positional.
                 let expected_total = receiver_slots + param_positional.len();
                 let fn_name = mname.to_string();
+                // CPython's Argument Clinic reports constructor arity under
+                // the concrete builtin type, not the implementation method's
+                // bare `__init__` name. `interp2app` carries that owner in its
+                // gateway metadata; use the pyre-class descriptor's same
+                // compile-time owner here.
+                let arity_name = if mname == "__init__" {
+                    quote! { <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME }
+                } else {
+                    quote! { #fn_name }
+                };
                 let expected = if visible_required == visible_max {
                     match visible_max {
                         0 => "no arguments".to_string(),
@@ -2067,7 +2082,7 @@ fn expand_pyre_methods(
                 let too_few = if visible_required == visible_max {
                     quote! {
                         crate::gateway::method_arity_failure(
-                            #fn_name,
+                            #arity_name,
                             #expected,
                             __pyre_positional_count.saturating_sub(#receiver_slots),
                         )
@@ -2075,7 +2090,7 @@ fn expand_pyre_methods(
                 } else {
                     quote! {
                         crate::gateway::method_min_arity_failure(
-                            #fn_name,
+                            #arity_name,
                             #visible_required,
                             __pyre_positional_count.saturating_sub(#receiver_slots),
                         )
@@ -2087,7 +2102,7 @@ fn expand_pyre_methods(
                     }
                     if __pyre_positional_count > #expected_total {
                         return crate::gateway::method_arity_failure(
-                            #fn_name,
+                            #arity_name,
                             #expected,
                             __pyre_positional_count.saturating_sub(#receiver_slots),
                         );

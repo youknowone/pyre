@@ -1154,6 +1154,20 @@ pub unsafe fn builtin_code_name(obj: PyObjectRef) -> &'static str {
     unsafe { (*func_obj).name }
 }
 
+/// PyPy `Function.name` as presented to `Arguments.parse_obj`: a builtin
+/// descriptor is qualified by the type that owns it, while a module builtin
+/// uses the module spelling.  Signature binding happens before the generated
+/// wrapper runs, so its error path must obtain the same name here rather than
+/// falling back to `BuiltinCode.name` (`"__init__"`).
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObjectRef>) -> String {
+    let code = unsafe { &*(obj as *const BuiltinCode) };
+    builtin_names(code, receiver).1
+}
+
 /// gateway.py:777 BuiltinCode.getdocstring — return the stored docstring
 /// wrapped as a `str`, or `None` if no docstring was attached.
 ///

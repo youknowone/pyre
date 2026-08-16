@@ -1420,6 +1420,18 @@ pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
+    // RPython history.py:361 defines CONST_NULL as a real
+    // `ConstPtr(lltype.nullptr(llmemory.GCREF.TO))`.  Preserve that typed
+    // constant before consulting the runtime-concrete table.  A symbolic Ref
+    // operation whose concrete lookup happens to return Ref(NULL) is still an
+    // unresolved box and must remain absent, but an inline ConstPtr(NULL) is
+    // positive proof that this operand-stack slot contains Python's call
+    // sentinel.  LOAD_SPECIAL records exactly that constant for its
+    // `self_or_null` half, including the `__exit__` pair retained below a
+    // nested CALL inside a `with` body.
+    if let OpRef::ConstPtr(value) = opref {
+        return Some(value.as_usize() as pyre_object::PyObjectRef);
+    }
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
         _ => None,

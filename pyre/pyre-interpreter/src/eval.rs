@@ -2266,6 +2266,48 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
     }
 }
 
+/// CPython 3.14's failed-attribute refcount boundary: once `LOAD_ATTR` has
+/// popped a finalizable receiver, an otherwise-unreferenced temporary runs its
+/// finalizer before the surrounding exception handler continues. This is
+/// observable in `test_io.test_error_through_destructor` for both native and
+/// `_pyio` streams. A reachability pass, rather than an IO/type shortcut,
+/// decides whether the receiver is actually dead.
+#[majit_macros::dont_look_inside]
+pub(crate) fn finalize_failed_attr_receiver_now(
+    obj: PyObjectRef,
+    execution_context: *mut crate::PyExecutionContext,
+) {
+    let has_finalizer = crate::typedef::r#type(obj).is_some_and(|w_type| unsafe {
+        crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__del__").is_some()
+    });
+    if !has_finalizer || execution_context.is_null() {
+        return;
+    }
+    // The popped temporary normally lives in the nursery.  This boundary has
+    // rooted the pending exception and has no other live managed temporary;
+    // run the same full reachability pass exposed by `gc.collect()` so the
+    // nursery object can actually become unreachable before the handler.
+    pyre_object::gc_hook::try_gc_collect();
+    unsafe { (*execution_context)._run_finalizers_now() };
+}
+
+fn finalize_failed_attr_receiver(
+    obj: PyObjectRef,
+    mut error: PyError,
+    execution_context: *mut crate::PyExecutionContext,
+) -> PyError {
+    // The reachability pass must not keep `obj` alive, but the pending
+    // AttributeError is still interpreter state and has to survive the same
+    // collection while an unrelated finalizer reports an unraisable error.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc = error.to_exc_object();
+    pyre_object::gc_roots::pin_root(exc);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    finalize_failed_attr_receiver_now(obj, execution_context);
+    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error
+}
+
 impl SharedOpcodeHandler for PyFrame {
     type Value = PyObjectRef;
 
@@ -2357,7 +2399,9 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
-        getattr_str(obj, name)
+        getattr_str(obj, name).map_err(|error| {
+            finalize_failed_attr_receiver(obj, error, self.execution_context as *mut _)
+        })
     }
 
     fn load_special_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
@@ -4710,7 +4754,10 @@ impl OpcodeStepExecutor for PyFrame {
                 nameindex,
                 name,
             )
-        }?;
+        }
+        .map_err(|error| {
+            finalize_failed_attr_receiver(obj, error, self.execution_context as *mut _)
+        })?;
         self.push(w_value);
         Ok(())
     }

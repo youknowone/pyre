@@ -5631,9 +5631,17 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     else {
         return false;
     };
-    if want_below != below.len() || below.iter().any(|slot| slot.is_null()) {
+    if want_below != below.len() {
         return false;
     }
+    // `below` is not restricted to ordinary Python object pointers.  CPython
+    // 3.14 LOAD_SPECIAL leaves `[exit_func, NULL]` below the body of a `with`
+    // statement, and a nested CALL therefore legitimately carries that NULL
+    // through this post-CALL handoff.  The carrier has already proved every
+    // slot before it becomes a raw `PyObjectRef`: NULL is admitted only from
+    // an inline `ConstPtr(NULL)` (RPython history.py:361 `CONST_NULL`) or the
+    // CALL layout's named null-or-self slot.  Rejecting it here collapses that
+    // distinction again and forces the effectful callee prologue to replay.
     let base = info.num_static_extra_boxes;
     if let Some(abs) = (0..nlocals).find(|&abs| ctx.virtualizable_entry_at(base + abs).is_none()) {
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

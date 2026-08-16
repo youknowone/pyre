@@ -4396,14 +4396,15 @@ fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
     majit_gc::shadow_stack::register_extra_root_walker(walk_immortal_store_roots);
-    // The mapdict side tables are keyed by owner address and root their
-    // values, so a major collection has to drop the entries whose owner it is
-    // about to sweep.
+    // The mapdict side tables are keyed by owner address. Their values are
+    // conditional edges, matching the instance-dict and weakref fields PyPy
+    // stores on the owner itself, so major marking keeps a value only after
+    // its owner is known live and drops entries whose owner is about to sweep.
     majit_gc::shadow_stack::register_ephemeron_pruner(
         pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
     );
     majit_gc::shadow_stack::register_ephemeron_marker(
-        pyre_interpreter::objspace::std::mapdict::mark_live_weakref_entries,
+        pyre_interpreter::objspace::std::mapdict::mark_live_side_table_entries,
     );
     // An owner that dies in the nursery cannot wait for that major: the reset
     // hands its address to the next allocation, which would then answer to its

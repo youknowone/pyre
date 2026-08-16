@@ -1114,6 +1114,27 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::autoflusher_add",
         autoflusher_add as *const (),
     );
+    let allocate_buffered_lock: fn() -> usize = crate::module::_io::allocate_buffered_lock;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::allocate_buffered_lock",
+        "pyre_interpreter::allocate_buffered_lock",
+        allocate_buffered_lock as *const (),
+    );
+    let acquire_buffered_lock: fn(usize) -> bool = crate::module::_io::acquire_buffered_lock;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::acquire_buffered_lock",
+        "pyre_interpreter::acquire_buffered_lock",
+        acquire_buffered_lock as *const (),
+    );
+    let release_buffered_lock: fn(usize) = crate::module::_io::release_buffered_lock;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::module::_io::release_buffered_lock",
+        "pyre_interpreter::release_buffered_lock",
+        release_buffered_lock as *const (),
+    );
     let warnings_state_ns: fn() -> pyre_object::PyObjectRef = crate::module::_warnings::state_ns;
     push_alias_pair(
         &mut entries,
@@ -1136,6 +1157,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::module::thread::current_ident",
         "pyre_interpreter::current_ident",
         current_ident as *const (),
+    );
+    let finalize_failed_attr_receiver_now: fn(
+        pyre_object::PyObjectRef,
+        *mut crate::PyExecutionContext,
+    ) = crate::eval::finalize_failed_attr_receiver_now;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::eval::finalize_failed_attr_receiver_now",
+        "pyre_interpreter::finalize_failed_attr_receiver_now",
+        finalize_failed_attr_receiver_now as *const (),
     );
     let set_in_flight_exception: fn(pyre_object::PyObjectRef) =
         crate::eval::set_in_flight_exception;
@@ -1167,7 +1198,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `cdata_bytes_object` carries the `_ctypes` module's own gate
     // (`module/mod.rs`), so the row repeats it rather than resolving a path
     // configured out of the build.
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     {
         let cdata_bytes_object: fn(pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> =
             crate::module::_ctypes::cdata::cdata_bytes_object;

@@ -10707,30 +10707,30 @@ impl CodeWriter {
                             // object on the shadow stack so a following
                             // SET_FUNCTION_ATTRIBUTE / STORE_FAST sees the function.
                             //
-                            // `globals` is the code's `w_globals` object as a
-                            // post-rtype `Signed(ptr) + Kind::Ref` constant, the same
-                            // shape the StoreAttr arm bakes `w_code` with.
-                            // `pyframe.py:49 self.w_globals = w_globals` stamps a
-                            // `malloc_typed`-immortal wrapper at frame construction,
-                            // so its pointer is fixed and GC-stable at jitcode build
-                            // time (see the LOAD_GLOBAL namespace fold above).
+                            // `pyopcode.py:1457 MAKE_FUNCTION` passes
+                            // `self.w_globals` from the executing MIFrame.  Keep
+                            // that per-frame red dependency: baking the jitcode's
+                            // `w_code.w_globals` here loses an `exec(code, ns)`
+                            // override, and an inlined cross-module callee can then
+                            // stamp a nested function with its caller's globals.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let code_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let globals_obj = unsafe {
-                                pyre_interpreter::w_code_get_w_globals(
-                                    w_code as pyre_object::PyObjectRef,
-                                )
-                            };
-                            let globals_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(globals_obj as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
+                            let globals_value = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getfield_vable_r",
+                                vable_getfield_ref_graph_args(
+                                    frame_var.into(),
+                                    VABLE_NAMESPACE_FIELD_IDX,
+                                ),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
                                 "make_function_value",
-                                vec![globals_const.into(), code_value.into()],
+                                vec![globals_value.into(), code_value.into()],
                                 Kind::Ref,
                                 py_pc as i64,
                             );

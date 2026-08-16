@@ -662,7 +662,7 @@ fn w_memoryview_new_with_flags_impl(
             let (address, length, readonly) = view?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
         if let Some((backing_obj, offset, byte_len, fmt, itemsize, shape)) =
             crate::module::_ctypes::cdata::cdata_buffer_view(w_obj)
         {
@@ -15033,14 +15033,17 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     )));
                 }
                 file_check_closed(args[0])?;
-                let offset = args
-                    .get(1)
-                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                    .unwrap_or(0);
-                let whence = args
-                    .get(2)
-                    .map(|&o| unsafe { pyre_object::w_int_get_value(o) })
-                    .unwrap_or(0) as i32;
+                // interp_fileio.py:267-275
+                // `@unwrap_spec(pos=r_longlong, whence=int)`: both operands
+                // go through Python's integer/index conversion before the
+                // host lseek.  Reading their object payloads unchecked made a
+                // float such as 0.0 look like offset zero instead of raising
+                // TypeError (test_io.IOTest.write_ops).
+                let offset = crate::builtins::space_index_w(args[1])?;
+                let whence = match args.get(2).copied() {
+                    Some(value) => crate::baseobjspace::index_c_int_w(value)?,
+                    None => 0,
+                };
                 // CPython 3.14 TextIOWrapper only permits the opaque-cookie
                 // forms for current/end-relative seeks; FileIO remains free
                 // to use ordinary non-zero offsets.
@@ -15222,6 +15225,30 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__repr__", fileio_method_repr, 1),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "_dealloc_warn",
+            make_builtin_function_with_arity("_dealloc_warn", fileio_method_dealloc_warn, 2),
+        )
+    };
+}
+
+fn fileio_method_dealloc_warn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("_dealloc_warn() requires self"))?;
+    if !file_is_closed(self_obj) && file_closefd(self_obj) && file_get_fd(self_obj).is_some() {
+        let source = args.get(1).copied().unwrap_or(self_obj);
+        let repr = unsafe { crate::display::py_repr_wtf8(source)? };
+        crate::warn::warn_category(
+            &format!("unclosed file {}", repr.to_string_lossy()),
+            "ResourceWarning",
+            1,
+        )?;
+    }
+    Ok(w_none())
 }
 
 fn fileio_get_slot(args: &[PyObjectRef], storage: &str) -> Result<PyObjectRef, crate::PyError> {
@@ -15655,7 +15682,7 @@ unsafe fn fileio_writebuf(
                 ));
             }
         }
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
         if let Some((backing, offset, length, _format, _itemsize, _shape)) =
             crate::module::_ctypes::cdata::cdata_buffer_view(obj)
         {
@@ -16498,40 +16525,57 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.is_empty() {
         return Ok(w_none());
     }
-    if !file_is_closed(args[0]) {
-        fileio_clear_stat_atopen(args[0]);
+    if file_is_closed(args[0]) {
+        return Ok(w_none());
     }
-    if let Some(fd) = file_get_fd(args[0]) {
-        let already = file_is_closed(args[0]);
-        if !already {
-            // Mark closed first so the fd is not reusable even if the underlying
-            // close reports an error, then surface that error (matching
-            // _io.FileIO.close).
-            file_set_closed(args[0], true)?;
-            let closefd = file_closefd(args[0]);
-            if !closefd {
-                return Ok(w_none());
-            }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let current = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+    fileio_clear_stat_atopen(current());
+
+    // `W_FileIO.close_w` first runs `W_RawIOBase.close_w`, whose IOBase
+    // implementation dispatches the possibly overridden `flush` while the
+    // stream is still open and marks its own closed state in `finally`.
+    let base_close_error = crate::module::_io::iobase_close(&[current()]).err();
+    file_set_closed(current(), true)?;
+
+    let close_result: Result<(), crate::PyError> = if let Some(fd) = file_get_fd(current()) {
+        if file_closefd(current()) {
             #[cfg(all(
                 feature = "host_env",
                 not(target_arch = "wasm32"),
                 not(feature = "sandbox")
             ))]
-            // SAFETY: close(2) on the file object's own fd.
-            if crt_call!(libc::close(fd)) < 0 {
-                return Err(crate::PyError::os_error_with_errno(crt_errno(), "close"));
+            {
+                // SAFETY: close(2) on the file object's own fd.
+                if crt_call!(libc::close(fd)) < 0 {
+                    Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+                } else {
+                    Ok(())
+                }
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-            crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+            {
+                crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
+            }
             #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
-            let _ = fd;
+            {
+                let _ = fd;
+                Ok(())
+            }
+        } else {
+            Ok(())
         }
-        return Ok(w_none());
+    } else {
+        // If the file was opened in a writable mode, `flush` above committed
+        // the in-memory backing before the closed flag was set.
+        Ok(())
+    };
+    close_result?;
+    if let Some(error) = base_close_error {
+        return Err(error);
     }
-    // If the file was opened in a writable mode, flush the in-memory
-    // buffer to disk.
-    file_flush_dirty(args[0])?;
-    file_set_closed(args[0], true)?;
     Ok(w_none())
 }
 

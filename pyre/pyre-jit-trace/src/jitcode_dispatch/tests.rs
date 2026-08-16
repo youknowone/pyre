@@ -11946,6 +11946,52 @@ fn portal_vable_bookkeeping_anchor_accepts_only_same_pc_same_frame_vable_writes(
     ));
 }
 
+#[test]
+fn portal_vable_bookkeeping_anchor_accepts_registered_entry_marker_prefix() {
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+    use majit_translate::jitcode::BhDescr;
+
+    let setfield = *insns_opname_to_byte()
+        .get("setfield_vable_i/rid")
+        .expect("setfield_vable_i must exist");
+    let abort = *insns_opname_to_byte()
+        .get("abort_permanent/")
+        .expect("abort_permanent must exist");
+    let descrs = [RuntimeBhDescr::Descr(Box::new(BhDescr::VableField {
+        index: 2,
+    }))];
+    let code = [setfield, 1, 7, 0, 0, abort];
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    // The loop-header marker at jit pc 5 names Python pc 29, while its
+    // bookkeeping prefix remains in the preceding floor segment (pc 28).
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 28)];
+    pyjit.metadata.merge_entry_by_green = vec![(29, 5)];
+
+    assert!(super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &code,
+        29,
+        5,
+        |_| 28,
+    ));
+
+    // The floor mismatch is admitted only at the exact registered entry.
+    pyjit.metadata.merge_entry_by_green = vec![(29, 4)];
+    assert!(!super::portal_vable_bookkeeping_anchor(
+        &pyjit.metadata,
+        true,
+        1,
+        &descrs,
+        &code,
+        29,
+        5,
+        |_| 28,
+    ));
+}
+
 /// The operand-stack spill the walker emits ahead of an unwalkable opcode is
 /// `setarrayitem_vable_r` + `setfield_vable_i(valuestackdepth)`, not the
 /// `last_instr` write alone; the rebuild rewrites both, so both are admitted.

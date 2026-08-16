@@ -1,11 +1,8 @@
 //! Buffered binary streams — PyPy `pypy/module/_io/interp_bufferedio.py`.
 //!
 //! Keep the buffering state on the typed object, matching `BufferedMixin`.
-//! In particular, `raw`, the byte buffer, and the logical/raw positions are
-//! not instance-dict side data.  Pyre currently runs Python threads
-//! synchronously, so `locked` is the direct single-thread representation of
-//! PyPy's `TryLock`: it still detects a raw-stream callback re-entering the
-//! same buffered object.
+//! In particular, `raw`, the byte buffer, the per-stream `TryLock`, and the
+//! logical/raw positions are not instance-dict side data.
 
 use pyre_object::*;
 
@@ -86,7 +83,7 @@ pub struct W_BufferedReader {
     write_end: i64,
     readable: bool,
     writable: bool,
-    locked: bool,
+    lock: usize,
 }
 
 impl Default for W_BufferedReader {
@@ -105,7 +102,7 @@ impl Default for W_BufferedReader {
             write_end: -1,
             readable: false,
             writable: false,
-            locked: false,
+            lock: 0,
         }
     }
 }
@@ -144,12 +141,11 @@ impl W_BufferedReader {
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, crate::PyError>,
     ) -> Result<T, crate::PyError> {
-        if self.locked {
+        if !super::acquire_buffered_lock(self.lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
-        self.locked = true;
         let result = body(self);
-        self.locked = false;
+        super::release_buffered_lock(self.lock);
         result
     }
 
@@ -609,7 +605,7 @@ impl W_BufferedReader {
         self.read_end = -1;
         self.write_pos = 0;
         self.write_end = -1;
-        self.locked = false;
+        self.lock = super::allocate_buffered_lock();
         // Where the raw stream sits is left unknown rather than asked for:
         // `seek` refreshes it before its fast path reads it and `tell` always
         // asks, which is every use, so construction owes no `lseek`.
@@ -824,18 +820,23 @@ impl W_BufferedReader {
     }
 
     fn flush(&self) -> Result<PyObjectRef, crate::PyError> {
-        self.check_init()?;
+        // CPython 3.14 test_io.BufferedReaderTest.test_read_on_closed requires
+        // the derived raw `closed` state here. PyPy's `simple_flush_w` checks
+        // only initialization and therefore lets BufferedReader(BytesIO)
+        // flush after close; that observable result is the spec exception.
+        self.check_closed("flush of closed file")?;
         super::call_method_result(self.w_raw, "flush", &[])
     }
 
     fn close(&mut self) -> Result<(), crate::PyError> {
         self.check_init()?;
-        if self.raw_closed()? {
+        if self.with_lock(|this| this.raw_closed())? {
             return Ok(());
         }
         let self_obj = self.self_obj();
         let flush_error = super::call_method_result(self_obj, "flush", &[]).err();
-        let close_result = super::call_method_result(self.w_raw, "close", &[]);
+        let close_result =
+            self.with_lock(|this| super::call_method_result(this.w_raw, "close", &[]).map(|_| ()));
         if let Err(mut close_error) = close_result {
             if let Some(mut flush_error) = flush_error {
                 // PyPy's `try: flush() finally: raw.close()` exposes the

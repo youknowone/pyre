@@ -941,8 +941,10 @@ pub fn builtin_code_call_positional(
         // excess positionals reach the typed wrapper, which consumes its
         // declared prefix and silently ignores the rest.
         if unsafe { crate::builtin_code_get_fast_natural_arity(current_code) } == crate::HOPELESS {
-            let fname = unsafe { crate::builtin_code_name(current_code) };
-            let bound = bind_kwargs_to_signature(sig, fname, current_args, &[])?;
+            let fname = unsafe {
+                crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
+            };
+            let bound = bind_kwargs_to_signature(sig, &fname, current_args, &[])?;
             return unsafe { crate::builtin_code_call(current_code, &bound) };
         }
     }
@@ -2617,8 +2619,13 @@ fn call_with_kwargs_in_ctx_impl(
             if let Some(sig) =
                 unsafe { crate::builtin_code_get_signature(code as pyre_object::PyObjectRef) }
             {
-                let fname = unsafe { crate::builtin_code_name(code as pyre_object::PyObjectRef) };
-                let bound = bind_kwargs_to_signature(sig, fname, pos_args, kwargs)?;
+                let fname = unsafe {
+                    crate::gateway::builtin_code_call_name(
+                        code as pyre_object::PyObjectRef,
+                        pos_args.first().copied(),
+                    )
+                };
+                let bound = bind_kwargs_to_signature(sig, &fname, pos_args, kwargs)?;
                 // Under an active C-level profiler the call must still emit
                 // `c_call_trace` / `c_return_trace`, so route the bound flat
                 // slice through the profile-aware path like the marker branch

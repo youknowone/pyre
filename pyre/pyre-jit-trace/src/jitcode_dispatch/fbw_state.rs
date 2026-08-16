@@ -1432,6 +1432,38 @@ pub(crate) fn fbw_set_midbody_abort_resume(payload: MidBodyPayload) {
     FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = Some(InlineAbortCarrier::MidBody(payload)));
 }
 
+/// Attach the outer CALL's complete operand stack to an already-latched
+/// mid-body carrier after the callee sub-walk has executed an effect.
+///
+/// The stack prefix is needed to resume the caller *past* an expression-
+/// position CALL after rebuilding the live callee frame.  Preserve the
+/// pre-subwalk effect count rather than sampling the current count: if the
+/// rebuild later declines before running, `EntryCarrierCall` must still reject
+/// rewinding to the CALL because the callee prologue's effects are already
+/// applied.  The stack is data for the preferred RPython-style frame rebuild;
+/// it does not make the fallback rewind sound.
+pub(crate) fn fbw_attach_midbody_call_stack(
+    outer_jitcode_index: u32,
+    call_jitcode_pc: usize,
+    stack: Vec<pyre_object::PyObjectRef>,
+    entry_executed_effects: usize,
+) {
+    FBW_ABORT_CALL_RESUME.with(|c| {
+        let mut slot = c.borrow_mut();
+        let Some(InlineAbortCarrier::MidBody(payload)) = slot.as_mut() else {
+            return;
+        };
+        if payload.outer_jitcode_index == outer_jitcode_index
+            && payload.call_jitcode_pc == call_jitcode_pc
+        {
+            payload.entry_fallback = Some(crate::jitcode_dispatch::EntryFallback {
+                call_stack: stack,
+                entry_executed_effects,
+            });
+        }
+    });
+}
+
 pub(crate) fn fbw_abort_carrier_clone() -> Option<InlineAbortCarrier> {
     FBW_ABORT_CALL_RESUME.with(|c| c.borrow().clone())
 }

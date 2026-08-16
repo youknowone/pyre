@@ -758,6 +758,16 @@ fn try_commit_midbody_abort_inner(
                 .map(|fallback| fallback.call_stack.as_slice())
                 .filter(|full| full.len() == n + payload.call_stack_len)
             else {
+                if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[fbw-abort-flush] caller-stack mismatch: below={n} call={} carried={:?}",
+                        payload.call_stack_len,
+                        payload
+                            .entry_fallback
+                            .as_ref()
+                            .map(|fallback| fallback.call_stack.len()),
+                    );
+                }
                 return Err(MidBodyDecline::BeforeRun(
                     "expression-position call with no reconstructed stack below it",
                 ));

@@ -2,6 +2,36 @@ import sys
 
 def reduce_1(obj, proto):
     import copyreg
+    cls = obj.__class__
+
+    # CPython 3.14 exposes object.__new__ on these native IO types, so
+    # copyreg._reduce_ex walks through them to object and serializes a user
+    # subclass via its __getstate__. PyPy's generic_new_descr (and pyre's
+    # field-layout allocator) is necessarily a distinct callable, which makes
+    # copyreg stop at the IO base and try to pickle a second native IO object.
+    # Preserve the CPython-visible base decision only for a subclass; exact
+    # Buffered*/TextIOWrapper objects remain deliberately unpickleable.
+    io_object_new_bases = (
+        '_io.BufferedReader',
+        '_io.BufferedWriter',
+        '_io.BufferedRandom',
+        '_io.TextIOWrapper',
+    )
+    for base in cls.__mro__[1:]:
+        if base is cls:
+            continue
+        if '%s.%s' % (base.__module__, base.__name__) in io_object_new_bases:
+            getstate = obj.__getstate__
+            state = getstate()
+            # pyre cannot route object.__new__ through a distinct native IO
+            # layout: PyPy's `check_user_subclass` correctly rejects that
+            # allocator/layout pair.  `__newobj__` invokes the subtype's own
+            # inherited native allocator and reaches the same CPython-visible
+            # uninitialized instance before `__setstate__` restores it.
+            args = (cls,)
+            if state:
+                return copyreg.__newobj__, args, state
+            return copyreg.__newobj__, args
     return copyreg._reduce_ex(obj, proto)
 
 def reduce_2(obj, proto, args, kwargs):

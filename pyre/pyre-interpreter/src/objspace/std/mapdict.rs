@@ -5322,25 +5322,29 @@ pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<u
     }
 }
 
-/// Mark weakref lifelines only for owners that survived major marking.
+/// Mark side-table values only for owners that survived major marking.
 ///
-/// PyPy stores this edge in each concrete object's weakref field, so ordinary
-/// tracing reaches the lifeline iff it first reaches the owner. The temporary
-/// `WEAKREF_TABLE` carrier must reproduce that conditional edge; treating all
-/// values as unconditional roots delays callbacks by one major collection.
-pub fn mark_live_weakref_entries(
+/// PyPy stores both the instance dict and weakref lifeline in fields on each
+/// concrete object, so ordinary tracing reaches either value iff it first
+/// reaches the owner. The temporary address-keyed carriers must reproduce that
+/// conditional edge. In particular, unconditionally rooting an instance dict
+/// whose value points back to its owner turns `obj.attr = obj` into a permanent
+/// root and prevents the owner's finalizer from ever running.
+pub fn mark_live_side_table_entries(
     classify: &mut dyn FnMut(usize) -> Option<usize>,
     roots: &mut Vec<majit_ir::GcRef>,
 ) {
-    let entries: Vec<(usize, usize)> = WEAKREF_TABLE
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(&owner, &value)| (owner, value))
-        .collect();
-    for (owner, value) in entries {
-        if classify(owner).is_some() && value != 0 {
-            roots.push(majit_ir::GcRef(value));
+    for table in [&INSTANCE_DICT, &WEAKREF_TABLE] {
+        let entries: Vec<(usize, usize)> = table
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&owner, &value)| (owner, value))
+            .collect();
+        for (owner, value) in entries {
+            if classify(owner).is_some() && value != 0 {
+                roots.push(majit_ir::GcRef(value));
+            }
         }
     }
 }
@@ -5377,7 +5381,15 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     // only the entries stored since the previous minor walk are visited here.
     let minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
-    let dict_values = snapshot_root_entries(&INSTANCE_DICT, &INSTANCE_DICT_PENDING, minor);
+    // During a major collection the instance-dict edge is conditional on its
+    // owner, exactly like the weakref-lifeline edge below; the registered
+    // ephemeron marker reports it after ordinary marking establishes owner
+    // liveness. A minor collection still forwards newly stored values here.
+    let dict_values = if minor {
+        snapshot_root_entries(&INSTANCE_DICT, &INSTANCE_DICT_PENDING, true)
+    } else {
+        Vec::new()
+    };
     // SAFETY: do not hold the table lock while invoking callbacks. The visitor
     // and w_dict_walk_entries_mut may re-enter mapdict/dict APIs; every write
     // back into the table is deferred to `apply_root_rekeys`.
