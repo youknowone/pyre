@@ -122,6 +122,102 @@ fn record_inline_trial_error(error: &BackendError) {
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
+static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
+
+/// One compiled trace's guest-memory entry counters.  The generated module
+/// updates `counts[key]` directly, so this owner must outlive every module
+/// that bakes its base address.
+struct TraceEntryCensus {
+    trace_id: u64,
+    counts: Box<[u64]>,
+}
+
+/// The census deliberately has no per-entry Rust callback: a module writes
+/// this guest-memory storage itself.  The runner reads it only after Python
+/// exits, when no trace is executing.
+static TRACE_ENTRY_CENSUS: Mutex<Vec<TraceEntryCensus>> = Mutex::new(Vec::new());
+
+/// Baked into an armed module. `trace_id` is the backend's monotonic trace id,
+/// which stays attached to a loop when its module is re-emitted.
+#[derive(Clone, Copy)]
+pub struct TraceEntryCensusStorage {
+    pub trace_id: u64,
+    pub base: u32,
+    pub key_count: u32,
+}
+
+/// Arm trace-entry instrumentation before the guest starts compiling traces.
+/// Native runs select the same facility with `MAJIT_TRACE_ENTRY_CENSUS`; wasm
+/// has no environment, so its host calls this function through pyre-wasm.
+pub fn trace_entry_census_enable() {
+    TRACE_ENTRY_CENSUS_FORCED.store(true, Ordering::Relaxed);
+}
+
+fn trace_entry_census_enabled() -> bool {
+    if TRACE_ENTRY_CENSUS_FORCED.load(Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MAJIT_TRACE_ENTRY_CENSUS").is_some())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// Allocate the one counter array that an armed physical trace module uses.
+/// Re-emission clones the stored descriptor, preserving both the trace id and
+/// the counters rather than assigning the replacement a second identity.
+fn alloc_trace_entry_census(trace_id: u64, key_count: usize) -> Option<TraceEntryCensusStorage> {
+    if !trace_entry_census_enabled() {
+        return None;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut counts = vec![0u64; key_count].into_boxed_slice();
+        let base = counts.as_mut_ptr() as usize as u32;
+        TRACE_ENTRY_CENSUS
+            .lock()
+            .unwrap()
+            .push(TraceEntryCensus { trace_id, counts });
+        Some(TraceEntryCensusStorage {
+            trace_id,
+            base,
+            key_count: key_count as u32,
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (trace_id, key_count);
+        None
+    }
+}
+
+/// Greppable, stable host readout of the guest-written entry counters.
+pub fn trace_entry_census_summary() -> String {
+    let census = TRACE_ENTRY_CENSUS.lock().unwrap();
+    let mut total = 0u64;
+    let mut report = String::new();
+    for trace in census.iter() {
+        for (key, count) in trace.counts.iter().enumerate() {
+            // Trace modules update this memory directly, outside Rust's alias
+            // analysis; volatile makes the post-run host read explicit.
+            let count = unsafe { core::ptr::read_volatile(count) };
+            if count != 0 {
+                total = total.saturating_add(count);
+                report.push_str(&format!(
+                    "[trace-entry-census] trace_id={} key={key} entries={count}\n",
+                    trace.trace_id
+                ));
+            }
+        }
+    }
+    report.push_str(&format!("[trace-entry-census] total={total}\n"));
+    report
+}
 
 /// Arm loop-module replacement from the host before guest execution starts.
 pub fn reemit_enable() {
@@ -2559,6 +2655,8 @@ impl majit_backend::Backend for WasmBackend {
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
+        let trace_entry_census =
+            alloc_trace_entry_census(trace_id, codegen::entry_dispatch_key_count(ops));
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
@@ -2592,6 +2690,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             bridge_entry_arity: None,
             bridge_param_dispatch: bridge_params_enabled(),
+            trace_entry_census,
             // A real loop's JUMP is a local back-edge `br`; an entry bridge
             // tail-calls its target loop and is deliberately not re-emittable.
             external_jump_slot: entry_bridge_target.map_or(0, |t| t.func_handle),
@@ -3278,6 +3377,8 @@ impl majit_backend::Backend for WasmBackend {
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
+        let trace_entry_census =
+            alloc_trace_entry_census(trace_id, codegen::entry_dispatch_key_count(ops));
 
         let typeid_table = self.collect_classptr_typeid_table(ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info(ops);
@@ -3339,6 +3440,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             bridge_entry_arity,
             bridge_param_dispatch: bridge_params_enabled(),
+            trace_entry_census,
             external_jump_slot,
             external_jump_key,
             frame: source_frame,

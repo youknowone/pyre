@@ -17,9 +17,9 @@ use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    ImportSection, InstructionSink, MemArg, MemoryType, Module, RefType, TableType, TypeSection,
-    ValType,
+    BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType,
+    Module, RefType, TableType, TypeSection, ValType,
 };
 
 /// Frame slot byte offset: slot[i] is at frame_ptr + 8 + i * 8.
@@ -2111,6 +2111,9 @@ pub struct ModuleBuildInputs {
     pub bridge_entry_arity: Option<usize>,
     /// Emit fixed-arity guard-to-bridge parameter tail-call arms for this module.
     pub bridge_param_dispatch: bool,
+    /// Guest-memory counters baked into an armed trace-entry census module.
+    /// `None` keeps the generated module byte-identical to the normal path.
+    pub trace_entry_census: Option<crate::TraceEntryCensusStorage>,
     pub external_jump_slot: u32,
     pub external_jump_key: u32,
     pub frame: FrameGeometry,
@@ -2178,6 +2181,7 @@ impl Clone for ModuleBuildInputs {
             bridge_cells_base: self.bridge_cells_base,
             bridge_entry_arity: self.bridge_entry_arity,
             bridge_param_dispatch: self.bridge_param_dispatch,
+            trace_entry_census: self.trace_entry_census,
             external_jump_slot: self.external_jump_slot,
             external_jump_key: self.external_jump_key,
             frame: self.frame,
@@ -2207,6 +2211,7 @@ pub fn build_wasm_module(
         bridge_cells_base,
         bridge_entry_arity,
         bridge_param_dispatch,
+        trace_entry_census,
         external_jump_slot,
         external_jump_key,
         frame,
@@ -2593,10 +2598,29 @@ pub fn build_wasm_module(
     functions.function(bridge_entry_type_idx.unwrap_or(0));
     module.section(&functions);
 
+    // Only armed modules carry this global. The runner reads it after
+    // instantiation to give `PYRE_WASM_DUMP_ALL_TRACES` the same trace id the
+    // census reports; it is omitted entirely from ordinary trace modules.
+    if let Some(census) = trace_entry_census {
+        let mut globals = GlobalSection::new();
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: false,
+                shared: false,
+            },
+            &ConstExpr::i64_const(census.trace_id as i64),
+        );
+        module.section(&globals);
+    }
+
     // Export section: trace function index depends on whether we imported jit_call
     let trace_func_idx = if needs_call { 1 } else { 0 };
     let mut exports = ExportSection::new();
     exports.export("trace", ExportKind::Func, trace_func_idx);
+    if trace_entry_census.is_some() {
+        exports.export("trace_entry_census_id", ExportKind::Global, 0);
+    }
     module.section(&exports);
 
     // Code section
@@ -2637,6 +2661,7 @@ pub fn build_wasm_module(
         ca.clone(),
         bridge_finish_fi,
         ca_helper_type_idx,
+        *trace_entry_census,
     )?;
     codes.function(&func);
     module.section(&codes);
@@ -2701,6 +2726,7 @@ fn build_function(
     // module type section when `ca.emit_ca`. The CA arm uses it to `call_indirect`
     // `ca.deopt_helper_slot` for a deopted callee.
     ca_helper_type_idx: u32,
+    trace_entry_census: Option<crate::TraceEntryCensusStorage>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
@@ -2728,6 +2754,17 @@ fn build_function(
     let base_i32_locals: u32 = 1 + if ca.emit_ca { 2 } else { 0 };
     let alloc_scratch_local = bridge_slot_local + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
+    // A keyed census must preserve the raw dispatch value until `br_table`.
+    // Its counter-address scratch cannot share `bridge_slot_local`, because
+    // the latter would replace the selector with a guest-memory address.
+    let trace_entry_key_local = bridge_slot_local
+        + base_i32_locals
+        + if nursery.is_some() || ca.inline.is_some() {
+            2
+        } else {
+            0
+        };
+    let trace_entry_needs_key_local = trace_entry_census.is_some() && is_resumable_peeled(ops);
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -2777,7 +2814,8 @@ fn build_function(
                 2
             } else {
                 0
-            },
+            }
+            + u32::from(trace_entry_needs_key_local),
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -2876,6 +2914,24 @@ fn build_function(
         sink.local_get(0);
         sink.i64_load(mem64(frame.dispatch_key_ofs));
         sink.i32_wrap_i64();
+        // Without a census the key is already where `br_table` wants it. Only
+        // the census needs it a second time, so only the census pays to keep a
+        // copy: a `tee`/`get` pair here costs every entry into a peeled module.
+        if let Some(census) = trace_entry_census {
+            let dispatch_key_local = if trace_entry_needs_key_local {
+                trace_entry_key_local
+            } else {
+                bridge_slot_local
+            };
+            sink.local_tee(dispatch_key_local);
+            emit_trace_entry_census(
+                &mut sink,
+                census,
+                bridge_slot_local,
+                Some(dispatch_key_local),
+            );
+            sink.local_get(dispatch_key_local);
+        }
         // Depths at this point, innermost first: D=0, then (C_j, B_j) pairs
         // with C_j at 2j+1. Entry j+1 of the table targets C_j; entry 0 and
         // the default target D (the entry path).
@@ -2884,6 +2940,8 @@ fn build_function(
             .collect();
         sink.br_table(br_targets, 0);
         sink.end(); // end D $dispatch — key-0 entry path continues here
+    } else if let Some(census) = trace_entry_census {
+        emit_trace_entry_census(&mut sink, census, bridge_slot_local, None);
     }
 
     // Fresh entry owns key 0 and must clear both the trace's ordinary homes
@@ -5864,6 +5922,57 @@ pub fn resumable_label_count(ops: &[Op]) -> usize {
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .count()
+}
+
+/// Number of entry-dispatch keys an armed trace module can observe. Ordinary
+/// traces have only the fresh-entry bucket; a resumable peeled loop has key 0
+/// plus one bucket for each `br_table` resume arm.
+pub fn entry_dispatch_key_count(ops: &[Op]) -> usize {
+    if is_resumable_peeled(ops) {
+        resumable_label_count(ops) + 1
+    } else {
+        1
+    }
+}
+
+/// Increment one module's guest-memory entry counter. `key_local` holds the
+/// i32 value consumed by the entry `br_table`; out-of-range values retain that
+/// table's normal default-to-fresh-entry behaviour but do not index beyond the
+/// fixed counter array.
+fn emit_trace_entry_census(
+    sink: &mut PeepSink<'_, '_>,
+    census: crate::TraceEntryCensusStorage,
+    scratch_local: u32,
+    key_local: Option<u32>,
+) {
+    if let Some(key_local) = key_local {
+        sink.local_get(key_local);
+        sink.i32_const(census.key_count as i32);
+        sink.i32_lt_u();
+        sink.if_(BlockType::Empty);
+        sink.i32_const(census.base as i32);
+        sink.local_get(key_local);
+        sink.i32_const(std::mem::size_of::<u64>() as i32);
+        sink.i32_mul();
+        sink.i32_add();
+        sink.local_set(scratch_local);
+        sink.local_get(scratch_local);
+        sink.local_get(scratch_local);
+        sink.i64_load(mem64(0));
+        sink.i64_const(1);
+        sink.i64_add();
+        sink.i64_store(mem64(0));
+        sink.end();
+    } else {
+        sink.i32_const(census.base as i32);
+        sink.local_set(scratch_local);
+        sink.local_get(scratch_local);
+        sink.local_get(scratch_local);
+        sink.i64_load(mem64(0));
+        sink.i64_const(1);
+        sink.i64_add();
+        sink.i64_store(mem64(0));
+    }
 }
 
 /// The single-label subset of `is_resumable_peeled`: exactly one LABEL.

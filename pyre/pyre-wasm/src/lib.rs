@@ -1149,6 +1149,15 @@ mod host_abi {
         majit_metainterp::guard_census_enable();
     }
 
+    /// Arm the per-trace, per-entry-resume-key census before tracing starts.
+    /// The runner owns `PYRE_WASM_TRACE_ENTRY_CENSUS`; the wasm guest cannot
+    /// read its environment, and arming before compilation keeps the counter
+    /// instructions absent from every unarmed trace module.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_trace_entry_census_enable() {
+        majit_backend_wasm::trace_entry_census_enable();
+    }
+
     /// Arm loop-module replacement before tracing begins. The host owns the
     /// environment; this guest export carries that choice into the backend.
     #[unsafe(no_mangle)]
@@ -1177,6 +1186,13 @@ mod host_abi {
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_jit_guard_census() -> u64 {
         pack_into_guest(majit_metainterp::guard_census_summary(12).into_bytes())
+    }
+
+    /// Guest-memory trace-entry census readout. The runner prints every line
+    /// verbatim, preserving one greppable record per nonzero `(trace_id, key)`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_trace_entry_census() -> u64 {
+        pack_into_guest(majit_backend_wasm::trace_entry_census_summary().into_bytes())
     }
 
     /// Trial-build errors recorded while deciding whether a bridge can be

@@ -127,6 +127,8 @@ struct Host {
 /// read back through the `pyre_fbw_census` export, and `MAJIT_GUARD_CENSUS`'s
 /// per-guard deopt census is `PYRE_WASM_GUARD_CENSUS`, armed through
 /// `pyre_jit_guard_census_enable` and read through `pyre_jit_guard_census`.
+/// `PYRE_WASM_TRACE_ENTRY_CENSUS` similarly arms the emitted-module entry
+/// census before tracing starts.
 ///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
 /// `PYRE_STDLIB`, `MAJIT_STATS`) and `check.py`'s own `PYRE_CHECK_*`
@@ -536,6 +538,12 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some()
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_trace_entry_census_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
     if std::env::var_os("PYRE_WASM_REEMIT").is_some()
         && let Ok(arm) = instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_reemit_enable")
     {
@@ -550,9 +558,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // Parameter bridge entries are the default. The guest has no environment,
     // so an explicit host-side opt-out must travel through this export before
     // tracing begins.
-    if std::env::var_os("PYRE_WASM_BRIDGE_PARAMS").is_some_and(|value| {
-        matches!(value.to_str().map(str::trim), Some("0" | "false" | "off"))
-    })
+    if std::env::var_os("PYRE_WASM_BRIDGE_PARAMS")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
         && let Ok(arm) =
             instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_bridge_params_disable")
     {
@@ -1197,6 +1204,27 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             Err(_) => eprintln!("[jit-stats] guard_census=unexported"),
         }
     }
+    if std::env::var_os("PYRE_WASM_TRACE_ENTRY_CENSUS").is_some() {
+        match instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_trace_entry_census") {
+            Ok(census) => {
+                let census_result: Result<()> = (|| {
+                    let packed = census.call(&mut store, ())?;
+                    let (ptr, clen) = ((packed >> 32) as u32, (packed & 0xffff_ffff) as u32);
+                    if clen != 0 {
+                        let mut bytes = vec![0u8; clen as usize];
+                        memory.read(&store, ptr as usize, &mut bytes)?;
+                        dealloc.call(&mut store, (ptr, clen))?;
+                        eprint!("{}", String::from_utf8_lossy(&bytes));
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = census_result {
+                    eprintln!("pyre-wasm-runner: trace entry census failed: {err}");
+                }
+            }
+            Err(_) => eprintln!("[trace-entry-census] unexported"),
+        }
+    }
     let exit_code = instance
         .get_typed_func::<(), i32>(&mut store, "pyre_exit_code")
         .and_then(|f| f.call(&mut store, ()))
@@ -1507,12 +1535,6 @@ fn jit_compile_trace(
         .context("read trace module bytes")?;
 
     let engine = caller.engine().clone();
-    if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
-        match wasmprinter::print_bytes(&bytes) {
-            Ok(wat) => eprintln!("=== trace module ({} bytes) ===\n{wat}", bytes.len()),
-            Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
-        }
-    }
     let compile_start = std::time::Instant::now();
     let module_result = Module::new(&engine, &bytes);
     caller.data_mut().jit_compile_time_ns += compile_start.elapsed().as_nanos();
@@ -1571,6 +1593,20 @@ fn jit_compile_trace(
 
     let instance =
         Instance::new(&mut *caller, &module, &externs).context("instantiate trace module")?;
+    if std::env::var_os("PYRE_WASM_DUMP_ALL_TRACES").is_some() {
+        let trace_id = instance
+            .get_global(&mut *caller, "trace_entry_census_id")
+            .and_then(|global| global.get(&mut *caller).i64())
+            .map(|id| format!(" trace_id={id}"))
+            .unwrap_or_default();
+        match wasmprinter::print_bytes(&bytes) {
+            Ok(wat) => eprintln!(
+                "=== trace module{trace_id} ({} bytes) ===\n{wat}",
+                bytes.len()
+            ),
+            Err(pe) => eprintln!("[jit_compile_wasm] wat print failed: {pe}"),
+        }
+    }
     let trace = instance
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
