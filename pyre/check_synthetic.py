@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BENCH_DIR = ROOT / "bench" / "synth"
+SELFCHECK_DIRECTIVE = "# pyre-check: selfcheck"
 
 
 def green(s):
@@ -60,6 +61,17 @@ def iter_benches(pattern):
     return benches
 
 
+def is_selfcheck(path):
+    with path.open(encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if line.strip() == SELFCHECK_DIRECTIVE:
+                return True
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Synthetic Pyre parity benchmark runner")
     parser.add_argument("--python", default=os.environ.get("PYRE_SYNTH_PYTHON") or sys.executable)
@@ -88,8 +100,12 @@ def main():
 
     for bench in benches:
         print(bench.name)
+        selfcheck = is_selfcheck(bench)
         baseline = None
         for name, exe in interpreters:
+            if selfcheck and name != "pyre":
+                print(f"  {name:<8s} {dim('skip'):<14s} {'-':>6s}  pyre self-check")
+                continue
             rc, out, err, elapsed = run([exe, str(bench)], args.timeout)
             if baseline is None and name == "python" and rc == 0:
                 baseline = out
@@ -101,6 +117,10 @@ def main():
                 last_error = err.strip().splitlines()[-1] if err.strip() else ""
                 detail = f"exit={rc} {last_error}"
                 failures.append((bench.name, name, "exit", rc))
+            elif selfcheck and "PASS" not in out:
+                status = red("FAIL")
+                detail = "missing 'PASS'"
+                failures.append((bench.name, name, "self-check", 0))
             elif baseline is not None and out != baseline:
                 status = red("WRONG")
                 detail = f"got={out.strip()!r} expected={baseline.strip()!r}"

@@ -1,5 +1,6 @@
+# pyre-check: selfcheck
 # Self-checking regression guard for the frame-escape flush that resumes past
-# the abort (registered via check.py run_selfcheck, NOT the synthetic suite).
+# the abort. The synthetic suite discovers it as a self-checking fixture.
 # A residual (may-force) callee stores its own frame; the loop body then reads
 # the caller's f_back.f_locals and mutates it through the 3.14 FrameLocalsProxy
 # write-through. Reading the redirected caller frame forces it mid-expression:
@@ -11,8 +12,8 @@
 #
 # The write-through is a 3.14 FrameLocalsProxy behaviour PyPy 3.11 lacks (its
 # f_locals is a snapshot), so cpython and pypy disagree on the mutated value and
-# this cannot be a synthetic bench; the invariant is pyre-internal instead (a
-# correct JIT reproduces the no-JIT result) and is asserted here.
+# this cannot use synthetic output parity; the invariant is pyre-internal
+# instead (a correct JIT reproduces the no-JIT result) and is asserted here.
 import sys
 
 LOOPS = 20000

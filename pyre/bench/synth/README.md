@@ -20,3 +20,15 @@ Each benchmark prints a stable checksum.  A Pyre failure is useful signal: it
 marks a feature category that needs trace, optimizer, backend, or frontend
 parity work.
 
+Fixtures whose invariant cannot be expressed as stable CPython/PyPy output may
+opt into the same directory's self-checking mode:
+
+```python
+# pyre-check: selfcheck
+```
+
+Such a fixture must exit successfully and print `PASS`. It is still discovered
+by both runners; `check_synthetic.py` runs it only when `--pyre` is supplied.
+A backend lacking a required mechanism can be scoped out in `check.py` with
+`# pyre-check: skip-backends=wasm` followed by a comment explaining the missing
+mechanism.

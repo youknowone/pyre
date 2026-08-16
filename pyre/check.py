@@ -1620,6 +1620,22 @@ def synth_no_cpython(path):
     )
 
 
+def synth_selfcheck(path):
+    """Read an optional self-checking fixture marker from its header:
+        # pyre-check: selfcheck
+
+    These fixtures assert their own invariant and print ``PASS`` instead of
+    producing stable output for the cpython/pypy parity comparison.  Keeping
+    the marker on the fixture lets the synthetic suite discover it normally
+    without a second, hard-coded list in ``main``.
+    """
+    return _synth_header_flag(
+        path,
+        "# pyre-check: selfcheck",
+        "synthetic selfcheck marker takes no value",
+    )
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -2905,8 +2921,8 @@ class Check:
 
         The script asserts its own invariant (exit 0 AND prints *expect*);
         check.py only honors the exit code and the required marker. Used for
-        guards whose signal is a timing ratio, not byte-identical output, so
-        they cannot go through `run_bench` or the synthetic suite.
+        guards whose signal is an asserted invariant, not byte-identical
+        output, so they cannot go through `run_bench` or synthetic parity.
 
         *skip_backends* names backends the guard does not apply to (e.g. a
         `time`-module timing guard cannot run on the wasm guest, which has no
@@ -3158,9 +3174,23 @@ class Check:
         print(bold("synthetic parity suite"))
         print(dim(f"{len(paths)} benchmark(s), pattern={pattern!r}"))
         for path in paths:
-            self.run_synthetic_bench(
-                str(path), self.args.synthetic_timeout,
-            )
+            try:
+                selfcheck = synth_selfcheck(path)
+                skip_backends = synth_skip_backends(path) if selfcheck else ()
+            except ValueError as e:
+                print(f"{red('ERROR')}: {e}")
+                sys.exit(1)
+            if selfcheck:
+                self.run_selfcheck(
+                    f"synth/{path.stem}",
+                    str(path),
+                    self.args.synthetic_timeout,
+                    skip_backends=skip_backends,
+                )
+            else:
+                self.run_synthetic_bench(
+                    str(path), self.args.synthetic_timeout,
+                )
         # A fixture that loses its cpython reference also loses the
         # cpython/pypy output cross-check, so the count belongs in the summary
         # rather than only in the per-fixture line it scrolled past. A fixture
@@ -3516,76 +3546,6 @@ def main():
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
-        # Skipped on wasm: the guard times calls with `time.perf_counter()`, and
-        # the wasm guest has no `time` module (import fails before any output),
-        # so the guard is native-JIT-backend only.
-        chk.run_selfcheck(
-            "loop_reentry",
-            f"{B}/loop_reentry_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # Skipped on wasm: the guest has no os/filesystem — open() raises
-        # NotImplementedError and `import os` has no posix backend — so the
-        # errno-specific OSError subclass behaviour is native-JIT-backend only.
-        chk.run_selfcheck(
-            "oserror_errno_fields",
-            f"{B}/oserror_errno_fields_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # Skipped on wasm for the same reason: os.replace needs a filesystem.
-        chk.run_selfcheck(
-            "posix_replace",
-            f"{B}/posix_replace_regression.py",
-            15,
-            skip_backends=("wasm",),
-        )
-        # The f_locals write-through it drives is a 3.14 FrameLocalsProxy
-        # behaviour PyPy 3.11 lacks (its f_locals is a snapshot), so cpython and
-        # pypy disagree on the mutated value and it cannot be a synthetic bench.
-        # The guard is pyre-internal: a forcing callee's escape flush must resume
-        # past the abort, else the in-flight FOR_ITER iteration drops and the
-        # loop total comes up short. Asserted inside the script.
-        chk.run_selfcheck(
-            "getframe_escape_flush_writethrough",
-            f"{B}/getframe_escape_flush_writethrough_regression.py",
-            15,
-        )
-        # The coordinate a frame reports WHILE it is still running: compiled code
-        # runs no per-opcode `last_instr` store, so a replayed frame answers for
-        # the instruction it is on only if the blackhole publishes at the
-        # `-live-` marker. Runs on every backend -- it is also the guard that
-        # catches a store whose width overruns `valuestackdepth` onto the
-        # `last_instr` next to it, which is a 32-bit-only failure.
-        chk.run_selfcheck(
-            "frame_lineno_mid_replay",
-            f"{B}/frame_lineno_mid_replay_regression.py",
-            20,
-        )
-        # The sibling shape: the frame handed out is the INLINED CALLEE's own,
-        # not the virtualizable its caller runs as. That frame carries the `-1`
-        # `last_instr` sentinel and is not what the escape flush writes, so its
-        # `f_lineno` / `f_locals` are only right because `sys._getframe` forces
-        # and the resulting abort finishes the iteration interpreted. Pins the
-        # answer so a change that retires that abort has to keep it -- the whole
-        # synthetic corpus stayed green while these three reads broke.
-        chk.run_selfcheck(
-            "frame_inlined_callee_own_image",
-            f"{B}/frame_inlined_callee_own_image_regression.py",
-            20,
-        )
-        # The third frame-image shape: an inlined callee reads its CALLER's
-        # real frame via `sys._getframe(1)` while the caller's compiled loop is
-        # still active.  The two sibling guards miss this because one reads
-        # after the loop and the other reads the callee's own frame.  The read
-        # stays on non-forcing coordinates (`f_lasti` / `f_lineno`) so a bad
-        # escape flush cannot be masked by routing back through the interpreter.
-        chk.run_selfcheck(
-            "frame_caller_image_from_inlined_callee",
-            f"{B}/frame_caller_image_from_inlined_callee_regression.py",
-            20,
-        )
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing

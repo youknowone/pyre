@@ -1,11 +1,13 @@
+# pyre-check: selfcheck
+# pyre-check: skip-backends=wasm
+# The wasm guest has no `time` module, which this timing guard requires.
 # Regression guard: a compiled hot loop must be re-entered on every call of its
 # enclosing function, not only on the call that compiled it.
 #
-# Wired into check.py via run_selfcheck on dynasm + cranelift; skipped on wasm,
-# whose guest has no `time` module. Run it directly:
+# Discovered by the synthetic suite as a native-backend self-check. Run it directly:
 #
-#     python pyre/bench/loop_reentry_regression.py               # PASS (interpreter)
-#     target/release/pyre-cranelift pyre/bench/loop_reentry_regression.py
+#     python pyre/bench/synth/loop_reentry_regression.py
+#     target/release/pyre-cranelift pyre/bench/synth/loop_reentry_regression.py
 #
 # The regression it guards: is_compatible refused re-entry once the enclosing
 # module bound a new top-level name and its globals dict grew, so call 1 ran the

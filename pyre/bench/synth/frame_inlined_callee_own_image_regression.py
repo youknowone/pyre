@@ -1,5 +1,6 @@
+# pyre-check: selfcheck
 # Self-checking regression guard for the image an INLINED CALLEE's own frame
-# reports (registered via check.py run_selfcheck, NOT the synthetic suite).
+# reports. The synthetic suite discovers it as a self-checking fixture.
 #
 # Sibling of `frame_lineno_mid_replay_regression`, which reads the coordinate
 # through `sys._getframe(1)` from a callee whose caller is the portal — the

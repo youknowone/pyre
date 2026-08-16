@@ -1,10 +1,12 @@
+# pyre-check: selfcheck
+# pyre-check: skip-backends=wasm
+# The wasm guest has no os/filesystem support used by this fixture.
 # A failed syscall raises the errno-specific OSError subclass with
 # .errno/.strerror/.filename set and args=(errno, strerror): open() of a
 # missing path -> FileNotFoundError(2), os.mkdir of an existing path ->
 # FileExistsError(17).  Native-only: the wasm guest has no os/filesystem
 # (open() raises NotImplementedError, `import os` has no posix backend), so
-# this guard is registered with skip_backends=("wasm",).  Behaviour verified
-# against CPython/PyPy.
+# this guard skips that backend. Behaviour verified against CPython/PyPy.
 #
 # Both fixtures come from `os` alone: a pid-named directory this script
 # creates in the cwd, rather than tempfile.mkdtemp, so the guard stays

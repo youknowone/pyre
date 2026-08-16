@@ -30,9 +30,8 @@
 #
 # Both frame exits publishing is not enough on its own: a frame can also be
 # READ while it is still running.  That half lives in
-# `pyre/bench/frame_lineno_mid_replay_regression.py` instead of here, because
-# the wasm backend does not satisfy it yet and the synthetic suite has no
-# per-backend scoping; the guard carries the measurement.
+# `frame_lineno_mid_replay_regression.py` as a self-checking synth fixture; the
+# guard carries the measurement instead of comparing stable oracle output.
 #
 # Offsets run from `co_firstlineno` so edits above these functions do not move
 # the expected values.

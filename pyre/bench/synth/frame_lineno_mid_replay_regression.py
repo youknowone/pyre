@@ -1,5 +1,6 @@
+# pyre-check: selfcheck
 # Self-checking regression guard for the coordinate a frame reports WHILE it is
-# still running (registered via check.py run_selfcheck, NOT the synthetic suite).
+# still running. The synthetic suite discovers it as a self-checking fixture.
 #
 # `dispatch_bytecode` (pyopcode.py) stamps `last_instr` before every opcode, so
 # a running frame answers `f_lineno`, `f_lasti` and any traceback taken off it
