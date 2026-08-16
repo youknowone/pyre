@@ -96,6 +96,7 @@ pub mod resume_box_reader;
 pub(crate) mod ruleopt;
 pub mod support;
 mod trace_ctx;
+pub mod virt_array;
 pub mod virtualizable;
 pub mod virtualref;
 pub mod walkvirtual;

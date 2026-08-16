@@ -2177,6 +2177,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
                 // exactly this reason).  Fail loud rather than emit a
                 // `GetfieldGcR` at `field_offset` that would read `cap` as the
                 // base pointer and corrupt memory.
+                //
+                // The way out is the field's declared container, not this arm: a
+                // `virt_array::VirtArray` field holds a pointer to a block whose
+                // length and payload sit at fixed offsets, which registers as
+                // `DirectPointer` above and reloads through the ordinary
+                // `compile.py:441-457` pair.
                 panic!(
                     "patch_new_loop reload of a RustVec virtualizable array \
                      (array {ai}) is unsupported: the in-trace IR cannot locate \

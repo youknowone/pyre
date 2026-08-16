@@ -647,8 +647,9 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .collect();
     // One value: the virtualizable identity (`&state` ==
     // `virtualizable_heap_ptr`), NOT any array's data pointer —
-    // `vable_getarrayitem_*` reaches every element through the RustVec storage
-    // from this base, and all `[.. ; virt]` arrays share it.  Emitting it once
+    // `vable_getarrayitem_*` reaches every element from this base through the
+    // storage each field registered, and all `[.. ; virt]` arrays share it.
+    // Emitting it once
     // is `virtualizable.py:139-144`; the lengths stay off the red vector
     // (`virtualizable.py:150-153` reads them off the live object).
     let extract_vable_identity_part: TokenStream = if has_vable_identity {
@@ -790,7 +791,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 StateFieldKind::VirtArray(tp) if tp == "float" => quote! { 0.0f64 },
                 _ => quote! { 0i64 },
             };
-            quote! { #fname: ::std::vec![#zero; self.#len_value_name as usize], }
+            // Constructed through the backing trait rather than as a `vec![]`,
+            // so the field keeps whatever container it was declared with. The
+            // target type comes from the field this initializer fills.
+            quote! {
+                #fname: majit_metainterp::virt_array::VirtArrayBacking::filled(
+                    #zero,
+                    self.#len_value_name as usize,
+                ),
+            }
         })
         .collect();
     // Reds in `extract_live` order: int scalars, then flattened fixed-array
@@ -1926,15 +1935,17 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // (`warmspot.py:520-545 make_virtualizable_infos`) is what makes
     // `compile.py:508-511`'s field-reload preamble run, which would retire the
     // per-entry re-export of the virtualizable's array elements. Not declared
-    // here yet, and the missing piece is NOT the declaration: this state model
-    // backs its virtualizable arrays with `Vec`s embedded by value, and
-    // `compile.py:441-457`'s reconstruction needs to reach each array's data
-    // pointer with a load the trace IR can express. It cannot: a `Vec`'s data
-    // pointer is not at a specified offset within it, so there is no field
-    // load that portably finds it (see the `RustVec` arm of
-    // `patch_new_loop_to_load_virtualizable_fields`). Declaring the name
-    // without first giving that arm a reload it can emit turns every compile
-    // of such a driver into that arm's refusal.
+    // here yet, and whether it CAN be is the declared field type's answer, not
+    // this expansion's: `compile.py:441-457`'s reconstruction reaches each
+    // array's data pointer with a load the trace IR has to be able to express.
+    // A `Vec` embedded by value defeats that — its data pointer is not at a
+    // specified offset within it, so no field load portably finds it, and the
+    // `RustVec` arm of `patch_new_loop_to_load_virtualizable_fields` refuses
+    // rather than read a capacity as a base address. A field declared with
+    // `majit_metainterp::virt_array::VirtArray` holds a pointer to a block whose
+    // length and payload are at fixed offsets, which is the `Ptr(GcArray)` shape
+    // that arm's ordinary path already emits. So declaring the name is safe only
+    // once every `[.. ; virt]` field on the state is block-backed.
     //
     // When it is declared, it must arrive through
     // `JitDriver::declare_flat_entry_contract` together with the width of the
@@ -2031,13 +2042,20 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
 
     // ── VirtualizableInfo / heap-ptr overrides for `[int; virt]` arrays ──
-    // Each virt array becomes a standard-virtualizable RustVec array field on
-    // a zero-static-field vinfo, so `state.<arr>[i]` lowers through the
+    // Each virt array becomes a standard-virtualizable array field on a
+    // zero-static-field vinfo, so `state.<arr>[i]` lowers through the
     // `virtualizable_boxes` devirt path. Scalars stay in the state-field
     // scalar resume mechanism (disjoint from the array restore).
+    //
+    // Which storage the field registers as is the declared field type's to say,
+    // not this expansion's: `register_virt_array_field` resolves it from the
+    // container the interpreter author wrote. That is the difference the
+    // compiled entry sees — only a field holding a pointer to a block with a
+    // fixed payload offset can be reloaded by `compile.py:441-457`, and a `Vec`
+    // embedded by value is not one.
     let build_vinfo_override: TokenStream = if num_virt_arrays > 0 {
-        // Per virt array: nested data-ptr/len extractor fns + an
-        // `add_rust_vec_array_field` call keyed on the field byte offset.
+        // Per virt array: nested data-ptr/len extractor fns + a registration
+        // keyed on the field byte offset.
         let virt_array_field_parts: Vec<TokenStream> = virt_arrays
             .iter()
             .map(|(_, f)| {
@@ -2062,18 +2080,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     fn #len_fn(__p: *const u8) -> usize {
                         unsafe { (*(__p as *const #state_type)).#fname.len() }
                     }
-                    let __descr = majit_ir::descr::make_array_descr(
-                        0,
-                        #item_size,
-                        #item_type,
-                    );
-                    __info.add_rust_vec_array_field(
+                    majit_metainterp::virt_array::register_virt_array_field(
+                        &mut __info,
                         #fname_str,
                         #item_type,
+                        #item_size,
                         ::std::mem::offset_of!(#state_type, #fname),
                         #data_ptr_fn,
                         #len_fn,
-                        __descr,
+                        |__s: &#state_type| &__s.#fname,
                     );
                 }
             })
