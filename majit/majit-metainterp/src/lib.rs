@@ -221,6 +221,13 @@ pub fn bh_debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_DEBUG").is_some())
 }
 
+/// TEMPORARY DIAGNOSTIC. Reports a blackhole register bank resized while a
+/// root registration still names its buffer. Remove with the investigation.
+pub fn bh_root_check_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_ROOT_CHECK").is_some())
+}
+
 pub fn callee_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("PYRE_CALLEE_RCA").is_some())

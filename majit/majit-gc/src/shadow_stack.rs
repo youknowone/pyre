@@ -1148,6 +1148,34 @@ pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
     RESUME_REF_ROOTS_STACK.with(|ss| ss.borrow().iter().any(|&(p, _)| std::ptr::eq(p, ptr)))
 }
 
+/// The longest registration naming a buffer that starts at `ptr`, across both
+/// the resume-construction stack and the blackhole register-bank stack.
+///
+/// Both stacks root a bank by the raw `(pointer, length)` of its `Vec` buffer
+/// and share one precondition: the bank is sized once and only indexed
+/// afterwards. A caller about to resize a bank consults this to find out
+/// whether that precondition still holds for the buffer it is holding.
+pub fn ref_bank_registration_len(ptr: *const i64) -> Option<usize> {
+    let resume = RESUME_REF_ROOTS_STACK.with(|ss| {
+        ss.borrow()
+            .iter()
+            .filter(|&&(p, _)| std::ptr::eq(p, ptr))
+            .map(|&(_, len)| len)
+            .max()
+    });
+    let bh = BH_REGS_STACK.with(|ss| {
+        ss.borrow()
+            .iter()
+            .filter(|entry| std::ptr::eq(entry.regs_ptr.cast_const(), ptr))
+            .map(|entry| entry.regs_len)
+            .max()
+    });
+    match (resume, bh) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (only, None) | (None, only) => only,
+    }
+}
+
 /// Register a ref slice as a GC root for the blackhole resume
 /// construction window (`resume.py:1312 blackhole_from_resumedata`).
 ///
