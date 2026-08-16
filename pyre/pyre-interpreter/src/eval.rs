@@ -5133,6 +5133,23 @@ mod tests {
     }
 
     #[test]
+    fn test_metaclass_super_call_preserves_keyword_arguments() {
+        // PyPy typeobject.py W_TypeObject.descr_call receives one Arguments
+        // object and forwards it unchanged to __new__ and __init__.  The
+        // default metaclass descriptor reached through super().__call__ must
+        // therefore keep `config` as a keyword instead of exposing pyre's
+        // builtin keyword-marker dict as a positional argument.
+        let (result, frame) = run_exec_frame(
+            "class Meta(type):\n    def __call__(cls, *args, **kwargs):\n        return super().__call__(*args, **kwargs)\nclass Config:\n    rootpath = 'ok'\nclass Node(metaclass=Meta):\n    def __init__(self, config):\n        self.rootpath = config.rootpath\nnode = Node(config=Config())\nresult = node.rootpath",
+        );
+        result.expect("metaclass super().__call__ keyword forwarding failed");
+        let w_globals = frame.get_w_globals();
+        let result = unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }
+            .expect("missing result");
+        assert_eq!(unsafe { pyre_object::w_str_get_value(result) }, "ok");
+    }
+
+    #[test]
     fn test_raise_invalid_cause_raises_typeerror() {
         let (result, _frame) = run_exec_frame("raise ValueError() from 1");
         let err = result.expect_err("invalid cause should fail");
