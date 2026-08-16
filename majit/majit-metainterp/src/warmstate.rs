@@ -5019,6 +5019,14 @@ mod tests {
     /// handing on the key for a second lookup — which is why upstream has no
     /// second reader that could disagree.
     ///
+    /// The entry path now carries the token the same way: `back_edge_internal`
+    /// binds it at the decision and hands it to
+    /// `MetaInterp::execute_assembler_at_dispatch_key` as an argument, so on
+    /// that route there is no longer a second reader for the resolved key to
+    /// keep honest — only the one modelled below. The u64 reader survives for
+    /// callers that reach a run without having decided anything about the cell
+    /// first, which is what the `executed` line stands in for.
+    ///
     /// # What this used to pin, and what it pins now
     ///
     /// This is the rewritten body of the `#[ignore]`d pin

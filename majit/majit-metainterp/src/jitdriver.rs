@@ -4472,12 +4472,19 @@ impl<S: JitState> JitDriver<S> {
         // They were not: the decision walked the bucket by `comparekey` while
         // the runner read `compiled_loops[hash]`, so on a chained bucket the
         // entry could decide about one cell's token and run another's.
-        let runnable_meta = if self.meta.has_compiled_loop(green_key) {
-            self.meta.get_compiled_meta(green_key).cloned()
-        } else {
-            None
-        };
-        if let Some(compiled_meta) = runnable_meta {
+        //
+        // The token itself is bound here rather than only tested, and travels
+        // to the run below as an argument. `warmstate.py:483` reads
+        // `procedure_token = cell.get_procedure_token()` once per
+        // `maybe_compile_and_run` and `:509-511` carries it out through
+        // `raise EnterJitAssembler(procedure_token, *execute_args)`; the
+        // runner receives it and never asks the cell again. This is the same
+        // resolve-once discipline the cell key above already follows, one
+        // level in: the token the gate said yes about IS the token executed,
+        // and a warm entry pays for one cell lookup rather than two.
+        if let Some(procedure_token) = self.meta.entry_procedure_token(green_key)
+            && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
+        {
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
@@ -4640,16 +4647,12 @@ impl<S: JitState> JitDriver<S> {
                 hook(green_key, target_pc);
             }
 
-            let result = if let Some(dispatch_key) = dispatch_key {
-                self.meta.run_compiled_detailed_with_values_at_dispatch_key(
-                    green_key,
-                    live_values,
-                    dispatch_key,
-                )
-            } else {
-                self.meta
-                    .run_compiled_detailed_with_values(green_key, live_values)
-            };
+            let result = self.meta.execute_assembler_at_dispatch_key(
+                &procedure_token,
+                green_key,
+                live_values,
+                selected_dispatch_key,
+            );
             // The compiled body has run and nothing below reads the entry
             // arguments, so the buffers go back before the first exit past
             // this point.

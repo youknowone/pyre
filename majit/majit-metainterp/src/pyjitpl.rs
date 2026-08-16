@@ -10516,15 +10516,47 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> Option<CompileResult<M>> {
-        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         // warmstate.py:398: execute the token returned by the JitCell, not
         // the compiled-metadata index's possibly retired predecessor.
+        //
+        // This is the resolving form, for callers that reach the run without
+        // having decided anything about the cell first. A caller that already
+        // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
+        self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
+    }
+
+    /// `warmstate.py:405-419 execute_assembler(loop_token, *args)`: the run
+    /// RECEIVES the token whoever decided to enter already resolved, and never
+    /// looks the cell up again. Upstream hands it over the same way —
+    /// `warmstate.py:483` reads `procedure_token = cell.get_procedure_token()`
+    /// once per `maybe_compile_and_run` and `:509-511` carries it out through
+    /// `raise EnterJitAssembler(procedure_token, *execute_args)`.
+    ///
+    /// A caller that holds no token yet goes through
+    /// [`Self::run_compiled_detailed_with_values_at_dispatch_key`], which is
+    /// this one with the resolve in front.
+    ///
+    /// What is passed must be a token read off the JitCell — the artifact
+    /// `compiled_loops` indexes is metadata and can still name a predecessor a
+    /// recompile or redirect has already replaced, and entering that one
+    /// re-enters invalidated machine code and fails GUARD_NOT_INVALIDATED on
+    /// every iteration.
+    pub fn execute_assembler_at_dispatch_key(
+        &mut self,
+        procedure_token: &std::sync::Arc<JitCellToken>,
+        green_key: u64,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> Option<CompileResult<M>> {
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
 
         Self::prepare_compiled_run_io();
-        let frame = self
-            .backend
-            .execute_token_with_dispatch_key(&token, live_values, dispatch_key);
+        let frame = self.backend.execute_token_with_dispatch_key(
+            procedure_token,
+            live_values,
+            dispatch_key,
+        );
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
@@ -11436,17 +11468,35 @@ impl<M: Clone> MetaInterp<M> {
     /// `is_invalidated` AND here.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
-        // warmstate.py:482-511 maybe_compile_and_run gates execution entry on
-        // `cell.get_procedure_token() is not None` (code present), NOT on
-        // has_compiled_targets. An entry bridge (ResumeFromInterpDescr) has
-        // compiled code but may carry 0 target_tokens; gating on
-        // has_target_tokens() refused to dispatch it, so the interp re-ticked
-        // the green key every back-edge -> bound_reached -> decay_all_counters
-        // flood that starved the guard-failure bridge counter. Gate on
-        // has_compiled_code() so a code-present token is entered directly.
+        self.entry_procedure_token(green_key).is_some()
+    }
+
+    /// `warmstate.py:483` `procedure_token = cell.get_procedure_token()` — the
+    /// entry decision's single read of the cell's current token, handed back so
+    /// the caller can carry it into the run instead of resolving a second time.
+    /// Upstream carries it the same way: `warmstate.py:509-511 raise
+    /// EnterJitAssembler(procedure_token, *execute_args)` passes the resolved
+    /// token to `execute_assembler`, which never re-reads the cell.
+    ///
+    /// `None` is upstream's `procedure_token is None`, where the entry falls
+    /// through to the counter tick. [`Self::has_compiled_loop`] is the boolean
+    /// form of exactly this question and is defined in terms of it, so a
+    /// decision taken through the predicate and a run taken through the token
+    /// cannot be about different objects.
+    ///
+    /// warmstate.py:482-511 maybe_compile_and_run gates execution entry on
+    /// `cell.get_procedure_token() is not None` (code present), NOT on
+    /// has_compiled_targets. An entry bridge (ResumeFromInterpDescr) has
+    /// compiled code but may carry 0 target_tokens; gating on
+    /// has_target_tokens() refused to dispatch it, so the interp re-ticked
+    /// the green key every back-edge -> bound_reached -> decay_all_counters
+    /// flood that starved the guard-failure bridge counter. Gate on
+    /// has_compiled_code() so a code-present token is entered directly.
+    #[inline]
+    pub fn entry_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
         self.warm_state
             .get_procedure_token(green_key)
-            .is_some_and(|token| token.has_compiled_code())
+            .filter(|token| token.has_compiled_code())
     }
 
     /// `warmstate.py:458-464` — the same code-presence gate as
