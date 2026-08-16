@@ -34,6 +34,50 @@ non-empty list un-skips 39 tests that load CPython's `_testsinglephase` and
 by default once slice 5 below lands and both modules build (slice 6 is Windows
 packaging, which the os gates make irrelevant to the default).
 
+## The header
+
+`include/pyre3.14t/` is what an extension compiles against.
+An extension includes `Python.h`; that file is only the include list, and the
+content is split by topic the way `pypy/module/cpyext/include` and CPython's
+own `Include` are -- `object.h`, `longobject.h`, `modsupport.h`, and so on, one
+per `cpyext` module. `pytypedefs.h` names the shared types once so no
+declaration waits on a definition.
+
+`pyre_decl.h` holds every exported entry point and **is generated** by
+`scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
+themselves, so a declaration cannot drift from its implementation. It is
+included after the headers that name the types it uses and before the ones
+defining `static inline` functions that call it.
+
+The generator does not spell the declaration from the Rust signature where
+CPython has one of its own. It emits **CPython's** declaration -- `PyLongObject
+*`, `Py_hash_t`, `PyCapsule_Destructor` -- having first checked that the two
+describe the same call. That check is `scripts/cpyext-abi.py check`, and it is
+a CI gate:
+
+```sh
+python3 pyre/scripts/cpyext-abi.py check          # every export vs. CPython
+python3 pyre/scripts/cpyext-abi.py generate --check
+```
+
+It compares ABI slots rather than spellings, resolving CPython's typedefs, so
+`Py_hash_t` and `Py_ssize_t` agree and `long` and `Py_ssize_t` do not. The
+recorded declarations live in `scripts/cpython-abi.txt` because CI has no
+CPython checkout; `snapshot` rewrites them from one, and that diff is the ABI
+change a version bump makes.
+
+This matters because nothing else here can see the failure. Every fixture in
+this tree is compiled against pyre's own header, so a parameter declared at the
+wrong width agrees with itself and only disagrees with the real world -- and
+only on a platform where the widths differ. `PyModule_AddIntConstant` took a
+`Py_ssize_t` where the reference declaration says `long`, which is the same on
+LP64 and 32 bits against 64 on Windows.
+
+The 35 exports CPython does not declare are the macros it spells over struct
+fields -- `PyLong_Check`, `PySequence_Fast_GET_ITEM`, `PyBytes_AS_STRING` --
+which have to be calls here, plus the two `_PyPyre_*` helpers the header's own
+`static inline` functions use.
+
 ## What is implemented
 
 The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a

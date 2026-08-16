@@ -3520,12 +3520,12 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// `PyType_FromSpec` reads the numbers an extension compiled against
-    /// `Python.h` wrote into its slot array, so the two tables are one ABI in
-    /// two places.  This walks the header and rejects any identifier whose
+    /// `typeslots.h` wrote into its slot array, so the two tables are one ABI
+    /// in two places.  This walks the header and rejects any identifier whose
     /// number the Rust side spells differently, or does not spell at all.
     #[test]
     fn every_slot_id_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../include/pyre3.14t/Python.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/typeslots.h");
 
         let mut checked = 0;
         for line in HEADER.lines() {

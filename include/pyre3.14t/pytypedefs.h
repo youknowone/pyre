@@ -1,0 +1,46 @@
+/* Forward names, so a declaration never waits on a definition.
+ *
+ * One of the headers `Python.h` includes; an extension includes only
+ * `Python.h`. The exported entry points are declared together in
+ * `pyre_decl.h`, which is generated.
+ */
+#ifndef PYRE_PYTYPEDEFS_H
+#define PYRE_PYTYPEDEFS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct _object PyObject;
+typedef struct _typeobject PyTypeObject;
+typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *);
+typedef PyObject *(*_PyCFunctionFast)(PyObject *, PyObject *const *, Py_ssize_t);
+typedef PyObject *(*_PyCFunctionFastWithKeywords)(PyObject *, PyObject *const *,
+                                                  Py_ssize_t, PyObject *);
+typedef int (*visitproc)(PyObject *, void *);
+typedef int (*traverseproc)(PyObject *, visitproc, void *);
+typedef int (*inquiry)(PyObject *);
+typedef void (*freefunc)(void *);
+typedef int (*converter)(PyObject *, void *);
+
+/* Named here because a declaration only ever takes a pointer to one, and
+   the header that defines each is included after `pyre_decl.h`. */
+typedef struct PyVarObject PyVarObject;
+typedef struct PyModuleDef PyModuleDef;
+typedef struct PyModuleDef_Slot PyModuleDef_Slot;
+typedef struct PyMethodDef PyMethodDef;
+typedef struct PyMemberDef PyMemberDef;
+typedef struct PyGetSetDef PyGetSetDef;
+typedef struct PyType_Slot PyType_Slot;
+typedef struct PyType_Spec PyType_Spec;
+typedef struct Py_buffer Py_buffer;
+/* An `int` is not a distinct object here, so the reference header's
+   `PyLongObject` is the ordinary mirror under its upstream name. */
+typedef PyObject PyLongObject;
+typedef void (*PyCapsule_Destructor)(PyObject *);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* !PYRE_PYTYPEDEFS_H */
