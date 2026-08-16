@@ -315,18 +315,47 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
 fn capture_root_parent_resume_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<MirrorStackImage> {
+    // Every refusal below names itself: an adopter that declines on a missing
+    // root-parent stack reports only "not capturable", so without these the
+    // seven silent `?` exits are indistinguishable from "never reached".
+    macro_rules! need {
+        ($opt:expr, $what:literal) => {
+            match $opt {
+                Some(value) => value,
+                None => {
+                    latchdbg!("root-parent-stack: {}", $what);
+                    return None;
+                }
+            }
+        };
+    }
     let session = ctx.session.borrow();
-    let parent = session.framestack.first()?.parent.as_ref()?;
-    let call_jit_pc = parent.call_jitcode_pc?;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)?;
+    let parent = need!(
+        need!(session.framestack.first(), "empty framestack")
+            .parent
+            .as_ref(),
+        "innermost frame has no parent"
+    );
+    let call_jit_pc = need!(parent.call_jitcode_pc, "parent has no call_jitcode_pc");
+    let pjc = need!(
+        crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32),
+        "parent jitcode index unresolved"
+    );
     if pjc.code_ptr.is_null() {
+        latchdbg!("root-parent-stack: parent code_ptr null");
         return None;
     }
-    let resume_py_pc = resolve_parent_resume_py_pc(parent)? as usize;
-    let depth = crate::liveness::liveness_for(pjc.code_ptr)
-        .depth_at_py_pc()
-        .get(resume_py_pc)
-        .copied()? as usize;
+    let resume_py_pc = need!(
+        resolve_parent_resume_py_pc(parent),
+        "parent resume py_pc unresolved"
+    ) as usize;
+    let depth = need!(
+        crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(resume_py_pc)
+            .copied(),
+        "no depth_at_py_pc for the parent resume pc"
+    ) as usize;
     // `MIFrame`'s operand stack starts after locals *and* cell/freevar
     // entries (`pyframe.py:111`).  `call_stack_overrides` uses that same
     // semantic slot space through `caller_sym.nlocals()`; using only
@@ -334,8 +363,11 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     // its cells when the multi-frame blackhole image is adopted.
     let code = unsafe { &*pjc.code_ptr };
     let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
-    let result_bank = call.argcodes.chars().last()?;
+    let call = need!(
+        decode_op_at(&pjc.jitcode.code, call_jit_pc),
+        "parent call op does not decode"
+    );
+    let result_bank = need!(call.argcodes.chars().last(), "parent call op has no argcodes");
     let result_slot = (result_bank != 'v' && depth != 0).then_some(nlocals + depth - 1);
     let mut slots = Vec::with_capacity(depth);
     for slot in nlocals..nlocals + depth {
@@ -343,10 +375,23 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             slots.push(pyre_object::PY_NULL);
             continue;
         }
-        let value = parent
+        let Some(value) = parent
             .call_stack_overrides
             .iter()
-            .find_map(|&(candidate, value)| (candidate == slot).then_some(value))?;
+            .find_map(|&(candidate, value)| (candidate == slot).then_some(value))
+        else {
+            latchdbg!(
+                "root-parent-stack: no call_stack_override for slot {slot} \
+                 (nlocals={nlocals} depth={depth} resume_py_pc={resume_py_pc} \
+                 call_jit_pc={call_jit_pc} have={:?})",
+                parent
+                    .call_stack_overrides
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .collect::<Vec<_>>()
+            );
+            return None;
+        };
         slots.push(value);
     }
     Some(MirrorStackImage {
