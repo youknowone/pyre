@@ -1461,9 +1461,42 @@ impl VirtualizableInfo {
             self.reset_vable_token(obj_ptr);
         }
     }
+
+    /// Whether every array field can be rebuilt by the compiled entry's
+    /// field-load preamble — see [`VableArrayInfo::is_entry_reloadable`].
+    ///
+    /// `compile.py:508-511` runs that preamble for any driver whose
+    /// `virtualizable_info` is set, with no per-array escape, so the decision
+    /// is all-or-nothing per virtualizable: one array the preamble cannot
+    /// reload disqualifies the whole entry contract, not just that array.
+    pub fn arrays_are_entry_reloadable(&self) -> bool {
+        self.array_fields
+            .iter()
+            .all(VableArrayInfo::is_entry_reloadable)
+    }
 }
 
 impl VableArrayInfo {
+    /// Whether the compiled entry's field-load preamble can rebuild this
+    /// array's elements from the virtualizable pointer alone.
+    ///
+    /// `compile.py:441-457` reaches every element with `GETFIELD_GC_R` for the
+    /// array's data pointer followed by one `GETARRAYITEM_GC_*` per element —
+    /// two loads expressible in trace IR with nothing but byte offsets. A
+    /// storage whose data pointer sits at a fixed offset (from the field, or
+    /// from a container the field points at) answers that; a `Vec` embedded by
+    /// value does not, because its data pointer is one of three words in an
+    /// order the language does not specify, so no field load portably finds it.
+    /// `patch_new_loop_to_load_virtualizable_fields` panics rather than read a
+    /// capacity as a base address, which makes this the predicate a caller must
+    /// consult BEFORE putting a virtualizable on the preamble's path.
+    pub fn is_entry_reloadable(&self) -> bool {
+        match self.storage {
+            VableArrayStorage::DirectPointer | VableArrayStorage::EmbeddedArray { .. } => true,
+            VableArrayStorage::RustVec { .. } => false,
+        }
+    }
+
     pub fn can_read_length_from_heap(&self) -> bool {
         match self.storage {
             VableArrayStorage::EmbeddedArray { .. } => true,

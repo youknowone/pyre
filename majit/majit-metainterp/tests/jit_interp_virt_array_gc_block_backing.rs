@@ -157,3 +157,35 @@ fn the_live_arrays_are_reachable_from_the_state_pointer_by_the_registered_offset
         0.5
     );
 }
+
+/// Because the storage is reloadable, installing the machine ARMS the flat
+/// entry contract: `warmspot.py:520-545` names the virtualizable on the
+/// jitdriver static data, which is what makes `compile.py:508-511`'s reload
+/// preamble run.
+///
+/// The width is the flat live-value prefix, not the red count — this state has
+/// no scalars, so the whole prefix is the one virtualizable identity slot at
+/// index 0, and `virtualizable_arg_index` answers in that model rather than
+/// with a position among the reds.
+#[test]
+fn installing_a_block_backed_machine_arms_the_flat_entry_contract() {
+    let program = count_program();
+    let mut driver: majit_metainterp::JitDriver<Machine> =
+        majit_metainterp::JitDriver::new(u32::MAX);
+    let state = Machine {
+        regs: VirtArray::from_slice(&[0i64, 1]),
+        fregs: VirtArray::filled(0.0f64, 1),
+    };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, &program)
+            .install_canonical_liveness(&mut driver);
+    }
+
+    let contract = driver
+        .flat_entry_contract()
+        .expect("a reloadable virtualizable arms the contract");
+    assert_eq!(contract.len, 1);
+    assert_eq!(contract.index_of_virtualizable, 0);
+}

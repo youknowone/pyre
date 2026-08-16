@@ -1933,28 +1933,60 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
     // Naming the virtualizable on the jitdriver static data
     // (`warmspot.py:520-545 make_virtualizable_infos`) is what makes
-    // `compile.py:508-511`'s field-reload preamble run, which would retire the
-    // per-entry re-export of the virtualizable's array elements. Not declared
-    // here yet, and whether it CAN be is the declared field type's answer, not
-    // this expansion's: `compile.py:441-457`'s reconstruction reaches each
-    // array's data pointer with a load the trace IR has to be able to express.
-    // A `Vec` embedded by value defeats that — its data pointer is not at a
-    // specified offset within it, so no field load portably finds it, and the
-    // `RustVec` arm of `patch_new_loop_to_load_virtualizable_fields` refuses
-    // rather than read a capacity as a base address. A field declared with
-    // `majit_metainterp::virt_array::VirtArray` holds a pointer to a block whose
-    // length and payload are at fixed offsets, which is the `Ptr(GcArray)` shape
-    // that arm's ordinary path already emits. So declaring the name is safe only
-    // once every `[.. ; virt]` field on the state is block-backed.
+    // `compile.py:508-511`'s field-reload preamble run, which retires the
+    // per-entry re-export of the virtualizable's array elements: the compiled
+    // entry reloads them from the virtualizable pointer instead of being handed
+    // one entry argument per element.
     //
-    // When it is declared, it must arrive through
-    // `JitDriver::declare_flat_entry_contract` together with the width of the
-    // entry it applies to: the flat live-value prefix, not the red count (the
-    // whole state is a single red in the merge-point payload). That prefix is
-    // `num_scalars + num_vable_identity_slots + num_ref_scalars +
-    // num_float_scalars` with the identity at flat index `num_scalars`, valid
-    // only while the state declares no fixed arrays — the same restriction
-    // `identity_live_index` below carries, and for the same reason.
+    // The name arrives through `JitDriver::declare_flat_entry_contract` together
+    // with the width of the entry it applies to, because the two halves are only
+    // meaningful together: the entry is the flat live-value prefix, not the red
+    // count (the whole state is a single red in the merge-point payload), and an
+    // index into one picks out a different value than the same index into the
+    // other. That prefix is `num_scalars + num_vable_identity_slots +
+    // num_ref_scalars + num_float_scalars` with the identity at flat index
+    // `num_scalars` — the order `extract_live` emits — valid only while the
+    // state declares no fixed arrays, the same restriction `identity_live_index`
+    // below carries and for the same reason: a fixed array contributes its
+    // runtime length to the prefix, and no constant here can name a length that
+    // is read off a state instance.
+    //
+    // Whether the contract CAN be declared at all is the declared field type's
+    // answer, not this expansion's: `compile.py:441-457`'s reconstruction
+    // reaches each array's data pointer with a load the trace IR has to be able
+    // to express, and a `Vec` embedded by value defeats that — its data pointer
+    // is not at a specified offset within it, so no field load portably finds
+    // it. `JitDriver::arm_flat_entry_contract` answers that off the vinfo this
+    // expansion already installed, and declines rather than declaring, so the
+    // width below is stated unconditionally and the structural gate stays where
+    // the storage is known. Left unarmed, a state keeps the per-entry re-export
+    // and behaves exactly as it did before.
+    //
+    // SOUNDNESS. Arming puts this driver on
+    // `patch_new_loop_to_load_virtualizable_fields`, which BAKES each array's
+    // trace-start length into the prologue as a fixed count of `GETARRAYITEM`
+    // ops (`compile.py:443`), and nothing re-reads it afterwards. The invariant
+    // stated on that helper is that the lengths are a function of the trace's
+    // GREENS, so a virtualizable with other lengths keys to a different trace
+    // and never reaches this entry. It is the interpreter author's to satisfy —
+    // a `[.. ; virt]` array whose length can vary while the greens stay fixed
+    // must not be block-backed — and it cannot be checked here: the lengths live
+    // on state instances that do not exist at install time.
+    let arm_flat_entry_contract: TokenStream = if num_virt_arrays > 0 && arrays.is_empty() {
+        let entry_len =
+            num_scalars + num_vable_identity_slots + num_ref_scalars + num_float_scalars;
+        let index_of_virtualizable = num_scalars;
+        quote! {
+            driver.arm_flat_entry_contract(
+                majit_metainterp::FlatEntryContract {
+                    len: #entry_len,
+                    index_of_virtualizable: #index_of_virtualizable,
+                },
+            );
+        }
+    } else {
+        quote! {}
+    };
 
     // pyjitpl.py:3443-3444 `rebuild_state_after_failure`:
     //     if vinfo is not None:
@@ -2353,6 +2385,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // empty stub.  `green_kind_counts` / `red_kind_counts`
                 // then reflect the actual payload partition.
                 #declare_schema_fn_name(driver);
+                // `warmspot.py:520-545 make_virtualizable_infos` names the
+                // virtualizable on the jitdriver static data during setup, i.e.
+                // before the driver is registered. Order matters here for the
+                // same reason: `ensure_descriptor_registered` MOVES the
+                // descriptor into the `MetaInterpStaticData` table, so a
+                // contract declared after it would land on a descriptor no
+                // consumer reads.
+                #arm_flat_entry_contract
                 driver.ensure_descriptor_registered();
                 // Register canonical entry +
                 // canonical opcode ids into the driver-shared

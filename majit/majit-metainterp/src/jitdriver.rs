@@ -1836,6 +1836,52 @@ impl<S: JitState> JitDriver<S> {
         self.descriptor_cache = None;
     }
 
+    /// Declare `contract` if — and only if — this driver's virtualizable is one
+    /// the compiled entry's field-load preamble can serve. Reports whether it
+    /// was declared.
+    ///
+    /// Declaring the contract is what puts the driver on
+    /// `compile.py:508-511`'s preamble: the fields ride through the optimizer
+    /// as expanded inputargs and are reloaded from the virtualizable at entry
+    /// instead of being handed over one argument per element. That only works
+    /// for a virtualizable whose arrays the preamble can reach — see
+    /// [`crate::virtualizable::VirtualizableInfo::arrays_are_entry_reloadable`]
+    /// — and which array storage a state's fields register as is resolved from
+    /// the containers the interpreter author declared, at
+    /// `VirtualizableInfo`-build time. So the caller supplies the two numbers
+    /// only it can know (the width of its own entry and the virtualizable's
+    /// position in it) and the gate is answered here, off the vinfo already
+    /// installed on this driver.
+    ///
+    /// The name comes from the same vinfo (`interp_jit.py:25`
+    /// `jitdriver_sd.virtualizable_info.name`) rather than from the caller, so
+    /// the descriptor cannot end up naming a virtualizable other than the one
+    /// the gate was answered about.
+    ///
+    /// A driver with no virtualizable info, or one holding an array the
+    /// preamble cannot reload, is left exactly as it was: no contract, no name,
+    /// and the entry keeps whichever shape it already had.
+    pub fn arm_flat_entry_contract(&mut self, contract: FlatEntryContract) -> bool {
+        let Some(info) = self.meta.virtualizable_info() else {
+            return false;
+        };
+        if !info.arrays_are_entry_reloadable() {
+            return false;
+        }
+        let name = info.name.clone();
+        self.declare_flat_entry_contract(&name, contract);
+        true
+    }
+
+    /// The entry contract this driver's descriptor carries, if one was armed.
+    ///
+    /// Reads through the driver rather than the registered static data because
+    /// `register_descriptor` mirrors the stamped copy back onto the driver, so
+    /// this answer is the same before and after registration.
+    pub fn flat_entry_contract(&self) -> Option<FlatEntryContract> {
+        self.descriptor.as_ref()?.flat_entry_contract()
+    }
+
     pub fn with_descriptor(threshold: u32, descriptor: JitDriverStaticData) -> Self {
         let mut driver = Self::new(threshold);
         // warmstate.py:564 `_green_args_spec` carries lltype TYPE per
@@ -8412,6 +8458,112 @@ mod tests {
         assert_eq!(after.index_of_virtualizable, 1);
         // The reds still describe the merge-point payload, unchanged.
         assert_eq!(after.num_reds(), 1);
+    }
+
+    /// Build a driver whose virtualizable holds one array in `storage`.
+    fn driver_with_one_vable_array(
+        storage: crate::virtualizable::VableArrayStorage,
+    ) -> JitDriver<TypedRestoreState> {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema_typed(vec![("pc", GreenType::Int)], vec![("state", Type::Ref)]);
+        let mut info = crate::virtualizable::VirtualizableInfo::without_vable_token();
+        info.name = "state".to_string();
+        match storage {
+            crate::virtualizable::VableArrayStorage::RustVec {
+                data_ptr_fn,
+                len_fn,
+            } => {
+                info.add_rust_vec_array_field(
+                    "regs",
+                    Type::Int,
+                    0,
+                    data_ptr_fn,
+                    len_fn,
+                    majit_ir::descr::make_array_descr(0, 8, Type::Int),
+                );
+            }
+            _ => {
+                info.add_array_field(
+                    "regs",
+                    Type::Int,
+                    0,
+                    0,
+                    8,
+                    majit_ir::descr::make_array_descr(8, 8, Type::Int),
+                );
+            }
+        }
+        driver
+            .meta
+            .set_virtualizable_info(info.finalize_arc(majit_ir::descr::make_size_descr(16)));
+        driver
+    }
+
+    /// A virtualizable whose arrays the entry preamble can reload gets armed:
+    /// `warmspot.py:520-545` names it on the static data, which is what makes
+    /// `compile.py:508-511` run.
+    #[test]
+    fn arming_declares_the_contract_for_a_reloadable_virtualizable() {
+        let mut driver =
+            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::DirectPointer);
+        assert!(driver.arm_flat_entry_contract(FlatEntryContract {
+            len: 2,
+            index_of_virtualizable: 1,
+        }));
+        assert_eq!(
+            driver.flat_entry_contract(),
+            Some(FlatEntryContract {
+                len: 2,
+                index_of_virtualizable: 1,
+            })
+        );
+        // The name comes from the vinfo the gate was answered about, so the
+        // descriptor cannot end up naming a different virtualizable.
+        assert_eq!(
+            driver.descriptor.as_ref().unwrap().virtualizable.as_deref(),
+            Some("state")
+        );
+    }
+
+    /// A `Vec` embedded by value has no offset a field load can reach its data
+    /// pointer at, so `patch_new_loop_to_load_virtualizable_fields` refuses that
+    /// storage. Arming must decline BEFORE the driver reaches that refusal, and
+    /// leave the descriptor exactly as it found it — no contract and no name, so
+    /// the entry keeps the shape it already had.
+    #[test]
+    fn arming_declines_a_virtualizable_the_entry_preamble_cannot_reload() {
+        fn data_ptr(_: *mut u8) -> *mut i64 {
+            std::ptr::null_mut()
+        }
+        fn len(_: *const u8) -> usize {
+            0
+        }
+        let mut driver =
+            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::RustVec {
+                data_ptr_fn: data_ptr,
+                len_fn: len,
+            });
+        assert!(!driver.arm_flat_entry_contract(FlatEntryContract {
+            len: 2,
+            index_of_virtualizable: 1,
+        }));
+        assert_eq!(driver.flat_entry_contract(), None);
+        let descriptor = driver.descriptor.as_ref().expect("descriptor survives");
+        assert_eq!(descriptor.virtualizable, None);
+        assert_eq!(descriptor.virtualizable_arg_index(), None);
+    }
+
+    /// With no virtualizable there is nothing for the preamble to reload from,
+    /// so there is no contract to declare either.
+    #[test]
+    fn arming_declines_a_driver_with_no_virtualizable_info() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema_typed(vec![("pc", GreenType::Int)], vec![("state", Type::Ref)]);
+        assert!(!driver.arm_flat_entry_contract(FlatEntryContract {
+            len: 2,
+            index_of_virtualizable: 1,
+        }));
+        assert_eq!(driver.flat_entry_contract(), None);
     }
 
     #[test]
