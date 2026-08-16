@@ -1291,6 +1291,31 @@ fn py_stack_depth(code_ptr: *const pyre_interpreter::CodeObject, py: u32) -> usi
         .unwrap_or(0) as usize
 }
 
+/// Drop any armed out-of-order region.
+///
+/// The region's snapshot is keyed on the `(py_pc, depth)` coordinate the walk
+/// left, and it is restored when the walk returns to that same coordinate on
+/// the premise that no Python opcode retired in between.  A caller that
+/// rewrites `vstack_boxes` wholesale and moves the coordinate — an exception
+/// handler entry, a call-assembler return — breaks that premise: the stack the
+/// snapshot describes no longer exists, so a later boundary that happens to
+/// land on the same `(py_pc, depth)` would restore it over the live mirror.
+pub(crate) fn disarm_vstack_reorder_region<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    if keep_reorder_region_across_reseed() {
+        return;
+    }
+    ctx.vstack_reorder_ceiling = u32::MAX;
+    ctx.vstack_reorder_saved = None;
+}
+
+/// `PYRE_VSTACK_KEEP_REORDER`: leave an armed region in place across a mirror
+/// re-seed. The escape hatch for A/B-ing the disarm against the behaviour it
+/// replaces.
+fn keep_reorder_region_across_reseed() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("PYRE_VSTACK_KEEP_REORDER").is_some())
+}
+
 /// The handler-entry coordinate the mirror adopted, under `PYRE_VSTACK_DIAG`.
 /// `floor_py` is reported next to it: the two disagreeing is what an
 /// out-of-line catch target looks like from the walk's side, and without both
@@ -1391,6 +1416,7 @@ pub(crate) fn vstack_enter_exception_handler<Sym: WalkSym>(
     };
     ctx.vstack_boxes.clear();
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;
@@ -1464,6 +1490,7 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     // mirror shallower than the handler depth pads with NONE holes, which
     // `mirror_covers_kept` declines per slot rather than latching invalid.
     ctx.vstack_boxes.resize(handler_depth, OpRef::NONE);
+    disarm_vstack_reorder_region(ctx);
     // The unwinder pushes the caught exception onto the new TOS.
     if handler_depth >= 1 && exc != OpRef::NONE {
         ctx.vstack_boxes[handler_depth - 1] = exc;

@@ -974,7 +974,7 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (64): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (65): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -1000,7 +1000,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_PORTAL_RCA`, `PYRE_PROBE_BH_STARTUP`, `PYRE_PROBE_SNAPSHOT`,
 `PYRE_PROBE_SUBSCR`, `PYRE_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
 `PYRE_RERAISE_DIAG`, `PYRE_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
-`PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_NO_EXACT`,
+`PYRE_VSTACK_EXACT_AUDIT`, `PYRE_VSTACK_KEEP_REORDER`, `PYRE_VSTACK_NO_EXACT`,
 `PYRE_WASM_DUMP_BAD_TRACE`, `PYRE_WASM_EXEC_TRACE`, `PYRE_WASM_FBW_CENSUS`,
 `PYRE_WASM_GUARD_CENSUS`, `PYRE_WASM_JIT_STATS`, `PYRE_WASM_CALL_HIST`,
 `PYRE_WASM_NO_CACHE`, `PYRE_WASM_STARTUP_TRACE`.
@@ -1011,15 +1011,16 @@ value knobs bound the capture window, sampling rate, and report size. This is a
 diagnostic tool rather than a temporary runtime experiment, so it retires only
 if the example itself is removed.
 
-`PYRE_VSTACK_NO_EXACT` is an A/B switch over the walk-level operand-stack
-mirror, restoring the behaviour its default replaced: resolving the mirror's
-Python-PC coordinate from the floor tier rather than from the per-emission
-segmentation. It exists so the switchover stays measurable on one binary — any
-env var of any name moves the allocation layout, so a knob and its control must
-live in the same build. It goes when the floor tier has no plausible reader left
-to compare against. `PYRE_VSTACK_EXACT_AUDIT` dumps that segmentation table at
-build time and, on the walk side, the coordinate it yields; it is a report with
-no ON behaviour.
+`PYRE_VSTACK_NO_EXACT` and `PYRE_VSTACK_KEEP_REORDER` are A/B switches over the
+walk-level operand-stack mirror, each restoring the behaviour its default
+replaced: resolving the mirror's Python-PC coordinate from the floor tier rather
+than from the per-emission segmentation, and leaving an armed out-of-order
+region in place across a mirror re-seed. They exist so each switchover stays
+measurable on one binary — any env var of any name moves the allocation layout,
+so a knob and its control must live in the same build. Each goes when the
+behaviour it restores has no plausible reader left to compare against.
+`PYRE_VSTACK_EXACT_AUDIT` dumps that segmentation table at build time and, on
+the walk side, the coordinate it yields; it is a report with no ON behaviour.
 
 `PYRE_CHECK_INHERIT_ENV` is the other odd one: an A/B switch, not a report.
 `check.py` starts a benchmark child from an allowlisted environment because the

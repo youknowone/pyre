@@ -1142,6 +1142,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.vstack_cur_pypc = resume_py_pc;
         ctx.vstack_depth = resume_depth;
         ctx.vstack_last_ref = OpRef::NONE;
+        super::vstack_mirror::disarm_vstack_reorder_region(ctx);
     }
 
     // pyjitpl.py: GUARD_NOT_FORCED + resume snapshot advanced past
