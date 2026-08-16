@@ -500,17 +500,42 @@ pub unsafe extern "C" fn PyNumber_Float(object: *mut CPyObject) -> *mut CPyObjec
 }
 
 /// `PyNumber_AsSsize_t(object, exc)` — `exc` is the class an overflow is
-/// reported with, and NULL clamps instead of raising.  Pyre's index conversion
-/// does not overflow a `Py_ssize_t`, so `exc` is only consulted for the error
-/// it would carry.
+/// reported with, and NULL asks for the clamp instead.
+///
+/// `getindex_w` is the clamping half: an index too large for the machine word
+/// comes back as `i64::MAX` or `i64::MIN` rather than as an error, which is
+/// what a NULL `exc` wants and what a non-NULL one must not get.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyNumber_AsSsize_t(object: *mut CPyObject, _exc: *mut CPyObject) -> isize {
+pub unsafe extern "C" fn PyNumber_AsSsize_t(object: *mut CPyObject, exc: *mut CPyObject) -> isize {
     let Some(object) = argument(object) else {
         return -1;
     };
-    match trap(crate::baseobjspace::getindex_w(object)) {
-        Some(value) => value as isize,
-        None => -1,
+    if exc.is_null() {
+        return match trap(crate::baseobjspace::getindex_w(object)) {
+            Some(value) => value as isize,
+            None => -1,
+        };
+    }
+    let Some(index) = trap(crate::baseobjspace::space_index(object)) else {
+        return -1;
+    };
+    match crate::baseobjspace::int_w(index) {
+        Ok(value) => value as isize,
+        Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+            let message = format!(
+                "cannot fit '{}' into an index-sized integer",
+                crate::type_methods::arg_type_name(object)
+            );
+            let Ok(message) = std::ffi::CString::new(message) else {
+                return -1;
+            };
+            unsafe { super::pyerrors::PyErr_SetString(exc, message.as_ptr()) };
+            -1
+        }
+        Err(error) => {
+            super::pyerrors::set_pending_error(error);
+            -1
+        }
     }
 }
 

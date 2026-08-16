@@ -20,9 +20,14 @@ thread_local! {
 }
 
 /// Replace the indicator, releasing whatever it held.
+///
+/// Every caller hands in a reference of its own — a fresh one from `make_ref`,
+/// or the one `PyErr_Restore` was given to steal — so the release happens even
+/// when the replacement is the same mirror.  Skipping it there would keep one
+/// reference per repeat of the same exception instance.
 fn set_pending_raw(raw: *mut CPyObject) {
     let previous = PENDING.with(|slot| slot.replace(raw));
-    if !previous.is_null() && previous != raw {
+    if !previous.is_null() {
         unsafe { pyobject::decref(previous) };
     }
 }
@@ -387,14 +392,47 @@ pub unsafe extern "C" fn PyErr_Restore(
     }
 }
 
-/// Already normalized when it was set, so this only has to satisfy callers
-/// that run it defensively.
+/// `PyErr_NormalizeException` — replace the pair with the exception instance
+/// the class and value name.
+///
+/// An indicator this module set is normalized already, but the triple handed in
+/// need not have come from one: an extension may build `(PyExc_ValueError, "a
+/// message", NULL)` itself.  Both slots are read as owned references and left
+/// holding new ones, which is the documented transfer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_NormalizeException(
-    _ptype: *mut *mut CPyObject,
-    _pvalue: *mut *mut CPyObject,
+    ptype: *mut *mut CPyObject,
+    pvalue: *mut *mut CPyObject,
     _ptraceback: *mut *mut CPyObject,
 ) {
+    if ptype.is_null() || pvalue.is_null() {
+        return;
+    }
+    let (was_type, was_value) = unsafe { (*ptype, *pvalue) };
+    let class = unsafe { pyobject::from_ref(was_type) };
+    if class.is_null() {
+        return;
+    }
+    let value = unsafe { pyobject::from_ref(was_value) };
+    let Some(instance) = trap(normalized(class, value)) else {
+        return;
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(instance);
+    let Some(w_class) = crate::typedef::r#type(instance) else {
+        return;
+    };
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_class.as_ptr());
+    let value_ref = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(instance_slot));
+    let type_ref = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(class_slot));
+    unsafe {
+        *ptype = type_ref;
+        *pvalue = value_ref;
+        pyobject::decref(was_type);
+        pyobject::decref(was_value);
+    }
 }
 
 /// The non-variadic half of `PyErr_Format`; the header formats the message.

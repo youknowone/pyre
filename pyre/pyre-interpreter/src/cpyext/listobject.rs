@@ -227,7 +227,8 @@ pub unsafe extern "C" fn PyList_Check(object: *mut CPyObject) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_CheckExact(object: *mut CPyObject) -> c_int {
-    unsafe { PyList_Check(object) }
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && super::object::is_exactly(object, &pyre_object::LIST_TYPE)) as c_int
 }
 
 pub(super) fn ensure_linked() {

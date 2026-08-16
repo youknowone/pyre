@@ -3057,16 +3057,38 @@ pub unsafe extern "C" fn PyObject_Del(object: *mut std::ffi::c_void) {
     unsafe { PyObject_Free(object) };
 }
 
-/// `PyObject_Init` — stamp a block's header.  The block a C extension hands in
-/// is one [`PyType_GenericAlloc`] already produced, so only `ob_type` is set.
+/// `PyObject_Init` — stamp a block's header and make it an object.
+///
+/// A block from [`PyType_GenericAlloc`] arrives linked, and only its `ob_type`
+/// is (re)written.  A block from `PyObject_Malloc` arrives as raw bytes, which
+/// is the other supported spelling of the same allocation, so the interpreter
+/// object it stands for is created here and linked to it: the count it leaves
+/// with is the link share plus the one reference the caller now owns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_Init(
     object: *mut CPyObject,
     tp: *mut CPyTypeObject,
 ) -> *mut CPyObject {
-    if !object.is_null() {
-        unsafe { (*object).ob_type = tp };
+    if object.is_null() {
+        return unsafe { super::pyerrors::PyErr_NoMemory() };
     }
+    unsafe { (*object).ob_type = tp };
+    if unsafe { !(*object).ob_pyre_link.is_null() } {
+        return object;
+    }
+    let w_type = interpreter_type(tp);
+    if w_type.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "PyObject_Init(): the type is not ready",
+        ));
+        return std::ptr::null_mut();
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_type);
+    let instance = pyre_object::w_instance_new(pyre_object::gc_roots::shadow_stack_get(type_slot));
+    pyobject::link_allocated(instance, object, REFCNT_FROM_PYRE + 1);
     object
 }
 

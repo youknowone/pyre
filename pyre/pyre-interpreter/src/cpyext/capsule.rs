@@ -47,12 +47,27 @@ fn slot_get(carrier: PyObjectRef, key: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Both the carrier and its dictionary are read across the boxing of `value`,
+/// which allocates, so each is pinned and re-read rather than carried over it.
 fn slot_set(carrier: PyObjectRef, key: &str, value: usize) {
-    let dict = crate::baseobjspace::getdict_native(carrier);
-    if !dict.is_null() {
-        let value = pyre_object::w_int_new(value as i64);
-        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str(dict, key, value) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(carrier);
+    let dict =
+        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(carrier_slot));
+    if dict.is_null() {
+        return;
     }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(dict);
+    let value = pyre_object::w_int_new(value as i64);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            value,
+        )
+    };
 }
 
 fn is_capsule(object: PyObjectRef) -> bool {
@@ -240,28 +255,39 @@ pub unsafe extern "C" fn PyCapsule_IsValid(capsule: *mut CPyObject, name: *const
     valid as c_int
 }
 
-/// `PyCapsule_Import("mod.sub.attr", no_block)` — import the module named by
-/// everything before the last dot and read the capsule from it.
+/// `PyCapsule_Import("mod.sub.attr", no_block)` — import the first component
+/// and walk the rest with `getattr`.
+///
+/// Only the head is a module name: the components after it may be attributes of
+/// an object that is not itself importable, so the path is traversed rather
+/// than split at its last dot.  Each step allocates, so the object reached so
+/// far is re-read from the shadow stack instead of carried across it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCapsule_Import(name: *const c_char, _no_block: c_int) -> *mut c_void {
     let Some(path) = text_of(name) else {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     };
-    let Some((module_name, attribute)) = path.rsplit_once('.') else {
-        super::pyerrors::set_pending_error(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "PyCapsule_Import() needs a dotted name",
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut components = path.split('.');
+    let head = components.next().unwrap_or_default();
+    let Some(reached) = super::pyerrors::trap(super::import_::import_module(head)) else {
+        return std::ptr::null_mut();
+    };
+    let mut slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(reached);
+    for component in components {
+        let step = super::pyerrors::trap(crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            component,
         ));
-        return std::ptr::null_mut();
-    };
-    let imported = super::pyerrors::trap(
-        super::import_::import_module(module_name)
-            .and_then(|module| crate::baseobjspace::getattr_str(module, attribute)),
-    );
-    let Some(capsule) = imported else {
-        return std::ptr::null_mut();
-    };
+        let Some(step) = step else {
+            return std::ptr::null_mut();
+        };
+        slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(step);
+    }
+    let capsule = pyre_object::gc_roots::shadow_stack_get(slot);
     if !is_capsule(capsule) {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::AttributeError,

@@ -32,6 +32,11 @@ pub unsafe extern "C" fn PyMapping_Length(object: *mut CPyObject) -> isize {
     unsafe { super::object::PyObject_Size(object) }
 }
 
+/// The `str` key a `*String` entry point names.
+///
+/// Minting it allocates, so a caller resolves it *before* reading its receiver
+/// out of the mirror: a collection between the two would leave the receiver a
+/// pre-move address.
 fn key_of(pointer: *const c_char) -> Option<PyObjectRef> {
     if pointer.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
@@ -47,7 +52,7 @@ pub unsafe extern "C" fn PyMapping_GetItemString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> *mut CPyObject {
-    let (Some(object), Some(key)) = (argument(object), key_of(key)) else {
+    let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return std::ptr::null_mut();
     };
     result(crate::baseobjspace::getitem(object, key))
@@ -59,7 +64,7 @@ pub unsafe extern "C" fn PyMapping_SetItemString(
     key: *const c_char,
     value: *mut CPyObject,
 ) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), key_of(key)) else {
+    let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return -1;
     };
     let Some(value) = argument(value) else {
@@ -76,7 +81,7 @@ pub unsafe extern "C" fn PyMapping_DelItemString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), key_of(key)) else {
+    let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         return -1;
     };
     if trap(crate::baseobjspace::delitem(object, key)).is_none() {
@@ -103,7 +108,7 @@ pub unsafe extern "C" fn PyMapping_HasKeyString(
     object: *mut CPyObject,
     key: *const c_char,
 ) -> c_int {
-    let (Some(object), Some(key)) = (argument(object), key_of(key)) else {
+    let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
         unsafe { super::pyerrors::PyErr_Clear() };
         return 0;
     };

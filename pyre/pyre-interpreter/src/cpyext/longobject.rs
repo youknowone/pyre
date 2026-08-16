@@ -690,7 +690,8 @@ pub unsafe extern "C" fn PyLong_Check(object: *mut CPyObject) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyLong_CheckExact(object: *mut CPyObject) -> c_int {
-    unsafe { PyLong_Check(object) }
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && super::object::is_exactly(object, &pyre_object::INT_TYPE)) as c_int
 }
 
 /// `PyNumber_Long` — `int(object)`.

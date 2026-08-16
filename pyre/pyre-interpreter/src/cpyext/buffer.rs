@@ -71,15 +71,16 @@ fn releasebuffer_of(tp: *mut CPyTypeObject) -> *const c_void {
 // ── the exports this layer owns ─────────────────────────────────────────
 
 /// The `Py_buffer` behind each live `memoryview` this layer built, keyed by the
-/// exported address.
+/// `BufferView` that memoryview carries.
 ///
 /// A view has to hand the exporter back the exact structure it filled in --
-/// `internal` is the exporter's own state and nothing else can reconstruct it.
-/// The key is the address rather than the interpreter object because the
-/// collector moves the object and not the foreign memory; repeated exports of
-/// one address stack, and a release pops one of them.
-fn exports() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
-    static EXPORTS: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
+/// `internal` is the exporter's own state and nothing else can reconstruct it,
+/// and two live views over one address each have their own.  The key is the
+/// `BufferView` allocation rather than the memoryview because the collector
+/// moves the object and not that block, and rather than the exported address
+/// because several exports can name the same one.
+fn exports() -> &'static Mutex<HashMap<usize, usize>> {
+    static EXPORTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
     EXPORTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -90,22 +91,15 @@ fn snapshots() -> &'static Mutex<HashMap<usize, usize>> {
     SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_export(address: usize, view: *mut CPyBuffer) {
-    exports()
-        .lock()
-        .entry(address)
-        .or_default()
-        .push(view as usize);
+fn record_export(carrier: usize, view: *mut CPyBuffer) {
+    exports().lock().insert(carrier, view as usize);
 }
 
-fn take_export(address: usize) -> Option<*mut CPyBuffer> {
-    let mut map = exports().lock();
-    let stack = map.get_mut(&address)?;
-    let view = stack.pop()?;
-    if stack.is_empty() {
-        map.remove(&address);
-    }
-    Some(view as *mut CPyBuffer)
+fn take_export(carrier: usize) -> Option<*mut CPyBuffer> {
+    exports()
+        .lock()
+        .remove(&carrier)
+        .map(|view| view as *mut CPyBuffer)
 }
 
 // ── reading the geometry a `Py_buffer` carries ──────────────────────────
@@ -267,13 +261,9 @@ fn acquire(
             w_strides: reload(2),
         }
     };
-    unsafe {
-        pyre_object::memoryview::w_memoryview_set_view(
-            mv,
-            pyre_object::memoryview::bufferview_alloc(built),
-        )
-    };
-    record_export(address, view);
+    let carrier = pyre_object::memoryview::bufferview_alloc(built);
+    unsafe { pyre_object::memoryview::w_memoryview_set_view(mv, carrier) };
+    record_export(carrier as usize, view);
     Ok(mv)
 }
 
@@ -318,12 +308,11 @@ pub unsafe fn release_view(mv: PyObjectRef, backing: PyObjectRef) -> bool {
     if slot_of(backing, getbuffer_of).is_null() {
         return false;
     }
-    let Buffer::External { address, .. } =
-        *unsafe { pyre_object::memoryview::w_memoryview_view(mv) }.backing()
-    else {
+    let carrier = unsafe { pyre_object::memoryview::w_memoryview_view(mv) };
+    let Buffer::External { .. } = *carrier.backing() else {
         return false;
     };
-    if let Some(view) = take_export(address) {
+    if let Some(view) = take_export(carrier as *const _ as usize) {
         release_c_view(view);
     }
     true
@@ -729,6 +718,24 @@ pub unsafe extern "C" fn PyObject_CopyData(
 
 // ── the legacy character-buffer entry points ────────────────────────────
 
+/// End a legacy export while leaving the address it handed out usable.
+///
+/// A C exporter's memory outlives the export, so the export is closed here as
+/// `buffer.py:179-195` closes it -- an exporter that counts its exports, or
+/// that allocated `internal`, otherwise never gets the balancing call.  A
+/// snapshot this layer took *is* the address, and releasing it would free what
+/// the caller was just handed, so only the reference the structure holds goes.
+unsafe fn close_legacy(view: *mut CPyBuffer) {
+    let snapshot = snapshots()
+        .lock()
+        .contains_key(&(unsafe { (*view).buf } as usize));
+    if snapshot {
+        unsafe { pyobject::decref((*view).obj) };
+    } else {
+        unsafe { PyBuffer_Release(view) };
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_AsCharBuffer(
     object: *mut CPyObject,
@@ -742,9 +749,7 @@ pub unsafe extern "C" fn PyObject_AsCharBuffer(
     unsafe {
         *buffer = view.buf as *const c_char;
         *size = view.len;
-        // The address has to outlive the call, so the export stays open; only
-        // the reference the structure holds is dropped.
-        pyobject::decref(view.obj);
+        close_legacy(&raw mut view);
     }
     0
 }
@@ -776,7 +781,7 @@ pub unsafe extern "C" fn PyObject_AsWriteBuffer(
     unsafe {
         *buffer = view.buf;
         *size = view.len;
-        pyobject::decref(view.obj);
+        close_legacy(&raw mut view);
     }
     0
 }

@@ -189,7 +189,9 @@ pub unsafe extern "C" fn PyBytes_Check(object: *mut CPyObject) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_CheckExact(object: *mut CPyObject) -> c_int {
-    unsafe { PyBytes_Check(object) }
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && super::object::is_exactly(object, &pyre_object::bytesobject::BYTES_TYPE))
+        as c_int
 }
 
 pub(super) fn ensure_linked() {

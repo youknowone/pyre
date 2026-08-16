@@ -19,6 +19,22 @@ pub(super) fn argument(raw: *mut CPyObject) -> Option<PyObjectRef> {
     Some(value)
 }
 
+/// Whether `object`'s user-visible class is exactly the one `tp` describes.
+///
+/// The layout an object carries is shared with its subclasses — an instance of
+/// a `str` subclass is a `W_UnicodeObject` under `STR_TYPE`, and `bool` is laid
+/// out as `int` — so a `*_CheckExact` spelling has to compare the class the
+/// interpreter reports, not the layout.
+pub(super) fn is_exactly(object: PyObjectRef, tp: *const pyre_object::PyType) -> bool {
+    match (
+        crate::typedef::r#type(object),
+        crate::typedef::gettypefor(tp),
+    ) {
+        (Some(actual), Some(exact)) => actual == exact,
+        _ => false,
+    }
+}
+
 /// A new reference to the result of an interpreter operation, or NULL with the
 /// error recorded.
 pub(super) fn result(value: Result<PyObjectRef, crate::PyError>) -> *mut CPyObject {
@@ -108,6 +124,8 @@ pub unsafe extern "C" fn PyObject_GetAttr(
     result(crate::baseobjspace::getattr(object, name))
 }
 
+/// A NULL `value` is the deletion spelling, which is what
+/// [`PyObject_SetAttrString`] already reads it as.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_SetAttr(
     object: *mut CPyObject,
@@ -117,10 +135,13 @@ pub unsafe extern "C" fn PyObject_SetAttr(
     let (Some(object), Some(name)) = (argument(object), argument(name)) else {
         return -1;
     };
-    let Some(value) = argument(value) else {
-        return -1;
+    let value = unsafe { pyobject::from_ref(value) };
+    let outcome = if value.is_null() {
+        crate::baseobjspace::delattr(object, name).map(|_| pyre_object::w_none())
+    } else {
+        crate::baseobjspace::setattr(object, name, value)
     };
-    if trap(crate::baseobjspace::setattr(object, name, value)).is_none() {
+    if trap(outcome).is_none() {
         return -1;
     }
     0

@@ -169,6 +169,24 @@ pub(super) fn attach_foreign(w_obj: PyObjectRef, raw: *mut CPyObject) {
     enter(w_obj, raw, 0);
 }
 
+/// Link a block that already exists to a fresh interpreter object.
+///
+/// `PyObject_Malloc` hands out an unlinked block and `PyObject_Init` is what
+/// makes it an object, so the two halves of [`attach`] are separated here.  The
+/// block keeps whatever [`allocate_raw`] recorded for it, which is what
+/// [`free_block`] later releases it by.
+pub(super) fn link_allocated(w_obj: PyObjectRef, raw: *mut CPyObject, refcnt: isize) {
+    debug_assert!(
+        refcnt >= REFCNT_FROM_PYRE,
+        "a linked mirror carries the link share"
+    );
+    unsafe {
+        (*raw).ob_refcnt = refcnt;
+        (*raw).ob_pyre_link = w_obj;
+    }
+    majit_gc::gc_rawrefcount_create_link_pyre(majit_ir::GcRef(w_obj as usize), raw as usize);
+}
+
 /// `pyobject.py:track_reference` — hand the collector the P-link.
 ///
 /// The mirror's header is already filled at this point, including the

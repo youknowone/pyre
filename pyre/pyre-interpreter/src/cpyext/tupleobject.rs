@@ -118,7 +118,8 @@ pub unsafe extern "C" fn PyTuple_Check(object: *mut CPyObject) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyTuple_CheckExact(object: *mut CPyObject) -> c_int {
-    unsafe { PyTuple_Check(object) }
+    let object = unsafe { pyobject::from_ref(object) };
+    (!object.is_null() && super::object::is_exactly(object, &pyre_object::TUPLE_TYPE)) as c_int
 }
 
 pub(super) fn ensure_linked() {
