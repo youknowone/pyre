@@ -840,6 +840,35 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
     });
 }
 
+/// Publish one frozen source-translation JitCode into the unified runtime
+/// registry on demand. RPython's `warmspot.py` installs the complete
+/// `CodeWriter.make_jitcodes()` list, so an `MIFrame` created for a translated
+/// helper resolves through the same absolute index as a portal frame. Pyre
+/// keeps the frozen table lazy; materialize the selected entry without
+/// changing that ownership or numbering shape.
+pub fn ensure_build_time_jitcode_at(index: usize) -> Option<std::sync::Arc<crate::PyJitCode>> {
+    ensure_finish_setup();
+    if let Some(payload) = METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(index)
+            .filter(|entry| !entry.payload.is_skeleton())
+            .map(|entry| std::sync::Arc::clone(&entry.payload))
+    }) {
+        return Some(payload);
+    }
+
+    let canonical = crate::jitcode_runtime::get_jitcode_by_index(index)?;
+    let runtime = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
+        std::sync::Arc::new(runtime),
+        std::ptr::null(),
+        false,
+    ));
+    install_build_time_jitcode_at(index, std::sync::Arc::clone(&payload));
+    Some(payload)
+}
+
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode

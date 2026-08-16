@@ -1308,11 +1308,14 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// executing under.  Used only for the temporary live-frame coordinate a
     /// residual frame reader observes; it is not a walk-end resume claim.
     pub inline_caller_py_pc: Option<u32>,
-    /// The current sub-walk is a translated builtin gateway helper, which has
-    /// no Python blackhole frame of its own. Guard snapshots therefore encode
-    /// only the precomputed Python caller chain on `framestack`, omitting the
-    /// helper JitCode itself.
+    /// The current sub-walk is a translated builtin gateway helper.  The
+    /// helper is not a Python frame, but it is an RPython `MIFrame` and must be
+    /// retained as the innermost blackhole frame so a post-residual guard can
+    /// continue after the residual instead of re-running the Python CALL.
     pub transparent_helper_subwalk: bool,
+    /// Absolute build-time `MetaInterpStaticData.jitcodes` index of that
+    /// helper. `None` outside a translated helper sub-walk.
+    pub transparent_helper_jitcode_index: Option<usize>,
     /// A bridge-carrier resume folds nested self-recursive calls directly to
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
@@ -1389,6 +1392,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             inline_subwalk: false,
             inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
+            transparent_helper_jitcode_index: None,
             carrier_resume: false,
             current_exception_seed: None,
             current_exception_seed_concrete: pyre_object::PY_NULL,

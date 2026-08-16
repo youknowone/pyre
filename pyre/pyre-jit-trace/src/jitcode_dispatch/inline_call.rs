@@ -2402,16 +2402,23 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!("no sub jitcode body", fnaddr);
         return Ok(None);
     };
+    // `warmspot.py:281-282` publishes every CodeWriter JitCode into the one
+    // MetaInterpStaticData registry.  The frozen table is lazy in pyre, so
+    // publish this wrapper before any guard snapshot names its absolute index.
+    if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        return Ok(None);
+    }
     if body.num_regs_r < 1 {
         return Ok(None);
     }
-    let nested_helper_entry = if ctx.fbw_mode.inline_subwalk {
-        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
-            Ok(frame) => Some(frame),
-            Err(_) => return Ok(None),
-        }
-    } else {
-        None
+    let nested_helper = ctx.fbw_mode.inline_subwalk;
+    // A translated helper is transparent to blackhole execution, but its
+    // Python caller is not.  Preserve that caller at the helper's CALL entry
+    // for both a nested inline and the root portal frame; RPython keeps the
+    // live MIFrame while tracing through the translated helper body.
+    let helper_entry = match compute_inline_helper_call_entry_frame(ctx, op.pc) {
+        Ok(frame) => frame,
+        Err(_) => return Ok(None),
     };
     // Guards inside the generated wrapper must resume at the outer Python
     // CALL, because helper JitCodes have no blackhole entry point of their
@@ -2429,9 +2436,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if sym.jitcode().is_null() {
         return Ok(None);
     }
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper_entry
-        .is_some()
-    {
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
         (
             ctx.entry_py_pc(),
             0,
@@ -2479,32 +2484,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             }
         }
     };
-    let call_site_word = call_site_marker
-        .map(|marker| marker as i32)
-        .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
     // Rewind point for the un-lowered-helper decline below.  Nothing above
     // this line records IR or touches the heap cache, so cutting back to it
     // leaves the caller's trace exactly as the ordinary residual call found it.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let call_site_active = if nested_helper_entry.is_some() {
+    let call_site_active = if nested_helper {
         ctx.outer_active_boxes.clone()
     } else {
-        collect_outer_active_boxes(
-            sym,
-            ctx.trace_ctx,
-            ctx.registers_i,
-            ctx.registers_r,
-            ctx.registers_f,
-            outer_jitcode_index,
-            false,
-            call_site_word,
-            op.pc as i32,
-            OuterActiveBoxesEntryTwin::Plain,
-            "builtin_wrapper_call_site",
-            None,
-            &[],
-            None,
-        )
+        helper_entry.boxes.clone()
     };
 
     // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
@@ -2605,7 +2592,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
     }
 
-    if nested_helper_entry.is_none() && sym.owns_virtualizable_shadow() {
+    if !nested_helper && sym.owns_virtualizable_shadow() {
         let last_instr = call_site_py_pc as i64 - 1;
         let last_instr_op = ctx.trace_ctx.const_int(last_instr);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -2650,11 +2637,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
-    let _helper_frame =
-        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
+    let _helper_frame = InlineFrameGuard::enter(ctx.session, 0, Some(helper_entry));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -3625,20 +3612,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             ctx,
             callee_frame_reg,
         );
-    // A strict straight-line callee at the top inline level is seeded with
-    // its own frame red so guards can carry a real two-frame snapshot.  A
-    // callee needing fresh cellvar allocation is not seeded — the seed block
-    // below breaks out to the ordinary single-frame inline for it — so exclude
-    // it here too, or the preflight would decline a CALL that path still
-    // serves.  Constructor inlining also stays out of the seed: `typeobject.py
-    // descr_call` owns the discard of `__init__`'s result, and the flattened
-    // frame shape cannot reconstruct that discard from a two-frame in-callee
-    // guard pause.
+    // A strict straight-line callee is seeded with its own frame red so guards
+    // carry a real multi-frame snapshot.  PyPy's `perform_call` always pushes
+    // one MIFrame and `capture_resumedata` serialises the complete framestack;
+    // an inline shape that cannot represent that frame must remain residual.
+    // Cellvar allocation, constructor-result discard, FOR_ITER replay, and the
+    // current snapshot depth cap are therefore eligibility limits, not reasons
+    // to collapse the callee onto the caller frame.
     let strict_seed = !force_caller_boundary_resume
         && strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
         && callee_code.cellvars.is_empty()
         && constructor_result.is_none();
+    if !try_multiframe && !strict_seed {
+        return Ok(None);
+    }
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -3649,8 +3637,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
             Ok(parent) => Some(parent),
             Err(InlineCallerFrameDecline::TryBlockCatchMarker) => return Ok(None),
-            Err(InlineCallerFrameDecline::Unavailable) if try_multiframe => return Ok(None),
-            Err(InlineCallerFrameDecline::Unavailable) => None,
+            Err(InlineCallerFrameDecline::Unavailable) => return Ok(None),
         }
     } else {
         None
@@ -4075,19 +4062,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // then unchanged (it finds real boxes).
     //
     // Seeded for BOTH the forward-branch multiframe callee (`try_multiframe`)
-    // AND a STRICT straight-line callee at the top inline level (`strict_seed`).
+    // AND a STRICT straight-line callee (`strict_seed`).
     // With the reds seeded, an in-callee guard resumes at the callee's OWN
     // coordinate through `walker_capture_multi_frame_inline_snapshot` instead of
     // collapsing to the caller boundary and re-executing the whole call — which
     // re-materializes it at a stale `valuestackdepth` (a resume `LOAD_FAST` push
     // overflows the frame, an `rd_numb` decode overruns) and re-applies a
     // committed heap side effect (visible on the wasm resume path, where a
-    // guard-failure deopt is not absorbed by a compiled bridge).  A
-    // `try_multiframe` callee HARD-declines the inline when a precondition below
-    // fails; a strict callee instead leaves the reds `OpRef::NONE` and falls
-    // back to the single-frame collapse (no paused caller frame is pushed), so
-    // an un-seedable strict shape never loses its inline.  Every bail below
-    // precedes any IR recording, so a strict fall-through records no dead op.
+    // guard-failure deopt is not absorbed by a compiled bridge).  Every failed
+    // seed precondition declines the inline before recording IR; it must never
+    // erase the callee frame by falling back to a single-frame snapshot.
     //
     // The seeded virtual callee frame /
     // shared ec / local count are hoisted so the sub-walk return site can
@@ -4101,19 +4085,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // The seeded callee frame's runtime object, for the `enter`/`leave`
     // bracket below — the OpRef alone cannot carry it out of the seed block.
     let mut ca_concrete_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
-    // A strict straight-line callee at the top inline level is seeded the same
-    // way, so its in-callee guards route through the multi-frame snapshot.  A
-    // deeper strict callee (`inline_depth >= fbw_max_multiframe_depth()`) keeps the
-    // single-frame collapse — a 3-frame snapshot the resume path is sound for
-    // only one paused caller frame.
     // True once the callee frame reds are actually seeded (all preconditions
-    // below met).  For a strict callee this gates routing its guards through the
-    // multi-frame snapshot vs. falling back to collapse.
+    // below met).  It brackets the recording-time concrete frame and marks the
+    // frame as materializable from guard resume data.
     let mut callee_frame_seeded = false;
-    // Names the `break 'seed` arm that left `callee_frame_seeded` false, for
-    // the `[fbw-census]` collapse tally at the `parent_frame` decision below.
-    // Empty means the seed block was never entered or ran to completion.
-    let mut seed_break_reason: &'static str = "";
     // The concrete callee frame the seed block materializes, retained so the
     // sub-walk can put it on the interpreter frame chain: the walk executes
     // the callee's residuals for real, and a residual that reads the chain
@@ -4129,8 +4104,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // precondition failed identically on every retrace, so the loop kept
     // re-tracing and re-aborting instead of settling.
     //
-    // The strict path already declines gracefully here (`break 'seed`); only
-    // the `try_multiframe` path aborted.  Upstream never has this state:
+    // Upstream never has an inline-without-a-frame state:
     // `pyjitpl.py` `do_residual_or_indirect_call` residualizes the callee it
     // cannot follow, and the recursion-budget path calls `dont_trace_here` and
     // then still falls through to `do_residual_call` — the enclosing trace
@@ -4147,7 +4121,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // All of these sit before the first recorded op (the `GETFIELD_GC_R`
     // below), so returning costs nothing but the inline.
     if try_multiframe || strict_seed {
-        'seed: {
+        {
             // Branch-A frame shape only (mirror REC_CA): existing freevar
             // cells are admissible, while fresh cellvar allocation is not.
             // `strict_seed` already excludes such a callee, so only the
@@ -4221,11 +4195,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     )
                 });
                 if has_is_none_branch {
-                    if try_multiframe {
-                        return Ok(None);
-                    }
-                    seed_break_reason = "Collapse::IsNoneBranch";
-                    break 'seed;
+                    return Ok(None);
                 }
             }
             let nlocals = callee_code.varnames.len();
@@ -4235,11 +4205,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let Some(callee_jitcode_index) =
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
             else {
-                if try_multiframe {
-                    return Ok(None);
-                }
-                seed_break_reason = "Collapse::NoCalleeJitcode";
-                break 'seed;
+                return Ok(None);
             };
             let (frame_reg, ec_reg) = crate::state::portal_red_regs_at(callee_jitcode_index as i32);
             if frame_reg == u16::MAX
@@ -4247,11 +4213,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 || frame_reg as usize >= callee_regs_r.len()
                 || ec_reg as usize >= callee_regs_r.len()
             {
-                if try_multiframe {
-                    return Ok(None);
-                }
-                seed_break_reason = "Collapse::NoPortalRedRegs";
-                break 'seed;
+                return Ok(None);
             }
 
             // ec red: the shared ExecutionContext (perform_call threads the
@@ -4263,11 +4225,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // portal frame's `execution_context` field is the single true ec.
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
-                if try_multiframe {
-                    return Ok(None);
-                }
-                seed_break_reason = "Collapse::NoSnapshotSym";
-                break 'seed;
+                return Ok(None);
             }
             let sym = unsafe { &*sym_ptr };
             let callee_ec = ctx.trace_ctx.record_op_with_descr(
@@ -4380,79 +4338,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // paused caller frame on the framestack so its in-callee guards snapshot
     // both frames.  The caller's live register banks were preflighted above,
     // before seed IR; at guard-capture time the walk context is the callee's.
-    let parent_frame = if try_multiframe {
-        // Declined above, before any seed IR: an un-entered multiframe-inline
-        // CALL that declines at its try-block catch marker is re-run whole and
-        // forward, exactly as if it had never been inlined (`pyjitpl.py`), so
-        // it leaves the enclosing trace alone rather than aborting it.
-        precomputed_parent_frame
-    } else if callee_frame_seeded {
-        // A strict straight-line callee seeded at the top inline level (the
-        // `try_multiframe` arm above already handled the branch path).  Push the
-        // paused caller frame so its in-callee guards resume through the
-        // multi-frame snapshot (`walker_capture_multi_frame_inline_snapshot`) at
-        // the callee's OWN coordinate, with the caller paused at the CALL return
-        // point (`get_list_of_active_boxes(in_a_call=true)` parity,
-        // `trace_opcode.rs`). With the callee frame red now seeded,
-        // `collect_callee_active_boxes` sources the callee's live boxes and the
-        // snapshot succeeds, producing the full RPython `Snapshot.frames` chain
-        // (`opencoder.py create_top_snapshot`, resumed by
-        // `resume.py rebuild_from_resumedata`).  This replaces the single-frame
-        // collapse, whose caller-boundary re-execute both mis-sizes the resumed
-        // frame (a decode / `LOAD_FAST` overrun) and re-applies the callee's
-        // committed side effect on deopt.
-        //
-        // Best effort: `compute_inline_caller_frame` returns `Unavailable` for a caller
-        // shape it cannot build yet (no result on the operand stack at the
-        // return point, missing liveness / resume tables).  Fall back to the
-        // single-frame collapse there (do NOT decline the inline — that shape is
-        // served correctly today), so this never removes a working inline.
-        //
-        // A `TryBlockCatchMarker` decline is different: the CALL is covered by
-        // the caller's exception table AND the callee has free variables, so it
-        // reads cells the caller frame owns — one of which, inside a handler, is
-        // the `except E as e` binding the implicit cleanup stores `None` into
-        // and then clears.  Inlining reads that cell as `None`
-        // (`synth/exception_as_cell_cleanup`).  Decline so the call stays
-        // residual, where the post-call catch resume
-        // (`GuardCaptureScope::residual_call_catch_resume`) routes the raise.
-        //
-        // Both declines were taken above, ahead of the seed block, so neither
-        // has to discard the enclosing loop trace to avoid stranding the
-        // `GETFIELD_GC_R` + `emit_new_pyframe_inline_with_params` this arm would
-        // otherwise have already recorded.
-        precomputed_parent_frame
-    } else {
-        // Single-frame collapse (resume at the CALL boundary, re-execute the
-        // whole call on deopt): a nested strict callee
-        // (`inline_depth >= fbw_max_multiframe_depth()`), an un-seedable
-        // strict callee, or a callee neither seed served.  Sound for a pure
-        // value-returning leaf (idempotent re-execute) and for a nested
-        // straight-line callee (its pre-multiframe behavior).
-        None
-    };
-    // Name the population a collapsing CALL falls into, so the
-    // `PYRE_FBW_DEBUG_ABORT` corpus can rank the remaining collapse sources
-    // the same way it ranks walk declines.  A collapse is not an abort and
-    // discards no trace, so this counts a resume-SHAPE choice, not a failure;
-    // it is read only to decide which population to retire next.
-    if fbw_debug_abort_enabled() && parent_frame.is_none() {
-        census_record(if !seed_break_reason.is_empty() {
-            seed_break_reason
-        } else if callee_frame_seeded {
-            // Seeded, but `compute_inline_caller_frame` could not build the
-            // caller side (`InlineCallerFrameDecline::Unavailable`).
-            "Collapse::ParentUnavailable"
-        } else if inline_depth >= fbw_max_multiframe_depth() {
-            "Collapse::DepthCap"
-        } else if !callee_code.cellvars.is_empty() {
-            "Collapse::CellVars"
-        } else if constructor_result.is_some() {
-            "Collapse::Constructor"
-        } else {
-            "Collapse::Other"
-        });
-    }
+    // Every successful inline now has the same shape as PyPy's framestack: a
+    // seeded live callee frame plus its paused caller chain.  Caller-frame
+    // construction failures were declined before seed IR was emitted.
+    let parent_frame = precomputed_parent_frame;
     let callee_frame_materialized_has_resume = callee_frame_seeded && parent_frame.is_some();
 
     // CODEX1 parity: snapshot the heap-effect state before the callee

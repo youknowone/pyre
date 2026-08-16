@@ -2264,27 +2264,65 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         .borrow()
         .framestack
         .last()
-        .map(|frame| frame.w_code)
-        .ok_or_else(|| unavail("Unavail::Helper/NoFramestack"))?;
-    let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
-        .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))? as u32;
-    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
+        .map(|frame| frame.w_code);
+    let (jitcode_index, pjc) = if let Some(caller_code) = caller_code {
+        let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
+            .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))?
+            as u32;
+        let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+            .ok_or_else(|| unavail("Unavail::Helper/NoPjc"))?;
+        (jitcode_index, pjc)
+    } else {
+        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+        if caller_sym_ptr.is_null() {
+            return Err(unavail("Unavail::Helper/NoSym"));
+        }
+        // SAFETY: `snapshot_sym` is installed for the lifetime of the
+        // full-body walk and only its immutable JitCode payload is read here.
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        if caller_sym.jitcode().is_null() {
+            return Err(unavail("Unavail::Helper/NoJitCode"));
+        }
+        let jc = unsafe { &*caller_sym.jitcode() };
+        (jc.index as u32, jc.payload.clone())
+    };
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
     let resume_marker_jit_pc = pjc
         .resume_marker_for_jitcode_pc(call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
-    let boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
-        jitcode_index,
-        call_jit_pc,
-        resume_marker_jit_pc as i32,
-    )
-    .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?;
+    let boxes = if caller_code.is_some() {
+        collect_callee_active_boxes(
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            jitcode_index,
+            call_jit_pc,
+            resume_marker_jit_pc as i32,
+        )
+        .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
+    } else {
+        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+        // SAFETY: checked non-null above and valid for this full-body walk.
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        collect_outer_active_boxes(
+            caller_sym,
+            ctx.trace_ctx,
+            ctx.registers_i,
+            ctx.registers_r,
+            ctx.registers_f,
+            jitcode_index,
+            false,
+            resume_marker_jit_pc as i32,
+            call_jit_pc as i32,
+            OuterActiveBoxesEntryTwin::Plain,
+            "builtin_wrapper_call_entry",
+            None,
+            &[],
+            None,
+        )
+    };
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
@@ -2380,15 +2418,41 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    after_residual_call: bool,
     parent_frames: Vec<InlineParentFrame>,
     guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
+    let helper_index = ctx
+        .fbw_mode
+        .transparent_helper_jitcode_index
+        .ok_or_else(|| DispatchError::callee_inline_unsupported(op_pc))?;
+    let helper = crate::state::ensure_build_time_jitcode_at(helper_index)
+        .ok_or_else(|| DispatchError::callee_inline_unsupported(op_pc))?;
+    let op_live = crate::state::op_live();
+    let helper_marker = if after_residual_call {
+        after_residual_guard_marker(&helper, op_pc, None)
+    } else {
+        (ctx.live_before_jit_pc != usize::MAX
+            && helper
+                .jitcode
+                .can_decode_live_vars(ctx.live_before_jit_pc, op_live))
+        .then_some(ctx.live_before_jit_pc)
+    }
+    .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
+    let helper_boxes = collect_callee_active_boxes(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        helper_index as u32,
+        op_pc,
+        helper_marker as i32,
+    )?;
     publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len());
+    let mut frames: Vec<(u32, u32, u32, &[OpRef])> = Vec::with_capacity(parent_frames.len() + 1);
     for frame in &parent_frames {
         let word = frame
             .resume_marker_jit_pc
@@ -2403,6 +2467,16 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         let py_pc = forward_snapshot_py_pc(frame.jitcode_index, pc_word)?;
         frames.push((frame.jitcode_index, pc_word, py_pc, frame.boxes.as_slice()));
     }
+    // Translated helpers are real RPython MIFrames but not Python frames, so
+    // retain their JitCode/pc section and use the no-Python-coordinate
+    // sentinel.  Blackhole return then delivers the helper result to the
+    // paused Python caller exactly like `MIFrame.perform_call` upstream.
+    frames.push((
+        helper_index as u32,
+        helper_marker as u32,
+        u32::MAX,
+        helper_boxes.as_slice(),
+    ));
     match guard_stamp {
         GuardStampTarget::GuardFromEnd(from_end) => ctx
             .trace_ctx
@@ -2446,6 +2520,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         return walker_capture_transparent_helper_snapshot(
             ctx,
             callee_op_pc,
+            after_residual_call,
             parent_frames,
             guard_stamp,
         );

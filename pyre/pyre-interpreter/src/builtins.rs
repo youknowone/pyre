@@ -19156,7 +19156,7 @@ mod tests {
 
         let raw = builtin_open(&[w_str_new(path_text), w_str_new("rb"), w_int_new(0)]).unwrap();
         let raw_type = crate::typedef::r#type(raw).unwrap().as_ptr();
-        assert_eq!(unsafe { pyre_object::w_type_get_name(raw_type) }, "FileIO");
+        assert_eq!(raw_type, crate::module::_io::fileio_type());
         let closed = crate::baseobjspace::call_method(raw, "close", &[]);
         assert!(!closed.is_null());
         std::fs::remove_file(path).unwrap();
