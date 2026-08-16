@@ -155,6 +155,7 @@ pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod sliceobject;
 pub mod stack_check;
+pub mod syntax_warnings;
 pub mod type_methods;
 pub mod typedef;
 pub mod warn;

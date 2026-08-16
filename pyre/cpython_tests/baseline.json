@@ -1078,7 +1078,7 @@
       "dynasm": "PASS"
     },
     "test.test_string_literals": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_stringprep": {
       "dynasm": "PASS"

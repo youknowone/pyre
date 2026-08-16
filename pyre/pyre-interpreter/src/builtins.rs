@@ -12393,6 +12393,9 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
+        // The escape warnings precede code generation, and a filter that
+        // escalates one replaces the compile with that error.
+        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
         crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
             compile_err_to_syntax_error_maybe_incomplete(
                 e,
@@ -12519,6 +12522,7 @@ fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
+            crate::syntax_warnings::emit_escape_warnings(&source, "<string>")?;
             let code = crate::compile::compile_source(&source, mode)
                 .map_err(|e| compile_err_to_syntax_error(e, &source))?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();

@@ -3,6 +3,7 @@
 pub use rustpython_compiler::CompileError;
 pub use rustpython_compiler::CompileOpts;
 pub use rustpython_compiler::Mode;
+pub use rustpython_compiler::ast;
 pub use rustpython_compiler::codegen;
 pub use rustpython_compiler::compile as rp_compile;
 pub use rustpython_compiler::parser;

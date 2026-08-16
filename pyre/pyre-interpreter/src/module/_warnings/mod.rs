@@ -598,7 +598,7 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
     }
 }
 
-fn do_warn_explicit(
+pub(crate) fn do_warn_explicit(
     category: PyObjectRef,
     message: PyObjectRef,
     filename: PyObjectRef,
