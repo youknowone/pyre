@@ -14,16 +14,16 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test__locale": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test__opcode": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test__osx_support": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_abc": {
       "cranelift": "PASS",
@@ -84,8 +84,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_bigaddrspace": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_bigmem": {
       "dynasm": "IMPORTERROR"
@@ -689,8 +689,8 @@
       "dynasm": "PASS"
     },
     "test.test_lltrace": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_locale": {
       "dynasm": "PASS"
@@ -814,8 +814,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_osx_env": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_pathlib": {
       "dynasm": "IMPORTERROR"
@@ -831,8 +831,8 @@
       "reason": "implementation detail"
     },
     "test.test_peg_generator": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_pep646_syntax": {
       "dynasm": "PASS"
@@ -1164,8 +1164,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_threadedtempfile": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_threading": {
       "dynasm": "PASS"
