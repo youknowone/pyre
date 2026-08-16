@@ -547,6 +547,17 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    // Parameter bridge entries are the default. The guest has no environment,
+    // so an explicit host-side opt-out must travel through this export before
+    // tracing begins.
+    if std::env::var_os("PYRE_WASM_BRIDGE_PARAMS").is_some_and(|value| {
+        matches!(value.to_str().map(str::trim), Some("0" | "false" | "off"))
+    })
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_bridge_params_disable")
+    {
+        arm.call(&mut store, ())?;
+    }
 
     let src = source.as_bytes();
     let len = src.len() as u32;
@@ -713,6 +724,9 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_ref_layout",
                 "inline_decl_missing_label",
                 "inline_decl_other",
+                "bridge_param_ok",
+                "bridge_param_decl_source_frame",
+                "bridge_param_decl_arity",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

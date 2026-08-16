@@ -78,8 +78,11 @@ use std::sync::{Arc, Mutex};
 /// owner's frozen frame geometry; 38 = the bridge does not resume at the loop
 /// header; 39 = the merged stream has no local loop LABEL for the wasm back
 /// edge. 40-43 split a rejected inline trial into value-layout,
-/// Ref-home-layout, missing-local-label, and other backend errors.
-pub static BRIDGE_DIAG: [AtomicU64; 44] = [const { AtomicU64::new(0) }; 44];
+/// Ref-home-layout, missing-local-label, and other backend errors. 44 = a
+/// bridge compiled with a parameter entry; 45 = parameter entry declined
+/// because the source module has frame-only dispatch; 46 = parameter entry
+/// declined because the source guard and bridge input arities disagree.
+pub static BRIDGE_DIAG: [AtomicU64; 47] = [const { AtomicU64::new(0) }; 47];
 
 /// The first three inline geometry failures, packed as `(needed, available)`.
 /// They expose a frozen-layout shortage without changing the compile result.
@@ -117,6 +120,7 @@ fn record_inline_trial_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Arm loop-module replacement from the host before guest execution starts.
 pub fn reemit_enable() {
@@ -136,6 +140,18 @@ pub fn inline_bridge_enable() {
 
 fn inline_bridge_enabled() -> bool {
     INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Disable guard-to-bridge value parameters from the host before guest
+/// execution. By default, a generated guard keeps the ordinary frame recovery
+/// state for the uncompiled case, then passes its live failure values directly
+/// once a bridge table slot is present.
+pub fn bridge_params_disable() {
+    BRIDGE_PARAMS_ENABLED.store(false, Ordering::Relaxed);
+}
+
+fn bridge_params_enabled() -> bool {
+    BRIDGE_PARAMS_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
@@ -1828,6 +1844,11 @@ impl WasmBackend {
                         cells_base: new_cells_base + offset as u32 * 4,
                         num_cells: count,
                         guard_fail_arg_advanced: guard_fail_args_advanced(&region.ops, exits),
+                        guard_fail_arg_counts: exits
+                            .iter()
+                            .map(|guard| guard.fail_arg_refs.len())
+                            .collect(),
+                        bridge_param_dispatch: inputs.bridge_param_dispatch,
                     },
                 );
                 offset += count;
@@ -2556,6 +2577,8 @@ impl majit_backend::Backend for WasmBackend {
             gc_table_base,
             fail_index_base,
             bridge_cells_base,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: bridge_params_enabled(),
             // A real loop's JUMP is a local back-edge `br`; an entry bridge
             // tail-calls its target loop and is deliberately not re-emittable.
             external_jump_slot: entry_bridge_target.map_or(0, |t| t.func_handle),
@@ -2705,6 +2728,11 @@ impl majit_backend::Backend for WasmBackend {
             has_preamble,
             label_descrs,
             guard_fail_arg_advanced,
+            guard_fail_arg_counts: guard_exits
+                .iter()
+                .map(|guard| guard.fail_arg_refs.len())
+                .collect(),
+            bridge_param_dispatch: bridge_params_enabled(),
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_owned_cells: std::cell::RefCell::new(bridge_cells_owner.into_iter().collect()),
@@ -2875,6 +2903,11 @@ impl majit_backend::Backend for WasmBackend {
                         .get(source_fail_index as usize)
                         .cloned()
                         .unwrap_or_default(),
+                    source_loop
+                        .guard_fail_arg_counts
+                        .get(source_fail_index as usize)
+                        .copied(),
+                    source_loop.bridge_param_dispatch,
                 ))
             } else {
                 source_loop
@@ -2889,6 +2922,10 @@ impl majit_backend::Backend for WasmBackend {
                                 .get(source_fail_index as usize)
                                 .cloned()
                                 .unwrap_or_default(),
+                            m.guard_fail_arg_counts
+                                .get(source_fail_index as usize)
+                                .copied(),
+                            m.bridge_param_dispatch,
                         )
                     })
             };
@@ -2906,7 +2943,13 @@ impl majit_backend::Backend for WasmBackend {
         // that trace's array. A foreign descr has no cell to flip; decline so
         // the metainterp keeps the correct interpreter fallback rather than
         // installing an unreachable bridge module.
-        let Some((source_cells_base, source_num_cells, source_fail_arg_advanced)) = source_guard
+        let Some((
+            source_cells_base,
+            source_num_cells,
+            source_fail_arg_advanced,
+            source_fail_arg_count,
+            source_bridge_param_dispatch,
+        )) = source_guard
         else {
             diag_bump(3); // declined: source guard's trace is not chained here
             return Err(BackendError::Unsupported(
@@ -2919,6 +2962,23 @@ impl majit_backend::Backend for WasmBackend {
                 "wasm backend: bridge source guard index has no dispatch cell".into(),
             ));
         }
+        let bridge_entry_arity = if bridge_params_enabled() {
+            if !source_bridge_param_dispatch {
+                diag_bump(45);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: source guard has no parameter bridge dispatch".into(),
+                ));
+            }
+            if source_fail_arg_count != Some(inputargs.len()) {
+                diag_bump(46);
+                return Err(BackendError::Unsupported(
+                    "wasm backend: guard and bridge input arities differ".into(),
+                ));
+            }
+            Some(inputargs.len())
+        } else {
+            None
+        };
         let allow_ca = ca_candidate;
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
@@ -3263,6 +3323,8 @@ impl majit_backend::Backend for WasmBackend {
             gc_table_base,
             fail_index_base: base,
             bridge_cells_base,
+            bridge_entry_arity,
+            bridge_param_dispatch: bridge_params_enabled(),
             external_jump_slot,
             external_jump_key,
             frame: source_frame,
@@ -3313,6 +3375,9 @@ impl majit_backend::Backend for WasmBackend {
             Self::register_gc_table(original_token, table);
         }
         diag_bump(5); // bridge compiled — chained in-module
+        if bridge_entry_arity.is_some() {
+            diag_bump(44); // bridge compiled with a parameter entry
+        }
 
         // x86/assembler.py:706 publishes the target tokens defined by an
         // accepted bridge. `codegen::is_resumable_peeled` and
@@ -3363,6 +3428,11 @@ impl majit_backend::Backend for WasmBackend {
                     cells_base: bridge_cells_base,
                     num_cells: guard_exits.len(),
                     guard_fail_arg_advanced: guard_fail_args_advanced(ops, &guard_exits),
+                    guard_fail_arg_counts: guard_exits
+                        .iter()
+                        .map(|guard| guard.fail_arg_refs.len())
+                        .collect(),
+                    bridge_param_dispatch: bridge_params_enabled(),
                 },
             );
             // The bridge module lives as long as this source loop, so hand its

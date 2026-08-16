@@ -1163,6 +1163,14 @@ mod host_abi {
         majit_backend_wasm::inline_bridge_enable();
     }
 
+    /// Disable the default guard-to-bridge parameter entries. The host owns
+    /// the environment, so this call carries its explicit opt-out into the
+    /// guest before tracing begins.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_bridge_params_disable() {
+        majit_backend_wasm::bridge_params_disable();
+    }
+
     /// The armed census as the same packed pair, for the host to print under
     /// `PYRE_WASM_GUARD_CENSUS`. Same `top` as `pyrex` prints natively, so the
     /// two lines compare directly. Reading, not draining.

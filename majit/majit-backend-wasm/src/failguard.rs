@@ -568,6 +568,11 @@ pub struct ChainedTraceMeta {
     /// Per-guard, per-fail-arg induction-advance flags
     /// (`CompiledWasmLoop::guard_fail_arg_advanced` analog).
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// Number of values each guard transfers to a bridge.  A parameter entry
+    /// is admitted only when this agrees with the bridge's input list.
+    pub guard_fail_arg_counts: Vec<usize>,
+    /// Whether this trace's guard epilogue has typed parameter dispatch arms.
+    pub bridge_param_dispatch: bool,
 }
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
@@ -642,6 +647,11 @@ pub struct CompiledWasmLoop {
     /// `compile_bridge`'s livelock check: a loop-closing bridge that JUMPs
     /// such a fail arg verbatim still advances the chained cycle.
     pub guard_fail_arg_advanced: Vec<Vec<bool>>,
+    /// Number of fail arguments for every guard/finish exit in this trace.
+    pub guard_fail_arg_counts: Vec<usize>,
+    /// Whether this module transfers a compiled bridge's fail arguments as
+    /// wasm call parameters instead of reloading their positional frame slots.
+    pub bridge_param_dispatch: bool,
     /// `(source_trace_id, source_fail_index, start, count)` ranges into
     /// `fail_descrs` for each chained bridge `compile_bridge` appended (lib.rs
     /// extend site). Lets `compiled_bridge_fail_descr_layouts` /
