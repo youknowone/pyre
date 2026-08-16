@@ -206,6 +206,22 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 # as the run it is subtracted from.
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
+# `exec` is `bench - startup`, and startup is a measured median rather than a
+# constant.  Between runs of the same job on the same platform, pypy readings
+# moved 0.013s -> 0.031s and 0.019s -> 0.029s, dynasm moved 0.088s -> 0.158s,
+# and cranelift moved 0.084s -> 0.144s (while cpython moved 0.022s -> 0.023s).
+# As a fraction of the larger reading in each pair that is 34%, 58%, 44% and
+# 42%.  Whatever the startup estimate is off by lands whole in `exec`, so the
+# residual error of a startup-subtracted time scales with the startup, not
+# with the timer quantum -- for pypy it is 2-6x EXEC_TIME_FLOOR_S and for the
+# backends more than 10x.  Half the measured startup sits in the middle of the
+# observed range.
+# Consequently the effective ceiling becomes
+# `limit * (1 + STARTUP_DRIFT_FRACTION * startup / exec_baseline)`: a fixture
+# whose baseline is real work is barely affected, while one whose baseline is
+# the same size as its own startup gets several times the slack -- which is
+# what its measurement can actually support.
+STARTUP_DRIFT_FRACTION = 0.5
 # A floor failure is only trustworthy when the baseline clears the execution
 # floor enough for small relative error: execution time is the difference
 # between two independently measured values.
@@ -2540,6 +2556,12 @@ class Check:
             pyre_times.append(elapsed)
         return statistics.median(pyre_times), statistics.median(baseline_times)
 
+    def _startup_drift(self, key):
+        """Run-to-run error of the startup `_exec_time` subtracted for *key*."""
+        if self.args.no_startup_subtract:
+            return 0.0
+        return STARTUP_DRIFT_FRACTION * self.startup.get(key, 0.0)
+
     def _baseline_exec_time_clamped(self, baseline, baseline_time):
         """Whether startup subtraction pinned a baseline to its floor."""
         exec_b = self._exec_time(baseline, baseline_time)
@@ -2594,6 +2616,13 @@ class Check:
         # for a baseline that is real work.  `exception_traceback_loop_forms`
         # read 35.6x on one runner and 37.1x on another against an unchanged
         # ~2.3s exec, a 0.06s baseline wobbling +-0.004s across the 36x line.
+        #
+        # That term stays: it is the granularity of the clock, and it is what a
+        # baseline sitting at the floor is worth.  It is not the whole error.
+        # An exec time also carries whatever its startup estimate was off by,
+        # which is a separate quantity of a different size -- see
+        # STARTUP_DRIFT_FRACTION, applied per side below rather than folded in
+        # here, because the two bounds are distorted by opposite sides.
         compare_buffer = BENCH_COMPARE_BUFFER_S
         if sys.platform == "win32":
             compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
@@ -2634,12 +2663,33 @@ class Check:
             # wants a ratio gate has to give pypy enough work to measure.
             if self._baseline_exec_time_clamped(baseline_key, baseline_value):
                 return None
-            if exec_measured > exec_baseline * limit + compare_buffer:
+            # Each bound is distorted by one side only, so each gets the
+            # allowance on that side. A startup estimate that came out high
+            # under-states every exec derived from it: for the ceiling that
+            # shrinks the DENOMINATOR and inflates the ratio, so the allowance
+            # goes to the baseline; for the floor it shrinks the NUMERATOR and
+            # the fixture reads as having reached parity, so the allowance goes
+            # to the measured side. The opposite side of each bound is left
+            # alone -- an under-stated numerator only makes the ceiling pass,
+            # and a gate is not made honest by relaxing it where it cannot
+            # falsely fire.
+            #
+            # One run demonstrated both at once: pypy startup read 0.029s
+            # against 0.019s on the same base, and dynasm 0.158s against
+            # 0.088s, which failed four ceilings and three floors while every
+            # fixture's own measured time had gone down.
+            if exec_measured > (
+                exec_baseline + self._startup_drift(baseline_key)
+            ) * limit + compare_buffer:
                 return "ceiling"
+            # The measured side enters amplified by `limit / minimum`, so its
+            # error is amplified with it: the allowance belongs inside that
+            # factor, not in the flat buffer.
             if (
                 minimum is not None
                 and exec_baseline >= FLOOR_GATE_MIN_BASELINE_S
-                and exec_measured * (limit / minimum) + compare_buffer
+                and (exec_measured + self._startup_drift(backend))
+                * (limit / minimum) + compare_buffer
                 < exec_baseline * limit
             ):
                 return "floor"
