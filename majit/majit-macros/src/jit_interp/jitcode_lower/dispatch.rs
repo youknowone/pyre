@@ -2332,6 +2332,7 @@ impl<'c> Lowerer<'c> {
         let snap_label = self.next_label;
         let snap_bindings = self.bindings.clone();
         let snap_opcode = self.opcode_var_name.clone();
+        let snap_inline_prebuild = self.inline_liveness_prebuild.len();
 
         self.pc_pinned = true;
         let mut ok = true;
@@ -2358,6 +2359,7 @@ impl<'c> Lowerer<'c> {
             self.next_label = snap_label;
             self.bindings = snap_bindings;
             self.opcode_var_name = snap_opcode;
+            self.inline_liveness_prebuild.truncate(snap_inline_prebuild);
             return InlineArmOutcome::Rejected;
         }
 

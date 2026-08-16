@@ -271,6 +271,9 @@ pub struct Assembler {
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
     )]
     all_liveness_positions: indexmap::IndexMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
+    /// Length of the build-time liveness prefix installed by an embedded
+    /// JitCode table; zero until one is installed.
+    embedded_liveness_prefix_len: usize,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
     /// State-field JIT canonical "all-live" liveness triple, set once at
@@ -319,6 +322,7 @@ impl Assembler {
             all_liveness: Vec::new(),
             all_liveness_length: 0,
             all_liveness_positions: indexmap::IndexMap::new(),
+            embedded_liveness_prefix_len: 0,
             num_liveness_ops: 0,
             canonical_liveness_triple: None,
             canonical_liveness_offset: None,
@@ -3865,6 +3869,22 @@ fn unique_slot_at_offset(fields: &[crate::jitcode::BhFieldSpec], offset: usize) 
     at_offset.next().is_none().then_some(idx)
 }
 
+fn transparent_scalar_field<'a>(
+    parent: &'a crate::jitcode::BhSizeSpec,
+    field_name: &str,
+    offset: usize,
+    expected_type: majit_ir::value::Type,
+) -> Option<&'a crate::jitcode::BhFieldSpec> {
+    let prefix = format!("{field_name}.");
+    let mut matches = parent.all_fielddescrs.iter().filter(|spec| {
+        spec.offset == offset
+            && spec.field_type == expected_type
+            && spec.field_key().starts_with(&prefix)
+    });
+    let field = matches.next()?;
+    matches.next().is_none().then_some(field)
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
@@ -3915,7 +3935,7 @@ fn fielddescrof(
             parent_spec.type_id = owner_id.as_u64();
         }
         let field_lookup = bh_field_lookup(cc, field);
-        let found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
+        let mut found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
         match field_lookup {
             BhFieldLookup::Parent(spec) => {
                 offset = spec.offset;
@@ -3928,13 +3948,35 @@ fn fielddescrof(
                 index_in_parent = Some(spec.index_in_parent);
             }
             BhFieldLookup::Layout(layout_field) => {
-                offset = layout_field.offset;
-                field_size = layout_field.size;
-                field_type = layout_field.field_type;
-                field_flag = layout_field.flag;
-                is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
-                is_immutable = layout_field.is_immutable();
-                is_quasi_immutable = layout_field.is_quasi_immutable();
+                if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
+                    && field_type != majit_ir::value::Type::Ref
+                    && let Some(spec) = parent.as_ref().and_then(|parent| {
+                        transparent_scalar_field(
+                            parent,
+                            &field.name,
+                            layout_field.offset,
+                            field_type,
+                        )
+                    })
+                {
+                    offset = spec.offset;
+                    field_size = spec.field_size;
+                    field_type = spec.field_type;
+                    field_flag = spec.field_flag;
+                    is_field_signed = spec.is_field_signed;
+                    is_immutable = spec.is_immutable;
+                    is_quasi_immutable = spec.is_quasi_immutable;
+                    index_in_parent = Some(spec.index_in_parent);
+                    found_parent_field = true;
+                } else {
+                    offset = layout_field.offset;
+                    field_size = layout_field.size;
+                    field_type = layout_field.field_type;
+                    field_flag = layout_field.flag;
+                    is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
+                    is_immutable = layout_field.is_immutable();
+                    is_quasi_immutable = layout_field.is_quasi_immutable();
+                }
             }
             BhFieldLookup::Missing => {
                 if let Some((
@@ -4738,6 +4780,48 @@ impl Assembler {
     /// position table.
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
+    }
+
+    /// Place an embedded codewriter's liveness table before entries already
+    /// registered by the runtime JitCode builder.
+    ///
+    /// The embedded JitCodes already contain offsets relative to byte zero of
+    /// `prefix`, so that table cannot be appended. Entries registered in this
+    /// Assembler have not yet been patched into runtime-built JitCodes; moving
+    /// their cached offsets by the prefix length keeps both producers in one
+    /// `metainterp_sd.liveness_info` stream. Repeated installation of the same
+    /// prefix is idempotent.
+    pub fn prepend_embedded_liveness(&mut self, prefix: &[u8]) {
+        if prefix.is_empty() {
+            return;
+        }
+        if self.embedded_liveness_prefix_len != 0 {
+            assert_eq!(
+                self.embedded_liveness_prefix_len,
+                prefix.len(),
+                "a different embedded liveness prefix was already installed"
+            );
+            assert_eq!(
+                &self.all_liveness[..prefix.len()],
+                prefix,
+                "the installed embedded liveness prefix changed"
+            );
+            return;
+        }
+
+        let shift = prefix.len();
+        let mut combined = Vec::with_capacity(shift + self.all_liveness.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(&self.all_liveness);
+        self.all_liveness = combined;
+        self.embedded_liveness_prefix_len = shift;
+        self.all_liveness_length = self.all_liveness.len();
+        for offset in self.all_liveness_positions.values_mut() {
+            *offset += shift;
+        }
+        if let Some(offset) = self.canonical_liveness_offset.as_mut() {
+            *offset += shift;
+        }
     }
 
     /// Snapshot the descriptor table after all jitcodes have been fully
@@ -7057,5 +7141,20 @@ mod tests {
         assert_eq!(opnames[0], "int_guard_value");
         assert_eq!(opnames[1], "ref_guard_value");
         assert_eq!(opnames[2], "float_guard_value");
+    }
+
+    #[test]
+    fn embedded_liveness_prefix_shifts_runtime_registered_offsets() {
+        let mut asm = Assembler::new();
+        assert_eq!(asm._register_liveness_offset(&[2], &[], &[]), 0);
+        let original = asm.all_liveness().to_vec();
+        let prefix = [0_u8, 0, 0];
+
+        asm.prepend_embedded_liveness(&prefix);
+
+        assert_eq!(asm.all_liveness(), [prefix.as_slice(), &original].concat());
+        assert_eq!(asm._register_liveness_offset(&[2], &[], &[]), prefix.len());
+        asm.prepend_embedded_liveness(&prefix);
+        assert_eq!(asm.all_liveness(), [prefix.as_slice(), &original].concat());
     }
 }

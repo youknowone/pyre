@@ -52,6 +52,46 @@ pub(super) fn struct_type_id_tokens(path: &syn::Path, is_gc_managed: bool) -> To
     if has_generic_args {
         let legacy = struct_type_id(path, is_gc_managed);
         quote! { #legacy }
+    } else if path.segments.len() > 1 {
+        let first = path
+            .segments
+            .first()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        if matches!(first.as_str(), "crate" | "self" | "super") {
+            let type_path = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            return quote! {
+                majit_metainterp::__pyre_struct_type_id_path(
+                    module_path!(),
+                    #type_path,
+                    #is_gc_managed,
+                )
+            };
+        }
+        // A fully qualified external Rust path carries its defining crate as
+        // the first segment. Charon's module origin drops that crate boundary,
+        // so hash the remaining definition path exactly as the graph
+        // codewriter does for `BhSizeSpec.type_id`.
+        let definition_path = path
+            .segments
+            .iter()
+            .skip(1)
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        definition_path.hash(&mut hasher);
+        if !is_gc_managed {
+            "raw".hash(&mut hasher);
+        }
+        let type_id = hasher.finish();
+        quote! { #type_id }
     } else {
         quote! { majit_metainterp::__pyre_struct_type_id::<#path>(#is_gc_managed) }
     }
@@ -1364,10 +1404,9 @@ impl<'c> Lowerer<'c> {
                     // Resolve the callee by name through the host's
                     // `__majit_pipeline_jitcode`, which returns the
                     // pipeline-built (`make_jitcodes()`, codewriter.py:89)
-                    // sub-jitcode shell. Unlike the macro-helper `Inline*`
-                    // path there is no `_prebuild` symbol: the pipeline
-                    // jitcode carries its own `-live-` markers from the build,
-                    // installed when the host registers the descr pool.
+                    // sub-jitcode shell. Its build-time liveness table is
+                    // installed through the host prebuild hook before the
+                    // driver snapshots the shared assembler table.
                     let pipeline_name = match &*call.func {
                         syn::Expr::Path(ep) => ep.path.segments.last().map(|s| s.ident.to_string()),
                         _ => None,
@@ -1375,6 +1414,9 @@ impl<'c> Lowerer<'c> {
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        __majit_pipeline_liveness_prebuild(__asm);
+                    });
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::InlineCall,
@@ -2294,6 +2336,8 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.inline_liveness_prebuild
+            .extend(nested.inline_liveness_prebuild);
         Some(LoweredSequence::new(nested.statements, nested.op_metadata))
     }
 
@@ -2332,6 +2376,8 @@ impl<'c> Lowerer<'c> {
         };
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.inline_liveness_prebuild
+            .extend(nested.inline_liveness_prebuild);
         Some((
             LoweredSequence::new(nested.statements, nested.op_metadata),
             binding,

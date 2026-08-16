@@ -75,6 +75,42 @@ impl EmbeddedJitCodeTable {
         canonical: &[Arc<CanonicalJitCode>],
         descrs: Vec<CanonicalBhDescr>,
     ) -> &'static Self {
+        Self::materialize_with_replacements(canonical, descrs, &[])
+    }
+
+    /// Join a table after resolving symbolic function addresses supplied by
+    /// the embedding runtime.
+    ///
+    /// A build-script translator cannot take callable addresses from the
+    /// final process. For an unbound callee it therefore stores a stable
+    /// symbolic value and records its path in `symbolic_paths`. The host owns
+    /// the ABI shims for those paths; this method replaces their symbolic
+    /// values in JitCode shells, constant pools, and inline-call descriptors
+    /// before any runtime object is published.
+    pub fn materialize_with_symbolic_fnaddrs(
+        canonical: &[Arc<CanonicalJitCode>],
+        descrs: Vec<CanonicalBhDescr>,
+        symbolic_paths: &[(i64, String)],
+        runtime_bindings: &[(&str, i64)],
+    ) -> &'static Self {
+        let replacements: Vec<(i64, i64)> = symbolic_paths
+            .iter()
+            .filter_map(|(symbolic, path)| {
+                runtime_bindings
+                    .iter()
+                    .find(|(binding_path, _)| *binding_path == path)
+                    .map(|(_, runtime)| *runtime)
+                    .map(|runtime| (*symbolic, runtime))
+            })
+            .collect();
+        Self::materialize_with_replacements(canonical, descrs, &replacements)
+    }
+
+    fn materialize_with_replacements(
+        canonical: &[Arc<CanonicalJitCode>],
+        descrs: Vec<CanonicalBhDescr>,
+        replacements: &[(i64, i64)],
+    ) -> &'static Self {
         let jitcodes: &'static [Arc<JitCode>] = Box::leak(
             canonical
                 .iter()
@@ -88,7 +124,24 @@ impl EmbeddedJitCodeTable {
                         core.name,
                         core.try_index(),
                     );
-                    Arc::new(JitCode::from_canonical((**core).clone()))
+                    let mut core = (**core).clone();
+                    if let Some((_, runtime)) = replacements
+                        .iter()
+                        .find(|(symbolic, _)| *symbolic == core.fnaddr)
+                    {
+                        core.fnaddr = *runtime;
+                    }
+                    if core.try_body().is_some() {
+                        for constant in &mut core.body_mut().constants_i {
+                            if let Some((_, runtime)) = replacements
+                                .iter()
+                                .find(|(symbolic, _)| symbolic == constant)
+                            {
+                                *constant = *runtime;
+                            }
+                        }
+                    }
+                    Arc::new(JitCode::from_canonical(core))
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -232,5 +285,35 @@ mod tests {
         let (mut canonical, descrs) = fixture();
         canonical.swap(0, 1);
         let _ = EmbeddedJitCodeTable::materialize(&canonical, descrs);
+    }
+
+    #[test]
+    fn symbolic_fnaddrs_are_resolved_before_the_table_is_published() {
+        let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64 | 7;
+        let runtime = 0x1234_i64;
+        let callee = CanonicalJitCode::new("callee");
+        callee.set_index(0);
+        callee.set_body(majit_translate::jitcode::JitCodeBody {
+            constants_i: vec![symbolic, 11],
+            ..Default::default()
+        });
+        let mut callee = Arc::new(callee);
+        Arc::get_mut(&mut callee).unwrap().fnaddr = symbolic;
+
+        let table = EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs(
+            &[callee],
+            vec![CanonicalBhDescr::JitCode {
+                jitcode_index: 0,
+                fnaddr: symbolic,
+                calldescr: Default::default(),
+            }],
+            &[(symbolic, "runtime::callee".to_string())],
+            &[("runtime::callee", runtime)],
+        );
+
+        let loaded = table.by_index(0).unwrap();
+        assert_eq!(loaded.fnaddr, runtime);
+        assert_eq!(loaded.body().constants_i, vec![runtime, 11]);
+        assert!(Arc::ptr_eq(loaded, table.descrs()[0].as_jitcode().unwrap()));
     }
 }

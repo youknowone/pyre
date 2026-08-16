@@ -561,12 +561,14 @@ pub(crate) enum CallPolicyKind {
     /// resolved by name through the host's `__majit_pipeline_jitcode`, rather
     /// than a macro-generated `__majit_inline_jitcode_<name>` helper. Int /
     /// Ref / Float select the trailing-return register kind read back into the
-    /// caller binding. `make_jitcodes()` (codewriter.py:89) builds the callee;
-    /// the dispatch traces into it the same way `Inline*` does, only the
-    /// jitcode source differs.
+    /// caller binding; Void records a statement-position call with no result.
+    /// `make_jitcodes()` (codewriter.py:89) builds the callee; the dispatch
+    /// traces into it the same way `Inline*` does, only the jitcode source
+    /// differs.
     InlinePipelineInt,
     InlinePipelineRef,
     InlinePipelineFloat,
+    InlinePipelineVoid,
     /// Calls the function on the concrete path only; the JIT-path lowerer
     /// emits no IR ops at all. Use for operations that have no JIT-visible
     /// side effects (e.g. returning a node to a free-list -- RPython's `del`
@@ -632,6 +634,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "inline_pipeline_int" => CallPolicyKind::InlinePipelineInt,
         "inline_pipeline_ref" => CallPolicyKind::InlinePipelineRef,
         "inline_pipeline_float" => CallPolicyKind::InlinePipelineFloat,
+        "inline_pipeline_void" => CallPolicyKind::InlinePipelineVoid,
         "concrete_only_void" => CallPolicyKind::ConcreteOnlyVoid,
         _ => return None,
     })

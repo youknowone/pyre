@@ -4104,6 +4104,37 @@ impl CallControl {
             .unwrap_or_else(|| declared.clone());
         Some(return_type_string_to_value_type(Some(&effective)))
     }
+
+    /// The shared low-level result type of an indirect-call family.
+    ///
+    /// RPython's `FunctionReprBase.call` gets this from the selected
+    /// call-family row's `FuncType.RESULT`.  Charon may leave a dependency's
+    /// transparent newtype opaque in the caller artefact, so the front-end
+    /// destination alone can only say `Ref`; the locally defined family
+    /// member still carries the authoritative translated result type.
+    pub(crate) fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<Type> {
+        let mut declared = self
+            .all_impls_for_indirect(trait_root, method_name)
+            .into_iter()
+            .filter_map(|path| self.function_graphs.get(&path))
+            .filter_map(|graph| graph.return_type.as_ref())
+            .map(|result| {
+                let effective = crate::front::typestr::transparent_result_ok_type(result)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| result.clone());
+                return_type_string_to_value_type(Some(&effective))
+            });
+        let first = declared.next()?;
+        assert!(
+            declared.all(|result| result == first),
+            "indirect-call family {trait_root}::{method_name} has inconsistent result types"
+        );
+        Some(first)
+    }
 }
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by

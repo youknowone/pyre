@@ -1521,6 +1521,31 @@ impl<'c> Lowerer<'c> {
                     );
                     self.emit_op(OpMeta::live_marker(), post_live);
                 }
+                crate::jit_interp::CallPolicyKind::InlinePipelineVoid => {
+                    let pipeline_name = match &*call.func {
+                        syn::Expr::Path(ep) => ep
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string()),
+                        _ => None,
+                    }?;
+                    let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
+                    let arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        __majit_pipeline_liveness_prebuild(__asm);
+                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::InlineCall, arg_regs, vec![]),
+                        quote! {
+                            let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
+                            let __sub_idx = __builder.add_sub_jitcode_arc(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
+                }
                 // A result-returning inline helper whose result the statement
                 // discards. The sub-jitcode still ends in a typed return
                 // opcode, so it needs a destination even though nothing reads

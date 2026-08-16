@@ -566,6 +566,7 @@ pub(super) fn call_policy_effect_slot(
         | K::InlinePipelineInt
         | K::InlinePipelineRef
         | K::InlinePipelineFloat
+        | K::InlinePipelineVoid
         | K::ConcreteOnlyVoid => None,
     }
 }
@@ -580,7 +581,11 @@ pub(super) fn call_policy_effect_slot(
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
     if binding_kind_for_inline_policy(kind).is_some()
-        || matches!(kind, crate::jit_interp::CallPolicyKind::InlineVoid)
+        || matches!(
+            kind,
+            crate::jit_interp::CallPolicyKind::InlineVoid
+                | crate::jit_interp::CallPolicyKind::InlinePipelineVoid
+        )
     {
         return false;
     }
@@ -608,6 +613,7 @@ pub(super) fn call_policy_result_kind(
         | K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
         | K::InlineVoid
+        | K::InlinePipelineVoid
         | K::ConcreteOnlyVoid => Some(CallResultKind::Void),
 
         K::ResidualInt
@@ -2841,5 +2847,81 @@ mod tests {
         assert!(body.contains("stack_pop"));
         assert!(body.contains("add_sub_jitcode_arc"));
         assert!(body.contains("__sub_return_kind"));
+    }
+
+    #[test]
+    fn inline_pipeline_void_policy_resolves_callee_by_name() {
+        let expr: syn::Expr = syn::parse_quote! { stack_swap() };
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_swap".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineVoid),
+            )],
+            InferenceFailureMode::Panic,
+        );
+
+        lowerer
+            .lower_config_call_stmt(&expr)
+            .expect("inline-pipeline void call should lower");
+
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("__majit_pipeline_jitcode"));
+        assert!(body.contains("stack_swap"));
+        assert!(body.contains("add_sub_jitcode_arc"));
+        let prebuild = &lowerer.inline_liveness_prebuild;
+        let prebuild = quote! { #(#prebuild)* }.to_string();
+        assert!(prebuild.contains("__majit_pipeline_liveness_prebuild"));
+    }
+
+    #[test]
+    fn nested_branch_preserves_pipeline_liveness_prebuild() {
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_pop".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let expr_if: syn::ExprIf = syn::parse_quote! {
+            if 1 {
+                let popped = stack_pop();
+            }
+        };
+
+        lowerer
+            .lower_if_stmt(&expr_if)
+            .expect("branch containing a pipeline call should lower");
+
+        let prebuild = &lowerer.inline_liveness_prebuild;
+        let tokens = quote! { #(#prebuild)* }.to_string();
+        assert!(tokens.contains("__majit_pipeline_liveness_prebuild"));
+    }
+
+    #[test]
+    fn rejected_inline_arm_rolls_back_pipeline_liveness_prebuild() {
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_pop".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let body: syn::Expr = syn::parse_quote! {{
+            let popped = stack_pop();
+            match 0 {
+                (1, 2) => unsupported_body(),
+                _ => 1,
+            };
+        }};
+
+        assert_eq!(
+            lowerer.try_inline_dispatch_arm(&body),
+            dispatch::InlineArmOutcome::Rejected,
+        );
+        assert!(lowerer.inline_liveness_prebuild.is_empty());
     }
 }

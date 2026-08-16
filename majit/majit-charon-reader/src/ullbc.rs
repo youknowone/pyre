@@ -189,6 +189,15 @@ pub struct TypeLayout {
     /// [`TypeLayout::discriminant_offset`].
     #[serde(default)]
     pub discriminator: Option<Value>,
+    #[serde(default)]
+    pub repr: Option<TypeRepr>,
+}
+
+/// Representation properties that affect the low-level value shape.
+#[derive(Debug, Deserialize)]
+pub struct TypeRepr {
+    #[serde(default)]
+    pub transparent: bool,
 }
 
 /// Per-variant field offsets within [`TypeLayout`].
@@ -211,6 +220,24 @@ impl TypeDecl {
         let raw = self.layout.as_ref()?;
         let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
         select_target_layout(entries, target)
+    }
+
+    /// Whether every emitted target layout records `#[repr(transparent)]`.
+    pub fn is_repr_transparent(&self) -> bool {
+        let Some(raw) = self.layout.as_ref() else {
+            return false;
+        };
+        let Ok(entries) = serde_json::from_str::<Vec<TargetLayout>>(raw.get()) else {
+            return false;
+        };
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                entry
+                    .value
+                    .repr
+                    .as_ref()
+                    .is_some_and(|repr| repr.transparent)
+            })
     }
 }
 
@@ -799,8 +826,20 @@ mod tests {
         assert_eq!(layout.struct_field_offset(3), Some(72));
         assert_eq!(layout.struct_field_offset(4), Some(73));
         assert_eq!(layout.struct_field_offset(5), None);
+        assert!(!layout.repr.as_ref().unwrap().transparent);
         // single-variant type has no decodable discriminant tag
         assert_eq!(layout.discriminant_offset(), None);
+    }
+
+    #[test]
+    fn transparent_repr_is_preserved() {
+        let json = r#"{
+            "size": 8, "align": 8,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": true}
+        }"#;
+        let layout: TypeLayout = serde_json::from_str(json).unwrap();
+        assert!(layout.repr.unwrap().transparent);
     }
 
     /// An enum's per-variant field offsets, plus the niche tag position.

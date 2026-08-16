@@ -181,6 +181,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    link_transparent_scalar_types(llbcs);
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -807,6 +808,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    link_transparent_scalar_types(std::slice::from_ref(llbc));
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
         mut known_struct_names,
@@ -4825,6 +4827,22 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
+                // A transparent one-field aggregate is represented by its
+                // only operand. Constructing a separate instance would split
+                // one machine word into incompatible scalar and reference
+                // annotations at later merges.
+                if tyref_transparent_inner_value_type(dest_ty, self.llbc).is_some()
+                    && operands.len() == 1
+                {
+                    let value = self.resolve_operand(
+                        mir_bb,
+                        operands
+                            .into_iter()
+                            .next()
+                            .expect("one transparent aggregate operand"),
+                    )?;
+                    return Ok((None, value));
+                }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
@@ -5412,6 +5430,16 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
+                    // Projecting the sole field of a transparent wrapper is
+                    // the identity on its low-level value. The wrapper and
+                    // field share one register bank and one machine word, so
+                    // emitting a FieldRead would try to dereference that word
+                    // as an aggregate base.
+                    if field_name == "__pos_0"
+                        && tyref_transparent_inner_value_type(&inner.ty, self.llbc).is_some()
+                    {
+                        return self.resolve_place(mir_bb, *inner);
+                    }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the
                     // `Some` payload IS the base pointer — reading `Some.__pos_0`
@@ -8284,7 +8312,13 @@ impl<'a> Lowering<'a> {
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
                     let promote_marker = self.jit_promote_marker(&reg);
-                    let target = if args.len() == 1
+                    let target = if let Some((trait_root, method_name)) =
+                        abstract_trait_call_target(&reg, self.llbc)
+                    {
+                        CallTarget::indirect(trait_root, method_name)
+                    } else if let Some(path) = transparent_inherent_method_path(&reg, self.llbc) {
+                        CallTarget::FunctionPath { segments: path }
+                    } else if args.len() == 1
                         && let Some(marker) = promote_marker
                     {
                         CallTarget::FunctionPath {
@@ -15456,6 +15490,13 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // A transparent one-field struct has the same low-level value shape as
+    // its field. Charon records the representation in `TypeDecl.layout`, so
+    // preserve the field's register bank instead of treating the wrapper as
+    // a GC reference.
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
+        return inner;
+    }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
     // `u32` bytecode operands.  Their dependency declarations are opaque in
     // interpreter LLBC, so model the exact upstream family as unsigned
@@ -16049,6 +16090,69 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
         l if l.starts_with("AtomicI") => Some(ValueType::Int),
         l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
         _ => None,
+    }
+}
+
+fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let node = tyref_node(ty, llbc)?;
+    let id = adt_node_def_id(node)?;
+    let decl = llbc.type_by_id(id)?;
+    if !decl.is_repr_transparent() {
+        return None;
+    }
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) => {
+            let [field] = fields.as_slice() else {
+                return None;
+            };
+            Some(tyref_to_value_type(&field.ty, llbc))
+        }
+        TypeDeclKind::Opaque => llbc
+            .transparent_scalar_kind(&decl.item_meta.name_path())
+            .map(|kind| match kind {
+                majit_charon_reader::TransparentScalarKind::Signed => ValueType::Int,
+                majit_charon_reader::TransparentScalarKind::Unsigned => ValueType::Unsigned,
+                majit_charon_reader::TransparentScalarKind::Bool => ValueType::Bool,
+                majit_charon_reader::TransparentScalarKind::Float => ValueType::Float,
+            }),
+        _ => None,
+    }
+}
+
+/// Link complete transparent-scalar declarations to opaque dependency views.
+///
+/// Charon keeps `repr(transparent)` in an external declaration's layout but
+/// omits its private field type. The defining crate's LLBC contains that field;
+/// both declarations share the same qualified Rust path. RPython translates a
+/// linked type universe, so collect that one register-bank fact before lowering
+/// any body and publish it to every artefact in the same translation input.
+fn link_transparent_scalar_types(llbcs: &[Llbc]) {
+    let mut discovered = Vec::new();
+    for llbc in llbcs {
+        for decl in llbc.iter_type_decls() {
+            if !decl.is_repr_transparent() {
+                continue;
+            }
+            let TypeDeclKind::Struct(fields) = &decl.kind else {
+                continue;
+            };
+            let [field] = fields.as_slice() else {
+                continue;
+            };
+            let kind = match tyref_to_value_type(&field.ty, llbc) {
+                ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+                ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
+                ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
+                ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
+                _ => continue,
+            };
+            discovered.push((decl.item_meta.name_path(), kind));
+        }
+    }
+    discovered.sort_by(|a, b| a.0.cmp(&b.0));
+    discovered.dedup();
+    for llbc in llbcs {
+        llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
     }
 }
 
@@ -17700,6 +17804,47 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
         _ => return None,
     };
     Some((parent, leaf))
+}
+
+/// Resolve a call to a bodyless trait declaration as dynamic dispatch.
+///
+/// Charon keeps a call such as `self.head()` inside a trait default method as
+/// `CallKind::Trait` pointing at the declaration of `head`. When that
+/// declaration has no body, the direct `[Trait, method]` path has nothing to
+/// execute; the receiver's implementation family must select the target.
+fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String, String)> {
+    let CallKind::Trait(value) = &reg.kind else {
+        return None;
+    };
+    let method_id = value.as_array()?.get(2)?.as_u64()?;
+    let declaration = llbc.fn_by_id(method_id)?;
+    if declaration.unstructured().is_some() {
+        return None;
+    }
+    trait_method_owner(declaration)
+}
+
+/// Return the static graph path for an inherent method on a transparent type.
+///
+/// Its receiver is a scalar in the low-level model, so routing through
+/// `CallTarget::Method` would perform an attribute lookup on an integer. The
+/// Rust call is statically resolved already; use the registered impl graph
+/// directly and keep the scalar receiver as its first argument.
+fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let declaration = llbc.fn_by_id(*id)?;
+    let (owner, method) = impl_method_owner_for_fundecl(llbc, declaration)?;
+    let receiver = declaration.signature.inputs.first()?;
+    let node = strip_ty_wrappers(tyref_node(receiver, llbc)?, llbc)?;
+    let owner_id = adt_node_def_id(node)?;
+    if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
+        return None;
+    }
+    let mut path = owner.split("::").map(str::to_string).collect::<Vec<_>>();
+    path.push(method);
+    Some(path)
 }
 
 /// Compact identifier for a `CallKind::Trait` payload — the triple
@@ -23613,6 +23758,177 @@ mod tests {
             ]
         );
         assert_ne!(ids["Array<i64;1>"], ids["Array<bool;2>"]);
+    }
+
+    #[test]
+    fn bodyless_trait_method_uses_indirect_dispatch() {
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(
+            super::abstract_trait_call_target(&call, &llbc),
+            Some(("Storage".to_string(), "head".to_string()))
+        );
+    }
+
+    #[test]
+    fn transparent_scalar_struct_uses_inner_register_bank() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Word", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 16}
+                }},
+                "source_text": "struct Word(i64);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Struct": [{
+                "name": null,
+                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "attr_info": null
+            }]},
+            "layout": [{
+                "key": "x86_64-unknown-linux-gnu",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": true}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let word_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+
+        assert_eq!(
+            super::tyref_to_value_type(&word_ty, &llbc),
+            crate::model::ValueType::Int
+        );
+    }
+
+    #[test]
+    fn linked_transparent_definition_types_opaque_dependency_view() {
+        let type_decl = |kind: serde_json::Value| {
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": {
+                    "name": [{"Ident": ["shared", 0]}, {"Ident": ["Word", 0]}],
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 16}
+                    }},
+                    "source_text": "struct Word(i64);",
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "kind": kind,
+                "layout": [{
+                    "key": "x86_64-unknown-linux-gnu",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": true}
+                    }
+                }]
+            })
+        };
+        let artifact = |kind| {
+            serde_json::json!({
+                "charon_version": "0.1.201",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [null, type_decl(kind)],
+                    "fun_decls": [],
+                    "global_decls": [],
+                    "trait_decls": [],
+                    "trait_impls": []
+                }
+            })
+        };
+        let defining = Llbc::from_slice(
+            artifact(serde_json::json!({"Struct": [{
+                "name": null,
+                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "attr_info": null
+            }]}))
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let opaque =
+            Llbc::from_slice(artifact(serde_json::json!("Opaque")).to_string().as_bytes()).unwrap();
+        let llbcs = vec![defining, opaque];
+        super::link_transparent_scalar_types(&llbcs);
+        let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::tyref_to_value_type(&linked_ty, &llbcs[1]),
+            crate::model::ValueType::Int
+        );
     }
 
     /// The `Vec` index fold must accept a `usize` index.

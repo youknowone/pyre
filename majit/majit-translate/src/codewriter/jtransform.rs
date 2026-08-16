@@ -702,6 +702,22 @@ fn variable_has_declared_unsigned_type(
         })
 }
 
+/// Preserve the MIR distinction between reading a by-value field and taking
+/// the address of an inline substructure. RPython receives distinct
+/// `getfield`/`getsubstruct` operations from its rtyper; Rust references are
+/// aliases in the flow graph, so the front records that distinction on the
+/// field access instead.
+fn getsubstruct_offset_for_access(
+    field: &FieldDescriptor,
+    resolve_offset: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    if field.taken_by_address {
+        resolve_offset()
+    } else {
+        None
+    }
+}
+
 impl<'a> Transformer<'a> {
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
     /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
@@ -2909,10 +2925,19 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        let inline_substruct_offset = self
-            .callcontrol
-            .as_deref()
-            .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field));
+        // `rewrite_op_getsubstruct` applies only to an address-producing
+        // projection.  A by-value Rust field can itself have an inline-struct
+        // layout (notably a `#[repr(transparent)]` newtype) while the operation
+        // is still an ordinary load.  Treating every offset-zero Struct field
+        // as getsubstruct aliases the result to the container pointer and
+        // silently drops the load.  The MIR front records the distinction on
+        // the access because `Rvalue::Ref` otherwise has the same FieldRead
+        // shape as `Rvalue::Use`.
+        let inline_substruct_offset = getsubstruct_offset_for_access(field, || {
+            self.callcontrol
+                .as_deref()
+                .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field))
+        });
         if let Some(0) = inline_substruct_offset {
             let OpKind::FieldRead { base, .. } = &op.kind else {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
@@ -7508,6 +7533,23 @@ mod tests {
             kind: OpKind::Live,
         };
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
+
+    #[test]
+    fn inline_struct_value_read_is_not_getsubstruct() {
+        let value_read = FieldDescriptor::new("value", Some("Node".into()));
+        assert_eq!(
+            getsubstruct_offset_for_access(&value_read, || {
+                panic!("a by-value field read must not consult getsubstruct layout")
+            }),
+            None,
+        );
+
+        let address = value_read.with_taken_by_address(true);
+        assert_eq!(
+            getsubstruct_offset_for_access(&address, || Some(0)),
+            Some(0)
+        );
     }
 
     /// A `FunctionPath` override matches its own segmentation and nothing
