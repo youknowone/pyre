@@ -6156,11 +6156,16 @@ fn bind_published_dense_refs(
     info: &GuardInfo,
     constants: &IndexMap<u32, i64>,
 ) {
-    for &slot in &info.failarg_ref_slots {
-        let Some(&arg_ref) = info.fail_arg_refs.get(slot) else {
-            continue;
-        };
-        if arg_ref.is_none() || arg_ref.is_constant() || constants.contains_key(&arg_ref.raw()) {
+    for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+        // regalloc.py:164-176 `FrameManager.bind`: publishing a new box into a
+        // frame location replaces the location's previous occupant.  The raw
+        // dense store does the same even when the new value is Int or Float,
+        // so an earlier Ref binding must not survive that store.
+        if !info.failarg_ref_slots.contains(&slot)
+            || arg_ref.is_none()
+            || arg_ref.is_constant()
+            || constants.contains_key(&arg_ref.raw())
+        {
             dense_ref_bindings.swap_remove(&slot);
             continue;
         }
