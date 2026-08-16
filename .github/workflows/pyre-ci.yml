@@ -121,17 +121,20 @@ jobs:
     - name: Compute LLBC fingerprints
       id: llbc-fingerprint
       shell: bash
-      # One fingerprint per Charon target crate, over that crate's own local
-      # path-dependency source closure (not broad pyre/** or majit/** globs).
-      # Per-crate so a change confined to one crate's closure only re-extracts
-      # that crate, via the split caches below. extract-llbc.py drops
-      # majit-translate from the pyre-object/-interpreter fingerprints — their
-      # .ullbc holds zero majit-translate content (it re-asserts this on every
-      # extraction) — so a translator-only edit reuses those two artefacts;
-      # pyre-jit keeps majit-translate because its .ullbc embeds those types.
+      # One cache key per Charon target crate. `build/llbc` is empty this early,
+      # so no crate has a `.readfiles` yet and `source=` is the whole cargo
+      # closure — which is what a key wants: it must be computable before the
+      # artefact it will name exists. The narrow digest the stamp records is a
+      # freshness verdict, not a key, and is not available here.
+      #
+      # Take the `source=` line alone. `--fingerprint` prints three fields, and
+      # `$GITHUB_OUTPUT` parses one `name=value` per line, so passing the whole
+      # block through would file `closure=` and `external=` as outputs of their
+      # own and leave the key holding a stray `source=` prefix.
       run: |
         for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
-          value="$(scripts/extract-llbc.py --fingerprint "$crate")"
+          value="$(scripts/extract-llbc.py --fingerprint "$crate" | sed -n 's/^source=//p')"
+          test -n "$value" || { echo "no source= for $crate" >&2; exit 1; }
           echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
         done
     # Per-crate caches (per-OS/arch because cfg(target_os)/cfg(target_arch)
@@ -146,6 +149,15 @@ jobs:
     # the extraction host's. They must restore alongside the artefact they
     # accompany: a cache hit skips extraction, and `pyre-jit-trace`'s build
     # script refuses a cross-target build whose sidecars are absent.
+    #
+    # `.ullbc.readfiles` restores for the same reason and is equally required:
+    # it carries the artefact's own file table, which is what `source=` now
+    # hashes. Restored without it, every consumer falls back to the whole cargo
+    # closure and computes a digest that CANNOT equal the narrow one the stamp
+    # beside it records, so all four crates read STALE while the artefact is
+    # current. The `llbc2-` prefix retires the keys whose payload predates it —
+    # the key is the wide digest, which no edit to the extraction driver moves,
+    # so without a new namespace the shapeless entries would restore forever.
     - name: Cache LLBC (majit-rlib)
       id: llbc-cache-rlib
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -153,8 +165,9 @@ jobs:
         path: |
           build/llbc/majit-rlib.ullbc
           build/llbc/majit-rlib.ullbc.fingerprint
+          build/llbc/majit-rlib.ullbc.readfiles
           build/llbc/majit-rlib.*.layouts.ullbc
-        key: llbc-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
+        key: llbc2-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
     - name: Cache LLBC (pyre-object)
       id: llbc-cache-object
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -162,8 +175,9 @@ jobs:
         path: |
           build/llbc/pyre-object.ullbc
           build/llbc/pyre-object.ullbc.fingerprint
+          build/llbc/pyre-object.ullbc.readfiles
           build/llbc/pyre-object.*.layouts.ullbc
-        key: llbc-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
+        key: llbc2-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
     - name: Cache LLBC (pyre-interpreter)
       id: llbc-cache-interpreter
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -171,8 +185,9 @@ jobs:
         path: |
           build/llbc/pyre-interpreter.ullbc
           build/llbc/pyre-interpreter.ullbc.fingerprint
+          build/llbc/pyre-interpreter.ullbc.readfiles
           build/llbc/pyre-interpreter.*.layouts.ullbc
-        key: llbc-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
+        key: llbc2-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
     - name: Cache LLBC (pyre-jit)
       id: llbc-cache-jit
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -180,7 +195,8 @@ jobs:
         path: |
           build/llbc/pyre-jit.ullbc
           build/llbc/pyre-jit.ullbc.fingerprint
-        key: llbc-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
+          build/llbc/pyre-jit.ullbc.readfiles
+        key: llbc2-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
     - name: Extract LLBC
       # Runs only when some crate's cache missed. extract-llbc.py self-skips
       # the crates whose .ullbc + matching .fingerprint stamp were restored
@@ -270,10 +286,14 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
-        test -s build/llbc/majit-rlib.ullbc
-        test -s build/llbc/pyre-object.ullbc
-        test -s build/llbc/pyre-interpreter.ullbc
-        test -s build/llbc/pyre-jit.ullbc
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          test -s "build/llbc/${crate}.ullbc"
+          # The sidecar carries the artefact's own file table, which is what
+          # `source=` hashes. Without it the fingerprint falls back to the whole
+          # cargo closure and every consumer reports LLBC STALE, so fail here
+          # where the cause is still visible.
+          test -s "build/llbc/${crate}.ullbc.readfiles"
+        done
     - name: Free up runner disk space
       if: runner.os == 'Linux'
       shell: bash
@@ -408,10 +428,14 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
-        test -s build/llbc/majit-rlib.ullbc
-        test -s build/llbc/pyre-object.ullbc
-        test -s build/llbc/pyre-interpreter.ullbc
-        test -s build/llbc/pyre-jit.ullbc
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          test -s "build/llbc/${crate}.ullbc"
+          # The sidecar carries the artefact's own file table, which is what
+          # `source=` hashes. Without it the fingerprint falls back to the whole
+          # cargo closure and every consumer reports LLBC STALE, so fail here
+          # where the cause is still visible.
+          test -s "build/llbc/${crate}.ullbc.readfiles"
+        done
     - name: Only frame construction accesses PyFrame virtualizable fields without a pointer (Linux only)
       # A red here means a virtualizable field of `PyFrame` is now reached off
       # a non-dereferenced local aggregate somewhere the census does not expect
@@ -631,10 +655,14 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
-        test -s build/llbc/majit-rlib.ullbc
-        test -s build/llbc/pyre-object.ullbc
-        test -s build/llbc/pyre-interpreter.ullbc
-        test -s build/llbc/pyre-jit.ullbc
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          test -s "build/llbc/${crate}.ullbc"
+          # The sidecar carries the artefact's own file table, which is what
+          # `source=` hashes. Without it the fingerprint falls back to the whole
+          # cargo closure and every consumer reports LLBC STALE, so fail here
+          # where the cause is still visible.
+          test -s "build/llbc/${crate}.ullbc.readfiles"
+        done
     - name: Build pyre-dynasm
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
     - name: Run CPython suite (gate regressions, JIT on)
@@ -686,10 +714,14 @@ jobs:
       shell: bash
       run: |
         test -d .pyre-build/charon
-        test -s build/llbc/majit-rlib.ullbc
-        test -s build/llbc/pyre-object.ullbc
-        test -s build/llbc/pyre-interpreter.ullbc
-        test -s build/llbc/pyre-jit.ullbc
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          test -s "build/llbc/${crate}.ullbc"
+          # The sidecar carries the artefact's own file table, which is what
+          # `source=` hashes. Without it the fingerprint falls back to the whole
+          # cargo closure and every consumer reports LLBC STALE, so fail here
+          # where the cause is still visible.
+          test -s "build/llbc/${crate}.ullbc.readfiles"
+        done
     - name: Build pyre --features sandbox
       # A green sandbox build is the fails-closed proof: every mediated module
       # names libc through host_seam::sys, so any direct syscall left outside
