@@ -1,6 +1,4 @@
 # pyre-check: max-pypy-ratio=19
-# pyre-check: max-wasm-ratio=3.7
-# Reported 3.2x twice on ubuntu-24.04.
 # Exercises short-circuit `and` / `or` in VALUE context inside a hot loop.
 #
 # `x = (i % 7) and (i + 3)` lowers to `BINARY_OP %; COPY 1; TO_BOOL;

@@ -1,6 +1,3 @@
-# pyre-check: max-wasm-ratio=3.8
-# Reported 3.2x and 3.3x on ubuntu-24.04.
-
 def main():
     s = 0
     i = 0

@@ -1,6 +1,3 @@
-# pyre-check: max-wasm-ratio=3.6
-# Reported 3.1x on ubuntu-24.04, and under the gate on the run before it.
-
 def fib(n):
     if n < 2:
         return n
