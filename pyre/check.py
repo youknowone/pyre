@@ -1496,11 +1496,13 @@ def synth_jitstats_bands(path):
     header. It is only for schedule-sensitive counters; badness counters must
     remain exactly zero. The directive must be followed by a comment describing
     the measured variance, so the allowance is reviewable next to the workload.
-    Unknown or duplicate fields and non-positive or non-integer widths are
-    errors rather than silent no-ops. A directive below the 20-line window is
-    simply not read, so the fixture gates normally in that case.
+    Unknown or duplicate fields, repeated directives, and non-positive or
+    non-integer widths are errors rather than silent no-ops. A directive below
+    the 20-line window is simply not read, so the fixture gates normally in
+    that case.
     """
     prefix = "# pyre-check: jitstats-band="
+    bands = None
     with open(path, encoding="utf-8") as source:
         for _ in range(20):
             line = source.readline()
@@ -1508,6 +1510,8 @@ def synth_jitstats_bands(path):
                 break
             if not line.startswith(prefix):
                 continue
+            if bands is not None:
+                raise ValueError(f"duplicate jit-stats band directive in {path}: {line.strip()}")
             bands = {}
             entries = line[len(prefix):].strip().split(",")
             for entry in entries:
@@ -1538,8 +1542,7 @@ def synth_jitstats_bands(path):
                         f"jit-stats band width must be positive in {path}: {line.strip()}"
                     )
                 bands[field] = width
-            return bands
-    return {}
+    return bands if bands is not None else {}
 
 
 def _synth_header_flag(path, directive, malformed):
@@ -2057,19 +2060,17 @@ class Check:
                     (s for s in repeats or () if s != jitstats), None
                 )
                 if drifted is not None:
-                    moved = _jit_stats_change(jitstats, drifted, jitstats_bands)
-                    # Snapshot text can drift inside a band without making any
-                    # gated counter unstable.
-                    if moved[0] or moved[1]:
-                        self.jitstats_unstable.append(f"{backend}/{name}")
-                        return "unstable", (
-                            "jit-stats unstable — re-running the same binary moved "
-                            + ", ".join(moved[0] + moved[1])
-                            + ", so this run's counters are not a property of the "
-                            "tree and the baseline comparison ("
-                            + ", ".join(regressions + improvements)
-                            + ") is not gated"
-                        )
+                    # Drift compares two samples directly and is deliberately unbanded.
+                    moved = _jit_stats_change(jitstats, drifted)
+                    self.jitstats_unstable.append(f"{backend}/{name}")
+                    return "unstable", (
+                        "jit-stats unstable — re-running the same binary moved "
+                        + ", ".join(moved[0] + moved[1])
+                        + ", so this run's counters are not a property of the "
+                        "tree and the baseline comparison ("
+                        + ", ".join(regressions + improvements)
+                        + ") is not gated"
+                    )
                 parts = []
                 if regressions:
                     parts.append("regressed: " + ", ".join(regressions))
@@ -2089,8 +2090,13 @@ class Check:
                 self.jitstats_improvements.append(f"{backend}/{name}")
                 return "improved", reason
             if banded:
+                # Assigned, not returned: every other verdict above is a
+                # failure, so leaving early costs those nothing. A band means
+                # the run is fine, and returning here would carry the fixture
+                # past the `--snapshot-diff` and `--threshold` gates below on
+                # every run of a host that sits inside its band.
                 self.jitstats_banded.append(f"{backend}/{name}")
-                return "banded", (
+                status, reason = "banded", (
                     "jit-stats within band — " + ", ".join(banded)
                     + _jit_stats_context(jitstats)
                 )
