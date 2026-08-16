@@ -3011,7 +3011,7 @@ fn raw_values_from_deadframe_typed(
         .collect()
 }
 
-fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendError> {
+fn finish_result_from_deadframe(frame: &DeadFrame) -> Result<i64, BackendError> {
     let (fail_arg_types, is_exit_frame_with_exception) = {
         let descr = get_latest_descr_from_deadframe(frame)?;
         assert!(descr.is_finish(), "expected finish deadframe");
@@ -3033,14 +3033,10 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
     match fail_arg_types.as_slice() {
         [] => Ok(0),
         [Type::Int] => get_int_from_deadframe(frame, 0),
-        [Type::Ref] => {
-            if let Some(jf) = frame.as_jitframe_mut() {
-                return Ok(jf.take_ref_for_call_result(0).as_usize() as i64);
-            }
-            Err(BackendError::Unsupported(
-                "unsupported dead frame type for Ref finish result".to_string(),
-            ))
-        }
+        // compile.py:640-642 DoneWithThisFrameDescrRef.get_result reads the
+        // slot through `cpu.get_ref_value(deadframe, 0)` and leaves it there —
+        // the same read the exception arm above makes.
+        [Type::Ref] => Ok(get_ref_from_deadframe(frame, 0)?.0 as i64),
         [Type::Float] => Ok(get_float_from_deadframe(frame, 0)?.to_bits() as i64),
         [Type::Void] => Ok(0),
         other => Err(BackendError::Unsupported(format!(
@@ -3049,7 +3045,7 @@ fn finish_result_from_deadframe(frame: &mut DeadFrame) -> Result<i64, BackendErr
     }
 }
 
-fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<i64> {
+fn call_assembler_finish_or_blackhole_deadframe(frame: DeadFrame) -> Option<i64> {
     // `compile.py:710-716 resume_in_blackhole(descr, deadframe)` parity:
     // the descr is the sole identity carrier crossing the C-ABI; the
     // receiver derives green_key (memmgr-evicted JCT recovery via
@@ -3071,7 +3067,7 @@ fn call_assembler_finish_or_blackhole_deadframe(mut frame: DeadFrame) -> Option<
         (is_finish, fail_descr, fail_arg_types)
     };
     if is_finish {
-        return finish_result_from_deadframe(&mut frame).ok();
+        return finish_result_from_deadframe(&frame).ok();
     }
 
     let raw_values = raw_values_from_deadframe_typed(&frame, &fail_arg_types).ok()?;
@@ -3789,7 +3785,7 @@ fn call_assembler_shim_inner(
             target.trace_id, target.num_inputs, i0
         );
     }
-    let mut frame = execute_registered_loop_target(target, input_slice);
+    let frame = execute_registered_loop_target(target, input_slice);
     let descr =
         get_latest_descr_from_deadframe(&frame).expect("get_latest_descr_from_deadframe failed");
     if descr.is_finish() {
@@ -3797,7 +3793,7 @@ fn call_assembler_shim_inner(
             *outcome.add(0) = CALL_ASSEMBLER_OUTCOME_FINISH;
             *outcome.add(1) = 0;
         }
-        let result = finish_result_from_deadframe(&mut frame)
+        let result = finish_result_from_deadframe(&frame)
             .expect("finish_result_from_deadframe failed") as u64;
         return result;
     }

@@ -10,7 +10,7 @@ use majit_gc::shadow_stack::OwnerRootGuard;
 use majit_ir::{DescrRef, GcRef};
 
 use crate::ExitRecoveryLayout;
-use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS};
+use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame};
 
 /// Where a held deadframe keeps its jitframe pointer.
 ///
@@ -36,6 +36,12 @@ enum JitFrameRoot {
     /// LIFO stack next to it: a deadframe's lifetime is the caller's, and two
     /// live deadframes are released in whatever order their owners drop, which
     /// a stack discipline cannot express.
+    ///
+    /// The vector is per-thread, so the position names a slot on the thread
+    /// that acquired it and the guard must be dropped there: releasing it
+    /// elsewhere would free a foreign thread's slot, or find none active. The
+    /// guard is `!Send` for that reason, which makes the whole deadframe
+    /// thread-confined.
     Slot(OwnerRootGuard),
     /// The frame is not a GC object — it was allocated out of the Rust heap
     /// because no type registry was available to allocate it under — so it
@@ -116,6 +122,16 @@ impl JitFrameDeadFrame {
 
     #[inline]
     pub fn get_int(&self, index: usize) -> i64 {
+        // A safe function that dereferences an index the caller chose, so the
+        // only thing between an index error and an out-of-bounds read is this
+        // check. The frame carries its own slot count in the length word ahead
+        // of `jf_frame`, which is the bound. `get_float` and `get_ref` read
+        // through here, so one check covers all three.
+        debug_assert!(
+            (index as isize)
+                < unsafe { JitFrame::frame_length(self.jf_gcref().0 as *const JitFrame) },
+            "jf_frame index {index} is past the frame's own length",
+        );
         unsafe { *((self.jf_gcref().0 + FIRST_ITEM_OFFSET + index * 8) as *const i64) }
     }
 
@@ -126,10 +142,6 @@ impl JitFrameDeadFrame {
 
     #[inline]
     pub fn get_ref(&self, index: usize) -> GcRef {
-        GcRef(self.get_int(index) as usize)
-    }
-
-    pub fn take_ref_for_call_result(&mut self, index: usize) -> GcRef {
         GcRef(self.get_int(index) as usize)
     }
 

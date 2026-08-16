@@ -1599,16 +1599,23 @@ unsafe impl Sync for JitCellToken {}
 ///
 /// [`DeadFrame::Boxed`] keeps the erasure for backends whose deadframe is not a
 /// jitframe, or is a jitframe held under a different ownership discipline.
+///
+/// **A deadframe is thread-confined**: it must be created and dropped on the
+/// same thread. The root slot [`DeadFrame::JitFrame`] holds names a position in
+/// the acquiring thread's root vector, so releasing it anywhere else would free
+/// a foreign thread's slot. That is what the guard's own thread-pinning
+/// enforces, and it is the rule for the enum as a whole — the erased variant
+/// states no weaker one, so its payload carries no `Send` bound either.
 pub enum DeadFrame {
     /// `llmodel.py:323` — the deadframe IS the jitframe the run returned.
     JitFrame(deadframe::JitFrameDeadFrame),
     /// Backend-specific frame data.
-    Boxed(Box<dyn std::any::Any + Send>),
+    Boxed(Box<dyn std::any::Any>),
 }
 
 impl DeadFrame {
     /// Wrap backend-specific frame data that is not a [`deadframe::JitFrameDeadFrame`].
-    pub fn boxed(data: impl std::any::Any + Send) -> Self {
+    pub fn boxed(data: impl std::any::Any) -> Self {
         DeadFrame::Boxed(Box::new(data))
     }
 
@@ -1632,7 +1639,7 @@ impl DeadFrame {
 
     /// The erased payload, for backends that still carry one.
     #[inline]
-    pub fn boxed_data(&self) -> Option<&(dyn std::any::Any + Send)> {
+    pub fn boxed_data(&self) -> Option<&dyn std::any::Any> {
         match self {
             DeadFrame::Boxed(data) => Some(&**data),
             DeadFrame::JitFrame(_) => None,
