@@ -1543,7 +1543,7 @@ pub struct GuardExit {
 /// The default sets `supports_guard_gc_type = false`, matching
 /// `AbstractCPU.supports_guard_gc_type` in `backend/model.py:21`; the
 /// codegen arms assert this flag before reading any other field.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct GuardGcTypeInfo {
     pub supports_guard_gc_type: bool,
     /// `get_translated_info_for_typeinfo()` = (base, shift, sizeof_ti).
@@ -1893,6 +1893,12 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
     (guards, max_var)
 }
 
+/// Number of guard/finish exits a module will need bridge-dispatch cells for.
+/// Cell ownership belongs to the compiled trace, outside module generation.
+pub fn guard_exit_count(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    collect_guards_and_vars(inputargs, ops).0.len()
+}
+
 /// Dense wasm-local assignment and type lookup for each addressed SSA value.
 fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> ValueLocals {
     ValueLocals::collect(inputargs, ops, num_vars)
@@ -1918,7 +1924,14 @@ fn collect_value_types(inputargs: &[InputArg], ops: &[Op], num_vars: u32) -> Val
 /// On native the trace is never executed, so the dispatch is omitted and no
 /// cells are needed — returning `(0, None)` keeps the emitted module
 /// byte-identical to the pre-chaining output and allocates nothing.
-fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
+pub fn alloc_bridge_cells(num_guards: usize) -> (u32, Option<Box<[u32]>>) {
+    // `Box<[u32; 0]>` has a non-null dangling `as_mut_ptr()`.  The pointer is
+    // not a dispatch table, so preserve the no-dispatch representation even
+    // on wasm where allocating that empty box would otherwise make the
+    // epilogue load an uninitialised bridge-slot local.
+    if num_guards == 0 {
+        return (0, None);
+    }
     #[cfg(target_arch = "wasm32")]
     {
         let mut cells = vec![0u32; num_guards].into_boxed_slice();
@@ -2014,6 +2027,7 @@ pub struct CaInlineParams {
 /// backend lowers as `malloc_cond`: load free, bump, compare top, call the
 /// slow path only on overflow). `None` keeps every allocation on the
 /// `wasm_jit_alloc` helper call.
+#[derive(Clone)]
 pub struct NurseryAllocParams {
     /// Linear-memory address of the GC's `nursery_free` bump pointer.
     pub free_addr: u32,
@@ -2043,54 +2057,187 @@ pub struct AllocHelpers {
     pub new_array_oldgen_fn_ptr: i64,
 }
 
-type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize, u32, Option<Box<[u32]>>);
+type BuildWasmModuleOutput = (Vec<u8>, Vec<GuardExit>, usize);
+
+/// Owned inputs for one wasm module build.  A loop retains this after its
+/// first build so it can emit the same trace again without revisiting mutable
+/// backend state such as the constants pool or GC-reference interning pass.
+pub struct ModuleBuildInputs {
+    pub inputargs: Vec<InputArg>,
+    /// These are the post-intern operations.  Re-interning them would lose the
+    /// already allocated GC-table base encoded by `gc_table_base`.
+    pub ops: Vec<Op>,
+    /// Loop-closing bridge regions emitted inside this loop's wasm function.
+    /// Their value ids are already in the owning trace's global space; retain
+    /// them verbatim so every analysis and the generated locals see the same
+    /// identities as the bridge metadata.
+    pub inlined_bridges: Vec<InlinedBridge>,
+    pub constants: indexmap::IndexMap<u32, i64>,
+    pub vtable_offset: Option<usize>,
+    pub classptr_to_typeid: HashMap<i64, u32>,
+    pub guard_gc_type_info: GuardGcTypeInfo,
+    pub alloc: AllocHelpers,
+    pub wb_fn_ptr: i64,
+    pub nursery: Option<NurseryAllocParams>,
+    pub invalidated_flag_addr: u32,
+    pub gc_table_base: u32,
+    pub fail_index_base: u32,
+    pub bridge_cells_base: u32,
+    pub external_jump_slot: u32,
+    pub external_jump_key: u32,
+    pub frame: FrameGeometry,
+    pub ca: CaParams,
+}
+
+pub struct InlinedBridge {
+    /// Per-trace fail index of the guard that enters this region.
+    pub source_fail_index: u32,
+    pub trace_id: u64,
+    pub inputargs: Vec<InputArg>,
+    pub ops: Vec<Op>,
+    /// Base of this already-interned region's GC table. Each region retains
+    /// its own roots; codegen selects it by the LoadFromGcTable producer.
+    pub gc_table_base: u32,
+}
+
+/// Whether the exact operation stream emitted for `inputs` has a local loop
+/// back-edge target.  An inline bridge transfers with `br`, which can only
+/// target the wasm `loop` opened for that LABEL.
+pub fn merged_stream_has_loop_label(inputs: &ModuleBuildInputs) -> bool {
+    let mut ops = inputs.ops.clone();
+    for bridge in &inputs.inlined_bridges {
+        ops.extend(bridge.ops.iter().cloned());
+    }
+    find_loop_label_index(&ops).is_some_and(|label_idx| label_idx < inputs.ops.len())
+}
+
+impl Clone for InlinedBridge {
+    fn clone(&self) -> Self {
+        Self {
+            source_fail_index: self.source_fail_index,
+            trace_id: self.trace_id,
+            inputargs: self
+                .inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            ops: self.ops.clone(),
+            gc_table_base: self.gc_table_base,
+        }
+    }
+}
+
+impl Clone for ModuleBuildInputs {
+    fn clone(&self) -> Self {
+        Self {
+            inputargs: self
+                .inputargs
+                .iter()
+                .map(InputArg::fresh_value_copy)
+                .collect(),
+            ops: self.ops.clone(),
+            inlined_bridges: self.inlined_bridges.clone(),
+            constants: self.constants.clone(),
+            vtable_offset: self.vtable_offset,
+            classptr_to_typeid: self.classptr_to_typeid.clone(),
+            guard_gc_type_info: self.guard_gc_type_info.clone(),
+            alloc: self.alloc,
+            wb_fn_ptr: self.wb_fn_ptr,
+            nursery: self.nursery.clone(),
+            invalidated_flag_addr: self.invalidated_flag_addr,
+            gc_table_base: self.gc_table_base,
+            fail_index_base: self.fail_index_base,
+            bridge_cells_base: self.bridge_cells_base,
+            external_jump_slot: self.external_jump_slot,
+            external_jump_key: self.external_jump_key,
+            frame: self.frame,
+            ca: self.ca.clone(),
+        }
+    }
+}
 
 /// Build a wasm module from majit IR.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "this is the single code-generation phase boundary and keeps each RPython backend input—IR, descriptors, GC state, frame geometry, and chaining state—explicit and independently auditable"
-)]
 pub fn build_wasm_module(
-    inputargs: &[InputArg],
-    ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
-    vtable_offset: Option<usize>,
-    classptr_to_typeid: &HashMap<i64, u32>,
-    guard_gc_type_info: &GuardGcTypeInfo,
-    alloc: AllocHelpers,
-    wb_fn_ptr: i64,
-    // Inline nursery-bump fast path for eligible `New`/`NewWithVtable`
-    // (see `NurseryAllocParams`); `None` keeps allocations on the helper.
-    nursery: Option<&NurseryAllocParams>,
-    // Address of the owning JitCellToken.invalidated AtomicBool in shared
-    // linear memory. GUARD_NOT_INVALIDATED reads this byte at runtime, like
-    // the native backends bake the same Arc allocation's address.
-    invalidated_flag_addr: u32,
-    // Base address of this trace's per-loop `GcTable` slot array in shared
-    // linear memory (`gcreftracer.py:9` `array_base_addr`), baked as the
-    // `LoadFromGcTable` base immediate exactly as the native backends bake
-    // it. `0` when the trace holds no reference constant.
-    gc_table_base: u32,
-    fail_index_base: u32,
-    // Table slot of the loop a JUMP-with-no-local-LABEL re-enters (a loop-closing
-    // bridge). `0` for a loop trace (its JUMP is a local back-edge `br`) and for a
-    // straight-line bridge (no JUMP). When set, the terminal external JUMP writes
-    // the loop's next inputargs into the frame and `return_call_indirect`s the
-    // loop's table slot — a wasm tail call, so the loop⇄bridge cycle runs at
-    // constant stack depth instead of growing one frame per iteration.
-    external_jump_slot: u32,
-    // Resume-at-LABEL dispatch key for the terminal external JUMP (`target
-    // label ordinal + 1`, or 0 for a non-peeled target); see `build_function`.
-    external_jump_key: u32,
-    // Frozen layout of the frame this module executes on. A chained bridge
-    // receives its source token's layout; a loop receives its own compact
-    // layout at first compilation.
-    frame: FrameGeometry,
-    // Self-recursive CALL_ASSEMBLER arm parameters (`PYRE_WASM_CA`); `emit_ca`
-    // off keeps the module byte-identical.
-    ca: CaParams,
+    inputs: &ModuleBuildInputs,
 ) -> Result<BuildWasmModuleOutput, BackendError> {
-    let (mut guards, num_vars) = collect_guards_and_vars(inputargs, ops);
+    let ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges,
+        constants,
+        vtable_offset,
+        classptr_to_typeid,
+        guard_gc_type_info,
+        alloc,
+        wb_fn_ptr,
+        nursery,
+        invalidated_flag_addr,
+        gc_table_base,
+        fail_index_base,
+        bridge_cells_base,
+        external_jump_slot,
+        external_jump_key,
+        frame,
+        ca,
+    } = inputs;
+    // A bridge region has no function-entry loads, but its InputArgs and ops
+    // still need locals, liveness, homes, guard exits, and call signatures.
+    // Analyse the complete function as one stream while keeping `inputargs`
+    // below as the actual function-entry list.
+    // A normal module is emitted directly from its retained vectors.  Keep
+    // that path allocation-free: code generation runs in the guest process,
+    // so transient merged-stream allocations can otherwise perturb the next
+    // collection boundary before any bridge is attached.
+    let mut merged_inputargs = Vec::new();
+    let mut merged_ops = Vec::new();
+    let mut gc_table_bases = HashMap::new();
+    let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
+        (inputargs, ops)
+    } else {
+        merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
+        merged_ops.extend(ops.iter().cloned());
+        for bridge in inlined_bridges {
+            merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
+            for op in &bridge.ops {
+                if op.opcode == OpCode::LoadFromGcTable {
+                    gc_table_bases.insert(op.pos.get().raw(), bridge.gc_table_base);
+                }
+            }
+            merged_ops.extend(bridge.ops.iter().cloned());
+        }
+        (&merged_inputargs, &merged_ops)
+    };
+    let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
+
+    // An inlined bridge branches back into the owner with wasm `br`.  The
+    // merged stream must therefore contain the local LABEL that opens the
+    // wasm loop; a label-less cross-loop bridge has no in-function target.
+    if !inlined_bridges.is_empty() && !merged_stream_has_loop_label(inputs) {
+        return Err(BackendError::Unsupported(
+            "wasm backend: inlined bridge stream has no local loop LABEL".into(),
+        ));
+    }
+    for bridge in inlined_bridges {
+        if bridge.ops.is_empty() {
+            return Err(BackendError::Unsupported(
+                "wasm backend: inlined bridge stream has an empty region".into(),
+            ));
+        }
+        let source_guard = guards
+            .get(bridge.source_fail_index as usize)
+            .ok_or_else(|| {
+                BackendError::Unsupported(
+                    "wasm backend: inlined bridge source guard is outside the owner stream".into(),
+                )
+            })?;
+        let source_args = source_guard.fail_arg_refs.len();
+        if source_args != bridge.inputargs.len() {
+            return Err(BackendError::Unsupported(format!(
+                "wasm backend: inlined bridge input arity {} differs from source guard arity {source_args}",
+                bridge.inputargs.len(),
+            )));
+        }
+    }
 
     // Every trace's guard/finish exits draw their indices from ONE global
     // fail-index space (`failguard::FAIL_DESCR_REGISTRY`): a cross-trace chain
@@ -2118,22 +2265,20 @@ pub fn build_wasm_module(
     // into its CA bridge, and a BRIDGE's own guards chain nested sub-bridges the
     // same way (a hot guard inside a chained bridge would otherwise round-trip
     // to the host forever). So any guarded trace wants dispatch cells.
-    let want_dispatch = !guards.is_empty();
-    let (cells_base, cells_owner) = if want_dispatch {
-        alloc_bridge_cells(guards.len())
-    } else {
-        (0, None)
-    };
-    let bridge_dispatch = cells_base != 0;
+    let bridge_dispatch = *bridge_cells_base != 0;
 
     // Frame value slots (inputs at entry, fail-arg spills at guard exit) occupy
     // `[1, 1 + max(num inputs, max fail args))`. They precede the dispatch key,
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let label_resume = LabelResumeData::collect(inputargs, ops);
-    let max_value_slots = normal_frame_value_slots(inputargs, ops) + label_resume.scalar_slots;
+    let label_resume = LabelResumeData::collect(&analysis_inputargs, &analysis_ops);
+    let max_value_slots =
+        normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(max_value_slots, frame.value_slots);
+        }
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {max_value_slots} frame value slots exceed frozen frame layout \
              ({})",
@@ -2141,11 +2286,19 @@ pub fn build_wasm_module(
         )));
     }
 
-    let value_types = collect_value_types(inputargs, ops, num_vars);
-    let ref_values = RefValues::collect(inputargs, ops);
-    let ref_homes = RefHomes::collect(inputargs, ops, ca.emit_ca, &label_resume.captured_refs);
+    let value_types = collect_value_types(&analysis_inputargs, &analysis_ops, num_vars);
+    let ref_values = RefValues::collect(&analysis_inputargs, &analysis_ops);
+    let ref_homes = RefHomes::collect(
+        &analysis_inputargs,
+        &analysis_ops,
+        ca.emit_ca,
+        &label_resume.captured_refs,
+    );
     let num_ref_homes = ref_homes.len();
-    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(frame) {
+    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(*frame) {
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(num_ref_homes, frame.ordinary_home_slots());
+        }
         return Err(BackendError::Unsupported(format!(
             "wasm backend: {num_ref_homes} ordinary ref homes and {} LABEL ref captures exceed frozen frame layout ({}, {})",
             label_resume.ref_slots,
@@ -2176,7 +2329,7 @@ pub fn build_wasm_module(
     // residual helpers, including the CA arm's inline fast path, use
     // `call_indirect` and need no import, although their frozen frame still
     // keeps the tail call area for future bridges.
-    let needs_call = has_trampoline_calls(inputargs, ops, ca.emit_ca);
+    let needs_call = has_trampoline_calls(&analysis_inputargs, &analysis_ops, ca.emit_ca);
     // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
@@ -2184,7 +2337,7 @@ pub fn build_wasm_module(
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
     let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
-        let scanned = ops
+        let scanned = analysis_ops
             .iter()
             .filter_map(|op| direct_helper_i64_arity(op, &ref_values))
             .max();
@@ -2210,7 +2363,7 @@ pub fn build_wasm_module(
     // trace gets stable type indices while declaring each signature once.
     let mut float_residual_sigs = Vec::new();
     if WASM_DIRECT_RESIDUAL_CALL {
-        for op in ops {
+        for op in analysis_ops {
             if let Some(sig) = residual_call_float_sig(op)
                 && !float_residual_sigs.contains(&sig)
             {
@@ -2222,7 +2375,10 @@ pub fn build_wasm_module(
     // i64- and f64-result types. As with the uniform i64 family, declaring
     // `0..=max` makes each type index a base plus the call arity.
     let true_void_residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
-        ops.iter().filter_map(residual_call_void_true_arity).max()
+        analysis_ops
+            .iter()
+            .filter_map(residual_call_void_true_arity)
+            .max()
     } else {
         None
     };
@@ -2348,51 +2504,50 @@ pub fn build_wasm_module(
     let jit_call_idx = if needs_call { Some(0u32) } else { None };
     let func = build_function(
         inputargs,
-        ops,
+        &analysis_inputargs,
+        &analysis_ops,
+        inlined_bridges,
         constants,
         num_vars,
         &value_types,
         jit_call_idx,
-        vtable_offset,
+        *vtable_offset,
         classptr_to_typeid,
         guard_gc_type_info,
-        alloc,
-        wb_fn_ptr,
-        nursery,
+        *alloc,
+        *wb_fn_ptr,
+        nursery.as_ref(),
         &ref_values,
         &ref_homes,
         &label_resume,
-        cells_base,
+        *bridge_cells_base,
         bridge_dispatch,
-        invalidated_flag_addr,
-        gc_table_base,
-        fail_index_base,
-        external_jump_slot,
-        external_jump_key,
-        frame,
+        *invalidated_flag_addr,
+        *gc_table_base,
+        &gc_table_bases,
+        *fail_index_base,
+        *external_jump_slot,
+        *external_jump_key,
+        *frame,
         residual_max_arity.map(|_| residual_type_base),
         &float_residual_type_indices,
         true_void_residual_max_arity.map(|_| true_void_residual_type_base),
-        ca,
+        ca.clone(),
         bridge_finish_fi,
         ca_helper_type_idx,
     )?;
     codes.function(&func);
     module.section(&codes);
 
-    Ok((
-        module.finish(),
-        guards,
-        num_ref_homes,
-        cells_base,
-        cells_owner,
-    ))
+    Ok((module.finish(), guards, num_ref_homes))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_function(
+    entry_inputargs: &[InputArg],
     inputargs: &[InputArg],
     ops: &[Op],
+    inlined_bridges: &[InlinedBridge],
     constants: &indexmap::IndexMap<u32, i64>,
     num_vars: u32,
     value_types: &ValueLocals,
@@ -2410,6 +2565,7 @@ fn build_function(
     bridge_dispatch: bool,
     invalidated_flag_addr: u32,
     gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
     fail_index_base: u32,
     external_jump_slot: u32,
     // Resume-at-LABEL dispatch key the terminal external JUMP writes before
@@ -2472,11 +2628,26 @@ fn build_function(
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
     debug_assert_eq!(alloc_scratch_local, bridge_slot_local + base_i32_locals);
     debug_assert_eq!(alloc_size_local, alloc_scratch_local + 1);
+    let inline_guards: Vec<InlineGuard<'_>> = inlined_bridges
+        .iter()
+        .enumerate()
+        .map(|(region, bridge)| InlineGuard {
+            guard_idx: fail_index_base + bridge.source_fail_index,
+            inputargs: &bridge.inputargs,
+            // Blocks open in reverse attach order, making region 0 innermost.
+            // This is the target depth at statement level; the guard `if`
+            // contributes the final +1 in `emit_guard_if_exit`.
+            branch_depth: region as u32,
+        })
+        .collect();
     let guard_dispatch = BridgeDispatch {
         cells_base,
         fail_index_base,
         bridge_slot_local,
         enabled: bridge_dispatch,
+        inline_guards: &inline_guards,
+        ref_homes,
+        frame,
     };
     let mut locals = Vec::new();
     let mut start = 0;
@@ -2525,6 +2696,15 @@ fn build_function(
     // re-execute the complete loop body.
     let loop_label_idx = find_loop_label_index(ops);
     let has_loop = loop_label_idx.is_some();
+    let bridge_op_count = inlined_bridges
+        .iter()
+        .map(|bridge| bridge.ops.len())
+        .sum::<usize>();
+    let bridge_start = ops.len().checked_sub(bridge_op_count).ok_or_else(|| {
+        BackendError::Unsupported(
+            "wasm backend: inlined bridge operations are not contained in the merged stream".into(),
+        )
+    })?;
 
     // Def / last-use positions for the post-collection Ref reload filter.
     let liveness = HomeLiveness::collect(inputargs, ops);
@@ -2643,7 +2823,7 @@ fn build_function(
     // bridge never scatters its frame-passed label values into the function
     // inputargs' home slots; those stay null-initialized (GC-safe) and the
     // resume loader sets the live label-arg homes.
-    for (k, ia) in inputargs.iter().enumerate() {
+    for (k, ia) in entry_inputargs.iter().enumerate() {
         let local_idx = value_types.local(ia.index);
         let offset = FRAME_SLOT_BASE + k as u64 * SLOT_SIZE;
         sink.local_get(0).i64_load(mem64(offset));
@@ -2670,6 +2850,7 @@ fn build_function(
             ref_homes,
             frame,
             gc_table_base,
+            gc_table_bases,
             *result,
         );
     }
@@ -2768,6 +2949,7 @@ fn build_function(
                     ref_homes,
                     frame,
                     gc_table_base,
+                    gc_table_bases,
                     *result,
                 );
             }
@@ -2776,8 +2958,49 @@ fn build_function(
         }
         if Some(op_idx) == loop_label_idx {
             sink.loop_(BlockType::Empty);
+            for _ in inlined_bridges.iter().rev() {
+                sink.block(BlockType::Empty);
+            }
             in_loop_body = true;
         }
+        // The loop's normal body ends with its JUMP, which branches around all
+        // regions. Closing one block before each attached region makes its
+        // body reachable only from the guard that branched to that block.
+        let mut started_bridge_regions = 0usize;
+        if in_loop_body && op_idx >= bridge_start {
+            let mut start = bridge_start;
+            for bridge in inlined_bridges {
+                if op_idx == start {
+                    sink.end();
+                }
+                if op_idx >= start {
+                    started_bridge_regions += 1;
+                }
+                start += bridge.ops.len();
+            }
+        }
+        // The blocks opened at the loop LABEL are closed once at the start of
+        // each appended region.  Compute the remaining nesting directly from
+        // this operation's position, so a label-less stream cannot close a
+        // block that was never opened.
+        let open_bridge_blocks = if in_loop_body {
+            let remaining = inlined_bridges
+                .len()
+                .checked_sub(started_bridge_regions)
+                .ok_or_else(|| {
+                    BackendError::Unsupported(
+                        "wasm backend: inlined bridge region bookkeeping exceeded its open blocks"
+                            .into(),
+                    )
+                })?;
+            u32::try_from(remaining).map_err(|_| {
+                BackendError::Unsupported(
+                    "wasm backend: too many inlined bridge regions for wasm branch depth".into(),
+                )
+            })?
+        } else {
+            0
+        };
         // Depth (from statement level) of the enclosing `block` that guard
         // exits `br` to. Without `key_dispatch`: preamble = 0, loop body = 1
         // (the `loop` sits between the body and block A). With `key_dispatch`
@@ -2787,15 +3010,27 @@ fn build_function(
         // before the loop). Straight-line traces use the universal hot exit
         // block at depth 0.
         let block_exit_depth = match (has_loop, in_loop_body) {
-            (false, _) => 0u32,
+            (false, _) => {
+                if open_bridge_blocks != 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: inlined bridge regions require a local loop LABEL".into(),
+                    ));
+                }
+                0u32
+            }
             (true, false) => {
+                if open_bridge_blocks != 0 {
+                    return Err(BackendError::Unsupported(
+                        "wasm backend: inlined bridge region opened before its loop LABEL".into(),
+                    ));
+                }
                 if key_dispatch {
                     2 * (num_labels - labels_passed) as u32
                 } else {
                     0u32
                 }
             }
-            (true, true) => 1u32,
+            (true, true) => 1u32 + open_bridge_blocks,
         };
         // The guard whose condition the previous op already pushed and tested.
         // `block_exit_depth` is unchanged across the pair: only a LABEL moves
@@ -2953,7 +3188,7 @@ fn build_function(
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                     }
                 }
-                sink.br(0);
+                sink.br(open_bridge_blocks);
             }
 
             OpCode::Finish => {
@@ -3287,6 +3522,7 @@ fn build_function(
                             guard_idx,
                             guard,
                             block_exit_depth,
+                            guard_dispatch,
                         );
                         guard_idx += 1;
                         fused_guard_at = Some(op_idx + 1);
@@ -4102,8 +4338,9 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) && !hoisted_gc_table_loads.contains(&op.pos.get()) {
                     let index = resolve_const_bits(constants, op.arg(0).to_opref());
-                    let slot = gc_table_base as u64
-                        + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+                    let base = gc_table_bases.get(&vi).copied().unwrap_or(gc_table_base);
+                    let slot =
+                        base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
                     sink.i32_const(slot as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -5659,6 +5896,7 @@ fn emit_seed_gc_table_ref(
     ref_homes: &RefHomes,
     frame: FrameGeometry,
     gc_table_base: u32,
+    gc_table_bases: &HashMap<u32, u32>,
     result: OpRef,
 ) {
     let producer = ops
@@ -5666,7 +5904,11 @@ fn emit_seed_gc_table_ref(
         .find(|op| op.pos.get() == result)
         .expect("hoisted GC-table result must have a producer");
     let index = resolve_const_bits(constants, producer.arg(0).to_opref());
-    let slot = gc_table_base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
+    let base = gc_table_bases
+        .get(&result.raw())
+        .copied()
+        .unwrap_or(gc_table_base);
+    let slot = base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
     sink.i32_const(slot as i32);
     sink.i32_load(MemArg {
         offset: 0,
@@ -5854,11 +6096,21 @@ fn emit_array_addr(
 // ── Guard emission helpers ──
 
 #[derive(Clone, Copy)]
-struct BridgeDispatch {
+struct InlineGuard<'a> {
+    guard_idx: u32,
+    inputargs: &'a [InputArg],
+    branch_depth: u32,
+}
+
+#[derive(Clone, Copy)]
+struct BridgeDispatch<'a> {
     cells_base: u32,
     fail_index_base: u32,
     bridge_slot_local: u32,
     enabled: bool,
+    inline_guards: &'a [InlineGuard<'a>],
+    ref_homes: &'a RefHomes,
+    frame: FrameGeometry,
 }
 
 fn emit_guard_true(
@@ -5868,7 +6120,7 @@ fn emit_guard_true(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
-    dispatch: BridgeDispatch,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_eqz();
@@ -5890,7 +6142,7 @@ fn emit_guard_false(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
-    dispatch: BridgeDispatch,
+    dispatch: BridgeDispatch<'_>,
 ) {
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref());
     sink.i64_const(0);
@@ -6003,7 +6255,7 @@ fn emit_guard_if_exit(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
-    dispatch: BridgeDispatch,
+    dispatch: BridgeDispatch<'_>,
 ) {
     sink.if_(BlockType::Empty);
     emit_guard_exit(
@@ -6025,8 +6277,27 @@ fn emit_guard_exit(
     guard_idx: u32,
     op: &Op,
     block_exit_depth: u32,
-    dispatch: BridgeDispatch,
+    dispatch: BridgeDispatch<'_>,
 ) {
+    if let Some(inline) = dispatch
+        .inline_guards
+        .iter()
+        .find(|g| g.guard_idx == guard_idx)
+    {
+        emit_guard_inline_bridge_move(
+            sink,
+            constants,
+            value_types,
+            dispatch.ref_homes,
+            dispatch.frame,
+            op,
+            inline.inputargs,
+        );
+        // The target depth is measured outside this failing `if`; include the
+        // `if` itself before selecting the enclosing bridge block.
+        sink.br(inline.branch_depth + 1);
+        return;
+    }
     emit_guard_spill(sink, constants, value_types, guard_idx, op);
     if dispatch.enabled {
         emit_guard_bridge_dispatch(sink, guard_idx, dispatch);
@@ -6034,10 +6305,50 @@ fn emit_guard_exit(
     sink.br(block_exit_depth);
 }
 
+/// Transfer a failing guard directly into an inlined bridge.  All sources are
+/// pushed before any destination local is written, preserving parallel-move
+/// semantics when fail arguments overlap bridge input locals.
+fn emit_guard_inline_bridge_move(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    op: &Op,
+    inputargs: &[InputArg],
+) {
+    let fail_args: Vec<OpRef> = op
+        .getfailargs()
+        .map(|args| args.iter().map(|arg| arg.to_opref()).collect())
+        .unwrap_or_else(|| op.getarglist().iter().map(|arg| arg.to_opref()).collect());
+    assert_eq!(
+        fail_args.len(),
+        inputargs.len(),
+        "guard and bridge input arity diverged"
+    );
+    for (arg, input) in fail_args.iter().zip(inputargs) {
+        if value_types.ty(input.index) == ValType::F64 {
+            emit_resolve_f64(sink, constants, value_types, *arg);
+        } else {
+            emit_resolve(sink, constants, value_types, *arg);
+        }
+    }
+    for input in inputargs.iter().rev() {
+        sink.local_set(value_types.local(input.index));
+    }
+    for input in inputargs {
+        if let Some(home) = ref_homes.home_id(input.index) {
+            sink.local_get(0);
+            sink.local_get(value_types.local(input.index));
+            sink.i64_store(mem64(frame.home_slot_base + home as u64 * SLOT_SIZE));
+        }
+    }
+}
+
 fn emit_guard_bridge_dispatch(
     sink: &mut PeepSink<'_, '_>,
     guard_idx: u32,
-    dispatch: BridgeDispatch,
+    dispatch: BridgeDispatch<'_>,
 ) {
     debug_assert!(guard_idx >= dispatch.fail_index_base);
     let cell_addr = dispatch.cells_base

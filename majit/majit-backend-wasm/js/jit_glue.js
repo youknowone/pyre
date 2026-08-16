@@ -55,13 +55,16 @@ function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
 }
 
 export function jit_compile_wasm(bytesPtr, bytesLen) {
+  const trace = instantiateTrace(bytesPtr, bytesLen);
+  return registerTrace(trace);
+}
+
+function instantiateTrace(bytesPtr, bytesLen) {
   if (!mainMemory) {
     throw new Error("jit_set_memory() must be called before jit_compile_wasm()");
   }
   const bytes = new Uint8Array(mainMemory.buffer, bytesPtr, bytesLen).slice();
   const module = new WebAssembly.Module(bytes);
-  const imports = { env: { memory: mainMemory } };
-
   // Check if the module needs jit_call import
   // (wasm-encoder adds it when trace has CALL ops)
   try {
@@ -71,13 +74,33 @@ export function jit_compile_wasm(bytesPtr, bytesLen) {
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, __indirect_function_table: mainTable }
     });
-    return registerTrace(instance.exports.trace);
+    return instance.exports.trace;
   } catch (e) {
     // Retry without jit_call (for traces without CALL ops)
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory }
     });
-    return registerTrace(instance.exports.trace);
+    return instance.exports.trace;
+  }
+}
+
+// Compile and instantiate a trace, then overwrite an existing shared-table
+// slot. A caller already running the old function retains that invocation;
+// later indirect calls use the replacement.
+export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
+  try {
+    if (!funcTable[funcId]) {
+      return 0;
+    }
+    const trace = instantiateTrace(bytesPtr, bytesLen);
+    if (mainTable) {
+      mainTable.set(funcId, trace);
+    }
+    funcTable[funcId] = trace;
+    return funcId;
+  } catch (e) {
+    console.error('[jit_replace_wasm] failed:', e);
+    return 0;
   }
 }
 

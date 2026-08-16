@@ -536,6 +536,17 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    if std::env::var_os("PYRE_WASM_REEMIT").is_some()
+        && let Ok(arm) = instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_reemit_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
+    if std::env::var_os("PYRE_WASM_INLINE_BRIDGE").is_some()
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_bridge_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
 
     let src = source.as_bytes();
     let len = src.len() as u32;
@@ -688,6 +699,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "cell_set",
                 "cell_missing",
                 "cell_rebridge",
+                "reemit_failed",
+                "reemit_ok",
+                "inline_ok",
+                "inline_decl_not_direct",
+                "inline_decl_not_loop_closing",
+                "inline_decl_not_reemittable",
+                "inline_decl_already_owned",
+                "inline_decl_frame",
+                "inline_decl_not_header",
+                "inline_decl_no_loop_label",
+                "inline_decl_value_layout",
+                "inline_decl_ref_layout",
+                "inline_decl_missing_label",
+                "inline_decl_other",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -695,6 +720,20 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 parts.push(format!("{lbl}={n}"));
             }
             eprintln!("[jit-stats] bridge_diag {}", parts.join(" "));
+        }
+        if let Ok(geometry) =
+            instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_inline_geometry_diag")
+        {
+            let mut parts = Vec::new();
+            for i in 0..3 {
+                let packed = geometry.call(&mut store, i).unwrap_or(0);
+                if packed != 0 {
+                    parts.push(format!("{}:{}/{}", i + 1, packed >> 32, packed as u32));
+                }
+            }
+            if !parts.is_empty() {
+                eprintln!("[jit-stats] inline_geometry {}", parts.join(" "));
+            }
         }
         // Per-walk full-body-walk census (diagnostic). Prints the same record
         // the native backends print as `[fbw-census]` under PYRE_FBW_CENSUS,
@@ -1079,6 +1118,21 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // back through their own exports. Absent on a module predating them, in
     // which case the run keeps the old stdout-only, always-0 behaviour.
     let err_bytes = take_guest_stderr(&mut store, &instance, &memory)?;
+    if let Ok(errors) =
+        instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_inline_trial_errors")
+        && let Ok(packed) = errors.call(&mut store, ())
+    {
+        let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+        if len != 0 {
+            let mut bytes = vec![0u8; len as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, len))?;
+            eprintln!(
+                "[jit-stats] inline_trial_errors {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
     // `PYRE_FBW_DEBUG_ABORT` cannot select the walker's decline census in the
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a
@@ -1254,6 +1308,20 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
 
     linker.func_wrap(
         "pyre_jit",
+        "jit_replace_wasm",
+        |mut caller: Caller<'_, Host>, func_id: u32, bytes_ptr: u32, bytes_len: u32| -> u32 {
+            match jit_replace(&mut caller, func_id, bytes_ptr, bytes_len) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("[jit_replace_wasm] {e:?}");
+                    0
+                }
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "pyre_jit",
         "jit_execute_wasm",
         |mut caller: Caller<'_, Host>, func_id: u32, frame_ptr: u32| -> u32 {
             match jit_execute(&mut caller, func_id, frame_ptr) {
@@ -1406,7 +1474,11 @@ fn host_read(
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
 /// module's linear memory and wiring the `jit_call` trampoline.
-fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+fn jit_compile_trace(
+    caller: &mut Caller<'_, Host>,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<(Table, Func)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
@@ -1488,14 +1560,48 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
 
+    Ok((table, trace))
+}
+
+/// Compile and instantiate a trace, then append its export to the trace table.
+fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
+    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     // Register the trace into the shared indirect function table so it is
-    // reachable by table index. `grow` returns the previous size, i.e. the
-    // index of the newly appended entry, which becomes this trace's id.
+    // reachable by table index. `grow` returns the newly appended slot.
     let slot = table
         .grow(&mut *caller, 1, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
-
     Ok(slot)
+}
+
+/// Compile and instantiate a trace, then replace an existing trace-table slot.
+fn jit_replace(
+    caller: &mut Caller<'_, Host>,
+    func_id: u32,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<u32> {
+    if (func_id as u64) < caller.data().trace_base {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} is not a trace slot"
+        )));
+    }
+    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    if !matches!(
+        table.get(&mut *caller, func_id as u64),
+        Some(Ref::Func(Some(_)))
+    ) {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} is not a live trace"
+        )));
+    }
+    // The Store retains every instantiated module. Replacing this table entry
+    // therefore leaves an old trace live when a non-tail indirect call still
+    // has one of its frames on the guest stack.
+    table
+        .set(&mut *caller, func_id as u64, Ref::Func(Some(trace)))
+        .context("replace trace in shared table")?;
+    Ok(func_id)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.

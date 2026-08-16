@@ -233,6 +233,22 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
     linker
         .func_wrap(
             "pyre_jit",
+            "jit_replace_wasm",
+            |mut caller: Caller<'_, Host>, func_id: u32, bytes_ptr: u32, bytes_len: u32| -> u32 {
+                match jit_replace(&mut caller, func_id, bytes_ptr, bytes_len) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("[jit_replace_wasm] {e}");
+                        0
+                    }
+                }
+            },
+        )
+        .map_err(estr)?;
+
+    linker
+        .func_wrap(
+            "pyre_jit",
             "jit_execute_wasm",
             |mut caller: Caller<'_, Host>, func_id: u32, frame_ptr: u32| -> u32 {
                 match jit_execute(&mut caller, func_id, frame_ptr) {
@@ -381,11 +397,11 @@ fn host_read(
 
 /// Compile and instantiate a JIT-emitted trace module, sharing the main
 /// module's linear memory and wiring the `jit_call` trampoline.
-fn jit_compile(
+fn jit_compile_trace(
     caller: &mut Caller<'_, Host>,
     bytes_ptr: u32,
     bytes_len: u32,
-) -> Result<u32, String> {
+) -> Result<Func, String> {
     let memory = caller.data().memory.ok_or("main memory not initialized")?;
 
     let mut bytes = vec![0u8; bytes_len as usize];
@@ -460,11 +476,36 @@ fn jit_compile(
         .get_func(&*caller, "trace")
         .ok_or("trace module is missing its `trace` export")?;
 
+    Ok(trace)
+}
+
+fn jit_compile(
+    caller: &mut Caller<'_, Host>,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<u32, String> {
+    let trace = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     let host = caller.data_mut();
     let id = host.next_id;
     host.next_id += 1;
     host.traces.insert(id, trace);
     Ok(id)
+}
+
+fn jit_replace(
+    caller: &mut Caller<'_, Host>,
+    func_id: u32,
+    bytes_ptr: u32,
+    bytes_len: u32,
+) -> Result<u32, String> {
+    if !caller.data().traces.contains_key(&func_id) {
+        return Err(format!("jit_replace_wasm: unknown func id {func_id}"));
+    }
+    let trace = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    // The map owns the old function until this overwrite. Existing calls keep
+    // their already-entered instance; later dispatches use this replacement.
+    caller.data_mut().traces.insert(func_id, trace);
+    Ok(func_id)
 }
 
 /// Run a previously compiled trace, returning its guard-exit index.

@@ -37,6 +37,7 @@ mod imports {
     #[wasm_bindgen(raw_module = "./jit_glue.js")]
     unsafe extern "C" {
         pub(super) fn jit_compile_wasm(bytes_ptr: u32, bytes_len: u32) -> u32;
+        pub(super) fn jit_replace_wasm(func_id: u32, bytes_ptr: u32, bytes_len: u32) -> u32;
         pub(super) fn jit_execute_wasm(func_id: u32, frame_ptr: u32) -> u32;
         pub(super) fn jit_free_wasm(func_id: u32);
     }
@@ -50,6 +51,7 @@ mod imports {
     #[link(wasm_import_module = "pyre_jit")]
     unsafe extern "C" {
         pub(super) fn jit_compile_wasm(bytes_ptr: u32, bytes_len: u32) -> u32;
+        pub(super) fn jit_replace_wasm(func_id: u32, bytes_ptr: u32, bytes_len: u32) -> u32;
         pub(super) fn jit_execute_wasm(func_id: u32, frame_ptr: u32) -> u32;
         pub(super) fn jit_free_wasm(func_id: u32);
     }
@@ -63,6 +65,9 @@ mod imports {
     const NO_BINDING: &str =
         "wasm backend: no JIT host binding (enable feature \"web\" or \"host-import\")";
     pub(super) unsafe fn jit_compile_wasm(_bytes_ptr: u32, _bytes_len: u32) -> u32 {
+        panic!("{NO_BINDING}")
+    }
+    pub(super) unsafe fn jit_replace_wasm(_func_id: u32, _bytes_ptr: u32, _bytes_len: u32) -> u32 {
         panic!("{NO_BINDING}")
     }
     pub(super) unsafe fn jit_execute_wasm(_func_id: u32, _frame_ptr: u32) -> u32 {
@@ -105,6 +110,24 @@ pub fn compile_module_cached(wasm_bytes: &[u8]) -> u32 {
         cache.lock().unwrap().insert(wasm_bytes.into(), handle);
     }
     handle
+}
+
+/// Replace the function stored in an existing trace slot.
+///
+/// Replacements deliberately bypass `MODULE_CACHE`: a slot belongs to one
+/// token, while a byte-identical later trace must not inherit that token's
+/// table identity.
+pub fn replace_module(func_id: u32, wasm_bytes: &[u8]) -> u32 {
+    let ptr = wasm_bytes.as_ptr() as u32;
+    let len = wasm_bytes.len() as u32;
+    #[cfg(feature = "web")]
+    {
+        imports::jit_replace_wasm(func_id, ptr, len)
+    }
+    #[cfg(not(feature = "web"))]
+    unsafe {
+        imports::jit_replace_wasm(func_id, ptr, len)
+    }
 }
 
 /// Execute a compiled JIT function with the given frame pointer.

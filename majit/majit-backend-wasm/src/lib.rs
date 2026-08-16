@@ -15,8 +15,8 @@ mod glue;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -66,7 +66,77 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// re-bridged after its first bridge was outgrown); a count that tracks
 /// `BRIDGE_OK` says the epilogue dispatch is not taking the cell at all and
 /// every bridge after the first is dead weight.
-pub static BRIDGE_DIAG: [AtomicU64; 30] = [const { AtomicU64::new(0) }; 30];
+/// 30 = a host-armed loop re-emission was attempted but failed;
+/// 31 = it succeeded and the rebuilt module is installed in the loop's
+/// original table slot. 31 is the only positive evidence that a re-emission
+/// ran at all: a re-emission that silently never fires is indistinguishable
+/// from one that fires and changes nothing.
+/// 32 = a loop-closing bridge region was inlined; 33 = inlining declined
+/// because the source guard belongs to an already chained trace; 34 = the
+/// bridge is not loop-closing; 35 = the owner has no retained module inputs;
+/// 36 = that guard already owns a region; 37 = the merged stream exceeds the
+/// owner's frozen frame geometry; 38 = the bridge does not resume at the loop
+/// header; 39 = the merged stream has no local loop LABEL for the wasm back
+/// edge. 40-43 split a rejected inline trial into value-layout,
+/// Ref-home-layout, missing-local-label, and other backend errors.
+pub static BRIDGE_DIAG: [AtomicU64; 44] = [const { AtomicU64::new(0) }; 44];
+
+/// The first three inline geometry failures, packed as `(needed, available)`.
+/// They expose a frozen-layout shortage without changing the compile result.
+static INLINE_GEOMETRY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub(crate) fn record_inline_geometry(needed: usize, available: usize) {
+    let index = INLINE_GEOMETRY_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
+    if let Some(slot) = INLINE_GEOMETRY.get(index) {
+        slot.store(
+            ((needed as u64) << 32) | available as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Read a packed `(needed, available)` inline geometry failure.
+pub fn inline_geometry_diag(index: usize) -> u64 {
+    INLINE_GEOMETRY
+        .get(index)
+        .map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
+
+pub fn inline_trial_errors() -> String {
+    INLINE_TRIAL_ERRORS.lock().unwrap().join(" | ")
+}
+
+fn record_inline_trial_error(error: &BackendError) {
+    let mut errors = INLINE_TRIAL_ERRORS.lock().unwrap();
+    if errors.len() < 3 {
+        errors.push(error.to_string());
+    }
+}
+
+static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Arm loop-module replacement from the host before guest execution starts.
+pub fn reemit_enable() {
+    REEMIT_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn reemit_enabled() -> bool {
+    REEMIT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Arm loop-closing bridge inlining. Inlining rebuilds the owning loop, so it
+/// also enables the replacement path.
+pub fn inline_bridge_enable() {
+    INLINE_BRIDGE_ENABLED.store(true, Ordering::Relaxed);
+    reemit_enable();
+}
+
+fn inline_bridge_enabled() -> bool {
+    INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Read a `BRIDGE_DIAG` tally (saturating index). Surfaced to the host through
 /// the `pyre_jit_bridge_diag` export in the `pyre-wasm` crate.
@@ -114,6 +184,7 @@ fn diag_bump(i: usize) {
 // per compiled token.
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
 const FROZEN_CHAIN_REF_HOMES: usize = 128;
+const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
 
 /// An op whose result advances loop-carried state. A value produced inside the
 /// re-running region by arithmetic or by a heap load is fresh on each pass, so
@@ -1636,6 +1707,164 @@ impl WasmBackend {
             }
         }
     }
+
+    /// Rebuild a loop module and install it into its original shared-table
+    /// slot. The retained inputs are post-intern, so this does not allocate a
+    /// second GC reference table or change any reference-constant immediate.
+    #[allow(unreachable_code, unused_variables)]
+    pub fn reemit_loop(&mut self, token: &JitCellToken) -> Result<(), BackendError> {
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+            .ok_or_else(|| {
+                BackendError::Unsupported("wasm backend: no compiled loop to re-emit".into())
+            })?;
+        let Some(mut inputs) = compiled.reemit.borrow().as_ref().cloned() else {
+            return Err(BackendError::Unsupported(
+                "wasm backend: entry bridge is not re-emittable".into(),
+            ));
+        };
+        let old_handle = compiled.eager_func_handle();
+        if old_handle == 0 {
+            return Err(BackendError::Unsupported(
+                "wasm backend: unmaterialized loop is not re-emittable".into(),
+            ));
+        }
+
+        inputs.fail_index_base = fail_descr_base();
+        let merged_guard_count = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops)
+            + inputs
+                .inlined_bridges
+                .iter()
+                .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
+                .sum::<usize>();
+        let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
+        inputs.bridge_cells_base = new_cells_base;
+        let (wasm_bytes, guard_exits, _) = codegen::build_wasm_module(&inputs)?;
+        let code_size = wasm_bytes.len();
+        let own_guard_count = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops);
+        let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
+            .iter()
+            .enumerate()
+            .map(|(index, g)| {
+                let mut region_start = own_guard_count;
+                let trace_id = inputs
+                    .inlined_bridges
+                    .iter()
+                    .find_map(|region| {
+                        let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
+                        let contains = (region_start..region_start + count).contains(&index);
+                        region_start += count;
+                        contains.then_some(region.trace_id)
+                    })
+                    .unwrap_or(compiled.trace_id);
+                Arc::new(WasmFailDescr {
+                    fail_index: g.fail_index,
+                    trace_id,
+                    fail_arg_types: g.fail_arg_types.clone(),
+                    is_finish: g.is_finish,
+                    meta_descr: g.meta_descr.clone(),
+                })
+            })
+            .collect();
+
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
+            return Err(BackendError::Unsupported(
+                "wasm host rejected the re-emitted trace module".into(),
+            ));
+        }
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        {
+            let _ = wasm_bytes;
+            return Err(BackendError::Unsupported(
+                "wasm backend: no host replacement binding".into(),
+            ));
+        }
+
+        // The host has accepted the replacement, so its newly encoded global
+        // indices can now be made visible in the registry and local metadata.
+        // Both instances remain resident, so account for the replacement block
+        // in the same lifetime ledger as an ordinary compiled module.
+        let block = self.asm_memory_stats.record_block(code_size, code_size);
+        self.asm_memory_blocks.push(block);
+        // Keep still-standalone bridge descriptors after the rebuilt merged
+        // prefix. Adding regions grows that prefix, so every old positional
+        // range moves by exactly the difference in guard-cell counts.
+        let old_guard_count = compiled.num_guard_cells.get();
+        let chained_descrs = compiled.fail_descrs.borrow()[old_guard_count..].to_vec();
+        let mut replacement_descrs = descrs.clone();
+        replacement_descrs.extend(chained_descrs);
+        *compiled.fail_descrs.borrow_mut() = replacement_descrs;
+        register_fail_descrs(&descrs);
+        let guard_growth = guard_exits.len().saturating_sub(old_guard_count);
+        if guard_growth != 0 {
+            for (_, _, start, _) in compiled.bridge_descr_ranges.borrow_mut().iter_mut() {
+                *start += guard_growth;
+            }
+        }
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        if new_cells_base != 0 {
+            for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
+                let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
+                unsafe { core::ptr::write(cell, bridge_slot) };
+            }
+        }
+        if let Some(owner) = new_cells_owner {
+            compiled._bridge_owned_cells.borrow_mut().push(owner);
+        }
+        compiled.bridge_cells_base.set(new_cells_base);
+        compiled.num_guard_cells.set(guard_exits.len());
+        {
+            let mut metas = compiled.chained_trace_meta.borrow_mut();
+            let mut offset = own_guard_count;
+            for region in &inputs.inlined_bridges {
+                let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
+                let exits = &guard_exits[offset..offset + count];
+                metas.insert(
+                    region.trace_id,
+                    ChainedTraceMeta {
+                        cells_base: new_cells_base + offset as u32 * 4,
+                        num_cells: count,
+                        guard_fail_arg_advanced: guard_fail_args_advanced(&region.ops, exits),
+                    },
+                );
+                offset += count;
+            }
+        }
+        *compiled.reemit.borrow_mut() = Some(inputs.clone());
+
+        // LABEL targets bake only the stable table slot, so restamp them for
+        // this build. CA dispatch additionally carries the new finish index.
+        let _ = stamp_and_publish_label_targets(
+            old_handle,
+            compiled.frame,
+            &inputs.inputargs,
+            &inputs.ops,
+        );
+        let loop_finish_fi = descrs
+            .iter()
+            .find(|descr| {
+                descr.is_finish
+                    && !failguard::meta_descr_is_exit_frame_with_exception(&descr.meta_descr)
+            })
+            .map(|descr| descr.fail_index)
+            .unwrap_or(failguard::WASM_CA_FINISH_FI_UNKNOWN);
+        ca_dispatch_publish(
+            token.number,
+            old_handle,
+            loop_finish_fi,
+            compiled as *const CompiledWasmLoop as usize as u32,
+        );
+        if let Some(mut target) = call_assembler_target(token.number) {
+            target.func_handle = old_handle;
+            target.loop_finish_fi = loop_finish_fi;
+            target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
+            publish_call_assembler_target(token.number, target);
+        }
+        Ok(())
+    }
 }
 
 unsafe impl Send for WasmBackend {}
@@ -2220,7 +2449,8 @@ impl majit_backend::Backend for WasmBackend {
         // geometry for both the loop and each nursery-allocated self callee.
         let raw_frame_value_slots = codegen::frame_value_slots(inputargs, ops);
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
-        let label_ref_slots = codegen::label_ref_capture_slots(inputargs, ops);
+        let label_ref_slots =
+            codegen::label_ref_capture_slots(inputargs, ops).max(FROZEN_CHAIN_LABEL_REF_SLOTS);
         // An entry bridge (`compile.py:1006-1022 ResumeFromInterpDescr`) is sent
         // to the backend through `compile_loop` like any loop, but it is not one:
         // it has no LABEL of its own and ends in a JUMP into an
@@ -2307,50 +2537,51 @@ impl majit_backend::Backend for WasmBackend {
         // chain's `frame[0]` resolves regardless of which module wrote it
         // (`failguard::FAIL_DESCR_REGISTRY`).
         let fail_index_base = fail_descr_base();
-        let (wasm_bytes, guard_exits, num_ref_homes, bridge_cells_base, bridge_cells_owner) =
-            codegen::build_wasm_module(
-                inputargs,
-                ops,
-                &self.constants,
-                self.vtable_offset,
-                &typeid_table,
-                &guard_gc_type_info,
-                alloc,
-                wb_fn_ptr,
-                nursery_alloc_params(ops).as_ref(),
-                Arc::as_ptr(&token.invalidated) as usize as u32,
-                gc_table_base,
-                fail_index_base,
-                // A real loop's JUMP is a local back-edge `br` and needs
-                // neither; an entry bridge tail-calls the target loop's table
-                // slot and resumes at the label `external_jump_key` selects.
-                entry_bridge_target.map_or(0, |t| t.func_handle),
-                entry_bridge_target.map_or(0, |t| t.key),
-                frame,
-                ca_targets.as_ref().map_or_else(
-                    || codegen::CaParams {
-                        // A loop can run on a nursery CA frame and must reload
-                        // local 0 after a collection even when it emits no CA.
-                        ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
-                        jf_top_addr: jf_top_addr(),
-                        ..codegen::CaParams::default()
-                    },
-                    |targets| codegen::CaParams {
-                        emit_ca: true,
-                        targets: ca_codegen_targets(targets),
-                        deopt_helper_slot: ca_deopt_helper_slot(),
-                        ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
-                        ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
-                        ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
-                        ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const ()
-                            as usize as i64,
-                        // Inline allocation is shared module state, so admit
-                        // it only if the largest target frame is eligible.
-                        inline: ca_inline_params(ca_max_frame_bytes(targets)),
-                        jf_top_addr: jf_top_addr(),
-                    },
-                ),
-            )?;
+        let (bridge_cells_base, bridge_cells_owner) =
+            codegen::alloc_bridge_cells(codegen::guard_exit_count(inputargs, ops));
+        let module_inputs = codegen::ModuleBuildInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            // Keep these rewritten operations exactly as intern_ref_constants
+            // produced them; their LoadFromGcTable immediates share this base.
+            ops: ops_owned.clone(),
+            inlined_bridges: Vec::new(),
+            constants: self.constants.clone(),
+            vtable_offset: self.vtable_offset,
+            classptr_to_typeid: typeid_table,
+            guard_gc_type_info,
+            alloc,
+            wb_fn_ptr,
+            nursery: nursery_alloc_params(ops),
+            invalidated_flag_addr: Arc::as_ptr(&token.invalidated) as usize as u32,
+            gc_table_base,
+            fail_index_base,
+            bridge_cells_base,
+            // A real loop's JUMP is a local back-edge `br`; an entry bridge
+            // tail-calls its target loop and is deliberately not re-emittable.
+            external_jump_slot: entry_bridge_target.map_or(0, |t| t.func_handle),
+            external_jump_key: entry_bridge_target.map_or(0, |t| t.key),
+            frame,
+            ca: ca_targets.as_ref().map_or_else(
+                || codegen::CaParams {
+                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    jf_top_addr: jf_top_addr(),
+                    ..codegen::CaParams::default()
+                },
+                |targets| codegen::CaParams {
+                    emit_ca: true,
+                    targets: ca_codegen_targets(targets),
+                    deopt_helper_slot: ca_deopt_helper_slot(),
+                    ca_alloc_fn_ptr: wasm_jit_ca_alloc_frame as *const () as usize as i64,
+                    ca_pop_fn_ptr: wasm_jit_ca_pop_frame as *const () as usize as i64,
+                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    ca_reload_caller_fn_ptr: wasm_jit_ca_reload_caller_frame as *const () as usize
+                        as i64,
+                    inline: ca_inline_params(ca_max_frame_bytes(targets)),
+                    jf_top_addr: jf_top_addr(),
+                },
+            ),
+        };
+        let (wasm_bytes, guard_exits, num_ref_homes) = codegen::build_wasm_module(&module_inputs)?;
 
         // Build fail descriptors
         let fail_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -2469,15 +2700,25 @@ impl majit_backend::Backend for WasmBackend {
             max_output_slots,
             num_ref_homes,
             frame,
-            bridge_cells_base,
-            num_guard_cells: guard_exits.len(),
+            bridge_cells_base: std::cell::Cell::new(bridge_cells_base),
+            num_guard_cells: std::cell::Cell::new(guard_exits.len()),
             has_preamble,
             label_descrs,
             guard_fail_arg_advanced,
             bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
-            _bridge_cells_owner: bridge_cells_owner,
-            _bridge_owned_cells: std::cell::RefCell::new(Vec::new()),
+            _bridge_owned_cells: std::cell::RefCell::new(bridge_cells_owner.into_iter().collect()),
+            bridge_slots: std::cell::RefCell::new(HashMap::new()),
+            // Retaining the snapshot costs long-lived heap for the token's
+            // whole lifetime, which moves when the collector next runs and so
+            // moves which iteration a back edge's eval-breaker guard bails on.
+            // Keep it only when a re-emission can actually consume it, so a run
+            // with the switches off allocates exactly what it did before.
+            reemit: std::cell::RefCell::new(
+                (entry_bridge_target.is_none() && (reemit_enabled() || inline_bridge_enabled()))
+                    .then_some(module_inputs),
+            ),
+            reemitted: std::cell::Cell::new(false),
             bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
             ca_terminal_declined: std::cell::Cell::new(false),
@@ -2578,8 +2819,8 @@ impl majit_backend::Backend for WasmBackend {
         // round-tripping through the interpreter, the source loop's epilogue
         // `call_indirect`s the bridge in-module (see `codegen` epilogue). The
         // bridge runs in the SOURCE loop's reused frame: the guard spilled its
-        // fail args positionally into `frame[1..]`, exactly where the bridge's
-        // `build_function` reads its inputs (`inputargs[k].index == k`), so no
+        // fail args positionally into `frame[1..]`. `build_function` reads the
+        // positional slot `k`, independently of the bridge value id, so no
         // argument-recovery layout is needed — hence `caller_recovery_layout`
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
@@ -2607,7 +2848,7 @@ impl majit_backend::Backend for WasmBackend {
 
         // Scalars read from the source loop up front, so the immutable borrow of
         // `original_token` is released before the `&mut self` codegen calls.
-        let (source_guard, source_func_handle, source_has_preamble, source_frame) = {
+        let (source_guard, source_func_handle, source_has_preamble, source_frame, is_direct) = {
             let source_loop = original_token
                 .compiled
                 .get()
@@ -2627,8 +2868,8 @@ impl majit_backend::Backend for WasmBackend {
             let is_direct = source_trace_id == source_loop.trace_id;
             let guard = if is_direct {
                 Some((
-                    source_loop.bridge_cells_base,
-                    source_loop.num_guard_cells,
+                    source_loop.bridge_cells_base.get(),
+                    source_loop.num_guard_cells.get(),
                     source_loop
                         .guard_fail_arg_advanced
                         .get(source_fail_index as usize)
@@ -2656,6 +2897,7 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.materialize_func_handle()?,
                 source_loop.has_preamble,
                 source_loop.frame,
+                is_direct,
             )
         };
 
@@ -2837,6 +3079,128 @@ impl majit_backend::Backend for WasmBackend {
             }
         }
 
+        if inline_bridge_enabled() {
+            if !is_direct {
+                diag_bump(33);
+            } else if !bridge_is_loop_closing {
+                diag_bump(34);
+            } else if !resumes_at_loop_header {
+                diag_bump(38);
+            } else if let Some(mut candidate) = original_token
+                .compiled
+                .get()
+                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                .and_then(|loop_| loop_.reemit.borrow().as_ref().cloned())
+            {
+                if candidate
+                    .inlined_bridges
+                    .iter()
+                    .any(|r| r.source_fail_index == source_fail_index)
+                {
+                    diag_bump(36);
+                } else if !codegen::merged_stream_has_loop_label(&candidate) {
+                    diag_bump(39);
+                } else {
+                    self.collect_constants_from_ops(ops);
+                    candidate.inlined_bridges.push(codegen::InlinedBridge {
+                        source_fail_index,
+                        trace_id: self.trace_counter,
+                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                        ops: ops_owned.clone(),
+                        gc_table_base,
+                    });
+                    let mut merged_ops = candidate.ops.clone();
+                    for region in &candidate.inlined_bridges {
+                        merged_ops.extend(region.ops.iter().cloned());
+                    }
+                    candidate.constants = self.constants.clone();
+                    candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
+                    candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
+                    candidate.nursery = nursery_alloc_params(&merged_ops);
+                    match codegen::build_wasm_module(&candidate) {
+                        Err(ref error @ BackendError::Unsupported(ref reason)) => {
+                            record_inline_trial_error(error);
+                            diag_bump(37);
+                            if reason.contains("frame value slots exceed frozen frame layout") {
+                                diag_bump(40);
+                            } else if reason.contains("ordinary ref homes") {
+                                diag_bump(41);
+                            } else if reason
+                                .contains("inlined bridge stream has no local loop LABEL")
+                            {
+                                diag_bump(42);
+                            } else {
+                                diag_bump(43);
+                            }
+                        }
+                        Err(ref error @ BackendError::CompilationFailed(_)) => {
+                            record_inline_trial_error(error);
+                            diag_bump(37);
+                            diag_bump(43);
+                        }
+                        Ok(_) => {
+                            let source_loop = original_token
+                                .compiled
+                                .get()
+                                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                                .expect("source loop disappeared before inline install");
+                            // The local branch supersedes any previous direct-cell
+                            // dispatch for this guard. Remove it before reemit so
+                            // the fresh array cannot replay a contradictory slot.
+                            let old_bridge_slot = source_loop
+                                .bridge_slots
+                                .borrow_mut()
+                                .remove(&source_fail_index);
+                            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                            if source_cells_base != 0 {
+                                let cell = (source_cells_base as usize
+                                    + source_fail_index as usize * 4)
+                                    as *mut u32;
+                                unsafe { core::ptr::write(cell, 0) };
+                            }
+                            let old_inputs = source_loop.reemit.replace(Some(candidate));
+                            match self.reemit_loop(original_token) {
+                                Ok(()) => {
+                                    self.trace_counter += 1;
+                                    if let Some(table) = gc_table {
+                                        Self::register_gc_table(original_token, table);
+                                    }
+                                    diag_bump(31);
+                                    diag_bump(32);
+                                    return Ok(AsmInfo {
+                                        code_addr: 0,
+                                        code_size: 0,
+                                    });
+                                }
+                                Err(_) => {
+                                    source_loop.reemit.replace(old_inputs);
+                                    if let Some(slot) = old_bridge_slot {
+                                        source_loop
+                                            .bridge_slots
+                                            .borrow_mut()
+                                            .insert(source_fail_index, slot);
+                                        #[cfg(all(
+                                            target_arch = "wasm32",
+                                            not(target_os = "wasi")
+                                        ))]
+                                        if source_cells_base != 0 {
+                                            let cell = (source_cells_base as usize
+                                                + source_fail_index as usize * 4)
+                                                as *mut u32;
+                                            unsafe { core::ptr::write(cell, slot) };
+                                        }
+                                    }
+                                    diag_bump(30);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                diag_bump(35);
+            }
+        }
+
         self.collect_constants_from_ops(ops);
         let trace_id = self.trace_counter;
         self.trace_counter += 1;
@@ -2882,29 +3246,29 @@ impl majit_backend::Backend for WasmBackend {
         // invalidation starts valid; only a later invalidation may kill its
         // `GUARD_NOT_INVALIDATED` operations.
         let bridge_flag = original_token.mint_bridge_invalidation_flag();
-        let (wasm_bytes, guard_exits, _num_ref_homes, bridge_cells_base, bridge_cells_owner) =
-            codegen::build_wasm_module(
-                inputargs,
-                ops,
-                &self.constants,
-                self.vtable_offset,
-                &typeid_table,
-                &guard_gc_type_info,
-                alloc,
-                wb_fn_ptr,
-                nursery_alloc_params(ops).as_ref(),
-                Arc::as_ptr(&bridge_flag) as usize as u32,
-                gc_table_base,
-                base,
-                // A loop-closing bridge's terminal JUMP re-enters the target
-                // loop (own or sibling, resolved via `LABEL_TARGETS`) through
-                // its table slot via a tail call, resuming at the label
-                // `external_jump_key` selects.
-                external_jump_slot,
-                external_jump_key,
-                source_frame,
-                ca_params,
-            )?;
+        let (bridge_cells_base, bridge_cells_owner) =
+            codegen::alloc_bridge_cells(codegen::guard_exit_count(inputargs, ops));
+        let module_inputs = codegen::ModuleBuildInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: ops_owned.clone(),
+            inlined_bridges: Vec::new(),
+            constants: self.constants.clone(),
+            vtable_offset: self.vtable_offset,
+            classptr_to_typeid: typeid_table,
+            guard_gc_type_info,
+            alloc,
+            wb_fn_ptr,
+            nursery: nursery_alloc_params(ops),
+            invalidated_flag_addr: Arc::as_ptr(&bridge_flag) as usize as u32,
+            gc_table_base,
+            fail_index_base: base,
+            bridge_cells_base,
+            external_jump_slot,
+            external_jump_key,
+            frame: source_frame,
+            ca: ca_params,
+        };
+        let (wasm_bytes, guard_exits, _num_ref_homes) = codegen::build_wasm_module(&module_inputs)?;
 
         // Bridge exit descrs (fail_index already base-offset by build_wasm_module).
         let bridge_descrs: Vec<Arc<WasmFailDescr>> = guard_exits
@@ -3050,6 +3414,21 @@ impl majit_backend::Backend for WasmBackend {
             unsafe {
                 core::ptr::write(cell, bridge_slot);
             }
+            // Only retained module replacement needs to restore this cell
+            // after allocating a fresh dispatch array.  Without replacement,
+            // the live cell is already the sole dispatch state.
+            if is_direct && reemit_enabled() {
+                if let Some(source_loop) = original_token
+                    .compiled
+                    .get()
+                    .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                {
+                    source_loop
+                        .bridge_slots
+                        .borrow_mut()
+                        .insert(source_fail_index, bridge_slot);
+                }
+            }
         }
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         let _ = (source_cells_base, bridge_slot);
@@ -3059,6 +3438,23 @@ impl majit_backend::Backend for WasmBackend {
         // block of its own.
         let block = self.asm_memory_stats.record_block(code_size, code_size);
         self.asm_memory_blocks.push(block);
+
+        // The first bridge installation is the identity re-emission probe.
+        // A failed probe leaves the old module installed and must not disrupt
+        // the bridge that just became reachable.
+        if is_direct && reemit_enabled() {
+            let should_reemit = original_token
+                .compiled
+                .get()
+                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                .is_some_and(|loop_| !loop_.reemitted.replace(true));
+            if should_reemit {
+                match self.reemit_loop(original_token) {
+                    Ok(()) => diag_bump(31),
+                    Err(_) => diag_bump(30),
+                }
+            }
+        }
 
         Ok(AsmInfo {
             code_addr: 0,
