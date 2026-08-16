@@ -1202,13 +1202,18 @@ JITSTATS_STABILITY_RUNS = 2
 # regressions, so the ambiguous case is the one a human is asked to look at.
 
 
-def _jit_stats_change(saved, current):
+def _jit_stats_change(saved, current, bands=None):
     """Return `(regressions, improvements)`, each a list of "field a -> b".
 
     Both directions gate: a rise means the JIT started aborting traces, hitting
     internal compile panics or failing guards it did not before, and a fall
     means it stopped compiling something it used to compile. Neither may pass
     unrecorded — see the surface comment above.
+
+    A band suppresses an integer-valued move at or below its symmetric width,
+    whether that move is a regression or an improvement. It cannot suppress a
+    non-integer value or a move outside the band, and the fixture parser rejects
+    bands on badness counters whose healthy value must remain exactly zero.
 
     A field missing from either side reads as "0", so a baseline recorded before
     a counter existed still matches a run that reports it as 0, and adding an
@@ -1218,6 +1223,7 @@ def _jit_stats_change(saved, current):
     one of its baselines, silently. Whenever a backend's line changes shape,
     re-record its whole baseline surface rather than trusting the run that
     follows."""
+    bands = bands or {}
     old_fields = _parse_jit_stats(saved)
     new_fields = _parse_jit_stats(current)
     regressions, improvements = [], []
@@ -1226,10 +1232,14 @@ def _jit_stats_change(saved, current):
         if old == new:
             continue
         try:
-            rose = int(new) > int(old)
+            old_int, new_int = int(old), int(new)
         except ValueError:
             # A counter that stopped being an integer is not a gain.
             rose = None
+        else:
+            if field in bands and abs(new_int - old_int) <= bands[field]:
+                continue
+            rose = new_int > old_int
         if rose is not None and (
             (rose and field in JITSTATS_REGRESSION_ON_FALL)
             or (not rose and field in JITSTATS_REGRESSION_ON_RISE)
@@ -1469,6 +1479,61 @@ def synth_skip_backends(path):
                 )
             return tuple(names)
     return ()
+
+
+def synth_jitstats_bands(path):
+    """Read an optional per-fixture jit-stats band from its header:
+        # pyre-check: jitstats-band=guard_failures=8
+
+    The band is symmetric around the recorded baseline and absorbs moves in
+    both directions: a delta smaller than the band is not signal either way.
+    It is only for schedule-sensitive counters; badness counters must remain
+    exactly zero. The directive must be followed by a comment describing the
+    measured variance, so the allowance is reviewable next to the workload.
+    Unknown or duplicate fields and non-positive or non-integer widths are
+    errors rather than silent no-ops. A directive below the 20-line window is
+    simply not read, so the fixture gates normally in that case.
+    """
+    prefix = "# pyre-check: jitstats-band="
+    with open(path, encoding="utf-8") as source:
+        for _ in range(20):
+            line = source.readline()
+            if not line:
+                break
+            if not line.startswith(prefix):
+                continue
+            bands = {}
+            entries = line[len(prefix):].strip().split(",")
+            for entry in entries:
+                parts = entry.split("=")
+                if len(parts) != 2 or not all(part.strip() for part in parts):
+                    raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
+                field, raw_width = (part.strip() for part in parts)
+                if field not in JITSTATS_SNAPSHOT_FIELDS:
+                    raise ValueError(
+                        f"unknown jit-stats band field {field!r} in {path}: {line.strip()}"
+                    )
+                if field in JITSTATS_BADNESS_FIELDS:
+                    raise ValueError(
+                        f"badness counter cannot be banded in {path}: {line.strip()}"
+                    )
+                if field in bands:
+                    raise ValueError(
+                        f"duplicate jit-stats band field {field!r} in {path}: {line.strip()}"
+                    )
+                try:
+                    width = int(raw_width)
+                except ValueError as e:
+                    raise ValueError(
+                        f"invalid jit-stats band width in {path}: {line.strip()}"
+                    ) from e
+                if width <= 0:
+                    raise ValueError(
+                        f"jit-stats band width must be positive in {path}: {line.strip()}"
+                    )
+                bands[field] = width
+            return bands
+    return {}
 
 
 def _synth_header_flag(path, directive, malformed):
@@ -1927,6 +1992,7 @@ class Check:
         time_path = self._snapshot_path(backend, name, "time")
         jitstats_path = self._jitstats_baseline_path(backend, script)
         jitstats = _jit_stats_snapshot(stderr)
+        jitstats_bands = synth_jitstats_bands(script)
 
         # The jit-stats gate — enforced on EVERY run, so a structural JIT change
         # reddens the default `pyre/check.py` (locally, and in the bare CI
@@ -1974,7 +2040,7 @@ class Check:
                 self.jitstats_vacuous.append(f"{backend}/{name}")
                 return "fail", vacuous
             regressions, improvements = _jit_stats_change(
-                jitstats_path.read_text(encoding="utf-8"), jitstats
+                jitstats_path.read_text(encoding="utf-8"), jitstats, jitstats_bands
             )
             if regressions or improvements:
                 repeats = self._jitstats_repeats(backend, script, timeout)
@@ -1982,16 +2048,19 @@ class Check:
                     (s for s in repeats or () if s != jitstats), None
                 )
                 if drifted is not None:
-                    moved = _jit_stats_change(jitstats, drifted)
-                    self.jitstats_unstable.append(f"{backend}/{name}")
-                    return "unstable", (
-                        "jit-stats unstable — re-running the same binary moved "
-                        + ", ".join(moved[0] + moved[1])
-                        + ", so this run's counters are not a property of the "
-                        "tree and the baseline comparison ("
-                        + ", ".join(regressions + improvements)
-                        + ") is not gated"
-                    )
+                    moved = _jit_stats_change(jitstats, drifted, jitstats_bands)
+                    # Snapshot text can drift inside a band without making any
+                    # gated counter unstable.
+                    if moved[0] or moved[1]:
+                        self.jitstats_unstable.append(f"{backend}/{name}")
+                        return "unstable", (
+                            "jit-stats unstable — re-running the same binary moved "
+                            + ", ".join(moved[0] + moved[1])
+                            + ", so this run's counters are not a property of the "
+                            "tree and the baseline comparison ("
+                            + ", ".join(regressions + improvements)
+                            + ") is not gated"
+                        )
                 parts = []
                 if regressions:
                     parts.append("regressed: " + ", ".join(regressions))
