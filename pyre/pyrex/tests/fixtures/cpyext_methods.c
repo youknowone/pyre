@@ -233,9 +233,16 @@ static PyObject *m_numbers(PyObject *self, PyObject *args)
     if (parsed == NULL) {
         return NULL;
     }
+    PyObject *quarter = PyFloat_FromDouble(0.25);
+    if (quarter == NULL) {
+        Py_DECREF(parsed);
+        return NULL;
+    }
+    double quarter_value = PyFloat_AsDouble(quarter);
+    Py_DECREF(quarter);
     return Py_BuildValue("(ldNiid)", as_long, as_double, parsed,
                          PyLong_Check(value), PyFloat_Check(value),
-                         PyFloat_AsDouble(PyFloat_FromDouble(0.25)));
+                         quarter_value);
 }
 
 static PyObject *m_dict_ops(PyObject *self, PyObject *unused)
@@ -456,7 +463,7 @@ static PyObject *m_call_surface(PyObject *self, PyObject *args)
     if (name == NULL) goto done;
     meth_no = PyObject_CallMethodNoArgs(text, name);
     if (meth_no == NULL) goto done;
-    meth_one = PyObject_CallMethodOneArg(text, name, NULL);
+    meth_one = PyObject_CallMethodOneArg(text, name, text);
     /* `upper` takes no argument, so that call must have failed. */
     if (meth_one != NULL) {
         PyErr_SetString(PyExc_AssertionError, "upper() accepted an argument");
@@ -480,6 +487,7 @@ done:
     Py_XDECREF(objargs);
     Py_XDECREF(fmt);
     Py_XDECREF(meth_no);
+    Py_XDECREF(meth_one);
     Py_XDECREF(meth_obj);
     Py_XDECREF(meth_fmt);
     Py_XDECREF(name);
@@ -540,7 +548,7 @@ static PyObject *m_set_ops(PyObject *self, PyObject *args)
     PyMem_Del(typed);
 
     result = Py_BuildValue(
-        "(nnnininniiil)",
+        "(nnniiinniiil)",
         PySet_Size(empty), after_add, after_readd, has_key,
         first, second, after_pop, PySet_Size(built),
         PySet_Check(built), PyFrozenSet_Check(frozen), PyAnySet_Check(frozen),

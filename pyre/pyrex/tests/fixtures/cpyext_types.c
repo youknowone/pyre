@@ -31,6 +31,7 @@ static PyObject *point_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     self->scale = 1.0;
     self->label = PyUnicode_FromString("");
     if (self->label == NULL) {
+        Py_DECREF(self);
         return NULL;
     }
     return (PyObject *)self;
@@ -198,12 +199,20 @@ static PyGetSetDef point_getset[] = {
 
 PyDoc_STRVAR(point_doc, "a two-dimensional point defined in C");
 
+/* `label` is a strong reference the instance owns, so it is released here;
+   Point3 inherits this slot. */
+static void point_dealloc(PyObject *self)
+{
+    Py_CLEAR(((PointObject *)self)->label);
+    Py_TYPE(self)->tp_free(self);
+}
+
 static PyTypeObject PointType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "cpyext_types.Point",                       /* tp_name */
     sizeof(PointObject),                        /* tp_basicsize */
     0,                                          /* tp_itemsize */
-    0,                                          /* tp_dealloc */
+    point_dealloc,                              /* tp_dealloc */
     0,                                          /* tp_vectorcall_offset */
     0,                                          /* tp_getattr */
     0,                                          /* tp_setattr */
@@ -593,15 +602,18 @@ static PyObject *bag_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     Py_ssize_t given = PyTuple_Size(args);
     if (given > BAG_CAPACITY) {
         PyErr_SetString(PyExc_ValueError, "too many items");
+        Py_DECREF(self);
         return NULL;
     }
     for (Py_ssize_t i = 0; i < given; i++) {
         PyObject *item = PyTuple_GetItem(args, i);
         if (item == NULL) {
+            Py_DECREF(self);
             return NULL;
         }
         long value = PyLong_AsLong(item);
         if (value == -1 && PyErr_Occurred()) {
+            Py_DECREF(self);
             return NULL;
         }
         self->items[self->count++] = value;
@@ -749,7 +761,11 @@ static PyObject *table_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
     self->store = PyDict_New();
-    return self->store == NULL ? NULL : (PyObject *)self;
+    if (self->store == NULL) {
+        Py_DECREF(self);
+        return NULL;
+    }
+    return (PyObject *)self;
 }
 
 static Py_ssize_t table_length(PyObject *self)
@@ -793,12 +809,18 @@ static PyMappingMethods table_as_mapping = {
     table_ass_subscript,                        /* mp_ass_subscript */
 };
 
+static void table_dealloc(PyObject *self)
+{
+    Py_CLEAR(((TableObject *)self)->store);
+    Py_TYPE(self)->tp_free(self);
+}
+
 static PyTypeObject TableType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     "cpyext_types.Table",                       /* tp_name */
     sizeof(TableObject),                        /* tp_basicsize */
     0,                                          /* tp_itemsize */
-    0,                                          /* tp_dealloc */
+    table_dealloc,                              /* tp_dealloc */
     0,                                          /* tp_vectorcall_offset */
     0,                                          /* tp_getattr */
     0,                                          /* tp_setattr */
@@ -854,6 +876,7 @@ static PyObject *m_make(PyObject *self, PyObject *args)
     point->scale = 1.0;
     point->label = PyUnicode_FromString("made");
     if (point->label == NULL) {
+        Py_DECREF(point);
         return NULL;
     }
     return (PyObject *)point;
