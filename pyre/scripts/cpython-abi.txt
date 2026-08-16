@@ -1,0 +1,1381 @@
+# The declarations pyre's extension ABI is measured against.
+# Written by scripts/cpyext-abi.py snapshot; do not edit by hand.
+# source: CPython 3.14.7 Include/*.h and Include/cpython/*.h
+
+# [declarations]
+PyAIter_Check :: PyObject * -> int
+PyArg_Parse :: PyObject *, const char *, ... -> int
+PyArg_ParseTuple :: PyObject *, const char *, ... -> int
+PyArg_ParseTupleAndKeywords :: PyObject *, PyObject *, const char *, PY_CXX_CONST char *const *, ... -> int
+PyArg_UnpackTuple :: PyObject *, const char *, Py_ssize_t, Py_ssize_t, ... -> int
+PyArg_VaParse :: PyObject *, const char *, va_list -> int
+PyArg_VaParseTupleAndKeywords :: PyObject *, PyObject *, const char *, PY_CXX_CONST char *const *, va_list -> int
+PyArg_ValidateKeywordArguments :: PyObject * -> int
+PyAsyncGen_New :: PyFrameObject *, PyObject *, PyObject * -> PyObject *
+PyBool_FromLong :: long -> PyObject *
+PyBuffer_FillContiguousStrides :: int, Py_ssize_t *, Py_ssize_t *, int, char -> void
+PyBuffer_FillInfo :: Py_buffer *, PyObject *, void *, Py_ssize_t, int, int -> int
+PyBuffer_FromContiguous :: const Py_buffer *, const void *, Py_ssize_t, char -> int
+PyBuffer_GetPointer :: const Py_buffer *, const Py_ssize_t * -> void *
+PyBuffer_IsContiguous :: const Py_buffer *, char -> int
+PyBuffer_Release :: Py_buffer * -> void
+PyBuffer_SizeFromFormat :: const char * -> Py_ssize_t
+PyBuffer_ToContiguous :: void *, const Py_buffer *, Py_ssize_t, char -> int
+PyByteArray_AsString :: PyObject * -> char *
+PyByteArray_Concat :: PyObject *, PyObject * -> PyObject *
+PyByteArray_FromObject :: PyObject * -> PyObject *
+PyByteArray_FromStringAndSize :: const char *, Py_ssize_t -> PyObject *
+PyByteArray_Resize :: PyObject *, Py_ssize_t -> int
+PyByteArray_Size :: PyObject * -> Py_ssize_t
+PyBytes_AsString :: PyObject * -> char *
+PyBytes_AsStringAndSize :: PyObject *, char **, Py_ssize_t * -> int
+PyBytes_Concat :: PyObject **, PyObject * -> void
+PyBytes_ConcatAndDel :: PyObject **, PyObject * -> void
+PyBytes_DecodeEscape :: const char *, Py_ssize_t, const char *, Py_ssize_t, const char * -> PyObject *
+PyBytes_FromFormat :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> PyObject *
+PyBytes_FromFormatV :: const char *, ) Py_GCC_ATTRIBUTE((format(printf, 1, 0)) -> PyObject *
+PyBytes_FromObject :: PyObject * -> PyObject *
+PyBytes_FromString :: const char * -> PyObject *
+PyBytes_FromStringAndSize :: const char *, Py_ssize_t -> PyObject *
+PyBytes_Join :: PyObject *, PyObject * -> PyObject *
+PyBytes_Repr :: PyObject *, int -> PyObject *
+PyBytes_Size :: PyObject * -> Py_ssize_t
+PyCFunction_GetFlags :: PyObject * -> int
+PyCFunction_GetFunction :: PyObject * -> PyCFunction
+PyCFunction_GetSelf :: PyObject * -> PyObject *
+PyCFunction_New :: PyMethodDef *, PyObject * -> PyObject *
+PyCFunction_NewEx :: PyMethodDef *, PyObject *, PyObject * -> PyObject *
+PyCMethod_New :: PyMethodDef *, PyObject *, PyObject *, PyTypeObject * -> PyObject *
+PyCallIter_New :: PyObject *, PyObject * -> PyObject *
+PyCallable_Check :: PyObject * -> int
+PyCapsule_GetContext :: PyObject * -> void *
+PyCapsule_GetDestructor :: PyObject * -> PyCapsule_Destructor
+PyCapsule_GetName :: PyObject * -> const char *
+PyCapsule_GetPointer :: PyObject *, const char * -> void *
+PyCapsule_Import :: const char *, int -> void *
+PyCapsule_IsValid :: PyObject *, const char * -> int
+PyCapsule_New :: void *, const char *, PyCapsule_Destructor -> PyObject *
+PyCapsule_SetContext :: PyObject *, void * -> int
+PyCapsule_SetDestructor :: PyObject *, PyCapsule_Destructor -> int
+PyCapsule_SetName :: PyObject *, const char * -> int
+PyCapsule_SetPointer :: PyObject *, void * -> int
+PyCell_Get :: PyObject * -> PyObject *
+PyCell_New :: PyObject * -> PyObject *
+PyCell_Set :: PyObject *, PyObject * -> int
+PyClassMethod_New :: PyObject * -> PyObject *
+PyCode_AddWatcher :: PyCode_WatchCallback -> int
+PyCode_Addr2Line :: PyCodeObject *, int -> int
+PyCode_Addr2Location :: PyCodeObject *, int, int *, int *, int *, int * -> int
+PyCode_ClearWatcher :: int -> int
+PyCode_GetCellvars :: PyCodeObject * -> PyObject *
+PyCode_GetCode :: PyCodeObject * -> PyObject *
+PyCode_GetFreevars :: PyCodeObject * -> PyObject *
+PyCode_GetVarnames :: PyCodeObject * -> PyObject *
+PyCode_NewEmpty :: const char *, const char *, int -> PyCodeObject *
+PyCode_Optimize :: PyObject *, PyObject *consts, PyObject *, PyObject * -> PyObject *
+PyCodec_BackslashReplaceErrors :: PyObject * -> PyObject *
+PyCodec_Decode :: PyObject *, const char *, const char * -> PyObject *
+PyCodec_Decoder :: const char * -> PyObject *
+PyCodec_Encode :: PyObject *, const char *, const char * -> PyObject *
+PyCodec_Encoder :: const char * -> PyObject *
+PyCodec_IgnoreErrors :: PyObject * -> PyObject *
+PyCodec_IncrementalDecoder :: const char *, const char * -> PyObject *
+PyCodec_IncrementalEncoder :: const char *, const char * -> PyObject *
+PyCodec_KnownEncoding :: const char * -> int
+PyCodec_LookupError :: const char * -> PyObject *
+PyCodec_NameReplaceErrors :: PyObject * -> PyObject *
+PyCodec_Register :: PyObject * -> int
+PyCodec_RegisterError :: const char *, PyObject * -> int
+PyCodec_ReplaceErrors :: PyObject * -> PyObject *
+PyCodec_StreamReader :: const char *, PyObject *, const char * -> PyObject *
+PyCodec_StreamWriter :: const char *, PyObject *, const char * -> PyObject *
+PyCodec_StrictErrors :: PyObject * -> PyObject *
+PyCodec_Unregister :: PyObject * -> int
+PyCodec_XMLCharRefReplaceErrors :: PyObject * -> PyObject *
+PyCompile_OpcodeStackEffect :: int, int -> int
+PyCompile_OpcodeStackEffectWithJump :: int, int, int -> int
+PyComplex_AsCComplex :: PyObject * -> Py_complex
+PyComplex_FromCComplex :: Py_complex -> PyObject *
+PyComplex_FromDoubles :: double, double -> PyObject *
+PyComplex_ImagAsDouble :: PyObject * -> double
+PyComplex_RealAsDouble :: PyObject * -> double
+PyConfig_Clear :: PyConfig * -> void
+PyConfig_Get :: const char * -> PyObject *
+PyConfig_GetInt :: const char *, int * -> int
+PyConfig_InitIsolatedConfig :: PyConfig * -> void
+PyConfig_InitPythonConfig :: PyConfig * -> void
+PyConfig_Names :: void -> PyObject *
+PyConfig_Read :: PyConfig * -> PyStatus
+PyConfig_Set :: const char *, PyObject * -> int
+PyConfig_SetArgv :: PyConfig *, Py_ssize_t, wchar_t *const * -> PyStatus
+PyConfig_SetBytesArgv :: PyConfig *, Py_ssize_t, char *const * -> PyStatus
+PyConfig_SetBytesString :: PyConfig *, wchar_t **, const char * -> PyStatus
+PyConfig_SetString :: PyConfig *, wchar_t **, const wchar_t * -> PyStatus
+PyConfig_SetWideStringList :: PyConfig *, PyWideStringList *, Py_ssize_t, wchar_t ** -> PyStatus
+PyContextVar_Get :: PyObject *, PyObject *, PyObject ** -> int
+PyContextVar_New :: const char *, PyObject * -> PyObject *
+PyContextVar_Reset :: PyObject *, PyObject * -> int
+PyContextVar_Set :: PyObject *, PyObject * -> PyObject *
+PyContext_AddWatcher :: PyContext_WatchCallback -> int
+PyContext_ClearWatcher :: int -> int
+PyContext_Copy :: PyObject * -> PyObject *
+PyContext_CopyCurrent :: void -> PyObject *
+PyContext_Enter :: PyObject * -> int
+PyContext_Exit :: PyObject * -> int
+PyContext_New :: void -> PyObject *
+PyCoro_New :: PyFrameObject *, PyObject *, PyObject * -> PyObject *
+PyCriticalSection2_Begin :: PyCriticalSection2 *, PyObject *, PyObject * -> void
+PyCriticalSection2_BeginMutex :: PyCriticalSection2 *, PyMutex *, PyMutex * -> void
+PyCriticalSection2_End :: PyCriticalSection2 * -> void
+PyCriticalSection_Begin :: PyCriticalSection *, PyObject * -> void
+PyCriticalSection_BeginMutex :: PyCriticalSection *, PyMutex * -> void
+PyCriticalSection_End :: PyCriticalSection * -> void
+PyDescr_IsData :: PyObject * -> int
+PyDescr_NewClassMethod :: PyTypeObject *, PyMethodDef * -> PyObject *
+PyDescr_NewGetSet :: PyTypeObject *, PyGetSetDef * -> PyObject *
+PyDescr_NewMember :: PyTypeObject *, PyMemberDef * -> PyObject *
+PyDescr_NewMethod :: PyTypeObject *, PyMethodDef * -> PyObject *
+PyDescr_NewWrapper :: PyTypeObject *, struct wrapperbase *, void * -> PyObject *
+PyDictProxy_New :: PyObject * -> PyObject *
+PyDict_AddWatcher :: PyDict_WatchCallback -> int
+PyDict_Clear :: PyObject * -> void
+PyDict_ClearWatcher :: int -> int
+PyDict_Contains :: PyObject *, PyObject * -> int
+PyDict_ContainsString :: PyObject *, const char * -> int
+PyDict_Copy :: PyObject * -> PyObject *
+PyDict_DelItem :: PyObject *, PyObject * -> int
+PyDict_DelItemString :: PyObject *, const char * -> int
+PyDict_GetItem :: PyObject *, PyObject * -> PyObject *
+PyDict_GetItemRef :: PyObject *, PyObject *, PyObject ** -> int
+PyDict_GetItemString :: PyObject *, const char * -> PyObject *
+PyDict_GetItemStringRef :: PyObject *, const char *, PyObject ** -> int
+PyDict_GetItemWithError :: PyObject *, PyObject * -> PyObject *
+PyDict_Items :: PyObject * -> PyObject *
+PyDict_Keys :: PyObject * -> PyObject *
+PyDict_Merge :: PyObject *, PyObject *, int -> int
+PyDict_MergeFromSeq2 :: PyObject *, PyObject *, int -> int
+PyDict_New :: void -> PyObject *
+PyDict_Next :: PyObject *, Py_ssize_t *, PyObject **, PyObject ** -> int
+PyDict_Pop :: PyObject *, PyObject *, PyObject ** -> int
+PyDict_PopString :: PyObject *, const char *, PyObject ** -> int
+PyDict_SetDefault :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyDict_SetDefaultRef :: PyObject *, PyObject *, PyObject *, PyObject ** -> int
+PyDict_SetItem :: PyObject *, PyObject *, PyObject * -> int
+PyDict_SetItemString :: PyObject *, const char *, PyObject * -> int
+PyDict_Size :: PyObject * -> Py_ssize_t
+PyDict_Unwatch :: int, PyObject * -> int
+PyDict_Update :: PyObject *, PyObject * -> int
+PyDict_Values :: PyObject * -> PyObject *
+PyDict_Watch :: int, PyObject * -> int
+PyErr_BadArgument :: void -> int
+PyErr_BadInternalCall :: void -> void
+PyErr_CheckSignals :: void -> int
+PyErr_Clear :: void -> void
+PyErr_Display :: PyObject *, PyObject *, PyObject * -> void
+PyErr_DisplayException :: PyObject * -> void
+PyErr_ExceptionMatches :: PyObject * -> int
+PyErr_Fetch :: PyObject **, PyObject **, PyObject ** -> void
+PyErr_Format :: PyObject *, const char *, ... -> PyObject *
+PyErr_FormatUnraisable :: const char *, ... -> void
+PyErr_FormatV :: PyObject *, const char *, va_list -> PyObject *
+PyErr_GetExcInfo :: PyObject **, PyObject **, PyObject ** -> void
+PyErr_GetHandledException :: void -> PyObject *
+PyErr_GetRaisedException :: void -> PyObject *
+PyErr_GivenExceptionMatches :: PyObject *, PyObject * -> int
+PyErr_NewException :: const char *, PyObject *, PyObject * -> PyObject *
+PyErr_NewExceptionWithDoc :: const char *, const char *, PyObject *, PyObject * -> PyObject *
+PyErr_NoMemory :: void -> PyObject *
+PyErr_NormalizeException :: PyObject **, PyObject **, PyObject ** -> void
+PyErr_Occurred :: void -> PyObject *
+PyErr_Print :: void -> void
+PyErr_PrintEx :: int -> void
+PyErr_ProgramText :: const char *, int -> PyObject *
+PyErr_ProgramTextObject :: PyObject *, int -> PyObject *
+PyErr_RangedSyntaxLocationObject :: PyObject *, int, int, int, int -> void
+PyErr_ResourceWarning :: PyObject *, Py_ssize_t, const char *, ... -> int
+PyErr_Restore :: PyObject *, PyObject *, PyObject * -> void
+PyErr_SetExcFromWindowsErr :: PyObject *, int -> PyObject *
+PyErr_SetExcFromWindowsErrWithFilename :: PyObject *, int, const char * -> PyObject *
+PyErr_SetExcFromWindowsErrWithFilenameObject :: PyObject *, int, PyObject * -> PyObject *
+PyErr_SetExcFromWindowsErrWithFilenameObjects :: PyObject *, int, PyObject *, PyObject * -> PyObject *
+PyErr_SetExcInfo :: PyObject *, PyObject *, PyObject * -> void
+PyErr_SetFromErrno :: PyObject * -> PyObject *
+PyErr_SetFromErrnoWithFilename :: PyObject *, const char * -> PyObject *
+PyErr_SetFromErrnoWithFilenameObject :: PyObject *, PyObject * -> PyObject *
+PyErr_SetFromErrnoWithFilenameObjects :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyErr_SetFromWindowsErr :: int -> PyObject *
+PyErr_SetFromWindowsErrWithFilename :: int, const char * -> PyObject *
+PyErr_SetHandledException :: PyObject * -> void
+PyErr_SetImportError :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyErr_SetImportErrorSubclass :: PyObject *, PyObject *, PyObject *, PyObject * -> PyObject *
+PyErr_SetInterrupt :: void -> void
+PyErr_SetInterruptEx :: int -> int
+PyErr_SetNone :: PyObject * -> void
+PyErr_SetObject :: PyObject *, PyObject * -> void
+PyErr_SetRaisedException :: PyObject * -> void
+PyErr_SetString :: PyObject *, const char * -> void
+PyErr_SyntaxLocation :: const char *, int -> void
+PyErr_SyntaxLocationEx :: const char *, int, int -> void
+PyErr_SyntaxLocationObject :: PyObject *, int, int -> void
+PyErr_WarnEx :: PyObject *, const char *, Py_ssize_t -> int
+PyErr_WarnExplicit :: PyObject *, const char *, const char *, int, const char *, PyObject * -> int
+PyErr_WarnExplicitFormat :: PyObject *, const char *, int, const char *, PyObject *, const char *, ... -> int
+PyErr_WarnExplicitObject :: PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject * -> int
+PyErr_WarnFormat :: PyObject *, Py_ssize_t, const char *, ... -> int
+PyErr_WriteUnraisable :: PyObject * -> void
+PyEval_AcquireThread :: PyThreadState * -> void
+PyEval_EvalCode :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyEval_EvalCodeEx :: PyObject *, PyObject *, PyObject *, PyObject *const *, int, PyObject *const *, int, PyObject *const *, int, PyObject *, PyObject * -> PyObject *
+PyEval_EvalFrame :: PyFrameObject * -> PyObject *
+PyEval_EvalFrameEx :: PyFrameObject *, int -> PyObject *
+PyEval_GetBuiltins :: void -> PyObject *
+PyEval_GetFrame :: void -> PyFrameObject *
+PyEval_GetFrameBuiltins :: void -> PyObject *
+PyEval_GetFrameGlobals :: void -> PyObject *
+PyEval_GetFrameLocals :: void -> PyObject *
+PyEval_GetFuncDesc :: PyObject * -> const char *
+PyEval_GetFuncName :: PyObject * -> const char *
+PyEval_GetGlobals :: void -> PyObject *
+PyEval_GetLocals :: void -> PyObject *
+PyEval_InitThreads :: void -> void
+PyEval_MergeCompilerFlags :: PyCompilerFlags * -> int
+PyEval_ReleaseThread :: PyThreadState * -> void
+PyEval_RestoreThread :: PyThreadState * -> void
+PyEval_SaveThread :: void -> PyThreadState *
+PyEval_SetProfile :: Py_tracefunc, PyObject * -> void
+PyEval_SetProfileAllThreads :: Py_tracefunc, PyObject * -> void
+PyEval_SetTrace :: Py_tracefunc, PyObject * -> void
+PyEval_SetTraceAllThreads :: Py_tracefunc, PyObject * -> void
+PyExceptionClass_Name :: PyObject * -> const char *
+PyException_GetArgs :: PyObject * -> PyObject *
+PyException_GetCause :: PyObject * -> PyObject *
+PyException_GetContext :: PyObject * -> PyObject *
+PyException_GetTraceback :: PyObject * -> PyObject *
+PyException_SetArgs :: PyObject *, PyObject * -> void
+PyException_SetCause :: PyObject *, PyObject * -> void
+PyException_SetContext :: PyObject *, PyObject * -> void
+PyException_SetTraceback :: PyObject *, PyObject * -> int
+PyFile_FromFd :: int, const char *, const char *, int, const char *, const char *, const char *, int -> PyObject *
+PyFile_GetLine :: PyObject *, int -> PyObject *
+PyFile_NewStdPrinter :: int -> PyObject *
+PyFile_OpenCode :: const char * -> PyObject *
+PyFile_OpenCodeObject :: PyObject * -> PyObject *
+PyFile_SetOpenCodeHook :: Py_OpenCodeHookFunction, void * -> int
+PyFile_WriteObject :: PyObject *, PyObject *, int -> int
+PyFile_WriteString :: const char *, PyObject * -> int
+PyFloat_AsDouble :: PyObject * -> double
+PyFloat_FromDouble :: double -> PyObject *
+PyFloat_FromString :: PyObject * -> PyObject *
+PyFloat_GetInfo :: void -> PyObject *
+PyFloat_GetMax :: void -> double
+PyFloat_GetMin :: void -> double
+PyFloat_Pack2 :: double, char *, int -> int
+PyFloat_Pack4 :: double, char *, int -> int
+PyFloat_Pack8 :: double, char *, int -> int
+PyFloat_Unpack2 :: const char *, int -> double
+PyFloat_Unpack4 :: const char *, int -> double
+PyFloat_Unpack8 :: const char *, int -> double
+PyFrame_FastToLocals :: PyFrameObject * -> void
+PyFrame_FastToLocalsWithError :: PyFrameObject * -> int
+PyFrame_GetBack :: PyFrameObject * -> PyFrameObject *
+PyFrame_GetBuiltins :: PyFrameObject * -> PyObject *
+PyFrame_GetCode :: PyFrameObject * -> PyCodeObject *
+PyFrame_GetGenerator :: PyFrameObject * -> PyObject *
+PyFrame_GetGlobals :: PyFrameObject * -> PyObject *
+PyFrame_GetLasti :: PyFrameObject * -> int
+PyFrame_GetLineNumber :: PyFrameObject * -> int
+PyFrame_GetLocals :: PyFrameObject * -> PyObject *
+PyFrame_GetVar :: PyFrameObject *, PyObject * -> PyObject *
+PyFrame_GetVarString :: PyFrameObject *, const char * -> PyObject *
+PyFrame_LocalsToFast :: PyFrameObject *, int -> void
+PyFrame_New :: PyThreadState *, PyCodeObject *, PyObject *, PyObject * -> PyFrameObject *
+PyFrozenSet_New :: PyObject * -> PyObject *
+PyFunction_AddWatcher :: PyFunction_WatchCallback -> int
+PyFunction_ClearWatcher :: int -> int
+PyFunction_GetAnnotations :: PyObject * -> PyObject *
+PyFunction_GetClosure :: PyObject * -> PyObject *
+PyFunction_GetCode :: PyObject * -> PyObject *
+PyFunction_GetDefaults :: PyObject * -> PyObject *
+PyFunction_GetGlobals :: PyObject * -> PyObject *
+PyFunction_GetKwDefaults :: PyObject * -> PyObject *
+PyFunction_GetModule :: PyObject * -> PyObject *
+PyFunction_New :: PyObject *, PyObject * -> PyObject *
+PyFunction_NewWithQualName :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyFunction_SetAnnotations :: PyObject *, PyObject * -> int
+PyFunction_SetClosure :: PyObject *, PyObject * -> int
+PyFunction_SetDefaults :: PyObject *, PyObject * -> int
+PyFunction_SetKwDefaults :: PyObject *, PyObject * -> int
+PyFunction_SetVectorcall :: PyFunctionObject *, vectorcallfunc -> void
+PyGC_Collect :: void -> Py_ssize_t
+PyGC_Disable :: void -> int
+PyGC_Enable :: void -> int
+PyGC_IsEnabled :: void -> int
+PyGILState_Check :: void -> int
+PyGILState_Ensure :: void -> PyGILState_STATE
+PyGILState_GetThisThreadState :: void -> PyThreadState *
+PyGILState_Release :: PyGILState_STATE -> void
+PyGen_GetCode :: PyGenObject * -> PyCodeObject *
+PyGen_New :: PyFrameObject * -> PyObject *
+PyGen_NewWithQualName :: PyFrameObject *, PyObject *, PyObject * -> PyObject *
+PyHash_GetFuncDef :: void -> PyHash_FuncDef *
+PyImport_AddModule :: const char * -> PyObject *
+PyImport_AddModuleObject :: PyObject * -> PyObject *
+PyImport_AddModuleRef :: const char * -> PyObject *
+PyImport_AppendInittab :: const char *, PyObject * ( * )(void) -> int
+PyImport_ExecCodeModule :: const char *, PyObject * -> PyObject *
+PyImport_ExecCodeModuleEx :: const char *, PyObject *, const char * -> PyObject *
+PyImport_ExecCodeModuleObject :: PyObject *, PyObject *, PyObject *, PyObject * -> PyObject *
+PyImport_ExecCodeModuleWithPathnames :: const char *, PyObject *, const char *, const char * -> PyObject *
+PyImport_ExtendInittab :: struct _inittab * -> int
+PyImport_GetImporter :: PyObject * -> PyObject *
+PyImport_GetMagicNumber :: void -> long
+PyImport_GetMagicTag :: void -> const char *
+PyImport_GetModule :: PyObject * -> PyObject *
+PyImport_GetModuleDict :: void -> PyObject *
+PyImport_Import :: PyObject * -> PyObject *
+PyImport_ImportFrozenModule :: const char * -> int
+PyImport_ImportFrozenModuleObject :: PyObject * -> int
+PyImport_ImportModule :: const char * -> PyObject *
+PyImport_ImportModuleAttr :: PyObject *, PyObject * -> PyObject *
+PyImport_ImportModuleAttrString :: const char *, const char * -> PyObject *
+PyImport_ImportModuleLevel :: const char *, PyObject *, PyObject *, PyObject *, int -> PyObject *
+PyImport_ImportModuleLevelObject :: PyObject *, PyObject *, PyObject *, PyObject *, int -> PyObject *
+PyImport_ImportModuleNoBlock :: const char * -> PyObject *
+PyImport_ReloadModule :: PyObject * -> PyObject *
+PyIndex_Check :: PyObject * -> int
+PyInitConfig_AddModule :: PyInitConfig *, const char *, PyObject * ( * )(void) -> int
+PyInitConfig_Create :: void -> PyInitConfig *
+PyInitConfig_Free :: PyInitConfig * -> void
+PyInitConfig_FreeStrList :: size_t, char ** -> void
+PyInitConfig_GetError :: PyInitConfig *, const char ** -> int
+PyInitConfig_GetExitCode :: PyInitConfig *, int * -> int
+PyInitConfig_GetInt :: PyInitConfig *, const char *, int64_t * -> int
+PyInitConfig_GetStr :: PyInitConfig *, const char *, char ** -> int
+PyInitConfig_GetStrList :: PyInitConfig *, const char *, size_t *, char *** -> int
+PyInitConfig_HasOption :: PyInitConfig *, const char * -> int
+PyInitConfig_SetInt :: PyInitConfig *, const char *, int64_t -> int
+PyInitConfig_SetStr :: PyInitConfig *, const char *, const char * -> int
+PyInitConfig_SetStrList :: PyInitConfig *, const char *, size_t, char *const * -> int
+PyInstanceMethod_Function :: PyObject * -> PyObject *
+PyInstanceMethod_New :: PyObject * -> PyObject *
+PyInterpreterState_Clear :: PyInterpreterState * -> void
+PyInterpreterState_Delete :: PyInterpreterState * -> void
+PyInterpreterState_Get :: void -> PyInterpreterState *
+PyInterpreterState_GetDict :: PyInterpreterState * -> PyObject *
+PyInterpreterState_GetID :: PyInterpreterState * -> int64_t
+PyInterpreterState_Head :: void -> PyInterpreterState *
+PyInterpreterState_Main :: void -> PyInterpreterState *
+PyInterpreterState_New :: void -> PyInterpreterState *
+PyInterpreterState_Next :: PyInterpreterState * -> PyInterpreterState *
+PyInterpreterState_ThreadHead :: PyInterpreterState * -> PyThreadState *
+PyIter_Check :: PyObject * -> int
+PyIter_Next :: PyObject * -> PyObject *
+PyIter_NextItem :: PyObject *, PyObject ** -> int
+PyIter_Send :: PyObject *, PyObject *, PyObject ** -> PySendResult
+PyList_Append :: PyObject *, PyObject * -> int
+PyList_AsTuple :: PyObject * -> PyObject *
+PyList_Clear :: PyObject * -> int
+PyList_Extend :: PyObject *, PyObject * -> int
+PyList_GetItem :: PyObject *, Py_ssize_t -> PyObject *
+PyList_GetItemRef :: PyObject *, Py_ssize_t -> PyObject *
+PyList_GetSlice :: PyObject *, Py_ssize_t, Py_ssize_t -> PyObject *
+PyList_Insert :: PyObject *, Py_ssize_t, PyObject * -> int
+PyList_New :: Py_ssize_t -> PyObject *
+PyList_Reverse :: PyObject * -> int
+PyList_SetItem :: PyObject *, Py_ssize_t, PyObject * -> int
+PyList_SetSlice :: PyObject *, Py_ssize_t, Py_ssize_t, PyObject * -> int
+PyList_Size :: PyObject * -> Py_ssize_t
+PyList_Sort :: PyObject * -> int
+PyLongWriter_Create :: int, Py_ssize_t, void ** -> PyLongWriter *
+PyLongWriter_Discard :: PyLongWriter * -> void
+PyLongWriter_Finish :: PyLongWriter * -> PyObject *
+PyLong_AsDouble :: PyObject * -> double
+PyLong_AsInt :: PyObject * -> int
+PyLong_AsInt32 :: PyObject *, int32_t * -> int
+PyLong_AsInt64 :: PyObject *, int64_t * -> int
+PyLong_AsLong :: PyObject * -> long
+PyLong_AsLongAndOverflow :: PyObject *, int * -> long
+PyLong_AsLongLong :: PyObject * -> long long
+PyLong_AsLongLongAndOverflow :: PyObject *, int * -> long long
+PyLong_AsNativeBytes :: PyObject *, void *, Py_ssize_t, int -> Py_ssize_t
+PyLong_AsSize_t :: PyObject * -> size_t
+PyLong_AsSsize_t :: PyObject * -> Py_ssize_t
+PyLong_AsUInt32 :: PyObject *, uint32_t * -> int
+PyLong_AsUInt64 :: PyObject *, uint64_t * -> int
+PyLong_AsUnsignedLong :: PyObject * -> unsigned long
+PyLong_AsUnsignedLongLong :: PyObject * -> unsigned long long
+PyLong_AsUnsignedLongLongMask :: PyObject * -> unsigned long long
+PyLong_AsUnsignedLongMask :: PyObject * -> unsigned long
+PyLong_AsVoidPtr :: PyObject * -> void *
+PyLong_Export :: PyObject *, PyLongExport * -> int
+PyLong_FreeExport :: PyLongExport * -> void
+PyLong_FromDouble :: double -> PyObject *
+PyLong_FromInt32 :: int32_t -> PyObject *
+PyLong_FromInt64 :: int64_t -> PyObject *
+PyLong_FromLong :: long -> PyObject *
+PyLong_FromLongLong :: long long -> PyObject *
+PyLong_FromNativeBytes :: const void *, size_t, int -> PyObject *
+PyLong_FromSize_t :: size_t -> PyObject *
+PyLong_FromSsize_t :: Py_ssize_t -> PyObject *
+PyLong_FromString :: const char *, char **, int -> PyObject *
+PyLong_FromUInt32 :: uint32_t -> PyObject *
+PyLong_FromUInt64 :: uint64_t -> PyObject *
+PyLong_FromUnicodeObject :: PyObject *, int -> PyObject *
+PyLong_FromUnsignedLong :: unsigned long -> PyObject *
+PyLong_FromUnsignedLongLong :: unsigned long long -> PyObject *
+PyLong_FromUnsignedNativeBytes :: const void *, size_t, int -> PyObject *
+PyLong_FromVoidPtr :: void * -> PyObject *
+PyLong_GetInfo :: void -> PyObject *
+PyLong_GetNativeLayout :: void -> const PyLongLayout *
+PyLong_GetSign :: PyObject *, int * -> int
+PyLong_IsNegative :: PyObject * -> int
+PyLong_IsPositive :: PyObject * -> int
+PyLong_IsZero :: PyObject * -> int
+PyMapping_Check :: PyObject * -> int
+PyMapping_GetItemString :: PyObject *, const char * -> PyObject *
+PyMapping_GetOptionalItem :: PyObject *, PyObject *, PyObject ** -> int
+PyMapping_GetOptionalItemString :: PyObject *, const char *, PyObject ** -> int
+PyMapping_HasKey :: PyObject *, PyObject * -> int
+PyMapping_HasKeyString :: PyObject *, const char * -> int
+PyMapping_HasKeyStringWithError :: PyObject *, const char * -> int
+PyMapping_HasKeyWithError :: PyObject *, PyObject * -> int
+PyMapping_Items :: PyObject * -> PyObject *
+PyMapping_Keys :: PyObject * -> PyObject *
+PyMapping_Length :: PyObject * -> Py_ssize_t
+PyMapping_SetItemString :: PyObject *, const char *, PyObject * -> int
+PyMapping_Size :: PyObject * -> Py_ssize_t
+PyMapping_Values :: PyObject * -> PyObject *
+PyMarshal_ReadLastObjectFromFile :: FILE * -> PyObject *
+PyMarshal_ReadLongFromFile :: FILE * -> long
+PyMarshal_ReadObjectFromFile :: FILE * -> PyObject *
+PyMarshal_ReadObjectFromString :: const char *, Py_ssize_t -> PyObject *
+PyMarshal_ReadShortFromFile :: FILE * -> int
+PyMarshal_WriteLongToFile :: long, FILE *, int -> void
+PyMarshal_WriteObjectToFile :: PyObject *, FILE *, int -> void
+PyMarshal_WriteObjectToString :: PyObject *, int -> PyObject *
+PyMem_Calloc :: size_t, size_t -> void *
+PyMem_Free :: void * -> void
+PyMem_GetAllocator :: PyMemAllocatorDomain, PyMemAllocatorEx * -> void
+PyMem_Malloc :: size_t -> void *
+PyMem_RawCalloc :: size_t, size_t -> void *
+PyMem_RawFree :: void * -> void
+PyMem_RawMalloc :: size_t -> void *
+PyMem_RawRealloc :: void *, size_t -> void *
+PyMem_Realloc :: void *, size_t -> void *
+PyMem_SetAllocator :: PyMemAllocatorDomain, PyMemAllocatorEx * -> void
+PyMem_SetupDebugHooks :: void -> void
+PyMember_GetOne :: const char *, PyMemberDef * -> PyObject *
+PyMember_SetOne :: char *, PyMemberDef *, PyObject * -> int
+PyMemoryView_FromBuffer :: const Py_buffer * -> PyObject *
+PyMemoryView_FromMemory :: char *, Py_ssize_t, int -> PyObject *
+PyMemoryView_FromObject :: PyObject * -> PyObject *
+PyMemoryView_GetContiguous :: PyObject *, int, char -> PyObject *
+PyMethod_Function :: PyObject * -> PyObject *
+PyMethod_New :: PyObject *, PyObject * -> PyObject *
+PyMethod_Self :: PyObject * -> PyObject *
+PyModuleDef_Init :: PyModuleDef * -> PyObject *
+PyModule_Add :: PyObject *, const char *, PyObject * -> int
+PyModule_AddFunctions :: PyObject *, PyMethodDef * -> int
+PyModule_AddIntConstant :: PyObject *, const char *, long -> int
+PyModule_AddObject :: PyObject *, const char *, PyObject * -> int
+PyModule_AddObjectRef :: PyObject *, const char *, PyObject * -> int
+PyModule_AddStringConstant :: PyObject *, const char *, const char * -> int
+PyModule_AddType :: PyObject *, PyTypeObject * -> int
+PyModule_Create2 :: PyModuleDef *, int -> PyObject *
+PyModule_ExecDef :: PyObject *, PyModuleDef * -> int
+PyModule_FromDefAndSpec2 :: PyModuleDef *, PyObject *, int -> PyObject *
+PyModule_GetDef :: PyObject * -> PyModuleDef *
+PyModule_GetDict :: PyObject * -> PyObject *
+PyModule_GetFilename :: PyObject * -> const char *
+PyModule_GetFilenameObject :: PyObject * -> PyObject *
+PyModule_GetName :: PyObject * -> const char *
+PyModule_GetNameObject :: PyObject * -> PyObject *
+PyModule_GetState :: PyObject * -> void *
+PyModule_New :: const char * -> PyObject *
+PyModule_NewObject :: PyObject * -> PyObject *
+PyModule_SetDocString :: PyObject *, const char * -> int
+PyMonitoring_EnterScope :: PyMonitoringState *, uint64_t *, const uint8_t *, Py_ssize_t -> int
+PyMonitoring_ExitScope :: void -> int
+PyMutex_IsLocked :: PyMutex * -> int
+PyMutex_Lock :: PyMutex * -> void
+PyMutex_Unlock :: PyMutex * -> void
+PyNumber_Absolute :: PyObject * -> PyObject *
+PyNumber_Add :: PyObject *, PyObject * -> PyObject *
+PyNumber_And :: PyObject *, PyObject * -> PyObject *
+PyNumber_AsSsize_t :: PyObject *, PyObject * -> Py_ssize_t
+PyNumber_Check :: PyObject * -> int
+PyNumber_Divmod :: PyObject *, PyObject * -> PyObject *
+PyNumber_Float :: PyObject * -> PyObject *
+PyNumber_FloorDivide :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceAdd :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceAnd :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceFloorDivide :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceLshift :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceMatrixMultiply :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceMultiply :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceOr :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlacePower :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceRemainder :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceRshift :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceSubtract :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceTrueDivide :: PyObject *, PyObject * -> PyObject *
+PyNumber_InPlaceXor :: PyObject *, PyObject * -> PyObject *
+PyNumber_Index :: PyObject * -> PyObject *
+PyNumber_Invert :: PyObject * -> PyObject *
+PyNumber_Long :: PyObject * -> PyObject *
+PyNumber_Lshift :: PyObject *, PyObject * -> PyObject *
+PyNumber_MatrixMultiply :: PyObject *, PyObject * -> PyObject *
+PyNumber_Multiply :: PyObject *, PyObject * -> PyObject *
+PyNumber_Negative :: PyObject * -> PyObject *
+PyNumber_Or :: PyObject *, PyObject * -> PyObject *
+PyNumber_Positive :: PyObject * -> PyObject *
+PyNumber_Power :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyNumber_Remainder :: PyObject *, PyObject * -> PyObject *
+PyNumber_Rshift :: PyObject *, PyObject * -> PyObject *
+PyNumber_Subtract :: PyObject *, PyObject * -> PyObject *
+PyNumber_ToBase :: PyObject *, int -> PyObject *
+PyNumber_TrueDivide :: PyObject *, PyObject * -> PyObject *
+PyNumber_Xor :: PyObject *, PyObject * -> PyObject *
+PyODict_DelItem :: PyObject *, PyObject * -> int
+PyODict_New :: void -> PyObject *
+PyODict_SetItem :: PyObject *, PyObject *, PyObject * -> int
+PyOS_AfterFork :: void -> void
+PyOS_AfterFork_Child :: void -> void
+PyOS_AfterFork_Parent :: void -> void
+PyOS_BeforeFork :: void -> void
+PyOS_CheckStack :: void -> int
+PyOS_FSPath :: PyObject * -> PyObject *
+PyOS_InterruptOccurred :: void -> int
+PyOS_Readline :: FILE *, FILE *, const char * -> char *
+PyOS_double_to_string :: double, char, int, int, int * -> char *
+PyOS_getsig :: int -> PyOS_sighandler_t
+PyOS_mystricmp :: const char *, const char * -> int
+PyOS_mystrnicmp :: const char *, const char *, Py_ssize_t -> int
+PyOS_setsig :: int, PyOS_sighandler_t -> PyOS_sighandler_t
+PyOS_snprintf :: char *, size_t, const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 3, 4)) -> int
+PyOS_string_to_double :: const char *, char **, PyObject * -> double
+PyOS_strtol :: const char *, char **, int -> long
+PyOS_strtoul :: const char *, char **, int -> unsigned long
+PyOS_vsnprintf :: char *, size_t, const char *, va_list ) Py_GCC_ATTRIBUTE((format(printf, 3, 0)) -> int
+PyObject_ASCII :: PyObject * -> PyObject *
+PyObject_AsFileDescriptor :: PyObject * -> int
+PyObject_Bytes :: PyObject * -> PyObject *
+PyObject_Call :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyObject_CallFinalizer :: PyObject * -> void
+PyObject_CallFinalizerFromDealloc :: PyObject * -> int
+PyObject_CallFunction :: PyObject *, const char *, ... -> PyObject *
+PyObject_CallFunctionObjArgs :: PyObject *, ... -> PyObject *
+PyObject_CallMethod :: PyObject *, const char *, const char *, ... -> PyObject *
+PyObject_CallMethodObjArgs :: PyObject *, PyObject *, ... -> PyObject *
+PyObject_CallNoArgs :: PyObject * -> PyObject *
+PyObject_CallObject :: PyObject *, PyObject * -> PyObject *
+PyObject_CallOneArg :: PyObject *, PyObject * -> PyObject *
+PyObject_Calloc :: size_t, size_t -> void *
+PyObject_CheckBuffer :: PyObject * -> int
+PyObject_ClearManagedDict :: PyObject * -> void
+PyObject_ClearWeakRefs :: PyObject * -> void
+PyObject_CopyData :: PyObject *, PyObject * -> int
+PyObject_DelAttr :: PyObject *, PyObject * -> int
+PyObject_DelAttrString :: PyObject *, const char * -> int
+PyObject_DelItem :: PyObject *, PyObject * -> int
+PyObject_DelItemString :: PyObject *, const char * -> int
+PyObject_Dir :: PyObject * -> PyObject *
+PyObject_Format :: PyObject *, PyObject * -> PyObject *
+PyObject_Free :: void * -> void
+PyObject_GC_Del :: void * -> void
+PyObject_GC_IsFinalized :: PyObject * -> int
+PyObject_GC_IsTracked :: PyObject * -> int
+PyObject_GC_Track :: void * -> void
+PyObject_GC_UnTrack :: void * -> void
+PyObject_GET_WEAKREFS_LISTPTR :: PyObject * -> PyObject **
+PyObject_GenericGetAttr :: PyObject *, PyObject * -> PyObject *
+PyObject_GenericGetDict :: PyObject *, void * -> PyObject *
+PyObject_GenericHash :: PyObject * -> Py_hash_t
+PyObject_GenericSetAttr :: PyObject *, PyObject *, PyObject * -> int
+PyObject_GenericSetDict :: PyObject *, PyObject *, void * -> int
+PyObject_GetAIter :: PyObject * -> PyObject *
+PyObject_GetArenaAllocator :: PyObjectArenaAllocator * -> void
+PyObject_GetAttr :: PyObject *, PyObject * -> PyObject *
+PyObject_GetAttrString :: PyObject *, const char * -> PyObject *
+PyObject_GetBuffer :: PyObject *, Py_buffer *, int -> int
+PyObject_GetItem :: PyObject *, PyObject * -> PyObject *
+PyObject_GetItemData :: PyObject * -> void *
+PyObject_GetIter :: PyObject * -> PyObject *
+PyObject_GetOptionalAttr :: PyObject *, PyObject *, PyObject ** -> int
+PyObject_GetOptionalAttrString :: PyObject *, const char *, PyObject ** -> int
+PyObject_GetTypeData :: PyObject *, PyTypeObject * -> void *
+PyObject_HasAttr :: PyObject *, PyObject * -> int
+PyObject_HasAttrString :: PyObject *, const char * -> int
+PyObject_HasAttrStringWithError :: PyObject *, const char * -> int
+PyObject_HasAttrWithError :: PyObject *, PyObject * -> int
+PyObject_Hash :: PyObject * -> Py_hash_t
+PyObject_HashNotImplemented :: PyObject * -> Py_hash_t
+PyObject_IS_GC :: PyObject * -> int
+PyObject_Init :: PyObject *, PyTypeObject * -> PyObject *
+PyObject_InitVar :: PyVarObject *, PyTypeObject *, Py_ssize_t -> PyVarObject *
+PyObject_IsInstance :: PyObject *, PyObject * -> int
+PyObject_IsSubclass :: PyObject *, PyObject * -> int
+PyObject_IsTrue :: PyObject * -> int
+PyObject_Length :: PyObject * -> Py_ssize_t
+PyObject_LengthHint :: PyObject *, Py_ssize_t -> Py_ssize_t
+PyObject_Malloc :: size_t -> void *
+PyObject_Not :: PyObject * -> int
+PyObject_Print :: PyObject *, FILE *, int -> int
+PyObject_Realloc :: void *, size_t -> void *
+PyObject_Repr :: PyObject * -> PyObject *
+PyObject_RichCompare :: PyObject *, PyObject *, int -> PyObject *
+PyObject_RichCompareBool :: PyObject *, PyObject *, int -> int
+PyObject_SelfIter :: PyObject * -> PyObject *
+PyObject_SetArenaAllocator :: PyObjectArenaAllocator * -> void
+PyObject_SetAttr :: PyObject *, PyObject *, PyObject * -> int
+PyObject_SetAttrString :: PyObject *, const char *, PyObject * -> int
+PyObject_SetItem :: PyObject *, PyObject *, PyObject * -> int
+PyObject_Size :: PyObject * -> Py_ssize_t
+PyObject_Str :: PyObject * -> PyObject *
+PyObject_Type :: PyObject * -> PyObject *
+PyObject_Vectorcall :: PyObject *, PyObject *const *, size_t, PyObject * -> PyObject *
+PyObject_VectorcallDict :: PyObject *, PyObject *const *, size_t, PyObject * -> PyObject *
+PyObject_VectorcallMethod :: PyObject *, PyObject *const *, size_t, PyObject * -> PyObject *
+PyObject_VisitManagedDict :: PyObject *, visitproc, void * -> int
+PyPickleBuffer_FromObject :: PyObject * -> PyObject *
+PyPickleBuffer_GetBuffer :: PyObject * -> const Py_buffer *
+PyPickleBuffer_Release :: PyObject * -> int
+PyPreConfig_InitIsolatedConfig :: PyPreConfig * -> void
+PyPreConfig_InitPythonConfig :: PyPreConfig * -> void
+PyRefTracer_GetTracer :: void ** -> PyRefTracer
+PyRefTracer_SetTracer :: PyRefTracer, void * -> int
+PyRun_AnyFile :: FILE *, const char * -> int
+PyRun_AnyFileEx :: FILE *, const char *, int -> int
+PyRun_AnyFileExFlags :: FILE *, const char *, int, PyCompilerFlags * -> int
+PyRun_AnyFileFlags :: FILE *, const char *, PyCompilerFlags * -> int
+PyRun_File :: FILE *, const char *, int, PyObject *, PyObject * -> PyObject *
+PyRun_FileEx :: FILE *, const char *, int, PyObject *, PyObject *, int -> PyObject *
+PyRun_FileExFlags :: FILE *, const char *, int, PyObject *, PyObject *, int, PyCompilerFlags * -> PyObject *
+PyRun_FileFlags :: FILE *, const char *, int, PyObject *, PyObject *, PyCompilerFlags * -> PyObject *
+PyRun_InteractiveLoop :: FILE *, const char * -> int
+PyRun_InteractiveLoopFlags :: FILE *, const char *, PyCompilerFlags * -> int
+PyRun_InteractiveOne :: FILE *, const char * -> int
+PyRun_InteractiveOneFlags :: FILE *, const char *, PyCompilerFlags * -> int
+PyRun_InteractiveOneObject :: FILE *, PyObject *, PyCompilerFlags * -> int
+PyRun_SimpleFile :: FILE *, const char * -> int
+PyRun_SimpleFileEx :: FILE *, const char *, int -> int
+PyRun_SimpleFileExFlags :: FILE *, const char *, int, PyCompilerFlags * -> int
+PyRun_SimpleString :: const char * -> int
+PyRun_SimpleStringFlags :: const char *, PyCompilerFlags * -> int
+PyRun_String :: const char *, int, PyObject *, PyObject * -> PyObject *
+PyRun_StringFlags :: const char *, int, PyObject *, PyObject *, PyCompilerFlags * -> PyObject *
+PySeqIter_New :: PyObject * -> PyObject *
+PySequence_Check :: PyObject * -> int
+PySequence_Concat :: PyObject *, PyObject * -> PyObject *
+PySequence_Contains :: PyObject *, PyObject * -> int
+PySequence_Count :: PyObject *, PyObject * -> Py_ssize_t
+PySequence_DelItem :: PyObject *, Py_ssize_t -> int
+PySequence_DelSlice :: PyObject *, Py_ssize_t, Py_ssize_t -> int
+PySequence_Fast :: PyObject *, const char * -> PyObject *
+PySequence_GetItem :: PyObject *, Py_ssize_t -> PyObject *
+PySequence_GetSlice :: PyObject *, Py_ssize_t, Py_ssize_t -> PyObject *
+PySequence_In :: PyObject *, PyObject * -> int
+PySequence_InPlaceConcat :: PyObject *, PyObject * -> PyObject *
+PySequence_InPlaceRepeat :: PyObject *, Py_ssize_t -> PyObject *
+PySequence_Index :: PyObject *, PyObject * -> Py_ssize_t
+PySequence_Length :: PyObject * -> Py_ssize_t
+PySequence_List :: PyObject * -> PyObject *
+PySequence_Repeat :: PyObject *, Py_ssize_t -> PyObject *
+PySequence_SetItem :: PyObject *, Py_ssize_t, PyObject * -> int
+PySequence_SetSlice :: PyObject *, Py_ssize_t, Py_ssize_t, PyObject * -> int
+PySequence_Size :: PyObject * -> Py_ssize_t
+PySequence_Tuple :: PyObject * -> PyObject *
+PySet_Add :: PyObject *, PyObject * -> int
+PySet_Clear :: PyObject * -> int
+PySet_Contains :: PyObject *, PyObject * -> int
+PySet_Discard :: PyObject *, PyObject * -> int
+PySet_New :: PyObject * -> PyObject *
+PySet_Pop :: PyObject * -> PyObject *
+PySet_Size :: PyObject * -> Py_ssize_t
+PySignal_SetWakeupFd :: int -> int
+PySlice_AdjustIndices :: Py_ssize_t, Py_ssize_t *, Py_ssize_t *, Py_ssize_t -> Py_ssize_t
+PySlice_GetIndices :: PyObject *, Py_ssize_t, Py_ssize_t *, Py_ssize_t *, Py_ssize_t * -> int
+PySlice_GetIndicesEx :: PyObject *, Py_ssize_t, Py_ssize_t *, Py_ssize_t *, Py_ssize_t *, Py_ssize_t * -> int
+PySlice_New :: PyObject *, PyObject *, PyObject * -> PyObject *
+PySlice_Unpack :: PyObject *, Py_ssize_t *, Py_ssize_t *, Py_ssize_t * -> int
+PyState_AddModule :: PyObject *, PyModuleDef * -> int
+PyState_FindModule :: PyModuleDef * -> PyObject *
+PyState_RemoveModule :: PyModuleDef * -> int
+PyStaticMethod_New :: PyObject * -> PyObject *
+PyStatus_Error :: const char * -> PyStatus
+PyStatus_Exception :: PyStatus -> int
+PyStatus_Exit :: int -> PyStatus
+PyStatus_IsError :: PyStatus -> int
+PyStatus_IsExit :: PyStatus -> int
+PyStatus_NoMemory :: void -> PyStatus
+PyStatus_Ok :: void -> PyStatus
+PyStructSequence_GetItem :: PyObject *, Py_ssize_t -> PyObject *
+PyStructSequence_InitType :: PyTypeObject *, PyStructSequence_Desc * -> void
+PyStructSequence_InitType2 :: PyTypeObject *, PyStructSequence_Desc * -> int
+PyStructSequence_New :: PyTypeObject * -> PyObject *
+PyStructSequence_NewType :: PyStructSequence_Desc * -> PyTypeObject *
+PyStructSequence_SetItem :: PyObject *, Py_ssize_t, PyObject * -> void
+PySys_AddAuditHook :: Py_AuditHookFunction, void * -> int
+PySys_Audit :: const char *, const char *, ... -> int
+PySys_AuditTuple :: const char *, PyObject * -> int
+PySys_FormatStderr :: const char *, ... -> void
+PySys_FormatStdout :: const char *, ... -> void
+PySys_GetObject :: const char * -> PyObject *
+PySys_GetXOptions :: void -> PyObject *
+PySys_ResetWarnOptions :: void -> void
+PySys_SetArgv :: int, wchar_t ** -> void
+PySys_SetArgvEx :: int, wchar_t **, int -> void
+PySys_SetObject :: const char *, PyObject * -> int
+PySys_WriteStderr :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> void
+PySys_WriteStdout :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> void
+PyThreadState_Clear :: PyThreadState * -> void
+PyThreadState_Delete :: PyThreadState * -> void
+PyThreadState_DeleteCurrent :: void -> void
+PyThreadState_EnterTracing :: PyThreadState * -> void
+PyThreadState_Get :: void -> PyThreadState *
+PyThreadState_GetDict :: void -> PyObject *
+PyThreadState_GetFrame :: PyThreadState * -> PyFrameObject *
+PyThreadState_GetID :: PyThreadState * -> uint64_t
+PyThreadState_GetInterpreter :: PyThreadState * -> PyInterpreterState *
+PyThreadState_GetUnchecked :: void -> PyThreadState *
+PyThreadState_LeaveTracing :: PyThreadState * -> void
+PyThreadState_New :: PyInterpreterState * -> PyThreadState *
+PyThreadState_Next :: PyThreadState * -> PyThreadState *
+PyThreadState_SetAsyncExc :: unsigned long, PyObject * -> int
+PyThreadState_Swap :: PyThreadState * -> PyThreadState *
+PyThread_GetInfo :: void -> PyObject *
+PyThread_ReInitTLS :: void -> void
+PyThread_acquire_lock :: PyThread_type_lock, int -> int
+PyThread_acquire_lock_timed :: PyThread_type_lock, PY_TIMEOUT_T, int -> PyLockStatus
+PyThread_allocate_lock :: void -> PyThread_type_lock
+PyThread_create_key :: void -> int
+PyThread_delete_key :: int -> void
+PyThread_delete_key_value :: int -> void
+PyThread_exit_thread :: void -> void
+PyThread_free_lock :: PyThread_type_lock -> void
+PyThread_get_key_value :: int -> void *
+PyThread_get_stacksize :: void -> size_t
+PyThread_get_thread_ident :: void -> unsigned long
+PyThread_get_thread_native_id :: void -> unsigned long
+PyThread_init_thread :: void -> void
+PyThread_release_lock :: PyThread_type_lock -> void
+PyThread_set_key_value :: int, void * -> int
+PyThread_set_stacksize :: size_t -> int
+PyThread_start_new_thread :: void ( * )(void * ), void * -> unsigned long
+PyThread_tss_alloc :: void -> Py_tss_t *
+PyThread_tss_create :: Py_tss_t * -> int
+PyThread_tss_delete :: Py_tss_t * -> void
+PyThread_tss_free :: Py_tss_t * -> void
+PyThread_tss_get :: Py_tss_t * -> void *
+PyThread_tss_is_created :: Py_tss_t * -> int
+PyThread_tss_set :: Py_tss_t *, void * -> int
+PyTime_AsSecondsDouble :: PyTime_t -> double
+PyTime_Monotonic :: PyTime_t * -> int
+PyTime_MonotonicRaw :: PyTime_t * -> int
+PyTime_PerfCounter :: PyTime_t * -> int
+PyTime_PerfCounterRaw :: PyTime_t * -> int
+PyTime_Time :: PyTime_t * -> int
+PyTime_TimeRaw :: PyTime_t * -> int
+PyTraceBack_Here :: PyFrameObject * -> int
+PyTraceBack_Print :: PyObject *, PyObject * -> int
+PyTraceMalloc_Track :: unsigned int, uintptr_t, size_t -> int
+PyTraceMalloc_Untrack :: unsigned int, uintptr_t -> int
+PyTuple_GetItem :: PyObject *, Py_ssize_t -> PyObject *
+PyTuple_GetSlice :: PyObject *, Py_ssize_t, Py_ssize_t -> PyObject *
+PyTuple_New :: Py_ssize_t -> PyObject *
+PyTuple_Pack :: Py_ssize_t, ... -> PyObject *
+PyTuple_SetItem :: PyObject *, Py_ssize_t, PyObject * -> int
+PyTuple_Size :: PyObject * -> Py_ssize_t
+PyType_AddWatcher :: PyType_WatchCallback -> int
+PyType_ClearCache :: void -> unsigned int
+PyType_ClearWatcher :: int -> int
+PyType_Freeze :: PyTypeObject * -> int
+PyType_FromMetaclass :: PyTypeObject *, PyObject *, PyType_Spec *, PyObject * -> PyObject *
+PyType_FromModuleAndSpec :: PyObject *, PyType_Spec *, PyObject * -> PyObject *
+PyType_FromSpec :: PyType_Spec * -> PyObject *
+PyType_FromSpecWithBases :: PyType_Spec *, PyObject * -> PyObject *
+PyType_GenericAlloc :: PyTypeObject *, Py_ssize_t -> PyObject *
+PyType_GenericNew :: PyTypeObject *, PyObject *, PyObject * -> PyObject *
+PyType_GetBaseByToken :: PyTypeObject *, void *, PyTypeObject ** -> int
+PyType_GetDict :: PyTypeObject * -> PyObject *
+PyType_GetFlags :: PyTypeObject * -> unsigned long
+PyType_GetFullyQualifiedName :: PyTypeObject * -> PyObject *
+PyType_GetModule :: PyTypeObject * -> PyObject *
+PyType_GetModuleByDef :: PyTypeObject *, PyModuleDef * -> PyObject *
+PyType_GetModuleName :: PyTypeObject * -> PyObject *
+PyType_GetModuleState :: PyTypeObject * -> void *
+PyType_GetName :: PyTypeObject * -> PyObject *
+PyType_GetQualName :: PyTypeObject * -> PyObject *
+PyType_GetSlot :: PyTypeObject *, int -> void *
+PyType_GetTypeDataSize :: PyTypeObject * -> Py_ssize_t
+PyType_IsSubtype :: PyTypeObject *, PyTypeObject * -> int
+PyType_Modified :: PyTypeObject * -> void
+PyType_Ready :: PyTypeObject * -> int
+PyType_SUPPORTS_WEAKREFS :: PyTypeObject * -> int
+PyType_Unwatch :: int, PyObject * -> int
+PyType_Watch :: int, PyObject * -> int
+PyUnicodeDecodeError_Create :: const char *, const char *, Py_ssize_t, Py_ssize_t, Py_ssize_t, const char * -> PyObject *
+PyUnicodeDecodeError_GetEncoding :: PyObject * -> PyObject *
+PyUnicodeDecodeError_GetEnd :: PyObject *, Py_ssize_t * -> int
+PyUnicodeDecodeError_GetObject :: PyObject * -> PyObject *
+PyUnicodeDecodeError_GetReason :: PyObject * -> PyObject *
+PyUnicodeDecodeError_GetStart :: PyObject *, Py_ssize_t * -> int
+PyUnicodeDecodeError_SetEnd :: PyObject *, Py_ssize_t -> int
+PyUnicodeDecodeError_SetReason :: PyObject *, const char * -> int
+PyUnicodeDecodeError_SetStart :: PyObject *, Py_ssize_t -> int
+PyUnicodeEncodeError_GetEncoding :: PyObject * -> PyObject *
+PyUnicodeEncodeError_GetEnd :: PyObject *, Py_ssize_t * -> int
+PyUnicodeEncodeError_GetObject :: PyObject * -> PyObject *
+PyUnicodeEncodeError_GetReason :: PyObject * -> PyObject *
+PyUnicodeEncodeError_GetStart :: PyObject *, Py_ssize_t * -> int
+PyUnicodeEncodeError_SetEnd :: PyObject *, Py_ssize_t -> int
+PyUnicodeEncodeError_SetReason :: PyObject *, const char * -> int
+PyUnicodeEncodeError_SetStart :: PyObject *, Py_ssize_t -> int
+PyUnicodeTranslateError_GetEnd :: PyObject *, Py_ssize_t * -> int
+PyUnicodeTranslateError_GetObject :: PyObject * -> PyObject *
+PyUnicodeTranslateError_GetReason :: PyObject * -> PyObject *
+PyUnicodeTranslateError_GetStart :: PyObject *, Py_ssize_t * -> int
+PyUnicodeTranslateError_SetEnd :: PyObject *, Py_ssize_t -> int
+PyUnicodeTranslateError_SetReason :: PyObject *, const char * -> int
+PyUnicodeTranslateError_SetStart :: PyObject *, Py_ssize_t -> int
+PyUnicodeWriter_Create :: Py_ssize_t -> PyUnicodeWriter *
+PyUnicodeWriter_DecodeUTF8Stateful :: PyUnicodeWriter *, const char *, Py_ssize_t, const char *, Py_ssize_t * -> int
+PyUnicodeWriter_Discard :: PyUnicodeWriter * -> void
+PyUnicodeWriter_Finish :: PyUnicodeWriter * -> PyObject *
+PyUnicodeWriter_Format :: PyUnicodeWriter *, const char *, ... -> int
+PyUnicodeWriter_WriteASCII :: PyUnicodeWriter *, const char *, Py_ssize_t -> int
+PyUnicodeWriter_WriteChar :: PyUnicodeWriter *, Py_UCS4 -> int
+PyUnicodeWriter_WriteRepr :: PyUnicodeWriter *, PyObject * -> int
+PyUnicodeWriter_WriteStr :: PyUnicodeWriter *, PyObject * -> int
+PyUnicodeWriter_WriteSubstring :: PyUnicodeWriter *, PyObject *, Py_ssize_t, Py_ssize_t -> int
+PyUnicodeWriter_WriteUCS4 :: PyUnicodeWriter *, Py_UCS4 *, Py_ssize_t -> int
+PyUnicodeWriter_WriteUTF8 :: PyUnicodeWriter *, const char *, Py_ssize_t -> int
+PyUnicodeWriter_WriteWideChar :: PyUnicodeWriter *, const wchar_t *, Py_ssize_t -> int
+PyUnicode_Append :: PyObject **, PyObject * -> void
+PyUnicode_AppendAndDel :: PyObject **, PyObject * -> void
+PyUnicode_AsASCIIString :: PyObject * -> PyObject *
+PyUnicode_AsCharmapString :: PyObject *, PyObject * -> PyObject *
+PyUnicode_AsDecodedObject :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_AsDecodedUnicode :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_AsEncodedObject :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_AsEncodedString :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_AsEncodedUnicode :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_AsLatin1String :: PyObject * -> PyObject *
+PyUnicode_AsMBCSString :: PyObject * -> PyObject *
+PyUnicode_AsRawUnicodeEscapeString :: PyObject * -> PyObject *
+PyUnicode_AsUCS4 :: PyObject *, Py_UCS4 *, Py_ssize_t, int -> Py_UCS4 *
+PyUnicode_AsUCS4Copy :: PyObject * -> Py_UCS4 *
+PyUnicode_AsUTF16String :: PyObject * -> PyObject *
+PyUnicode_AsUTF32String :: PyObject * -> PyObject *
+PyUnicode_AsUTF8 :: PyObject * -> const char *
+PyUnicode_AsUTF8AndSize :: PyObject *, Py_ssize_t * -> const char *
+PyUnicode_AsUTF8String :: PyObject * -> PyObject *
+PyUnicode_AsUnicodeEscapeString :: PyObject * -> PyObject *
+PyUnicode_AsWideChar :: PyObject *, wchar_t *, Py_ssize_t -> Py_ssize_t
+PyUnicode_AsWideCharString :: PyObject *, Py_ssize_t * -> wchar_t *
+PyUnicode_BuildEncodingMap :: PyObject * -> PyObject *
+PyUnicode_Compare :: PyObject *, PyObject * -> int
+PyUnicode_CompareWithASCIIString :: PyObject *, const char * -> int
+PyUnicode_Concat :: PyObject *, PyObject * -> PyObject *
+PyUnicode_Contains :: PyObject *, PyObject * -> int
+PyUnicode_CopyCharacters :: PyObject *, Py_ssize_t, PyObject *, Py_ssize_t, Py_ssize_t -> Py_ssize_t
+PyUnicode_Count :: PyObject *, PyObject *, Py_ssize_t, Py_ssize_t -> Py_ssize_t
+PyUnicode_DATA :: PyObject * -> void *
+PyUnicode_Decode :: const char *, Py_ssize_t, const char *, const char * -> PyObject *
+PyUnicode_DecodeASCII :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeCharmap :: const char *, Py_ssize_t, PyObject *, const char * -> PyObject *
+PyUnicode_DecodeCodePageStateful :: int, const char *, Py_ssize_t, const char *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeFSDefault :: const char * -> PyObject *
+PyUnicode_DecodeFSDefaultAndSize :: const char *, Py_ssize_t -> PyObject *
+PyUnicode_DecodeLatin1 :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeLocale :: const char *, const char * -> PyObject *
+PyUnicode_DecodeLocaleAndSize :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeMBCS :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeMBCSStateful :: const char *, Py_ssize_t, const char *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeRawUnicodeEscape :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeUTF16 :: const char *, Py_ssize_t, const char *, int * -> PyObject *
+PyUnicode_DecodeUTF16Stateful :: const char *, Py_ssize_t, const char *, int *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeUTF32 :: const char *, Py_ssize_t, const char *, int * -> PyObject *
+PyUnicode_DecodeUTF32Stateful :: const char *, Py_ssize_t, const char *, int *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeUTF7 :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeUTF7Stateful :: const char *, Py_ssize_t, const char *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeUTF8 :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_DecodeUTF8Stateful :: const char *, Py_ssize_t, const char *, Py_ssize_t * -> PyObject *
+PyUnicode_DecodeUnicodeEscape :: const char *, Py_ssize_t, const char * -> PyObject *
+PyUnicode_EncodeCodePage :: int, PyObject *, const char * -> PyObject *
+PyUnicode_EncodeFSDefault :: PyObject * -> PyObject *
+PyUnicode_EncodeLocale :: PyObject *, const char * -> PyObject *
+PyUnicode_Equal :: PyObject *, PyObject * -> int
+PyUnicode_EqualToUTF8 :: PyObject *, const char * -> int
+PyUnicode_EqualToUTF8AndSize :: PyObject *, const char *, Py_ssize_t -> int
+PyUnicode_FSConverter :: PyObject *, void * -> int
+PyUnicode_FSDecoder :: PyObject *, void * -> int
+PyUnicode_Fill :: PyObject *, Py_ssize_t, Py_ssize_t, Py_UCS4 -> Py_ssize_t
+PyUnicode_Find :: PyObject *, PyObject *, Py_ssize_t, Py_ssize_t, int -> Py_ssize_t
+PyUnicode_FindChar :: PyObject *, Py_UCS4, Py_ssize_t, Py_ssize_t, int -> Py_ssize_t
+PyUnicode_Format :: PyObject *, PyObject * -> PyObject *
+PyUnicode_FromEncodedObject :: PyObject *, const char *, const char * -> PyObject *
+PyUnicode_FromFormat :: const char *, ... -> PyObject *
+PyUnicode_FromFormatV :: const char *, va_list -> PyObject *
+PyUnicode_FromKindAndData :: int, const void *, Py_ssize_t -> PyObject *
+PyUnicode_FromObject :: PyObject * -> PyObject *
+PyUnicode_FromOrdinal :: int -> PyObject *
+PyUnicode_FromString :: const char * -> PyObject *
+PyUnicode_FromStringAndSize :: const char *, Py_ssize_t -> PyObject *
+PyUnicode_FromWideChar :: const wchar_t *, Py_ssize_t -> PyObject *
+PyUnicode_GetDefaultEncoding :: void -> const char *
+PyUnicode_GetLength :: PyObject * -> Py_ssize_t
+PyUnicode_InternFromString :: const char * -> PyObject *
+PyUnicode_InternInPlace :: PyObject ** -> void
+PyUnicode_IsIdentifier :: PyObject * -> int
+PyUnicode_Join :: PyObject *, PyObject * -> PyObject *
+PyUnicode_KIND :: PyObject * -> int
+PyUnicode_New :: Py_ssize_t, Py_UCS4 -> PyObject *
+PyUnicode_Partition :: PyObject *, PyObject * -> PyObject *
+PyUnicode_RPartition :: PyObject *, PyObject * -> PyObject *
+PyUnicode_RSplit :: PyObject *, PyObject *, Py_ssize_t -> PyObject *
+PyUnicode_ReadChar :: PyObject *, Py_ssize_t -> Py_UCS4
+PyUnicode_Replace :: PyObject *, PyObject *, PyObject *, Py_ssize_t -> PyObject *
+PyUnicode_Resize :: PyObject **, Py_ssize_t -> int
+PyUnicode_RichCompare :: PyObject *, PyObject *, int -> PyObject *
+PyUnicode_Split :: PyObject *, PyObject *, Py_ssize_t -> PyObject *
+PyUnicode_Splitlines :: PyObject *, int -> PyObject *
+PyUnicode_Substring :: PyObject *, Py_ssize_t, Py_ssize_t -> PyObject *
+PyUnicode_Tailmatch :: PyObject *, PyObject *, Py_ssize_t, Py_ssize_t, int -> Py_ssize_t
+PyUnicode_Translate :: PyObject *, PyObject *, const char * -> PyObject *
+PyUnicode_WriteChar :: PyObject *, Py_ssize_t, Py_UCS4 -> int
+PyUnstable_AtExit :: PyInterpreterState *, atexit_datacallbackfunc, void * -> int
+PyUnstable_Code_GetExtra :: PyObject *, Py_ssize_t, void ** -> int
+PyUnstable_Code_New :: int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject * -> PyCodeObject *
+PyUnstable_Code_NewWithPosOnlyArgs :: int, int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject * -> PyCodeObject *
+PyUnstable_Code_SetExtra :: PyObject *, Py_ssize_t, void * -> int
+PyUnstable_CopyPerfMapFile :: const char * -> int
+PyUnstable_EnableTryIncRef :: PyObject * -> void
+PyUnstable_Eval_RequestCodeExtraIndex :: freefunc -> Py_ssize_t
+PyUnstable_Exc_PrepReraiseStar :: PyObject *, PyObject * -> PyObject *
+PyUnstable_GC_VisitObjects :: gcvisitobjects_t, void * -> void
+PyUnstable_InterpreterFrame_GetCode :: struct _PyInterpreterFrame * -> PyObject *
+PyUnstable_InterpreterFrame_GetLasti :: struct _PyInterpreterFrame * -> int
+PyUnstable_InterpreterFrame_GetLine :: struct _PyInterpreterFrame * -> int
+PyUnstable_IsImmortal :: PyObject * -> int
+PyUnstable_Long_CompactValue :: const PyLongObject * -> Py_ssize_t
+PyUnstable_Long_IsCompact :: const PyLongObject * -> int
+PyUnstable_Module_SetGIL :: PyObject *, void * -> int
+PyUnstable_Object_ClearWeakRefsNoCallbacks :: PyObject * -> void
+PyUnstable_Object_EnableDeferredRefcount :: PyObject * -> int
+PyUnstable_Object_GC_NewWithExtraData :: PyTypeObject *, size_t -> PyObject *
+PyUnstable_Object_IsUniqueReferencedTemporary :: PyObject * -> int
+PyUnstable_Object_IsUniquelyReferenced :: PyObject * -> int
+PyUnstable_PerfMapState_Fini :: void -> void
+PyUnstable_PerfMapState_Init :: void -> int
+PyUnstable_PerfTrampoline_CompileCode :: PyCodeObject * -> int
+PyUnstable_PerfTrampoline_SetPersistAfterFork :: int -> int
+PyUnstable_ThreadState_ResetStackProtection :: PyThreadState * -> void
+PyUnstable_ThreadState_SetStackProtection :: PyThreadState *, void *, size_t -> int
+PyUnstable_TryIncRef :: PyObject * -> int
+PyUnstable_Type_AssignVersionTag :: PyTypeObject * -> int
+PyUnstable_WritePerfMapEntry :: const void *, unsigned int, const char * -> int
+PyVectorcall_Call :: PyObject *, PyObject *, PyObject * -> PyObject *
+PyVectorcall_Function :: PyObject * -> vectorcallfunc
+PyVectorcall_NARGS :: size_t -> Py_ssize_t
+PyWeakref_GetObject :: PyObject * -> PyObject *
+PyWeakref_GetRef :: PyObject *, PyObject ** -> int
+PyWeakref_IsDead :: PyObject * -> int
+PyWeakref_NewProxy :: PyObject *, PyObject * -> PyObject *
+PyWeakref_NewRef :: PyObject *, PyObject * -> PyObject *
+PyWideStringList_Append :: PyWideStringList *, const wchar_t * -> PyStatus
+PyWideStringList_Insert :: PyWideStringList *, Py_ssize_t, const wchar_t * -> PyStatus
+PyWrapper_New :: PyObject *, PyObject * -> PyObject *
+Py_AddPendingCall :: int ( * )(void * ), void * -> int
+Py_AtExit :: void ( * )(void) -> int
+Py_BuildValue :: const char *, ... -> PyObject *
+Py_BytesMain :: int, char ** -> int
+Py_CompileString :: const char *, const char *, int -> PyObject *
+Py_CompileStringExFlags :: const char *, const char *, int, PyCompilerFlags *, int -> PyObject *
+Py_CompileStringFlags :: const char *, const char *, int, PyCompilerFlags * -> PyObject *
+Py_CompileStringObject :: const char *, PyObject *, int, PyCompilerFlags *, int -> PyObject *
+Py_DecRef :: PyObject * -> void
+Py_DecodeLocale :: const char *, size_t * -> wchar_t *
+Py_EncodeLocale :: const wchar_t *, size_t * -> char *
+Py_EndInterpreter :: PyThreadState * -> void
+Py_EnterRecursiveCall :: const char * -> int
+Py_Exit :: int -> void
+Py_ExitStatusException :: PyStatus -> void
+Py_FatalError :: const char * -> void
+Py_FdIsInteractive :: FILE *, const char * -> int
+Py_Finalize :: void -> void
+Py_FinalizeEx :: void -> int
+Py_FrozenMain :: int, char ** -> int
+Py_GETENV :: const char * -> char *
+Py_GenericAlias :: PyObject *, PyObject * -> PyObject *
+Py_GetArgcArgv :: int *, wchar_t *** -> void
+Py_GetBuildInfo :: void -> const char *
+Py_GetCompiler :: void -> const char *
+Py_GetConstant :: unsigned int -> PyObject *
+Py_GetConstantBorrowed :: unsigned int -> PyObject *
+Py_GetCopyright :: void -> const char *
+Py_GetExecPrefix :: void -> wchar_t *
+Py_GetPath :: void -> wchar_t *
+Py_GetPlatform :: void -> const char *
+Py_GetPrefix :: void -> wchar_t *
+Py_GetProgramFullPath :: void -> wchar_t *
+Py_GetProgramName :: void -> wchar_t *
+Py_GetPythonHome :: void -> wchar_t *
+Py_GetRecursionLimit :: void -> int
+Py_GetVersion :: void -> const char *
+Py_HashBuffer :: const void *, Py_ssize_t -> Py_hash_t
+Py_HashPointer :: const void * -> Py_hash_t
+Py_IncRef :: PyObject * -> void
+Py_Initialize :: void -> void
+Py_InitializeEx :: int -> void
+Py_InitializeFromConfig :: const PyConfig * -> PyStatus
+Py_InitializeFromInitConfig :: PyInitConfig * -> int
+Py_Is :: PyObject *, PyObject * -> int
+Py_IsFalse :: PyObject * -> int
+Py_IsFinalizing :: void -> int
+Py_IsInitialized :: void -> int
+Py_IsNone :: PyObject * -> int
+Py_IsTrue :: PyObject * -> int
+Py_LeaveRecursiveCall :: void -> void
+Py_Main :: int, wchar_t ** -> int
+Py_MakePendingCalls :: void -> int
+Py_NewInterpreter :: void -> PyThreadState *
+Py_NewInterpreterFromConfig :: PyThreadState **, const PyInterpreterConfig * -> PyStatus
+Py_NewRef :: PyObject * -> PyObject *
+Py_PACK_FULL_VERSION :: int, int, int, int, int -> uint32_t
+Py_PACK_VERSION :: int, int -> uint32_t
+Py_PreInitialize :: const PyPreConfig * -> PyStatus
+Py_PreInitializeFromArgs :: const PyPreConfig *, Py_ssize_t, wchar_t ** -> PyStatus
+Py_PreInitializeFromBytesArgs :: const PyPreConfig *, Py_ssize_t, char ** -> PyStatus
+Py_REFCNT :: PyObject * -> Py_ssize_t
+Py_ReprEnter :: PyObject * -> int
+Py_ReprLeave :: PyObject * -> void
+Py_RunMain :: void -> int
+Py_SetProgramName :: const wchar_t * -> void
+Py_SetPythonHome :: const wchar_t * -> void
+Py_SetRecursionLimit :: int -> void
+Py_TYPE :: PyObject * -> PyTypeObject *
+Py_UniversalNewlineFgets :: char *, int, FILE *, PyObject * -> char *
+Py_VaBuildValue :: const char *, va_list -> PyObject *
+Py_XNewRef :: PyObject * -> PyObject *
+Py_fclose :: FILE * -> int
+Py_fopen :: PyObject *, const char * -> FILE *
+_PyArg_ParseTupleAndKeywordsFast :: PyObject *, PyObject *, struct _PyArg_Parser *, ... -> int
+_PyBytes_Resize :: PyObject **, Py_ssize_t -> int
+_PyCode_CheckLineNumber :: int, PyCodeAddressRange * -> int
+_PyCode_ConstantKey :: PyObject * -> PyObject *
+_PyDict_GetItemStringWithError :: PyObject *, const char * -> PyObject *
+_PyDict_GetItem_KnownHash :: PyObject *, PyObject *, Py_hash_t -> PyObject *
+_PyDict_NewPresized :: Py_ssize_t -> PyObject *
+_PyDict_Pop :: PyObject *, PyObject *, PyObject * -> PyObject *
+_PyErr_BadInternalCall :: const char *, int -> void
+_PyErr_ChainExceptions1 :: PyObject * -> void
+_PyEval_EvalFrameDefault :: PyThreadState *, struct _PyInterpreterFrame *, int -> PyObject *
+_PyEval_SliceIndex :: PyObject *, Py_ssize_t * -> int
+_PyEval_SliceIndexNotNone :: PyObject *, Py_ssize_t * -> int
+_PyFrame_IsEntryFrame :: PyFrameObject * -> int
+_PyInterpreterState_GetEvalFrameFunc :: PyInterpreterState * -> _PyFrameEvalFunction
+_PyInterpreterState_GetRefTotal :: PyInterpreterState * -> Py_ssize_t
+_PyInterpreterState_RequireIDRef :: PyInterpreterState *, int -> void
+_PyInterpreterState_RequiresIDRef :: PyInterpreterState * -> int
+_PyInterpreterState_SetEvalFrameFunc :: PyInterpreterState *, _PyFrameEvalFunction -> void
+_PyLong_AsByteArray :: PyLongObject *, unsigned char *, size_t, int, int, int -> int
+_PyLong_Copy :: PyLongObject * -> PyObject *
+_PyLong_FromByteArray :: const unsigned char *, size_t, int, int -> PyObject *
+_PyLong_FromDigits :: int, Py_ssize_t, digit * -> PyLongObject *
+_PyLong_GCD :: PyObject *, PyObject * -> PyObject *
+_PyLong_New :: Py_ssize_t -> PyLongObject *
+_PyLong_NumBits :: PyObject * -> int64_t
+_PyLong_Sign :: PyObject * -> int
+_PyMonitoring_FireBranchEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireBranchLeftEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireBranchRightEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireCRaiseEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FireCReturnEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireCallEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject *, PyObject * -> int
+_PyMonitoring_FireExceptionHandledEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FireJumpEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireLineEvent :: PyMonitoringState *, PyObject *, int32_t, int -> int
+_PyMonitoring_FirePyResumeEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FirePyReturnEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FirePyStartEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FirePyThrowEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FirePyUnwindEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FirePyYieldEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyMonitoring_FireRaiseEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FireReraiseEvent :: PyMonitoringState *, PyObject *, int32_t -> int
+_PyMonitoring_FireStopIterationEvent :: PyMonitoringState *, PyObject *, int32_t, PyObject * -> int
+_PyObject_AssertFailed :: PyObject *, const char *, const char *, const char *, int, const char * -> void
+_PyObject_CallMethodId :: PyObject *, _Py_Identifier *, const char *, ... -> PyObject *
+_PyObject_Dump :: PyObject * -> void
+_PyObject_FunctionStr :: PyObject * -> PyObject *
+_PyObject_GC_New :: PyTypeObject * -> PyObject *
+_PyObject_GC_NewVar :: PyTypeObject *, Py_ssize_t -> PyVarObject *
+_PyObject_GC_Resize :: PyVarObject *, Py_ssize_t -> PyVarObject *
+_PyObject_GenericGetAttrWithDict :: PyObject *, PyObject *, PyObject *, int -> PyObject *
+_PyObject_GenericSetAttrWithDict :: PyObject *, PyObject *, PyObject *, PyObject * -> int
+_PyObject_GetAttrId :: PyObject *, _Py_Identifier * -> PyObject *
+_PyObject_GetDictPtr :: PyObject * -> PyObject **
+_PyObject_New :: PyTypeObject * -> PyObject *
+_PyObject_NewVar :: PyTypeObject *, Py_ssize_t -> PyVarObject *
+_PyObject_SetManagedDict :: PyObject *, PyObject * -> int
+_PySlice_FromIndices :: Py_ssize_t, Py_ssize_t -> PyObject *
+_PySlice_GetLongIndices :: PySliceObject *, PyObject *, PyObject **, PyObject **, PyObject ** -> int
+_PyStack_AsDict :: PyObject *const *, PyObject * -> PyObject *
+_PyThread_CurrentFrames :: void -> PyObject *
+_PyTrash_thread_deposit_object :: PyThreadState *, PyObject * -> void
+_PyTrash_thread_destroy_chain :: PyThreadState * -> void
+_PyTuple_Resize :: PyObject **, Py_ssize_t -> int
+_PyType_Lookup :: PyTypeObject *, PyObject * -> PyObject *
+_PyType_LookupRef :: PyTypeObject *, PyObject * -> PyObject *
+_PyType_Name :: PyTypeObject * -> const char *
+_PyUnicodeWriter_Dealloc :: _PyUnicodeWriter * -> void
+_PyUnicodeWriter_Finish :: _PyUnicodeWriter * -> PyObject *
+_PyUnicodeWriter_Init :: _PyUnicodeWriter * -> void
+_PyUnicodeWriter_PrepareInternal :: _PyUnicodeWriter *, Py_ssize_t, Py_UCS4 -> int
+_PyUnicodeWriter_PrepareKindInternal :: _PyUnicodeWriter *, int -> int
+_PyUnicodeWriter_WriteASCIIString :: _PyUnicodeWriter *, const char *, Py_ssize_t -> int
+_PyUnicodeWriter_WriteChar :: _PyUnicodeWriter *, Py_UCS4 -> int
+_PyUnicodeWriter_WriteLatin1String :: _PyUnicodeWriter *, const char *, Py_ssize_t -> int
+_PyUnicodeWriter_WriteStr :: _PyUnicodeWriter *, PyObject * -> int
+_PyUnicodeWriter_WriteSubstring :: _PyUnicodeWriter *, PyObject *, Py_ssize_t, Py_ssize_t -> int
+_PyUnicode_FromId :: _Py_Identifier * -> PyObject *
+_PyUnicode_IsAlpha :: Py_UCS4 -> int
+_PyUnicode_IsDecimalDigit :: Py_UCS4 -> int
+_PyUnicode_IsDigit :: Py_UCS4 -> int
+_PyUnicode_IsLinebreak :: const Py_UCS4 -> int
+_PyUnicode_IsLowercase :: Py_UCS4 -> int
+_PyUnicode_IsNumeric :: Py_UCS4 -> int
+_PyUnicode_IsPrintable :: Py_UCS4 -> int
+_PyUnicode_IsTitlecase :: Py_UCS4 -> int
+_PyUnicode_IsUppercase :: Py_UCS4 -> int
+_PyUnicode_IsWhitespace :: const Py_UCS4 -> int
+_PyUnicode_ToDecimalDigit :: Py_UCS4 -> int
+_PyUnicode_ToDigit :: Py_UCS4 -> int
+_PyUnicode_ToLowercase :: Py_UCS4 -> Py_UCS4
+_PyUnicode_ToNumeric :: Py_UCS4 -> double
+_PyUnicode_ToTitlecase :: Py_UCS4 -> Py_UCS4
+_PyUnicode_ToUppercase :: Py_UCS4 -> Py_UCS4
+_PyWeakref_ClearRef :: PyWeakReference * -> void
+_Py_BreakPoint :: void -> void
+_Py_DECREF_DecRefTotal :: void -> void
+_Py_Dealloc :: PyObject * -> void
+_Py_DecRef :: PyObject * -> void
+_Py_DecRefShared :: PyObject * -> void
+_Py_DecRefSharedDebug :: PyObject *, const char *, int -> void
+_Py_FatalErrorFunc :: const char *, const char * -> void
+_Py_ForgetReference :: PyObject * -> void
+_Py_GetGlobalRefTotal :: void -> Py_ssize_t
+_Py_GetLegacyRefTotal :: void -> Py_ssize_t
+_Py_GetThreadLocal_Addr :: void -> uintptr_t
+_Py_HashDouble :: PyObject *, double -> Py_hash_t
+_Py_INCREF_IncRefTotal :: void -> void
+_Py_IncRef :: PyObject * -> void
+_Py_MergeZeroLocalRefcount :: PyObject * -> void
+_Py_NegativeRefcount :: const char *, int, PyObject * -> void
+_Py_NewReference :: PyObject * -> void
+_Py_NewReferenceNoTotal :: PyObject * -> void
+_Py_ReachedRecursionLimitWithMargin :: PyThreadState *, int -> int
+_Py_ResurrectReference :: PyObject * -> void
+_Py_SetRefcnt :: PyObject *, Py_ssize_t -> void
+_Py_c_abs :: Py_complex -> double
+_Py_c_diff :: Py_complex, Py_complex -> Py_complex
+_Py_c_neg :: Py_complex -> Py_complex
+_Py_c_pow :: Py_complex, Py_complex -> Py_complex
+_Py_c_prod :: Py_complex, Py_complex -> Py_complex
+_Py_c_quot :: Py_complex, Py_complex -> Py_complex
+_Py_c_sum :: Py_complex, Py_complex -> Py_complex
+pthread_attr_destroy :: pthread_attr_t * -> int
+pthread_attr_init :: pthread_attr_t * -> int
+pthread_attr_setstacksize :: pthread_attr_t *, size_t -> int
+pthread_cond_destroy :: pthread_cond_t * -> int
+pthread_cond_init :: pthread_cond_t * restrict, const pthread_condattr_t * restrict -> int
+pthread_cond_signal :: pthread_cond_t * -> int
+pthread_cond_timedwait :: pthread_cond_t * restrict, pthread_mutex_t * restrict, const struct timespec * restrict -> int
+pthread_cond_wait :: pthread_cond_t * restrict, pthread_mutex_t * restrict -> int
+pthread_condattr_init :: pthread_condattr_t * -> int
+pthread_condattr_setclock :: pthread_condattr_t *, clockid_t -> int
+pthread_create :: pthread_t * restrict, const pthread_attr_t * restrict, void * ( * )(void * ), void * restrict -> int
+pthread_detach :: pthread_t -> int
+pthread_exit :: void * ) __attribute__ ((__noreturn__) -> int
+pthread_getspecific :: pthread_key_t -> void *
+pthread_join :: pthread_t, void ** -> int
+pthread_key_create :: pthread_key_t *, void ( * )(void * ) -> int
+pthread_key_delete :: pthread_key_t -> int
+pthread_mutex_destroy :: pthread_mutex_t * -> int
+pthread_mutex_init :: pthread_mutex_t * restrict, const pthread_mutexattr_t * restrict -> int
+pthread_mutex_lock :: pthread_mutex_t * -> int
+pthread_mutex_trylock :: pthread_mutex_t * -> int
+pthread_mutex_unlock :: pthread_mutex_t * -> int
+pthread_self :: void -> pthread_t
+pthread_setspecific :: pthread_key_t, const void * -> int
+
+# [typedefs]
+DictKeysKind :: int
+FILE_INFO_BY_NAME_CLASS :: int
+JitSymType :: int
+PY_UNICODE_TYPE :: wchar_t
+PyCFunction :: void *
+PyCFunctionFast :: void *
+PyCFunctionFastWithKeywords :: void *
+PyCFunctionWithKeywords :: void *
+PyCMethod :: void *
+PyCOND_T :: CONDITION_VARIABLE
+PyCapsule_Destructor :: void *
+PyCodeEvent :: int
+PyCode_WatchCallback :: void *
+PyContextEvent :: int
+PyContext_WatchCallback :: void *
+PyDict_WatchCallback :: void *
+PyDict_WatchEvent :: int
+PyEnvironmentErrorObject :: PyOSErrorObject
+PyFrameState :: int
+PyFunction_WatchCallback :: void *
+PyFunction_WatchEvent :: int
+PyGILState_STATE :: int
+PyLockStatus :: int
+PyMUTEX_T :: CRITICAL_SECTION
+PyMemAllocatorDomain :: int
+PyMemAllocatorName :: int
+PyModInitFunction :: void *
+PyOS_sighandler_t :: void *
+PyRefTracer :: void *
+PyRefTracerEvent :: int
+PySendResult :: int
+PyStructSequence :: PyTupleObject
+PyThread_handle_t :: Py_uintptr_t
+PyThread_ident_t :: unsigned long long
+PyTime_t :: int64_t
+PyType_WatchCallback :: void *
+PyWindowsErrorObject :: PyOSErrorObject
+Py_AuditHookFunction :: void *
+Py_OpenCodeHookFunction :: void *
+Py_UCS1 :: uint8_t
+Py_UCS2 :: uint16_t
+Py_UCS4 :: uint32_t
+Py_UNICODE :: wchar_t
+Py_hash_t :: Py_ssize_t
+Py_intptr_t :: intptr_t
+Py_ssize_clean_t :: Py_ssize_t
+Py_ssize_t :: ssize_t
+Py_tracefunc :: void *
+Py_uhash_t :: size_t
+Py_uintptr_t :: uintptr_t
+_PyCFunctionFast :: PyCFunctionFast
+_PyCFunctionFastWithKeywords :: PyCFunctionFastWithKeywords
+_PyCodeLocationInfoKind :: int
+_PyCompile_optype :: int
+_PyConfigGILEnum :: int
+_PyConfigInitEnum :: int
+_PyFrameEvalFunction :: void *
+_PyGC_Reason :: int
+_PyLocals_Kind :: unsigned char
+_PyLockFlags :: int
+_PyMonitoringEventSet :: uint32_t
+_PyPropertyObject :: propertyobject
+_PyTime_round_t :: int
+_PyXI_errcode :: int
+_Py_add_pending_call_result :: int
+_Py_block_ty :: int
+_Py_comprehension_ty :: int
+_Py_error_handler :: int
+_Py_ext_module_kind :: int
+_Py_ext_module_origin :: int
+_Py_hashtable_compare_func :: void *
+_Py_hashtable_destroy_func :: void *
+_Py_hashtable_foreach_func :: void *
+_Py_hashtable_get_entry_func :: void *
+_Py_hashtable_hash_func :: void *
+_Py_mimalloc_heap_id :: int
+_Py_pending_call_func :: void *
+_Py_sighandler_t :: PyOS_sighandler_t
+_Py_simple_func :: void *
+_py_validate_type :: void *
+allocfunc :: void *
+atexit_callbackfunc :: void *
+atexit_datacallbackfunc :: void *
+binaryfunc :: void *
+binaryopactionfunc :: void *
+binaryopguardfunc :: void *
+boolop_ty :: int
+cmpop_ty :: int
+conversion_func :: void *
+delayed_dealloc_cb :: void *
+descrgetfunc :: void *
+descrsetfunc :: void *
+destructor :: void *
+digit :: uint32_t
+dl_funcptr :: void *
+expr_context_ty :: int
+freefunc :: void *
+gcvisitobjects_t :: void *
+getattrfunc :: void *
+getattrofunc :: void *
+getbufferproc :: void *
+getiterfunc :: void *
+getname :: void *
+getter :: void *
+hashfunc :: void *
+init_state :: void *
+initproc :: void *
+inquiry :: void *
+intrinsic_func1 :: void *
+intrinsic_func2 :: void *
+iternextfunc :: void *
+jit_func :: void *
+lenfunc :: void *
+m_init :: void *
+malloc :: void *
+mi_arena_id_t :: int
+mi_delayed_t :: int
+mi_encoded_t :: uintptr_t
+mi_memkind_t :: int
+mi_memory_order :: int
+mi_msecs_t :: int64_t
+mi_option_t :: int
+mi_page_kind_t :: int
+mi_segment_kind_t :: int
+mi_slice_t :: mi_page_t
+mi_ssize_t :: int64_t
+mi_tagged_segment_t :: uintptr_t
+mi_thread_free_t :: uintptr_t
+mi_threadid_t :: size_t
+msc_intptr_t :: LONG64
+newfunc :: void *
+objobjargproc :: void *
+objobjproc :: void *
+operator_ty :: int
+perf_status_t :: int
+printfunc :: Py_ssize_t
+pthread_key_t :: unsigned
+pthread_t :: unsigned
+pymem_block :: uint8_t
+pymem_uint :: unsigned int
+releasebufferproc :: void *
+reprfunc :: void *
+richcmpfunc :: void *
+sdigit :: int32_t
+sendfunc :: void *
+setattrfunc :: void *
+setattrofunc :: void *
+setter :: void *
+ssizeargfunc :: void *
+ssizeobjargproc :: void *
+ssizessizeargfunc :: void *
+ssizessizeobjargproc :: void *
+stwodigits :: int64_t
+ternaryfunc :: void *
+traverseproc :: void *
+twodigits :: uint64_t
+unaryfunc :: void *
+unaryop_ty :: int
+value_type :: T
+vectorcallfunc :: void *
+visitproc :: void *
+wrapperfunc :: void *
+wrapperfunc_kwds :: void *
+xid_freefunc :: void *
+xid_newobjfunc :: void *
+xidata_fallback_t :: int
+xidatafbfunc :: void *
+xidatafunc :: void *

@@ -5,7 +5,7 @@ use super::methodobject::{CPyMethodDef, METH_CLASS, METH_COEXIST, METH_STATIC, n
 use super::pyerrors::{self, trap};
 use super::pyobject::{self, CPyObject, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 /// `Py_mod_create`.
@@ -518,11 +518,13 @@ pub unsafe extern "C" fn PyModule_AddObjectRef(
     0
 }
 
+/// The value is a C `long`, which is the width the reference declaration says
+/// and narrower than a `Py_ssize_t` wherever the two differ.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_AddIntConstant(
     module: *mut CPyObject,
     name: *const c_char,
-    value: isize,
+    value: c_long,
 ) -> c_int {
     let Some(module) = module_argument(module, "PyModule_AddIntConstant") else {
         return -1;

@@ -54,6 +54,25 @@ jobs:
     - name: Run cargo fmt --check
       run: cargo fmt --all -- --check
 
+  cpyext-abi:
+    name: cpyext ABI
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - name: Check the exported C declarations
+      # An extension is compiled against CPython's headers everywhere else, so
+      # a parameter pyre declares differently is a calling-convention mismatch
+      # rather than a style difference -- and one no other test here can see,
+      # because every fixture is compiled against pyre's own header. Needs no
+      # cargo and no CPython checkout: the declarations are recorded in
+      # pyre/scripts/cpython-abi.txt.
+      shell: bash
+      run: |
+        python3 pyre/scripts/cpyext-abi.py check
+        python3 pyre/scripts/cpyext-abi.py generate --check
+
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
