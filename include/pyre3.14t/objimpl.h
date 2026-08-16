@@ -21,6 +21,19 @@ extern "C" {
 #define PyObject_GC_Track(ob) ((void)(ob))
 #define PyObject_GC_UnTrack(ob) ((void)(ob))
 
+/* The body of a `tp_traverse`: report one field, and stop at the first
+   visitor that answers non-zero.  `visit` and `arg` are the names
+   `traverseproc` gives its own parameters, which is what lets the macro read
+   as a single argument at the call site. */
+#define Py_VISIT(op)                                            \
+    do {                                                        \
+        if (op) {                                               \
+            int vret = visit((PyObject *)(op), arg);            \
+            if (vret)                                           \
+                return vret;                                    \
+        }                                                       \
+    } while (0)
+
 #ifdef __cplusplus
 }
 #endif
