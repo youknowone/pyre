@@ -2055,6 +2055,7 @@ fn jit_blackhole_resume_from_guard(
             guard_exc,
             false, // CALL_ASSEMBLER portal is jd0 (virtualizable)
             all_virtuals,
+            None, // `raw_deadframe` is rooted only by the copy made inside
         );
         return handle_blackhole_result(result, actual_green_key);
     }
@@ -2351,6 +2352,12 @@ pub fn blackhole_resume_via_rd_numb(
     // materialized, when this resume is the GUARD_NOT_FORCED that follows a
     // force. `None` for every other guard.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
+    // The caller's own rooting of the `deadframe` slice it passed, when it has
+    // one. It covers the same window as `deadframe_roots` below and must end at
+    // the same point, so the caller hands ownership over instead of holding it
+    // across this call: a caller-side scope would stay registered for the whole
+    // forward run.
+    caller_deadframe_roots: Option<majit_metainterp::resume::DeadFrameRefRoots>,
 ) -> BlackholeResult {
     // Same window as `handle_fail`, for every blackhole resume including the
     // CALL_ASSEMBLER caller: the decode below rebuilds virtuals through the
@@ -2531,6 +2538,7 @@ pub fn blackhole_resume_via_rd_numb(
     // `deadframe`'s live range at `_prepare_resume_from_failure`, before
     // `_run_forever`, for the same reason.
     drop(deadframe_roots);
+    drop(caller_deadframe_roots);
     // resume.py:1332-1343 builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
