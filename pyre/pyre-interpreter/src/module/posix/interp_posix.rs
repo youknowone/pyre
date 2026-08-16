@@ -8770,8 +8770,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fpathconf() requires fd, name"));
                     }
-                    // interp_posix.py:2411 `@unwrap_spec(fd=c_int)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    // interp_posix.py:2411 descriptor argument: accept an int
+                    // or a `fileno()` object through `space.c_filedescriptor_w`;
+                    // that boundary also raises the bool file descriptor warning.
+                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                     let name = confname_arg(args[1], PATHCONF_NAMES)?;
                     let limit = host_posix::fpathconf(fd, name).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(indeterminate_limit(limit)))

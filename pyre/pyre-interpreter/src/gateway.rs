@@ -1766,7 +1766,21 @@ fn path_or_fd_w(
             // raising `__index__` and a working `__fspath__` reports that
             // exception rather than being statted. The parity suite's oracle
             // is CPython.
-            let fd = crate::baseobjspace::c_int_w(obj)?;
+            //
+            // A bool is an integer, so it reaches this arm and names
+            // descriptor 0 or 1; the warning says so before it is used.
+            if pyre_object::is_bool(obj) {
+                crate::warn::warn_category(
+                    "bool is used as a file descriptor",
+                    "RuntimeWarning",
+                    1,
+                )?;
+            }
+            // The warning runs the installed filters, which are Python, so the
+            // argument is read back off the shadow stack the same way the
+            // `__fspath__` arm reads it after its call.
+            let fd =
+                crate::baseobjspace::c_int_w(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
             // interp_posix.py:269-271 `unwrap_fd` — `-1` is the sentinel for
             // "not a descriptor", so a caller naming it has to be turned away
             // here rather than silently read as a path.

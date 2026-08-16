@@ -8458,6 +8458,13 @@ pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
 /// non-negative C int.  `isinstance_w(w_fd, w_int)` accepts a long or an
 /// int subclass as well, so the membership test is `is_int_or_long`.
 pub fn c_filedescriptor_w(obj: PyObjectRef) -> Result<i32, PyError> {
+    // A bool passes the int test below and names descriptor 0 or 1, which is
+    // almost always a mistake at a descriptor argument.  Only the object the
+    // caller named is reported: a `fileno()` that answers with a bool is the
+    // object's own doing, not the caller's.
+    if unsafe { pyre_object::is_bool(obj) } {
+        crate::warn::warn_category("bool is used as a file descriptor", "RuntimeWarning", 1)?;
+    }
     let w_fd = if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
         obj
     } else {
