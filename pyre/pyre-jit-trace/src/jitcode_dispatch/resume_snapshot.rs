@@ -828,9 +828,30 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             // (`resume.py`). The orthodox fix is
                             // push-time boxing plus optimizer virtualization,
                             // beyond this capture hook.
+                            // Decline wherever the shadow already carries a
+                            // live Ref for this slot.  Omitting a slot leaves
+                            // the shadow's own value standing in the snapshot,
+                            // and the shadow is the executed-store record —
+                            // every push and pop writes it, including a NULL
+                            // push (`emit_pushvalue_ref_const!`) and a pop's
+                            // clear (`emit_popvalue_ref!`).  The per-PC color
+                            // map is a program-point LABEL rather than a
+                            // binding, so it must fill a slot neither the
+                            // mirror nor the shadow can source, not outrank a
+                            // slot the walk demonstrably stored: the label is
+                            // fixed per PC while the stored box varies per
+                            // capture, so overriding published one invariant
+                            // box over several different live ones.
+                            let shadow_has_live_ref =
+                                ctx.trace_ctx.virtualizable_box_at(vidx).is_some_and(|b| {
+                                    b != OpRef::NONE
+                                        && !opref_is_null_const_ptr(b)
+                                        && b.ty() == Some(majit_ir::Type::Ref)
+                                });
                             if box_op != OpRef::NONE
                                 && !opref_is_null_const_ptr(box_op)
                                 && box_op.ty() == Some(majit_ir::Type::Ref)
+                                && !shadow_has_live_ref
                             {
                                 augmented.push((vidx, box_op));
                                 covered.insert(vidx);
