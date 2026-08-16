@@ -302,6 +302,7 @@
       "dynasm": "PASS"
     },
     "test.test_datetime": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_dbm": {
