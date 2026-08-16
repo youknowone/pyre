@@ -166,3 +166,23 @@ impl JitFrameDeadFrame {
         GcRef(unsafe { *((self.jf_gcref().0 + JF_GUARD_EXC_OFS as usize) as *const usize) })
     }
 }
+
+impl Drop for JitFrameDeadFrame {
+    /// Release the frame's `jf_gcmap` before the root slot goes.
+    ///
+    /// Releasing the root does not take the frame out of the collector's
+    /// remembered set, so the frame stays reachable there after this owner is
+    /// gone — and `jitframe_trace` (`jitframe.py:115-135`) would keep walking
+    /// the exiting guard's map over `jf_frame` items nothing owns any more.
+    /// A null `jf_gcmap` traces no items (`jitframe.py:115-116`) while the
+    /// fixed header GCREFs stay traceable, which is what the frame needs once
+    /// its values have been read out (`llmodel.py:437-451`).
+    ///
+    /// Only the rooted arm: an `Unrooted` frame is not a GC object, so nothing
+    /// traces it at all.
+    fn drop(&mut self) {
+        if let JitFrameRoot::Slot(guard) = &self.jf_root {
+            unsafe { (*(guard.get().0 as *mut JitFrame)).jf_gcmap = std::ptr::null() };
+        }
+    }
+}
