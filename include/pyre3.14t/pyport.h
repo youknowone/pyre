@@ -23,6 +23,18 @@ extern "C" {
 #  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE
 #  define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
 #endif
+/* C++ has no implicit conversion from `const char *[]` to `char **`, so the
+ * keyword list a C++ extension can build is only accepted when the parameter
+ * carries this qualifier.  C keeps it unqualified, where an extension may pass
+ * a non-const array. */
+#ifndef PY_CXX_CONST
+#  ifdef __cplusplus
+#    define PY_CXX_CONST const
+#  else
+#    define PY_CXX_CONST
+#  endif
+#endif
+
 typedef intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)

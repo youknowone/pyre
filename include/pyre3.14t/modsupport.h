@@ -271,7 +271,8 @@ done:
 }
 
 static inline int _PyPyre_VaParse(PyObject *args, PyObject *kwargs,
-                                  const char *format, char **keywords,
+                                  const char *format,
+                                  PY_CXX_CONST char *const *keywords,
                                   va_list *va, const char *fname)
 {
     Py_ssize_t total = 0;
@@ -351,7 +352,9 @@ static inline int PyArg_ParseTuple(PyObject *args, const char *format, ...)
 }
 
 static inline int PyArg_ParseTupleAndKeywords(PyObject *args, PyObject *kwargs,
-                                              const char *format, char **keywords, ...)
+                                              const char *format,
+                                              PY_CXX_CONST char *const *keywords,
+                                              ...)
 {
     va_list va;
     va_start(va, keywords);

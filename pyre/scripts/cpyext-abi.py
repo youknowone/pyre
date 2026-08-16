@@ -73,7 +73,11 @@ def param_type(text):
     if text in ("", "void"):
         return "void"
     if "(" in text:  # a function pointer spelled inline
-        return re.sub(r"\b[A-Za-z_]\w*\s*\)", ")", text, count=1)
+        # Only the declarator -- `(*name)` -- holds a name to drop.  An
+        # unanchored match would take the first identifier before any `)`,
+        # which is a type in `void (*)(int, int)` and a trailing attribute
+        # clause in `va_list) Py_GCC_ATTRIBUTE((format(printf, 1, 0))`.
+        return re.sub(r"\(\s*(\*+)\s*[A-Za-z_]\w*\s*\)", r"(\1)", text, count=1)
     text = re.sub(r"\[\s*\]", " *", text)
     named = NAMED.match(text)
     if named and named.group(2) not in KEYWORDS:
@@ -216,7 +220,10 @@ def load_record():
             typedefs[name] = rest
             continue
         args, _, ret = rest.partition(" -> ")
-        declarations[name] = ([a.strip() for a in args.split(",")], ret.strip())
+        # The record was written with `split_commas`, so a parameter that
+        # carries a comma of its own -- a function pointer's own list -- must
+        # be read back with the same depth-aware split.
+        declarations[name] = ([a.strip() for a in split_commas(args)], ret.strip())
     return declarations, typedefs
 
 
