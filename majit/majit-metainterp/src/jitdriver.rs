@@ -716,6 +716,58 @@ where
     }
 }
 
+/// Flatten a dispatch JitCode and everything it can inline-call into the one
+/// flat `all_jitcodes` registry, returning it with the dispatch JitCode's
+/// `Arc`.
+///
+/// `codewriter.py:89 make_jitcodes` numbers a single list — `jitcode.index =
+/// index` as each is appended — and `resume.py:1338-1340 jitcode =
+/// jitcodes[jitcode_pos]` reads that same list back. So the registry has one
+/// property to keep: `registry[jitcode.index()]` is that jitcode.
+///
+/// `seed` is the part of the list a host already numbered at build time, which
+/// its own `j` operands are written against. Those indices are not this
+/// function's to assign — `JitCode::set_index` is set-once and asserts on a
+/// second value, so overwriting one is not even a silent renumbering, it is a
+/// panic. Numbering therefore CONTINUES above the seed rather than restarting,
+/// which is the same thing upstream does by appending to `all_jitcodes` in one
+/// pass.
+///
+/// The walk starts at the dispatch JitCode, not at the seed: every seeded entry
+/// is already present, so its callees are too. It is depth-agnostic, so a
+/// nested inline helper stays correctly indexed without a parent-relative walk.
+fn build_jitcode_registry(
+    seed: &[std::sync::Arc<crate::jitcode::JitCode>],
+    dispatch: crate::jitcode::JitCode,
+) -> (
+    Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    std::sync::Arc<crate::jitcode::JitCode>,
+) {
+    let mut registry = seed.to_vec();
+    let dispatch_position = registry.len();
+    dispatch.set_index(dispatch_position);
+    let dispatch_arc = std::sync::Arc::new(dispatch);
+    registry.push(dispatch_arc.clone());
+    let mut cursor = dispatch_position;
+    while cursor < registry.len() {
+        let current = registry[cursor].clone();
+        cursor += 1;
+        for descr in &current.exec.descrs {
+            if let Some(sub) = descr.as_jitcode() {
+                if registry.iter().any(|j| std::sync::Arc::ptr_eq(j, sub)) {
+                    continue;
+                }
+                // Reached here only if the seed does not already hold it, so
+                // it is a jitcode built at run time and has no index yet.
+                let idx = registry.len();
+                sub.set_index(idx);
+                registry.push(sub.clone());
+            }
+        }
+    }
+    (registry, dispatch_arc)
+}
+
 /// Descriptor for a JitDriver's variable layout.
 ///
 /// Mirrors RPython's `JitDriver(greens=[...], reds=[...])`:
@@ -1554,29 +1606,8 @@ impl<S: JitState> JitDriver<S> {
         // Production-active — `warmspot.py:660-666
         // make_args_specification` translation-time assert parity.
         validate_dispatch_jitcode_payload(self, &jitcode);
-        // Assign the dispatch JitCode the root global index 0, then flatten
-        // every reachable sub-JitCode into one flat registry, assigning each
-        // its own absolute index (resume.py:1050 `metainterp_sd.jitcodes`).
-        // The worklist enumeration is depth-agnostic, so a future nested
-        // inline helper stays correctly indexed without a parent-relative walk.
-        jitcode.set_index(0);
-        let dispatch_arc = std::sync::Arc::new(jitcode);
-        let mut registry: Vec<std::sync::Arc<crate::jitcode::JitCode>> = vec![dispatch_arc.clone()];
-        let mut cursor = 0;
-        while cursor < registry.len() {
-            let current = registry[cursor].clone();
-            cursor += 1;
-            for descr in &current.exec.descrs {
-                if let Some(sub) = descr.as_jitcode() {
-                    if registry.iter().any(|j| std::sync::Arc::ptr_eq(j, sub)) {
-                        continue;
-                    }
-                    let idx = registry.len();
-                    sub.set_index(idx);
-                    registry.push(sub.clone());
-                }
-            }
-        }
+        let (registry, dispatch_arc) =
+            build_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode);
         // call.py:147-148 `grab_initial_jitcodes`:
         //
         //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
@@ -9464,5 +9495,117 @@ mod cross_loop_cut_close_tests {
             !driver.meta.is_cross_loop_cut_key(inner_key),
             "the cut mark must not outlive the loop it describes",
         );
+    }
+}
+
+#[cfg(test)]
+mod jitcode_registry_tests {
+    use super::*;
+    use crate::jitcode::{JitCode, RuntimeBhDescr};
+    use std::sync::Arc;
+
+    /// A jitcode with a committed body, optionally already numbered the way a
+    /// build-time table numbers its entries.
+    fn jitcode(name: &str, prenumbered: Option<usize>) -> Arc<JitCode> {
+        let core = majit_translate::jitcode::JitCode::new(name);
+        core.set_body(Default::default());
+        if let Some(index) = prenumbered {
+            core.set_index(index);
+        }
+        Arc::new(JitCode::from_canonical(core))
+    }
+
+    /// A dispatch jitcode that inline-calls each of `callees`.
+    fn dispatch_calling(callees: &[Arc<JitCode>]) -> JitCode {
+        let core = majit_translate::jitcode::JitCode::new("dispatch");
+        core.set_body(Default::default());
+        let mut dispatch = JitCode::from_canonical(core);
+        dispatch.exec.descrs = callees
+            .iter()
+            .map(|callee| RuntimeBhDescr::JitCode(Arc::clone(callee)))
+            .collect();
+        dispatch
+    }
+
+    /// Every entry sits at the index it names — the property
+    /// `resume.py:1338-1340` reads the registry with.
+    fn assert_self_indexed(registry: &[Arc<JitCode>]) {
+        for (position, jitcode) in registry.iter().enumerate() {
+            assert_eq!(
+                jitcode.try_index(),
+                Some(position),
+                "`{}` sits at {position} but names {:?}",
+                jitcode.name(),
+                jitcode.try_index(),
+            );
+        }
+    }
+
+    /// With no build-time table the dispatch jitcode is the root of the list,
+    /// exactly as before a seed existed.
+    #[test]
+    fn an_unseeded_registry_numbers_the_dispatch_jitcode_first() {
+        let helper = jitcode("helper", None);
+        let (registry, dispatch) = build_jitcode_registry(&[], dispatch_calling(&[helper]));
+        assert_eq!(dispatch.index(), 0);
+        assert_eq!(registry.len(), 2);
+        assert_self_indexed(&registry);
+    }
+
+    /// The subject: a callee that a build-time table already numbered keeps
+    /// that number.
+    ///
+    /// Renumbering it is not a silent drift — `set_index` is set-once and
+    /// asserts — so before the seed existed, inline-calling a build-time
+    /// jitcode panicked here rather than tracing.
+    /// A seed whose inline-called entry sits at an index the run-time
+    /// numbering would otherwise hand to something else. `add` at 2 rather
+    /// than at the first free slot is the point: a seed one entry long would
+    /// pass this test by coincidence.
+    fn seed() -> Vec<Arc<JitCode>> {
+        vec![
+            jitcode("mainloop", Some(0)),
+            jitcode("val_add", Some(1)),
+            jitcode("add", Some(2)),
+        ]
+    }
+
+    #[test]
+    fn a_prenumbered_callee_keeps_the_index_its_own_operands_use() {
+        let seed = seed();
+        let (registry, dispatch) = build_jitcode_registry(&seed, dispatch_calling(&seed[2..]));
+        assert_eq!(
+            seed[2].index(),
+            2,
+            "the seed's own `j` operands are written against this index",
+        );
+        assert_eq!(
+            dispatch.index(),
+            3,
+            "the run-time numbering continues above the seed rather than \
+             restarting over slots the build already assigned",
+        );
+        assert_eq!(
+            registry.len(),
+            4,
+            "the callee is seeded, not appended twice"
+        );
+        assert_self_indexed(&registry);
+    }
+
+    /// A seed and a run-time helper in one registry: both numbering authorities
+    /// land in one list with no collision and no hole.
+    #[test]
+    fn a_runtime_helper_is_numbered_above_a_seeded_callee() {
+        let seed = seed();
+        let helper = jitcode("helper", None);
+        let (registry, dispatch) = build_jitcode_registry(
+            &seed,
+            dispatch_calling(&[Arc::clone(&seed[2]), Arc::clone(&helper)]),
+        );
+        assert_eq!(dispatch.index(), 3);
+        assert_eq!(helper.index(), 4);
+        assert_eq!(registry.len(), 5);
+        assert_self_indexed(&registry);
     }
 }

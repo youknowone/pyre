@@ -299,6 +299,19 @@ pub trait RuntimeDescrTable: Sync {
     fn get(&self, index: usize) -> Option<&'static RuntimeBhDescr>;
     fn len(&self) -> usize;
 
+    /// The build-time `all_jitcodes` list this pool's `j` operands index
+    /// (`codewriter.py:89 make_jitcodes`), positioned by `jitcode.index`.
+    ///
+    /// Empty by default: a host that decodes its jitcodes on demand has no
+    /// such list to hand over, and nothing here requires one. A host that
+    /// does return it is stating that those indices are already assigned, so
+    /// a second numbering must continue above them rather than restart —
+    /// `resume.py:1338-1340` indexes one list by a frame's `jitcode_pos`, and
+    /// two numberings over the same slots make that lookup ambiguous.
+    fn jitcodes(&self) -> &'static [std::sync::Arc<JitCode>] {
+        &[]
+    }
+
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -329,6 +342,14 @@ pub fn init_global_build_descr_pool(table: &'static dyn RuntimeDescrTable) {
 /// only exercises runtime-built jitcodes).
 pub(crate) fn global_build_descr_pool() -> Option<&'static dyn RuntimeDescrTable> {
     GLOBAL_BUILD_DESCR_POOL.get().copied()
+}
+
+/// The build-time `all_jitcodes` the installed pool numbers against, or empty.
+///
+/// See [`RuntimeDescrTable::jitcodes`]: this is the prefix of the flat registry
+/// that is already assigned, so any numbering done at run time starts above it.
+pub(crate) fn global_build_jitcodes() -> &'static [std::sync::Arc<JitCode>] {
+    global_build_descr_pool().map_or(&[], |pool| pool.jitcodes())
 }
 
 /// Per-`JitCode` descrs.  Pyre's analog of

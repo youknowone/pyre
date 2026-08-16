@@ -147,6 +147,10 @@ impl RuntimeDescrTable for EmbeddedJitCodeTable {
     fn len(&self) -> usize {
         self.descrs.len()
     }
+
+    fn jitcodes(&self) -> &'static [Arc<JitCode>] {
+        self.jitcodes
+    }
 }
 
 #[cfg(test)]
