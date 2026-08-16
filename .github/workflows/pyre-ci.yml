@@ -520,6 +520,20 @@ jobs:
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/parity_tests/run.py
+    - name: Run pyre/extra_tests/snippets (gated subset)
+      # The snippet corpus is mostly imported from RustPython and is not all
+      # green, so only the scripts declaring `# pyre-check: gate=1` run here —
+      # the pyre-authored language/builtin gaps, every one of which passes
+      # under CPython and both backends. They live here rather than as
+      # `#[cfg(test)]` cases because CPython is one of the runners: a snippet
+      # that drifts from CPython fails on its own reference, which a Rust test
+      # asserting the same thing cannot notice.
+      #
+      # Same `!cancelled()` reasoning as the parity step above.
+      if: ${{ !cancelled() }}
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/run.py --gated-only
     - name: Run the vendored root extra_tests
       # PyPy's own `extra_tests/` tree, run in place through a driver that
       # supplies the pytest names those files use. Only `run.py`'s ENABLED list

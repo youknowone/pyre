@@ -17,13 +17,16 @@ The interpreter's cwd is set to the snippets directory so the local
 Usage:
     python3 pyre/extra_tests/run.py [--dynasm-only|--cranelift-only]
                                     [--cpython-only]
+                                    [--gated-only]
                                     [--filter SUBSTRING]
                                     [--timeout SECONDS]
                                     [--list]
 
-Exit code is 0 iff every (script, backend) pair passed.  Until the
-runtime catches up to the full snippet surface a large number of
-failures is expected; use `--filter` to focus on a category.
+Exit code is 0 iff every (script, backend) pair passed.  The imported
+corpus is not all green, so a bare run is survey material; use
+`--filter` to focus on a category.  `--gated-only` selects the
+`# pyre-check: gate=1` subset, which is green everywhere and is what CI
+blocks on.
 """
 
 from __future__ import annotations
@@ -42,6 +45,15 @@ TARGET_RELEASE = ROOT / "target" / "release"
 EXE = ".exe" if sys.platform == "win32" else ""
 PLATFORMS_PREFIX = "# pyre-check: platforms="
 
+# A snippet carrying `# pyre-check: gate=1` is green on every backend and is
+# expected to stay that way, so CI runs the marked subset (`--gated-only`) as
+# a hard gate.  The rest of the corpus is the imported RustPython set, parts
+# of which fail today — some only under CPython, which asserts behaviour the
+# original suite never ran there.  Marking a snippet is what moves it from
+# survey material to something a red run blocks a merge on; do it only once
+# the script passes under CPython and both backends.
+GATE_PREFIX = "# pyre-check: gate="
+
 # Snippet basenames that are not standalone test files (helpers /
 # scaffolding imported by other snippets).  Skip them from the run.
 NON_TEST_FILES = {
@@ -49,7 +61,7 @@ NON_TEST_FILES = {
 }
 
 
-def _scripts(filter_substring: str | None) -> list[Path]:
+def _scripts(filter_substring: str | None, gated_only: bool = False) -> list[Path]:
     out: list[Path] = []
     for p in sorted(SNIPPETS.glob("*.py")):
         if p.name in NON_TEST_FILES:
@@ -62,6 +74,10 @@ def _scripts(filter_substring: str | None) -> list[Path]:
                 for item in marker[len(PLATFORMS_PREFIX):].split(",")
             }
             if sys.platform not in platforms:
+                continue
+        if gated_only:
+            gate = next((line for line in header if line.startswith(GATE_PREFIX)), None)
+            if gate is None or gate[len(GATE_PREFIX):].strip() != "1":
                 continue
         if filter_substring and filter_substring not in p.name:
             continue
@@ -125,6 +141,9 @@ def main() -> int:
     parser.add_argument("--cpython-only", action="store_true")
     parser.add_argument("--filter", default=None,
                         help="run only scripts whose name contains this substring")
+    parser.add_argument("--gated-only", action="store_true",
+                        help="run only scripts marked `# pyre-check: gate=1` "
+                             "(the set CI blocks on)")
     parser.add_argument("--timeout", type=int, default=30,
                         help="per-script timeout in seconds (default 30)")
     parser.add_argument("--list", action="store_true",
@@ -133,7 +152,7 @@ def main() -> int:
                         help="print pass/fail for every (script, backend)")
     args = parser.parse_args()
 
-    scripts = _scripts(args.filter)
+    scripts = _scripts(args.filter, args.gated_only)
     if args.list:
         for s in scripts:
             print(s.name)
@@ -149,6 +168,8 @@ def main() -> int:
 
     print(f"runners: {[name for name, _ in runners]}")
     print(f"scripts: {len(scripts)}")
+    if args.gated_only:
+        print("filter:  gate=1 only")
     if args.filter:
         print(f"filter:  {args.filter!r}")
     print()

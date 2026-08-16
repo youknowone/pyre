@@ -14,9 +14,17 @@ exits with code 0.
 ```sh
 python3 pyre/extra_tests/run.py            # all three backends
 python3 pyre/extra_tests/run.py --cpython-only
+python3 pyre/extra_tests/run.py --gated-only   # the set CI blocks on
 python3 pyre/extra_tests/run.py --filter builtin_dict
 python3 pyre/extra_tests/run.py -v         # show every (script, backend)
 ```
+
+Parts of the imported corpus fail today — a few only under CPython,
+because they assert behaviour the original suite never ran there — so a
+bare run is survey material rather than a gate.  A snippet that is green
+under CPython **and** both backends can declare `# pyre-check: gate=1` on
+its first line; CI runs exactly that subset (`--gated-only`) and a red
+run there blocks the merge.  Add the marker only after checking all three.
 
 The runner sets `cwd` to `snippets/` so `from testutils import ...`
 works.  `testutils.py` is the helper module shipped with the snippets
@@ -25,7 +33,9 @@ works.  `testutils.py` is the helper module shipped with the snippets
 ## Layout
 
 - `snippets/` — imported RustPython tests and generic pyre-authored gaps,
-  breadth-first surface coverage.  Runner: `pyre/extra_tests/run.py`.
+  breadth-first surface coverage.  The pyre-authored ones carry
+  `# pyre-check: gate=1`, which is what CI runs.  Runner:
+  `pyre/extra_tests/run.py`.
 - `parity_tests/` — pyre-authored scripts reserved for specific PyPy/JIT/GC
   invariants not already covered by `snippets/` or the vendored CPython suite
   under `lib-python/3/test/`.  Do not mirror general language, builtin, or
