@@ -2700,6 +2700,18 @@ fn try_adopt_single_frame_blackhole(
                 terminal.last_opcode_position,
                 &[cf_addr, forwarded_root_addr],
             );
+            // A raise that reaches this terminal came out of a residual
+            // helper that published into the backend `_store_exception`
+            // cells as well (`publish_residual_call_exception`); the
+            // blackhole's in-frame catch (`route_to_catch`) drains those
+            // cells, but a raise that leaves the frame keeps them.  From
+            // here the exception lives in the walk's finish-raise channel
+            // only, so drain the cells — a survivor is read by the next
+            // compiled trace's `must_save_exception` guard and delivered
+            // as that frame's own raise.
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
+            }
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,
             ));
@@ -3227,6 +3239,13 @@ fn try_adopt_multi_frame_blackhole(
                     image.last_opcode_position,
                     &[cf_addr, root_addr],
                 );
+            }
+            // Same cell drain as the single-frame arm, for the same reason:
+            // the raise leaves the blackhole without an in-frame catch, so
+            // nothing downstream drains the backend `_store_exception`
+            // cells the raising helper published into.
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
             }
             crate::jitcode_dispatch::fbw_finish_raise_set(crate::state::ConcreteValue::Ref(
                 value.as_usize() as pyre_object::PyObjectRef,

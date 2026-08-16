@@ -3,6 +3,7 @@
 //! Mirrors RPython's `executor.py`: executes individual JIT IR operations
 //! by dispatching on the opcode and computing the result.
 
+use majit_backend::Backend;
 use majit_ir::{OpCode, OpRef};
 
 /// rpython/jit/metainterp/executor.py:524-528 `execute_varargs(cpu, metainterp, opnum, argboxes, descr)`.
@@ -371,6 +372,18 @@ pub fn execute_varargs<M: Clone>(
         v
     });
     if bh_exc != 0 {
+        // The shared `bh_*` helper published this raise into the backend
+        // `_store_exception` cells as well as `BH_LAST_EXC_VALUE`
+        // (`publish_residual_call_exception`).  Those cells belong to
+        // compiled / blackhole execution; RPython tracing never touches
+        // them (executor.py:52-78 hands the exception straight to
+        // `metainterp.execute_raised`).  Drain them here, or a raise that
+        // tracing consumed — for example one handled by a recorded
+        // GUARD_EXCEPTION — outlives the trace, and the next compiled
+        // trace's `must_save_exception` guard delivers it as that frame's
+        // own raise: an exception surfacing out of a frame that raised
+        // nothing.
+        metainterp.backend.clear_stored_exception();
         metainterp.execute_raised(bh_exc, false);
         return 0;
     }
