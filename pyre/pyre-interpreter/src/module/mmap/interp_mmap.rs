@@ -79,6 +79,12 @@ struct NativeMMap {
     /// releases it.  A Windows mapping tracks `handle` instead.
     #[cfg(unix)]
     fd: Option<rustpython_host_env::crt_fd::Owned>,
+    /// The `flags` the mapping was created with, as `mmap(2)` received them.
+    /// `mode` cannot stand in for it: a `MAP_PRIVATE` mapping that is not
+    /// writable resolves to the same `AccessMode::Read` as a shared one.
+    /// `resize` needs the bit to reject expanding a shared anonymous mapping.
+    #[cfg(unix)]
+    flags: libc::c_int,
     /// `rmmap.py:953-970` — the file handle the object duplicated at
     /// construction, or `INVALID_HANDLE` for a mapping backed by no file of
     /// its own.  Leaving it open would keep the file locked after `close()`.
@@ -169,7 +175,21 @@ fn mmap_mapped(obj: pyre_object::PyObjectRef) -> std::io::Result<&'static Mapped
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))
 }
 
-#[cfg(any(unix, windows))]
+/// `rmmap.py:566-578 flush` — `c_msync(self.getptr(offset), size, MS_SYNC)`.
+/// The pointer goes to `msync` exactly as computed: Linux rejects a start that
+/// is not page-aligned with EINVAL, and that refusal is observable
+/// (`test_flush_return_value`).  `MappedFile::flush_range` rounds the start
+/// down to a page boundary first, which turns the error into a success.
+#[cfg(unix)]
+fn mmap_flush(obj: pyre_object::PyObjectRef, offset: usize, size: usize) -> std::io::Result<()> {
+    let start = unsafe { mmap_mapped(obj)?.as_ptr().add(offset) };
+    if unsafe { libc::msync(start as *mut libc::c_void, size, libc::MS_SYNC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn mmap_flush(obj: pyre_object::PyObjectRef, offset: usize, size: usize) -> std::io::Result<()> {
     mmap_mapped(obj)?.flush_range(offset, size)
 }
@@ -842,16 +862,16 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             if off_raw < 0 || raw_size_raw < 0 {
-                return Err(crate::PyError::value_error("flush range out of bounds"));
+                return Err(crate::PyError::value_error("flush values out of range"));
             }
             let off = off_raw as usize;
             let raw_size = raw_size_raw as usize;
             if off > len {
-                return Err(crate::PyError::value_error("flush range out of bounds"));
+                return Err(crate::PyError::value_error("flush values out of range"));
             }
             let n = if raw_size == 0 { len - off } else { raw_size };
             if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
-                return Err(crate::PyError::value_error("flush range out of bounds"));
+                return Err(crate::PyError::value_error("flush values out of range"));
             }
             let _ = p;
             mmap_flush(obj, off, n)
@@ -1369,8 +1389,11 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 /// place, so the mapping is re-created at the new size.  A file-backed map is
 /// re-mapped from the (ftruncated) fd, an anonymous map is remade and the
 /// surviving bytes copied.  The new mapping may land at a different address
-/// than an mremap would have, but that address is never exposed to Python, so
-/// the observable result is unchanged.
+/// than an mremap would have, but that address is never exposed to Python.
+///
+/// Re-creating the mapping does change one observable, though: `mremap` refuses
+/// to grow a shared anonymous mapping on Linux (kernel bug 8691), while a
+/// remake succeeds.  The guard below restores the refusal.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn mmap_resize_mapping(
     obj: pyre_object::PyObjectRef,
@@ -1380,6 +1403,18 @@ fn mmap_resize_mapping(
 ) -> Result<(), crate::PyError> {
     let fd = mmap_get_attr_i64(obj, "_fd") as libc::c_int;
     let offset = mmap_get_attr_i64(obj, "_offset");
+    // `mmapmodule.c mmap_resize_method`, the `#ifdef __linux__` arm ahead of
+    // the ftruncate:
+    //   if (self->fd == -1 && !(self->flags & MAP_PRIVATE) && new_size > self->size)
+    //       ValueError("mmap: can't expand a shared anonymous mapping on Linux")
+    if fd < 0
+        && mmap_native(obj)?.flags & host_mmap::MAP_PRIVATE == 0
+        && newsize > old_len
+    {
+        return Err(crate::PyError::value_error(
+            "mmap: can't expand a shared anonymous mapping on Linux",
+        ));
+    }
     let mapped = if fd >= 0 {
         let r = unsafe { libc::ftruncate(fd, (offset as libc::off_t) + newsize as libc::off_t) };
         if r != 0 {
@@ -1745,6 +1780,7 @@ fn mmap_construct(
         NativeMMap {
             mapped: Some(MappedObj::Mapped(mapped)),
             fd: owned_fd,
+            flags,
             trackfd,
         },
         access,
