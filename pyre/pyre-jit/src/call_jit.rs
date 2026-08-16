@@ -7314,13 +7314,12 @@ mod tests_bh_normalize_raise {
 
     #[test]
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
-        let code = compile_exec("x = len\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("module body should execute");
-        let callable = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
-            .expect("namespace should contain x");
+        let callable = pyre_interpreter::make_builtin_function(
+            "len",
+            pyre_interpreter::builtins::__pyre_wrap_builtin_len,
+        );
+        let code = compile_exec("").expect("empty module should compile");
+        let frame = pyre_interpreter::PyFrame::new(code);
 
         let frame_ptr = (&*frame as *const pyre_interpreter::PyFrame) as i64;
         let result = bh_normalize_raise_varargs_with_frame(

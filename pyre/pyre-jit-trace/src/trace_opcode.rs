@@ -3631,13 +3631,11 @@ mod tests {
     #[test]
     fn normalize_raise_varargs_jit_null_frame_still_publishes_pending_exception() {
         clear_pending_jit_exception();
-        let code = pyre_interpreter::compile_exec("x = ValueError\n").expect("compile failed");
-        let mut frame = pyre_interpreter::PyFrame::new(code);
-        frame
-            .execute_frame(None, None)
-            .expect("module body should execute");
-        let exc_class = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "x") }
-            .expect("namespace should contain ValueError");
+        let execution_context = pyre_interpreter::PyExecutionContext::default();
+        let exc_class = unsafe {
+            pyre_object::w_dict_getitem_str(execution_context.get_builtin_dict(), "ValueError")
+        }
+        .expect("builtins should contain ValueError");
 
         let result = normalize_raise_varargs_jit(0, exc_class as i64, pyre_object::PY_NULL as i64);
 
