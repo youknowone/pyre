@@ -96,7 +96,18 @@ pub mod frame_locals_proxy {
             name: &str,
             args: &[PyObjectRef],
         ) -> Result<PyObjectRef, crate::PyError> {
-            let result = crate::baseobjspace::call_method(self.mapping()?, name, args);
+            // `mapping` materializes a fresh dict, so every element of the
+            // caller's slice is a pre-allocation copy by the time the call
+            // reads it.  Publish the slice, take the snapshot, then rebuild it.
+            // The proxy payload itself is born non-moving, so `self` and the
+            // frame it reaches stay valid across the allocation.
+            let roots = pyre_object::gc_roots::push_roots();
+            let args_base = roots.publish(args);
+            roots.normalize(args_base, args.len());
+            let mapping = self.mapping()?;
+            let args: Vec<PyObjectRef> =
+                (0..args.len()).map(|i| roots.get(args_base + i)).collect();
+            let result = crate::baseobjspace::call_method(mapping, name, &args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("method call failed")))
@@ -106,13 +117,28 @@ pub mod frame_locals_proxy {
         }
 
         fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-            let frame = self.frame();
-            let code = frame.code();
+            // Every candidate name allocates its own string and `eq_w` can run
+            // a Python `__eq__`, so the caller's key is a pre-allocation copy
+            // from the first comparison onward.  Publish it and reload it for
+            // each compare; the candidate reuses one slot rather than growing
+            // the stack once per local.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.base();
+            roots.pin_root(key);
+            let candidate_slot = key_slot + 1;
+            roots.pin_root(pyre_object::PY_NULL);
+            // `code` addresses the compiler code object, which lives outside
+            // the GC heap and so stays valid across those collections.
+            let code = self.frame().code();
+            let matches = |name: &str| -> Result<bool, crate::PyError> {
+                roots.set(candidate_slot, pyre_object::w_str_new(name));
+                crate::baseobjspace::eq_w(roots.get(candidate_slot), roots.get(key_slot))
+            };
             for (index, name) in code.varnames.iter().enumerate() {
                 if hidden_local(code, index) {
                     continue;
                 }
-                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                if matches(name.as_ref())? {
                     return Ok(Some(index));
                 }
             }
@@ -121,13 +147,13 @@ pub mod frame_locals_proxy {
                 if code.varnames.iter().any(|local| local == name) {
                     continue;
                 }
-                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                if matches(name.as_ref())? {
                     return Ok(Some(index));
                 }
                 index += 1;
             }
             for name in code.freevars.iter() {
-                if crate::baseobjspace::eq_w(pyre_object::w_str_new(name.as_ref()), key)? {
+                if matches(name.as_ref())? {
                     return Ok(Some(index));
                 }
                 index += 1;
@@ -140,13 +166,20 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             value: PyObjectRef,
         ) -> Result<(), crate::PyError> {
-            if let Some(index) = self.fast_local_index(key)? {
+            // `fast_local_index` compares against a freshly allocated string
+            // per local and `get_or_create_extra_locals` allocates the dict, so
+            // both stores below would otherwise write pre-allocation copies.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.publish(&[key, value]);
+            roots.normalize(key_slot, 2);
+            let value_slot = key_slot + 1;
+            if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
                 let frame = self.frame();
                 let slot = locals_w!(frame)[index];
                 if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
-                    unsafe { pyre_object::w_cell_set(slot, value) };
+                    unsafe { pyre_object::w_cell_set(slot, roots.get(value_slot)) };
                 } else {
-                    frame.set_locals_w(index, value);
+                    frame.set_locals_w(index, roots.get(value_slot));
                 }
                 return Ok(());
             }
@@ -156,7 +189,8 @@ pub mod frame_locals_proxy {
             // local is read from the fast slot but proxy writes of the same
             // name do not mutate that slot or the module/eval locals mapping.
             let extra = self.frame().get_or_create_extra_locals();
-            crate::baseobjspace::setitem(extra, key, value).map(|_| ())
+            crate::baseobjspace::setitem(extra, roots.get(key_slot), roots.get(value_slot))
+                .map(|_| ())
         }
 
         fn key_is_fast_local(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
@@ -196,7 +230,12 @@ pub mod frame_locals_proxy {
         }
 
         fn __getitem__(&self, key: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            crate::baseobjspace::getitem(self.mapping()?, key)
+            // `mapping` allocates the snapshot dict, so reload the key after it.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.base();
+            roots.pin_root(key);
+            let mapping = self.mapping()?;
+            crate::baseobjspace::getitem(mapping, roots.get(key_slot))
         }
 
         fn __setitem__(
@@ -208,16 +247,22 @@ pub mod frame_locals_proxy {
         }
 
         fn __delitem__(&mut self, key: PyObjectRef) -> Result<(), crate::PyError> {
+            // The snapshot, the lookup, the fast-local scan and the extras dict
+            // all allocate, so reload the key between them.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.base();
+            roots.pin_root(key);
             let mapping = self.mapping()?;
             // Perform the lookup first so absent/unhashable keys retain the
             // underlying mapping's KeyError/TypeError.
-            crate::baseobjspace::getitem(mapping, key)?;
-            if self.key_is_fast_local(key)? {
+            crate::baseobjspace::getitem(mapping, roots.get(key_slot))?;
+            if self.key_is_fast_local(roots.get(key_slot))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            crate::baseobjspace::delitem(self.frame().get_or_create_extra_locals(), key)
+            let extra = self.frame().get_or_create_extra_locals();
+            crate::baseobjspace::delitem(extra, roots.get(key_slot))
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
@@ -239,7 +284,11 @@ pub mod frame_locals_proxy {
         }
 
         fn __contains__(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
-            crate::baseobjspace::contains(self.mapping()?, key)
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.base();
+            roots.pin_root(key);
+            let mapping = self.mapping()?;
+            crate::baseobjspace::contains(mapping, roots.get(key_slot))
         }
 
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -261,11 +310,25 @@ pub mod frame_locals_proxy {
         }
 
         fn items(&self) -> Result<PyObjectRef, crate::PyError> {
-            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(self.mapping()?) };
-            let mut out: Vec<PyObjectRef> = Vec::with_capacity(items.len());
-            for (key, value) in items {
-                out.push(pyre_object::w_tuple_new(vec![key, value]));
+            // Each `w_tuple_new` allocates, so the pairs still queued in the
+            // snapshot and the tuples already built are pre-allocation copies
+            // by the next iteration.  Publish both and read them back.
+            let roots = pyre_object::gc_roots::push_roots();
+            let mapping = self.mapping()?;
+            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(mapping) };
+            let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+            for &(key, value) in &items {
+                roots.pin_root(key);
+                roots.pin_root(value);
             }
+            let out_base = pyre_object::gc_roots::shadow_stack_len();
+            for index in 0..items.len() {
+                roots.pin_root(pyre_object::w_tuple_new(vec![
+                    roots.get(pairs_base + index * 2),
+                    roots.get(pairs_base + index * 2 + 1),
+                ]));
+            }
+            let out: Vec<PyObjectRef> = (0..items.len()).map(|i| roots.get(out_base + i)).collect();
             Ok(pyre_object::w_list_new(out))
         }
 
@@ -285,27 +348,37 @@ pub mod frame_locals_proxy {
             // frameobject.c `framelocalsproxy_merge` applies only the incoming
             // mapping's keys.  Starting from the proxy snapshot would also
             // replay every existing fast local into `f_extra_locals`.
-            let incoming = unsafe { pyre_object::w_dict_new() };
-            let result = crate::baseobjspace::call_method(incoming, "update", &[other]);
+            // Building `incoming` allocates and the merge runs the incoming
+            // mapping's Python, so read both back across each other.
+            let roots = pyre_object::gc_roots::push_roots();
+            let other_slot = roots.base();
+            roots.pin_root(other);
+            let incoming_slot = other_slot + 1;
+            roots.pin_root(unsafe { pyre_object::w_dict_new() });
+            let result = crate::baseobjspace::call_method(
+                roots.get(incoming_slot),
+                "update",
+                &[roots.get(other_slot)],
+            );
             if result.is_null() {
                 return Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("update failed")));
             }
             // `setitem_value` can hash the key into `f_extra_locals`, which
-            // runs `__hash__` and collects.  `incoming` and the item snapshot
-            // are native locals no root walker updates, so publish the set and
-            // read each pair back across the stores that precede it.
-            let _roots = pyre_object::gc_roots::push_roots();
+            // runs `__hash__` and collects.  The item snapshot is a native
+            // local no root walker updates, so publish the set and read each
+            // pair back across the stores that precede it.
             let items_base = pyre_object::gc_roots::shadow_stack_len();
-            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(incoming) };
+            let items =
+                unsafe { pyre_object::dictmultiobject::w_dict_items(roots.get(incoming_slot)) };
             for &(key, value) in &items {
-                pyre_object::gc_roots::pin_root(key);
-                pyre_object::gc_roots::pin_root(value);
+                roots.pin_root(key);
+                roots.pin_root(value);
             }
             for index in 0..items.len() {
                 self.setitem_value(
-                    pyre_object::gc_roots::shadow_stack_get(items_base + index * 2),
-                    pyre_object::gc_roots::shadow_stack_get(items_base + index * 2 + 1),
+                    roots.get(items_base + index * 2),
+                    roots.get(items_base + index * 2 + 1),
                 )?;
             }
             Ok(())
@@ -316,11 +389,17 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             #[default(pyre_object::w_none())] default: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            match self.__getitem__(key) {
+            // The lookup allocates its snapshot and can run a Python `__eq__`
+            // before the miss, so both arguments are stale by the store.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.publish(&[key, default]);
+            roots.normalize(key_slot, 2);
+            let default_slot = key_slot + 1;
+            match self.__getitem__(roots.get(key_slot)) {
                 Ok(value) => Ok(value),
                 Err(err) if err.kind == crate::PyErrorKind::KeyError => {
-                    self.setitem_value(key, default)?;
-                    Ok(default)
+                    self.setitem_value(roots.get(key_slot), roots.get(default_slot))?;
+                    Ok(roots.get(default_slot))
                 }
                 Err(err) => Err(err),
             }
@@ -331,17 +410,25 @@ pub mod frame_locals_proxy {
             if args.len() < 2 || args.len() > 3 {
                 return Err(crate::PyError::type_error("pop expected 1 or 2 arguments"));
             }
-            let call_args = &args[1..];
+            // The snapshot, the lookup, the fast-local scan and the extras dict
+            // all allocate, so publish the incoming arguments and rebuild the
+            // slice for the delegated call.
+            let roots = pyre_object::gc_roots::push_roots();
+            let args_base = roots.publish(&args[1..]);
+            let nargs = args.len() - 1;
+            roots.normalize(args_base, nargs);
             let mapping = self.mapping()?;
-            if crate::baseobjspace::getitem(mapping, call_args[0]).is_ok()
-                && self.key_is_fast_local(call_args[0])?
+            if crate::baseobjspace::getitem(mapping, roots.get(args_base)).is_ok()
+                && self.key_is_fast_local(roots.get(args_base))?
             {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
             let extra = self.frame().get_or_create_extra_locals();
-            let result = crate::baseobjspace::call_method(extra, "pop", call_args);
+            let call_args: Vec<PyObjectRef> =
+                (0..nargs).map(|i| roots.get(args_base + i)).collect();
+            let result = crate::baseobjspace::call_method(extra, "pop", &call_args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("pop failed")))
@@ -364,7 +451,11 @@ pub mod frame_locals_proxy {
         }
 
         fn __eq__(&self, other: PyObjectRef) -> Result<bool, crate::PyError> {
-            crate::baseobjspace::eq_w(self.mapping()?, other)
+            let roots = pyre_object::gc_roots::push_roots();
+            let other_slot = roots.base();
+            roots.pin_root(other);
+            let mapping = self.mapping()?;
+            crate::baseobjspace::eq_w(mapping, roots.get(other_slot))
         }
 
         fn __repr__(&self) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
