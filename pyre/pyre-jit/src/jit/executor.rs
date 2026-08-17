@@ -67,20 +67,41 @@ pub fn bhimpl_int_mul_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue,
 }
 
 /// The `int_py_div` residual call's target: Python's floor quotient.
+///
+/// `rint.py:399-408 ll_int_py_div`: truncate as C does, then correct by the
+/// sign of the residue. `r * y` and `x - r * y` both stay in range because
+/// `r` is the truncating quotient, so the only wrap is the `INT_MIN / -1`
+/// corner the trace guards out ahead of the call.
 pub fn bhimpl_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) if y != 0 => {
-            let d = x.wrapping_div(y);
-            ConcreteValue::Int(if (x ^ y) < 0 && d * y != x { d - 1 } else { d })
+            let r = x.wrapping_div(y);
+            let p = r.wrapping_mul(y);
+            let u = if y < 0 {
+                p.wrapping_sub(x)
+            } else {
+                x.wrapping_sub(p)
+            };
+            ConcreteValue::Int(r.wrapping_add(u >> (i64::BITS - 1)))
         }
         _ => ConcreteValue::Null,
     }
 }
 
 /// The `int_py_mod` residual call's target: Python's floor remainder.
+///
+/// `rint.py:496-500 ll_int_py_mod`: truncate as C does, then add the divisor
+/// back exactly when the remainder carries the wrong sign. Adding `y` to a
+/// remainder of the opposite sign cannot leave the range, which is why the
+/// correction is masked out of `y` rather than computed as `(r + y) % y` —
+/// that intermediate overflows for a remainder near the type's limit.
 pub fn bhimpl_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
-        (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(((x % y) + y) % y),
+        (Some(x), Some(y)) if y != 0 => {
+            let r = x.wrapping_rem(y);
+            let u = if y < 0 { r.wrapping_neg() } else { r };
+            ConcreteValue::Int(r.wrapping_add(y & (u >> (i64::BITS - 1))))
+        }
         _ => ConcreteValue::Null,
     }
 }
@@ -561,5 +582,78 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
         }
         // Unknown opcode — no concrete result
         _ => (ConcreteValue::Null, false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn py_div(x: i64, y: i64) -> i64 {
+        bhimpl_int_floordiv(ConcreteValue::Int(x), ConcreteValue::Int(y))
+            .getint()
+            .unwrap()
+    }
+
+    fn py_mod(x: i64, y: i64) -> i64 {
+        bhimpl_int_mod(ConcreteValue::Int(x), ConcreteValue::Int(y))
+            .getint()
+            .unwrap()
+    }
+
+    /// The truncating primitives beside them round toward zero; these two
+    /// round toward negative infinity, which is what `int_py_div` /
+    /// `int_py_mod` are called for.
+    #[test]
+    fn the_floor_helpers_round_toward_negative_infinity() {
+        for (x, y, div, rem) in [
+            (7_i64, 3_i64, 2_i64, 1_i64),
+            (-7, 3, -3, 2),
+            (7, -3, -3, -2),
+            (-7, -3, 2, -1),
+            (9, 3, 3, 0),
+            (-9, 3, -3, 0),
+            (9, -3, -3, 0),
+        ] {
+            assert_eq!(py_div(x, y), div, "{x} // {y}");
+            assert_eq!(py_mod(x, y), rem, "{x} % {y}");
+        }
+    }
+
+    /// A remainder near the type's limit: `(r + y) % y` overflows on the way
+    /// to the answer, while masking the divisor out of the remainder's sign
+    /// does not.
+    #[test]
+    fn the_floor_helpers_hold_at_the_limits() {
+        // The same floor, computed with room to spare so the reference cannot
+        // share a wrap with what it is checking.
+        fn floor_div_wide(x: i128, y: i128) -> i128 {
+            let q = x / y;
+            if x % y != 0 && (x < 0) != (y < 0) {
+                q - 1
+            } else {
+                q
+            }
+        }
+
+        for (x, y) in [
+            (i64::MAX - 1, i64::MAX),
+            (-1, i64::MIN),
+            (i64::MAX, i64::MIN),
+            (i64::MIN, i64::MAX),
+            (i64::MIN + 1, i64::MAX),
+            (i64::MIN, 3),
+            (i64::MAX, -3),
+            (i64::MIN, -3),
+        ] {
+            let q = floor_div_wide(i128::from(x), i128::from(y));
+            let r = i128::from(x) - q * i128::from(y);
+            assert_eq!(i128::from(py_mod(x, y)), r, "{x} % {y}");
+            // `INT_MIN // -1` is the one quotient that does not fit; the trace
+            // guards it out ahead of the call, so it is not asserted here.
+            if let Ok(expected) = i64::try_from(q) {
+                assert_eq!(py_div(x, y), expected, "{x} // {y}");
+            }
+        }
     }
 }

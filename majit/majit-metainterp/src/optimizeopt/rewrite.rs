@@ -1146,16 +1146,9 @@ impl OptRewrite {
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:797-805: intdiv.modulo_operations fallback, which emits
-        // UINT_MUL_HIGH.  A backend that has to emulate that multiply expands
-        // through the native truncating remainder instead; either way the
-        // residual call goes away.
+        // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let expand = if ctx.supports_efficient_uint_mul_high {
-            crate::optimizeopt::intdiv::modulo_operations
-        } else {
-            crate::optimizeopt::intdiv::trunc_modulo_operations
-        };
-        let result_ref = expand(
+        let result_ref = crate::optimizeopt::intdiv::modulo_operations(
             arg1.to_opref(),
             val,
             known_nonneg,
@@ -1257,16 +1250,9 @@ impl OptRewrite {
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:758-766: intdiv.division_operations fallback, which emits
-        // UINT_MUL_HIGH.  A backend that has to emulate that multiply expands
-        // through the native truncating quotient instead; either way the
-        // residual call goes away.
+        // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let expand = if ctx.supports_efficient_uint_mul_high {
-            crate::optimizeopt::intdiv::division_operations
-        } else {
-            crate::optimizeopt::intdiv::trunc_division_operations
-        };
-        let result_ref = expand(
+        let result_ref = crate::optimizeopt::intdiv::division_operations(
             arg1.to_opref(),
             val,
             known_nonneg,
@@ -2937,35 +2923,25 @@ mod tests {
         }
     }
 
-    /// The `int_py_div` / `int_py_mod` calls carry Python's floor semantics,
-    /// which no backend has an instruction for, so the call always goes away.
-    /// The capability picks the expansion: the magic-number sequence where
-    /// `UintMulHigh` is cheap, `intdiv::trunc_division_operations` /
-    /// `trunc_modulo_operations` — the native truncating primitive plus a
-    /// sign correction — where it is not.
+    /// `rewrite.py:797-805` / `:758-766` reach `intdiv.modulo_operations` /
+    /// `division_operations` with no capability test of any kind, so the
+    /// residual call goes away and the expansion is the same one on every
+    /// backend.  A backend that has to emulate `UintMulHigh` pays for it in
+    /// its own lowering, not by keeping the call.
     #[test]
-    fn call_int_py_div_and_mod_expand_on_either_mul_high_setting() {
-        for (oopspecindex, primitive) in [
-            (majit_ir::OopSpecIndex::IntPyDiv, OpCode::IntFloorDiv),
-            (majit_ir::OopSpecIndex::IntPyMod, OpCode::IntMod),
+    fn call_int_py_div_and_mod_always_expand_through_mul_high() {
+        for oopspecindex in [
+            majit_ir::OopSpecIndex::IntPyDiv,
+            majit_ir::OopSpecIndex::IntPyMod,
         ] {
-            let (result, ctx) = run_int_py_call(oopspecindex, 100, false);
-            assert_remove(&result);
-            assert!(
-                !emitted_uint_mul_high(&ctx),
-                "{oopspecindex:?} expanded through UintMulHigh on a backend that lacks it"
-            );
-            assert!(
-                emitted_opcode(&ctx, primitive),
-                "{oopspecindex:?} reached neither expansion on a backend without UintMulHigh"
-            );
-
-            let (result, ctx) = run_int_py_call(oopspecindex, 100, true);
-            assert_remove(&result);
-            assert!(
-                emitted_uint_mul_high(&ctx),
-                "{oopspecindex:?} left the residual call on a backend that has UintMulHigh"
-            );
+            for mul_high in [false, true] {
+                let (result, ctx) = run_int_py_call(oopspecindex, 100, mul_high);
+                assert_remove(&result);
+                assert!(
+                    emitted_uint_mul_high(&ctx),
+                    "{oopspecindex:?} left the residual call (mul_high={mul_high})"
+                );
+            }
         }
     }
 
