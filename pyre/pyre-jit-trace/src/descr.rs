@@ -1536,6 +1536,79 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `pypy/interpreter/function.py:673` / `:720`
+/// `_immutable_fields_ = ['w_function?']` for `StaticMethod` and `ClassMethod`.
+/// The `?` is what makes the wrapped callable a constant, and it registers the
+/// invalidation an assignment owes; pyre's setters do not force that yet, so
+/// the field stays LIVE/MUTABLE here and the read is paired with a
+/// `GuardValue`, the same pre-invalidation stand-in
+/// [`FUNCTION_DESCR_GROUP`] documents for `code?`.
+///
+/// Both censuses are COMPLETE — `w_dict` is listed even though nothing reads
+/// it, because a field the struct declares but a group omits has no
+/// `index_in_parent` to rederive and the two sides that mint its descr then
+/// disagree on the number.  `PyObject.w_class` is absent because no emit
+/// allocates either wrapper, so the analyzer's count is the whole answer.
+static W_STATICMETHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::function::{
+        STATICMETHOD_W_DICT_OFFSET, STATICMETHOD_W_FUNCTION_OFFSET, W_STATICMETHOD_GC_TYPE_ID,
+        W_STATICMETHOD_OBJECT_SIZE,
+    };
+    let field = |key, offset| {
+        (
+            key,
+            offset,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )
+    };
+    build_object_descr_group_with_def_path(
+        W_STATICMETHOD_OBJECT_SIZE,
+        W_STATICMETHOD_GC_TYPE_ID,
+        &pyre_object::function::STATICMETHOD_TYPE as *const _ as usize,
+        &[
+            field("w_function", STATICMETHOD_W_FUNCTION_OFFSET),
+            field("w_dict", STATICMETHOD_W_DICT_OFFSET),
+        ],
+        "StaticMethod",
+        "function::StaticMethod",
+    )
+});
+
+/// The `classmethod` twin of [`W_STATICMETHOD_DESCR_GROUP`]; see it for why
+/// `w_function` is mutable and why `w_dict` is listed.
+static W_CLASSMETHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::function::{
+        CLASSMETHOD_W_DICT_OFFSET, CLASSMETHOD_W_FUNCTION_OFFSET, W_CLASSMETHOD_GC_TYPE_ID,
+        W_CLASSMETHOD_OBJECT_SIZE,
+    };
+    let field = |key, offset| {
+        (
+            key,
+            offset,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )
+    };
+    build_object_descr_group_with_def_path(
+        W_CLASSMETHOD_OBJECT_SIZE,
+        W_CLASSMETHOD_GC_TYPE_ID,
+        &pyre_object::function::CLASSMETHOD_TYPE as *const _ as usize,
+        &[
+            field("w_function", CLASSMETHOD_W_FUNCTION_OFFSET),
+            field("w_dict", CLASSMETHOD_W_DICT_OFFSET),
+        ],
+        "ClassMethod",
+        "function::ClassMethod",
+    )
+});
+
 /// `pypy/objspace/std/typeobject.py:26-34 ObjectMutableCell`. The single
 /// `w_value` field is read LIVE on the module-global cell fast path: a
 /// frequently-rewritten global mutates the cell payload in place without
@@ -2661,6 +2734,19 @@ pub fn range_length_descr() -> DescrRef {
 /// bound-method specialization in `call_callable_value`.
 pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
+}
+
+/// Live `StaticMethod.w_function` — the callable a descriptor fold unwraps in
+/// place of invoking `__get__`.  Read live and pinned by a `GuardValue`; see
+/// [`W_STATICMETHOD_DESCR_GROUP`] for why it is not a constant.
+pub fn staticmethod_w_function_descr() -> DescrRef {
+    field_descr_from_group(&W_STATICMETHOD_DESCR_GROUP, 0)
+}
+
+/// Live `ClassMethod.w_function` — the `classmethod` twin of
+/// [`staticmethod_w_function_descr`].
+pub fn classmethod_w_function_descr() -> DescrRef {
+    field_descr_from_group(&W_CLASSMETHOD_DESCR_GROUP, 0)
 }
 
 /// Resolve one [`FUNCTION_DESCR_GROUP`] field by byte offset, so the accessors
@@ -6753,6 +6839,8 @@ pub(crate) fn publish_runtime_descr_groups() {
         &*W_ZIP_DESCR_GROUP,
         &*RANGE_DESCR_GROUP,
         &*W_METHOD_DESCR_GROUP,
+        &*W_STATICMETHOD_DESCR_GROUP,
+        &*W_CLASSMETHOD_DESCR_GROUP,
         &*W_OBJECT_MUTABLE_CELL_DESCR_GROUP,
         &*W_LIST_DESCR_GROUP,
         &*W_TUPLE_DESCR_GROUP,

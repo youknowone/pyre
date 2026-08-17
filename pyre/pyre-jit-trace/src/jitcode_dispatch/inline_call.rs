@@ -5493,8 +5493,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // pre-subwalk count so it can source the preferred rebuild
                 // while the fallback rewind remains provably disabled.
                 if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
-                    && let Some(stack) =
-                        reconstructed_all_ref_call_stack(code, op, ctx, call_descr).or_else(|| {
+                    && let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
+                        .or_else(|| {
                             reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc)
                         })
                 {
@@ -6303,6 +6303,23 @@ enum HookLeading {
     None,
 }
 
+/// The wrapper slot a descriptor spelling of the hook unwrapped, so the fold
+/// can pin the value it read.  `function.py:673`/`:720`
+/// `_immutable_fields_ = ['w_function?']`.
+enum WrapperField {
+    ClassMethod,
+    StaticMethod,
+}
+
+impl WrapperField {
+    fn descr(&self) -> majit_ir::DescrRef {
+        match self {
+            Self::ClassMethod => crate::descr::classmethod_w_function_descr(),
+            Self::StaticMethod => crate::descr::staticmethod_w_function_descr(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -6330,24 +6347,35 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    // `get_and_call_function` leads the positionals with the receiver only for
-    // a plain `Function`; every other descriptor is bound through `get` first
-    // and called with the name alone.  The version-tag pin makes that binding
-    // decision a constant of the trace, so each spelling resolves to its own
-    // function and leading argument here instead of declining.
-    let (w_func, leading) = unsafe {
-        if pyre_object::function::is_classmethod(w_getattr) {
+    // `get_and_call_function` (`descroperation.py:169-187`) leads the
+    // positionals with the receiver only for an exact `Function`; every other
+    // descriptor goes through `space.get` first and is called with the name
+    // alone.  The version-tag pin makes that binding decision a constant of the
+    // trace, so each spelling resolves to its own function and leading argument
+    // here instead of declining.
+    //
+    // The type tests are EXACT.  Upstream is explicit that they have to be
+    // ("isinstance(typ, Function) would not be correct here … because a builtin
+    // function binds differently than a normal function"), and the same holds
+    // for the two wrappers: a `classmethod` subclass overriding `__get__` binds
+    // through that override, so unwrapping `w_function` in its place calls the
+    // wrong callable.  `wrapper_field` names the slot that unwrapping read, for
+    // the guard below; the plain arm reads no field.
+    let (w_func, leading, wrapper_field) = unsafe {
+        if pyre_object::function::is_exact_classmethod(w_getattr) {
             (
                 pyre_object::function::w_classmethod_get_func(w_getattr),
                 HookLeading::Class,
+                Some(WrapperField::ClassMethod),
             )
-        } else if pyre_object::function::is_staticmethod(w_getattr) {
+        } else if pyre_object::function::is_exact_staticmethod(w_getattr) {
             (
                 pyre_object::function::w_staticmethod_get_func(w_getattr),
                 HookLeading::None,
+                Some(WrapperField::StaticMethod),
             )
         } else {
-            (w_getattr, HookLeading::Receiver)
+            (w_getattr, HookLeading::Receiver, None)
         }
     };
     if w_func.is_null() {
@@ -6373,6 +6401,16 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
 
     // Both pins the oracle asked for, plus the layout guard its map read needs.
     walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    // The pins above make the DESCRIPTOR a constant; they say nothing about the
+    // callable inside it.  Re-initialising an installed wrapper swaps
+    // `w_function` without touching the owner type's version tag, which is the
+    // only thing those pins hold, so read the slot live and pin the value this
+    // fold unwrapped — the stand-in [`walker_guard_function_field`] already
+    // makes for a quasi-immutable field pyre's setters do not invalidate.
+    if let Some(field) = wrapper_field {
+        let wrapper = ctx.trace_ctx.const_ref(w_getattr as i64);
+        walker_guard_function_field(ctx, op.pc, wrapper, field.descr(), w_func as i64)?;
+    }
 
     let name_obj =
         pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))

@@ -8,7 +8,8 @@
 # whole `object_getattr_miss` walk plus a fresh frame for the hook. Inlining
 # the hook against the version-tag and map pins that make the miss constant
 # dropped the ratio from 48.6x/59.5x (dynasm/wasm) to 7.4x/10.4x/8.7x
-# (dynasm/cranelift/wasm); the bound is twice the slowest of those, rounded up.
+# (dynasm/cranelift/wasm); the bound is twice the slowest of those (10.4x),
+# rounded up to the next multiple of five.
 
 
 class ClassmethodGetattr:

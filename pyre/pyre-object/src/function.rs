@@ -177,6 +177,12 @@ pub struct StaticMethod {
     pub w_dict: PyObjectRef,
 }
 
+/// Field offsets of the inline `PyObjectRef` slots within `StaticMethod`,
+/// consumed by `pyre-jit-trace/src/descr.rs` on the same footing as the
+/// `METHOD_*` consts above.
+pub const STATICMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(StaticMethod, w_function);
+pub const STATICMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(StaticMethod, w_dict);
+
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
     // wrapped function across the GC malloc and read its relocated address.
@@ -271,6 +277,23 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
     py_type_check(obj, &STATICMETHOD_TYPE)
 }
 
+/// An exact `staticmethod`, excluding subclasses — the test a caller needs
+/// before it may unwrap `w_function` in place of invoking `__get__`.
+/// `descroperation.py:169-187 get_and_call_function` takes its descriptor
+/// shortcut only on the exact type and routes every other one through
+/// `space.get`, so a subclass that overrides `__get__` binds differently.
+/// Compares the user-visible class object, as [`is_exact_tuple`] does, because
+/// a subclass instance keeps the base layout in `ob_type` and retags `w_class`.
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_exact_staticmethod(obj: PyObjectRef) -> bool {
+    unsafe {
+        is_staticmethod(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&STATICMETHOD_TYPE))
+    }
+}
+
 // ── ClassMethod ──────────────────────────────────────────────────────
 // PyPy: pypy/interpreter/function.py ClassMethod
 //
@@ -284,6 +307,11 @@ pub struct ClassMethod {
     /// allocated lazily by `ClassMethod.getdict`.
     pub w_dict: PyObjectRef,
 }
+
+/// Field offsets of the inline `PyObjectRef` slots within `ClassMethod`, the
+/// `classmethod` twin of the `STATICMETHOD_*` consts above.
+pub const CLASSMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_function);
+pub const CLASSMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_dict);
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
@@ -376,6 +404,18 @@ pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_classmethod(obj: PyObjectRef) -> bool {
     py_type_check(obj, &CLASSMETHOD_TYPE)
+}
+
+/// An exact `classmethod`, excluding subclasses — the `classmethod` twin of
+/// [`is_exact_staticmethod`], for the same reason.
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_exact_classmethod(obj: PyObjectRef) -> bool {
+    unsafe {
+        is_classmethod(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&CLASSMETHOD_TYPE))
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,8 @@
 # The trip count now puts pypy above the startup-subtraction floor, so this
 # ratio is a measurement rather than pyre divided by the floor constant; a
 # ceiling fitted against the clamp (the 45 this bench once carried) fails.
-# The bound is twice the slowest of the three backends, rounded up.
+# The bound is twice the slowest of the three backends (27.7x), rounded up to
+# the next multiple of ten.
 #
 # `push` binds `a.append` inside an inlined callee, and the folds that shape a
 # bound-method load used to decline for the whole of such a sub-walk. They now
