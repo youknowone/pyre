@@ -1389,14 +1389,24 @@ impl TraceCtx {
         // and could never fire, which is exactly the mismatched-nesting bug
         // upstream is asserting against.  A box with no stamp at all is not a
         // mismatch, only an unknown, so it is skipped rather than failed.
-        if let Some(Value::Ref(r)) = self.concrete_of_opref(virtual_obj) {
+        // Both sides are read now, through the stamp, exactly as upstream calls
+        // `getref_base()` on both.  `lastbox_ptr` is the address the object had
+        // when the pair was pushed, and the object it names is movable: a minor
+        // collection between `opimpl_virtual_ref` and here relocates it and
+        // forwards the stamp, leaving the pushed copy naming the old address.
+        // Comparing a forwarded address against that copy reports a mismatch
+        // that is only the move.  A box with no stamp is an unknown, not a
+        // mismatch, so either side missing skips the check.
+        if let Some(Value::Ref(r)) = self.concrete_of_opref(virtual_obj)
+            && let Some(Value::Ref(last)) = self.concrete_of_opref(lastbox)
+        {
             // RPython's plain `assert` fires in both untranslated and
             // translated builds, so this is an `assert_eq!`: a release build
             // must fail at the divergence rather than silently corrupt the
             // vref stack.
             assert_eq!(
                 r.as_usize(),
-                lastbox_ptr,
+                last.as_usize(),
                 "opimpl_virtual_ref_finish: leaving frame ref != top virtualref ref \
                  (virtual_obj={virtual_obj:?}, lastbox={lastbox:?})"
             );
