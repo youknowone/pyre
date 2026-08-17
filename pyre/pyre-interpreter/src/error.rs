@@ -16,6 +16,26 @@ pub struct OperationError {
     pub _application_traceback: Option<PyObjectRef>,
 }
 
+/// Test whether a live exception object is an instance of StopIteration.
+/// The class cache is populated only after registry lookup succeeds, so a
+/// call before exception-class initialisation returns false without caching
+/// absence forever.
+#[majit_macros::dont_look_inside]
+pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool {
+    static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    let stop_iteration = match STOP_ITERATION_CLASS.get() {
+        Some(&class) => class as PyObjectRef,
+        None => {
+            let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
+                return false;
+            };
+            let _ = STOP_ITERATION_CLASS.set(class as usize);
+            class
+        }
+    };
+    crate::eval::check_exc_match_against(exc_object, stop_iteration)
+}
+
 impl OperationError {
     pub fn new(w_type: PyObjectRef, w_value: PyObjectRef) -> Self {
         Self {
@@ -590,19 +610,7 @@ impl PyError {
         if self.exc_object.is_null() {
             return false;
         }
-
-        static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
-        let stop_iteration = match STOP_ITERATION_CLASS.get() {
-            Some(&class) => class as PyObjectRef,
-            None => {
-                let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
-                    return false;
-                };
-                let _ = STOP_ITERATION_CLASS.set(class as usize);
-                class
-            }
-        };
-        crate::eval::check_exc_match_against(self.exc_object, stop_iteration)
+        exception_object_matches_stop_iteration(self.exc_object)
     }
 
     pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {

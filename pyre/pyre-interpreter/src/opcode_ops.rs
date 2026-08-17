@@ -1152,6 +1152,16 @@ pub extern "C" fn bh_w_exception_get_kind(evalue: pyre_object::PyObjectRef) -> i
     pyre_object::interp_exceptions::exc_kind_discriminant(evalue)
 }
 
+/// C-ABI residual bridge for `exception_object_matches_stop_iteration`: the
+/// caught exception value rides in as a `PyObjectRef`; its boolean result rides
+/// back in the integer result slot.
+#[allow(improper_ctypes_definitions)]
+pub extern "C" fn bh_exception_object_matches_stop_iteration(
+    evalue: pyre_object::PyObjectRef,
+) -> i64 {
+    crate::error::exception_object_matches_stop_iteration(evalue) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -681,6 +681,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::exc_kind_discriminant",
         crate::opcode_ops::bh_w_exception_get_kind as *const (),
     );
+    // `exception_object_matches_stop_iteration` performs the cached
+    // StopIteration class lookup and MRO match for the caught exception
+    // object. Its residual call rides a C-ABI bridge that returns the boolean
+    // in the integer result slot. Emitted by `try_fuse_drain_match` for the
+    // drain loop's exception-edge subclass test.
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::error::exception_object_matches_stop_iteration",
+        "pyre_interpreter::exception_object_matches_stop_iteration",
+        crate::opcode_ops::bh_exception_object_matches_stop_iteration as *const (),
+    );
     // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
     // twin), `dereference` reads the weakref `w_obj_weak` slot
     // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and

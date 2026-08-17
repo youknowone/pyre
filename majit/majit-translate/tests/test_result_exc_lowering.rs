@@ -179,24 +179,21 @@ fn execute_wrapper_family_lowers_to_raise_links() {
 /// Facet A firing guard — the jd1 drain-loop `match next()` fusion.
 ///
 /// `_unpackiterable_unknown_length`'s StopIteration drain loop is a
-/// hand-written `match next() { Ok(w) => append, Err(e) if e.kind ==
-/// StopIteration => break, Err(e) => return Err(e) }`.  Lowered naively it
-/// materialises a `Result` shell whose Err arm holds a `StopIteration`
-/// `SyntheticTransparentCtor` + a `PyErrorKind::eq` — residuals with no host
-/// funcptr that SIGBUS the jd1 walk.  `try_fuse_drain_match`
-/// (`front::result_exc`) replaces that shell with a `LastException`
-/// exception-edge whose handler is the exact-kind test
-/// `exc_kind_discriminant(evalue) == 10` (`ExcKind::StopIteration`).
+/// hand-written `match next() { Ok(w) => append, Err(e) if
+/// e.matches_stop_iteration() => break, Err(e) => return Err(e) }`. Lowered
+/// naively it materialises a `Result` shell and leaves the PyError predicate
+/// on its Err arm. `try_fuse_drain_match` (`front::result_exc`) replaces that
+/// shell with a `LastException` exception-edge whose handler runs the
+/// equivalent object-level MRO predicate on the live exception value.
 ///
 /// The fusion is FAIL-SAFE: on any shape it does not recognise it silently
-/// falls back to `catch_and_rewrap`, which leaves the `StopIteration` ctor in
-/// place.  That silent decline is invisible to the correctness suite — the
-/// default (non-jd1) run never executes the fusion, and the
-/// `unpack_drain_exact_kind` parity test only guards the default path — yet it
-/// reintroduces the unwalkable ctors and reopens the jd1 SIGBUS.  A drain
-/// rework that perturbs the recognised shape (or a recognizer regression) is
-/// exactly such a silent decline.  This lowers the REAL drain and asserts the
-/// fused signature is present and the ctor is gone, so a decline fails loud.
+/// falls back to `catch_and_rewrap`, leaving the source predicate in place.
+/// That silent decline is invisible to the default (non-jd1) drain path yet
+/// reintroduces the Result shell the jd1 walk cannot consume. A drain rework
+/// that perturbs the recognised shape (or a recognizer regression) is exactly
+/// such a silent decline. This lowers the real drain and asserts the fused
+/// helper signature is present and the source-method residual is gone, so a
+/// decline fails loud.
 #[test]
 fn unpackiterable_drain_match_fuses_to_kind_test() {
     let llbc = interp();
@@ -206,9 +203,50 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
     )
     .expect("lower _unpackiterable_unknown_length");
 
-    // Positive firing signal: the fusion synthesises the exc_kind_discriminant
-    // kind-test call — the only site in the tree that emits this FunctionPath,
-    // so its presence proves `try_fuse_drain_match` fired (not declined).
+    // Positive firing signal: only the fusion emits this object-level helper
+    // FunctionPath, so its presence proves `try_fuse_drain_match` fired rather
+    // than declining to catch_and_rewrap.
+    let object_predicate_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str)
+                        == Some("exception_object_matches_stop_iteration")
+            )
+        })
+        .count();
+    assert!(
+        object_predicate_calls >= 1,
+        "drain fusion must synthesise the object-level StopIteration predicate \
+         (0 = recognizer silently declined to catch_and_rewrap → the \
+         Result shell and source predicate remain on the jd1 walk)"
+    );
+
+    // Elimination signal: the source PyError method survives only on the
+    // decline path, so a fired fusion leaves none.
+    let source_predicate_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "matches_stop_iteration"
+            )
+        })
+        .count();
+    assert_eq!(
+        source_predicate_calls, 0,
+        "the source PyError predicate must be gone after the drain fusion"
+    );
+
     let exc_kind_calls = graph
         .blocks
         .iter()
@@ -221,32 +259,9 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
             )
         })
         .count();
-    assert!(
-        exc_kind_calls >= 1,
-        "drain fusion must synthesise the exc_kind_discriminant kind-test \
-         (0 = recognizer silently declined to catch_and_rewrap → the \
-         StopIteration ctor/eq residuals remain and SIGBUS the jd1 walk)"
-    );
-
-    // Elimination signal: the StopIteration guard ctor survives ONLY on the
-    // decline (catch_and_rewrap) path, so a fired fusion leaves none.
-    let stopiteration_ctors = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor { name, .. },
-                    ..
-                } if name == "StopIteration"
-            )
-        })
-        .count();
     assert_eq!(
-        stopiteration_ctors, 0,
-        "the StopIteration guard ctor must be gone after the drain fusion"
+        exc_kind_calls, 0,
+        "the fused handler must not reintroduce the flat exception-kind test"
     );
 
     // The fused next() call site carries a LastException exit.
@@ -260,8 +275,9 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         "the drain next() site must become a LastException exception-edge"
     );
     eprintln!(
-        "drain fusion: exc_kind_discriminant={exc_kind_calls} \
-         stopiteration_ctors={stopiteration_ctors} lastexc_blocks={lastexc_blocks}"
+        "drain fusion: object_predicate={object_predicate_calls} \
+         source_predicate={source_predicate_calls} exc_kind_discriminant={exc_kind_calls} \
+         lastexc_blocks={lastexc_blocks}"
     );
 }
 

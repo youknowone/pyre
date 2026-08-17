@@ -1029,10 +1029,10 @@ pub(crate) struct RewireOutcome {
     /// consuming.
     pub rewrapped: usize,
     /// Drain-loop `match next()` sites fused by [`try_fuse_drain_match`]
-    /// into an exception-edge handler with a guest-KIND test, eliminating
-    /// the `Result` shell's `Ok`/`StopIteration` ctors + `PyErrorKind::eq`
-    /// residuals.  Counted separately from `rewrapped` and independent of
-    /// `tail_forwards` (which feeds `lower_result_exc_returns`).
+    /// into an exception-edge handler with an object-level StopIteration
+    /// subclass test, eliminating the `Result` shell's guard residuals.
+    /// Counted separately from `rewrapped` and independent of `tail_forwards`
+    /// (which feeds `lower_result_exc_returns`).
     pub fused: usize,
 }
 
@@ -1119,12 +1119,12 @@ fn rewire_one_call_site(
     let Some(branch_op_idx) = branch_op_idx else {
         // No `Result::branch` op → a hand-written `match` consumer.  The
         // drain-loop `match next()` fusion recognises its exact shape and
-        // rewrites it into an exception-edge handler with a guest-KIND test;
-        // every other custom-match shape (and the drain shape when any
-        // hazard guard trips) falls through to `catch_and_rewrap`.  The
-        // fusion is fail-safe: an `Err` from `try_fuse_drain_match` MUST NOT
-        // propagate (that would decline the whole graph); it converts here
-        // into the existing rewrap path.
+        // rewrites it into an exception-edge handler with an object-level
+        // StopIteration test; every other custom-match shape (and the drain
+        // shape when any hazard guard trips) falls through to
+        // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
+        // `try_fuse_drain_match` MUST NOT propagate (that would decline the
+        // whole graph); it converts here into the existing rewrap path.
         if try_fuse_drain_match(graph, a, r).is_ok() {
             return Ok(SiteOutcome::Fused);
         }
@@ -1561,20 +1561,16 @@ fn verify_drain_reraise_returns_err_payload(
 /// ```text
 ///     match next(w_iterator) {
 ///         Ok(w_item) => append(items, w_item),
-///         Err(e) if e.kind == PyErrorKind::StopIteration => break,
+///         Err(e) if e.matches_stop_iteration() => break,
 ///         Err(e) => return Err(e),
 ///     }
 /// ```
 /// which lowers to a materialised `Result<*mut PyObject, PyError>` shell:
-/// a `__discriminant` switch whose arms build a `StopIteration`
-/// `SyntheticTransparentCtor`, read `__pos_0[Result::Err]`, and call
-/// `PyErrorKind::eq` — niladic ctors with no host symbol the jd1 walker
-/// SIGBUSes on.  This rewrites the `next()` block into `LastException`
-/// exits (normal → the `Ok` arm; exception → a handler `H`) whose handler
-/// runs the **guest-KIND** test `w_exception_get_kind(evalue) == 10`
-/// (`ExcKind::StopIteration`) — the exact source semantics
-/// `e.kind == PyErrorKind::StopIteration` through the
-/// `ExcKind ↔ PyErrorKind` bijection, NOT an MRO/subclass match.
+/// a `__discriminant` switch whose Err arm reads `__pos_0[Result::Err]`
+/// and calls `PyError::matches_stop_iteration`. This rewrites the `next()`
+/// block into `LastException` exits (normal → the `Ok` arm; exception → a
+/// handler `H`) whose handler calls the equivalent object-level predicate on
+/// the live exception value, preserving the MRO/subclass match.
 ///
 /// Fail-safe: returns `Err` on ANY structural mismatch or hazard, and the
 /// caller ([`rewire_one_call_site`]) converts that into `catch_and_rewrap`
@@ -1680,47 +1676,12 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     // payload directly).  Record its payload position on the Ok link.
     assert_single_pred(graph, ok_target, &name)?;
 
-    // --- (5) Err arm: single predecessor, EXACTLY the four guard ops
-    // (StopIteration ctor, Err payload read, kind read, PyErrorKind::eq).
+    // --- (5) Err arm: single predecessor, EXACTLY the two guard ops
+    // (Err payload read, PyError::matches_stop_iteration call).
     assert_single_pred(graph, err_target, &name)?;
     let r_err = forward_alias(graph, &r_b, &err_link)
         .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
     let err_ops = &graph.blocks[err_target].operations;
-    // `PyErrorKind::StopIteration` reaches the `eq` below in either of two
-    // lowered forms: as a niladic `SyntheticTransparentCtor` while the
-    // fieldless variant is still carried as an ADT constructor, or as a plain
-    // `ConstInt` once the fieldless enum lowers to its discriminant. Accept
-    // both. The constant form is value-checked, so a comparison against a
-    // different kind (`e.kind == PyErrorKind::ValueError`) can never be fused
-    // into a StopIteration test; the operand is additionally pinned by the
-    // `PyErrorKind::eq` argument check below.
-    //
-    // 9 == `PyErrorKind::StopIteration` (pyre-interpreter error.rs); like the
-    // `ExcKind::StopIteration` 10 used by the synthesised handler, the two are
-    // coupled — renumbering that variant makes this recognizer decline, which
-    // `unpackiterable_drain_match_fuses_to_kind_test` reports as a failure.
-    const PYERRORKIND_STOP_ITERATION: i64 = 9;
-    let (ctor_idx, sc) = err_ops
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| {
-            let is_stop_iteration = match &op.kind {
-                OpKind::Call {
-                    target:
-                        CallTarget::SyntheticTransparentCtor {
-                            name: n,
-                            owner_path,
-                        },
-                    ..
-                } => n == "StopIteration" && owner_path.last().is_some_and(|s| s == "PyErrorKind"),
-                OpKind::ConstInt(v) => *v == PYERRORKIND_STOP_ITERATION,
-                _ => false,
-            };
-            is_stop_iteration.then(|| op.result.clone().map(|s| (i, s)))?
-        })
-        .ok_or_else(|| {
-            format!("{name}: drain fuse: Err arm lacks the StopIteration ctor or discriminant")
-        })?;
     let (errpay_idx, err_payload) = err_ops
         .iter()
         .enumerate()
@@ -1738,73 +1699,46 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
-    let (kind_idx, kind_var) = err_ops
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == err_payload
-                    && field.name == "kind"
-                    && field.owner_root.as_deref() == Some("PyError") =>
-            {
-                op.result.clone().map(|k| (i, k))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the PyError.kind read"))?;
-    let (eq_idx, eq_result) = err_ops
+    let (predicate_idx, predicate_result) = err_ops
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
             OpKind::Call {
                 target:
                     CallTarget::Method {
-                        name: m,
+                        name: method,
                         receiver_root,
                         ..
                     },
                 args,
                 ..
-            } if m == "eq"
-                && receiver_root.as_deref() == Some("PyErrorKind")
-                && args.len() == 2
-                && args.contains(&kind_var)
-                && args.contains(&sc) =>
+            } if method == "matches_stop_iteration"
+                && receiver_root.as_deref() == Some("PyError")
+                && args.as_slice() == std::slice::from_ref(&err_payload) =>
             {
-                op.result.clone().map(|m| (i, m))
-            }
-            // The derived `PyErrorKind::eq` between two fieldless enums lowers
-            // to a discriminant `BinOp { op: "eq" }` (both operands sit in the
-            // int bank), the twin of the `sc` ConstInt form handled above. Pin
-            // the operands to exactly `{kind_var, sc}` in either order — as
-            // strict as the `Method` `args.contains` pair — so a comparison
-            // against any other kind can never fuse into a StopIteration test.
-            OpKind::BinOp {
-                op: binop,
-                lhs,
-                rhs,
-                ..
-            } if binop == "eq"
-                && ((*lhs == kind_var && *rhs == sc) || (*lhs == sc && *rhs == kind_var)) =>
-            {
-                op.result.clone().map(|m| (i, m))
+                op.result.clone().map(|matched| (i, matched))
             }
             _ => None,
         })
-        .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the PyErrorKind::eq call"))?;
-    // The ctor and eq are Calls (not `is_pure_op`), so they must be among
-    // the recognized indices, not merely tolerated.
+        .ok_or_else(|| {
+            format!("{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration")
+        })?;
+    if err_ops.len() != 2 || errpay_idx >= predicate_idx {
+        return Err(format!(
+            "{name}: drain fuse: Err arm is not exactly payload-read then StopIteration predicate"
+        ));
+    }
     assert_block_pure_besides(
         graph,
         err_target,
-        &[ctor_idx, errpay_idx, kind_idx, eq_idx],
+        &[errpay_idx, predicate_idx],
         "Err arm",
         &name,
     )?;
 
-    // --- (6) Err arm → bool-switch block: `m2 = bool(eq)`, `exitswitch ==
+    // --- (6) Err arm → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
     // Value(m2)`, pure besides, single predecessor.
-    let (bswitch, eq_bs) = follow_single_exit(graph, err_target, &eq_result)
+    let (bswitch, predicate_bs) = follow_single_exit(graph, err_target, &predicate_result)
         .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
     assert_single_pred(graph, bswitch, &name)?;
     let (bool_idx, bool_temp) = graph.blocks[bswitch]
@@ -1812,17 +1746,19 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
-            OpKind::UnaryOp { op: o, operand, .. } if o == "bool" && *operand == eq_bs => {
+            OpKind::UnaryOp { op: o, operand, .. } if o == "bool" && *operand == predicate_bs => {
                 op.result.clone().map(|m| (i, m))
             }
             _ => None,
         })
-        .ok_or_else(|| format!("{name}: drain fuse: bool-switch block {bswitch} lacks bool(eq)"))?;
+        .ok_or_else(|| {
+            format!("{name}: drain fuse: bool-switch block {bswitch} lacks bool(predicate)")
+        })?;
     match &graph.blocks[bswitch].exitswitch {
         Some(ExitSwitch::Value(v)) if *v == bool_temp => {}
         other => {
             return Err(format!(
-                "{name}: drain fuse: block {bswitch} exitswitch {other:?} is not the eq bool switch"
+                "{name}: drain fuse: block {bswitch} exitswitch {other:?} is not the predicate bool switch"
             ));
         }
     }
@@ -1955,9 +1891,9 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     // --- Build the break edge (H → break-target) args, resolving each
     // original break-link value back toward A scope.  Values defined in the
     // detached B / Err-arm / bool-switch blocks decline unless they are a
-    // const-justifiable temp: the eq bool (true on the matched arm) and the
-    // Err-arm discriminant (1).  The Result value `r` and any other detached
-    // temp decline — they are not available on the exception edge.
+    // const-justifiable temp: the predicate bool (true on the matched arm) and
+    // the Err-arm discriminant (1).  The Result value `r` and any other
+    // detached temp decline — they are not available on the exception edge.
     // `forwarded` collects the DISTINCT A-scope loop-carried vars the break
     // edge needs; each becomes a forwarded inputarg of H.
     // A break-arg resolution: either a constant, or an A-scope var to forward.
@@ -1973,7 +1909,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         };
         // Hop bswitch → Err-arm.  The exitswitch bool temp is the only
         // bswitch-defined value; the break arm never carries it, but guard
-        // it just in case (matched arm ⟹ eq true).
+        // it just in case (matched arm ⟹ predicate true).
         if *x == bool_temp {
             return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
                 ConstValue::Bool(true),
@@ -1998,14 +1934,14 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
             return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
         };
         let y = y.clone();
-        // Hop Err-arm → B.  Err-arm-defined values (the four guard ops)
-        // decline, except the eq bool (matched arm ⟹ true).
-        if y == eq_result {
+        // Hop Err-arm → B.  Err-arm-defined values (the two guard ops)
+        // decline, except the predicate bool (matched arm ⟹ true).
+        if y == predicate_result {
             return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
                 ConstValue::Bool(true),
             ))));
         }
-        if y == sc || y == err_payload || y == kind_var {
+        if y == err_payload {
             return Err(format!(
                 "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
             ));
@@ -2135,41 +2071,24 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
     let (r_id, r_inputs) = graph.create_block_with_arg_vars(1);
     let r_vb = r_inputs[0].clone();
 
-    // H: `k = exc_kind_discriminant(vb)`; `cmp = (k == 10)`.  `set_branch`
-    // below wraps `cmp` in the `bool` hop the switch condition expects.
-    let k = graph
+    // H: run the object-level StopIteration predicate on `vb`. `set_branch`
+    // below wraps the result in the `bool` hop the switch condition expects.
+    let matched = graph
         .push_op_var(
             h_id,
             OpKind::Call {
                 target: CallTarget::function_path([
-                    "pyre_object",
-                    "interp_exceptions",
-                    "exc_kind_discriminant",
+                    "pyre_interpreter",
+                    "error",
+                    "exception_object_matches_stop_iteration",
                 ]),
                 args: vec![h_vb.clone()],
                 result_ty: ValueType::Int,
             },
             true,
         )
-        .expect("exc_kind_discriminant produces a value");
-    // 10 == `ExcKind::StopIteration` (pyre-object interp_exceptions.rs); the two
-    // are coupled — renumbering that discriminant silently breaks this test.
-    let c10 = graph
-        .push_op_var(h_id, OpKind::ConstInt(10), true)
-        .expect("ConstInt produces a value");
-    let cmp = graph
-        .push_op_var(
-            h_id,
-            OpKind::BinOp {
-                op: "eq".to_string(),
-                lhs: k,
-                rhs: c10,
-                result_ty: ValueType::Int,
-            },
-            true,
-        )
-        .expect("BinOp eq produces a value");
-    // GAP#4: the kind test reads only `vb`; the `etype` slot must stay unused
+        .expect("exception_object_matches_stop_iteration produces a value");
+    // GAP#4: the predicate reads only `vb`; the `etype` slot must stay unused
     // so the exception edge may thread the caught type in without a live
     // consumer (H is freshly built here, so this is a construction invariant).
     debug_assert!(
@@ -2210,12 +2129,12 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         }
     }
 
-    // H: branch on the kind test — `cmp` true (kind == StopIteration) → break
-    // target; false → R (reraise `raise vb`).  `set_branch` wraps `cmp` in
-    // `bool` and installs arity-checked links (MUST-ADD#2).
+    // H: branch on the object-level predicate — true → break target; false →
+    // R (reraise `raise vb`). `set_branch` wraps `matched` in `bool` and
+    // installs arity-checked links (MUST-ADD#2).
     graph.set_branch(
         h_id,
-        cmp,
+        matched,
         BlockId(break_target),
         break_vars,
         r_id,
