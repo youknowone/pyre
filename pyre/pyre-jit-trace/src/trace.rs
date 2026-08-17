@@ -4208,7 +4208,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                     ..
                 }
             )
-        ) && crate::jitcode_dispatch::fbw_executed_effect_count() == 0;
+        ) && crate::jitcode_dispatch::fbw_executed_effect_count()
+            == 0;
         let walk_abort_adopted = !trace_too_long_adopted
             && !nested_residual_ran_nothing
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()

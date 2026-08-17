@@ -1632,10 +1632,9 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             if overrides.iter().any(|&(present, _)| present == slot) {
                 continue;
             }
-            let vstack_box = (ctx.vstack_valid
-                && ctx.vstack_depth == depth
-                && ctx.vstack_boxes.len() >= depth)
-                .then(|| ctx.vstack_boxes[slot - nlocals]);
+            let vstack_box =
+                (ctx.vstack_valid && ctx.vstack_depth == depth && ctx.vstack_boxes.len() >= depth)
+                    .then(|| ctx.vstack_boxes[slot - nlocals]);
             let vstack_concrete =
                 vstack_box.map(|opref| concrete_ref_for_opref(ctx, opref).is_some());
             let pcdep_color = pcdep_entries

@@ -367,7 +367,10 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
         decode_op_at(&pjc.jitcode.code, call_jit_pc),
         "parent call op does not decode"
     );
-    let result_bank = need!(call.argcodes.chars().last(), "parent call op has no argcodes");
+    let result_bank = need!(
+        call.argcodes.chars().last(),
+        "parent call op has no argcodes"
+    );
     let result_slot = (result_bank != 'v' && depth != 0).then_some(nlocals + depth - 1);
     let mut slots = Vec::with_capacity(depth);
     for slot in nlocals..nlocals + depth {
