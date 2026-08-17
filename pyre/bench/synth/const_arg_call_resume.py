@@ -27,13 +27,34 @@
 # not. Whichever way it is settled locally, it will stay that way long enough
 # to look like a property of the tree.
 #
-# The two readings are one bridge generation apart. Each of the three resume
-# guards keeps failing after its first bridge is attached, so another is
-# compiled every `trace_eagerness` (200) failures. Under MAJIT_GUARDLOG both
-# readings show the same three guard sites and differ only in their failure
-# totals: 402/402/400 sums to 1204 and floors to 2+2+2 = six bridges,
-# 602/402/400 to 1404 and 3+2+2 = seven. So the counter is a generation count,
-# and one generation is worth a whole 200.
+# The two readings are one bridge generation apart. Under MAJIT_GUARDLOG both
+# show the same three guard sites and differ only in their failure totals:
+# 402/402/400 sums to 1204 and floors to 2+2+2 = six bridges, 602/402/400 to
+# 1404 and 3+2+2 = seven. That arithmetic relates the two values; what decides
+# which one a run lands on is upstream of it.
+#
+# What decides it is whether the short preamble exports the list's
+# array-bearing boxes at all. `ArraylenGc` is the op that carries an array
+# descr, so exporting it builds an `ArrayPtrInfo` whose `make_guards` demands
+# a GC layout tid; not exporting it means nothing ever asks. When it is
+# exported the resolution always fails, because the descr `make_array_descr`
+# mints for these carries `cache_key = 0` -- documented at its producer as
+# "no identity carrier, no cache slot" -- and `resolve_gc_tid` performs a real
+# lookup on that sentinel anyway. The failure signals InvalidLoop, the unroll
+# is abandoned, and the unroll-free retry compiles a simple loop instead --
+# which is the cheaper mode, by one bridge and 200 failures. So the low
+# reading is the rescued one.
+#
+# MAJIT_LOG=1 places this fixture in that family directly: it aborts three
+# times with `short preamble GC layout tid is unresolved`, on three distinct
+# trace keys, one per helper, matching `unroll_free_retry_rescued=3`. Reading
+# the abort out beats waiting for the flip, because a host settles on one mode
+# and repeats it -- 32 runs here across all three backends drew 6/1204 every
+# time. But note what that line does and does not say: it names the path taken,
+# not why the path was entered. Three separate analyses of these fixtures were
+# wrecked by reading a mechanism out of it; the split is upstream, in short-box
+# export. Three other fixtures here are bimodal the same way, and issue #1297
+# tracks it.
 #
 # Two things that do not settle it, both measured, so neither is worth trying
 # again:
