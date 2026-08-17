@@ -606,15 +606,19 @@ fn journaled_concrete_traceback_attach(exc_ptr: pyre_object::PyObjectRef, attach
 /// execution context and so writes the same object; a leftover store is
 /// therefore the answer the replay reaches anyway.
 ///
-/// The hook only *answers* the context; the store is a `SetfieldGc` of this
-/// trace's own.  A hook that wrote the field itself would need an `EffectInfo`
-/// naming that write, and `make_call_descr_with_effect` rejects a non-trivial
-/// raw descr set minted after `compute_bitstrings` (`effectinfo.py:182-184`);
-/// declaring `default_effect_info` (`EffectInfo::MOST_GENERAL`) instead asserts
-/// "can raise, can force, writes anything", which costs a `GuardNoException`, a
-/// `GuardNotForced` and a full heapcache flush at every raise — enough to
-/// double a hot raise/catch loop.  A reading call plus an explicit store is
-/// both accurate and the shape the optimizer already models.
+/// The hook performs the chaining and *answers* the resulting value, and the
+/// trace stores that answer itself.  The store cannot be left to the hook
+/// alone: `make_call_descr_with_effect` rejects a non-trivial raw descr set
+/// minted after `compute_bitstrings` (`effectinfo.py:182-184`), so a call
+/// cannot name `w_context` as its write set here, and the only alternative
+/// that admits an unnamed write to it is `default_effect_info`
+/// (`EffectInfo::MOST_GENERAL`) — "can raise, can force, writes anything",
+/// which costs a `GuardNoException`, a `GuardNotForced` and a full heapcache
+/// flush at every raise.  `cannot_raise_effect_info()` covers what the hook
+/// really does: it cannot raise, and it is a heap mutator because breaking a
+/// context cycle nulls the `__context__` of an exception other than this one.
+/// The explicit `SetfieldGc` then gives the optimizer the one write it can
+/// model.
 fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete: ConcreteValue) {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
         return;
@@ -634,16 +638,10 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
     if fbw_context_chained_contains(exc) {
         return;
     }
-    let w_context =
-        majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
-    if w_context != 0 {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_context(
-                exc_ptr,
-                w_context as usize as pyre_object::PyObjectRef,
-            )
-        };
-    }
+    // The hook chains through `chain_context`, so calling it here both applies
+    // the effect to this authoritative walk's concrete exception and reaches
+    // the value the compiled iterations will store.
+    majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
     let hook = majit_metainterp::resolve_exception_context_hook_address();
     if !hook.is_null() && !exc.is_none() {
         // `w_context` sits at one offset for every kind, so the recording
@@ -655,7 +653,7 @@ fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete:
             hook,
             &[exc],
             &[Type::Ref],
-            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            majit_metainterp::cannot_raise_effect_info(),
         );
         let context_idx = context_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[exc, w_context], context_descr);

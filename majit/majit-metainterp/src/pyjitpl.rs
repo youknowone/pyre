@@ -1936,12 +1936,12 @@ pub type RecordDiscardedLevelTraceback = extern "C" fn(i64, i64, i64);
 /// for `record_application_traceback`.  The host owns the execution context
 /// the active exception is read from, so majit keeps only this ABI hook.
 ///
-/// It **answers** rather than stores because the trace records the store as a
-/// `SetfieldGc` of its own.  A callback that wrote the field itself would need
-/// an `EffectInfo` naming that write, and `make_call_descr_with_effect` rejects
-/// a non-trivial raw descr set minted after `compute_bitstrings`
-/// (`effectinfo.py:182-184`); declaring no write instead would let the
-/// optimizer answer a later `__context__` read from its pre-call cache.
+/// It **answers** the value in addition to chaining, because the trace records
+/// the store as a `SetfieldGc` of its own: a call cannot name `w_context` as
+/// its write set here — `make_call_descr_with_effect` rejects a non-trivial raw
+/// descr set minted after `compute_bitstrings` (`effectinfo.py:182-184`) — so
+/// without the explicit store the optimizer would answer a later `__context__`
+/// read from its pre-call cache.
 pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
 
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
@@ -1987,9 +1987,9 @@ pub fn resolve_exception_context_hook_address() -> *const () {
     RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire) as *const ()
 }
 
-/// The `__context__` of `exc_value`, answered through the same host hook the
-/// compiled run calls, so the one-shot recording iteration reaches the value
-/// its compiled successors will.  `0` when there is nothing to chain.
+/// Chain `exc_value` through the same host hook the compiled run calls, so the
+/// one-shot recording iteration applies the same effect and reaches the same
+/// value its compiled successors will.  `0` when there is nothing to chain.
 pub fn resolve_exception_context_for_recording(exc_value: i64) -> i64 {
     if exc_value == 0 {
         return 0;

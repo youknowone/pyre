@@ -776,16 +776,17 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
 /// Without this, the compiled iterations of a loop raising under a live handler
 /// leave `__context__` null while the interpreted ones set it.
 ///
-/// Answers the object the slot must end up holding, so an exception that was
-/// already chained answers its own context and the emitted store is idempotent;
-/// `0` means the slot stays null.
+/// Chains through `chain_context`, so the active exception is selected, a
+/// non-exception or self-referential pair is refused, and a chain that would
+/// close a cycle is broken by nulling the offending link — all exactly as the
+/// interpreter does it — and then answers the slot's resulting value.  The
+/// trace's own `SetfieldGc` therefore stores what is already there; `0` means
+/// the slot stays null.
 ///
-/// One divergence from `chain_context`: a chain that already reaches `w_exc`
-/// declines here where the interpreter breaks the cycle by nulling the
-/// offending link.  That break writes the `__context__` of an unrelated
-/// exception, which a pure answer cannot do and the emitted `SetfieldGc` does
-/// not describe.  Declining leaves the slot as the compiled path leaves it
-/// today, so it can under-chain a cycle but never answers a wrong context.
+/// The cycle break writes the `__context__` of an exception other than
+/// `w_exc`, which the emitted store does not describe, so the call is declared
+/// `cannot_raise_effect_info()` — a heap mutator that cannot raise — rather
+/// than as having no heap effect.
 pub(crate) extern "C" fn resolve_exception_context(exc_value: i64) -> i64 {
     if exc_value == 0 {
         return 0;
@@ -801,38 +802,8 @@ pub(crate) extern "C" fn resolve_exception_context(exc_value: i64) -> i64 {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(w_exc);
     let active = pyre_interpreter::eval::get_sys_exception();
-    if active.is_null()
-        || std::ptr::eq(w_exc, active)
-        || unsafe { pyre_object::is_none(active) }
-        || !unsafe { pyre_object::is_exception(active) }
-    {
-        return 0;
-    }
-    // `error.rs _break_context_cycle` walks the chain tortoise-and-hare so a
-    // pre-existing cycle terminates; the same walk decides here whether
-    // chaining would close one.
-    let mut w_rabbit = active;
-    let mut w_tortoise = active;
-    let mut advance_tortoise = false;
-    loop {
-        let w_next = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_rabbit) };
-        if w_next.is_null() || unsafe { pyre_object::is_none(w_next) } {
-            break;
-        }
-        if std::ptr::eq(w_next, w_exc) {
-            return 0;
-        }
-        w_rabbit = w_next;
-        if std::ptr::eq(w_rabbit, w_tortoise) {
-            break;
-        }
-        if advance_tortoise {
-            w_tortoise =
-                unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_tortoise) };
-        }
-        advance_tortoise = !advance_tortoise;
-    }
-    active as i64
+    pyre_interpreter::error::chain_context(w_exc, active);
+    unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_exc) as i64 }
 }
 
 pub(crate) extern "C" fn record_inline_traceback_for_recording(
