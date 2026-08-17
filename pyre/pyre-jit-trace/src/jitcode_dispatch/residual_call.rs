@@ -6158,7 +6158,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         original_call_descr.arg_types(),
     );
 
-    // pyjitpl.py:1105-1120 `opimpl_jit_force_quasi_immutable` must run before
+    // pyjitpl.py:1094-1118 `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,
     // `try_walker_specialize_store_attr` mutates `?` fields while resolving,
     // so moving this below the STORE_ATTR fold would hide the force. The abort

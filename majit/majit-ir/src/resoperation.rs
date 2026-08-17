@@ -252,7 +252,7 @@ impl OpRef {
     }
 
     /// resoperation.py:47 `AbstractValue.is_constant()` returns False;
-    /// history.py:213 `Const.is_constant()` returns True. The
+    /// history.py:220 `Const.is_constant()` returns True. The
     /// dispatch is class-based — typed body variants
     /// (`IntOp/RefOp/FloatOp/VoidOp/InputArg*`) correspond to
     /// `AbstractValue` subclasses and are NOT constants.

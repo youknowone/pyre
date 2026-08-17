@@ -4423,7 +4423,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
              copied descrs share their donor's type vector via prev"
         );
     }
-    /// history.py:143 `AbstractFailDescr.attach_vector_info`: writes
+    /// history.py:150 `AbstractFailDescr.attach_vector_info`: writes
     /// `self.rd_vector_info`, never `self.prev`.  `prev` is for resume
     /// storage only (compile.py:849 `get_resumestorage`); vector info
     /// lives on the copied descr itself.

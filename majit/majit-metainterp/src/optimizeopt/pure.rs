@@ -2376,7 +2376,7 @@ mod tests {
     }
 
     /// pure.py:62 / :72-74 same_box semantics for constant args.
-    /// history.py:204-205 / :244 — `same_box(a, b) == same_constant(a, b)`
+    /// history.py:211-212 / :251 — `same_box(a, b) == same_constant(a, b)`
     /// for Const subclasses, so cache hits are value-equality. With
     /// inline `ConstInt.value`, two `make_constant_int(5)` calls return
     /// the same `OpRef::ConstInt(5)` and the cache hit is by

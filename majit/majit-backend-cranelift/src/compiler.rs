@@ -4364,7 +4364,7 @@ thread_local! {
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
-    // history.py:213 `Const.is_constant()` returns True; inline-Const
+    // history.py:220 `Const.is_constant()` returns True; inline-Const
     // variants are constants, never op results — short-circuit before
     // `.raw()` (which panics on inline variants).
     if opref.inline_const_bits().is_some() {
@@ -4706,7 +4706,7 @@ fn validate_oprefs_for_compile(
         }
         if op_dereferences_first_arg(op.opcode) {
             let arg = op.arg(0);
-            // history.py:213 `Const.is_constant()` — Const operands are
+            // history.py:220 `Const.is_constant()` — Const operands are
             // always "bound" by the value carried inline.
             let bound = arg.is_none()
                 || arg.is_constant()

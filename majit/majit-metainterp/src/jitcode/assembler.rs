@@ -6077,7 +6077,7 @@ impl JitCodeBuilder {
     }
 }
 
-/// pyjitpl.py:3675 `effectinfo.call_release_gil_target` parity.
+/// pyjitpl.py:3699 `effectinfo.call_release_gil_target` parity.
 ///
 /// PyPy populates `(realfuncaddr, saveerr)` at descr creation time:
 /// `codewriter/call.py:252-258` reads `_call_aroundstate_target_` off

@@ -1664,7 +1664,7 @@ fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize>
 /// ```
 ///
 /// `live/` is special-cased to advance by `liveness::OFFSET_SIZE` per
-/// `blackhole.py:1603-1605` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
+/// `blackhole.py:1605-1607` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
 pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     let opcode_byte = *code.get(pc)?;
     let key: &'static str = INSNS_BYTE_TO_OPNAME.get(&opcode_byte)?.as_str();
@@ -3092,7 +3092,7 @@ mod tests {
         //   PC=3:  float_add r0, r1 → r2
         //   PC=7:  void_return
         //
-        // RPython parity: blackhole.py:574-577 `bhimpl_float_add` +
+        // RPython parity: blackhole.py:696-700 `bhimpl_float_add` +
         // :859-862 `bhimpl_void_return`. Pyre's `registers_f` stores
         // `f64::to_bits() as i64`; the `bhhandler_ff_f!` macro decodes
         // via `f64::from_bits` on read and `to_bits()` on write, so

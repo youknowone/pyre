@@ -117,7 +117,7 @@ struct LoopTargetDescrState {
 struct LoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
-    /// `history.py:470` `TargetToken._ll_loop_code` parity (PyPy stores
+    /// `history.py:478` `TargetToken._ll_loop_code` parity (PyPy stores
     /// a plain integer GIL-atomic; pyre uses `AtomicUsize` so the
     /// cranelift backend's in-code `closing_jump` dispatch can read
     /// the slot via a baked address without taking a Mutex).

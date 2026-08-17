@@ -3683,7 +3683,7 @@ impl<'a> RegAlloc<'a> {
         ) {
             return false;
         }
-        // history.py:213 `Const.is_constant()` — Const operands are not
+        // history.py:220 `Const.is_constant()` — Const operands are not
         // op-result identities; comparison via raw position is invalid.
         if next_op.num_args() == 0
             || next_op.arg(0).is_constant()

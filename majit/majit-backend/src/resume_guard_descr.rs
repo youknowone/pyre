@@ -550,7 +550,7 @@ impl FailDescr for ResumeGuardDescr {
         self.external_jump_target.get().is_some()
     }
 
-    /// `history.py:470` `TargetToken._ll_loop_code` parity: when this
+    /// `history.py:478` `TargetToken._ll_loop_code` parity: when this
     /// descr is the synthesised cross-loop JUMP exit, surface the target
     /// `DescrRef` the dispatcher re-enters via.  `None` for regular
     /// guard descrs.

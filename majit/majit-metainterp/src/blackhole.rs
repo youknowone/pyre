@@ -5393,27 +5393,27 @@ fn bhimpl_int_ne(a: i64, b: i64) -> i64 {
     (a != b) as i64
 }
 
-/// blackhole.py:551 `bhimpl_int_gt(a, b): return int(a > b)`.
+/// blackhole.py:548 `bhimpl_int_gt(a, b): return int(a > b)`.
 fn bhimpl_int_gt(a: i64, b: i64) -> i64 {
     (a > b) as i64
 }
 
-/// blackhole.py:555 `bhimpl_int_ge(a, b): return int(a >= b)`.
+/// blackhole.py:551 `bhimpl_int_ge(a, b): return int(a >= b)`.
 fn bhimpl_int_ge(a: i64, b: i64) -> i64 {
     (a >= b) as i64
 }
 
-/// blackhole.py:559 `bhimpl_int_is_true(a): return int(bool(a))`.
+/// blackhole.py:557 `bhimpl_int_is_true(a): return int(bool(a))`.
 fn bhimpl_int_is_true(a: i64) -> i64 {
     (a != 0) as i64
 }
 
-/// blackhole.py:563 `bhimpl_int_is_zero(a): return int(not a)`.
+/// blackhole.py:554 `bhimpl_int_is_zero(a): return int(not a)`.
 fn bhimpl_int_is_zero(a: i64) -> i64 {
     (a == 0) as i64
 }
 
-/// blackhole.py:567 `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
+/// blackhole.py:563 `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
 fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
     if a < 0 { 0 } else { a }
 }
@@ -9688,7 +9688,7 @@ fn handler_copystrcontent(
     }
     Ok(p + 5)
 }
-/// RPython `blackhole.py:1580-1583` `bhimpl_copyunicodecontent`.
+/// RPython `blackhole.py:1593-1595` `bhimpl_copyunicodecontent`.
 fn handler_copyunicodecontent(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

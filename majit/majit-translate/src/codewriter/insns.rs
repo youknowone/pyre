@@ -34,7 +34,7 @@ use indexmap::IndexMap;
 // 1:1 invariant that `pyjitpl.py:2230 setup_insns` enforces.
 pub const BC_CAST_FLOAT_TO_INT: u8 = 0;
 pub const BC_ARRAYLEN_GC: u8 = 1;
-/// RPython `blackhole.py:531-533` `bhimpl_int_is_true(a) -> !!a` — the
+/// RPython `blackhole.py:556-558` `bhimpl_int_is_true(a) -> !!a` — the
 /// boolean-coercion of an int, produced by a `Bool` exitswitch source
 /// that is read before the branch rather than fused into
 /// `goto_if_not_int_is_true`. Takes slot 2 (was free; `BC_ARRAYLEN_VABLE`

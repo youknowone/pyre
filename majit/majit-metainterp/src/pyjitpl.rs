@@ -158,7 +158,7 @@ pub struct BridgeRetraceResult {
 }
 
 /// Result of checking a back-edge.
-/// pyjitpl.py:2807 `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)` —
+/// pyjitpl.py:2831 `raise SwitchToBlackhole(Counters.ABORT_TOO_LONG)` —
 /// reason attached to an abort.  RPython uses `Counters.ABORT_*` ints
 /// (`resoperation.Counters.ABORT_TOO_LONG`, `ABORT_BRIDGE`, ...); pyre
 /// tracks only the variants that propagate through the blackhole flow.
@@ -1520,7 +1520,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
     /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` runtime hook.
     pub(crate) string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
-    /// history.py:377 `get_const_ptr_for_string(s)` runtime hook.
+    /// history.py:384 `get_const_ptr_for_string(s)` runtime hook.
     pub(crate) string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// pyjitpl.py:2389: partial trace from a failed bridge compilation attempt.
     /// When bridge optimization returns "not final" (retrace needed), the
@@ -5685,7 +5685,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key
             );
         }
-        // pyjitpl.py:2807 `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
+        // pyjitpl.py:2831 `raise SwitchToBlackhole(ABORT_TOO_LONG)`.
         // Return the reason; caller unwinds with abort_trace_live +
         // aborted_tracing(reason) exactly once.
         Some(AbortReason::TooLong)
@@ -5715,7 +5715,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(outer_key) = outermost_merge_key {
             // pyjitpl.py:2819 `JitCell.trace_next_iteration(greenkey)`.
             self.warm_state.trace_next_iteration(outer_key);
-            // pyjitpl.py:2820 `warmstate.mark_force_finish_tracing(greenkey)`.
+            // pyjitpl.py:2844 `warmstate.mark_force_finish_tracing(greenkey)`.
             self.warm_state.mark_force_finish_tracing(outer_key);
             // pyjitpl.py:2822 `warmstate.dont_trace_here(greenkey)`.
             self.warm_state.disable_noninlinable_function(outer_key);
@@ -8930,7 +8930,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_and_attach` just set to the SOURCE loop's token.
                 // `unroll.py:290-297` separately appended the freshly minted
                 // one to `loop_jitcell_token.target_tokens`
-                // (`compile.py:356`'s `get_procedure_token(greenkey)`), which
+                // (`compile.py:355`'s `get_procedure_token(greenkey)`), which
                 // is what `pyjitpl.py:3923 has_compiled_targets` reads.
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(source_jct.number);
@@ -11210,7 +11210,7 @@ impl<M: Clone> MetaInterp<M> {
             let _ = self
                 .backend
                 .redirect_call_assembler(&old_token, &attach_token);
-            // `warmstate.py:347` `old_token.record_jump_to(procedure_token)`.
+            // `warmstate.py:348` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
     }

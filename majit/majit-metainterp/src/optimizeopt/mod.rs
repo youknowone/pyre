@@ -755,7 +755,7 @@ pub struct OptContext {
     /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
     /// extracting character data from a constant string GcRef.
     pub string_content_resolver: Option<StringContentResolver>,
-    /// history.py:377 `get_const_ptr_for_string(s)` — runtime hook for
+    /// history.py:384 `get_const_ptr_for_string(s)` — runtime hook for
     /// creating a constant string GcRef from char values (used by
     /// force_box constant-folding path, vstring.py:79-90).
     pub string_constant_alloc: Option<StringConstantAllocator>,

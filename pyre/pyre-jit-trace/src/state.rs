@@ -5668,7 +5668,7 @@ pub(crate) fn can_flush_walk_end_state_after_outer_call(
     // statement, and a nested CALL therefore legitimately carries that NULL
     // through this post-CALL handoff.  The carrier has already proved every
     // slot before it becomes a raw `PyObjectRef`: NULL is admitted only from
-    // an inline `ConstPtr(NULL)` (RPython history.py:361 `CONST_NULL`) or the
+    // an inline `ConstPtr(NULL)` (RPython history.py:368 `CONST_NULL`) or the
     // CALL layout's named null-or-self slot.  Rejecting it here collapses that
     // distinction again and forces the effectful callee prologue to replay.
     let base = info.num_static_extra_boxes;

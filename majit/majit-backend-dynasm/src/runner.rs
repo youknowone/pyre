@@ -50,7 +50,7 @@ struct DynasmCaTarget {
     /// `model.py:292-338` `CompiledLoopToken` — Arc-shared with the
     /// owning `JitCellToken` once the real target registers.
     compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
-    /// `pyjitpl.py:3605` `outermost_jitdriver_sd.index_of_virtualizable`.
+    /// `pyjitpl.py:3629` `outermost_jitdriver_sd.index_of_virtualizable`.
     /// Captured from `JitCellToken.virtualizable_arg_index` when the compiled
     /// target registers.
     index_of_virtualizable: i32,

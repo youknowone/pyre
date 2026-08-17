@@ -3108,7 +3108,7 @@ struct BasicLoopTargetDescrState {
 struct BasicLoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
-    /// `history.py:470` `TargetToken._ll_loop_code` parity: a single
+    /// `history.py:478` `TargetToken._ll_loop_code` parity: a single
     /// integer recording the address of the loop's compiled entry
     /// point.  RPython sets this with a plain `setattr` (atomic w.r.t.
     /// the GIL); pyre uses `AtomicUsize` so cranelift-emitted in-code
@@ -3406,7 +3406,7 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// compile.py:919-920: `invent_fail_descr_for_op` mints
+    /// compile.py:924-927: `invent_fail_descr_for_op` mints
     /// `ResumeGuardForcedDescr` for `GUARD_NOT_FORCED` /
     /// `GUARD_NOT_FORCED_2`.  Allows descr-level dispatch in places
     /// that today switch on opcode (e.g. `handle_fail` for forced

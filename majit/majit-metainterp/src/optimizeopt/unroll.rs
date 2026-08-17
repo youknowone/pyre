@@ -2182,7 +2182,7 @@ pub struct ExportedState {
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
-    /// RPython unroll.py:466-477 `short_boxes = sb.create_short_boxes(...)`
+    /// RPython unroll.py:478-479 `short_boxes = sb.create_short_boxes(...)`
     /// stored directly on ExportedState. Consumer sites
     /// (`build_imported_short_preamble`, `import_short_preamble_state`)
     /// iterate this list verbatim. Pyre derives this eagerly from
@@ -2313,7 +2313,7 @@ impl ExportedState {
         short_inputargs: Vec<OpRef>,
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     ) -> Self {
-        // unroll.py:466-477 `sb.create_short_boxes(...)` parity: pyre
+        // unroll.py:478-479 `sb.create_short_boxes(...)` parity: pyre
         // pre-derives the per-OpRef ProducedShortOp view and stores it
         // directly, matching RPython's `ExportedState.short_boxes`. The
         // label-arg → short-inputarg rename already happened at export time
@@ -3424,7 +3424,7 @@ impl OptUnroll {
         runtime_boxes: &[OpRef],
         pre_vs: Option<crate::optimizeopt::virtualstate::VirtualState>,
     ) -> Option<crate::optimizeopt::virtualstate::VirtualState> {
-        // optimizer.py:317 `with self.optimizer.cant_replace_guards():`
+        // unroll.py:317 `with self.optimizer.cant_replace_guards():`
         // line-by-line — save current `can_replace_guards`, set False
         // for the guarded section, restore on exit. Nested scopes
         // preserve the outer False via the saved token. An InvalidLoop is

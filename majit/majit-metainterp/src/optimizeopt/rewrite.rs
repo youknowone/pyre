@@ -397,13 +397,13 @@ impl OptRewrite {
     // ── Unary operations ──
 
     /// Constant fold INT_IS_ZERO.
-    /// rewrite.py:512-513 `optimize_INT_IS_ZERO`:
+    /// rewrite.py:522-523 `optimize_INT_IS_ZERO`:
     ///     return self._optimize_nullness(op, op.getarg(0), False)
     fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.optimize_nullness(op, op.arg(0).to_opref(), false, ctx)
     }
 
-    /// rewrite.py:505-510 `optimize_INT_IS_TRUE`:
+    /// rewrite.py:515-520 `optimize_INT_IS_TRUE`:
     ///     if (not self.is_raw_ptr(op.getarg(0)) and
     ///         self.getintbound(op.getarg(0)).is_bool()):
     ///         self.make_equal_to(op, op.getarg(0))

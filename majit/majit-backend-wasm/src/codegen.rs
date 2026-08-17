@@ -6425,7 +6425,7 @@ fn next_op_can_accept_cc<'a>(
     if !matches!(next_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
         return None;
     }
-    // history.py:213 `Const.is_constant()` — a Const operand is not an
+    // history.py:220 `Const.is_constant()` — a Const operand is not an
     // op-result identity, so comparing raw positions against it is invalid.
     if next_op.num_args() == 0 || next_op.arg(0).is_constant() {
         return None;

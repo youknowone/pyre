@@ -1570,7 +1570,7 @@ impl ProducedShortOp {
         // `result_opref` is a typed synthetic alias minted by
         // `add_op_to_short` via `ctx.alloc_op_position_typed(arg_type)`
         // — its variant carries `Box.type` from the chosen producer
-        // (history.py:802 `record_same_as` parity). Downstream type
+        // (history.py:809 `record_same_as` parity). Downstream type
         // lookups read it directly via `OpRef::ty()` or the producing
         // SAME_AS body op's `op.type_` once it lands in
         // `new_operations`.
