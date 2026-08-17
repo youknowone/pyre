@@ -881,9 +881,26 @@ impl Optimization for OptPure {
             self.last_emitted_was_removed = false;
         }
 
-        // Clear any position arm the previous op left un-consumed: a demoted
-        // CALL removed by a downstream pass never reaches postprocess, so the
-        // one-shot could otherwise leak onto this op.
+        // Clear any position arm the previous op left un-consumed, so the
+        // one-shot cannot leak onto this op.
+        //
+        // The arm is armed in `optimize_call_pure` and consumed in
+        // `propagate_postprocess`. Every ordinary exit now consumes it: the op
+        // is collected under its demoted `CallI`/`CallR` opcode, and emission,
+        // a later pass's removal and a restart all run the collected callbacks
+        // (`send_extra_operation`, optimizer.py:600-616, ends the walk on a
+        // removal but not the callbacks). What is left un-consumed is the
+        // error exit — a pass reporting `InvalidLoop`, which abandons the
+        // trace — so this reset is defensive rather than load-bearing.
+        //
+        // Consuming it on a removal is what upstream does too: the callback
+        // rides on the result object `emit_result` built (pure.py:30-33), and
+        // that object stays in `opt_results` whatever a later pass decides. It
+        // then appends `len(_newoperations) - 1`, which for a removed call
+        // names a different op — an exposure both implementations carry.
+        // Unreachable today: the only removal of a call below this pass is
+        // OptHeap's DICT_LOOKUP dedup, and a dict lookup is registered as a
+        // plain residual call, so it never arrives here demoted from a pure one.
         self.pending_call_pure_position = false;
 
         // pure.py: OVF operation postponement.
