@@ -102,10 +102,59 @@ static PyObject *m_alive(PyObject *self, PyObject *unused)
     return PyLong_FromLong(alive);
 }
 
+/* The other kind of reference one mirror holds in another: the borrow
+   `PyList_GetItem` and `PyDict_GetItem` hand back, which the layer keeps owned
+   on the container's behalf.  Nothing here declares the collection protocol, so
+   these two reach the same question through a table rather than a C field. */
+
+static PyObject *m_peek_list(PyObject *self, PyObject *sequence)
+{
+    (void)self;
+    if (PyList_GetItem(sequence, 0) == NULL) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *m_peek_dict(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *mapping;
+    PyObject *key;
+    if (!PyArg_ParseTuple(args, "OO", &mapping, &key)) {
+        return NULL;
+    }
+    return PyBool_FromLong(PyDict_GetItem(mapping, key) != NULL);
+}
+
+/* A borrowed pointer kept across a collection, to read back afterwards. */
+static PyObject *held = NULL;
+
+static PyObject *m_hold_item(PyObject *self, PyObject *sequence)
+{
+    (void)self;
+    held = PyList_GetItem(sequence, 0);
+    if (held == NULL) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *m_held_item(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return Py_NewRef(held ? held : Py_None);
+}
+
 static PyMethodDef methods[] = {
     {"alive", m_alive, METH_NOARGS, "how many Nodes have not been deallocated"},
     {"pin", m_pin, METH_O, "hold one reference in a C global"},
     {"pinned_ref", m_pinned_ref, METH_NOARGS, "what the C global holds"},
+    {"peek_list", m_peek_list, METH_O, "take a borrow on a list's first item"},
+    {"peek_dict", m_peek_dict, METH_VARARGS, "take a borrow on a dict value"},
+    {"hold_item", m_hold_item, METH_O, "keep the borrow on a list's first item"},
+    {"held_item", m_held_item, METH_NOARGS, "read the kept borrow back"},
     {NULL, NULL, 0, NULL},
 };
 

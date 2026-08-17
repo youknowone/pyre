@@ -602,6 +602,11 @@ pub fn drain_dead() {
 /// A set, not a list: the membership test below runs once per item read, so a
 /// C loop over `PyTuple_GetItem` for every item of an n-item container would
 /// otherwise scan n/2 entries per step.
+///
+/// Each entry roots the item's object, and a collection is told which container
+/// that root belongs to -- [`borrowed_edges`].  Without that the retention above
+/// is unbounded rather than merely wide: an item referring back to its container
+/// keeps the container, which is what would release the entry.
 type BorrowSet = std::collections::HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
 type BorrowMap = HashMap<usize, BorrowSet, BuildHasherDefault<std::hash::DefaultHasher>>;
 static BORROWED: ForkMutex<BorrowMap> =
@@ -638,6 +643,29 @@ fn release_borrowed(container: *mut CPyObject) {
     let owned = BORROWED.lock().remove(&(container as usize));
     for item in owned.into_iter().flatten() {
         unsafe { decref(item as *mut CPyObject) };
+    }
+}
+
+/// This table read as [`super::gc::c_edges`] reads a `tp_traverse`.
+///
+/// Each entry is a reference one mirror holds in another, released exactly when
+/// the container mirror is deallocated, so it is an edge of the same kind as a C
+/// field -- and one no traverse can report, the reference living here rather
+/// than in the block. Without it a container that handed C a borrowed reference
+/// to something referring back to the container is a cycle neither side can
+/// see: the item's count roots the item, the item roots the container, and the
+/// container is what would release the count.
+///
+/// Reported as separate entries rather than merged into a block's own, which the
+/// collector sums either way.
+pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
+    let borrowed = BORROWED.lock();
+    edges.reserve(borrowed.len());
+    for (&container, items) in borrowed.iter() {
+        if items.is_empty() {
+            continue;
+        }
+        edges.push((container, items.iter().copied().collect()));
     }
 }
 

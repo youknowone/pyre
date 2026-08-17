@@ -215,7 +215,10 @@ the header below.
   trace answers, and answering it before the trace frees objects that are
   alive. What survives neither test is a cycle, and `clear_garbage` runs the
   `tp_clear` that breaks it apart, the references being C fields no other layer
-  can drop. Upstream has none of this; the shape follows CPython's
+  can drop. `tp_traverse` is one of two sources of such a reference; the other
+  is the borrow the layer owns on a container's behalf for `PyList_GetItem` and
+  friends, which lives in a side table no traverse can reach and is reported
+  alongside. Upstream has none of this; the shape follows CPython's
   `gcmodule.c`, and the one pypy precedent for calling a user traverse from a
   collection is `_hpy_universal`'s tracer.
 

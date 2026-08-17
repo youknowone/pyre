@@ -11,8 +11,12 @@
 //!
 //! This module is the reporting half: which blocks participate, and what each
 //! one references. Deciding who dies is the collector's -- and once it has,
-//! [`clear_garbage`] runs the `tp_clear` that breaks the cycle apart, because
-//! the references are C fields and no other layer can drop one.
+//! [`clear_garbage`] runs the `tp_clear` that breaks the cycle apart, no other
+//! layer being able to drop a reference that lives in a C field.
+//!
+//! [`c_edges`] is where every reference of that kind is collected, `tp_traverse`
+//! being one of two sources; the other is
+//! [`super::pyobject::borrowed_edges`].
 
 use super::pyobject::CPyObject;
 use super::typeobject::{CPyTypeObject, PY_TPFLAGS_HAVE_GC};
@@ -185,8 +189,13 @@ pub unsafe extern "C" fn PyObject_GC_UnTrack(object: *mut CPyObject) {
 ///
 /// A referent is usually not itself tracked: an instance of a C-defined type
 /// holding a plain Python object is the ordinary case, and that edge is exactly
-/// the one the interpreter cannot see. Only a tracked block has reportable
-/// outgoing edges, so a reference from anywhere else goes on rooting.
+/// the one the interpreter cannot see. A block that reports nothing goes on
+/// rooting, which is why a type declaring no traverse is still a cycle nobody
+/// can break -- the position CPython takes for an untracked type.
+///
+/// A `tp_traverse` is not the only place a reference from one mirror to another
+/// lives, so [`super::pyobject::borrowed_edges`] adds the ones this layer holds
+/// on C's behalf.
 ///
 /// Runs with the collector borrowed, so nothing it reaches may allocate. Only
 /// mirror blocks are read, and those never move.
@@ -204,6 +213,7 @@ pub(super) fn c_edges() -> Vec<(usize, Vec<usize>)> {
             edges.push((block, referents));
         }
     }
+    super::pyobject::borrowed_edges(&mut edges);
     edges
 }
 
