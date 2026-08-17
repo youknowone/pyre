@@ -11355,6 +11355,12 @@ impl CodeWriter {
                                 &current_block,
                                 &{
                                     let mut s = current_state.clone();
+                                    // `push_and_bump!` above updated the
+                                    // continuing arm's shared walker state with
+                                    // the produced item.  The exhaustion arm did
+                                    // not produce that item, so remove only that
+                                    // speculative value; the iterator underneath
+                                    // stays for the target's POP_ITER.
                                     s.stack.pop();
                                     s.next_offset = exhaust_target;
                                     s.blocklist = frame_blocks_for_offset(code, exhaust_target);
@@ -11379,7 +11385,12 @@ impl CodeWriter {
                             // before it lowers `valuestackdepth`, so the pop
                             // goes through `emit_popvalue_ref!` like every
                             // other one rather than moving the depth alone.
+                            // The walker's symbolic stack pops in lock-step:
+                            // leaving `current_state.stack` one slot ahead
+                            // makes later stack permutations and stores consume
+                            // the wrong symbolic values.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _iterator_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
