@@ -4597,6 +4597,34 @@ impl MiniMarkGC {
         }
     }
 
+    /// Return the inherited frontend-only edge that app-level inspection must
+    /// omit.  RPython's class/type pointer is header metadata rather than a GC
+    /// referent; pyre's managed mirror is declared once on the OBJECT root.
+    fn app_level_inspector_hidden_edge_offset(&self, mut type_id: u32) -> Option<usize> {
+        loop {
+            let info = self.types.get(type_id);
+            if let Some(offset) = info.app_level_inspector_hidden_edge_offset {
+                return Some(offset);
+            }
+            type_id = info.parent?;
+        }
+    }
+
+    /// Inspector trace for a value that may be a translated prebuilt/foreign
+    /// object. RPython gives those objects a typeid through the prebuilt GC
+    /// layout; pyre recovers it from the registered vtable mapping.  Unlike
+    /// the collector trace, this omits the frontend's managed type-pointer
+    /// mirror by its slot address, so a real item equal to the class object is
+    /// still reported.
+    fn visit_actual_inspector_referents(&self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) -> bool {
+        let Some(type_id) = self.get_actual_typeid(obj) else {
+            return false;
+        };
+        let hidden_offset = self.app_level_inspector_hidden_edge_offset(type_id);
+        self.visit_referents_with_type_id_filtered(obj.0, type_id, hidden_offset, visitor);
+        true
+    }
+
     /// `visit_referents` for a caller that already resolved the type id,
     /// because a prebuilt object carries no header to read it back out of.
     /// The bounds check sits here rather than beside the header read so that
@@ -4608,11 +4636,24 @@ impl MiniMarkGC {
         type_id: u32,
         visitor: &mut dyn FnMut(GcRef),
     ) {
+        self.visit_referents_with_type_id_filtered(obj_addr, type_id, None, visitor);
+    }
+
+    fn visit_referents_with_type_id_filtered(
+        &self,
+        obj_addr: usize,
+        type_id: u32,
+        ignored_offset: Option<usize>,
+        visitor: &mut dyn FnMut(GcRef),
+    ) {
         self.validate_type_id(type_id, obj_addr, "visit_referents");
         let type_info = self.types.get(type_id);
         if let Some(trace_fn) = type_info.custom_trace {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
+                    if ignored_offset.is_some_and(|offset| slot_ptr as usize == obj_addr + offset) {
+                        return;
+                    }
                     let field_ref = *slot_ptr;
                     if !field_ref.is_null() {
                         visitor(field_ref);
@@ -4622,6 +4663,9 @@ impl MiniMarkGC {
             return;
         }
         for &offset in &type_info.gc_ptr_offsets {
+            if ignored_offset == Some(offset) {
+                continue;
+            }
             let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
             if !field_ref.is_null() {
                 visitor(field_ref);
@@ -4936,7 +4980,7 @@ impl MiniMarkGC {
     /// list reports its items rather than its item array. GCFLAG_EXTRA keeps
     /// each node out of the walk twice and is restored before returning.
     pub fn do_get_referents(&mut self, obj: GcRef, visitor: &mut dyn FnMut(GcRef)) {
-        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+        if obj.is_null() || self.get_actual_typeid(obj).is_none() {
             return;
         }
         // A host-side raw local can still hold a just-forwarded nursery
@@ -4959,16 +5003,23 @@ impl MiniMarkGC {
         let mut parent = obj;
         loop {
             let mut children: Vec<GcRef> = Vec::new();
-            self.visit_referents(parent.0, &mut |child| children.push(child));
+            self.visit_actual_inspector_referents(parent, &mut |child| children.push(child));
             for child in children {
-                if child.is_null() || !self.is_managed_heap_object(child.0) {
+                if child.is_null() || self.get_actual_typeid(child).is_none() {
                     continue;
                 }
-                let hdr = unsafe { header_of(child.0) };
-                if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+                if self.is_managed_heap_object(child.0) {
+                    let hdr = unsafe { header_of(child.0) };
+                    if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+                        continue;
+                    }
+                    unsafe { (*hdr).set_flag(flags::EXTRA) };
+                } else if pending.contains(&child) {
+                    // RPython toggles GCFLAG_EXTRA on prebuilt objects too.
+                    // Pyre's foreign wrappers have no GC header, so the same
+                    // per-call identity set lives in the existing pending Vec.
                     continue;
                 }
-                unsafe { (*hdr).set_flag(flags::EXTRA) };
                 pending.push(child);
             }
             // Walk the queue until a non-app-level node needs expanding; on
@@ -4989,7 +5040,9 @@ impl MiniMarkGC {
             }
         }
         for gcref in &pending {
-            unsafe { (*header_of(gcref.0)).clear_flag(flags::EXTRA) };
+            if self.is_managed_heap_object(gcref.0) {
+                unsafe { (*header_of(gcref.0)).clear_flag(flags::EXTRA) };
+            }
         }
         for gcref in result {
             visitor(gcref);
@@ -8029,6 +8082,87 @@ mod tests {
         gc.do_get_referents(far, &mut |gcref| referents.push(gcref));
         assert_eq!(referents, vec![holder]);
         gc.roots.clear();
+    }
+
+    #[test]
+    fn get_referents_hides_inherited_frontend_type_edge_by_slot() {
+        unsafe fn trace_pair(obj_addr: usize, visit: &mut dyn FnMut(*mut GcRef)) {
+            visit(obj_addr as *mut GcRef);
+            visit((obj_addr + std::mem::size_of::<GcRef>()) as *mut GcRef);
+        }
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let root_tid = gc.register_type(
+            TypeInfo::object_with_gc_ptrs(2 * ptr_size, vec![0])
+                .with_app_level_inspector_hidden_edge(0),
+        );
+        let holder_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            2 * ptr_size,
+            root_tid,
+            trace_pair,
+        ));
+        let class = gc.alloc_with_type(root_tid, 2 * ptr_size);
+        let item = gc.alloc_with_type(root_tid, 2 * ptr_size);
+        let mut holder = gc.alloc_with_type(holder_tid, 2 * ptr_size);
+        unsafe {
+            *(holder.0 as *mut GcRef) = class;
+            *((holder.0 + ptr_size) as *mut GcRef) = item;
+            gc.roots.add(&mut holder);
+        }
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![item]);
+
+        // Filtering is by the header slot, not by pointer identity: an actual
+        // payload entry equal to the class object remains visible.
+        unsafe { *((holder.0 + ptr_size) as *mut GcRef) = class };
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![class]);
+        for object in [holder, class, item] {
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+        }
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn get_referents_reports_prebuilt_foreign_objects() {
+        #[repr(C)]
+        struct ForeignLeaf {
+            vtable: usize,
+        }
+
+        #[repr(C)]
+        struct ForeignHolder {
+            vtable: usize,
+            child: GcRef,
+        }
+
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let leaf_vtable = 0x1000usize;
+        let holder_vtable = 0x2000usize;
+        let leaf_tid = gc.register_type(TypeInfo::object(ptr_size));
+        let holder_tid =
+            gc.register_type(TypeInfo::object_with_gc_ptrs(2 * ptr_size, vec![ptr_size]));
+        crate::GcAllocator::register_vtable_for_type(&mut gc, leaf_vtable, leaf_tid);
+        crate::GcAllocator::register_vtable_for_type(&mut gc, holder_vtable, holder_tid);
+
+        let leaf = Box::new(ForeignLeaf {
+            vtable: leaf_vtable,
+        });
+        let holder = Box::new(ForeignHolder {
+            vtable: holder_vtable,
+            child: GcRef((&*leaf as *const ForeignLeaf) as usize),
+        });
+        let holder_ref = GcRef((&*holder as *const ForeignHolder) as usize);
+        let leaf_ref = GcRef((&*leaf as *const ForeignLeaf) as usize);
+
+        let mut referents = Vec::new();
+        gc.do_get_referents(holder_ref, &mut |gcref| referents.push(gcref));
+        assert_eq!(referents, vec![leaf_ref]);
     }
 
     #[test]

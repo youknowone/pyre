@@ -1617,10 +1617,16 @@ fn build_gc() -> Box<MiniMarkGC> {
     // on the root so every ordinary offset-traced subclass inherits it
     // through its embedded PyObject header, matching GcStruct `super` field
     // tracing.
-    let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(
-        std::mem::size_of::<pyre_object::PyObject>(),
-        vec![std::mem::offset_of!(pyre_object::PyObject, w_class)],
-    ));
+    let object_tid = gc.register_type(
+        TypeInfo::object_with_gc_ptrs(
+            std::mem::size_of::<pyre_object::PyObject>(),
+            vec![std::mem::offset_of!(pyre_object::PyObject, w_class)],
+        )
+        // RPython's OBJECT.typeptr is non-GC header metadata.  Pyre's
+        // `w_class` is its managed frontend mirror: trace it for liveness but
+        // do not expose it as a Python-level referent.
+        .with_app_level_inspector_hidden_edge(std::mem::offset_of!(pyre_object::PyObject, w_class)),
+    );
     debug_assert_eq!(object_tid, OBJECT_GC_TYPE_ID);
     // W_IntObject / W_FloatObject carry `PyObject.ob_type` at offset 0,
     // matching RPython `rclass.OBJECT` layout (T_IS_RPYTHON_INSTANCE,

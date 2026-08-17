@@ -386,6 +386,14 @@ pub struct TypeInfo {
     /// their relevant edges, while an unmaterialized execution frame is not
     /// itself reported as an app-level referrer.
     pub hide_from_app_level_inspector: bool,
+    /// One frontend-owned GC edge in the common OBJECT header that keeps
+    /// runtime class metadata alive but is not an app-level referent.  PyPy's
+    /// RPython objects carry their class in the non-GC `typeptr`; pyre's
+    /// augmented `PyObject` header additionally stores the corresponding
+    /// Python class in a managed `w_class` slot.  The collector must trace
+    /// that slot, while `gc.get_referents()` must omit it.  Set this on the
+    /// OBJECT root; subclasses inherit it through [`Self::parent`].
+    pub app_level_inspector_hidden_edge_offset: Option<usize>,
     /// Parent class typeid in the `rclass.OBJECT` hierarchy, or
     /// `None` for `rclass.OBJECT` itself / non-OBJECT types.
     /// Mirrors what `classdef.getmro()` traverses in
@@ -443,6 +451,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -468,6 +477,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -513,6 +523,20 @@ impl TypeInfo {
         self
     }
 
+    /// Mark the frontend's managed mirror of RPython's non-GC type pointer.
+    /// This changes app-level inspection only; ordinary GC tracing continues
+    /// to visit the edge.
+    pub fn with_app_level_inspector_hidden_edge(mut self, offset: usize) -> Self {
+        assert!(
+            offset
+                .checked_add(std::mem::size_of::<crate::GcRef>())
+                .is_some_and(|end| end <= self.size),
+            "app-level inspector hidden edge exceeds the object payload"
+        );
+        self.app_level_inspector_hidden_edge_offset = Some(offset);
+        self
+    }
+
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
     /// the singleton WEAKREF GcStruct itself (gctypelayout.py).
     /// The struct payload is one `weakptr: GcRef` slot; the collector
@@ -530,6 +554,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -561,6 +586,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -591,6 +617,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -619,6 +646,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -656,6 +684,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -683,6 +712,7 @@ impl TypeInfo {
             is_object: true,
             has_subclass_range: true,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: Some(parent_typeid),
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -707,6 +737,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -735,6 +766,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -759,6 +791,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
@@ -799,6 +832,7 @@ impl TypeInfo {
             is_object: false,
             has_subclass_range: false,
             hide_from_app_level_inspector: false,
+            app_level_inspector_hidden_edge_offset: None,
             parent: None,
             subclassrange_min: 0,
             subclassrange_max: 0,
