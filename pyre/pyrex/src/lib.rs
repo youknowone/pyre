@@ -111,13 +111,9 @@ fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
     // the first character that is neither, so an indent built from any other
     // character is not a margin at all.
     let mut margin: Option<&str> = None;
-    let mut has_blank_line = false;
     for line in source.split_inclusive('\n') {
         let (content, _) = split_newline(line);
         if is_blank(content) {
-            // An empty line is already what emptying it would produce, so it
-            // alone does not make the source need rewriting.
-            has_blank_line |= !content.is_empty();
             continue;
         }
         let indent_len = content
@@ -137,8 +133,11 @@ fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
         });
     }
 
+    // No margin, no rewriting: a source with a line at column zero keeps its
+    // blank lines as they were written, rather than having them emptied on
+    // their own.
     let margin = margin.unwrap_or("");
-    if margin.is_empty() && !has_blank_line {
+    if margin.is_empty() {
         return std::borrow::Cow::Borrowed(source);
     }
     let mut dedented = String::with_capacity(source.len());
@@ -2102,6 +2101,18 @@ mod tests {
     #[test]
     fn command_dedent_is_raw_text_and_stops_at_column_zero() {
         let source = "    text = \"\"\"\n  inside\ninside\n\"\"\"\n";
+        assert!(matches!(
+            dedent_command(source),
+            std::borrow::Cow::Borrowed(value) if value == source
+        ));
+    }
+
+    #[test]
+    fn command_dedent_leaves_a_blank_line_alone_when_there_is_no_margin() {
+        // Emptying blank lines is part of removing a margin, not something
+        // done on its own: a source with a line at column zero comes back
+        // exactly as it was written.
+        let source = "x = \"\"\"a\n  \nb\"\"\"\n";
         assert!(matches!(
             dedent_command(source),
             std::borrow::Cow::Borrowed(value) if value == source

@@ -46,6 +46,17 @@ done = subprocess.run(
 assert done.returncode == 0, (done.returncode, done.stderr)
 assert done.stdout.strip() == repr("A\n\nB"), done.stdout
 
+# Emptying those lines is part of removing a prefix, not something done on its
+# own: an argument with a line at column zero has no prefix to remove and comes
+# back exactly as it was written, blank lines included.
+done = subprocess.run(
+    [sys.executable, "-c", 'x = """a\n  \nb"""\nprint(repr(x))'],
+    capture_output=True,
+    text=True,
+)
+assert done.returncode == 0, (done.returncode, done.stderr)
+assert done.stdout.strip() == repr("a\n  \nb"), done.stdout
+
 # Only spaces and tabs make a line empty.  Every other whitespace character is
 # content, so a line holding one has an indent of its own: at column zero it
 # leaves no common prefix at all, and after two spaces it narrows the prefix to
