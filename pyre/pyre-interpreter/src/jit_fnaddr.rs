@@ -802,6 +802,22 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_dict_new as *const (),
     );
     push_fnaddr(&mut entries, "w_dict_new", w_dict_new as *const ());
+    // `w_dict_new_instance` is `#[dont_look_inside]` (it dispatches through the
+    // `MAKE_INSTANCE_DICT_HOOK` fn-pointer cell); bind its zero-arg
+    // `fn() -> PyObjectRef` so the residual call resolves, mirroring `w_dict_new`.
+    let w_dict_new_instance: fn() -> pyre_object::PyObjectRef =
+        pyre_object::dictmultiobject::w_dict_new_instance;
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_new_instance",
+        "pyre_object::w_dict_new_instance",
+        w_dict_new_instance as *const (),
+    );
+    push_fnaddr(
+        &mut entries,
+        "w_dict_new_instance",
+        w_dict_new_instance as *const (),
+    );
     // `bool_invert_deprecation_text` is `#[dont_look_inside]` (it hides a
     // `static` prebuilt cell the front-end cannot lift); bind its zero-arg
     // `fn() -> PyObjectRef` so `invert`'s residual call to it resolves.

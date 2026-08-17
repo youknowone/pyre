@@ -1293,6 +1293,13 @@ pub fn clear_make_instance_dict_hook() {
 /// The interpreter installs the mapdict factory once its hooks are available.
 /// The plain-dict fallback keeps pyre-object-only users working before that
 /// initialization.
+///
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// dispatches through the runtime `MAKE_INSTANCE_DICT_HOOK` fn-pointer cell (or
+/// falls back to [`w_dict_new`]); both arms return a fresh dict GCREF, so
+/// residualising the whole getter models it by signature — a plain
+/// `PyObjectRef` — instead of tracing the hook-cell indirection.
+#[majit_macros::dont_look_inside]
 pub fn w_dict_new_instance() -> PyObjectRef {
     match MAKE_INSTANCE_DICT_HOOK.get() {
         Some(factory) => factory(),
