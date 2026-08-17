@@ -152,6 +152,20 @@ pub(crate) fn info_type_matches(expected: Type, incoming: &VirtualStateInfo) -> 
 
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
+
+/// TEMPORARY PROBE: which `_jump_to_existing_trace` runtime fallback may
+/// consult its runtime box. `PYRE_VSTATE_FALLBACK` is a comma-separated subset
+/// of `value,class,nonnull,intbound` (default: all). A disabled fallback reads
+/// its runtime box as absent, which is how every one of them behaved while the
+/// inputargs reached the optimizer valueless.
+fn fallback_enabled(name: &str) -> bool {
+    static SPEC: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| std::env::var("PYRE_VSTATE_FALLBACK").ok());
+    match SPEC.as_deref() {
+        None => true,
+        Some(spec) => spec.split(',').any(|part| part.trim() == name),
+    }
+}
 use crate::optimizeopt::intutils::{IntBound, IntBoundMakeGuards};
 
 /// Abstract info for one value at the loop boundary.
@@ -1549,6 +1563,7 @@ impl VirtualState {
                 // directly on `InputArg*`, so live InputArgs participate —
                 // route through `runtime_value_of`.
                 if runtime_box
+                    .filter(|_| fallback_enabled("value"))
                     .and_then(|runtime_box| state.ctx.runtime_value_of(runtime_box))
                     .is_some_and(|runtime_value| runtime_value == *val)
                 {
@@ -1590,7 +1605,10 @@ impl VirtualState {
                 };
                 // virtualstate.py:601 `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
-                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
+                let Some(runtime_cls) = Some(rb)
+                    .filter(|_| fallback_enabled("class"))
+                    .and_then(|rb| state.ctx.runtime_cls_of(rb))
+                else {
                     return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
@@ -1612,7 +1630,10 @@ impl VirtualState {
                 };
                 // virtualstate.py:608 `cpu.cls_of_box(runtime_box)` reads the
                 // runtime box's own ref (getref_base), no _forwarded walk.
-                let Some(runtime_cls) = state.ctx.runtime_cls_of(rb) else {
+                let Some(runtime_cls) = Some(rb)
+                    .filter(|_| fallback_enabled("class"))
+                    .and_then(|rb| state.ctx.runtime_cls_of(rb))
+                else {
                     return Err(VirtualStatesCantMatch::default());
                 };
                 if runtime_cls != *class_ptr {
@@ -1662,7 +1683,10 @@ impl VirtualState {
                 // (getref_base()), so gate on the runtime value being a
                 // non-null ref — not on mere OpRef presence. A null field
                 // read wrapped as ConstRef(NULL) must NOT emit GUARD_NONNULL.
-                if runtime_box.is_some_and(|rb| state.ctx.runtime_nonnull(rb)) {
+                if runtime_box
+                    .filter(|_| fallback_enabled("nonnull"))
+                    .is_some_and(|rb| state.ctx.runtime_nonnull(rb))
+                {
                     state.extra_guards.push(GuardRequirement::GuardNonnull {
                         arg_index: arg_idx,
                         box_opref,
@@ -1722,6 +1746,7 @@ impl VirtualState {
                     // `to_ops` only after a successful match keeps the const pool
                     // untouched on a rejected match.
                     let within = runtime_box
+                        .filter(|_| fallback_enabled("intbound"))
                         .and_then(|rb| state.ctx.runtime_value_of(rb))
                         .and_then(|v| match v {
                             Value::Int(i) => Some(i),

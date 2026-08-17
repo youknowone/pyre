@@ -792,6 +792,15 @@ pub struct OptContext {
     /// optimizer.py:34 `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
+    /// Bridge frontend values by logical inputarg index. Empty means the
+    /// current optimization run has no runtime-value channel. The values are
+    /// copied onto fresh `InputArgRc` hosts without sharing their forwarding
+    /// identity (`unroll.py:183-193`).
+    pub(crate) trace_inputarg_values: Vec<Option<majit_ir::Value>>,
+    /// Number of distinct inputarg positions that received a concrete value
+    /// while canonical bindings were installed. Used only by the temporary
+    /// bridge diagnostic in `optimizer.rs`.
+    pub(crate) inputarg_value_stamped_positions: usize,
     /// Strong `InputArgRc` ownership for the inputargs seeded by
     /// `with_inputarg_types`. Production traces own their `InputArgRc`s
     /// via `TreeLoop.inputargs`; the test-and-fallback helper
@@ -1744,6 +1753,8 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
+            trace_inputarg_values: Vec::new(),
+            inputarg_value_stamped_positions: 0,
             inputarg_refs: Vec::new(),
             resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
@@ -1847,10 +1858,44 @@ impl OptContext {
         // Void slots are skipped: `InputArg{Int,Ref,Float}` has no Void
         // encoding (resoperation.py:719/727/739), so a Void sentinel in
         // `inputargs` is not a real input-arg host and carries no binding.
+        // TEMPORARY PROBE: which of the two position sets may carry a value.
+        //
+        // Default OFF, so this tree measures exactly as the base does.
+        // `shifted` (and therefore `both`) is the arm that reaches
+        // `_jump_to_existing_trace`'s runtime fallbacks, and it currently
+        // produces wrong output on `defaults_reassigned_midloop` and a hang on
+        // `subscr_negative_index_deopt`; `canonical` is correct but delivers
+        // nothing, because the bridge's runtime boxes name shifted positions.
+        // The channel stays inert until the LEVEL_CONSTANT fallback is
+        // understood.
+        let (canonical_values, shifted_values) =
+            match std::env::var("PYRE_INPUTARG_VALUE_MODE").as_deref() {
+                Ok("canonical") => (true, false),
+                Ok("shifted") => (false, true),
+                Ok("both") => (true, true),
+                _ => (false, false),
+            };
+        self.ensure_inputarg_bindings_with_value_modes(canonical_values, shifted_values);
+    }
+
+    /// `ensure_inputarg_bindings`' body with the value-carriage decision handed
+    /// in, so a test can exercise the channel without touching the process
+    /// environment. `usize::MAX` indexes past `trace_inputarg_values`, so a
+    /// disabled set binds exactly as it did before the channel existed.
+    pub(crate) fn ensure_inputarg_bindings_with_value_modes(
+        &mut self,
+        canonical_values: bool,
+        shifted_values: bool,
+    ) {
         for op in self.inputargs.clone() {
             match op.ty() {
                 Some(tp) if tp != majit_ir::Type::Void => {
-                    self.bind_canonical_inputarg(op.raw() as usize, tp);
+                    let logical_index = if canonical_values {
+                        op.raw() as usize
+                    } else {
+                        usize::MAX
+                    };
+                    self.bind_canonical_inputarg(op.raw() as usize, tp, logical_index);
                 }
                 _ => {}
             }
@@ -1859,7 +1904,8 @@ impl OptContext {
         for i in 0..self.num_inputs as usize {
             match self.inputargs.get(i).and_then(|op| op.ty()) {
                 Some(tp) if tp != majit_ir::Type::Void => {
-                    self.bind_canonical_inputarg(base + i, tp);
+                    let logical_index = if shifted_values { i } else { usize::MAX };
+                    self.bind_canonical_inputarg(base + i, tp, logical_index);
                 }
                 _ => {}
             }
@@ -1873,15 +1919,33 @@ impl OptContext {
     /// `_forwarded` chain / live `Weak<InputArg>` chain targets on it) and only
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
     /// the `materialize_operand_at` InputArg arm).
-    fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
+    ///
+    /// `logical_index` names the same argument in `trace_inputarg_values`, whose
+    /// concrete value is stamped onto the host here. The two indices differ
+    /// because one argument occupies two positions: the canonical one at
+    /// `op.raw()` and the shifted per-iteration one at `inputarg_base + i`. A
+    /// host that already carries a value keeps it, and an index the vector does
+    /// not cover stamps nothing — the vector is empty on every non-bridge run,
+    /// which is why those paths bind exactly as before.
+    fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type, logical_index: usize) {
         if pos >= self.inputarg_refs.len() {
             self.inputarg_refs
                 .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+        }
+        if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
             self.inputarg_refs[pos] =
                 std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
-        } else if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
-            self.inputarg_refs[pos] =
-                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+        }
+        let value = self
+            .trace_inputarg_values
+            .get(logical_index)
+            .copied()
+            .flatten();
+        if self.inputarg_refs[pos].get_value().is_none()
+            && let Some(value) = value
+        {
+            self.inputarg_refs[pos].set_value(value);
+            self.inputarg_value_stamped_positions += 1;
         }
     }
 
@@ -2370,6 +2434,8 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
+            trace_inputarg_values: Vec::new(),
+            inputarg_value_stamped_positions: 0,
             inputarg_refs: Vec::new(),
             resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
@@ -8849,6 +8915,55 @@ mod input_ops_index_tests {
         assert!(
             !Rc::ptr_eq(&producer, &first),
             "the earlier occurrence must be shadowed by the later one"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bridge_inputarg_runtime_value_tests {
+    use super::*;
+    use majit_ir::{InputArg, OpRef, Type, Value};
+
+    #[test]
+    fn bridge_inputarg_runtime_value_reaches_shifted_optimizer_host() {
+        let source = InputArg::new_int(0);
+        source.set_value(Value::Int(73));
+
+        let bridge_inputarg_base = 41;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            0,
+            1,
+            bridge_inputarg_base,
+            bridge_inputarg_base + 1,
+        );
+        ctx.inputargs = vec![source.opref()];
+        ctx.trace_inputarg_values = vec![source.get_value()];
+        ctx.ensure_inputarg_bindings_with_value_modes(true, true);
+
+        assert_eq!(
+            ctx.runtime_value_of(OpRef::input_arg_typed(bridge_inputarg_base, Type::Int,)),
+            Some(Value::Int(73)),
+        );
+    }
+
+    #[test]
+    fn bridge_inputarg_without_runtime_value_stays_unknown() {
+        let source = InputArg::new_int(0);
+
+        let bridge_inputarg_base = 41;
+        let mut ctx = OptContext::with_num_inputs_and_start_pos(
+            0,
+            1,
+            bridge_inputarg_base,
+            bridge_inputarg_base + 1,
+        );
+        ctx.inputargs = vec![source.opref()];
+        ctx.trace_inputarg_values = vec![source.get_value()];
+        ctx.ensure_inputarg_bindings_with_value_modes(true, true);
+
+        assert_eq!(
+            ctx.runtime_value_of(OpRef::input_arg_typed(bridge_inputarg_base, Type::Int,)),
+            None,
         );
     }
 }
