@@ -4265,6 +4265,22 @@ fn read_code_unit(data: &[u8], pos: usize, unit: usize, big_endian: bool) -> u32
     }
 }
 
+/// Which buffer a decode error handler's returned position is folded against,
+/// and with it whether `exc.object` is reread at all.
+enum DecodeResume {
+    /// `unicodeobject.c` rereads `exc.object` once the handler returns and
+    /// goes on decoding *that*, so a handler which replaced it redirects
+    /// decoding, the position is bounded by what it left behind, and a
+    /// non-bytes value there is an error.
+    RereadObject,
+    /// `multibytecodec_decerror` folds the position against the buffer
+    /// decoding started on and goes on decoding that one.  It never reads
+    /// `exc.object` back, so replacing it neither redirects decoding nor
+    /// widens the range a position may name, and a non-bytes value is
+    /// simply not looked at.
+    OriginalInput,
+}
+
 /// interp_codecs.py:33-108 `call_errorhandler` (decode branch): invoke a
 /// custom handler registered through `_codecs.register_error` for a decode
 /// error position.
@@ -4282,6 +4298,54 @@ pub(crate) fn call_registered_decode_error_handler(
     end: usize,
     reason: &str,
     out: &mut Wtf8Buf,
+) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
+    call_decode_error_handler(
+        err_mode,
+        codec,
+        data,
+        start,
+        end,
+        reason,
+        out,
+        DecodeResume::RereadObject,
+    )
+}
+
+/// [`call_registered_decode_error_handler`] for a multibyte codec, which
+/// resumes in the buffer it started on whatever the handler did to
+/// `exc.object`.  Only the position comes back.
+pub(crate) fn call_registered_multibyte_decode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut Wtf8Buf,
+) -> Result<usize, crate::PyError> {
+    let (newpos, _) = call_decode_error_handler(
+        err_mode,
+        codec,
+        data,
+        start,
+        end,
+        reason,
+        out,
+        DecodeResume::OriginalInput,
+    )?;
+    Ok(newpos)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_decode_error_handler(
+    err_mode: &str,
+    codec: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+    out: &mut Wtf8Buf,
+    resume_in: DecodeResume,
 ) -> Result<(usize, Option<Vec<u8>>), crate::PyError> {
     let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
         crate::PyError::new(
@@ -4315,17 +4379,23 @@ pub(crate) fn call_registered_decode_error_handler(
     // returns.  The handler may have replaced it, in which case decoding
     // resumes from the new bytes.  A non-bytes object is rejected (the
     // decode C code checks PyBytes_Check on the reread object).
-    let w_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_object(w_exc) };
-    if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
-        return Err(crate::PyError::type_error(
-            "UnicodeError 'object' attribute must be a bytes",
-        ));
-    }
-    let new_bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) };
+    let new_bytes = match resume_in {
+        DecodeResume::RereadObject => {
+            let w_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_object(w_exc) };
+            if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
+                return Err(crate::PyError::type_error(
+                    "UnicodeError 'object' attribute must be a bytes",
+                ));
+            }
+            Some(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) })
+        }
+        DecodeResume::OriginalInput => None,
+    };
 
-    // newpos folds against the reread object's length (unicodeobject.c
-    // insize), which the loop resumes into.
-    let length = new_bytes.len() as i64;
+    // newpos folds against the length of whichever buffer decoding resumes
+    // in: the reread object (unicodeobject.c insize), or the one it started
+    // on (`multibytecodec_decerror`'s `size`).
+    let length = new_bytes.map_or(data.len(), <[u8]>::len) as i64;
     let mut newpos = match crate::baseobjspace::int_w(w_newpos) {
         Ok(n) => n,
         Err(e) => {
@@ -4347,10 +4417,9 @@ pub(crate) fn call_registered_decode_error_handler(
     }
 
     out.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(w_replace) });
-    let resume = if new_bytes == data {
-        None
-    } else {
-        Some(new_bytes.to_vec())
+    let resume = match new_bytes {
+        Some(bytes) if bytes != data => Some(bytes.to_vec()),
+        _ => None,
     };
     Ok((newpos as usize, resume))
 }

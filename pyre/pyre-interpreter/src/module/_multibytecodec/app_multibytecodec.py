@@ -114,6 +114,12 @@ class MultibyteIncrementalEncoder:
         self.errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
         self.codec = _codec_of(self)
         self.pending = ""
+        # `MultibyteCodec_State`, the shift state a stateful codec threads
+        # through its encode calls.  Every codec `_codecs_jp` carries is
+        # stateless, so nothing here ever writes it -- `encreset` is NULL for
+        # them, which is also why `reset` below leaves it alone -- but
+        # `setstate` still has to give it back, so it is carried verbatim.
+        self.state = bytes(8)
 
     def encode(self, object, final=False):
         data = self.pending + object
@@ -126,16 +132,14 @@ class MultibyteIncrementalEncoder:
 
     def getstate(self):
         # `interp_incremental.py:152-164`.  The state is one little-endian
-        # integer over a fixed 17-byte buffer:
+        # integer over a 17-byte buffer:
         #   byte 0             length of the pending utf-8, 0..8
         #   bytes 1..1+length  the pending code points, utf-8
         #   the 8 bytes after  the codec state
-        # Each `encode` here runs a fresh engine that is reset when it
-        # returns, so the codec state is always its initial all-zero value.
         pending = self.pending.encode("utf-8")
         if len(pending) > 8:
             raise UnicodeError("pending buffer too large")
-        buffer = bytes([len(pending)]) + pending + bytes(8)
+        buffer = bytes([len(pending)]) + pending + self.state
         return int.from_bytes(buffer, "little")
 
     def setstate(self, state):
@@ -153,8 +157,10 @@ class MultibyteIncrementalEncoder:
             raise UnicodeError("pending buffer too large")
         pending = buffer[1 : 1 + pending_len]
         try:
-            self.pending = pending.decode("utf-8")
+            decoded = pending.decode("utf-8")
         except UnicodeDecodeError as ex:
+            # Neither half is stored when the pending buffer does not decode,
+            # the way `mbiencoder_setstate` returns before both writes.
             raise UnicodeDecodeError(
                 "utf-8",
                 pending,
@@ -162,6 +168,8 @@ class MultibyteIncrementalEncoder:
                 ex.start + 1,
                 "invalid utf-8 in setstate pending buffer",
             ) from None
+        self.pending = decoded
+        self.state = buffer[1 + pending_len : 9 + pending_len]
 
 
 class MultibyteStreamReader(MultibyteIncrementalDecoder):

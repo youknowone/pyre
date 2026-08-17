@@ -217,12 +217,11 @@ fn decode_impl(
                 let mut text = Wtf8Buf::new();
                 // `multibytecodec_decerror` folds the returned position against
                 // the buffer decoding started on and goes on decoding that one,
-                // so a handler that put different bytes on `exc.object` does not
-                // redirect it.
-                let (newpos, _swapped_object) =
-                    crate::type_methods::call_registered_decode_error_handler(
-                        errors, name, input, start, end, reason, &mut text,
-                    )?;
+                // so a handler that put different bytes on `exc.object` neither
+                // redirects it nor widens the range a position may name.
+                let newpos = crate::type_methods::call_registered_multibyte_decode_error_handler(
+                    errors, name, input, start, end, reason, &mut text,
+                )?;
                 (text_to_wchars(&text).0, newpos)
             }
         };
