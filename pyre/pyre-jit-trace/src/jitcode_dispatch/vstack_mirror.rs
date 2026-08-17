@@ -540,6 +540,17 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
         // and the shadow-backed hole-fill declines any slot the virtualizable
         // does not carry, and those holes are exactly what the snapshot
         // restores.
+        //
+        // Such a restore can replace a live-looking Ref with a NULL const-ptr,
+        // and that is the intended outcome rather than a lost box.  A `with`
+        // block keeps the resolved `__exit__` and its `self_or_null` NULL side
+        // by side at the base of the block's stack for the whole body, and the
+        // NULL's slot is the one the callable's own push wrote last, so a
+        // reseed inside the region refills it from the shadow with the
+        // callable.  The snapshot is what puts the NULL back.  Extending the
+        // mask over these slots would keep the callable instead — the shape a
+        // blackhole resuming into WITH_EXCEPT_START calls with the receiver
+        // twice.
         if mask.iter().all(|&w| !w) {
             ctx.vstack_boxes = saved;
         } else {
