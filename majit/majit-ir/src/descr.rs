@@ -19,7 +19,7 @@
 ///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs:549`) compare
 ///   descrs via `opt_descr_ptr_eq` for the same reason.
 /// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
-///   (`majit-metainterp/src/resume.rs:1496/1523`) and
+///   (`majit-metainterp/src/resume.rs`) and
 ///   `PendingFieldLayoutSummary` (`majit-ir/src/resumedata.rs:137`) use
 ///   the canonical `resumedata::opt_descr_arc_ptr_eq`.
 /// * `GuardPendingFieldEntry` (resoperation.rs:892) carries

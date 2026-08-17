@@ -4221,7 +4221,7 @@ impl Optimizer {
             // jitcell is the one the recorded close JUMP points to, which is
             // also where `front_target_tokens` comes from (`compile_bridge`
             // resolves it off the JUMP target, not the bridge origin).
-            // `assert cell_token.target_tokens` ⇒ require a target.
+            // `assert cell_token.target_tokens`: require a target.
             if !front_target_tokens.is_empty() {
                 let mut ctx = self.final_ctx.take().unwrap_or_else(|| {
                     // opencoder.py:259 inputarg_from_tp parity — seed inputarg
