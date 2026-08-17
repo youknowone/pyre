@@ -12948,25 +12948,27 @@ fn write_barrier_after_ref_store(container: i64) {
     }
 }
 
-/// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
-/// helper for integer and float fields. Ref fields use a pointer-width
-/// store in `bh_setfield_gc_r`, matching `llmodel.py:723`.
-fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-    let field_offset = descr_info.offset;
+/// `resume.py:1518 cpu.bh_setfield_gc_i` → `llmodel.py:717-721
+/// bh_setfield_gc_i`, which unpacks the field's size and hands it to
+/// `write_int_at_mem`.
+///
+/// The width dispatch is the CPU model's, not this object model's, so
+/// it is not repeated here.
+fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
     if struct_ptr == 0 {
         return;
     }
-    majit_gc::bh_probe_note_store(struct_ptr as usize, field_offset, 8);
+    majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+    // SAFETY: `struct_ptr` is a materialized virtual; offset and size come
+    // from the field descriptor that described the store being replayed.
     unsafe {
-        let ptr = (struct_ptr as *mut u8).add(field_offset);
-        match descr_info.field_size {
-            8 => (ptr as *mut i64).write(value),
-            4 => (ptr as *mut i32).write(value as i32),
-            2 => (ptr as *mut i16).write(value as i16),
-            1 => ptr.write(value as u8),
-            _ => (ptr as *mut i64).write(value),
-        }
-    }
+        majit_backend::llmodel::write_int_at_mem(
+            struct_ptr as usize,
+            descr_info.offset,
+            descr_info.field_size,
+            value,
+        )
+    };
 }
 
 const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
@@ -13159,7 +13161,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+        bh_setfield_gc_int_write(struct_ptr, value, descr_info);
     }
 
     fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -13178,16 +13180,36 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // points at it, and the following major mark reads a dangling header.
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
         majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 7);
+        // SAFETY: see `bh_setfield_gc_int_write`.
         unsafe {
-            ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
-        }
+            majit_backend::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                value as usize,
+            )
+        };
         // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
         // ref store carries an implied write barrier on the destination struct.
         write_barrier_after_ref_store(struct_ptr);
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+        if struct_ptr == 0 {
+            return;
+        }
+        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+        // `resume.py:1515` → `llmodel.py:730-734 bh_setfield_gc_f`, which
+        // unpacks only the offset: float fields are excluded from the size
+        // table, so this store takes the storage width and no `field_size`.
+        // `value` carries the FLOATSTORAGE bits, the deadframe's untyped form.
+        // SAFETY: see `bh_setfield_gc_int_write`.
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                f64::from_bits(value as u64),
+            )
+        };
     }
 
     fn bh_setarrayitem_gc_i(
