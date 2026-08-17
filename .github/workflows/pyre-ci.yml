@@ -330,6 +330,12 @@ jobs:
           /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/share/boost
         sudo docker image prune --all --force || true
         df -h /
+    - name: Build test binaries (dynasm)
+      shell: bash
+      # Separate compilation failures from test failures in the job log. The
+      # following test command reuses these artifacts.
+      run: cargo test --all --no-run --no-default-features --features dynasm
+
     - name: Run cargo tests (dynasm)
       shell: bash
       # Only ONE full-workspace run. The dynasm pass runs the whole workspace
@@ -341,6 +347,16 @@ jobs:
       # relinking ~15 extra test binaries (the majit-translate harness alone
       # links >2900 tests).
       run: cargo test --all --no-default-features --features dynasm
+
+    - name: Build test binaries (cranelift)
+      shell: bash
+      # Keep this package list identical to the cranelift test step below.
+      run: |
+        cargo test --no-run --no-default-features --features cranelift \
+          -p majit-metainterp -p majit-backend-cranelift \
+          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
+          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
+          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
 
     - name: Run cargo tests (cranelift)
       shell: bash

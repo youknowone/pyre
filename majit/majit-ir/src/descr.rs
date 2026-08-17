@@ -4439,8 +4439,9 @@ pub trait SizeDescr: Descr {
     /// The class word's slot position within `all_fielddescrs()`, or `None`
     /// when this layout has no class word *in that list*.
     ///
-    /// ⛔ Deliberately NOT answered from [`Self::class_word_field`].  That one
-    /// searches `gc_fielddescrs()` first, and `with_extra_gc_fielddescr`
+    /// This is deliberately not answered from [`Self::class_word_field`]. That
+    /// accessor searches `gc_fielddescrs()` first, and
+    /// `with_extra_gc_fielddescr`
     /// appends header edges that are **absent from `all_fielddescrs()` on
     /// purpose** — its doc says "kept out of `all_fielddescrs` so the
     /// positional indexing above is unaffected".  `index_in_parent` is defined
@@ -4493,7 +4494,7 @@ pub trait SizeDescr: Descr {
     /// that case the GC list is the answer every byte-offset consumer here
     /// was already using.
     ///
-    /// ⚠ It answers with the *first* declaring entry.  A layout that publishes
+    /// It answers with the *first* declaring entry. A layout that publishes
     /// two — pyre's `Method` declares a payload field named `w_class` beside
     /// the inherited header, and the legacy name inference accepts both — gets
     /// the earlier one, which is not the header.  Pinned by
@@ -4665,7 +4666,7 @@ pub trait FieldDescr: Descr {
     /// resolves through the owner's value-field list, so the sites that must
     /// skip header fields ask this rather than spelling the union.
     ///
-    /// ⛔ This is the right question **only** where the two header fields are
+    /// This is the right question only where the two header fields are
     /// genuinely interchangeable.  It must not be substituted for
     /// `is_w_class()` at a site that has already handled `typeptr`
     /// separately: `virtualize.rs`'s GETFIELD fold resolves a `typeptr` from
@@ -5403,7 +5404,7 @@ pub struct SimpleFieldDescr {
 
 /// Guess from a descr's display name whether it is a class word.
 ///
-/// ⛔ **A fallback, not a rule.** It cannot separate a header row from a
+/// This is a fallback, not a layout rule. It cannot separate a header row from a
 /// payload field a host happens to spell the same way — pyre's `Method`
 /// carries both an inherited header and a payload field named `w_class`, and
 /// this returns `true` for both. Any producer that knows its own layout must
@@ -5411,7 +5412,7 @@ pub struct SimpleFieldDescr {
 /// `SimpleFieldDescr::with_class_word`.
 ///
 /// It survives for one caller: the serialized-`BhDescr` path, which rebuilds a
-/// descr from a field name with no layout in reach. ⚠ That also means a
+/// descr from a field name with no layout in reach. Consequently, a
 /// declaration does **not** survive a blackhole round trip — `BhFieldSpec`
 /// carries no flag, so a descr rebuilt from one falls back to this guess.
 pub fn class_word_inferred_from_name(name: &str) -> bool {

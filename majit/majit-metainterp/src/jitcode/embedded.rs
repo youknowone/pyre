@@ -131,9 +131,9 @@ impl EmbeddedJitCodeTable {
 
     /// Install this pool as the process-global `descr_at` fallback.
     ///
-    /// Idempotent through [`init_global_build_descr_pool`]: the first table
-    /// wins. Until this runs, a shell's operands resolve against its own empty
-    /// `exec.descrs` and every lookup returns `None`.
+    /// Idempotent through [`crate::jitcode::init_global_build_descr_pool`]: the
+    /// first table wins. Until this runs, a shell's operands resolve against
+    /// its own empty `exec.descrs` and every lookup returns `None`.
     pub fn install_as_global_pool(&'static self) {
         super::init_global_build_descr_pool(self);
     }

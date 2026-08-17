@@ -73,7 +73,7 @@ fn w_class_store_is_covered_by_alloc(
     let Some(init_field) = size.class_word_field() else {
         return false;
     };
-    // ⛔ Do NOT drop this comparison because the slot is now declared. The
+    // Keep this comparison even though the slot is now declared. The
     // declared slot replaces the *name* test and nothing else. `field` comes
     // from the operation and `init_field` from the layout, and pyre mints
     // those from two independent producers, so they are distinct objects that

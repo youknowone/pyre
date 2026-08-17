@@ -13852,10 +13852,9 @@ fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
 /// `items[0]` and must keep its residual `add`.
 ///
 /// Recognised through [`is_object_items_block_base_accessor`], the same
-/// module-qualified suffix brick 1 keys on. An earlier revision matched two
-/// whole `pyre_object::` paths here while brick 1 already matched by suffix,
-/// which made brick 3 strictly narrower than the rewrite it is paired with —
-/// see that function for why the two must not disagree.
+/// module-qualified suffix brick 1 keys on. Matching whole `pyre_object::`
+/// paths here would make brick 3 strictly narrower than the rewrite it is
+/// paired with; see that function for why the two must not disagree.
 fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return false;
@@ -16211,11 +16210,10 @@ fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 /// array ops. [`raw_ptr_pointee_class_root`] answering `Some` rejects a
 /// pointer-to-pointer whose pointee is not a class at all.
 ///
-/// The root is DERIVED, not fixed. An earlier revision compared it against the
-/// literal `"PyObject"`, which made the whole route unreachable from any host
-/// but pyre — `adt_node_class_root` answers with the pointee's own leaf name,
-/// so a host class family rooted at some other header answered its own name
-/// and was declined for having one. That is the same correction
+/// The root is derived rather than fixed. Comparing it against the literal
+/// `"PyObject"` would make the route unreachable from any other host:
+/// `adt_node_class_root` answers with the pointee's own leaf name, so a class
+/// family rooted at another header answers its own name. This matches
 /// `Lowering::resolve_place`'s class-singleton narrow already carries: a
 /// prebuilt is annotated with the class of the object itself
 /// (`rpython/annotator/bookkeeper.py:339-345`), so the root comes off the type

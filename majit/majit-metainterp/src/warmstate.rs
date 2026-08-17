@@ -1220,7 +1220,7 @@ impl WarmEnterState {
     /// reader enters at `jitcounter.lookup_chain(hash)`
     /// (warmstate.py:459-460, :597-598, :632-633), and `lookup_chain`
     /// (counter.py:239-240) is a bare `celltable[self._get_index(hash)]`. See
-    /// [`a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket`].
+    /// `a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket`.
     #[inline]
     pub fn bucket_is_chained(&self, green_key_hash: u64) -> bool {
         self.lookup_chain(green_key_hash)
@@ -5318,8 +5318,8 @@ mod tests {
     /// chains every cell whose `should_remove_jitcell` is false, so three warm
     /// keys sharing a bucket is enough.
     ///
-    /// **Pre-fix reading.** This test does not fail, it HANGS — the run was
-    /// killed after 11 minutes of CPU inside `mint_cell_key`'s retry loop.
+    /// A regression does not reach an assertion: it hangs in
+    /// `mint_cell_key`'s retry loop because every retry proposes the same key.
     #[test]
     fn a_bucket_that_mints_twice_gets_two_different_keys() {
         let mut ws = WarmEnterState::new(100);
@@ -5387,19 +5387,10 @@ mod tests {
     /// (counter.py:239-240) is a bare `celltable[self._get_index(hash)]` with
     /// nothing in front of it.
     ///
-    /// **Pre-fix reading.** Routing `bucket_is_chained` through `bucket_of`
-    /// fails the third assertion below, and substituting that one line back is
-    /// the whole difference between the two trees:
-    ///
-    /// ```text
-    /// panicked at majit/majit-metainterp/src/warmstate.rs:5446:9:
-    /// the two readers of one raw hash must describe ONE bucket: `sole_cell_key`
-    /// declined because the bucket this hash names is chained, and this answered
-    /// `unchained` about the bucket `bucket_of` sent it to instead
-    /// ```
-    ///
-    /// The assertions after it are what that costs: the entry resolves to a
-    /// cell belonging to neither the arriving key nor its sibling.
+    /// Routing `bucket_is_chained` through `bucket_of` makes the readers
+    /// disagree about whether this raw hash names a chained bucket. The later
+    /// assertions pin the consequence: the entry would resolve to a cell
+    /// belonging to neither the arriving key nor its sibling.
     #[test]
     fn a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket() {
         let mut ws = WarmEnterState::new(100);
