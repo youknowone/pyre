@@ -233,15 +233,27 @@ def traceback_verdict(lines: list[str], header: int) -> str:
     A chained exception prints one traceback per link, joined by `The above
     exception ...` / `During handling ...`. The last link is the one the test
     actually failed with, so each banner overwrites the previous answer.
+
+    The exception line alone is not always the cause. `assertSetEqual`,
+    `assertDictEqual` and `assertMultiLineEqual` put a header on the
+    `AssertionError` line ("Items in the first set but not the second:") and
+    the values that differ on the unindented lines below it, so a digest that
+    stops at the exception says only that some set differed. The first few of
+    those lines follow the verdict — for a case that only fails on the CI host,
+    the differing value is what identifies which assertion in the test ran into
+    the defect.
     """
     verdict = "(no traceback)"
+    detail: list[str] = []
     armed = False
+    capturing = False
     for line in lines[header + 1:]:
         stripped = line.strip()
         if stripped.startswith("====") or stripped.startswith("Ran "):
             break
         if stripped.startswith("Traceback ("):
             armed = True
+            capturing = False
             continue
         # Continuation lines of a traceback are indented, its separator rules
         # are punctuation, and blank lines end nothing.
@@ -251,11 +263,16 @@ def traceback_verdict(lines: list[str], header: int) -> str:
             continue
         if armed:
             verdict = stripped[:160]
+            detail = []
             armed = False
+            capturing = True
+        elif capturing:
+            if len(detail) < 4:
+                detail.append(stripped[:80])
         elif verdict == "(no traceback)":
             # No banner opened this block — a bare `SkipTest` reason, say.
             verdict = stripped[:160]
-    return verdict
+    return " ".join([verdict, *detail])
 
 
 def failure_digest(out: str, err: str) -> str:
