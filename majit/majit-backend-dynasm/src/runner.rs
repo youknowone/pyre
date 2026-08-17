@@ -2637,15 +2637,15 @@ impl Backend for DynasmBackend {
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
         let const_pool = std::mem::take(&mut self.constants);
-        let constants: indexmap::IndexMap<u32, i64> = const_pool
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
         let trace_ops_diag = std::env::var("PYRE_TRACE_OPS_DIAG")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             == Some(trace_id);
         if trace_ops_diag {
+            let constants: IndexMap<u32, i64> = const_pool
+                .iter()
+                .map(|(&k, c)| (k, c.as_raw_i64()))
+                .collect();
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
