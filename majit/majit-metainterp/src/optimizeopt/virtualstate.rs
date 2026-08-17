@@ -1337,16 +1337,28 @@ impl VirtualState {
             // at the top level it is always present.
             let box_opref = boxes[i];
             let runtime_box = Some(runtime_boxes[i]);
-            if Self::generate_guards_for_entry_recursive(
+            // TEMPORARY PROBE: every entry's verdict, not just the mismatch
+            // below, so two runs can be diffed to find which entries a runtime
+            // fallback newly accepted.
+            let trace_entries = std::env::var_os("PYRE_VSTATE_TRACE").is_some();
+            let guards_before = state.extra_guards.len();
+            let outcome = Self::generate_guards_for_entry_recursive(
                 i,
                 expected,
                 incoming,
                 box_opref,
                 runtime_box,
                 &mut state,
-            )
-            .is_err()
-            {
+            );
+            if trace_entries {
+                let rv = runtime_box.and_then(|rb| state.ctx.runtime_value_of(rb));
+                eprintln!(
+                    "[vstate] i={i} {} +{}g box={box_opref:?} rb={runtime_box:?} rv={rv:?} exp={expected:?} inc={incoming:?}",
+                    if outcome.is_ok() { "OK " } else { "ERR" },
+                    state.extra_guards.len() - guards_before,
+                );
+            }
+            if outcome.is_err() {
                 if crate::log_jtet_enabled() {
                     let runtime_value = runtime_box.and_then(|rb| {
                         state
