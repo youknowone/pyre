@@ -3084,10 +3084,13 @@ fn call_with_kwargs_in_ctx_impl(
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }
         {
+            // The constructor names itself the way its own argument clause
+            // does — bare, without the defining module — so a dotted type
+            // reports `BZ2Compressor()`, not `_bz2.BZ2Compressor()`.
             let type_name = unsafe { pyre_object::w_type_get_name(current_type()) };
+            let type_name = type_name.rsplit('.').next().unwrap_or(type_name);
             return Err(crate::PyError::type_error(format!(
-                "{}() takes no keyword arguments",
-                type_name,
+                "{type_name}() takes no keyword arguments",
             )));
         }
         // Three-argument `type(name, bases, namespace, **kw)` must select the
