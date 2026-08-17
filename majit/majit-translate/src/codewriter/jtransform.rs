@@ -9006,13 +9006,20 @@ mod tests {
         }
     }
 
+    /// A method call whose override says `Residual` lowers to the const
+    /// target plus a `CallResidual`, and is counted once.
+    ///
+    /// The table is built here rather than borrowed from an interpreter:
+    /// the subject is the transformer's reading of an override, so the
+    /// only row that matters is the one the call matches, and its
+    /// spelling is arbitrary.
     #[test]
     fn transform_graph_classifies_calls() {
         let mut graph = FunctionGraph::new("test");
         graph.push_op_var(
             graph.startblock,
             OpKind::Call {
-                target: CallTarget::method("call_callable", Some("PyFrame".into())),
+                target: CallTarget::method("do_call", Some("Frame".into())),
                 args: vec![],
                 result_ty: ValueType::Ref(None),
             },
@@ -9020,10 +9027,14 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = transform_graph(
-            &graph,
-            &crate::test_support::pyre_pipeline_config().transform,
-        );
+        let config = GraphTransformConfig {
+            call_effects: vec![CallEffectOverride::new(
+                CallTarget::method("do_call", Some("Frame".to_string())),
+                CallEffectKind::Residual,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
         assert_eq!(result.calls_classified, 1);
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,

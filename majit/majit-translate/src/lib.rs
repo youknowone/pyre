@@ -96,8 +96,6 @@ mod parse;
     )
 )]
 pub mod pipeline;
-#[cfg(test)]
-mod test_support;
 // `translator/` is the RPython-orthodox port home — see
 // `translator/mod.rs` for the contract.  Currently hosts
 // `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
