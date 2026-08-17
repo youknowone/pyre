@@ -4734,7 +4734,6 @@ impl Optimizer {
                     return Ok(());
                 }
                 OptimizationResult::Remove => {
-                    // optimizer.py:573-575: op removed → no postprocess.
                     ctx.pending_mark_last_guard = None;
                     ctx.pending_guard_class_postprocess = None;
                     // optimizer.py:84-92 `last_emitted_operation = REMOVED`
@@ -4742,6 +4741,14 @@ impl Optimizer {
                     // (e.g. `optimize_GUARD_NO_EXCEPTION`,
                     // rewrite.py:712-718) can observe the drop.
                     ctx.last_op_removed = true;
+                    // optimizer.py:600-616: a removal ends the WALK
+                    // (`op = None; break`) but not the callbacks — the
+                    // `opt_results` collected before it still run, in reverse.
+                    // Same loop as the Restart arm above.
+                    for &pp_idx in postprocess_passes.iter().rev() {
+                        self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+                    }
+                    self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
                 }
                 OptimizationResult::PassOn => {

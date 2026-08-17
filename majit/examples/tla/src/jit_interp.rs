@@ -355,9 +355,18 @@ mod tests {
              the interpreter is answering alone, which every other assertion in \
              this file would still pass"
         );
+        // 24 until removals started running the postprocess callbacks the pass
+        // chain had already collected for them (`send_extra_operation`,
+        // optimizer.py:600-616, ends the walk but not the callbacks).
+        // `postprocess_INT_SUB` synthesises up to six reverse-pure entries per
+        // op via `pure_from_args2`, so running it for the ops OptPure itself
+        // removes fills the 16-slot `RecentPureOps` ring: this subject's second
+        // exit test recomputes `v - 254`, `v - 509` and `v - 764`, and those
+        // three no longer find the first test's copies in the ring. +3 ops in
+        // the preamble and +3 in the peeled body.
         assert_eq!(
-            ops_after, 24,
-            "compiled loop body is {ops_after} ops, not the pinned 24 — a value \
+            ops_after, 30,
+            "compiled loop body is {ops_after} ops, not the pinned 30 — a value \
              of 1 means the body is a bare `Finish()`, i.e. a dispatch that \
              lowered nothing at all"
         );
