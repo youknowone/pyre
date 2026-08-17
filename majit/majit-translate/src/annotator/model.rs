@@ -248,38 +248,6 @@ fn same_struct_identity(a: &str, b: &str) -> bool {
     identity(a) == identity(b)
 }
 
-/// True when `option_name` spells a one-word niche `Option<*mut X>` /
-/// `Option<*const X>` whose pointee `X` is the same nominal type as
-/// `pointee_name`.
-///
-/// A raw-pointer Option payload lowers to a single nullable pointer word
-/// (`None` → null, `Some(p)` → the pointer), and mints a classdef named after
-/// its instantiated type (`core::option::Option<*mut PyObject>`).  When such a
-/// value merges with a bare `X` instance at a block phi or a field write, the
-/// two carry unrelated classdefs and `commonbase` returns None — yet the join
-/// is well-defined: a maybe-null pointer to `X` unioned with an `X` is a
-/// maybe-absent `X`.  This predicate recognises the shape so the union can
-/// recover `SomeInstance(X, can_be_none=true)` instead of failing "no common
-/// base".  Pointee identity reuses [`same_struct_identity`] so the inner
-/// crate-stripped `X` spelling reconciles with the qualified `m::X` operand.
-fn option_ptr_pointee_matches(option_name: &str, pointee_name: &str) -> bool {
-    let Some(inner) = option_name
-        .strip_prefix("core::option::Option<")
-        .and_then(|s| s.strip_suffix('>'))
-        .map(str::trim)
-    else {
-        return false;
-    };
-    let Some(pointee) = inner
-        .strip_prefix("*mut ")
-        .or_else(|| inner.strip_prefix("*const "))
-        .map(str::trim)
-    else {
-        return false;
-    };
-    same_struct_identity(pointee, pointee_name)
-}
-
 // ---------------------------------------------------------------------------
 // SomeObject base — RPython `model.py:51-125`.
 // ---------------------------------------------------------------------------
@@ -3307,7 +3275,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // which walks the classdef MRO to find the common base and
         // keeps only flags that agree on both sides.
         (SomeValue::Instance(a), SomeValue::Instance(b)) => {
-            let mut can_be_none = a.can_be_none || b.can_be_none;
+            let can_be_none = a.can_be_none || b.can_be_none;
             // binaryop.py:666-672 unions two SomeInstances through
             // `commonbase(classdef1, classdef2)`.  The `classdef is
             // None` case is a special case that yields `basedef = None`;
@@ -3325,19 +3293,6 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                         // crate-stripped `::` field-read spelling): two
                         // base-less leaves with no shared base but the same
                         // canonical identity.  Unify to the lhs class.
-                        Some(ca.clone())
-                    }
-                    None if option_ptr_pointee_matches(&ca.borrow().name, &cb.borrow().name) => {
-                        // `Option<*mut X>` ∪ `X`: a one-word nullable
-                        // Option-of-raw-pointer joined with a bare X instance
-                        // is a maybe-absent X.  Recover the pointee class and
-                        // mark it nullable rather than failing "no common
-                        // base" — the same widening as `None ∪ X`.
-                        can_be_none = true;
-                        Some(cb.clone())
-                    }
-                    None if option_ptr_pointee_matches(&cb.borrow().name, &ca.borrow().name) => {
-                        can_be_none = true;
                         Some(ca.clone())
                     }
                     None => {
@@ -4994,61 +4949,6 @@ mod tests {
         } else {
             panic!("expected SomeInstance");
         }
-    }
-
-    #[test]
-    fn union_option_raw_ptr_and_pointee_makes_nullable_instance() {
-        // `Option<*mut m::X>` ∪ `m::X` recovers a nullable `m::X` instead of
-        // failing "no common base".  The one-word nullable Option-of-raw-
-        // pointer widens with its own pointee to a maybe-absent pointee.
-        let pointee = Some(ClassDef::new_standalone("m::X", None));
-        let opt = Some(ClassDef::new_standalone(
-            "core::option::Option<*mut m::X>",
-            None,
-        ));
-        let s_pointee = SomeValue::Instance(SomeInstance::new(
-            pointee,
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        let s_opt = SomeValue::Instance(SomeInstance::new(
-            opt,
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        for u in [
-            union(&s_opt, &s_pointee).unwrap(),
-            union(&s_pointee, &s_opt).unwrap(),
-        ] {
-            if let SomeValue::Instance(s) = u {
-                assert!(s.can_be_none, "result must be nullable");
-                assert_eq!(s.classdef.unwrap().borrow().name, "m::X");
-            } else {
-                panic!("expected SomeInstance");
-            }
-        }
-    }
-
-    #[test]
-    fn union_option_raw_ptr_declines_unrelated_pointee() {
-        // The pointee must match: `Option<*mut m::X>` ∪ `m::Y` stays a "no
-        // common base" failure — the arm is not a blanket top-absorb.
-        let other = Some(ClassDef::new_standalone("m::Y", None));
-        let opt = Some(ClassDef::new_standalone(
-            "core::option::Option<*mut m::X>",
-            None,
-        ));
-        let s_other = SomeValue::Instance(SomeInstance::new(
-            other,
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        let s_opt = SomeValue::Instance(SomeInstance::new(
-            opt,
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        assert!(union(&s_opt, &s_other).is_err());
     }
 
     #[test]
