@@ -105,8 +105,11 @@ pub mod frame_locals_proxy {
             let args_base = roots.publish(args);
             roots.normalize(args_base, args.len());
             let mapping = self.mapping()?;
-            let args: Vec<PyObjectRef> =
-                (0..args.len()).map(|i| roots.get(args_base + i)).collect();
+            let mut reloaded_args: Vec<PyObjectRef> = Vec::with_capacity(args.len());
+            for i in 0..args.len() {
+                reloaded_args.push(roots.get(args_base + i));
+            }
+            let args = reloaded_args;
             let result = crate::baseobjspace::call_method(mapping, name, &args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
