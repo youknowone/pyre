@@ -18177,9 +18177,11 @@ fn init_int_type(ns: PyObjectRef) {
     // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
     // implementation delegates virtually to this repr slot.
     let int_to_text = |args: &[PyObjectRef]| {
-        Ok(pyre_object::w_str_new(&unsafe {
-            crate::builtins::int_to_decimal_string(args[0])?
-        }))
+        let text = unsafe { crate::builtins::int_to_decimal_string(args[0])? };
+        // `args[0]` is fully consumed above.  This terminal `space.newtext`
+        // allocation can therefore use the ordinary movable header PyPy gets
+        // from `StdObjSpace.newutf8`, with no unrooted operand live across it.
+        Ok(unsafe { pyre_object::w_str_new_managed_collecting(&text) })
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

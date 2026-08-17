@@ -9767,7 +9767,10 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     let w = unsafe { crate::py_str_wtf8(obj)? };
-    Ok(pyre_object::w_str_from_wtf8_managed(w))
+    // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.
+    // The input is fully consumed above, so only the newly built WTF-8 value
+    // must be rooted across this terminal collecting header allocation.
+    Ok(unsafe { pyre_object::w_str_from_wtf8_managed_collecting(w) })
 }
 
 unsafe fn py_repr_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {

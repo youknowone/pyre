@@ -347,6 +347,76 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     }
 }
 
+/// Allocate a dynamic exact string at a terminal, GC-safe return site.
+///
+/// PyPy's `StdObjSpace.newutf8` constructs an ordinary movable
+/// `W_UnicodeObject` (`objspace.py:391-394`).  Most interpreter callers still
+/// need the born-old stepping stone in [`w_str_from_wtf8_managed`] until their
+/// Rust-stack live references have explicit roots.  A caller that has consumed
+/// all of its Python operands can use this direct translated allocation shape:
+/// the separately allocated value box is the one live child rooted across the
+/// collecting header allocation.
+///
+/// # Safety
+/// Every managed Python reference live across this call must already be visible
+/// to the collector.  In particular, a caller must not read an unrooted raw
+/// `PyObjectRef` after this function returns.
+pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef {
+    if !crate::gc_interp::enabled() || unicode_value_gc_type_id() == 0 {
+        return w_str_from_wtf8_immortal(value);
+    }
+    let byte_len = value.len();
+    let char_len = value.code_points().count();
+    let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
+    let mut unicode = W_UnicodeObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class: get_instantiate(&STR_TYPE),
+        },
+        value,
+        byte_len,
+        len: char_len,
+        w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
+        hash: 0,
+    };
+    let value_slot = std::ptr::addr_of_mut!(unicode.value).cast::<*mut u8>();
+    let mut needs_write_barrier = true;
+    let raw = unsafe {
+        crate::gc_hook::try_gc_alloc_collecting_rooted(
+            W_UNICODE_GC_TYPE_ID,
+            W_UNICODE_OBJECT_SIZE,
+            value_slot,
+            &mut needs_write_barrier,
+        )
+    }
+    .filter(|raw| !raw.is_null())
+    .unwrap_or(std::ptr::null_mut());
+    if raw.is_null() {
+        let recovered = unsafe { (*unicode.value).clone() };
+        return w_str_from_wtf8_immortal(recovered);
+    }
+    unsafe {
+        std::ptr::write(raw as *mut W_UnicodeObject, unicode);
+    }
+    // A nursery header needs no creation barrier.  The collecting allocator
+    // can spill the header to old-gen; remember that old-to-young value edge
+    // exactly as listobject.py's rooted constructor does for its items block.
+    if needs_write_barrier {
+        crate::gc_hook::try_gc_write_barrier(raw);
+    }
+    raw as PyObjectRef
+}
+
+/// UTF-8 convenience wrapper for [`w_str_from_wtf8_managed_collecting`].
+///
+/// # Safety
+/// The caller must uphold the same root-safety contract as the wrapped
+/// function.
+pub unsafe fn w_str_new_managed_collecting(s: &str) -> PyObjectRef {
+    unsafe { w_str_from_wtf8_managed_collecting(Wtf8Buf::from_string(s.to_string())) }
+}
+
 /// `_utf8_sliced` (unicodeobject.py) — wrap a piece cut out of
 /// `recv`'s own WTF-8 storage.
 ///
