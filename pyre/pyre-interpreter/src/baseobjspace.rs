@@ -9267,7 +9267,7 @@ fn method_hash(version_tag: u64, name: &Wtf8) -> usize {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn _pure_version_tag(w_type: PyObjectRef) -> u64 {
+pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
     unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) }
 }
 
@@ -9316,10 +9316,10 @@ pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_where_with_method_cache(
-    w_type: PyObjectRef,
-    w_name: PyObjectRef,
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
     version_tag: u64,
-) -> PyObjectRef {
+) -> *mut PyObject {
     // PyPy's elidable returns the cached `(w_class, w_value)` tuple
     // object; the residual-call ABI here carries one raw register, so
     // the elidable surface projects the `w_value` half.  Callers that
@@ -9349,10 +9349,10 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_class_with_method_cache(
-    w_type: PyObjectRef,
-    w_name: PyObjectRef,
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
     version_tag: u64,
-) -> PyObjectRef {
+) -> *mut PyObject {
     _cached_lookup_where(w_type, w_name, version_tag).0
 }
 

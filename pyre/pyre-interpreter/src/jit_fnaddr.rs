@@ -941,6 +941,30 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::function_new_impl",
         crate::function::function_new_impl as *const (),
     );
+    let pure_version_tag: extern "C" fn(i64) -> i64 =
+        crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_version_tag",
+        "pyre_interpreter::_pure_version_tag",
+        pure_version_tag as *const (),
+    );
+    let pure_lookup_where_with_method_cache: extern "C" fn(i64, i64, i64) -> i64 =
+        crate::baseobjspace::__majit_call_target__pure_lookup_where_with_method_cache;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_lookup_where_with_method_cache",
+        "pyre_interpreter::_pure_lookup_where_with_method_cache",
+        pure_lookup_where_with_method_cache as *const (),
+    );
+    let pure_lookup_class_with_method_cache: extern "C" fn(i64, i64, i64) -> i64 =
+        crate::baseobjspace::__majit_call_target__pure_lookup_class_with_method_cache;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_lookup_class_with_method_cache",
+        "pyre_interpreter::_pure_lookup_class_with_method_cache",
+        pure_lookup_class_with_method_cache as *const (),
+    );
     // #346: null-collapsing stable-alloc primitive residualised via
     // `#[dont_look_inside]`, keeping the thread-local GC hook dispatch out of
     // the trace.
