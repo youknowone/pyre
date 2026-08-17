@@ -741,6 +741,22 @@ unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
     };
 }
 
+unsafe fn bz2_compressor_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_bz2::w_bz2compressor_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
+unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_bz2::w_bz2decompressor_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -3697,6 +3713,39 @@ fn build_gc() -> Box<MiniMarkGC> {
                 zlib_object_custom_trace,
             )
             .with_destructor_fn(destructor),
+        );
+        descr.gc_type_id.set(tid);
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            descr.pytype_ptr as usize,
+            tid,
+        );
+        pytype_to_tid.insert(descr.pytype_ptr as usize, tid);
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+    }
+    // `interp_bz2.py` likewise keeps each libbz2 stream and its lock on the
+    // W_Root owner.  Neither type is subclassable, so they carry no mapdict
+    // prefix and no inline GC edge beyond the header's `w_class`; the sweep
+    // destructor releases the native stream.  Unconditional, and placed with
+    // the zlib owners so their ids agree on wasm/native.
+    for (descr, destructor) in [
+        (
+            <pyre_interpreter::module::_bz2::W_BZ2Compressor
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            bz2_compressor_destructor as majit_gc::trace::DestructorFn,
+        ),
+        (
+            <pyre_interpreter::module::_bz2::W_BZ2Decompressor
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
+        ),
+    ] {
+        let tid = gc.register_type(
+            TypeInfo::object_subclass(descr.object_size, object_tid)
+                .with_destructor_fn(destructor),
         );
         descr.gc_type_id.set(tid);
         majit_gc::GcAllocator::register_vtable_for_type(

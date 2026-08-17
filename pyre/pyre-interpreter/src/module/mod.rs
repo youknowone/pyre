@@ -15,6 +15,8 @@ pub mod _bisect;
 #[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
+pub mod _bz2;
+#[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
 pub mod _collections;

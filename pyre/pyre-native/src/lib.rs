@@ -4,6 +4,7 @@
 //! heavy native code (crypto engines, codecs, large static tables) is never
 //! lowered into the meta-traceable `.ullbc`.
 
+pub mod bz2;
 pub mod hash;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;

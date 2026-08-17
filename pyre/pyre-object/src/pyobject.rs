@@ -664,23 +664,29 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (169, Some(0)),
     (170, Some(0)),
     (171, Some(0)),
-    // `posix.DirEntry` follows the zlib owners on native builds.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `_bz2`'s compressor and decompressor own their libbz2 stream state.
+    // They are unconditional, so they precede the target-gated tail and these
+    // ids agree on native and wasm.
     (172, Some(0)),
+    (173, Some(0)),
+    // `posix.DirEntry` follows the unconditional native owners on native
+    // builds.
+    #[cfg(not(target_arch = "wasm32"))]
+    (174, Some(0)),
     // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
     // extend the append-only native rclass tail; wasm omits the host TLS
     // module and therefore the hierarchy entries as well. Sandbox filtering
     // belongs to pyre-interpreter, which owns that module configuration.
-    #[cfg(not(target_arch = "wasm32"))]
-    (173, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
-    (174, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (175, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (176, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (177, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (178, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (179, Some(0)),
     // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
     // and the file handle on Windows — and follows the optional SSL tail
     // wherever the module is compiled.  The gate must match the alias gate in
@@ -689,12 +695,12 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
-    (178, Some(0)),
+    (180, Some(0)),
     // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
     // retained Python buffers.  pyre-interpreter supplies the vtable alias;
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
-    (179, Some(0)),
+    (181, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

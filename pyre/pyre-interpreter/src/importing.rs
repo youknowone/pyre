@@ -707,6 +707,7 @@ pub fn install_builtin_modules() {
     pyre_install_module!(binascii);
     pyre_install_module!(marshal);
     pyre_install_module!(zlib);
+    pyre_install_module!(_bz2);
     pyre_install_module!(_typing);
     pyre_install_module!(_template);
     pyre_install_module!(_hashlib);

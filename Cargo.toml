@@ -166,6 +166,10 @@ scrypt = { version = "0.11", default-features = false }
 # DEFLATE output is byte-identical to the reference C zlib.
 flate2 = { version = "1.1.9", default-features = false }
 zlib-rs = { version = "0.6.5", default-features = false, features = ["rust-allocator", "__internal-api"] }
+# bzip2 backend (pyre-native only): the crate's default feature selects
+# libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
+# whose output is byte-identical to the reference C libbz2.
+bzip2 = "0.6.1"
 # binascii transforms (pure-Rust logic).
 base64 = "0.22"
 crc32fast = "1.4"

@@ -123,7 +123,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_bz2": {
-      "dynasm": "CRASH"
+      "dynasm": "FAIL"
     },
     "test.test_c_locale_coercion": {
       "cranelift": "PASS",
@@ -1020,7 +1020,7 @@
       "dynasm": "PASS"
     },
     "test.test_shutil": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_signal": {
       "dynasm": "IMPORTERROR"
@@ -1142,7 +1142,7 @@
       "dynasm": "PASS"
     },
     "test.test_tarfile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "TIMEOUT"
     },
     "test.test_tcl": {
       "dynasm": "IMPORTERROR"
@@ -1415,7 +1415,7 @@
       "dynasm": "PASS"
     },
     "test.test_zipfile": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "FAIL"
     },
     "test.test_zipfile64": {
       "dynasm": "SKIP",
