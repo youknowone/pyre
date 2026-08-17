@@ -399,6 +399,15 @@ pub struct Optimizer {
     /// producer for the target token currently being compiled.
     pub imported_short_preamble_builder:
         Option<crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
+    /// RPython `unroll.py:298` `self.short_preamble_producer = ...`.
+    ///
+    /// `imported_short_preamble_builder` above ports `unroll.py:507`.
+    /// Upstream stage-switches one slot in time, overwriting the imported
+    /// plain builder with this extended builder. Pyre keeps both stages live
+    /// as distinct Rust types; relocating this field to `Optimizer` changes
+    /// the extended builder's home without merging those stages.
+    pub short_preamble_producer:
+        Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
@@ -1480,6 +1489,7 @@ impl Optimizer {
             imported_short_aliases: Vec::new(),
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
+            short_preamble_producer: None,
             imported_label_args: None,
             patchguardop: None,
             skip_flush: false,

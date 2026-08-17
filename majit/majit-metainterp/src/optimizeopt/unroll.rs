@@ -377,6 +377,9 @@ pub struct UnrollOptimizer {
     /// because the unroll optimizer owns the inner phase optimizers while the
     /// registered GC walker enters through MetaInterp.
     pub compile_snapshot_root_slots: Option<usize>,
+    /// MetaInterp-owned slot that publishes the in-flight phase-2
+    /// `Optimizer.short_preamble_producer` to the registered GC walker.
+    pub compile_short_preamble_producer_slot: Option<usize>,
     /// Snapshot-root slots that must stay rooted across every phase's
     /// `replace_compile_snapshot_roots`. pyjitpl installs the caller-owned
     /// original snapshot maps here so a moving GC during unroll forwards their
@@ -386,28 +389,41 @@ pub struct UnrollOptimizer {
     pub persistent_snapshot_root_slots: Vec<usize>,
 }
 
+/// Withdraws the address `publish_short_preamble_producer` installed in
+/// `MetaInterp.compile_short_preamble_producer`.
+pub(crate) struct PublishedShortPreambleProducer {
+    slot: Option<usize>,
+}
+
+impl Drop for PublishedShortPreambleProducer {
+    fn drop(&mut self) {
+        if let Some(addr) = self.slot {
+            // SAFETY: the same address pyjitpl installed for this compile, on
+            // the same thread as the registered root walker. Writing `None`
+            // here is what keeps the walker from reading the optimizer local
+            // after it is dropped.
+            unsafe {
+                *(addr as *mut Option<usize>) = None;
+            }
+        }
+    }
+}
+
 impl UnrollOptimizer {
     /// Supply the target tokens an earlier compile of this green key left
-    /// behind, stripped of their short-preamble producers.
+    /// behind.
     ///
-    /// unroll.py:250 declares `short_preamble_producer = None` on `OptUnroll`
-    /// and only `finalize_short_preamble` (unroll.py:298) ever sets it, so
-    /// upstream enters every compile with exactly one producer: the one for
-    /// the target token that compile is minting. That is what lets
-    /// `inline_short_preamble` decide by identity — `sb.target_token is
-    /// target_token` (unroll.py:376-385) — whether it may set the builder up
-    /// in place against the current label args.
+    /// `unroll.py:250` declares `short_preamble_producer = None`;
+    /// `import_state` sets its plain builder at `unroll.py:507`, and
+    /// `finalize_short_preamble` replaces it with the extended builder at
+    /// `unroll.py:298`. Thus one extended producer is live for an optimizer
+    /// run, which is what `unroll.py:378`'s
+    /// `assert isinstance(sb, ExtendedShortPreambleBuilder)` relies on.
     ///
-    /// pyre parks the producer on the `TargetToken` instead, and the tokens
-    /// resupplied here are clones of a previous compile's. Left intact, the
-    /// first one whose virtual state matches would hand out that compile's
-    /// builder, which would then be set up against this trace's label args and
-    /// have its stored short preamble overwritten with one naming this
-    /// compile's boxes.
-    pub fn seed_prior_target_tokens(&mut self, mut tokens: Vec<TargetToken>) {
-        for token in &mut tokens {
-            token.short_preamble_producer = None;
-        }
+    /// `inline_short_preamble` retains the `sb.target_token is target_token`
+    /// discrimination at `unroll.py:376-385`; its descriptor-identity gate
+    /// prevents an in-place setup against every matching candidate.
+    pub fn seed_prior_target_tokens(&mut self, tokens: Vec<TargetToken>) {
         self.target_tokens = tokens;
     }
 
@@ -450,6 +466,7 @@ impl UnrollOptimizer {
             cpu: crate::cpu::default_cpu(),
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
+            compile_short_preamble_producer_slot: None,
             persistent_snapshot_root_slots: Vec::new(),
         }
     }
@@ -486,6 +503,39 @@ impl UnrollOptimizer {
 
     fn clear_compile_snapshot_roots(&self) {
         self.replace_compile_snapshot_roots(Vec::new());
+    }
+
+    /// Publish the address of `optimizer.short_preamble_producer` to the
+    /// registered root walker, and withdraw it when the returned guard drops.
+    ///
+    /// The guard is not optional. The published address points into the
+    /// caller's `Optimizer` local, which dies when the unroll call returns;
+    /// `CompileSnapshotRootsGuard` clears the slot only when the enclosing
+    /// compile entry returns, which is later. Between those two points a root
+    /// walk would read the address of a dropped local. Bind the guard after
+    /// the optimizer so it withdraws the address first.
+    #[must_use]
+    fn publish_short_preamble_producer(
+        &self,
+        optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+    ) -> PublishedShortPreambleProducer {
+        if let Some(addr) = self.compile_short_preamble_producer_slot {
+            // SAFETY: pyjitpl installs this address from
+            // `MetaInterp.compile_short_preamble_producer` for the duration
+            // of one compile. Unroll phases run on the same thread as the
+            // registered root walker.
+            unsafe {
+                *(addr as *mut Option<usize>) = Some(
+                    (&mut optimizer.short_preamble_producer
+                        as *mut Option<
+                            crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder,
+                        >) as usize,
+                );
+            }
+        }
+        PublishedShortPreambleProducer {
+            slot: self.compile_short_preamble_producer_slot,
+        }
     }
 
     /// Optimize the preamble (first iteration) of a loop trace.
@@ -975,6 +1025,9 @@ impl UnrollOptimizer {
             }
             None => crate::optimizeopt::optimizer::Optimizer::default_pipeline(),
         };
+        // Bound after `opt_p2` so it drops first and withdraws the published
+        // address while the optimizer it names is still alive.
+        let _published_short_preamble_producer = self.publish_short_preamble_producer(&mut opt_p2);
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
         opt_p2.cpu = self.cpu.clone();
@@ -1558,13 +1611,14 @@ impl UnrollOptimizer {
             }
         }
         let opt_unroll = OptUnroll::new();
-        let target_token = opt_unroll.finalize_short_preamble(
+        let (target_token, short_preamble_producer) = opt_unroll.finalize_short_preamble(
             self.target_tokens.len() as u64,
             exported_vs,
             initial_sp.clone(),
             imported_short_preamble_builder.as_ref(),
         );
         self.target_tokens.push(target_token);
+        opt_p2.short_preamble_producer = short_preamble_producer;
 
         if crate::majit_log_enabled() {
             eprintln!(
@@ -3296,14 +3350,20 @@ impl OptUnroll {
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
         short_preamble: crate::optimizeopt::shortpreamble::ShortPreamble,
         short_preamble_builder: Option<&crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
-    ) -> TargetToken {
+    ) -> (
+        TargetToken,
+        Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
+    ) {
         let mut target_token = TargetToken::new_loop(token_id);
         target_token.virtual_state = Some(virtual_state);
         target_token.short_preamble = Some(short_preamble);
-        target_token.short_preamble_producer = short_preamble_builder.map(|builder| {
-            crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(token_id, builder)
+        let short_preamble_producer = short_preamble_builder.map(|builder| {
+            crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder::new(
+                target_token.as_jump_target_descr(),
+                builder,
+            )
         });
-        target_token
+        (target_token, short_preamble_producer)
     }
 
     /// unroll.py:320-362: _jump_to_existing_trace — check if any existing
@@ -3613,62 +3673,62 @@ impl OptUnroll {
             // unroll.py:353-356: inline short preamble
             let mut extra = Vec::new();
             if let Some(sp) = target_token.short_preamble.clone() {
-                if let Some(mut builder) = target_token.short_preamble_producer.take() {
-                    // unroll.py:376-385 inline_short_preamble sets a builder up
-                    // in place only when `sb.target_token is target_token`.
-                    // pyre needs no such test here: a producer exists only on
-                    // the token this compile minted, because
-                    // `seed_prior_target_tokens` strips the ones an earlier
-                    // compile left behind.
-                    if let Some(label_args) = current_label_args {
-                        // shortpreamble.py:283-296 / 311-341 parity:
-                        // setup() returns false when an op references an
-                        // unresolvable Phase 1 OpRef. Treat this exactly
-                        // like RPython's "produce_arg returned None →
-                        // add_op_to_short returned None" path: drop the
-                        // peeled trace and let the unroll caller raise
-                        // InvalidLoop, falling back to jump_to_preamble.
-                        if !builder.setup(&sp, label_args, ctx) {
-                            target_token.short_preamble_producer = Some(builder);
-                            // Drop the peeled trace and let the caller fall back
-                            // to jump_to_preamble. Recorded as a deferred
-                            // InvalidLoop signal (checked right after this
-                            // returns) so no unwinding is needed.
-                            ctx.signal_invalid_loop("short preamble has unresolvable Phase 1 args");
-                            return None;
-                        }
-                        ctx.activate_short_preamble_producer(builder);
-                        extra = Self::inline_short_preamble(
-                            &short_jump_args,
-                            &target_args,
-                            &sp,
-                            optimizer,
-                            ctx,
-                        );
-                        if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                            // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
-                            // rides inline on the OpRef. Production no longer
-                            // seeds `ctx.const_pool`
-                            // (`merge_backend_constants_from_ctx` asserts the
-                            // pool is empty at export), so the cross-compile
-                            // `loop_constants` snapshot is no longer built:
-                            // short-preamble ops embed the Const value
-                            // directly in `op.args`, mirroring RPython's
-                            // `shortpreamble.py` which has no parallel side
-                            // table.
-                            target_token.short_preamble =
-                                Some(builder.build_short_preamble_struct());
-                            target_token.short_preamble_producer = Some(builder);
-                        }
-                    } else {
-                        extra = Self::inline_short_preamble(
-                            &short_jump_args,
-                            &target_args,
-                            &sp,
-                            optimizer,
-                            ctx,
-                        );
-                        target_token.short_preamble_producer = Some(builder);
+                let is_mine = optimizer
+                    .short_preamble_producer
+                    .as_ref()
+                    .is_some_and(|sb| {
+                        majit_ir::descr_identity(&sb.target_token)
+                            == majit_ir::descr_identity(&target_token.as_jump_target_descr())
+                    });
+                // `descr_identity` identifies a descriptor allocation, not
+                // Python `is`: same descr allocation means the same clone
+                // family. That is sufficient here because TargetToken clones
+                // share one Arc, `finalize_short_preamble` mints a fresh
+                // LoopTargetDescr Arc per compile, and TargetToken carries no
+                // producer; `unroll.py:376-385` performs the corresponding
+                // identity discrimination.
+                if is_mine && let Some(label_args) = current_label_args {
+                    let mut builder = optimizer
+                        .short_preamble_producer
+                        .take()
+                        .expect("identity gate requires a short-preamble producer");
+                    // shortpreamble.py:283-296 / 311-341 parity:
+                    // setup() returns false when an op references an
+                    // unresolvable Phase 1 OpRef. Treat this exactly
+                    // like RPython's "produce_arg returned None →
+                    // add_op_to_short returned None" path: drop the
+                    // peeled trace and let the unroll caller raise
+                    // InvalidLoop, falling back to jump_to_preamble.
+                    if !builder.setup(&sp, label_args, ctx) {
+                        optimizer.short_preamble_producer = Some(builder);
+                        // Drop the peeled trace and let the caller fall back
+                        // to jump_to_preamble. Recorded as a deferred
+                        // InvalidLoop signal (checked right after this
+                        // returns) so no unwinding is needed.
+                        ctx.signal_invalid_loop("short preamble has unresolvable Phase 1 args");
+                        return None;
+                    }
+                    ctx.activate_short_preamble_producer(builder);
+                    extra = Self::inline_short_preamble(
+                        &short_jump_args,
+                        &target_args,
+                        &sp,
+                        optimizer,
+                        ctx,
+                    );
+                    if let Some(builder) = ctx.take_active_short_preamble_producer() {
+                        // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
+                        // rides inline on the OpRef. Production no longer
+                        // seeds `ctx.const_pool`
+                        // (`merge_backend_constants_from_ctx` asserts the
+                        // pool is empty at export), so the cross-compile
+                        // `loop_constants` snapshot is no longer built:
+                        // short-preamble ops embed the Const value
+                        // directly in `op.args`, mirroring RPython's
+                        // `shortpreamble.py` which has no parallel side
+                        // table.
+                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                        optimizer.short_preamble_producer = Some(builder);
                     }
                 } else {
                     extra = Self::inline_short_preamble(

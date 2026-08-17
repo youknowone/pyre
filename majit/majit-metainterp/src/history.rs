@@ -53,10 +53,6 @@ pub struct TargetToken {
     pub virtual_state: Option<crate::optimizeopt::virtualstate::VirtualState>,
     /// Short preamble: ops to replay when entering from a bridge.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
-    /// RPython unroll.py: active ExtendedShortPreambleBuilder for the target
-    /// token currently being finalized.
-    pub short_preamble_producer:
-        Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
     jump_target_descr: Arc<LoopTargetDescr>,
 }
 
@@ -73,7 +69,6 @@ impl TargetToken {
             is_preamble_target: false,
             virtual_state: None,
             short_preamble: None,
-            short_preamble_producer: None,
             jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
         }
     }

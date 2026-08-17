@@ -489,8 +489,9 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
     slots
 }
 
-/// RAII guard that empties `MetaInterp.compile_snapshot_refs` when
-/// dropped. Every compile entry point that calls
+/// RAII guard that empties `MetaInterp.compile_snapshot_refs` and unpublishes
+/// `MetaInterp.compile_short_preamble_producer` when dropped. Every compile
+/// entry point that calls
 /// `collect_snapshot_const_ptr_slots` stores raw `*mut OpRef`
 /// pointers into local `SnapshotBoxes` storage; once the enclosing
 /// compile returns, those locals are dropped and the raw pointers
@@ -500,12 +501,14 @@ fn collect_snapshot_const_ptr_slots(maps: &mut [&mut SnapshotBoxes]) -> Vec<usiz
 /// stale pointers.
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
+    short_preamble_producer: *mut Option<usize>,
 }
 
 impl CompileSnapshotRootsGuard {
-    pub(crate) fn new(refs: &mut Vec<usize>) -> Self {
+    pub(crate) fn new(refs: &mut Vec<usize>, short_preamble_producer: &mut Option<usize>) -> Self {
         Self {
             refs: refs as *mut _,
+            short_preamble_producer: short_preamble_producer as *mut _,
         }
     }
 }
@@ -520,6 +523,7 @@ impl Drop for CompileSnapshotRootsGuard {
         // observed the original `&mut` at construction.
         unsafe {
             (*self.refs).clear();
+            *self.short_preamble_producer = None;
         }
     }
 }
@@ -1564,6 +1568,10 @@ pub struct MetaInterp<M: Clone> {
     /// slots directly so a moving GC updates the snapshot boxes the
     /// optimizer will read.
     pub(crate) compile_snapshot_refs: Vec<usize>,
+    /// Address of the in-flight phase-2 optimizer's extended short-preamble
+    /// producer. Installed only while that optimizer is alive so the
+    /// registered root walker can forward its inline ConstPtr fields.
+    pub(crate) compile_short_preamble_producer: Option<usize>,
     /// Set by compile_bridge when optimizer returns retrace_requested=true.
     /// Checked by compile_bridge_trace to return RetraceNeeded.
     pub(crate) retrace_after_bridge: bool,
@@ -2172,9 +2180,19 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(sp) = tt.short_preamble.as_mut() {
                     sp.walk_const_ptr_refs_mut(&mut visitor);
                 }
-                if let Some(builder) = tt.short_preamble_producer.as_mut() {
-                    builder.walk_const_ptr_refs_mut(&mut visitor);
-                }
+            }
+        }
+        if let Some(slot_addr) = self.compile_short_preamble_producer {
+            // SAFETY: UnrollOptimizer publishes the address of the in-flight
+            // `Optimizer.short_preamble_producer` for one compile, and
+            // `CompileSnapshotRootsGuard` clears it before that optimizer is
+            // dropped. Phases run on the same thread as this root walker.
+            let producer = unsafe {
+                &mut *(slot_addr
+                    as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
+            };
+            if let Some(builder) = producer.as_mut() {
+                builder.walk_const_ptr_refs_mut(&mut visitor);
             }
         }
     }
@@ -3038,6 +3056,7 @@ impl<M: Clone> MetaInterp<M> {
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
+            compile_short_preamble_producer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
             declined_bridge_guards: std::collections::HashSet::new(),
@@ -6048,7 +6067,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
         self.single_pass_compact_label_values = None;
@@ -6499,6 +6521,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_short_preamble_producer_slot =
+            Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         unroll_opt.retraced_count = prior_retraced_count_early;
@@ -7674,7 +7698,10 @@ impl<M: Clone> MetaInterp<M> {
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<(u64, M)>,
     ) -> CompileOutcome {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         let ends_with_jump = finish_descr.is_none();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
@@ -7995,7 +8022,10 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
         // the rare missing-token path does not drain the active retrace.
@@ -8217,6 +8247,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_short_preamble_producer_slot =
+            Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
         // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py:797-811`,
@@ -9143,7 +9175,10 @@ impl<M: Clone> MetaInterp<M> {
         meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
         // Cache driver descriptor before ctx is partially consumed below.
@@ -9621,7 +9656,10 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns the green_key on success (caller must call
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
-        let _snapshot_guard = CompileSnapshotRootsGuard::new(&mut self.compile_snapshot_refs);
+        let _snapshot_guard = CompileSnapshotRootsGuard::new(
+            &mut self.compile_snapshot_refs,
+            &mut self.compile_short_preamble_producer,
+        );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take()?;

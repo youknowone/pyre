@@ -2538,7 +2538,7 @@ pub struct ExtendedShortPreambleBuilder {
     label_args: Vec<OpRef>,
     used_boxes: Vec<OpRef>,
     short_jump_args: Vec<OpRef>,
-    pub target_token: u64,
+    pub target_token: majit_ir::DescrRef,
     /// RPython parity: remap Phase 1 preamble OpRefs → current inputargs.
     /// Values are the current-namespace boxes, bound to their producers at
     /// `setup()` insertion (the mapping values in unroll.py:396 are the
@@ -2611,7 +2611,7 @@ impl ExtendedShortPreambleBuilder {
         // positions, never Const) — nothing to walk.
     }
 
-    pub fn new(target_token: u64, sb: &ShortPreambleBuilder) -> Self {
+    pub fn new(target_token: majit_ir::DescrRef, sb: &ShortPreambleBuilder) -> Self {
         ExtendedShortPreambleBuilder {
             // The live builder now keys `produced_short_boxes` by the short-box
             // res Box (#146/S8); this builder keys by `preamble_op.pos` (the
@@ -4478,7 +4478,10 @@ mod tests {
     #[test]
     fn test_extended_short_preamble_builder_fallback_keeps_invented_name_alias_identity() {
         let sb = ShortPreambleBuilder::new(&[OpRef::int_op(7)], &[], &[OpRef::int_op(7)]);
-        let mut builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        let mut builder = ExtendedShortPreambleBuilder::new(
+            crate::history::TargetToken::new_loop(0).as_jump_target_descr(),
+            &sb,
+        );
         let mut replay_op = Op::new(OpCode::GetfieldGcI, &[rop(Type::Int, 30)]);
         replay_op.pos.set(OpRef::int_op(14));
         let pop = crate::optimizeopt::info::PreambleOp {
@@ -4514,7 +4517,10 @@ mod tests {
         let original = OpRef::input_arg_typed(8, Type::Ref);
         let current = OpRef::ref_op(80);
         let sb = ShortPreambleBuilder::new(&[original], &[], &[renamed]);
-        let mut builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        let mut builder = ExtendedShortPreambleBuilder::new(
+            crate::history::TargetToken::new_loop(0).as_jump_target_descr(),
+            &sb,
+        );
         let initial = ShortPreamble {
             ops: vec![ShortPreambleOp {
                 op: Op::new(OpCode::GetfieldGcR, &[Operand::bound_from_opref(renamed)]),
@@ -4537,7 +4543,10 @@ mod tests {
         assert_eq!(rebuilt.ops[0].op.arg(0).to_opref(), original);
         assert!(rebuilt.ops[0].arg_mapping.is_empty());
 
-        let mut retrace_builder = ExtendedShortPreambleBuilder::new(0, &sb);
+        let mut retrace_builder = ExtendedShortPreambleBuilder::new(
+            crate::history::TargetToken::new_loop(0).as_jump_target_descr(),
+            &sb,
+        );
         assert!(retrace_builder.setup(&rebuilt, &[current], &mut ctx));
         assert_eq!(
             retrace_builder.short_op(0).unwrap().arg(0).to_opref(),
