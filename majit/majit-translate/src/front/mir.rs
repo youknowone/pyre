@@ -813,7 +813,6 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    link_transparent_scalar_types(std::slice::from_ref(llbc));
     // ── Pass 1: walk type_decls + trait_decls ─────────────────────
     let (
         mut known_struct_names,
@@ -1451,7 +1450,7 @@ fn derive_program_metadata(
                         let field_ty = if is_rbigint && fname == "_digits" {
                             "[i64]".to_string()
                         } else {
-                            tyref_to_ast_string(&f.ty, llbc)
+                            tyref_to_field_layout_string(&f.ty, llbc)
                         };
                         (fname, field_ty)
                     })
@@ -1700,7 +1699,7 @@ fn derive_program_metadata(
                                 ("u32".to_string(), ValueType::Int)
                             } else {
                                 (
-                                    tyref_to_ast_string(&f.ty, llbc),
+                                    tyref_to_field_layout_string(&f.ty, llbc),
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
@@ -15824,9 +15823,10 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// picks `SomeInteger { unsigned: true }`, matching the per-field shells
 /// the syn classifier produced for `u8`..`usize`.  `char` and every
 /// signed width fold to `Int`; `bool`/`float` keep their classes; every
-/// non-primitive shape (named struct/enum, reference, raw pointer, tuple,
-/// slice, array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose
-/// someshell ignores the payload.
+/// non-scalar shape (named struct/enum, reference, raw pointer, tuple, slice,
+/// array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose someshell ignores
+/// the payload. A `repr(transparent)` scalar wrapper keeps its inner register
+/// class, as it does at ordinary value sites.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
@@ -15882,6 +15882,9 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // the per-field someshell matches the inner scalar.  Checked after
     // the cheap `Literal` fast-path so primitive fields never pay it.
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return inner;
+    }
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
         return inner;
     }
     // A fieldless (C-like) enum field is represented by-value as its
@@ -16911,6 +16914,55 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
             TyRef::Dedup { id } => format!("??unresolved_dedup#{id}"),
             _ => "??no_body".to_string(),
         },
+    }
+}
+
+fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let Some(decl) = llbc.type_by_id(id) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    if !decl.is_repr_transparent() {
+        return tyref_to_ast_string(ty, llbc);
+    }
+    if let TypeDeclKind::Struct(fields) = &decl.kind
+        && let [field] = fields.as_slice()
+        && !matches!(
+            tyref_to_value_type(&field.ty, llbc),
+            ValueType::Ref(_)
+                | ValueType::Str
+                | ValueType::Void
+                | ValueType::State
+                | ValueType::Unknown
+        )
+    {
+        return tyref_to_ast_string(&field.ty, llbc);
+    }
+    let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let size = decl
+        .layout_for_target(&target)
+        .and_then(|layout| layout.size)
+        .unwrap_or(8);
+    match (kind, size) {
+        (majit_charon_reader::TransparentScalarKind::Signed, 1) => "i8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 2) => "i16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 4) => "i32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, _) => "i64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => "u8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => "u16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => "u32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => "u64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Bool, _) => "bool".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
     }
 }
 
@@ -23983,6 +24035,13 @@ mod tests {
             Llbc::from_slice(artifact(serde_json::json!("Opaque")).to_string().as_bytes()).unwrap();
         let llbcs = vec![defining, opaque];
         super::link_transparent_scalar_types(&llbcs);
+        super::build_semantic_program_from_llbc_with_static_addrs_filtered(
+            &llbcs[1],
+            crate::HostStaticAddrs::default(),
+            None,
+            None,
+        )
+        .unwrap();
         let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
             "HashConsedValue": [8, {
                 "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
@@ -23992,6 +24051,14 @@ mod tests {
         assert_eq!(
             super::tyref_to_value_type(&linked_ty, &llbcs[1]),
             crate::model::ValueType::Int
+        );
+        assert_eq!(
+            super::tyref_to_attr_value_type(&linked_ty, &llbcs[1]),
+            crate::model::ValueType::Int
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&linked_ty, &llbcs[1]),
+            "i64"
         );
     }
 

@@ -120,7 +120,8 @@ pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten_graph
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, DeclaredCallEffects, DeclaredExtraEffect,
-    GraphTransformConfig, GraphTransformResult, VirtualizableFieldDescriptor, transform_graph,
+    GraphTransformConfig, GraphTransformResult, StructStorageDescriptor,
+    VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
@@ -456,7 +457,8 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
 /// `front::llbc_hints::harvest_hints_from_llbcs` reads the
 /// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
 /// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
-/// `_jit_look_inside_<NAME>`, …) out of Charon's `global_decls`,
+/// `_jit_cannot_raise_<NAME>`, `_jit_look_inside_<NAME>`, …) out of
+/// Charon's `global_decls`,
 /// keyed by the crate-stripped function path.  Each `SemanticFunction`
 /// is matched by its `{module_path}::{name}` path so same-named helpers
 /// in different modules cannot inherit each other's hints.
@@ -1567,6 +1569,7 @@ fn analyze_pipeline_from_module_paths(
                     "elidable_cannot_raise" => {
                         call_control.mark_cannot_raise_assertion(path.clone())
                     }
+                    "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
                     "elidable_or_memerror" => {
                         call_control.mark_memerror_only_assertion(path.clone())
                     }
@@ -1588,6 +1591,7 @@ fn analyze_pipeline_from_module_paths(
                         "elidable_cannot_raise" => {
                             call_control.mark_cannot_raise_assertion(dp.clone())
                         }
+                        "cannot_raise" => call_control.mark_cannot_raise_assertion(dp.clone()),
                         "elidable_or_memerror" => {
                             call_control.mark_memerror_only_assertion(dp.clone())
                         }
@@ -1792,6 +1796,7 @@ fn analyze_pipeline_from_module_paths(
                 "elidable_cannot_raise" => {
                     call_control.mark_cannot_raise_assertion(direct_path.clone())
                 }
+                "cannot_raise" => call_control.mark_cannot_raise_assertion(direct_path.clone()),
                 "elidable_or_memerror" => {
                     call_control.mark_memerror_only_assertion(direct_path.clone())
                 }
@@ -1845,6 +1850,7 @@ fn analyze_pipeline_from_module_paths(
             match hint.as_str() {
                 "elidable" => call_control.mark_elidable(path.clone()),
                 "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
+                "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
                 "elidable_or_memerror" => call_control.mark_memerror_only_assertion(path.clone()),
                 "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
                 "close_stack" => call_control.mark_close_stack(path.clone()),
@@ -1922,6 +1928,7 @@ fn analyze_pipeline_from_module_paths(
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(p.clone()),
                     "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
+                    "cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
                     "elidable_or_memerror" => call_control.mark_memerror_only_assertion(p.clone()),
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
@@ -2174,6 +2181,7 @@ fn make_jitcodes(
     // `collect_jitcodes_in_alloc_order` materialises the `all_jitcodes[]`
     // vector with `all_jitcodes[i].index == i` (RPython codewriter.py:80
     // invariant).
+    call_control.set_struct_storage(&pipeline_config.transform.struct_storage);
     let mut codewriter = codewriter::CodeWriter::new();
 
     // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);

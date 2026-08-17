@@ -1410,8 +1410,10 @@ impl LowererConfig {
         // Bounded for the same reason the declaring-struct walk is: the map is
         // hand-written and can name a cycle the Rust types never see.
         let mut remaining = self.inlined_prefix.len();
-        while let Some((base_field, base)) = self.inlined_prefix.get(&canonical_path_segments(&current))
-        {
+        while let Some((base_field, base)) = crate::jit_interp::inlined_prefix_entry(
+            &self.inlined_prefix,
+            &canonical_path_segments(&current),
+        ) {
             if remaining == 0 {
                 break;
             }
@@ -1481,9 +1483,7 @@ impl LowererConfig {
             .map(|key| (key, true))
             .chain(self.int_fields.keys().map(|key| (key, false)))
             .chain(self.array_fields.keys().map(|key| (key, true)))
-            .filter_map(|(key, is_ref)| {
-                key.strip_prefix(&prefix).map(|field| (field, is_ref))
-            })
+            .filter_map(|(key, is_ref)| key.strip_prefix(&prefix).map(|field| (field, is_ref)))
             .collect();
         fields.sort_unstable();
         fields.dedup();
@@ -1499,10 +1499,9 @@ impl LowererConfig {
                     Some((ty, signed)) => {
                         (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
                     }
-                    None if self.array_fields.contains_key(&key) => (
-                        quote! { ::core::mem::size_of::<usize>() },
-                        quote! { false },
-                    ),
+                    None if self.array_fields.contains_key(&key) => {
+                        (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
+                    }
                     None => (quote! { ::core::mem::size_of::<i64>() }, quote! { true }),
                 };
                 (

@@ -3481,6 +3481,8 @@ fn bh_size_spec_from_callcontrol(
     if owner.is_empty() {
         return None;
     }
+    let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
+    let owner = canonical_owner.as_str();
     // RPython keys SizeDescrs on the low-level STRUCT object, not on an
     // annotation-side generic instantiation. Charon registers one physical
     // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
@@ -3599,28 +3601,28 @@ fn bh_size_spec_from_callcontrol(
             );
         }
     }
+    let (is_gc_managed, headerless) = cc.struct_storage_for(layout_owner).unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
-        // Analyzer-side structs keep the guard (unchanged); the raw
-        // header-less gate is driven by the runtime
-        // `register_struct_layout` path.
-        is_gc_managed: true,
-        headerless: false,
+        is_gc_managed,
+        headerless,
         // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
-        // `path_hash(owner)` per `majit_ir::descr::path_hash` doc
+        // `path_hash_for_gc_kind(owner, is_gc_managed)` per
+        // `majit_ir::descr::path_hash_for_gc_kind` doc
         // (`majit-ir/src/descr.rs:120-141`): the analyzer side hashes
         // `field.owner_root`, the runtime macro hashes
         // `concat!(module_path!(), "::", stringify!(Struct))`.  The
-        // analyzer hashes `owner` to the SAME u64 so analyzer-side
-        // `BhSizeSpec` and runtime-side `__majit_type_id` produce the
-        // same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
+        // analyzer hashes `owner` with the same raw-struct discriminator so
+        // analyzer-side `BhSizeSpec` and runtime-side `__majit_type_id`
+        // produce the same `LLType::Struct(u64)` cache key in
+        // `gc_cache._cache_size`.
         // MUST NOT truncate to u32 — `path_hash` has 64-bit range and
         // `as u32` collisions approach certainty around 2^16 distinct
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        type_id: majit_ir::descr::path_hash(layout_owner),
+        type_id: majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed),
         vtable: 0,
         all_fielddescrs,
     })
@@ -3885,6 +3887,27 @@ fn transparent_scalar_field<'a>(
     matches.next().is_none().then_some(field)
 }
 
+fn canonical_field_owner(field: &crate::model::FieldDescriptor) -> Option<String> {
+    let owner = field.owner_root.as_deref()?;
+    let canonical = majit_ir::descr::canonical_struct_name(owner);
+    if !owner.contains("::") {
+        return Some(canonical);
+    }
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let leaf_canonical = majit_ir::descr::canonical_struct_name(leaf);
+    let owner_id = field
+        .owner_id
+        .or_else(|| majit_ir::descr::struct_id_for_name(owner));
+    if leaf_canonical != leaf
+        && owner_id.is_some()
+        && majit_ir::descr::struct_id_for_name(&leaf_canonical) == owner_id
+    {
+        Some(leaf_canonical)
+    } else {
+        Some(canonical)
+    }
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
@@ -3916,7 +3939,8 @@ fn fielddescrof(
         field.name.clone()
     };
 
-    if let (Some(cc), Some(owner)) = (callcontrol, field.owner_root.as_deref()) {
+    let canonical_owner = canonical_field_owner(field);
+    if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
         // RPython `descr.py:108-118,218-239` keys both the SizeDescr and
         // FieldDescr caches on the low-level STRUCT object, never on the
@@ -3932,7 +3956,14 @@ fn fielddescrof(
                 .owner_id
                 .or_else(|| majit_ir::descr::struct_id_for_name(owner))
         {
-            parent_spec.type_id = owner_id.as_u64();
+            parent_spec.type_id = if parent_spec.is_gc_managed {
+                owner_id.as_u64()
+            } else {
+                // StructId identifies the nominal declaration only. Raw and
+                // GC variants of that declaration are distinct lltypes, so
+                // retain the storage discriminator installed above.
+                majit_ir::descr::path_hash_for_gc_kind(owner, false)
+            };
         }
         let field_lookup = bh_field_lookup(cc, field);
         let mut found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
@@ -4068,7 +4099,7 @@ fn fielddescrof(
         index_in_parent,
         parent,
         name: field_key,
-        owner: field.owner_root.clone().unwrap_or_default(),
+        owner: canonical_owner.unwrap_or_default(),
     }
 }
 

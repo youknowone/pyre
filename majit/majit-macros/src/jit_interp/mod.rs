@@ -1081,12 +1081,35 @@ pub(crate) fn declaring_struct_of(
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect();
-        let Some((_, base)) = inlined_prefix.get(&segments) else {
+        let Some((_, base)) = inlined_prefix_entry(inlined_prefix, &segments) else {
             return current;
         };
         current = base.clone();
     }
     current
+}
+
+/// Resolve an inlined-base declaration across equivalent Rust path spellings.
+///
+/// A function body can name an imported type as `Queue` while the macro
+/// configuration names it as `crate::storage::Queue`. An exact match remains
+/// authoritative. A leaf-name fallback is accepted only when this macro's
+/// declaration set contains one type with that leaf; two same-named types make
+/// the fallback ambiguous and therefore unresolved.
+pub(crate) fn inlined_prefix_entry<'a>(
+    inlined_prefix: &'a std::collections::HashMap<Vec<String>, (String, Path)>,
+    segments: &[String],
+) -> Option<&'a (String, Path)> {
+    if let Some(entry) = inlined_prefix.get(segments) {
+        return Some(entry);
+    }
+    let leaf = segments.last()?;
+    let mut matches = inlined_prefix
+        .iter()
+        .filter(|(candidate, _)| candidate.last() == Some(leaf))
+        .map(|(_, entry)| entry);
+    let entry = matches.next()?;
+    matches.next().is_none().then_some(entry)
 }
 
 /// Every `"StructLast::field"` key the three field vocabularies declare.
@@ -1150,9 +1173,7 @@ pub(crate) fn inlined_prefix_index(
 /// Parse `inlined_prefix = { Outer::field => Base, ... }`.  Split like
 /// `ref_fields`: the last segment of `Outer::field` names the field holding the
 /// inlined base.
-pub(crate) fn parse_inlined_prefix_map(
-    input: ParseStream,
-) -> syn::Result<Vec<InlinedPrefixEntry>> {
+pub(crate) fn parse_inlined_prefix_map(input: ParseStream) -> syn::Result<Vec<InlinedPrefixEntry>> {
     let content;
     braced!(content in input);
     let mut entries = Vec::new();
@@ -3086,6 +3107,52 @@ fn rewrite_body(
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    #[test]
+    fn an_unambiguous_imported_leaf_resolves_its_inlined_base() {
+        let mut prefixes = std::collections::HashMap::new();
+        prefixes.insert(
+            vec!["crate".into(), "storage".into(), "Queue".into()],
+            ("base".into(), parse_quote!(crate::storage::ListBase)),
+        );
+        let queue: Path = parse_quote!(Queue);
+        let owner = declaring_struct_of(
+            &prefixes,
+            |path, field| {
+                path.segments.last().is_some_and(|segment| {
+                    segment.ident == "ListBase" && matches!(field, "head" | "size")
+                })
+            },
+            &queue,
+            "head",
+        );
+        assert_eq!(
+            owner
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>(),
+            ["crate", "storage", "ListBase"],
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_imported_leaf_does_not_choose_an_inlined_base() {
+        let prefixes = std::collections::HashMap::from([
+            (
+                vec!["left".into(), "Queue".into()],
+                ("base".into(), parse_quote!(left::ListBase)),
+            ),
+            (
+                vec!["right".into(), "Queue".into()],
+                ("base".into(), parse_quote!(right::ListBase)),
+            ),
+        ]);
+        assert!(
+            inlined_prefix_entry(&prefixes, &["Queue".into()]).is_none(),
+            "a bare leaf shared by two configured types must fail closed",
+        );
+    }
 
     #[test]
     fn parse_helpers_list_basic() {

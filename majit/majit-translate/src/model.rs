@@ -5130,9 +5130,9 @@ pub struct FuncEffects {
     /// meaningful for an external (graph-less) funcobj; a graph-bearing
     /// function derives can-collect by walking the graph instead.
     pub random_effects_on_gcobjs: bool,
-    /// pyre `#[majit_macros::elidable_cannot_raise]` user assertion that
-    /// the callee never raises (honoured by `getcalldescr`'s elidable
-    /// branch before consulting `_canraise`).
+    /// pyre `#[majit_macros::elidable_cannot_raise]` or
+    /// `#[majit_macros::dont_look_inside_cannot_raise]` assertion that the
+    /// callee never raises.
     pub cannot_raise_assertion: bool,
     /// pyre `#[majit_macros::elidable_or_memerror]` user assertion that
     /// the callee raises only MemoryError.

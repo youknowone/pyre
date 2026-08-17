@@ -430,11 +430,7 @@ fn rewrite_jit_inline_ref_param_fields(
         .collect();
     let mut rewriter = InlineRefFieldRewriter {
         inlined_prefix: jit_interp::inlined_prefix_index(inlined_prefix),
-        declared_field_keys: jit_interp::declared_field_keys(
-            ref_fields,
-            int_fields,
-            array_fields,
-        ),
+        declared_field_keys: jit_interp::declared_field_keys(ref_fields, int_fields, array_fields),
         local_ref_types: ref_params
             .iter()
             .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
@@ -506,7 +502,9 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// alongside `_elidable_function_`, so the ullbc hint harvester
 /// (`front::llbc_hints`) can recover the strengthened-effect sub-flag
 /// the policy byte collapses to `UNSUPPORTED` for ref/float-return
-/// helpers.
+/// helpers. `dont_look_inside_cannot_raise` similarly emits
+/// `_jit_cannot_raise_` alongside `_jit_look_inside_` so graph-pipeline
+/// residual calls retain the declared exception effect.
 ///
 /// Receiver methods get the `elidable` / `elidable_cannot_raise` /
 /// `elidable_or_memerror` / `dont_look_inside` markers as associated
@@ -570,9 +568,11 @@ fn rpython_attribute_const_for(
             ("_elidable_function_", true, true),
             ("_jit_elidable_or_memerror_", true, true),
         ],
-        "dont_look_inside" | "dont_look_inside_cannot_raise" => {
-            &[("_jit_look_inside_", false, true)]
-        }
+        "dont_look_inside" => &[("_jit_look_inside_", false, true)],
+        "dont_look_inside_cannot_raise" => &[
+            ("_jit_look_inside_", false, true),
+            ("_jit_cannot_raise_", true, true),
+        ],
         "look_inside" => &[("_jit_look_inside_", true, false)],
         "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
         _ => return None,
@@ -1439,12 +1439,9 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Use when `#[dont_look_inside]` is parity-conservative: the function
 /// is opaque to the tracer (RPython annotation analysis would mark it
-/// as `EF_CANNOT_RAISE`) but pyre's analyzer output (which lives in
-/// the codewriter pipeline at `majit-translate/src/codewriter/
-/// call.rs:3250 effectinfo_from_writeanalyze`) is not yet plumbed to
-/// the runtime trace recorder. This attribute provides explicit user
-/// opt-in for the cannot-raise effect-info until the codewriter→
-/// recorder wire-up lands.
+/// as `EF_CANNOT_RAISE`) while pyre's conservative analyzer cannot prove
+/// that result. This attribute records the user's exception-effect
+/// assertion for both macro-generated and graph-pipeline JitCode.
 #[proc_macro_attribute]
 pub fn dont_look_inside_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise")

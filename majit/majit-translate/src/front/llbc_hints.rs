@@ -35,6 +35,7 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     ("_always_inline_", &["always_inline"]),
     ("_jit_elidable_cannot_raise_", &["elidable_cannot_raise"]),
     ("_jit_elidable_or_memerror_", &["elidable_or_memerror"]),
+    ("_jit_cannot_raise_", &["cannot_raise"]),
     ("_jit_loop_invariant_", &["loopinvariant"]),
     ("_jit_unroll_safe_", &["unroll_safe"]),
     // objectmodel.py:267 `not_rpython` sets `_not_rpython_ = True`;

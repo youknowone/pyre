@@ -684,6 +684,7 @@ mod jit_module {
         // variants share the upstream attribute.
         assert!(!std::hint::black_box(_jit_look_inside_opaque_plain));
         assert!(!std::hint::black_box(_jit_look_inside_opaque_cannot_raise));
+        assert!(std::hint::black_box(_jit_cannot_raise_opaque_cannot_raise));
 
         // `rlib/jit.py:169 _jit_loop_invariant_ = True` — both
         // `loop_invariant` and `jit_loop_invariant` (the latter is a pyre

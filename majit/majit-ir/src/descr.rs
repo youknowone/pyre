@@ -260,6 +260,23 @@ pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) ->
     serialized_cache_key > u32::MAX as u64 && resolved_tid == serialized_cache_key as u32
 }
 
+/// Descriptor-cache identity for a named low-level struct.
+///
+/// RPython treats `GcStruct(T)` and raw `Struct(T)` as distinct lltypes even
+/// when their fields are identical. Runtime `#[jit_interp]` lowering uses the
+/// same two-step hash, so build-time graph descriptors must include the raw
+/// discriminator as well.
+pub fn path_hash_for_gc_kind(s: &str, is_gc_managed: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    if !is_gc_managed {
+        "raw".hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module

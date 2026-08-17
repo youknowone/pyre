@@ -125,6 +125,15 @@ pub struct GraphTransformConfig {
     /// rather than being rediscovered from source text.
     #[serde(default)]
     pub call_effects: Vec<CallEffectOverride>,
+    /// Low-level storage shape for structs whose Rust representation is not
+    /// the default headered GC object.
+    ///
+    /// RPython carries this on the lltype itself (`Struct` versus `GcStruct`,
+    /// plus the allocation hints). Rust source types do not encode whether a
+    /// consumer stores one in its own heap, so an embedding pipeline supplies
+    /// that part of the translated low-level type here.
+    #[serde(default)]
+    pub struct_storage: Vec<StructStorageDescriptor>,
 }
 
 impl Default for GraphTransformConfig {
@@ -135,6 +144,32 @@ impl Default for GraphTransformConfig {
             vable_fields: Vec::new(),
             vable_arrays: Vec::new(),
             call_effects: Vec::new(),
+            struct_storage: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructStorageDescriptor {
+    pub owner: String,
+    pub is_gc_managed: bool,
+    pub headerless: bool,
+}
+
+impl StructStorageDescriptor {
+    pub fn raw(owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            is_gc_managed: false,
+            headerless: false,
+        }
+    }
+
+    pub fn headerless(owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            is_gc_managed: true,
+            headerless: true,
         }
     }
 }
@@ -151,6 +186,12 @@ pub enum CallEffectKind {
     /// The three variants above are shorthands for three particular rows;
     /// this one carries the row.
     Declared(DeclaredCallEffects),
+}
+
+impl Default for CallEffectKind {
+    fn default() -> Self {
+        Self::Residual
+    }
 }
 
 /// `effectinfo.py:17-24` `EF_*`, minus `EF_RANDOM_EFFECTS`.
@@ -222,6 +263,10 @@ pub struct CallEffectOverride {
     /// match counter in the same output — a row that reads `0x INERT` is not
     /// installed, whatever it looks like here.
     pub target: CallTarget,
+    /// The declared classification, retained so a full `Declared` row is not
+    /// collapsed back to the generic residual category during lookup.
+    #[serde(default)]
+    pub effect: CallEffectKind,
     /// `calldescr`-equivalent EffectInfo wrapper attached to the call.
     pub descriptor: CallDescriptor,
 }
@@ -230,6 +275,7 @@ impl CallEffectOverride {
     pub fn new(target: CallTarget, effect: CallEffectKind) -> Self {
         Self {
             target,
+            effect,
             descriptor: CallDescriptor::override_effect(effect_info_for_kind(effect)),
         }
     }
@@ -3771,9 +3817,11 @@ impl<'a> Transformer<'a> {
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
-                    let extraeffect = classify_call(target, &self.config.call_effects)
-                        .map(|(d, _)| d.extra_info.extraeffect);
-                    let descriptor = cc_ref.getcalldescr(
+                    let classified = classify_call(target, &self.config.call_effects);
+                    let extraeffect = classified
+                        .as_ref()
+                        .map(|(descriptor, _)| descriptor.extra_info.extraeffect);
+                    let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
                         result_ir_type,
@@ -3782,6 +3830,9 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
+                    if let Some((declared, CallEffectKind::Declared(_))) = classified {
+                        descriptor.extra_info = declared.extra_info;
+                    }
                     self.handle_residual_call(
                         graph,
                         op,
@@ -7314,6 +7365,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
         // reaching this function. Remaining oopspecs map to OS_* indices.
         "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
@@ -7503,8 +7555,7 @@ fn classify_call(
     {
         record_override_match(&override_.target);
         let descriptor = override_.descriptor.clone();
-        let effect = classify_effect_info(&descriptor.get_extra_info());
-        return Some((descriptor, effect));
+        return Some((descriptor, override_.effect));
     }
     let descriptor = crate::call::describe_call(target)?;
     let effect = classify_effect_info(&descriptor.get_extra_info());
@@ -9539,6 +9590,64 @@ mod tests {
     }
 
     #[test]
+    fn declared_override_replaces_analyzer_effect_sets() {
+        let target = CallTarget::function_path(["opaque_cleanup"]);
+        let mut graph = FunctionGraph::new("caller");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "node".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: target.clone(),
+                args: vec![arg],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            call_effects: vec![CallEffectOverride::new(
+                target,
+                CallEffectKind::Declared(DeclaredCallEffects {
+                    extra: DeclaredExtraEffect::CannotRaise,
+                    can_collect: false,
+                    can_invalidate: false,
+                }),
+            )],
+            ..Default::default()
+        };
+        let mut cc = crate::call::CallControl::new();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let descriptor = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("declared call must lower to CallResidual");
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(!descriptor.extra_info.can_collect);
+        assert!(!descriptor.extra_info.can_invalidate);
+        assert_eq!(descriptor.extra_info.write_descrs_fields, Some(Vec::new()));
+        assert_eq!(descriptor.extra_info.write_descrs_arrays, Some(Vec::new()));
+    }
+
+    #[test]
     fn transform_graph_reports_unknowns() {
         let mut graph = FunctionGraph::new("demo");
         graph.push_op_var(
@@ -11417,6 +11526,10 @@ mod tests {
     #[test]
     fn map_user_oopspec_dict_lookup() {
         use majit_ir::descr::OopSpecIndex;
+        assert_eq!(
+            super::map_user_oopspec_to_index("raw_free(node)"),
+            OopSpecIndex::RawFree
+        );
         assert_eq!(
             super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
             OopSpecIndex::DictLookup
