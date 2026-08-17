@@ -9470,16 +9470,14 @@ fn handle_fail(
         return HandleFailOutcome::ResumeInBlackhole;
     }
 
-    // A keyed guard resumes inside the seeded user `__next__` frame, so a
-    // bridge would start mid-callee and never revisit the FOR_ITER site whose
-    // generic residual maps exhaustion.  Preserve the existing bridge-only
-    // demotion marker, but always finish this failure in the blackhole.  This
-    // is unconditional for every keyed failure: `insert`
-    // reports false after the first one, while later exhaustion and class
-    // failures need the same no-bridge path.
+    // A keyed failure proves this FOR_ITER site's instance-`__next__`
+    // specialization unsuitable.  Deliberately discard the marker's bool:
+    // the first insertion retires the specialization, while later failures
+    // must leave it retired so the next walk compiles the generic residual.
+    // Do not override the ordinary bridge gate; `compile.py:702-703` makes
+    // `must_compile() && !stack_almost_full()` the complete decision.
     if let Some(foriter_key) = descr_arc.instance_next_foriter_green_key() {
-        pyre_jit_trace::trace::instance_next_foriter_bridge_demote_once(foriter_key);
-        return HandleFailOutcome::ResumeInBlackhole;
+        let _ = pyre_jit_trace::trace::instance_next_foriter_bridge_demote_once(foriter_key);
     }
 
     // compile.py:702-703: must_compile() AND not stack_almost_full()
