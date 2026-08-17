@@ -1122,6 +1122,21 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    if name == "co_lnotab" {
+        // CPython 3.14 `code_getlnotab`: issue the warning before decoding or
+        // allocating the bytes result, and propagate warnings-as-errors.
+        unsafe { require_code(obj, name)? };
+        crate::warn::warn_deprecation("co_lnotab is deprecated, use co_lines instead.")?;
+        // Warning dispatch can run arbitrary Python.  Reacquire the immutable
+        // CodeObject view after that call rather than retaining a Rust borrow
+        // across the re-entrant boundary.
+        let code = unsafe { require_code(obj, name)? };
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+            &legacy_lnotab(code, unsafe {
+                (*(obj as *const PyCode)).co_firstlineno_raw as i64
+            }),
+        ));
+    }
     let code = unsafe { require_code(obj, name)? };
     Ok(match name {
         "co_argcount" => w_int_new(code.arg_count as i64),
@@ -1148,12 +1163,6 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_firstlineno" => w_int_new((*(obj as *const PyCode)).co_firstlineno_raw as i64),
         "co_linetable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.linetable),
         "co_exceptiontable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.exceptiontable),
-        // location.py `linetable2lnotab`, reconstructed from the
-        // canonical decoded positions kept on CodeObject.
-        "co_lnotab" => pyre_object::bytesobject::w_bytes_from_bytes(&legacy_lnotab(
-            code,
-            (*(obj as *const PyCode)).co_firstlineno_raw as i64,
-        )),
         _ => {
             return Err(crate::PyError::attribute_error(format!(
                 "'code' object has no attribute '{name}'"
