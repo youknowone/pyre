@@ -2299,16 +2299,22 @@ mod tests {
     ///
     /// These two fields are exactly the ones that sub-walk reads, and both
     /// sit past a pointer, so they move between 64- and 32-bit targets.
+    ///
+    /// The owners are spelled with their crate-stripped module path, which is
+    /// how the mint records them: a field descriptor's owner goes through
+    /// `canonical_struct_name`, so two structs sharing a leaf but declared in
+    /// different modules stay apart in the pool. Passing the bare leaf here
+    /// matches nothing at all rather than matching loosely.
     #[test]
     fn build_time_offset_matches_runtime_layout() {
         for (owner, name, runtime) in [
             (
-                "PyObject",
+                "pyobject::PyObject",
                 "w_class",
                 std::mem::offset_of!(pyre_object::pyobject::PyObject, w_class),
             ),
             (
-                "PyType",
+                "pyobject::PyType",
                 "instantiate",
                 std::mem::offset_of!(pyre_object::pyobject::PyType, instantiate),
             ),
