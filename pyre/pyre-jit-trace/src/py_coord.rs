@@ -61,6 +61,19 @@ pub fn containing_py_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -
     Some(containing_py_pc_for_jitcode_pc(&payload.metadata, offset as usize) as i32)
 }
 
+/// Return the per-emission-run Python owner of a stored JitCode offset.
+///
+/// Unlike the floor tier, this preserves a Python instruction that emits in
+/// multiple disjoint JitCode regions. Empty skeleton metadata returns `None`.
+pub fn exact_py_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Option<i32> {
+    let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+        &payload.metadata.py_exact_by_jit_pc,
+        offset as usize,
+    )
+    .map(|py| py as i32)
+}
+
 /// Advance a Python instruction coordinate past resume trivia when code is available.
 pub fn skip_python_trivia_forward_public(
     jitcode_index: i32,

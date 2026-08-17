@@ -721,21 +721,40 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     let Ok(opcode_position) = i32::try_from(opcode_position) else {
         return;
     };
-    if pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+    let forwards_existing = pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
         jitcode_index,
         opcode_position,
-    ) {
-        return;
-    }
+    );
     let frame_ptr = frame_value as *mut PyFrame;
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
-    let last_instruction = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+    // A forwarding raise keeps the chain it arrived with only when this frame
+    // attached the head. When the raise came out of an inlined callee, the
+    // head names the callee and this frame still owes one node. The ownership
+    // check preserves `pyopcode.py:147-148 handle_operation_error` as the
+    // one-node-per-frame-per-delivery authority.
+    if forwards_existing {
+        let owns_head = unsafe {
+            let head =
+                pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
+            !head.is_null()
+                && pyre_interpreter::pytraceback::is_pytraceback(head)
+                && pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) == frame_ptr
+        };
+        if owns_head {
+            return;
+        }
+    }
+    let resolved = pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
         jitcode_index,
         opcode_position,
-    )
-    .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
+    );
+    let exact =
+        pyre_jit_trace::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, opcode_position);
+    let last_instruction = exact
+        .or(resolved)
+        .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
     // One catch can be reached by two recorders: this hook, emitted into the
     // loop trace by the in-trace handler-entry arm, and the IR-virtual node the
     // bridge handler-entry arm builds when the exception edge deopts into a

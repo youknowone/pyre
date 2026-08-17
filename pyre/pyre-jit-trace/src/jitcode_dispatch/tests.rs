@@ -103,6 +103,19 @@ fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     assert_eq!(vstack_step_py_pc(&pyjit.metadata, 120, 18), 18);
 }
 
+#[test]
+fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (10, 11), (20, 21)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 0), (10, 11), (20, 21), (30, 11)];
+
+    assert_eq!(vstack_containing_py_pc(&pyjit.metadata, 35), 21);
+    assert_eq!(
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&pyjit.metadata.py_exact_by_jit_pc, 35),
+        Some(11),
+    );
+}
+
 /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
 /// `const_ref` / `make_fail_descr` factories so the fixture stays
 /// out of `pub(crate)` API.

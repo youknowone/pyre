@@ -1245,9 +1245,10 @@ pub fn on_live_marker(
 ///
 /// `RAISE_VARARGS 0` and `RERAISE` both use RaiseWithExplicitTraceback.
 /// FOR_ITER's exception-match mismatch arm re-raises the value its own
-/// `catch_exception` caught — `pyopcode.py:1310` re-raises `e` untouched —
-/// and this frame's node was already recorded when the `space.next` residual
-/// raised into the catch.
+/// `catch_exception` caught — `pyopcode.py:1310` re-raises `e` untouched. It
+/// keeps this frame's existing node only when the `space.next` residual
+/// attached that node; an inlined `__next__` instead leaves the callee's node
+/// at the chain head.
 pub fn raise_at_py_pc_keeps_existing_traceback(raw_code: &CodeObject, py_pc: usize) -> bool {
     match unsafe { pyre_interpreter::decode_instruction_at(raw_code, py_pc) } {
         Some((Instruction::RaiseVarargs { .. }, op_arg)) => u32::from(op_arg) == 0,
@@ -1262,8 +1263,8 @@ pub fn jitcode_pc_raise_keeps_existing_traceback(jitcode_index: i32, offset: i32
     let Some(raw_code) = raw_code_for_jitcode_index(jitcode_index) else {
         return false;
     };
-    let Some(py_pc) =
-        crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, offset)
+    let Some(py_pc) = crate::py_coord::exact_py_pc_for_jitcode_pc_public(jitcode_index, offset)
+        .or_else(|| crate::py_coord::containing_py_pc_for_jitcode_pc_public(jitcode_index, offset))
     else {
         return false;
     };
