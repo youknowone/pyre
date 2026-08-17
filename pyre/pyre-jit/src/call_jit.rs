@@ -2728,26 +2728,32 @@ pub fn blackhole_resume_via_rd_numb(
                         )
                     });
                     if !frame_ptr.is_null() {
-                        let last_instruction = jitcode_index
-                            .and_then(|index| {
-                                pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
-                                    index,
+                        match jitcode_index {
+                            // Every indexed frame recorded during blackhole
+                            // propagation goes through the guarded recorder;
+                            // `pyopcode.py:147-148 handle_operation_error` is
+                            // upstream's single traceback attach point.
+                            Some(jitcode_index) => record_caught_blackhole_traceback(
+                                err.exc_object as i64,
+                                frame_ptr as i64,
+                                i64::from(jitcode_index),
+                                last_opcode_position as i64,
+                            ),
+                            None => {
+                                m73_lastinstr_audit(
+                                    "exit_guard_exc",
+                                    jitcode_index,
                                     last_opcode_position as i32,
-                                )
-                            })
-                            .map_or(unsafe { (*frame_ptr).last_instr as i64 }, i64::from);
-                        m73_lastinstr_audit(
-                            "exit_guard_exc",
-                            jitcode_index,
-                            last_opcode_position as i32,
-                            frame_ptr,
-                        );
-                        unsafe {
-                            pyre_interpreter::pytraceback::record_application_traceback(
-                                err.exc_object,
-                                frame_ptr,
-                                last_instruction,
-                            );
+                                    frame_ptr,
+                                );
+                                unsafe {
+                                    pyre_interpreter::pytraceback::record_application_traceback(
+                                        err.exc_object,
+                                        frame_ptr,
+                                        (*frame_ptr).last_instr as i64,
+                                    );
+                                }
+                            }
                         }
                     }
                     // `guard_exc` is now owned by the typed
