@@ -10,7 +10,7 @@
 //! never tagged.
 //!
 //! The tag path is gated behind [`CAN_BE_TAGGED`], which is currently `false`.
-//! If it is enabled: the
+//! Once enabled, the
 //! maker (`intobject::w_int_new`) returns small ints as immediates, the
 //! readers/dispatch chokepoints `& 1`-precheck before any `ob_type`
 //! deref, and the GC collector skips tagged immediates
@@ -26,9 +26,9 @@ use crate::pyobject::PyObjectRef;
 
 /// `rpython/rtyper/lltypesystem/rtagged.py:64-96` static `can_be_tagged`
 /// gate, collapsed to the single runtime `int` class. Off, mirroring
-/// `rpython/config/translationoption.py:185 taggedpointers` left off. If it is
-/// enabled, every consumer chokepoint
-/// takes the `& 1` tag precheck and the maker emits small ints as
+/// `rpython/config/translationoption.py:185 taggedpointers` left off. When
+/// enabled, every consumer chokepoint takes the `& 1` tag precheck and the
+/// maker emits small ints as
 /// immediates. `rerased.py:1-3`: the point is to avoid putting `& 1` tag
 /// checks on every object — they are gated on this static, which is kept
 /// in lockstep with the GC `taggedpointers` config (`pyre-jit`

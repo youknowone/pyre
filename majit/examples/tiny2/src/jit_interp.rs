@@ -490,6 +490,11 @@ mod tests {
         }
     }
 
+    /// Factorial through the plain interpreter.
+    ///
+    /// This covers only the plain interpreter. Add a JIT counterpart after
+    /// `OP_LOOP_END` lowers instead of producing an abort stub, and execute it
+    /// through [`run_locked`] to serialize the process-global probe counters.
     #[test]
     fn interp_factorial() {
         let prog: Vec<&str> = "1 { #1 MUL #1 1 SUB ->#1 #1 }".split_whitespace().collect();

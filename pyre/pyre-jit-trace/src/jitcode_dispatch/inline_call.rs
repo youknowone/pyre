@@ -1356,7 +1356,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // than a decline.
     // Run the call concretely to stamp `ca_result` (same rationale as the
     // self-recursive arm: the downstream consumer needs the real concrete to
-    // take its int specialization). ⚠️ The inlined prologue already ran the
+    // take its int specialization). The inlined prologue already ran the
     // callee's pre-loop bytecode concretely during the sub-walk; the executor
     // re-runs the WHOLE call fresh, so a side-effecting pre-loop body would
     // execute twice at trace time. The corpus target (`loop_callee_return`)

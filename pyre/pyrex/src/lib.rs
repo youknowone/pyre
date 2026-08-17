@@ -990,9 +990,10 @@ fn maybe_print_fbw_depth_census() {
 /// native run at all.
 ///
 /// Deliberately NOT under the `[jit-stats]` prefix: `check.py`'s
-/// `_jit_stats_snapshot` keeps the LAST such line, so a second one would
-/// silently replace the committed per-bench baseline. Its own env gate keeps it
-/// off the default `check.py` run, which sets `MAJIT_STATS` for every bench.
+/// `_jit_stats_snapshot` merges every such line into one key/value set, so a
+/// key printed under that prefix joins the counters instead of sitting beside
+/// them. Its own env gate keeps it off the default `check.py` run, which sets
+/// `MAJIT_STATS` for every bench.
 fn maybe_print_mc_diag() {
     if std::env::var_os("PYRE_MC_DIAG").is_none() {
         return;

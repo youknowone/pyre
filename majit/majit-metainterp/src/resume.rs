@@ -181,8 +181,8 @@ pub struct NumberingState {
     /// Ref,Float}, resoperation.py:564-638 *Op mixins) so that
     /// `InputArgRef(0)` and `RefOp(0)` do not collapse onto the same
     /// raw u32 — pyre's flat-OpRef stand-in for PyPy's `box is box`
-    /// identity. See `LiveboxMap` (resume.rs:98) for the matching
-    /// typed-key convention.
+    /// identity. See `LiveboxMap` for the matching typed-key
+    /// convention.
     pub livebox_types: LiveboxTypeMap,
 }
 
@@ -2215,8 +2215,8 @@ impl EncodedResumeData {
             TAGCONST => match value {
                 // resume.py:1552-1596 decode_ref: `if tagged_eq(tagged,
                 // NULLREF): return CONST_NULL`. The i64 decoder mirrors
-                // the i16 `decode_box`'s NULLREF fast-path (resume.rs
-                // line 4363) so encoder/decoder stay symmetric.
+                // the free `decode_box(tagged: i16, ..)`'s NULLREF
+                // fast-path so encoder/decoder stay symmetric.
                 ENCODED_NULLREF => {
                     ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
                 }
@@ -3607,7 +3607,8 @@ impl ResumeDataLoopMemo {
             // element type is not itself optional.  We use the
             // `RdVirtualInfo::Empty` sentinel variant to mark hole slots;
             // downstream consumers (compile.rs:644, compiler.rs:10952,
-            // state.rs:3180, eval.rs:2680, resume.rs:1766) match `Empty`
+            // state.rs:3180, eval.rs:2680,
+            // `resume.rs::rd_virtual_to_virtual_info`) match `Empty`
             // and treat it as `None` equivalent.  Functional parity is
             // preserved; the structural divergence stays isolated to
             // this one type.
@@ -4053,7 +4054,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `IndexMap` (resume.rs:98) so the
+        // `LiveboxMap` is built on `IndexMap` so the
         // `.iter()` sequence already matches that order, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
@@ -4267,9 +4268,9 @@ impl ResumeDataLoopMemo {
         // livebox slots.
         //
         // resume.py:412-417 + regalloc.py:1204: liveboxes contains ONLY
-        // non-Const boxes — `_number_boxes` (resume.rs:3755-3826) classifies
-        // Const via `is_const(opref)` → TAGCONST inline (lines 3773-3777)
-        // before the box ever reaches liveboxes. PyPy `resume.py:finish` has
+        // non-Const boxes — `_number_boxes` classifies Const via its
+        // `is_const(opref)` → TAGCONST branch before the box ever
+        // reaches liveboxes. PyPy `resume.py:finish` has
         // no post-numbering Const→hole step; the invariant is that liveboxes
         // entries stay non-Const through finish(). Hard-assert that
         // `get_box_replacement_not_const` does not produce a
@@ -6020,7 +6021,7 @@ pub trait VirtualInfoBlackholeExt {
     fn is_about_raw(&self) -> bool;
     /// `resume.py:973 if rd_virtual is not None`: detect the
     /// `RdVirtualInfo::Empty` placeholder propagated as a zero-shaped
-    /// `VirtualObj` (resume.rs:1446 conversion).  Used by
+    /// `VirtualObj` (the `rd_virtual_to_virtual_info` conversion). Used by
     /// `force_all_virtuals` to skip slots that PyPy keeps as `None`.
     fn is_empty_placeholder(&self) -> bool;
     fn allocate(
@@ -6150,8 +6151,8 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
     }
 
     fn is_empty_placeholder(&self) -> bool {
-        // The `RdVirtualInfo::Empty` → `VirtualObj` conversion at
-        // `resume.rs:1446` produces this exact shape.
+        // The `RdVirtualInfo::Empty` → `VirtualObj` conversion in
+        // `rd_virtual_to_virtual_info` produces this exact shape.
         matches!(
             self,
             VirtualInfo::VirtualObj {
@@ -6498,8 +6499,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     ///     `optimizeopt/optimizer.rs:3453` initializes both to
     ///     `UNASSIGNED`, but the entries are immediately fed through
     ///     `memo.finish()` (`optimizeopt/mod.rs:3390`) →
-    ///     `_add_pending_fields` (`resume.rs:3554`), which writes
-    ///     the tags from `_gettagged`.
+    ///     `_add_pending_fields`, which writes the tags from
+    ///     `_gettagged`.
     ///   * The sharing path (`_copy_resume_data_from`) routes resume
     ///     reads through `ResumeGuardCopiedDescr.prev` (compile.py:849
     ///     `get_resumestorage(): return prev`); readers reach the

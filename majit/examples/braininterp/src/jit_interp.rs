@@ -106,6 +106,10 @@ fn mainloop(program: &Bytecode, threshold: u32) -> String {
         if pc >= program.len() {
             break;
         }
+        // Keep the observer/replay form until the backward `]` arm lowers to a
+        // sub-JitCode. In the single-executor form that arm is an abort stub,
+        // so tracing repeats the loop-header guards until trace segmentation
+        // instead of compiling a useful loop body.
         jit_merge_point!();
         let ch = program[pc];
 

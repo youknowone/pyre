@@ -8,17 +8,8 @@ pub type Bytecode = [u8];
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Hot loops majit compiled, and the optimized op count of the last one.
-///
-/// `jit_tier_liveness_gate` reads both, and neither is a liveness verdict.
-/// `COMPILES > 0` is necessary and nowhere near sufficient: an empty dispatch
-/// still compiles a trace, just one whose whole body is `Finish()`.
-///
-/// AND THE OP COUNT DOES NOT RESCUE IT, which this doc asserted until the
-/// shape gate refuted it. The count is one integer over at least three states,
-/// and it collides where it matters: `1` is an empty dispatch, `5` is a
-/// segmented runaway, and a healthy body is some other number entirely — so
-/// reading a count tells you a body's SIZE and never its SHAPE. That is why
-/// `jit_tier_shape_gate` exists and why these two booleans do the grading.
+/// A count alone cannot distinguish a useful body from an empty or segmented
+/// trace; [`LAST_HAS_JUMP`] and [`LAST_ALWAYS_FAILS`] record that shape.
 pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
 pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
 /// Shape of the last compiled body, for `jit_tier_shape_gate`.
@@ -82,6 +73,11 @@ fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
         if pc >= program.len() {
             break;
         }
+        // Keep observer/replay until `OP_LOOP_END` lowers to a sub-JitCode.
+        // Single-executor would otherwise stop at that abort stub before the
+        // remaining program executes. `jit_tier_liveness_gate` checks the
+        // current non-compiling behavior; `jit_tier_shape_gate` is ignored
+        // until a useful loop body can compile.
         jit_merge_point!();
         let ch = program[pc];
 

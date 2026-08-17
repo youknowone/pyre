@@ -1103,8 +1103,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn is_virtual_raw(&self, opref: OpRef) -> bool {
         // info.py:865 `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
         // virtuals.  `get_type()` already classifies these as Int; mirror
-        // the classification here so resume encoding (`resume.rs:3672`)
-        // picks them up via TAGVIRTUAL instead of TAGBOX.
+        // the classification here so resume encoding
+        // (`ResumeDataLoopMemo::_number_boxes`, whose `Type::Int` arm calls
+        // `is_virtual_raw`) picks them up via TAGVIRTUAL instead of TAGBOX.
         let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
         resolved_box
             .as_ref()
@@ -1215,8 +1216,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             //         self.parent.visitor_walk_recursive(source_op, visitor)
             // ```
             //
-            // pyre's consumer (`resume.rs::encode_*` worklist at
-            // `resume.rs:3517`) drives the recursion off `get_virtual_fields`
+            // pyre's consumer (the virtual worklist in
+            // `ResumeDataLoopMemo::finish`) drives the recursion off
+            // `get_virtual_fields`
             // — registering the parent OpRef here lets the worklist enqueue
             // the parent and re-enter `get_virtual_fields` on it, which
             // matches RPython's `parent.visitor_walk_recursive(source_op,

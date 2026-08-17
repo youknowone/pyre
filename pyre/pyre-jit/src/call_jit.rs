@@ -3156,7 +3156,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// Derive the (`green_key`, `trace_id`, `fail_index`) bridge-source identity
 /// strictly from the failing guard's descr Arc.
 ///
-/// `pyjitpl.py:2890 handle_guard_failure(self, resumedescr, deadframe)`
+/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr, deadframe)`
 /// reads identity from `resumedescr` directly: `resumedescr.rd_loop_token
 /// .loop_token_wref()` (line 2897) yields the owning `JitCellToken`,
 /// `resumedescr.get_resumestorage()` (line 2893) yields the `ResumeGuardDescr`
@@ -3186,7 +3186,7 @@ pub(crate) fn bridge_source_identity_from_descr(
 
 /// Outcome of `trace_and_compile_from_bridge`.
 ///
-/// `pyjitpl.py:2884 handle_guard_failure` never returns — it raises
+/// `pyjitpl.py:2914 handle_guard_failure` never returns — it raises
 /// `ContinueRunningNormally` (bridge attached, resume in compiled code),
 /// switches to the blackhole, or raises `DoneWithThisFrame` when
 /// `interpret()` runs the resumed frames forward to a `Finish`.  Pyre
@@ -3225,7 +3225,7 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 /// Traces the alternative path from the guard failure point and compiles
 /// a bridge.
 ///
-/// pyjitpl.py:2884 handle_guard_failure:
+/// pyjitpl.py:2914 handle_guard_failure:
 ///   initialize_state_from_guard_failure(resumedescr, deadframe)
 ///   prepare_resume_from_failure(deadframe, inputargs, resumedescr, excdata)
 ///   self.interpret()
@@ -3250,7 +3250,7 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
 pub fn trace_and_compile_from_bridge(
-    // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+    // pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
     // threads `resumedescr` (the descr) as the canonical identity source
     // through the entire bridge tracer.  Pyre's backend FailDescr Arc
     // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
@@ -3346,7 +3346,7 @@ pub fn trace_and_compile_from_bridge(
         info
     };
 
-    // pyjitpl.py:2890-2911 handle_guard_failure parity:
+    // pyjitpl.py:2914-2935 handle_guard_failure parity:
     // RPython creates a fresh MetaInterp and calls
     // initialize_state_from_guard_failure(resumedescr, deadframe)
     // which internally calls rebuild_from_resumedata (resume.py:1042).
@@ -3976,7 +3976,7 @@ pub fn trace_and_compile_from_bridge(
 /// Checks must_compile (jitcounter.tick), and if threshold reached,
 /// traces the alternate path via trace_and_compile_from_bridge.
 ///
-/// pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
+/// pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
 /// — descr identity is the only argument crossing the C-ABI boundary;
 /// the receiver derives `(green_key, trace_id, fail_index)` from the
 /// recovered Arc, mirroring `compile.py:706-708 _trace_and_compile_
@@ -3990,7 +3990,7 @@ fn jit_ca_handle_guard_failure(
     if raw_values_ptr.is_null() || num_values == 0 {
         return false;
     }
-    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2890 — RPython's
+    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
     // `handle_guard_failure` unwinds to the top-level `execute_token` before any
     // tracing decision, so a guard never fires while another trace is open).
     // pyre's CALL_ASSEMBLER guard callback runs synchronously from the backend

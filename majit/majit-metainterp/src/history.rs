@@ -2840,7 +2840,7 @@ impl TraceCtx {
     /// responsible for deduplicating box positions across frames
     /// (RPython's `_number_boxes` does this implicitly via the memo
     /// table; pyre's `Snapshot.encode` does the same in
-    /// `resume.rs:1898 _number_boxes`).
+    /// `resume.rs::_number_boxes`).
     pub fn capture_snapshot_for_last_guard_multi_frame(
         &mut self,
         frames: &[(u32, u32, u32, &[OpRef])],
@@ -3397,7 +3397,7 @@ impl TraceCtx {
     /// separate "that family is constant" from "that family was never
     /// reached", because the const-by-construction callers dilute it.
     ///
-    /// ⇒ The minimal snapshot is load-bearing ONLY for the
+    /// The minimal snapshot is load-bearing only for the
     /// `rd_resume_position >= 0` invariant above. Do not read that as "the
     /// contents do not matter": they matter to any guard that survives
     /// optimization, and whether one survives is a property of the traced

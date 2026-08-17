@@ -430,13 +430,54 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     Ok((fdescr, adescr))
 }
 
+/// `pyjitpl.py:1201-1216 _get_arrayitem_vable_index` opens with
+/// `indexbox = self.implement_guard_value(indexbox, pc)`: the flat array slot
+/// is derived from the index's recording-time value, so the trace is only
+/// sound if it also pins that value.
+///
+/// The promote is hoisted out of `TraceCtx::get_arrayitem_vable_index` to the
+/// walker for the reason `pyjitpl/dispatch.rs` states at its own six
+/// `BC_*ARRAYITEM_VABLE_*` sites: promoting at the call site gets the guard a
+/// full-framestack, vable-carrying snapshot, where the callee can only build
+/// the minimal one `TraceCtx::promote_int` produces without an `MIFrameStack`.
+/// The hoist moves the promote to the caller, not ahead of the branch that
+/// selects it: `_get_arrayitem_vable_index` is reached only from the standard
+/// leg of `_opimpl_get|setarrayitem_vable` (pyjitpl.py:1229, :1244), so both
+/// call sites run `TraceCtx::nonstandard_virtualizable` first and skip this
+/// promote on the non-standard leg.
+///
+/// Mirrors `guard_value_record` (`arith.rs`) step for step, including the
+/// `replace_box` and register-bank rewrite. The callee's promote discards its
+/// promoted box, so nothing downstream would otherwise see the pinned value.
+fn walker_promote_vable_array_index<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    index: OpRef,
+    index_value: i64,
+) -> Result<OpRef, DispatchError> {
+    if index.is_constant() {
+        return Ok(index);
+    }
+    let expected = ctx.trace_ctx.const_int(index_value);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[index, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx.replace_box(index, expected);
+    for slot in ctx.registers_i.iter_mut() {
+        if *slot == index {
+            *slot = expected;
+        }
+    }
+    Ok(expected)
+}
+
 /// `getarrayitem_vable_<i|r|f>/ridd>X` handler. Operand layout `ridd>X`:
 /// 1B r-reg(vable) + 1B i-reg(index) + 2B fdescr(VableArray) + 2B
 /// adescr(Array) + 1B X-dst.
 ///
 /// RPython parity: `pyjitpl.py _opimpl_getarrayitem_vable`
 /// (`opimpl_getarrayitem_vable_{i,r,f}`).  Delegates to
-/// `TraceCtx::vable_getarrayitem_{int,ref,float}_indexed`
+/// `TraceCtx::vable_getarrayitem_{int,ref,float}_checked`
 /// (`trace_ctx.rs`) which implements the
 /// `_nonstandard_virtualizable` GETFIELD_GC + GETARRAYITEM_GC fallback
 /// and the standard-vable `virtualizable_boxes[index]` cache read.
@@ -508,9 +549,22 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 2, 4, ctx)?;
+    // Upstream decides standardness before promoting the index: an ordinary
+    // heap access on the non-standard leg must retain the index box as-is.
+    let check_guards_before = ctx.trace_ctx.num_guards();
+    let nonstandard = ctx
+        .trace_ctx
+        .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
+    let index = if nonstandard {
+        index
+    } else {
+        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
+    };
     let guards_before = ctx.trace_ctx.num_guards();
     let (result, shadow_value) = match dst_bank {
-        'i' => ctx.trace_ctx.vable_getarrayitem_int_indexed(
+        'i' => ctx.trace_ctx.vable_getarrayitem_int_checked(
+            nonstandard,
             op.pc,
             vable,
             index,
@@ -518,7 +572,8 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             fdescr,
             adescr,
         ),
-        'r' => ctx.trace_ctx.vable_getarrayitem_ref_indexed(
+        'r' => ctx.trace_ctx.vable_getarrayitem_ref_checked(
+            nonstandard,
             op.pc,
             vable,
             index,
@@ -526,7 +581,8 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             fdescr,
             adescr,
         ),
-        'f' => ctx.trace_ctx.vable_getarrayitem_float_indexed(
+        'f' => ctx.trace_ctx.vable_getarrayitem_float_checked(
+            nonstandard,
             op.pc,
             vable,
             index,
@@ -703,7 +759,7 @@ fn active_frame_nlocals<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<
 }
 
 /// RPython parity: `pyjitpl.py _opimpl_setarrayitem_vable`.
-/// Delegates to `TraceCtx::vable_setarrayitem_indexed`
+/// Delegates to `TraceCtx::vable_setarrayitem_checked`
 /// (`trace_ctx.rs`) which implements the `_nonstandard_virtualizable`
 /// SETARRAYITEM_GC fallback + the standard-vable
 /// `virtualizable_boxes[index] = valuebox` + `synchronize_virtualizable`.
@@ -774,6 +830,19 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
         }
     };
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
+    // As in the read path, only the standard virtualizable leg promotes the
+    // array index and needs the full walker-owned resume snapshot.
+    let check_guards_before = ctx.trace_ctx.num_guards();
+    let nonstandard = ctx
+        .trace_ctx
+        .nonstandard_virtualizable(op.pc, vable, &fdescr);
+    walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
+    let index = if nonstandard {
+        index
+    } else {
+        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
+    };
     let encoded_value = match value_bank {
         'i' => read_int_reg(code, op, 2, ctx)?,
         'r' => read_ref_reg(code, op, 2, ctx)?,
@@ -805,13 +874,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     {
         value = tos;
     }
-    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     let concrete =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = match ctx.trace_ctx.vable_setarrayitem_indexed(
+    let write = match ctx.trace_ctx.vable_setarrayitem_checked(
+        nonstandard,
         op.pc,
         vable,
         index,
