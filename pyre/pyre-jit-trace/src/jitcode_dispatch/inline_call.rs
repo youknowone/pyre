@@ -1587,11 +1587,32 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// pure-leaf callee resume to the caller's CALL boundary via the inherited
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
 /// sound for side-effect-free leaves (re-execute the whole call on deopt).
+///
+/// That layout is a property of the CALL-family helpers alone, so the residual
+/// this reads from has to be one of them.  Every other entry the inline lever
+/// serves passes its own receiver-plus-metadata list, not an operand-stack
+/// image: `load_attr_fn(obj, code, name_idx)` is `r_args = [obj, code]` and
+/// `store_attr_fn` is `[obj, value, code]`, whose `code` operand is a code
+/// object the Python stack never held.  Publishing it as a stack slot resumes
+/// the interpreter with the code object where the receiver belongs — the
+/// `__getattr__`/`property` folds returned `AttributeError: 'code' object has
+/// no attribute <name>` for an attribute their own hook answers.  Decline for
+/// those instead; their operand image comes from the per-slot resume sources
+/// ([`reconstructed_call_stack_from_resume_sources`]).
 pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
+    if !matches!(
+        call_descr.get_extra_info().pyre_helper,
+        majit_ir::PyreHelperKind::CallFn
+            | majit_ir::PyreHelperKind::CallKw
+            | majit_ir::PyreHelperKind::CallFunctionEx
+    ) {
+        return None;
+    }
     // The Ref list is NOT at a fixed offset: the method-form `CALL` helpers
     // this leg latches for lower through the mixed `iIRd>r` shape, whose
     // leading Int list shifts it (`dispatch_residual_call_iIRd_kind` reads it
@@ -3002,6 +3023,7 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
     is_top_inline: bool,
     unjournaled_before_subwalk: bool,
     executed_effects_before: usize,
@@ -3016,7 +3038,7 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord else {
         return;
     };
-    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx) {
+    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr) {
         fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
     }
 }
@@ -5284,6 +5306,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     code,
                     op,
                     ctx,
+                    call_descr,
                     is_top_inline,
                     unjournaled_before_subwalk,
                     executed_effects_before,
@@ -5314,6 +5337,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     code,
                     op,
                     ctx,
+                    call_descr,
                     is_top_inline,
                     unjournaled_before_subwalk,
                     executed_effects_before,
@@ -5357,6 +5381,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             code,
                             op,
                             ctx,
+                            call_descr,
                             is_top_inline,
                             unjournaled_before_subwalk,
                             executed_effects_before,
@@ -5385,6 +5410,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         code,
                         op,
                         ctx,
+                        call_descr,
                         is_top_inline,
                         unjournaled_before_subwalk,
                         executed_effects_before,
@@ -5468,7 +5494,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // while the fallback rewind remains provably disabled.
                 if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
                     && let Some(stack) =
-                        reconstructed_all_ref_call_stack(code, op, ctx).or_else(|| {
+                        reconstructed_all_ref_call_stack(code, op, ctx, call_descr).or_else(|| {
                             reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc)
                         })
                 {
