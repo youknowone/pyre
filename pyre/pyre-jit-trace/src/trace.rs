@@ -3116,12 +3116,23 @@ fn try_adopt_multi_frame_blackhole(
         (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
             as *mut pyre_interpreter::PyExecutionContext
     };
-    // Rooted for the whole drive: frames themselves never move, but once the
-    // tracer stores a `JitVirtualRef` in the chain the displaced value is a
-    // nursery object, and a collection inside the drive would leave the
-    // restore below writing back a pre-move pointer.
+    // Rooted for the whole drive: once the tracer stores a `JitVirtualRef` in
+    // the chain the displaced value is a nursery object, and a collection
+    // inside the drive would leave the restore below writing back a pre-move
+    // pointer.
     let saved_root =
         majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
+    // The live frame is rooted for the same window and for a stronger reason:
+    // a compiled trace allocates an inlined callee's `PyFrame` with its own
+    // `NewWithVtable`, which the GC rewriter lowers to a nursery allocation,
+    // so the first minor collection the chain triggers moves it.  Every read
+    // of `root_addr` below the drive — the fold into the snapshot, the CRN
+    // handoff, the raise coordinate — would otherwise take the vacated block,
+    // whose `valuestackdepth` and locals are free nursery space.  This is the
+    // same recovery the single-frame path makes from its post-drive frame
+    // register, and the same hazard `resume_mainloop` roots each level's
+    // `virtualizable_ptr` slot against.
+    let live_root = majit_gc::shadow_stack::push(majit_ir::GcRef(root_addr));
     // `enter`: publish `ec.topframeref = <this level's frame>` before it runs.
     let set_topframeref = |frame_ptr: i64| unsafe {
         (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
@@ -3189,6 +3200,8 @@ fn try_adopt_multi_frame_blackhole(
     // reading the root back so an in-place forward during the drive is kept.
     let saved_topframeref =
         majit_gc::shadow_stack::get(saved_root).0 as *mut pyre_interpreter::PyFrame;
+    // The authoritative post-drive identity of the frame the chain ran on.
+    let root_addr = majit_gc::shadow_stack::get(live_root).0;
     majit_gc::shadow_stack::pop_to(saved_root);
     unsafe {
         (*ec).topframeref = saved_topframeref;
@@ -4151,9 +4164,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         // and `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
         // carrier, which resumes the OUTER frame at its CALL rather than
         // inside the discarded callee attempt.  The nested-residual variant
-        // marked `blackhole_required: true` is the one this leg owns: it
-        // already executed residuals the carrier's rewind-to-the-CALL would
-        // repeat, and it carries a complete per-frame image.  It stays here
+        // marked `blackhole_required: true` is the one this leg owns, and only
+        // once the walk has actually executed something: that is the whole
+        // claim the flag makes — residuals ran that a rewind-to-the-CALL would
+        // repeat — and it carries a complete per-frame image.  It stays here
         // only because the drive now publishes each returning level's
         // `frame_finished_execution` (`on_leave_level`); before that a frame
         // outliving the call read back as still executing, which
@@ -4177,7 +4191,26 @@ fn run_perfn_walk<Sym: WalkSym>(
         // than silently becoming a wrong answer" — adopts an inline-escape
         // shape whose caller banks are incomplete and dies on an unwired
         // blackhole opcode.
+        // The effect half of the sentence above.  A `blackhole_required: true`
+        // abort whose walk executed NOTHING has nothing for a replay to
+        // repeat, so the legacy entry replay is exactly right — and driving
+        // instead hands the outer frame a resume state the walk never
+        // committed: `bench/synth/inline_subwalk_user_iterator` reads its
+        // callee's result back as a non-object and
+        // `bench/synth/list_append_write_barrier_gc` underflows its operand
+        // stack, both only once this variant is admitted.  This is the same
+        // predicate, for the same reason, that `TraceTooLong` applies above.
+        let nested_residual_ran_nothing = matches!(
+            &walk_result,
+            Err(
+                crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
+                    blackhole_required: true,
+                    ..
+                }
+            )
+        ) && crate::jitcode_dispatch::fbw_executed_effect_count() == 0;
         let walk_abort_adopted = !trace_too_long_adopted
+            && !nested_residual_ran_nothing
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
             && !matches!(
                 error,
