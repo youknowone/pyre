@@ -218,6 +218,7 @@ pub use inline_call::*;
 mod residual_call;
 pub use residual_call::*;
 mod fbw_state;
+mod symbolic_fold;
 pub use fbw_state::*;
 mod resume_snapshot;
 pub use resume_snapshot::*;

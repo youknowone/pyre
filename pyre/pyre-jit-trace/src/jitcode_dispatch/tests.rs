@@ -7448,6 +7448,150 @@ fn make_call_descr(
     ))
 }
 
+#[derive(Clone, Copy)]
+enum SymbolicBoxStrArg {
+    InternedStr,
+    NonStr,
+    NonConstant,
+}
+
+fn run_symbolic_box_str_dispatch(
+    arg_kind: SymbolicBoxStrArg,
+) -> (
+    Result<(DispatchOutcome, usize), DispatchError>,
+    Vec<OpCode>,
+    Option<majit_ir::Value>,
+    bool,
+    Option<usize>,
+) {
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in insns table");
+    // funcptr=i[0], one Ref arg r[0], descr=0, dst=r[1].
+    let code = [residual_byte, 0, 1, 0, 0, 0, 1];
+    let mut tc = fresh_trace_ctx();
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        "pyre_object",
+        "unicodeobject",
+        "box_str_constant",
+    ]);
+    let mut regs_i = vec![tc.const_int(symbolic)];
+    let (arg, expected_ptr) = match arg_kind {
+        SymbolicBoxStrArg::InternedStr => {
+            let obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__instancecheck__",
+            ));
+            (tc.const_ref(obj as i64), Some(obj as usize))
+        }
+        SymbolicBoxStrArg::NonStr => {
+            let obj = pyre_object::intobject::w_int_new(42);
+            (tc.const_ref(obj as i64), None)
+        }
+        SymbolicBoxStrArg::NonConstant => (OpRef::input_arg_ref(0), None),
+    };
+    let mut regs_r = vec![arg, OpRef::NONE];
+    let descr_pool = vec![make_call_descr(
+        31,
+        vec![Type::Ref],
+        Type::Ref,
+        majit_ir::ExtraEffect::CannotRaise,
+    )];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        last_exc_value: None,
+        last_exc_value_concrete: ConcreteValue::Null,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        store_subscr_fn_addr: None,
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let outcome = step(&code, 0, &mut wc);
+    drop(wc);
+    let dst = regs_r[1];
+    let dst_value = tc.box_value(dst);
+    let dst_is_constant = dst.is_constant();
+    let opcodes = tc.ops().iter().map(|op| op.opcode).collect();
+    (outcome, opcodes, dst_value, dst_is_constant, expected_ptr)
+}
+
+#[test]
+fn symbolic_box_str_constant_residual_folds_before_recording() {
+    let (outcome, opcodes, dst_value, dst_is_constant, expected_ptr) =
+        run_symbolic_box_str_dispatch(SymbolicBoxStrArg::InternedStr);
+
+    assert_eq!(
+        outcome.expect("registered symbolic call must fold"),
+        (DispatchOutcome::Continue, 7),
+    );
+    assert!(
+        opcodes.is_empty(),
+        "the folded residual must record no call op"
+    );
+    assert!(dst_is_constant, "the folded result must be a Ref constant");
+    assert_eq!(
+        dst_value,
+        expected_ptr.map(|ptr| majit_ir::Value::Ref(majit_ir::GcRef(ptr))),
+        "box_str_constant must return the existing interned object",
+    );
+}
+
+#[test]
+fn symbolic_box_str_constant_residual_declines_unsafe_arguments() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        "pyre_object",
+        "unicodeobject",
+        "box_str_constant",
+    ]);
+    for arg_kind in [SymbolicBoxStrArg::NonStr, SymbolicBoxStrArg::NonConstant] {
+        let (outcome, opcodes, _, _, _) = run_symbolic_box_str_dispatch(arg_kind);
+        assert!(
+            matches!(
+                outcome,
+                Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: 0,
+                    symbolic: observed,
+                }) if observed == symbolic
+            ),
+            "a rejected registry argument must reach the existing symbolic gate",
+        );
+        assert_eq!(
+            opcodes,
+            vec![OpCode::CallR],
+            "a rejected registry argument must retain the recorded-symbolic path",
+        );
+    }
+}
+
 /// Convenience: legacy signature used by elidable-classification
 /// tests with empty arglists (0 R args, descr arg_types=[]).
 /// `result_type` defaults to `Ref` matching `_r_r` shape. Callers

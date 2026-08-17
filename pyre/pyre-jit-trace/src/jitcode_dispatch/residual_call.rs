@@ -15,6 +15,7 @@
 //! residual-call body classification helpers. The `residual_call_*` opname
 //! arms themselves stay in `handle` (mod.rs) and call into these.
 
+use super::symbolic_fold::try_fold_registered_symbolic_residual;
 use super::*;
 use pyre_interpreter::{locals_w, locals_w_mut};
 
@@ -5845,6 +5846,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py forces-branch sub-case: when the descr's
     // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
     // pair, route through `direct_call_release_gil` which records
@@ -7030,6 +7035,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // pyjitpl.py forces-branch sub-case: route release-gil through
     // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
     if ei.is_call_release_gil() {
@@ -7265,6 +7274,10 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
     // `dispatch_residual_call_iRd_kind` for the rationale.
     do_jit_force_virtual_guard(ei, op.pc)?;
+
+    if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     if ei.is_call_release_gil() {
         if let Some(outcome) = direct_call_release_gil(

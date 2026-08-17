@@ -6737,6 +6737,13 @@ pub(crate) fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
     symbolic
 }
 
+/// Compute the symbolic function address for the same segmented path shape
+/// used by the codewriter.
+pub fn symbolic_fnaddr_for_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> i64 {
+    let path = CallPath::from_segments(segments);
+    symbolic_fnaddr_for_path(&path)
+}
+
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     if let Some(segments) = crate::model::fn_const_segments(target) {
         let path = CallPath::from_segments(segments.iter().map(String::as_str));
@@ -9151,6 +9158,14 @@ mod tests {
         assert!(paths.contains(&(path_symbolic, path.canonical_key())));
         assert!(target_description.starts_with("target:"));
         assert!(paths.contains(&(target_symbolic, target_description)));
+    }
+
+    #[test]
+    fn symbolic_fnaddr_for_segments_matches_known_box_str_constant_hash() {
+        assert_eq!(
+            symbolic_fnaddr_for_segments(["pyre_object", "unicodeobject", "box_str_constant",]),
+            0x7add_7d44_e51a_324c,
+        );
     }
 
     #[test]
