@@ -15,7 +15,7 @@ pub unsafe extern "C" fn PySequence_Check(object: *mut CPyObject) -> c_int {
         return 0;
     }
     let sequence = unsafe {
-        !pyre_object::is_dict(object)
+        !crate::baseobjspace::isinstance_dict_w(object)
             && crate::baseobjspace::lookup(object, "__getitem__").is_some()
     };
     sequence as c_int

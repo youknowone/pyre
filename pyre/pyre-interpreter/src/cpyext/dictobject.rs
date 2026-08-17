@@ -11,15 +11,32 @@ pub unsafe extern "C" fn PyDict_New() -> *mut CPyObject {
     pyobject::make_ref(pyre_object::dictmultiobject::w_dict_new())
 }
 
+/// The mapping a `PyDict_*` entry point operates on.
+///
+/// `PyDict_Check` is the gate every one of these applies, so a `dict` subclass
+/// is accepted -- and the operation reaches the concrete mapping rather than
+/// dispatching the subclass's Python-level override, which is what makes
+/// `PyDict_GetItem` on a `defaultdict` miss instead of calling
+/// `__missing__`.  In pyre a `dict` subclass instance is not a dict but an
+/// object holding one, so that concrete mapping has to be resolved rather than
+/// used directly.
+///
+/// A `mappingproxy` is not a `dict` subclass and is refused here, even though
+/// it also wraps a mapping `resolve_dict_backing` would hand back.
 fn dict_argument(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     let value = argument(object)?;
-    if !unsafe { pyre_object::is_dict(value) } {
+    let backing = if unsafe { crate::baseobjspace::isinstance_dict_w(value) } {
+        crate::type_methods::resolve_dict_backing(value)
+    } else {
+        pyre_object::PY_NULL
+    };
+    if backing.is_null() {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "{function}(): dict expected"
         )));
         return None;
     }
-    Some(value)
+    Some(backing)
 }
 
 fn key_name(name: *const c_char) -> Option<String> {
@@ -164,7 +181,7 @@ pub unsafe extern "C" fn PyDict_Contains(object: *mut CPyObject, key: *mut CPyOb
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyDict_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
-    (!object.is_null() && unsafe { pyre_object::is_dict(object) }) as c_int
+    (!object.is_null() && unsafe { crate::baseobjspace::isinstance_dict_w(object) }) as c_int
 }
 
 #[unsafe(no_mangle)]
@@ -394,6 +411,28 @@ pub unsafe extern "C" fn PyDict_Items(object: *mut CPyObject) -> *mut CPyObject 
     })
 }
 
+/// Whether `object` still iterates the way `dict` does — `Py_TYPE(b)->tp_iter
+/// == dict_iter`, the second half of the condition [`PyDict_Merge`] reads its
+/// source under.
+///
+/// An object whose type cannot be read answers `true`: it is then an exact dict
+/// as far as anything here can tell, and the direct read is what that deserves.
+fn iterates_as_dict(object: PyObjectRef) -> bool {
+    let Some(own_type) = crate::typedef::r#type(object) else {
+        return true;
+    };
+    let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+    unsafe {
+        match (
+            crate::baseobjspace::lookup_in_type(own_type.as_ptr(), "__iter__"),
+            crate::baseobjspace::lookup_in_type(dict_type, "__iter__"),
+        ) {
+            (Some(own), Some(canonical)) => std::ptr::eq(own, canonical),
+            _ => true,
+        }
+    }
+}
+
 /// `PyDict_Merge(a, b, override)` — copy `b`'s items into `a`, replacing an
 /// existing key only when `over` is non-zero.
 ///
@@ -424,9 +463,22 @@ pub unsafe extern "C" fn PyDict_Merge(
     //
     // A mapping that is not a dict is read through `keys()`, as upstream does
     // for the non-dict case (`dictobject.py:214-231`).
-    let (pairs, count) = if unsafe { pyre_object::is_dict(source_now) } {
+    //
+    // `dict_merge` takes the entry-by-entry path only for a source whose
+    // `tp_iter` is still `dict`'s: a subclass that iterates its own way is read
+    // through `keys()` so that the override is what decides the order and the
+    // membership.  One that does not override it is read directly, so a `keys()`
+    // override alone does not change what a merge sees.
+    let source_mapping = if unsafe { crate::baseobjspace::isinstance_dict_w(source_now) }
+        && iterates_as_dict(source_now)
+    {
+        crate::type_methods::resolve_dict_backing(source_now)
+    } else {
+        pyre_object::PY_NULL
+    };
+    let (pairs, count) = if !source_mapping.is_null() {
         let items: Vec<(PyObjectRef, PyObjectRef)> =
-            unsafe { pyre_object::dictmultiobject::w_dict_items(source_now) };
+            unsafe { pyre_object::dictmultiobject::w_dict_items(source_mapping) };
         let flat: Vec<PyObjectRef> = items
             .iter()
             .flat_map(|&(key, value)| [key, value])

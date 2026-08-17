@@ -97,7 +97,8 @@ reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
 The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
 single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
-the header below.
+the header below. `pyrex/tests/cpyext_dict_subclass.rs` takes its expectations
+from CPython 3.14.6 running the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -145,6 +146,12 @@ the header below.
 - the object protocol (`cpyext/object.rs`) and the primitive constructors and
   accessors for `int`, `bool`, `float`, `str`, `bytes`, `tuple`, `list` and
   `dict`;
+- a `dict` subclass wherever `PyDict_Check` is the gate, which is every
+  `PyDict_*` entry point and the keyword mapping of `PyObject_Call`. Such an
+  instance is not a dict in pyre but an object holding one in a reserved layout
+  slot (`typedef.rs dict_descr_new`), so each of them resolves that mapping and
+  operates on it directly, consulting no override the subclass declares. A
+  `list` subclass instance is a `W_ListObject` and needs none of this;
 - `PyArg_ParseTuple`, `PyArg_ParseTupleAndKeywords`, `PyArg_UnpackTuple`,
   `Py_BuildValue` and `PyErr_Format`, which are `static inline` C in the header
   because pyre ships no companion library and rustc's `c_variadic` is unstable;

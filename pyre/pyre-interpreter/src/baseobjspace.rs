@@ -725,6 +725,32 @@ pub unsafe fn isinstance_list_w(obj: PyObjectRef) -> bool {
     false
 }
 
+/// `space.isinstance_w(w_obj, space.w_dict)` — accepts `dict` and any `dict`
+/// subclass.  `pyre_object::is_dict` matches the exact tag and the module-dict
+/// sibling only.
+///
+/// A `list` subclass instance is a `W_ListObject` carrying the subclass in
+/// `w_class`, so the exact tag already answers for it; a `dict` subclass
+/// instance is not a dict at all but an object holding one
+/// (`typedef.rs dict_descr_new`), which is why this one is needed where
+/// [`isinstance_list_w`] is mostly a formality.  Reaching the mapping itself is
+/// [`crate::type_methods::resolve_dict_backing`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn isinstance_dict_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if pyre_object::is_dict(obj) {
+        return true;
+    }
+    if let Some(dict_type) = crate::typedef::gettypefor(&pyre_object::DICT_TYPE) {
+        return isinstance_w(obj, dict_type.as_ptr());
+    }
+    false
+}
+
 /// abstractinst.py:127-147 `p_abstract_issubclass_w`. Walks
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`

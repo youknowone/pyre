@@ -760,9 +760,9 @@ pub unsafe extern "C" fn PyObject_HasAttr(object: *mut CPyObject, name: *mut CPy
 pub unsafe extern "C" fn PyObject_Call(
     callable: *mut CPyObject,
     args: *mut CPyObject,
-    kwargs: *mut CPyObject,
+    keywords: *mut CPyObject,
 ) -> *mut CPyObject {
-    realize_all([callable, args, kwargs]);
+    realize_all([callable, args, keywords]);
     let Some([callable, args]) = arguments([callable, args]) else {
         return std::ptr::null_mut();
     };
@@ -772,8 +772,18 @@ pub unsafe extern "C" fn PyObject_Call(
         ));
         return std::ptr::null_mut();
     }
-    let kwargs = unsafe { pyobject::from_ref(kwargs) };
-    if !kwargs.is_null() && !unsafe { pyre_object::is_dict(kwargs) } {
+    let keywords = unsafe { pyobject::from_ref(keywords) };
+    // A `dict` subclass is accepted, and what goes on is its mapping: the
+    // unpack below reads dict storage directly, and a subclass instance is an
+    // object holding a dict rather than being one.
+    let kwargs = if keywords.is_null() {
+        keywords
+    } else if unsafe { crate::baseobjspace::isinstance_dict_w(keywords) } {
+        crate::type_methods::resolve_dict_backing(keywords)
+    } else {
+        pyre_object::PY_NULL
+    };
+    if kwargs.is_null() && !keywords.is_null() {
         super::pyerrors::set_pending_error(crate::PyError::type_error(
             "keyword arguments must be a dict",
         ));
