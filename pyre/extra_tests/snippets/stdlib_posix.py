@@ -66,8 +66,28 @@ class FsPathPropertyNone:
     __fspath__ = property(lambda self: None)
 
 
+class FsPathInt:
+    def __fspath__(self):
+        return 1
+
+
+class FsPathBytes:
+    def __fspath__(self):
+        return b"fspath-bytes"
+
+
 assert os.fspath(FsPathOk()) == "fspath-ok"
 assert os.fspath(FsPathProperty()) == "fspath-property"
+assert os.fspath(FsPathBytes()) == b"fspath-bytes"
+
+try:
+    os.fspath(FsPathInt())
+except TypeError as exc:
+    assert str(exc) == (
+        "expected FsPathInt.__fspath__() to return str or bytes, not int"
+    ), exc
+else:
+    raise AssertionError("os.fspath(FsPathInt()) did not raise")
 
 for cls in (FsPathNone, FsPathNoneOverride, FsPathPropertyNone):
     try:
@@ -215,6 +235,19 @@ for _ok in (
 ):
     assert_raises(FileNotFoundError, lambda e=_ok: os.execve(_MISSING, ["x"], e))
 
+# Empty names and names with an interior `=` cannot be represented, while an
+# initial `=` is the permitted drive-current-directory spelling.
+for _bad_name in (b"", b"A=B"):
+    assert_raises(
+        ValueError,
+        lambda n=_bad_name: os.execve(_MISSING, ["x"], _Env([n], [b"1"], 1)),
+    )
+
+assert_raises(
+    FileNotFoundError,
+    lambda: os.execve(_MISSING, ["x"], _Env([b"=C:"], [b"1"], 1)),
+)
+
 
 # `sendfile`'s header and trailer vectors are read by index, so each has to be
 # a sequence; a generator is refused rather than consumed.  Only the BSD-shaped
@@ -227,6 +260,12 @@ if sys.platform == "darwin":
                 TypeError,
                 lambda n=_name: os.sendfile(
                     _write_fd, _read_fd, 0, 1, **{n: (b"x" for _ in range(1))}
+                ),
+            )
+            assert_raises(
+                TypeError,
+                lambda n=_name: os.sendfile(
+                    _write_fd, _read_fd, 0, 1, **{n: [b"x", 1]}
                 ),
             )
     finally:
