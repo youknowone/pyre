@@ -126,17 +126,10 @@ fn eof_error(msg: &str) -> crate::PyError {
 
 // ── argument helpers ────────────────────────────────────────────────────
 
+/// `interp_zlib.py` spells every data argument `'bufferstr'`, so an
+/// `array.array` or a C-contiguous `memoryview` is as acceptable as `bytes`.
 fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    unsafe {
-        if bytesobject::is_bytes_like(obj) {
-            Ok(bytesobject::bytes_like_data(obj).to_vec())
-        } else {
-            Err(crate::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                crate::baseobjspace::object_functionstr_type_name(obj)
-            )))
-        }
-    }
+    crate::baseobjspace::charbuf_w(obj)
 }
 
 /// Coerce an argument slot to an integer, `None`/absent (`PY_NULL`) → default.
@@ -873,7 +866,7 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             let level = int_or_default(level, -1)? as i32;
             let wbits = to_wbits(int_or_default(wbits, backend::MAX_WBITS as i64)?);
-            let out = backend::compress(data, level, wbits).map_err(zlib_error)?;
+            let out = backend::compress(&data, level, wbits).map_err(zlib_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py:92 `decompress(string, __posonly__=None, wbits, bufsize)`.
@@ -890,7 +883,7 @@ crate::py_module! {
             if bufsize < 0 {
                 return Err(crate::PyError::value_error("bufsize must be non-negative"));
             }
-            let out = backend::decompress(data, wbits, bufsize as usize).map_err(zlib_error)?;
+            let out = backend::decompress(&data, wbits, bufsize as usize).map_err(zlib_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
         // interp_zlib.py:228 `Compress___new__(level, method, wbits, memLevel,

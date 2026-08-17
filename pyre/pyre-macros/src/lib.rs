@@ -654,7 +654,7 @@ fn typed_alias(
             },
         ),
         "PyBufferStr" => (
-            quote! { &'static [u8] },
+            quote! { ::std::vec::Vec<u8> },
             quote! { crate::baseobjspace::charbuf_w(args[#idx])? },
         ),
         "PyCNonNegInt" => (

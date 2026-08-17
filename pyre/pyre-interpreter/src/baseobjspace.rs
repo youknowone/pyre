@@ -8638,12 +8638,22 @@ pub fn text0_wtf8_w(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
     Ok(s)
 }
 
-/// baseobjspace.py:1819 charbuf_w — a read-only character buffer as raw bytes.
-pub fn charbuf_w(obj: PyObjectRef) -> Result<&'static [u8], PyError> {
-    if unsafe { !pyre_object::bytesobject::is_bytes_like(obj) } {
-        return Err(PyError::type_error("expected a readable buffer"));
-    }
-    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(obj) })
+/// baseobjspace.py:1819 charbuf_w — `buffer_w(w_obj, BUF_SIMPLE).as_str()`.
+///
+/// Every exporter of a C-contiguous read-only buffer qualifies, not only the
+/// bytes-like builtins: `array.array` and a `memoryview` over one reach a
+/// consumer this way.  The acquisition already copies, so the result owns its
+/// bytes and the export is released before returning.
+pub fn charbuf_w(obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+    let Some(buffer) = simple_buffer_bytes(obj)? else {
+        return Err(PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            object_functionstr_type_name(obj)
+        )));
+    };
+    let data = buffer.as_bytes().to_vec();
+    buffer.release();
+    Ok(data)
 }
 
 /// One copied `PyBUF_SIMPLE` export whose owner remains rooted and acquired
