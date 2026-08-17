@@ -450,6 +450,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
     super::typeobject::forget_type_name(address);
+    super::gc::forget(address);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };

@@ -3065,6 +3065,10 @@ pub unsafe extern "C" fn PyType_GenericAlloc(
     if unsafe { (*tp).tp_itemsize } != 0 {
         unsafe { (*(raw as *mut CPyVarObject)).ob_size = nitems };
     }
+    // An instance of a `Py_TPFLAGS_HAVE_GC` type is collected from the moment
+    // `tp_alloc` hands it back; only a type that allocates its own storage has
+    // to call `PyObject_GC_Track` by hand.
+    super::gc::track(raw);
     raw
 }
 

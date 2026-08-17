@@ -87,6 +87,10 @@ PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
 
+/* cpyext/gc.rs */
+PyAPI_FUNC(void) PyObject_GC_Track(void *);
+PyAPI_FUNC(void) PyObject_GC_UnTrack(void *);
+
 /* cpyext/import_.rs */
 PyAPI_FUNC(PyObject *) PyImport_AddModuleRef(const char *);
 PyAPI_FUNC(PyObject *) PyImport_GetModule(PyObject *);

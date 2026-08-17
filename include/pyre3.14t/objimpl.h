@@ -18,8 +18,6 @@ extern "C" {
    allocator and its blocks must go back to `PyMem_Free`. */
 
 #define PyObject_GC_Del(ob) PyObject_Del(ob)
-#define PyObject_GC_Track(ob) ((void)(ob))
-#define PyObject_GC_UnTrack(ob) ((void)(ob))
 
 /* The body of a `tp_traverse`: report one field, and stop at the first
    visitor that answers non-zero.  `visit` and `arg` are the names

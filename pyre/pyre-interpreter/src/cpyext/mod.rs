@@ -20,6 +20,7 @@ pub mod bytesobject;
 pub mod capsule;
 pub mod dictobject;
 pub mod floatobject;
+pub mod gc;
 pub mod import_;
 pub mod iterator;
 pub mod listobject;
@@ -192,6 +193,7 @@ pub fn after_fork_child() {
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
         bytesobject::after_fork_child();
+        gc::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
     // half-finished import must not name the next module created here.
@@ -726,6 +728,7 @@ pub fn ensure_linked() {
     std::hint::black_box(&raw const pyobject::_Py_NotImplementedStruct);
     std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
     pyobject::ensure_linked();
+    gc::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();
