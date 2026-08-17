@@ -1807,18 +1807,32 @@ fn path_or_fd_w(
             }
             (Vec::new(), obj_slot, fd)
         } else {
-            // `type(path).__fspath__(path)` — the descriptor read off the type is
-            // unbound, so `path` is supplied as the sole argument.
-            let Some(fspath_fn) = crate::typedef::r#type(obj)
+            let Some(fspath_descr) = crate::typedef::r#type(obj)
                 .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
             else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(fspath_fn);
+            pyre_object::gc_roots::pin_root(fspath_descr);
+            let path_type =
+                crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+                    .expect("a path argument has a type");
+            // `interp_posix.py:3048` binds the descriptor before calling it.
+            // A non-descriptor is its own bound value.
+            let fspath_fn = crate::baseobjspace::get(
+                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                path_type.as_ptr(),
+            )?
+            .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            if pyre_object::is_none(fspath_fn) {
+                return Err(reject(obj));
+            }
+            pyre_object::gc_roots::shadow_stack_set(fspath_slot, fspath_fn);
             let result = crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(fspath_slot),
-                &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+                &[],
             )?;
             let result_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(result);

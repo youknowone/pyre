@@ -952,14 +952,12 @@ fn create_environ() -> pyre_object::PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
-/// posix stub — PyPy: pypy/module/posix/ interp_posix.py
-///
-/// Provides the minimal surface that os.py module init needs to succeed.
-/// Real posix calls are not implemented — they raise or return defaults.
 /// `posix_fspath` / `PyOS_FSPath` — `str` and `bytes` pass through unchanged
-/// (the protocol's identity case); any other object is resolved through
-/// `type(path).__fspath__(path)`.
-pub(crate) fn fspath(arg: pyre_object::PyObjectRef) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+/// (the protocol's identity case); any other object has `type(path).__fspath__`
+/// bound before it is called.
+pub(crate) fn fspath(
+    arg: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     // `str` and `bytes` only — a `bytearray` is a readable buffer and not a
     // path, so it goes on to be rejected below.
     unsafe {
@@ -967,14 +965,42 @@ pub(crate) fn fspath(arg: pyre_object::PyObjectRef) -> Result<pyre_object::PyObj
             return Ok(arg);
         }
     }
-    // `path_type.__fspath__(path)` — the descriptor read off the type is
-    // unbound, so `path` is supplied as the sole argument.
+    let roots = pyre_object::gc_roots::push_roots();
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(arg);
+    let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
     let path_type = crate::typedef::r#type(arg);
     if let Some(pt) = path_type
-        && let Some(fspath_fn) =
+        && let Some(fspath_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
     {
-        let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
+        let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(fspath_descr);
+        // `interp_posix.py:3048` binds the descriptor before calling it. A
+        // non-descriptor is its own bound value.
+        let fspath_fn = unsafe {
+            crate::baseobjspace::get(
+                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+                pyre_object::gc_roots::shadow_stack_get(arg_slot),
+                pt.as_ptr(),
+            )?
+        }
+        .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
+        let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+        if unsafe { pyre_object::is_none(fspath_fn) } {
+            return Err(crate::PyError::type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                crate::gateway::short_type_name(arg)
+            )));
+        }
+        pyre_object::gc_roots::shadow_stack_set(fspath_slot, fspath_fn);
+        let result = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+            &[],
+        )?;
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(result);
+        let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
         // The protocol is only satisfied by what a path can be, so an answer
         // that is neither names the object that gave it and the type it gave.
         if unsafe { pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result) } {
@@ -982,16 +1008,23 @@ pub(crate) fn fspath(arg: pyre_object::PyObjectRef) -> Result<pyre_object::PyObj
         }
         return Err(crate::PyError::type_error(format!(
             "expected {}.__fspath__() to return str or bytes, not {}",
-            crate::gateway::short_type_name(arg),
+            crate::gateway::short_type_name(pyre_object::gc_roots::shadow_stack_get(arg_slot)),
             crate::gateway::short_type_name(result)
         )));
     }
-    Err(crate::PyError::type_error(format!(
+    let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+    let error = crate::PyError::type_error(format!(
         "expected str, bytes or os.PathLike object, not {}",
         crate::gateway::short_type_name(arg)
-    )))
+    ));
+    drop(roots);
+    Err(error)
 }
 
+/// posix stub — PyPy: pypy/module/posix/ interp_posix.py
+///
+/// Provides the minimal surface that os.py module init needs to succeed.
+/// Real posix calls are not implemented — they raise or return defaults.
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "environ", create_environ());
     crate::module_ns_store(
@@ -1525,12 +1558,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "wait",
             "pathconf",
             "fpathconf",
-            "setuid",
-            "setgid",
             "setsid",
             "setpgid",
-            "setreuid",
-            "setregid",
             "getgroups",
             "setgroups",
             "setpgrp",
@@ -3508,7 +3537,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let n = usize::try_from(n)
                     .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
                 #[cfg(not(feature = "sandbox"))]
-                let buf = host_os::urandom(n).unwrap_or_else(|_| vec![0u8; n]);
+                // Report entropy failures: absorbing one would return predictable bytes.
+                let buf = host_os::urandom(n).map_err(|e| io_err(e, ""))?;
                 // Route host entropy through the trusted controller instead of
                 // reaching host getrandom directly.
                 #[cfg(feature = "sandbox")]
@@ -4800,11 +4830,34 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn scandir_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Ok(args[0])
     }
-    fn scandir_iter_close(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
+        // `interp_scandir.py:111-119 _close` clears the one piece of state
+        // `_finalize_` tests, whether closure is explicit or due to exhaustion.
+        // `W_ScandirIterator.dirp` is internal there, and its typedef exports
+        // only the five operations at `interp_scandir.py:172-179`. Here `_open`
+        // is an instance attribute because this builtin type's dict is also the
+        // only storage available for the older `_entries` and `_index` state.
+        // All three are therefore readable and writable; hiding only `_open`
+        // needs descriptor-backed instance storage that `typedef.rs` does not
+        // provide.
+        let _ = crate::baseobjspace::setattr_str(
+            self_obj,
+            "_open",
+            pyre_object::w_bool_from(false),
+        );
+    }
+    fn scandir_iter_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        scandir_iter_mark_closed(args[0]);
         Ok(pyre_object::w_none())
     }
     fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = args[0];
+        // `interp_scandir.py:130-132 next_w` ends the enumeration once the
+        // directory is closed, so a `close()` partway through is the end of it
+        // and the entries already read into `_entries` are not handed out.
+        if !scandir_iter_is_open(self_obj) {
+            return Err(crate::PyError::stop_iteration());
+        }
         // The type carries an instance dict, so `_index` is writable from
         // Python and cannot be assumed to still hold the int this iterator
         // stored.
@@ -4813,13 +4866,46 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let entries = crate::baseobjspace::getattr_str(self_obj, "_entries")?;
         let len = unsafe { pyre_object::w_list_len(entries) } as i64;
         if idx >= len {
+            scandir_iter_mark_closed(self_obj);
             return Err(crate::PyError::stop_iteration());
         }
-        let item = unsafe { pyre_object::w_list_getitem(entries, idx) }
-            .ok_or_else(crate::PyError::stop_iteration)?;
+        let Some(item) = (unsafe { pyre_object::w_list_getitem(entries, idx) }) else {
+            scandir_iter_mark_closed(self_obj);
+            return Err(crate::PyError::stop_iteration());
+        };
         let _ =
             crate::baseobjspace::setattr_str(self_obj, "_index", pyre_object::w_int_new(idx + 1));
         Ok(item)
+    }
+    fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {
+        crate::baseobjspace::getattr_str(self_obj, "_open")
+            .and_then(crate::baseobjspace::is_true)
+            .unwrap_or(false)
+    }
+    fn scandir_iter_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = args[0];
+        if !scandir_iter_is_open(self_obj) {
+            return Ok(pyre_object::w_none());
+        }
+
+        let message = match unsafe { crate::display::py_repr_wtf8(self_obj) } {
+            Ok(repr) => format!(
+                "unclosed scandir iterator {}",
+                repr.to_string_lossy()
+            ),
+            Err(_) => "unclosed scandir iterator".to_string(),
+        };
+        if let Err(mut error) = crate::warn::warn_category(&message, "ResourceWarning", 1) {
+            // `interp_scandir.py:106-109 _finalize_` makes a warning promoted
+            // to an error unraisable because no exception may escape shutdown.
+            error.write_unraisable(
+                pyre_object::w_none(),
+                rustpython_wtf8::Wtf8::new(""),
+                self_obj,
+            );
+        }
+        scandir_iter_mark_closed(self_obj);
+        Ok(pyre_object::w_none())
     }
     fn scandir_iter_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -4835,17 +4921,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ("__enter__", scandir_iter_self),
                     ("__exit__", scandir_iter_close),
                     ("close", scandir_iter_close),
+                    ("__del__", scandir_iter_del),
                 ] {
+                    let function = if name == "__del__" {
+                        crate::make_builtin_function_with_arity(name, f, 1)
+                    } else {
+                        crate::make_builtin_function(name, f)
+                    };
                     unsafe {
                         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns,
-                            name,
-                            crate::make_builtin_function(name, f),
+                            ns, name, function,
                         )
                     };
                 }
             });
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
             // `interp_scandir.py:172-180` declares no `__new__` on the typedef
             // and `:180` sets `acceptable_as_base_class = False`.  The iterator
             // is produced only by `scandir_fn` below, through
@@ -4998,8 +5089,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
             }
         }
-        // Pin the iterator so the `_entries`/`_index` setattr allocations cannot
-        // strand it, re-reading `it`/`list` from their slots after each.
+        // Pin the iterator so the `_entries`/`_index`/`_open` setattr
+        // allocations cannot strand it, re-reading `it`/`list` from their
+        // slots after each.
         pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(scandir_iter_type()));
         let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
@@ -5007,6 +5099,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let _ = crate::baseobjspace::setattr_str(it, "_entries", list);
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
+        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
+        let _ = crate::baseobjspace::setattr_str(it, "_open", pyre_object::w_bool_from(true));
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         drop(_list_scope);
         Ok(it)
@@ -5474,19 +5568,65 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    let keys_obj = crate::baseobjspace::call_method(args[2], "keys", &[]);
+                    // Unlike `_env2interp`
+                    // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
+                    // snapshots `keys()` and `values()` before encoding pairs,
+                    // so `__fspath__` user code cannot make a second mapping
+                    // read observe a mutated mapping.
+                    let _env_roots = pyre_object::gc_roots::push_roots();
+                    let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
+                    let pair_count = crate::baseobjspace::len_w(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                    )? as usize;
+                    let keys_obj = crate::baseobjspace::call_method(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "keys",
+                        &[],
+                    );
                     if keys_obj.is_null() {
                         return Err(crate::call::take_call_error().unwrap_or_else(|| {
                             crate::PyError::type_error("execve: env must be a mapping")
                         }));
                     }
                     let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                    let mut env = Vec::with_capacity(keys.len());
-                    for key_obj in keys {
-                        let value_obj = crate::baseobjspace::getitem(args[2], key_obj)?;
-                        let key = extract_path(key_obj)?;
-                        let value = extract_path(value_obj)?;
-                        if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
+                    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
+                    let values_obj = crate::baseobjspace::call_method(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "values",
+                        &[],
+                    );
+                    if values_obj.is_null() {
+                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                            crate::PyError::type_error("execve: env must be a mapping")
+                        }));
+                    }
+                    let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
+                    let values_base = pyre_object::gc_roots::pin_roots(&values);
+                    let keys_len = keys.len();
+                    let values_len = values.len();
+                    drop(keys);
+                    drop(values);
+                    // The count is the mapping's own length, so it is whatever its
+                    // `__len__` answered. Reserve against the snapshots actually in
+                    // hand instead, and let the walk below report a count they
+                    // cannot cover.
+                    let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
+                    for i in 0..pair_count {
+                        if i >= keys_len || i >= values_len {
+                            return Err(crate::PyError::index_error("list index out of range"));
+                        }
+                        let key = extract_path(pyre_object::gc_roots::shadow_stack_get(
+                            keys_base + i,
+                        ))?;
+                        let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
+                            values_base + i,
+                        ))?;
+                        // `_env2interp` (`interp_posix.py:1762-1769`) permits
+                        // the Windows `=C:` spelling and rejects `=` only
+                        // after the first byte.
+                        if key.is_empty()
+                            || key.get(1..).is_some_and(|tail| tail.contains(&b'='))
+                        {
                             return Err(crate::PyError::value_error(
                                 "illegal environment variable name",
                             ));
@@ -6129,6 +6269,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
+        // `_run_forking_function`
+        // (`pypy/module/posix/interp_posix.py:1559-1582`) enters the callback
+        // lifecycle immediately.  The 3.14 guard precedes that lifecycle so a
+        // refused fork takes no lock and signals no thread.
+        fn guard_fork_finalization() -> Result<(), crate::PyError> {
+            if !crate::module::thread::is_finalizing() {
+                return Ok(());
+            }
+            let cls = crate::builtins::lookup_exc_class("PythonFinalizationError")
+                .expect("PythonFinalizationError must be installed");
+            let message = pyre_object::w_str_new("can't fork at interpreter shutdown");
+            let exc = crate::builtins::exc_exception_new(&[cls, message])?;
+            Err(unsafe { crate::PyError::from_exc_object(exc) })
+        }
+
         // os.fork() -> child pid in parent, 0 in child
         crate::module_ns_store(
             ns,
@@ -6136,6 +6291,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "fork",
                 |_| {
+                    guard_fork_finalization()?;
                     if majit_gc::gc_sync::registered_threads() > 1 {
                         crate::warn::warn_deprecation(
                             "This process is multi-threaded, use of fork() may lead to deadlocks",
@@ -6212,6 +6368,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "forkpty",
                 |_| {
+                    guard_fork_finalization()?;
                     if majit_gc::gc_sync::registered_threads() > 1 {
                         crate::warn::warn_deprecation(
                             "This process is multi-threaded, use of forkpty() may lead to deadlocks",
@@ -6346,6 +6503,105 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 1,
             ),
         );
+
+        // `interp_posix.py:2036-2079,2224-2245` uses the same `c_uid_t`
+        // conversion and non-retrying error path for all six id setters.
+        #[cfg(not(feature = "sandbox"))]
+        fn set_one_id(
+            args: &[PyObjectRef],
+            name: &str,
+            setter: fn(u32) -> libc::c_int,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let id = match args.first() {
+                Some(&obj) => crate::baseobjspace::c_uid_t_w(obj)?,
+                None => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{name}() requires 1 argument"
+                    )));
+                }
+            };
+            if setter(id) == -1 {
+                return Err(io_err(std::io::Error::last_os_error(), ""));
+            }
+            Ok(pyre_object::w_none())
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn set_two_ids(
+            args: &[PyObjectRef],
+            name: &str,
+            setter: fn(u32, u32) -> libc::c_int,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            if args.len() < 2 {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() requires 2 arguments"
+                )));
+            }
+            let first = crate::baseobjspace::c_uid_t_w(args[0])?;
+            let second = crate::baseobjspace::c_uid_t_w(args[1])?;
+            if setter(first, second) == -1 {
+                return Err(io_err(std::io::Error::last_os_error(), ""));
+            }
+            Ok(pyre_object::w_none())
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn setuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_one_id(args, "setuid", |uid| unsafe {
+                libc::setuid(uid as libc::uid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn seteuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_one_id(args, "seteuid", |euid| unsafe {
+                libc::seteuid(euid as libc::uid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn setgid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_one_id(args, "setgid", |gid| unsafe {
+                libc::setgid(gid as libc::gid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn setegid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_one_id(args, "setegid", |egid| unsafe {
+                libc::setegid(egid as libc::gid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn setreuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_two_ids(args, "setreuid", |ruid, euid| unsafe {
+                libc::setreuid(ruid as libc::uid_t, euid as libc::uid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        fn setregid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            set_two_ids(args, "setregid", |rgid, egid| unsafe {
+                libc::setregid(rgid as libc::gid_t, egid as libc::gid_t)
+            })
+        }
+
+        #[cfg(not(feature = "sandbox"))]
+        for (name, function, arity) in [
+            ("setuid", setuid as crate::gateway::BuiltinCodeFn, 1),
+            ("seteuid", seteuid as crate::gateway::BuiltinCodeFn, 1),
+            ("setgid", setgid as crate::gateway::BuiltinCodeFn, 1),
+            ("setegid", setegid as crate::gateway::BuiltinCodeFn, 1),
+            ("setreuid", setreuid as crate::gateway::BuiltinCodeFn, 2),
+            ("setregid", setregid as crate::gateway::BuiltinCodeFn, 2),
+        ] {
+            crate::module_ns_store(
+                ns,
+                name,
+                crate::make_builtin_function_with_arity(name, function, arity),
+            );
+        }
 
         // `interp_posix.py:2603-2608` — the controlling terminal's name, which
         // `rposix.py:1724-1728` reads by handing the call a null pointer and
@@ -8149,10 +8405,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function("sendfile", |args| {
                 use std::os::fd::BorrowedFd;
                 // Every parameter is positional-or-keyword. `headers`,
-                // `trailers` and `flags` are the BSD `sendfile(2)` tail, which
-                // neither arm below passes on; they are named here so a
-                // caller that supplies them is bound rather than truncated,
-                // and so an unknown keyword is an error.
+                // `trailers` and `flags` are the BSD `sendfile(2)` tail. The
+                // macOS arm forwards both vectors; `flags` alone remains
+                // unused because the host wrapper exposes no flags parameter.
+                // They are all named here so an unknown keyword is an error.
                 let (bound, _kwargs) = bind_path_args(
                     args,
                     "sendfile",
@@ -8228,6 +8484,97 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 #[cfg(target_os = "macos")]
                 {
+                    // Both Python sequences and all of their buffer exports are
+                    // consumed before entering the EINTR retry loop. The retry
+                    // therefore reuses only Rust-owned bytes.
+                    let (header_buffers, trailer_buffers) = {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let header_slot = bound[4].map(|value| {
+                            let slot = pyre_object::gc_roots::shadow_stack_len();
+                            pyre_object::gc_roots::pin_root(value);
+                            slot
+                        });
+                        let trailer_slot = bound[5].map(|value| {
+                            let slot = pyre_object::gc_roots::shadow_stack_len();
+                            pyre_object::gc_roots::pin_root(value);
+                            slot
+                        });
+                        let collect_buffers = |slot: Option<usize>, name: &str| {
+                            let Some(slot) = slot else {
+                                return Ok(None);
+                            };
+                            let value = pyre_object::gc_roots::shadow_stack_get(slot);
+                            if unsafe { pyre_object::is_none(value) } {
+                                return Ok(None);
+                            }
+                            // The vector is read by index, so it has to be a
+                            // sequence: an iterator would be consumed here and
+                            // a mapping's keys are not what is being asked for.
+                            if !crate::baseobjspace::issequence_w(value) {
+                                return Err(crate::PyError::type_error(format!(
+                                    "sendfile() {name} must be a sequence"
+                                )));
+                            }
+                            let items = crate::baseobjspace::unpackiterable(value, -1)?;
+                            let items_base = pyre_object::gc_roots::pin_roots(&items);
+                            let mut buffers = Vec::with_capacity(items.len());
+                            for index in 0..items.len() {
+                                let item =
+                                    pyre_object::gc_roots::shadow_stack_get(items_base + index);
+                                let Some(buffer) =
+                                    crate::baseobjspace::simple_buffer_bytes(item)?
+                                else {
+                                    return Err(crate::PyError::type_error(format!(
+                                        "sendfile() {name} items must be bytes-like"
+                                    )));
+                                };
+                                buffers.push(buffer.as_bytes().to_vec());
+                                buffer.release();
+                            }
+                            if buffers.is_empty() {
+                                Ok(None)
+                            } else {
+                                Ok(Some(buffers))
+                            }
+                        };
+                        (
+                            collect_buffers(header_slot, "headers")?,
+                            collect_buffers(trailer_slot, "trailers")?,
+                        )
+                    };
+                    // An empty sequence is indistinguishable from an absent
+                    // one at the syscall boundary, independently for headers
+                    // and trailers.
+                    let header_slices = header_buffers.as_ref().map(|buffers| {
+                        buffers
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<&[u8]>>()
+                    });
+                    let trailer_slices = trailer_buffers.as_ref().map(|buffers| {
+                        buffers
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<&[u8]>>()
+                    });
+                    // `sendfile(2)` on this host spends the length cell on the
+                    // header and the file together — "the value of len argument
+                    // indicates the maximum number of bytes in the header
+                    // and/or file to be sent" — so a caller asking for `count`
+                    // bytes of the file has to be given room for its headers on
+                    // top, or the headers eat into the range it asked for. The
+                    // trailer is outside the budget and is always sent whole.
+                    // A count of 0 already asks for everything and stays 0.
+                    let count = match header_buffers.as_ref() {
+                        Some(buffers) if count_raw != 0 => {
+                            buffers.iter().try_fold(count_raw, |count, buffer| {
+                                count.checked_add(buffer.len() as i64).ok_or_else(|| {
+                                    crate::PyError::overflow_error("sendfile() count is too large")
+                                })
+                            })?
+                        }
+                        _ => count_raw,
+                    };
                     loop {
                         let (res, written) = {
                             let _blocked = crate::module::thread::before_external_block();
@@ -8235,9 +8582,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 in_b,
                                 out_b,
                                 offset_i64 as rustpython_host_env::crt_fd::Offset,
-                                count_raw,
-                                None,
-                                None,
+                                count,
+                                header_slices.as_deref(),
+                                trailer_slices.as_deref(),
                             )
                         };
                         match res {
@@ -8318,10 +8665,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
                 let argv = collect_cstring_seq(positional[1], "posix_spawn", "argv")?;
-                // posixmodule.c parses `env` as a mapping.  This is the same
-                // owner/shape as PyPy's `_env2interp` path used by execve:
-                // iterate `keys()`, fetch each value through `getitem`, then
-                // filesystem-encode both sides into `key=value`.
+                // posixmodule.c parses `env` through the same keys/values
+                // snapshot used by execve, then filesystem-encodes paired
+                // elements into `key=value`.
                 let env = collect_spawn_env(positional[2])?;
                 let file_actions_obj = crate::builtins::kwarg_get(kwargs, "file_actions");
                 let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
@@ -8373,34 +8719,58 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     return Ok(env);
                 }
-                let keys_obj = crate::baseobjspace::call_method(mapping, "keys", &[]);
+                // Unlike `_env2interp`
+                // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
+                // snapshots `keys()` and `values()` before encoding pairs,
+                // so `__fspath__` user code cannot make a second mapping
+                // read observe a mutated mapping.
+                let _env_roots = pyre_object::gc_roots::push_roots();
+                let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
+                let pair_count = crate::baseobjspace::len_w(
+                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                )? as usize;
+                let keys_obj = crate::baseobjspace::call_method(
+                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                    "keys",
+                    &[],
+                );
                 if keys_obj.is_null() {
                     return Err(crate::call::take_call_error().unwrap_or_else(|| {
                         crate::PyError::type_error("posix_spawn: env must be a mapping")
                     }));
                 }
                 let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                // `getitem` runs the mapping's `__getitem__` and both encodes
-                // allocate, so the mapping and every key are published once and
-                // read back per iteration rather than kept in plain locals.
-                let _env_roots = pyre_object::gc_roots::push_roots();
-                let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
                 let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-                let mut env = Vec::with_capacity(keys.len());
-                for i in 0..keys.len() {
-                    let _entry_roots = pyre_object::gc_roots::push_roots();
-                    let value_obj = crate::baseobjspace::getitem(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
-                    )?;
-                    // Encoding the key can collect, so the value it was fetched
-                    // beside has to be published before that call.
-                    let value_slot = pyre_object::gc_roots::pin_roots(&[value_obj]);
+                let values_obj = crate::baseobjspace::call_method(
+                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                    "values",
+                    &[],
+                );
+                if values_obj.is_null() {
+                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                        crate::PyError::type_error("posix_spawn: env must be a mapping")
+                    }));
+                }
+                let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
+                let values_base = pyre_object::gc_roots::pin_roots(&values);
+                let keys_len = keys.len();
+                let values_len = values.len();
+                drop(keys);
+                drop(values);
+                // The count is the mapping's own length, so it is whatever its
+                // `__len__` answered. Reserve against the snapshots actually in
+                // hand instead, and let the walk below report a count they
+                // cannot cover.
+                let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
+                for i in 0..pair_count {
+                    if i >= keys_len || i >= values_len {
+                        return Err(crate::PyError::index_error("list index out of range"));
+                    }
                     let key = crate::gateway::fsencode_bytes_w(
                         pyre_object::gc_roots::shadow_stack_get(keys_base + i),
                     )?;
                     let value = crate::gateway::fsencode_bytes_w(
-                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                        pyre_object::gc_roots::shadow_stack_get(values_base + i),
                     )?;
                     // interp_posix.py:1762-1769 permits the Windows `=C:`
                     // spelling and rejects `=` only after the first byte.
@@ -9537,18 +9907,62 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv_wide(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
-                    let keys_obj = crate::baseobjspace::call_method(args[2], "keys", &[]);
+                    // Unlike `_env2interp`
+                    // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
+                    // snapshots `keys()` and `values()` before encoding pairs,
+                    // so `__fspath__` user code cannot make a second mapping
+                    // read observe a mutated mapping.
+                    let _env_roots = pyre_object::gc_roots::push_roots();
+                    let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
+                    let pair_count = crate::baseobjspace::len_w(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                    )? as usize;
+                    let keys_obj = crate::baseobjspace::call_method(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "keys",
+                        &[],
+                    );
                     if keys_obj.is_null() {
                         return Err(crate::call::take_call_error().unwrap_or_else(|| {
                             crate::PyError::type_error("execve: env must be a mapping")
                         }));
                     }
                     let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                    let mut env = Vec::with_capacity(keys.len());
-                    for key_obj in keys {
-                        let value_obj = crate::baseobjspace::getitem(args[2], key_obj)?;
-                        let key = extract_path(key_obj)?;
-                        let value = extract_path(value_obj)?;
+                    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
+                    let values_obj = crate::baseobjspace::call_method(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "values",
+                        &[],
+                    );
+                    if values_obj.is_null() {
+                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                            crate::PyError::type_error("execve: env must be a mapping")
+                        }));
+                    }
+                    let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
+                    let values_base = pyre_object::gc_roots::pin_roots(&values);
+                    let keys_len = keys.len();
+                    let values_len = values.len();
+                    drop(keys);
+                    drop(values);
+                    // The count is the mapping's own length, so it is whatever its
+                    // `__len__` answered. Reserve against the snapshots actually in
+                    // hand instead, and let the walk below report a count they
+                    // cannot cover.
+                    let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
+                    for i in 0..pair_count {
+                        if i >= keys_len || i >= values_len {
+                            return Err(crate::PyError::index_error("list index out of range"));
+                        }
+                        let key = extract_path(pyre_object::gc_roots::shadow_stack_get(
+                            keys_base + i,
+                        ))?;
+                        let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
+                            values_base + i,
+                        ))?;
+                        // `_env2interp` (`interp_posix.py:1762-1769`) permits
+                        // the Windows `=C:` spelling and rejects `=` only
+                        // after the first byte.
                         if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
                             return Err(crate::PyError::value_error(
                                 "illegal environment variable name",
@@ -10264,7 +10678,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "mknod",
             // privilege / scheduling
             "setuid",
+            "seteuid",
             "setgid",
+            "setegid",
             "setreuid",
             "setregid",
             "setresuid",

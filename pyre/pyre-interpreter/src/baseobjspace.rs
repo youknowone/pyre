@@ -14374,6 +14374,39 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// baseobjspace.py:1310-1317 `issequence_w`.
+///
+/// ```python
+/// def issequence_w(self, w_obj):
+///     flag = self.type(w_obj).flag_map_or_seq
+///     if flag == 'M':
+///         return False
+///     elif flag == 'S':
+///         return True
+///     else:
+///         return (self.lookup(w_obj, '__getitem__') is not None)
+/// ```
+///
+/// The `is_dict` arm mirrors `ismapping_w`'s, for the same reason: the builtin
+/// mapping's flag may not be reachable through `typedef::r#type`, while a dict
+/// subclass carries the inherited flag.
+pub fn issequence_w(w_obj: PyObjectRef) -> bool {
+    unsafe {
+        if is_dict(w_obj) {
+            return false;
+        }
+        let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+        let flag = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type);
+        if flag == b'M' {
+            return false;
+        }
+        if flag == b'S' {
+            return true;
+        }
+        lookup(w_obj, "__getitem__").is_some()
+    }
+}
+
 pub fn is_iterable(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
