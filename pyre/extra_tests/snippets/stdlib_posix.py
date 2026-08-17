@@ -200,7 +200,8 @@ assert not _scandir_warnings(_close_midway), "a closed scandir iterator is close
 # The number of variables an exec takes from its environment is the mapping's
 # own length, and `keys()` and `values()` are read by position under it, so a
 # snapshot that cannot cover that length is an error rather than a quietly
-# shorter environment.  `__getitem__` is never consulted for any of it.
+# shorter environment.  `__getitem__` must exist on the type but is never
+# called for any of it.
 class _Env(dict):
     def __init__(self, keys, values, size):
         self._keys, self._values, self._size = keys, values, size
@@ -218,7 +219,27 @@ class _Env(dict):
         raise AssertionError("__getitem__ must not be called")
 
 
+class _NonMappingEnv:
+    def __len__(self):
+        return 0
+
+    def keys(self):
+        return ()
+
+    def values(self):
+        return ()
+
+
 _MISSING = "/nonexistent-program-" + str(os.getpid())
+
+assert_raises(TypeError, lambda: os.execve(_MISSING, ["x"], _NonMappingEnv()))
+assert_raises(TypeError, lambda: os.execve(_MISSING, ["x"], None))
+# `posix_spawn` takes the same environment conversion but also accepts None, so
+# it is absent where the platform has no spawn at all.
+if hasattr(os, "posix_spawn"):
+    assert_raises(
+        TypeError, lambda: os.posix_spawn(_MISSING, ["x"], _NonMappingEnv())
+    )
 
 for _short in (_Env([b"A"], [b"1"], 3), _Env([b"A", b"B"], [b"1"], 2)):
     assert_raises(IndexError, lambda e=_short: os.execve(_MISSING, ["x"], e))

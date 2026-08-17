@@ -71,6 +71,20 @@ static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
 // corresponding process operation has its own narrow serializer.
 static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
 
+fn require_env_mapping(
+    mapping: PyObjectRef,
+    function: &str,
+    accepts_none: bool,
+) -> Result<(), crate::PyError> {
+    if crate::baseobjspace::py_mapping_check(mapping) {
+        return Ok(());
+    }
+    let none_tail = if accepts_none { " or None" } else { "" };
+    Err(crate::PyError::type_error(format!(
+        "{function}: environment must be a mapping object{none_tail}"
+    )))
+}
+
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 fn sysconf_names() -> &'static [(&'static str, i32)] {
     &[
@@ -5585,6 +5599,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // mutation performed while encoding a snapshot element.
                     let _env_roots = pyre_object::gc_roots::push_roots();
                     let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
+                    require_env_mapping(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "execve",
+                        false,
+                    )?;
                     let pair_count = crate::baseobjspace::len_w(
                         pyre_object::gc_roots::shadow_stack_get(mapping_slot),
                     )? as usize;
@@ -8733,6 +8752,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // mutation performed while encoding a snapshot element.
                 let _env_roots = pyre_object::gc_roots::push_roots();
                 let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
+                require_env_mapping(
+                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                    "posix_spawn",
+                    true,
+                )?;
                 let pair_count = crate::baseobjspace::len_w(
                     pyre_object::gc_roots::shadow_stack_get(mapping_slot),
                 )? as usize;
@@ -9919,6 +9943,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // mutation performed while encoding a snapshot element.
                     let _env_roots = pyre_object::gc_roots::push_roots();
                     let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
+                    require_env_mapping(
+                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+                        "execve",
+                        false,
+                    )?;
                     let pair_count = crate::baseobjspace::len_w(
                         pyre_object::gc_roots::shadow_stack_get(mapping_slot),
                     )? as usize;

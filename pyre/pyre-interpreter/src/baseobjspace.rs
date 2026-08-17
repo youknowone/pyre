@@ -14395,6 +14395,16 @@ pub fn issequence_w(w_obj: PyObjectRef) -> bool {
     }
 }
 
+/// `PyMapping_Check`'s rule: the object's type defines `__getitem__`.
+///
+/// This deliberately does not use `ismapping_w` or `issequence_w`: both first
+/// consult `flag_map_or_seq`, which makes a list non-mapping and a dict
+/// non-sequence before their shared type-level `__getitem__` fallback.  The C
+/// API predicate is only that fallback, and ignores instance attributes.
+pub fn py_mapping_check(w_obj: PyObjectRef) -> bool {
+    unsafe { lookup(w_obj, "__getitem__").is_some() }
+}
+
 pub fn is_iterable(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
