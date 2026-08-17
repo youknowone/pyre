@@ -87,6 +87,7 @@ mod local_crates;
 )]
 pub mod model;
 pub mod model_ssa;
+pub mod module_path;
 mod parse;
 #[cfg_attr(
     test,

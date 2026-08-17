@@ -263,11 +263,12 @@ pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) ->
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
-/// path alone (`descr.py:105 cache[STRUCT]`).  Pyre's `module_path!()`
-/// macro produces the full `crate::module::sub::...` form, whereas the
-/// analyzer-side `module_path_from_source_file` (and the hard-coded
-/// `build_object_descr_group_with_def_path` def-paths) strip the crate
-/// segment.  Stripping the crate here aligns the macro-emitted
+/// path alone (`descr.py:105 cache[STRUCT]`).  A consumer's
+/// `module_path!()` macro produces the full `crate::module::sub::...`
+/// form, whereas the analyzer-side
+/// `majit_translate::module_path::module_path_from_source_file` (and the
+/// hard-coded `build_object_descr_group_with_def_path` def-paths) strip
+/// the crate segment.  Stripping the crate here aligns the macro-emitted
 /// `__majit_type_id()` with both, giving a single `path_hash` namespace
 /// across analyzer / hard-coded runtime publish / generic `#[jit_struct]`
 /// runtime publish.
