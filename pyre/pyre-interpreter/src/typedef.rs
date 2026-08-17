@@ -4586,12 +4586,7 @@ pub(crate) fn check_user_subclass(
     }
     let mro_ptr = unsafe { pyre_object::w_type_get_mro(w_subtype) };
     let is_sub = !mro_ptr.is_null()
-        && unsafe {
-            (*mro_ptr)
-                .as_slice()
-                .iter()
-                .any(|&t| std::ptr::eq(t, w_self))
-        };
+        && unsafe { crate::baseobjspace::mro_contains((*mro_ptr).as_slice(), w_self) };
     if !is_sub {
         let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
         let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
