@@ -35,7 +35,7 @@ Measured on Apple M-series, single core:
 
 The JIT now fires on integer-, float-, and exception-heavy loops alike: nbody, fannkuch, spectral_norm, and raise_catch all JIT-compile (disabling the JIT makes nbody ~70x and spectral_norm ~500x slower). Most benchmarks land within ~1.5–3x of PyPy and several times faster than CPython. The clearest remaining gap is fib_recursive, where recursive call frames still cost more than in PyPy. Sub-0.2s timings carry significant run-to-run variance and are approximate.
 
-Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine.
+Run `python pyre/check.py` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--no-build` to skip the Cargo build phase.
 
 ## Installation
 

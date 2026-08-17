@@ -4,8 +4,11 @@
 #
 # `helper` is admitted into the surrounding FOR_ITER body.  The trailing
 # opaque `id` call makes the first inline sub-walk abort and replay `helper`.
-# If the `isinstance` call is incorrectly marked replay-safe, its property
-# effect is not recorded and that one replay invokes it twice (N + 1 hits).
+# The property returns `int`, so the same loop also pins the observable
+# `isinstance` semantics formerly covered by a separate, lower-priority parity
+# test: the MRO miss must consult the property, use its result, and invoke it on
+# every call.  If the call is incorrectly marked replay-safe, the first replay
+# invokes the getter twice (N + 1 hits).
 
 N = 5000
 hits = [0]
@@ -18,7 +21,7 @@ class C:
     @property
     def __class__(self):
         hits[0] += 1
-        return str
+        return int
 
 
 def helper(obj):

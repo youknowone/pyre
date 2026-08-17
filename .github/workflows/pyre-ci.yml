@@ -578,7 +578,8 @@ jobs:
             echo "#### $backend"
             echo '```'
             out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
-              --backend "$backend" --no-synthetic --snapshot-diff 2>&1 || true)
+              --backend "$backend" --no-build --no-synthetic \
+              --snapshot-diff 2>&1 || true)
             echo "$out" | grep -Ei 'jit-stats diff|snapshot diff' \
               || echo '(no jit-stats output)'
             echo '```'

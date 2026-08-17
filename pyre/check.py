@@ -3497,6 +3497,11 @@ def parse_args():
         f"(default: {','.join(DEFAULT_BACKENDS)})",
     )
     parser.add_argument(
+        "--no-build",
+        action="store_true",
+        help="use existing release backend binaries instead of running cargo build",
+    )
+    parser.add_argument(
         "--wasm-engine",
         choices=["wasmtime", "wasmi"],
         default="wasmtime",
@@ -3583,14 +3588,30 @@ def main():
     backends = args.backends
 
     for backend in backends:
-        chk.build_backend(backend)
+        if not args.no_build:
+            chk.build_backend(backend)
         pyre_bin = args.pyre_path if args.pyre_path else default_binary(backend)
         if not Path(pyre_bin).exists():
             alt = pyre_bin + EXE
             if Path(alt).exists():
                 pyre_bin = alt
         if not os.access(pyre_bin, os.X_OK) and not Path(pyre_bin).exists():
-            print(f"ERROR: build failed for backend '{backend}' (missing executable: {pyre_bin})")
+            if args.no_build:
+                print(
+                    f"ERROR: --no-build requested for backend '{backend}', but "
+                    f"the executable is missing: {pyre_bin}"
+                )
+            else:
+                print(
+                    f"ERROR: build failed for backend '{backend}' "
+                    f"(missing executable: {pyre_bin})"
+                )
+            sys.exit(1)
+        if backend == "wasm" and args.no_build and not Path(WASM_MODULE_PATH).is_file():
+            print(
+                "ERROR: --no-build requested for backend 'wasm', but the "
+                f"wasm-host module is missing: {WASM_MODULE_PATH}"
+            )
             sys.exit(1)
         chk._set_pyre(backend, pyre_bin)
 
