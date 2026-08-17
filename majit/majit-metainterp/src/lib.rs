@@ -160,9 +160,9 @@ pub use pyjitpl::{
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
-    set_record_inline_application_traceback_hook, set_resolve_exception_context_hook, trace_jitcode,
-    trace_jitcode_from_merge_point,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
+    trace_jitcode, trace_jitcode_from_merge_point, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
