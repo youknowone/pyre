@@ -412,6 +412,15 @@ pub unsafe fn try_compares_by_identity(w_type: PyObjectRef) -> Option<bool> {
 /// the registered fnaddr.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn has_compares_by_identity_hook() -> bool {
+    // Materialise a datum no sibling carries, behind an optimisation barrier.
+    // This predicate and [`has_eq_w_hook`] are both registered residual-call
+    // targets (`jit_fnaddr.rs`), and `runtime_fnaddr_patch` re-pairs a
+    // build-time address with the runtime one by that address alone, so two
+    // bodies folded onto one address make the pairing ambiguous. Which pair a
+    // folding linker picks moves with unrelated layout changes, so the bodies
+    // must differ by construction; `drain_list_append` keeps its
+    // `#[inline(never)]` forwarding call for the same reason.
+    std::hint::black_box(4u32);
     COMPARES_BY_IDENTITY_HOOK.with(|cell| cell.get().is_some())
 }
 

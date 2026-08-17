@@ -3563,17 +3563,27 @@ mod tests {
         for (path, addr) in jit_trace_fnaddrs() {
             by_addr.entry(addr).or_default().push(path);
         }
+        // Collect every colliding address before failing. Asserting inside
+        // the loop reports whichever collision the hash order reached first
+        // and hides the rest, so each repair looks complete and the next run
+        // names a different pair.
+        let mut collisions: Vec<String> = Vec::new();
         for (addr, paths) in &by_addr {
             let leaves: std::collections::BTreeSet<&str> = paths
                 .iter()
                 .map(|p| p.rsplit("::").next().unwrap_or(p))
                 .collect();
-            assert_eq!(
-                leaves.len(),
-                1,
-                "fnaddr {addr:#x} is claimed by unrelated functions {paths:?}",
-            );
+            if leaves.len() > 1 {
+                collisions.push(format!("{addr:#x} {leaves:?}"));
+            }
         }
+        collisions.sort();
+        assert!(
+            collisions.is_empty(),
+            "{} fnaddr(s) claimed by unrelated functions:\n  {}",
+            collisions.len(),
+            collisions.join("\n  "),
+        );
     }
 
     #[test]

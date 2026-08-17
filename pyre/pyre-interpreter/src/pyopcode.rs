@@ -1818,6 +1818,7 @@ pub fn label_arg_to_usize(
     delta: crate::bytecode::Arg<crate::bytecode::oparg::Label>,
     op_arg: OpArg,
 ) -> usize {
+    keep_fnaddr_distinct(2);
     delta.get(op_arg).as_usize()
 }
 
@@ -1844,6 +1845,7 @@ pub fn jump_target_forward_from_oparg(
     next_instr: usize,
     op_arg: OpArg,
 ) -> usize {
+    keep_fnaddr_distinct(3);
     jump_target_forward(&code.instructions, next_instr, op_arg_as_usize(op_arg))
 }
 
@@ -1919,6 +1921,25 @@ pub fn convert_value_arg(
     conv.get(op_arg)
 }
 
+/// Materialise `tag` behind an optimisation barrier so the caller's machine
+/// code carries an immediate no sibling shares.
+///
+/// The decode helpers below differ only in the phantom type of their `Arg<T>`
+/// parameter, so several of them compile to byte-identical bodies. Each is a
+/// residual-call target whose address `jit_fnaddr.rs` registers, and
+/// `runtime_fnaddr_patch` re-pairs a build-time address with the runtime one
+/// by that address alone — two functions folded onto a single address make
+/// that pairing ambiguous and can send one callee's call to the other. A
+/// linker that folds identical code (MSVC `/OPT:ICF`, on by default) is what
+/// performs the fold, and which pair it picks moves with unrelated layout
+/// changes, so the bodies have to differ by construction rather than by luck.
+/// `drain_list_append` keeps its `#[inline(never)]` forwarding call for the
+/// same reason; these have no callee to forward to, so they carry a datum.
+#[inline(always)]
+fn keep_fnaddr_distinct(tag: u32) {
+    std::hint::black_box(tag);
+}
+
 /// Decode `LOAD_SPECIAL`'s enum oparg behind a first-party helper.
 #[inline]
 #[majit_macros::dont_look_inside]
@@ -1926,6 +1947,7 @@ pub fn special_method_arg(
     method: crate::bytecode::Arg<crate::bytecode::oparg::SpecialMethod>,
     op_arg: OpArg,
 ) -> SpecialMethod {
+    keep_fnaddr_distinct(1);
     method.get(op_arg)
 }
 
