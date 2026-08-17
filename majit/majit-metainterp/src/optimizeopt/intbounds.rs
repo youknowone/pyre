@@ -1614,6 +1614,12 @@ impl Optimization for OptIntBounds {
     /// after rewrite postprocess has fixed the guard result to 1/0,
     /// intbounds propagates that knowledge backward through the producing
     /// int expression before later ops (e.g. INT_ADD_OVF) are optimized.
+    ///
+    /// `CallI` is listed alongside `CallPureI` although upstream declares only
+    /// `postprocess_CALL_PURE_I` (intbounds.py:155). It is load-bearing, and it
+    /// is what makes this port's postprocess model agree with upstream's rather
+    /// than a deviation from it — see the `CallPureI | CallI` arm in
+    /// `propagate_postprocess`.
     fn have_postprocess_op(&self, opcode: OpCode) -> bool {
         matches!(
             opcode,
@@ -1763,6 +1769,26 @@ impl Optimization for OptIntBounds {
             }
 
             // ── Call postprocess ──
+            //
+            // intbounds.py:155 `postprocess_CALL_PURE_I` — upstream has no
+            // `postprocess_CALL_I`, and matching `CallI` here is what keeps the
+            // two ports equivalent rather than what makes them differ.
+            //
+            // `OptimizationResult` (optimizer.py:47-53) remembers the op the
+            // pass itself emitted and runs the callback on THAT op, so upstream
+            // still sees `CALL_PURE_I` after OptPure demotes the call to
+            // `CALL_I` further down the chain. This port collects pass indices
+            // instead and hands every callback the FINAL op, so intbounds is
+            // handed the demoted `CallI`. Accepting both opcodes is how the
+            // bound still lands.
+            //
+            // Measured, not assumed: over 150 synth fixtures the demotion fires
+            // 72 times — 58 `CallPureR -> CallR` and 14 `CallPureI -> CallI`,
+            // and it is those 14 where intbounds has already been collected
+            // under `CallPureI` (the R-typed opcode is not in its set at all).
+            // Dropping `CallI` from this arm and from `have_postprocess_op` to
+            // "match upstream" would silently delete `mod_bound` /
+            // `py_div_bound` on every demoted call — the opposite of parity.
             OpCode::CallPureI | OpCode::CallI => {
                 let __descr_arc_d = op.getdescr();
                 if let Some(d) = __descr_arc_d.as_ref()
