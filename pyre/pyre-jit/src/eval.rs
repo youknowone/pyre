@@ -1455,8 +1455,11 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
-// rlib/jit.py PARAMETERS default: loop hot-count threshold.
-const JIT_THRESHOLD: u32 = 1039;
+// rlib/jit.py:588 PARAMETERS default: loop hot-count threshold. Read from
+// the parameter table rather than restated — upstream a jitdriver that does
+// not set the value takes it from `PARAMETERS`, so there is one place the
+// default can be read and one place it can change.
+const JIT_THRESHOLD: u32 = majit_metainterp::jit::PARAMETERS.threshold;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
