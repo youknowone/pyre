@@ -1183,12 +1183,12 @@ pub struct JitCellToken {
     bridge_invalidation_flags: parking_lot::Mutex<Vec<Arc<AtomicBool>>>,
     /// Alternative loop versions to compile immediately after the main loop.
     pub version_info: Option<LoopVersionInfo>,
-    /// history.py:449: _keepalive_jitcell_tokens — set of other tokens
+    /// history.py:455: _keepalive_jitcell_tokens — set of other tokens
     /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
     /// Upstream prevents the target from being evicted while this loop
     /// is alive by holding the actual `JitCellToken` object reference
-    /// (`history.py:441 _keepalive_jitcell_tokens = {}` keyed on the
-    /// token object itself, with `:451 record_jump_to` writing
+    /// (`history.py:455 _keepalive_jitcell_tokens = {}` keyed on the
+    /// token object itself, with `:457 record_jump_to` writing
     /// `self._keepalive_jitcell_tokens[target] = None`).  Pyre keeps the
     /// same shape: an `Arc<JitCellToken>` set keyed on token number.
     ///
@@ -1248,7 +1248,7 @@ pub struct JitCellToken {
     /// covered by the existing `unsafe impl Sync for JitCellToken`
     /// at line 1130 — single-threaded JIT scheduler invariant.
     pub generation: Cell<i64>,
-    /// `history.py:431-435 JitCellToken.retraced_count` parity slot.
+    /// `history.py:442 JitCellToken.retraced_count` parity slot.
     ///
     /// RPython packs two pieces of state into this u-int:
     ///   * bit 0 = `FORCE_BRIDGE_SEGMENTING` flag.
@@ -1318,7 +1318,7 @@ pub struct JitCellToken {
 }
 
 impl JitCellToken {
-    /// `history.py:431` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
+    /// `history.py:438` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
     /// into `retraced_count`.  Set at `pyjitpl.py:2833` (pyre:
     /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge
     /// trace aborts without an inlinable function; read at
@@ -1364,9 +1364,9 @@ impl JitCellToken {
             _ll_function_addr: AtomicUsize::new(0),
             // memmgr.py:38 default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
-            // history.py:435 `retraced_count = 0` (class attribute default).
+            // history.py:442 `retraced_count = 0` (class attribute default).
             retraced_count: Cell::new(0),
-            // history.py:433 `target_tokens = None` — pyre uses the
+            // history.py:440 `target_tokens = None` — pyre uses the
             // empty-Vec equivalent so `has_target_tokens` is one
             // `is_empty()` check away.
             target_tokens: parking_lot::Mutex::new(Vec::new()),

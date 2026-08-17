@@ -7781,9 +7781,10 @@ impl<M: Clone> MetaInterp<M> {
                 self.compiled_loops
                     .get(&green_key)
                     .and_then(|compiled| compiled.front_target_tokens.first())
-                    .is_none_or(|front| majit_ir::descr_identity(
-                        &front.as_jump_target_descr()
-                    ) == majit_ir::descr_identity(&jump_descr)),
+                    .is_none_or(
+                        |front| majit_ir::descr_identity(&front.as_jump_target_descr())
+                            == majit_ir::descr_identity(&jump_descr)
+                    ),
                 "compile_trace: token target-descr head disagrees with \
                  front_target_tokens head for key={green_key}"
             );
@@ -11590,12 +11591,13 @@ impl<M: Clone> MetaInterp<M> {
     /// reads `cell.loop_token.as_ref()` directly per F.1 audit
     /// (`tfinal_f0_f1_landed_2026_05_07`).
     ///
-    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` parity:
-    /// `bool(token) and bool(token.target_tokens)`.  pyre stores the
-    /// per-target descr identity on `JitCellToken.target_tokens`
-    /// (`backend/src/lib.rs`); each successful `compile_loop` /
-    /// `compile_retrace` populates it through `record_target_token` so
-    /// `has_target_tokens` returns the same signal PyPy reads.
+    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` is
+    /// `bool(token) and bool(token.target_tokens)`. pyre answers that
+    /// question from the `compiled_loops` side table instead
+    /// ([`Self::has_compiled_targets`]); the per-target descr identity
+    /// mirrored onto `JitCellToken.target_tokens` (`backend/src/lib.rs`) is
+    /// read only by `first_target_token`, and `has_target_tokens` has no
+    /// callers at all.
     /// Invalidation in PyPy is `quasiimmut.py:99 looptoken.invalidated = True`
     /// — a single boolean flag, not a clear of `target_tokens`. Pyre
     /// routes the `bool(token)` half through `WarmEnterState::
