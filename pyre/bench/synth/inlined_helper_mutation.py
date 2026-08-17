@@ -1,8 +1,14 @@
-# pyre-check: max-pypy-ratio=145
+# pyre-check: max-pypy-ratio=60
 # The trip count now puts pypy above the startup-subtraction floor, so this
-# ratio is a measurement rather than pyre divided by the floor constant. The
-# ceiling is twice the slowest of the three backends observed unclamped
-# (71.1x on wasm); the previous 45 was fitted against the clamp and fails.
+# ratio is a measurement rather than pyre divided by the floor constant; a
+# ceiling fitted against the clamp (the 45 this bench once carried) fails.
+# The bound is twice the slowest of the three backends, rounded up.
+#
+# `push` binds `a.append` inside an inlined callee, and the folds that shape a
+# bound-method load used to decline for the whole of such a sub-walk. They now
+# decline only where a guard would collapse its resume to the caller's CALL,
+# so the binding folds here: the ratio fell from 39.4x/70.2x/60.8x to
+# 15.1x/27.7x/26.4x (dynasm/cranelift/wasm).
 # Inlined-callee shared-heap mutation parity, in both helper orderings.
 #
 # A tiny helper mutates a caller-owned list/instance inside a hot while-loop,

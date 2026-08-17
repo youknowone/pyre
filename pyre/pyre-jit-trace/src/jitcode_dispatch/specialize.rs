@@ -3299,11 +3299,11 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 /// type as `cls`, and the following `CALL` inlines `__func__(cls, ...)` — the
 /// instance-method shape with the class in the receiver slot.
 ///
-/// Restricted to the top full-body frame for the reason
-/// [`try_walker_specialize_load_bound_method_attr`] carries: a fold guard
-/// inside an inlined callee sub-walk resumes at the caller's CALL, re-running
-/// side effects.  The `getattr` residual resumes past the call, so declining
-/// there re-runs nothing.
+/// Carries the inline-depth restriction
+/// [`try_walker_specialize_load_bound_method_attr`] documents: under the
+/// single-frame collapse a fold guard inside an inlined callee sub-walk
+/// resumes at the caller's CALL, re-running side effects.  The `getattr`
+/// residual resumes past the call, so declining there re-runs nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3317,7 +3317,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
-    if ctx.fbw_mode.inline_subwalk {
+    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
@@ -3537,12 +3537,14 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
 /// Returns `None` (fall through to the residual, SAFE) for every shape
 /// [`pyre_interpreter::baseobjspace::bound_method_attr_fast_path`] declines.
 ///
-/// Restricted to the top full-body frame for the reason
-/// [`try_walker_orthodox_list_append`] documents: inside an inlined callee
-/// sub-walk a fold's guards collapse their resume to the caller's CALL
-/// boundary, so a guard failure re-runs the callee from its entry and doubles
-/// any side effect it sequenced before this `LOAD_ATTR`. The residual resumes
-/// past the call instead, so declining here re-runs nothing extra.
+/// Inside an inlined callee sub-walk the fold is restricted to a depth whose
+/// guards resume at their own callee coordinate
+/// ([`walker_inline_guard_resumes_in_callee`]).  Under the single-frame
+/// collapse the reason [`try_walker_orthodox_list_append`] documents applies: a
+/// guard resumes at the caller's CALL boundary, so a failure re-runs the callee
+/// from its entry and doubles any side effect it sequenced before this
+/// `LOAD_ATTR`. The residual resumes past the call instead, so declining there
+/// re-runs nothing extra.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3553,7 +3555,10 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
@@ -3661,10 +3666,10 @@ pub(crate) fn try_walker_fold_load_method_self<Sym: WalkSym>(
         let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
         let class_pinned = attr.is_constant() || ctx.trace_ctx.heap_cache().is_class_known(attr);
         if !class_pinned {
-            // A guard here would resume at the caller's CALL inside an inlined
-            // callee sub-walk, re-running whatever that callee already did;
+            // Under the single-frame collapse a guard here would resume at the
+            // caller's CALL, re-running whatever that callee already did;
             // leave those to the residual (which resumes past the call).
-            if ctx.fbw_mode.inline_subwalk {
+            if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
                 return Ok(None);
             }
             let type_const = ctx.trace_ctx.const_int(method_type_addr);

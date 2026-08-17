@@ -299,6 +299,27 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
     Ok(())
 }
 
+/// Whether a guard emitted at the current inline depth resumes at its own
+/// callee coordinate instead of collapsing to the caller's CALL boundary.
+///
+/// The multi-frame snapshot below fires only when the paused-caller chain
+/// covers the full inline depth — one parent per active inlined callee.  A
+/// shorter chain falls through to the single-frame collapse, whose resume
+/// re-executes the entire call, so a guard emitted under it re-runs every side
+/// effect the inline region sequenced before it.  A fold that must not be
+/// re-run consults this before emitting its guards.
+pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> bool {
+    let session = ctx.session.borrow();
+    let n_parents = session
+        .framestack
+        .iter()
+        .filter(|frame| frame.parent.is_some())
+        .count();
+    n_parents > 0 && n_parents == session.framestack.len()
+}
+
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -385,31 +406,22 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // populates the chain; straight-line callees keep the empty chain + the
     // single-frame collapse below.
     if inline_subwalk {
-        // Fire the multi-frame snapshot only when the paused-caller chain
-        // covers the FULL current inline depth: framestack levels with parents
-        // must have one entry per active inlined callee. A nested
-        // straight-line callee inlined under a multiframe ancestor (e.g.
-        // `add3` inside a multiframe `mix`) pushes NO parent frame, so its own
-        // guards see a SHORTER chain than the callee depth — fall through to
-        // the single-frame collapse (the strict callee's resume-at-CALL
-        // behavior) rather than emit a chain that skips the intermediate frame.
-        let (n_parents, n_callees, parent_frames) = {
+        let parent_frames = {
             let session = ctx.session.borrow();
-            (
-                session
-                    .framestack
-                    .iter()
-                    .filter(|frame| frame.parent.is_some())
-                    .count(),
-                session.framestack.len(),
-                session
-                    .framestack
-                    .iter()
-                    .filter_map(|frame| frame.parent.clone())
-                    .collect::<Vec<_>>(),
-            )
+            session
+                .framestack
+                .iter()
+                .filter_map(|frame| frame.parent.clone())
+                .collect::<Vec<_>>()
         };
-        if n_parents > 0 && n_parents == n_callees {
+        // Fire the multi-frame snapshot only when the paused-caller chain
+        // covers the FULL current inline depth. A nested straight-line callee
+        // inlined under a multiframe ancestor (e.g. `add3` inside a multiframe
+        // `mix`) pushes NO parent frame, so its own guards see a SHORTER chain
+        // than the callee depth — fall through to the single-frame collapse
+        // (the strict callee's resume-at-CALL behavior) rather than emit a
+        // chain that skips the intermediate frame.
+        if walker_inline_guard_resumes_in_callee(ctx) {
             // A STRICT straight-line callee (gh#420) whose own frame is not
             // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
             // mirror) propagates the `Unsupported` error the same as the branch
