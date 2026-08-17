@@ -100,7 +100,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use crate::OpRef;
 use crate::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
@@ -191,11 +191,9 @@ pub enum LLType {
     Array(u64),
     /// descr.py:665: (arg_classes, result_type, result_signed,
     ///   RESULT_ERASED, extrainfo).
-    /// Structural key — two calls with the same signature + effects
-    /// share one CallDescr. `effectinfo.py:152-164` keys the EI cache
-    /// on the raw `_*_descrs_*` frozensets (not the lazily-populated
-    /// `bitstring_*` fields), so pyre's `Vec<u32>` lift carries the
-    /// frozenset content.
+    /// Two calls with the same signature and canonical EffectInfo identity
+    /// share one CallDescr. `effectinfo.py:147-148` interns the EI before
+    /// `descr.py:665` places that object in this tuple.
     Func {
         arg_classes: String,
         result_type: Type,
@@ -203,34 +201,12 @@ pub enum LLType {
         result_signed: bool,
         /// descr.py:662: result_size = symbolic.get_size(RESULT_ERASED, tsc)
         result_size: usize,
-        extraeffect: u8,
-        oopspecindex: u16,
-        /// effectinfo.py:128 `_readonly_descrs_fields = frozenset_or_none(...)`
-        ///
-        /// Stored as a `Vec<usize>` of `Arc::as_ptr` ptr-ids
-        /// (`crate::effectinfo::descr_ptr_id` lift of PyPy
-        /// `id(descr)`). The structural cache key collapses to one
-        /// entry when two `LLType::func_key` invocations carry the
-        /// same Arcs in the EI raw set, regardless of any
-        /// `descr.index()` collision between distinct Arcs.
-        readonly_descrs_fields: Option<Vec<usize>>,
-        /// effectinfo.py:131 `_write_descrs_fields`.
-        write_descrs_fields: Option<Vec<usize>>,
-        /// effectinfo.py:129 `_readonly_descrs_arrays`.
-        readonly_descrs_arrays: Option<Vec<usize>>,
-        /// effectinfo.py:132 `_write_descrs_arrays`.
-        write_descrs_arrays: Option<Vec<usize>>,
-        /// effectinfo.py:130 `_readonly_descrs_interiorfields`.
-        readonly_descrs_interiorfields: Option<Vec<usize>>,
-        /// effectinfo.py:133 `_write_descrs_interiorfields`.
-        write_descrs_interiorfields: Option<Vec<usize>>,
-        can_invalidate: bool,
-        can_collect: bool,
-        /// `effectinfo.py:144-146` release-gil cache breaker.  PyPy
-        /// appends a fresh `object()` to the EffectInfo cache key for
-        /// each target so those EIs never collapse.  `None` is the
-        /// normal structural cache key; `Some(_)` is a per-mint breaker.
-        release_gil_cache_breaker: Option<u64>,
+        /// `descr.py:665` stores the canonical `EffectInfo` object in the key.
+        /// `effectinfo.py:147-148` interns ordinary EIs process-globally, so
+        /// object identity carries all six raw sets without copying them into
+        /// every call-cache key. Release-gil EIs receive a fresh canonical
+        /// cell and therefore a fresh identity as well.
+        effect_info_identity: usize,
     },
 }
 
@@ -668,49 +644,7 @@ impl LLType {
         result_type: Type,
         result_signed: bool,
         result_size: usize,
-        effect: &EffectInfo,
-    ) -> Self {
-        Self::func_key_with_release_gil_breaker(
-            arg_types,
-            result_type,
-            result_signed,
-            result_size,
-            effect,
-            None,
-        )
-    }
-
-    /// `effectinfo.py:144-146` release-gil target key variant.
-    ///
-    /// PyPy does not structurally cache these EIs: each construction
-    /// appends a fresh `object()` to the key.  The call-descr cache is
-    /// still `GcCache._cache_call`; this helper simply supplies the
-    /// per-mint cache breaker that keeps release-gil descriptors unique.
-    pub fn func_key_with_fresh_release_gil_breaker(
-        arg_types: &[Type],
-        result_type: Type,
-        result_signed: bool,
-        result_size: usize,
-        effect: &EffectInfo,
-    ) -> Self {
-        static NEXT_RELEASE_GIL_CALL_KEY: AtomicU64 = AtomicU64::new(1);
-        Self::func_key_with_release_gil_breaker(
-            arg_types,
-            result_type,
-            result_signed,
-            result_size,
-            effect,
-            Some(NEXT_RELEASE_GIL_CALL_KEY.fetch_add(1, Ordering::Relaxed)),
-        )
-    }
-
-    fn func_key_with_release_gil_breaker(
-        arg_types: &[Type],
-        result_type: Type,
-        result_signed: bool,
-        result_size: usize,
-        effect: &EffectInfo,
-        release_gil_cache_breaker: Option<u64>,
+        effect: &Arc<crate::effectinfo::EffectInfoCell>,
     ) -> Self {
         let mut arg_classes = String::new();
         for t in arg_types {
@@ -726,32 +660,7 @@ impl LLType {
             result_type,
             result_signed,
             result_size,
-            extraeffect: effect.extraeffect as u8,
-            oopspecindex: effect.oopspecindex as u16,
-            // `effectinfo.py:152-164` cache key: raw `_*_descrs_*` sets
-            // (frozenset[Descr] lift, projected to `Arc::as_ptr`
-            // ptr-ids), NOT the lazily-published `bitstring_*` fields.
-            readonly_descrs_fields: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._readonly_descrs_fields,
-            ),
-            write_descrs_fields: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._write_descrs_fields,
-            ),
-            readonly_descrs_arrays: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._readonly_descrs_arrays,
-            ),
-            write_descrs_arrays: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._write_descrs_arrays,
-            ),
-            readonly_descrs_interiorfields: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._readonly_descrs_interiorfields,
-            ),
-            write_descrs_interiorfields: crate::effectinfo::descr_set_to_ptr_set_pub(
-                &effect._write_descrs_interiorfields,
-            ),
-            can_invalidate: effect.can_invalidate,
-            can_collect: effect.can_collect,
-            release_gil_cache_breaker,
+            effect_info_identity: Arc::as_ptr(effect) as usize,
         }
     }
 }
@@ -2433,6 +2342,7 @@ impl GcCache {
         result_size: usize,
         effect: EffectInfo,
     ) -> DescrRef {
+        let effect = crate::effectinfo::intern_effect_info(effect);
         let key = LLType::func_key(&arg_types, result_type, result_signed, result_size, &effect);
         // descr.py:667-668: cache hit
         if let Some(descr) = self._cache_call.get(&key) {
@@ -2440,7 +2350,7 @@ impl GcCache {
         }
         // descr.py:670-671: CallDescr(arg_classes, result_type, result_signed,
         //   result_size, extrainfo)
-        let descr: DescrRef = Arc::new(SimpleCallDescr::new(
+        let descr: DescrRef = Arc::new(SimpleCallDescr::new_with_effect_cell(
             next_call_descr_heapcache_index(),
             arg_types,
             result_type,
@@ -6488,7 +6398,7 @@ pub struct SimpleCallDescr {
     /// descr.py:453: CallDescr.result_flag — computed from result_type +
     /// result_signed in __init__ (descr.py:478-493).
     result_flag: ArrayFlag,
-    effect: crate::effectinfo::EffectInfoCell,
+    effect: Arc<crate::effectinfo::EffectInfoCell>,
 }
 
 impl Clone for SimpleCallDescr {
@@ -6544,7 +6454,51 @@ impl SimpleCallDescr {
         result_size: usize,
         effect: EffectInfo,
     ) -> Self {
-        // descr.py:478-493: compute result_flag from result_type + result_signed
+        Self::new_with_effect_cell_and_result_class(
+            index,
+            arg_types,
+            result_type,
+            result_class,
+            result_signed,
+            result_size,
+            crate::effectinfo::intern_effect_info(effect),
+        )
+    }
+
+    fn new_with_effect_cell(
+        index: u32,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_signed: bool,
+        result_size: usize,
+        effect: Arc<crate::effectinfo::EffectInfoCell>,
+    ) -> Self {
+        let result_class = match result_type {
+            Type::Int => 'i',
+            Type::Ref => 'r',
+            Type::Float => 'f',
+            Type::Void => 'v',
+        };
+        Self::new_with_effect_cell_and_result_class(
+            index,
+            arg_types,
+            result_type,
+            result_class,
+            result_signed,
+            result_size,
+            effect,
+        )
+    }
+
+    fn new_with_effect_cell_and_result_class(
+        index: u32,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_class: char,
+        result_signed: bool,
+        result_size: usize,
+        effect: Arc<crate::effectinfo::EffectInfoCell>,
+    ) -> Self {
         let result_flag = match result_type {
             Type::Void => ArrayFlag::Void,
             Type::Int => {
@@ -6565,7 +6519,7 @@ impl SimpleCallDescr {
             result_class,
             result_size,
             result_flag,
-            effect: crate::effectinfo::EffectInfoCell::new(effect),
+            effect,
         }
     }
 }

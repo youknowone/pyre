@@ -573,35 +573,48 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// little-endian index into this pool. The resolved `BhDescr` is what
 /// every `bhimpl_*` handler reads for field offsets, call descriptors,
 /// sub-JitCodes, and switch dicts.
-fn load_descr_index() -> &'static [u32] {
+struct DescrIndex {
+    offsets: Box<[u32]>,
+    /// `0` for structural/dispatch descriptors, `1` for Call/JitCode.
+    /// Mirrors the two groups consumed by `rehydrate_build_descr_raw_sets`.
+    kinds: Box<[u8]>,
+}
+
+fn load_descr_index() -> DescrIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize descrs_index.bin \
+    let (offsets, kinds): (Vec<u32>, Vec<u8>) =
+        bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize descrs_index.bin \
              ({} bytes): {e}",
-            INDEX_BYTES.len(),
-        )
-    });
+                INDEX_BYTES.len(),
+            )
+        });
     assert!(!offsets.is_empty());
     assert_eq!(offsets.first().copied(), Some(0));
     assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-    Box::leak(offsets.into_boxed_slice())
+    assert_eq!(kinds.len() + 1, offsets.len());
+    assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1)));
+    DescrIndex {
+        offsets: offsets.into_boxed_slice(),
+        kinds: kinds.into_boxed_slice(),
+    }
 }
 
-fn descrs_index() -> &'static [u32] {
-    static INDEX: OnceLock<&'static [u32]> = OnceLock::new();
+fn descrs_index() -> &'static DescrIndex {
+    static INDEX: OnceLock<DescrIndex> = OnceLock::new();
     INDEX.get_or_init(load_descr_index)
 }
 
 fn descr_count() -> usize {
-    descrs_index().len() - 1
+    descrs_index().kinds.len()
 }
 
 fn load_descr_uncached(index: usize) -> BhDescr {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let offsets = descrs_index();
+    let offsets = &descrs_index().offsets;
     let start = offsets[index] as usize;
     let end = offsets[index + 1] as usize;
     bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
@@ -621,7 +634,7 @@ fn descr_cells() -> &'static [OnceLock<&'static BhDescr>] {
         let cells = Box::leak(cells.into_boxed_slice());
         assert_eq!(
             cells.len() + 1,
-            descrs_index().len(),
+            descrs_index().offsets.len(),
             "pyre-jit-trace: descr cell count must match the indexed entry count",
         );
         cells
@@ -658,7 +671,7 @@ pub fn descr_table() -> &'static dyn DescrTable {
 /// gccache walk of `descr.py:25-47`; pyre's counterpart of *that* is
 /// `MetaInterpStaticData::finish_setup_descrs`, which enumerates the live
 /// `descr_registry`. The gap between the two tables is what
-/// [`ALL_EI_DESCR_MINTS`] carries.
+/// [`load_ei_descr_mints`] carries.
 #[cfg(test)]
 pub fn all_descrs() -> &'static [BhDescr] {
     static MATERIALIZED: OnceLock<&'static [BhDescr]> = OnceLock::new();
@@ -677,17 +690,16 @@ pub fn all_descrs() -> &'static [BhDescr] {
 ///
 /// See `descr::publish_effect_info_descr_mints` for why the opcode table alone
 /// leaves these slots empty on this side of the build/runtime split.
-static ALL_EI_DESCR_MINTS: LazyLock<Vec<majit_ir::effectinfo::DescrMintEntry>> =
-    LazyLock::new(|| {
-        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints.bin"));
-        bincode::deserialize(BYTES).unwrap_or_else(|e| {
-            panic!(
-                "pyre-jit-trace: failed to deserialize ei_descr_mints.bin \
-                 ({} bytes): {e}",
-                BYTES.len(),
-            )
-        })
-    });
+fn load_ei_descr_mints() -> Vec<majit_ir::effectinfo::DescrMintEntry> {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints.bin"));
+    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize ei_descr_mints.bin \
+             ({} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
 
 /// Analyzer-side release census captured at the end of the build-script
 /// translation. The live process adds its own counters before formatting the
@@ -750,10 +762,13 @@ fn call_descr_result_type(result_type: char) -> majit_ir::Type {
     }
 }
 
-fn rehydrated_call_descr_ref(bh: &majit_translate::jitcode::BhCallDescr) -> majit_ir::DescrRef {
+fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit_ir::DescrRef {
     let arg_types = call_descr_arg_types(&bh.arg_classes);
     let result_type = call_descr_result_type(bh.result_type);
-    let mut effect_info = bh.extra_info.clone();
+    // This BhCallDescr was decoded solely for setup.  Move its EffectInfo
+    // into the canonical runtime CallDescr instead of cloning the complete
+    // six-set serialization payload and then dropping the source copy.
+    let mut effect_info = bh.extra_info;
     crate::descr::rehydrate_effect_info(&mut effect_info);
     majit_metainterp::make_call_descr_sized_with_effect(
         &arg_types,
@@ -783,11 +798,17 @@ pub fn rehydrate_build_descr_raw_sets() {
         // below can only land on slots that already carry their complete
         // layout.  Resolving in the other order would leave every member
         // whose struct has not been published yet unresolvable.
-        for i in 0..descr_count() {
-            let bh = load_descr_uncached(i);
-            if !matches!(bh, BhDescr::Call { .. } | BhDescr::JitCode { .. }) {
-                crate::descr::make_descr_from_bh(&bh);
+        let index = descrs_index();
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind != 0 {
+                continue;
             }
+            let bh = load_descr_uncached(i);
+            debug_assert!(!matches!(
+                bh,
+                BhDescr::Call { .. } | BhDescr::JitCode { .. }
+            ));
+            crate::descr::make_descr_from_bh(&bh);
         }
         // Last, and only into what is still empty: the slots no opcode names,
         // which `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs`
@@ -800,12 +821,22 @@ pub fn rehydrate_build_descr_raw_sets() {
         // field, and going first would mean pre-filling a slot the loop then
         // asks for with its own numbering.  Publishing what the established
         // producers left over keeps their answers untouched.
-        crate::descr::publish_effect_info_descr_mints(&ALL_EI_DESCR_MINTS);
-        for i in 0..descr_count() {
+        // These mint specs are a one-shot wire format, not runtime state.
+        // Upstream's descriptors remain in GcCache; the temporary arguments
+        // passed to get_*_descr do not.  Drop the decoded strings/specs as
+        // soon as their canonical runtime descriptors have been published.
+        {
+            let ei_descr_mints = load_ei_descr_mints();
+            crate::descr::publish_effect_info_descr_mints(&ei_descr_mints);
+        }
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind != 1 {
+                continue;
+            }
             let bh = load_descr_uncached(i);
-            let calldescr = match &bh {
+            let calldescr = match bh {
                 BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
-                _ => continue,
+                _ => unreachable!("descrs_index call classification disagrees with descrs.bin"),
             };
             rehydrated_call_descr_ref(calldescr);
         }
@@ -1973,6 +2004,65 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 mod tests {
     use super::*;
 
+    #[test]
+    fn descr_index_kind_matches_each_serialized_entry() {
+        let index = descrs_index();
+        assert_eq!(index.kinds.len(), descr_count());
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            let call_like = matches!(
+                load_descr_uncached(i),
+                BhDescr::Call { .. } | BhDescr::JitCode { .. }
+            );
+            assert_eq!(kind, u8::from(call_like), "descriptor index {i}");
+        }
+    }
+
+    #[test]
+    fn rehydrate_effect_info_consumes_serialized_set_keys() {
+        let mut effect_info = majit_ir::EffectInfo::default();
+        assert!(effect_info.descr_set_keys.is_some());
+
+        crate::descr::rehydrate_effect_info(&mut effect_info);
+
+        assert!(effect_info.descr_set_keys.is_none());
+        assert!(
+            effect_info
+                ._readonly_descrs_fields
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            effect_info
+                ._write_descrs_fields
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            effect_info
+                ._readonly_descrs_arrays
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            effect_info
+                ._write_descrs_arrays
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            effect_info
+                ._readonly_descrs_interiorfields
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            effect_info
+                ._write_descrs_interiorfields
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+    }
+
     /// Splits the first-JIT descr cost into its stages, because the fix for
     /// each is different: deserialization is paid by the wire format,
     /// materialization by how much of the pool a run actually names.
@@ -2013,7 +2103,7 @@ mod tests {
         let base = rss_kb();
         let n_descrs = descr_count();
         let after_descrs = rss_kb();
-        let n_mints = ALL_EI_DESCR_MINTS.len();
+        let n_mints = load_ei_descr_mints().len();
         let after_mints = rss_kb();
         rehydrate_build_descr_raw_sets();
         let after_rehydrate = rss_kb();

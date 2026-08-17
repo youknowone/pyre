@@ -12,6 +12,7 @@
 
 use crate::descr::DescrRef;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// effectinfo.py:9-10 `class UnsupportedFieldExc(Exception)`.
 #[derive(Debug, Clone)]
@@ -271,6 +272,33 @@ impl Clone for EffectInfoCell {
         // existing test fixtures need.
         Self::new(self.get().clone())
     }
+}
+
+/// `effectinfo.py:14, 147-148 EffectInfo._cache`.
+///
+/// PyPy constructs one canonical EffectInfo object for each structural raw-set
+/// key and the call-descr cache stores that object by identity.  Keep the same
+/// process-global ownership here.  A small insertion-ordered vector is enough
+/// for the translated population and, unlike a second structural key, does not
+/// duplicate all six raw descriptor sets merely to find the canonical cell.
+///
+/// `effectinfo.py:144-146` deliberately bypasses the cache for release-gil
+/// targets by appending a fresh `object()` to the key; those calls receive a
+/// fresh cell here as well.
+pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
+    if effect_info.call_release_gil_target.0 != 0 {
+        return Arc::new(EffectInfoCell::new(effect_info));
+    }
+
+    static CACHE: LazyLock<Mutex<Vec<Arc<EffectInfoCell>>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = cache.iter().find(|existing| existing.get() == &effect_info) {
+        return existing.clone();
+    }
+    let canonical = Arc::new(EffectInfoCell::new(effect_info));
+    cache.push(canonical.clone());
+    canonical
 }
 
 /// effectinfo.py:266-269: frozenset_or_none(x)
@@ -1394,14 +1422,11 @@ impl EffectInfo {
 /// to the cache key in PyPy's runtime because the cache hit returns
 /// the same EI instance.
 ///
-/// Pyre lacks a process-global `EffectInfo._cache` today, so we
-/// reconstruct the key here for `compute_bitstrings`'s internal
-/// canonicalisation. Two structurally-equal `EffectInfo` values
-/// produce equal `EiCanonKey`s; `compute_bitstrings` then merges
-/// them into one canonical id, matching PyPy's post-frozenset class
-/// identity. Release-gil targets get a unique counter (mirroring
-/// PyPy's `object()` sentinel) so they remain distinct even when
-/// the rest of the EI matches.
+/// Production EffectInfos are interned by [`intern_effect_info`].  This key is
+/// still reconstructed for `compute_bitstrings` because its input is a set of
+/// owned snapshots, and test/macro callers can supply non-interned values.
+/// Two structurally-equal values produce equal `EiCanonKey`s; release-gil
+/// targets retain the fresh-object distinction below.
 /// `effectinfo.py:144-146` release-gil cache-breaker.
 ///
 /// PyPy: `if tgt_func: key += (object(),)` — every release-gil EI
@@ -1856,6 +1881,22 @@ mod compute_bitstrings_tests {
     }
     fn mk_array(idx: u32) -> DescrRef {
         Arc::new(SimpleArrayDescr::new(idx, 0, 8, 0, Type::Int)) as DescrRef
+    }
+
+    #[test]
+    fn effect_info_cache_reuses_ordinary_identity() {
+        let first = intern_effect_info(EffectInfo::default());
+        let second = intern_effect_info(EffectInfo::default());
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn effect_info_cache_keeps_release_gil_identity_fresh() {
+        let mut effect_info = EffectInfo::default();
+        effect_info.call_release_gil_target = (1, 0);
+        let first = intern_effect_info(effect_info.clone());
+        let second = intern_effect_info(effect_info);
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     /// Two EIs share a fielddescr in their write set; the descr's

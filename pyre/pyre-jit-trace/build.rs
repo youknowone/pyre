@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v7";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v8";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -73,9 +73,10 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
 /// moves it while an address change alone does not.
-/// `descrs_index.bin` is likewise a pure byte-offset table: `descrs.bin`
+/// `descrs_index.bin` is likewise a pure byte-offset/kind table: `descrs.bin`
 /// remains host-addressed, but its index contains no address and stays in the
-/// cross-process verdict to judge descriptor population, order, and lengths.
+/// cross-process verdict to judge descriptor population, order, lengths, and
+/// setup-pass classification.
 ///
 /// Caching them is still sound: a restore serves these tables and the
 /// `constants_i` baked against them from the *same* generation, so they stay
@@ -254,7 +255,7 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
-        bincode::serialize(&vec![0_u32]).unwrap(),
+        bincode::serialize(&(vec![0_u32], Vec::<u8>::new())).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -1065,8 +1066,20 @@ fn real_main() {
         // reconstituting every descriptor in this process.
         let mut descrs_bin = Vec::new();
         let mut descr_offsets = Vec::with_capacity(pipeline.descrs.len() + 1);
+        let mut descr_kinds = Vec::with_capacity(pipeline.descrs.len());
         descr_offsets.push(0_u32);
         for descr in &pipeline.descrs {
+            // `GcCache.setup_descrs` publishes structural descriptors before
+            // call descriptors.  Persist that two-pass classification beside
+            // the dense offsets so runtime can preserve the ordering without
+            // deserializing every entry once merely to discover its variant.
+            // One byte per dense slot retains upstream's list shape and avoids
+            // introducing a second keyed registry.
+            descr_kinds.push(match descr {
+                majit_translate::jitcode::BhDescr::Call { .. }
+                | majit_translate::jitcode::BhDescr::JitCode { .. } => 1_u8,
+                _ => 0_u8,
+            });
             descrs_bin.extend(bincode::serialize(descr).unwrap());
             descr_offsets.push(
                 u32::try_from(descrs_bin.len())
@@ -1074,10 +1087,11 @@ fn real_main() {
             );
         }
         assert_eq!(descr_offsets.len(), pipeline.descrs.len() + 1);
+        assert_eq!(descr_kinds.len(), pipeline.descrs.len());
         assert_eq!(descr_offsets.first().copied(), Some(0));
         assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
         assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-        let descrs_index_bin = bincode::serialize(&descr_offsets).unwrap();
+        let descrs_index_bin = bincode::serialize(&(descr_offsets, descr_kinds)).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
 

@@ -6843,7 +6843,11 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
         ei.single_write_descr_array = None;
     }
 
-    let Some(keys) = ei.descr_set_keys.as_ref() else {
+    // `descr_set_keys` is the build-process -> runtime-process wire channel
+    // for the six raw sets skipped by serde.  Consume it here: after the
+    // canonical DescrRefs below have been installed, retaining the member
+    // names duplicates the live object graph and has no RPython counterpart.
+    let Some(keys) = ei.descr_set_keys.take() else {
         // No serialized key channel.  For a build-time EI that means the
         // codewriter already emitted the `EF_RANDOM_EFFECTS` wildcard, so
         // the six raw sets are `None` and there is nothing to rebuild.  Any

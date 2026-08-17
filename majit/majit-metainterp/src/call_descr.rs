@@ -28,7 +28,7 @@ struct MetaCallDescr {
     result_type: Type,
     result_signed: bool,
     result_size: usize,
-    effect_info: EffectInfoCell,
+    effect_info: Arc<EffectInfoCell>,
 }
 
 /// `compile.py:187 isinstance(descr, JitCellToken)` parity.
@@ -719,28 +719,18 @@ fn make_call_descr_sized(
              runs (codewriter setup phase).\n  effect_info: {effect_info:?}"
         );
     }
-    // effectinfo.py:144-146: `if tgt_func: key += (object(),)  # don't
-    // care about caching in this case` — release-gil targets bypass the
-    // EffectInfo._cache via a fresh object() key.  The call descr still
-    // lives in GcCache._cache_call; the key just carries a per-mint
-    // breaker so release-gil call descrs never structurally collapse.
-    let key = if effect_info.call_release_gil_target.0 != 0 {
-        majit_ir::descr::LLType::func_key_with_fresh_release_gil_breaker(
-            arg_types,
-            result_type,
-            result_signed,
-            result_size,
-            &effect_info,
-        )
-    } else {
-        majit_ir::descr::LLType::func_key(
-            arg_types,
-            result_type,
-            result_signed,
-            result_size,
-            &effect_info,
-        )
-    };
+    // effectinfo.py:147-148 interns ordinary EffectInfos before
+    // descr.py:665 puts that object in `_cache_call`'s tuple. Release-gil
+    // targets bypass the interner with a fresh cell, matching the `object()`
+    // cache breaker at effectinfo.py:144-146.
+    let effect_info = majit_ir::effectinfo::intern_effect_info(effect_info);
+    let key = majit_ir::descr::LLType::func_key(
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+        &effect_info,
+    );
     let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
     gc.intern_call_descr_with(key, || {
         let descr: DescrRef = Arc::new(MetaCallDescr {
@@ -749,7 +739,7 @@ fn make_call_descr_sized(
             result_type,
             result_signed,
             result_size,
-            effect_info: EffectInfoCell::new(effect_info),
+            effect_info,
         });
         descr
     })
@@ -1052,6 +1042,46 @@ mod set_effect_bitstrings_tests {
             found,
             "GcCache._cache_call snapshot must include the descr we just made"
         );
+    }
+
+    #[test]
+    fn call_cache_keys_on_canonical_effect_info_identity() {
+        let first = make_call_descr_with_effect(
+            &[Type::Int, Type::Int, Type::Ref],
+            Type::Float,
+            EffectInfo::default(),
+        );
+        let second = make_call_descr_with_effect(
+            &[Type::Int, Type::Int, Type::Ref],
+            Type::Float,
+            EffectInfo::default(),
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(std::ptr::eq(
+            first.as_call_descr().unwrap().get_extra_info(),
+            second.as_call_descr().unwrap().get_extra_info(),
+        ));
+    }
+
+    #[test]
+    fn release_gil_call_cache_keeps_fresh_effect_info_identity() {
+        let mut effect_info = EffectInfo::default();
+        effect_info.call_release_gil_target = (0xfeed, 0);
+        let first = make_call_descr_with_effect(
+            &[Type::Int, Type::Ref, Type::Int],
+            Type::Void,
+            effect_info.clone(),
+        );
+        let second = make_call_descr_with_effect(
+            &[Type::Int, Type::Ref, Type::Int],
+            Type::Void,
+            effect_info,
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!std::ptr::eq(
+            first.as_call_descr().unwrap().get_extra_info(),
+            second.as_call_descr().unwrap().get_extra_info(),
+        ));
     }
 
     /// The trait-dispatch leg's `make_call_may_force_descr` and the walker
