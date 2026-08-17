@@ -1097,6 +1097,17 @@ impl<'c> Lowerer<'c> {
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
         // Check if this field is declared ref-kind in `ref_fields`.
+        // Resolve the access against the struct that DECLARES this field.
+        // Everything below reads the one `struct_path` local -- the field key,
+        // the ref/int/array lookup, the gc-kind, the type id, `size_of` and
+        // `offset_of!` -- so rebinding it here moves all of them onto the
+        // declaring struct together, which is what gives one physical field
+        // one descriptor across every struct that embeds it.
+        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // lowers it to `same_as`): the base register is unchanged, because an
+        // inlined base is required to start at offset 0.
+        let struct_path = config.declaring_struct(&struct_path, &member_name);
         let struct_last = struct_path
             .segments
             .last()
@@ -1222,6 +1233,17 @@ impl<'c> Lowerer<'c> {
         let struct_path = binding.struct_type.as_ref()?.clone();
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
+        // Resolve the access against the struct that DECLARES this field.
+        // Everything below reads the one `struct_path` local -- the field key,
+        // the ref/int/array lookup, the gc-kind, the type id, `size_of` and
+        // `offset_of!` -- so rebinding it here moves all of them onto the
+        // declaring struct together, which is what gives one physical field
+        // one descriptor across every struct that embeds it.
+        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // lowers it to `same_as`): the base register is unchanged, because an
+        // inlined base is required to start at offset 0.
+        let struct_path = config.declaring_struct(&struct_path, &member_name);
         let struct_last = struct_path
             .segments
             .last()
@@ -1336,6 +1358,17 @@ impl<'c> Lowerer<'c> {
         let struct_path = binding.struct_type.as_ref()?.clone();
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
+        // Resolve the access against the struct that DECLARES this field.
+        // Everything below reads the one `struct_path` local -- the field key,
+        // the ref/int/array lookup, the gc-kind, the type id, `size_of` and
+        // `offset_of!` -- so rebinding it here moves all of them onto the
+        // declaring struct together, which is what gives one physical field
+        // one descriptor across every struct that embeds it.
+        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // lowers it to `same_as`): the base register is unchanged, because an
+        // inlined base is required to start at offset 0.
+        let struct_path = config.declaring_struct(&struct_path, &member_name);
         let struct_last = struct_path
             .segments
             .last()
@@ -1663,6 +1696,17 @@ impl<'c> Lowerer<'c> {
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
         // Check if this field is declared ref-kind in `ref_fields`.
+        // Resolve the access against the struct that DECLARES this field.
+        // Everything below reads the one `struct_path` local -- the field key,
+        // the ref/int/array lookup, the gc-kind, the type id, `size_of` and
+        // `offset_of!` -- so rebinding it here moves all of them onto the
+        // declaring struct together, which is what gives one physical field
+        // one descriptor across every struct that embeds it.
+        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // lowers it to `same_as`): the base register is unchanged, because an
+        // inlined base is required to start at offset 0.
+        let struct_path = config.declaring_struct(&struct_path, &member_name);
         let struct_last = struct_path
             .segments
             .last()
@@ -1782,6 +1826,17 @@ impl<'c> Lowerer<'c> {
         let struct_path = binding.struct_type.as_ref()?.clone();
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
+        // Resolve the access against the struct that DECLARES this field.
+        // Everything below reads the one `struct_path` local -- the field key,
+        // the ref/int/array lookup, the gc-kind, the type id, `size_of` and
+        // `offset_of!` -- so rebinding it here moves all of them onto the
+        // declaring struct together, which is what gives one physical field
+        // one descriptor across every struct that embeds it.
+        // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // lowers it to `same_as`): the base register is unchanged, because an
+        // inlined base is required to start at offset 0.
+        let struct_path = config.declaring_struct(&struct_path, &member_name);
         let struct_last = struct_path
             .segments
             .last()

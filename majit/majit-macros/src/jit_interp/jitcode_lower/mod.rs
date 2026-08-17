@@ -248,6 +248,10 @@ pub struct LowererConfig {
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
     /// Struct types whose `New` allocation should carry the headerless bit.
     pub(super) headerless_structs: std::collections::HashSet<Vec<String>>,
+    /// `Outer` canonical segments -> (base field name, base path), from
+    /// `inlined_prefix`.  Empty unless a caller declares one, in which case
+    /// [`LowererConfig::declaring_struct`] is the identity.
+    pub(super) inlined_prefix: HashMap<Vec<String>, (String, syn::Path)>,
     /// Pure function → native IR integer binop aliases.  Key = canonical func
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
@@ -964,6 +968,7 @@ impl LowererConfig {
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
         headerless_structs: &[syn::Path],
+        inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
     ) -> Self {
         let array_fields_map = build_array_fields_map(array_fields);
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
@@ -1015,6 +1020,7 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
+            inlined_prefix: inlined_prefix_map(inlined_prefix),
             native_int_binops: native_int_binops
                 .iter()
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
@@ -1050,6 +1056,7 @@ impl LowererConfig {
         int_fields: &[crate::jit_interp::IntFieldEntry],
         call_returns: &[(Path, Path)],
         headerless_structs: &[Path],
+        inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
         split_dispatch: bool,
@@ -1291,6 +1298,7 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
+            inlined_prefix: inlined_prefix_map(inlined_prefix),
             pool_arrays,
             native_int_binops: native_int_binops
                 .iter()
@@ -1344,6 +1352,75 @@ impl LowererConfig {
     pub(super) fn struct_gc_kind_is_managed(&self, struct_path: &syn::Path) -> bool {
         self.is_headerless_struct(struct_path)
     }
+
+    /// The struct that DECLARES `field`, following inlined leading
+    /// substructures outward-in.
+    ///
+    /// `rclass.py:987-1001 InstanceRepr.getfield` resolves a field against the
+    /// repr that owns it: `if attr in self.fields` … else recurse into
+    /// `self.rbase` with `force_cast=True`. The cast is why
+    /// `jtransform.py:881` always reads the descr off the declaring struct,
+    /// and therefore why one physical field has one descriptor no matter how
+    /// many outer structs embed it.
+    ///
+    /// Callers rebind their struct path through this before building the field
+    /// key, so the declaration lookup, the type id, and every compile-time
+    /// witness (`size_of`, `offset_of!`) move together onto the declaring
+    /// struct. That is the whole of the cast: `jtransform.py:254
+    /// rewrite_op_cast_pointer` lowers `cast_pointer` to `same_as`, so no
+    /// operation is emitted and the base pointer is unchanged — which holds
+    /// only because an inlined base is required to start at offset 0.
+    ///
+    /// Returns `struct_path` unchanged when the struct declares the field
+    /// itself, when it has no inlined base, or when nothing declared one.
+    pub(super) fn declaring_struct(&self, struct_path: &syn::Path, field: &str) -> syn::Path {
+        let mut current = struct_path.clone();
+        // Bounded by the declaration chain, which cannot be cyclic without
+        // making the Rust types infinitely sized.
+        loop {
+            if self.declares_field(&current, field) {
+                return current;
+            }
+            let Some((_, base)) = self.inlined_prefix.get(&canonical_path_segments(&current))
+            else {
+                return current;
+            };
+            current = base.clone();
+        }
+    }
+
+    /// Whether `struct_path` itself declares `field` in any of the three field
+    /// vocabularies. A field in none of them is undeclared everywhere, so the
+    /// walk stops at the struct it was spelled with and the default applies.
+    fn declares_field(&self, struct_path: &syn::Path, field: &str) -> bool {
+        let Some(struct_name) = struct_path.segments.last() else {
+            return false;
+        };
+        let key = format!("{}::{}", struct_name.ident, field);
+        self.ref_fields.contains_key(&key)
+            || self.int_fields.contains_key(&key)
+            || self.array_fields.contains_key(&key)
+    }
+}
+
+/// Index `inlined_prefix` by the outer struct's full canonical segments.
+///
+/// Keyed by every segment rather than by the last one, unlike the
+/// `"Struct::field"` keys the field vocabularies use: this declaration names a
+/// type relationship, and two same-named types in different modules do not
+/// share a base.
+fn inlined_prefix_map(
+    entries: &[crate::jit_interp::InlinedPrefixEntry],
+) -> HashMap<Vec<String>, (String, syn::Path)> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                canonical_path_segments(&entry.outer),
+                (entry.base_field.to_string(), entry.base.clone()),
+            )
+        })
+        .collect()
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {
@@ -2696,9 +2773,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2726,9 +2804,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2756,9 +2835,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],

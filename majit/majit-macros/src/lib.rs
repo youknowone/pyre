@@ -40,6 +40,7 @@ struct JitInlineArgs {
     native_tag_small: Vec<Path>,
     struct_allocs: Vec<(Path, Path)>,
     headerless_structs: Vec<Path>,
+    inlined_prefix: Vec<jit_interp::InlinedPrefixEntry>,
 }
 
 impl Parse for JitInlineArgs {
@@ -52,6 +53,7 @@ impl Parse for JitInlineArgs {
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut headerless_structs: Vec<Path> = Vec::new();
+        let mut inlined_prefix: Vec<jit_interp::InlinedPrefixEntry> = Vec::new();
         let mut array_fields: Vec<jit_interp::ArrayFieldEntry> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -123,6 +125,9 @@ impl Parse for JitInlineArgs {
                 "headerless_structs" => {
                     headerless_structs = jit_interp::parse_path_set(input)?;
                 }
+                "inlined_prefix" => {
+                    inlined_prefix = jit_interp::parse_inlined_prefix_map(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -142,6 +147,7 @@ impl Parse for JitInlineArgs {
             native_tag_small,
             struct_allocs,
             headerless_structs,
+            inlined_prefix,
         })
     }
 }
@@ -2502,6 +2508,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.native_int_binops,
         &args.native_tag_small,
         &args.headerless_structs,
+        &args.inlined_prefix,
     ) {
         Ok(Some(lowered)) => lowered,
         Ok(None) => {

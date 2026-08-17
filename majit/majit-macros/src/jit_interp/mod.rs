@@ -177,6 +177,11 @@ pub struct JitInterpConfig {
     /// Structs whose `New` allocation should use the headerless nursery opcode.
     /// `headerless_structs = { StructType, ... }`.
     pub headerless_structs: Vec<Path>,
+    /// Leading-substructure declarations, `inlined_prefix = { Outer::field =>
+    /// Base, ... }`.  See [`InlinedPrefixEntry`].  Empty by default, in which
+    /// case every access resolves against the struct it is spelled with and the
+    /// expansion is unchanged.
+    pub inlined_prefix: Vec<InlinedPrefixEntry>,
     /// Pure function → native IR integer binop aliases.
     /// `native_int_binops = { val_add => IntAdd, ... }`.  When the JIT-path
     /// lowerer encounters a call whose path matches a key, it emits the named
@@ -426,6 +431,39 @@ pub struct RefFieldEntry {
     pub pointee_type: Path,
 }
 
+/// One entry in `inlined_prefix = { Outer::field => Base, ... }`.
+///
+/// Declares that `Outer.field` is an inlined substructure of type `Base`
+/// occupying the leading bytes of `Outer` — the relationship `rclass.py:548`
+/// builds into every instance struct as
+/// `MkStruct(name, ('super', rbase.object_type), *own_fields)`.
+///
+/// What it buys is descr identity. A field the outer struct does not itself
+/// declare is *owned* by the base, so an access reaching it is re-expressed
+/// against the base before the field key and the type id are built.
+/// `rclass.py:987-1001 InstanceRepr.getfield` does the same by recursing to
+/// `self.rbase` with `force_cast=True`, which leaves `jtransform.py:881`
+/// reading the descr off the declaring struct in every case — so one physical
+/// field has one descr for a whole family of outer structs, however many of
+/// them exist.
+///
+/// The base must be the leading field. `lltype.py:296-305` admits an inlined
+/// substructure only at `_names[0]`, and the offset arithmetic depends on it:
+/// a redirected access keeps the outer pointer in its register and offsets by
+/// the field's position within the *base*, which names the right word only when
+/// the base starts at zero. Each emit site therefore also emits a
+/// `const _: () = assert!(offset_of!(Outer, field) == 0)`.
+#[derive(Clone)]
+pub struct InlinedPrefixEntry {
+    /// The struct that embeds the base as its leading field.
+    pub outer: Path,
+    /// The field of `outer` holding the embedded base.
+    pub base_field: Ident,
+    /// The embedded leading substructure's own type, which declares the
+    /// fields the outer struct inherits.
+    pub base: Path,
+}
+
 /// One entry in `array_fields = { Struct::field => ElementType, ... }`.
 ///
 /// Declares that `Struct.field` holds the base pointer of a contiguous
@@ -661,6 +699,7 @@ impl Parse for JitInterpConfig {
         let mut call_returns: Vec<(Path, Path)> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut headerless_structs: Vec<Path> = Vec::new();
+        let mut inlined_prefix: Vec<InlinedPrefixEntry> = Vec::new();
         let mut native_int_binops: Vec<(Path, Ident)> = Vec::new();
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut split_dispatch = false;
@@ -735,6 +774,9 @@ impl Parse for JitInterpConfig {
                 "headerless_structs" => {
                     headerless_structs = parse_path_set(input)?;
                 }
+                "inlined_prefix" => {
+                    inlined_prefix = parse_inlined_prefix_map(input)?;
+                }
                 "native_int_binops" => {
                     native_int_binops = parse_native_int_binops_map(input)?;
                 }
@@ -804,6 +846,7 @@ impl Parse for JitInterpConfig {
             call_returns,
             struct_allocs,
             headerless_structs,
+            inlined_prefix,
             native_int_binops,
             native_tag_small,
             split_dispatch,
@@ -993,6 +1036,29 @@ pub(crate) fn parse_int_fields_map(input: ParseStream) -> syn::Result<Vec<IntFie
         };
         entry.is_signed()?;
         entries.push(entry);
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(entries)
+}
+
+/// Parse `inlined_prefix = { Outer::field => Base, ... }`.  Split like
+/// `ref_fields`: the last segment of `Outer::field` names the field holding the
+/// inlined base.
+pub(crate) fn parse_inlined_prefix_map(
+    input: ParseStream,
+) -> syn::Result<Vec<InlinedPrefixEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries = Vec::new();
+    while !content.is_empty() {
+        let (outer, base_field) = split_struct_field_path(content.parse::<Path>()?)?;
+        content.parse::<Token![=>]>()?;
+        let base: Path = content.parse()?;
+        entries.push(InlinedPrefixEntry {
+            outer,
+            base_field,
+            base,
+        });
         let _ = content.parse::<Token![,]>();
     }
     Ok(entries)
