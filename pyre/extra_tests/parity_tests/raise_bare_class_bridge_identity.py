@@ -3,13 +3,12 @@
 # parity-tests reason: a bridge must keep the normalized exception instance
 # distinct from the bare class operand that produced it.
 
-try:
-    import pypyjit
-
-    pypyjit.set_param("threshold=1,function_threshold=1")
-except ImportError:
-    pass
-
+# No `pypyjit.set_param` preamble on purpose.  The shape needs three traces in
+# sequence — a loop that folds the bare-class raise, a second loop that declines
+# it to the normalizing residual, then a bridge off that residual's class guard.
+# Lowering the thresholds compiles the first loop before the sequence can form,
+# and the fixture then passes on a binary that carries the defect.  The default
+# thresholds reach every trace well inside `N`.
 
 N = 200000
 
@@ -38,6 +37,8 @@ def probe(cls):
     return last
 
 
+# Order is the condition: a class the bare-class raise fold accepts, then one it
+# declines, then a second accepted class not yet seen at this site.
 for exception_class in (ValueError, UserError, RuntimeError):
     probe(exception_class)
 

@@ -10809,26 +10809,34 @@ impl JitState for PyreJitState {
             &vable_array_values,
         );
         // resume.py:1042-1057 `rebuild_from_resumedata` fills the live MIFrame
-        // register banks with `consume_boxes`; those boxes are the authoritative
-        // values at an after-residual guard.  The separately decoded virtualizable
-        // array can still contain the pre-call operand because the residual
-        // result has not passed through a frame-array write.  Rebuild both
-        // halves of the live array shadow from the slot-indexed frame stream in
-        // that shape.  Kept-stack branch guards retain their existing
+        // register banks with `consume_boxes`; operand-stack boxes are the
+        // authoritative values at an after-residual guard.  The separately
+        // decoded virtualizable array can still contain the pre-call operand
+        // because the residual result has not passed through a frame-array
+        // write.  Locals and cells keep the vable-image authority established
+        // above: a register color at an interior resume point can hold a dead
+        // or stale local value.  Kept-stack branch guards retain their existing
         // post-overlay path: their deeper pcdep stack is not the resumed
         // virtualizable depth.
         let mut bridge_array_items = vable_array_items.clone();
         let mut bridge_array_values = live_array_values.clone();
-        while bridge_array_values.len() < bridge_array_len {
-            bridge_array_values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
-        }
+        bridge_array_values.resize(
+            bridge_array_len,
+            majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+        );
         if !seed_deferred_to_overlay {
             let semantic_array_len = sym.registers_r.len().min(bridge_array_len);
             if bridge_array_items.len() < semantic_array_len {
                 let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
                 bridge_array_items.resize(semantic_array_len, null_ref);
             }
-            for (slot, &opref) in sym.registers_r.iter().take(semantic_array_len).enumerate() {
+            for (slot, &opref) in sym
+                .registers_r
+                .iter()
+                .take(semantic_array_len)
+                .enumerate()
+                .skip(nlocals)
+            {
                 if opref.is_none() {
                     continue;
                 }
@@ -13770,7 +13778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_bridge_sym_preserves_resumed_stack_tail() {
+    fn test_setup_bridge_sym_preserves_vable_locals_and_resumed_stack() {
         use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
         use majit_metainterp::jitcode::JitCodeBuilder;
         use pyre_interpreter::pyframe::PyFrame;
@@ -13816,9 +13824,9 @@ mod tests {
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
-                depth_pred_by_jit_pc: vec![(0, 2)],
-                depth_trivia_marker_by_jit_pc: vec![(0, Some(2))],
-                depth_trivia_pred_by_jit_pc: vec![(0, Some(2))],
+                depth_pred_by_jit_pc: vec![(0, 1)],
+                depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
+                depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
                 depth_containing_by_jit_pc: Vec::new(),
                 depth_block_head_by_jit_pc: Vec::new(),
                 pcdep_trivia_marker_by_jit_pc: Vec::new(),
@@ -13863,8 +13871,9 @@ mod tests {
             Type::Ref, // debugdata
             Type::Ref, // w_globals
             Type::Ref, // local0
+            Type::Ref, // stale cell
             Type::Ref, // stack0
-            Type::Ref, // stack1
+            Type::Ref, // live cell from the vable image
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
         // Slots 0 (frame) and 1 (ec) are both Ref-typed per `input_types`
@@ -13875,14 +13884,15 @@ mod tests {
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.frame = OpRef::input_arg_ref(0);
         sym.execution_context = OpRef::input_arg_ref(1);
-        sym.nlocals = 1;
-        sym.valuestackdepth = 1;
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
         sym.concrete_vable_ptr = frame_ptr as *mut u8;
 
         let local0 = w_int_new(41) as i64;
-        let stack0 = w_int_new(42) as i64;
-        let stack1 = w_int_new(43) as i64;
+        let stale_cell = w_int_new(42) as i64;
+        let stack0 = w_int_new(43) as i64;
         let globals = w_int_new(44) as i64;
+        let live_cell = w_int_new(45) as i64;
         let fail_values = [
             frame_ptr as i64,
             0,
@@ -13892,8 +13902,9 @@ mod tests {
             0,
             globals,
             local0,
+            stale_cell,
             stack0,
-            stack1,
+            live_cell,
         ];
         let fail_types = [
             Type::Ref,
@@ -13906,6 +13917,7 @@ mod tests {
             Type::Ref,
             Type::Ref,
             Type::Ref,
+            Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
             frames: vec![RebuiltFrame {
@@ -13913,15 +13925,16 @@ mod tests {
                 pc: 0,
                 py_pc: 0,
                 values: vec![
-                    RebuiltValue::Box(7, Type::Ref),
+                    RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
                 ],
             }],
-            // Keep the virtualizable array deliberately stale: an after-call
-            // frame register contains the call result, while the array still
-            // contains the pre-call operand.  The frame stream is authoritative
-            // for the register's concrete shadow.
+            // Exercise both authorities in one bridge setup.  The first local's
+            // register is a dead null and the second local/cell's register is a
+            // stale non-null object; both vable entries are live.  Conversely,
+            // the stack entry in the vable image is stale while the frame
+            // register contains the after-call result.
             virtualizable_values: vec![
                 RebuiltValue::Box(0, Type::Ref),
                 RebuiltValue::Box(2, Type::Int),
@@ -13930,7 +13943,7 @@ mod tests {
                 RebuiltValue::Box(5, Type::Ref),
                 RebuiltValue::Box(6, Type::Ref),
                 RebuiltValue::Box(7, Type::Ref),
-                RebuiltValue::Box(7, Type::Ref),
+                RebuiltValue::Box(10, Type::Ref),
                 RebuiltValue::Box(7, Type::Ref),
             ],
             virtualref_values: Vec::new(),
@@ -13959,34 +13972,44 @@ mod tests {
             vec![
                 OpRef::input_arg_ref(7),
                 OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9)
+                OpRef::input_arg_ref(9),
             ]
         );
-        assert_eq!(sym.symbolic_local_types, vec![Type::Ref]);
-        assert_eq!(sym.symbolic_stack_types, vec![Type::Ref, Type::Ref]);
-        assert_eq!(sym.bridge_local_oprefs, Some(vec![OpRef::input_arg_ref(7)]));
+        assert_eq!(sym.symbolic_local_types, vec![Type::Ref, Type::Ref]);
+        assert_eq!(sym.symbolic_stack_types, vec![Type::Ref]);
+        assert_eq!(
+            sym.bridge_local_oprefs,
+            Some(vec![OpRef::input_arg_ref(7), OpRef::input_arg_ref(8)])
+        );
+        assert_eq!(
+            sym.concrete_locals,
+            vec![ConcreteValue::Int(41), ConcreteValue::Int(45)]
+        );
         let array_base = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        assert_eq!(
+            ctx.virtualizable_entry_at(array_base),
+            Some((
+                OpRef::input_arg_ref(7),
+                majit_ir::Value::Ref(majit_ir::GcRef(local0 as usize)),
+            )),
+        );
         assert_eq!(
             ctx.virtualizable_entry_at(array_base + 1),
             Some((
-                OpRef::input_arg_ref(8),
-                majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize)),
+                OpRef::input_arg_ref(10),
+                majit_ir::Value::Ref(majit_ir::GcRef(live_cell as usize)),
             )),
         );
         assert_eq!(
             ctx.virtualizable_entry_at(array_base + 2),
             Some((
                 OpRef::input_arg_ref(9),
-                majit_ir::Value::Ref(majit_ir::GcRef(stack1 as usize)),
+                majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize)),
             )),
         );
         assert_eq!(
-            ctx.box_value(OpRef::input_arg_ref(8)),
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
-        );
-        assert_eq!(
             ctx.box_value(OpRef::input_arg_ref(9)),
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(stack1 as usize))),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
         );
     }
 
