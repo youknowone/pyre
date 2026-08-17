@@ -1066,9 +1066,13 @@ pub(crate) fn declaring_struct_of(
     field: &str,
 ) -> Path {
     let mut current = struct_path.clone();
-    // Terminates: the chain cannot be cyclic without making the Rust types
-    // infinitely sized.
-    loop {
+    // A chain visits a struct at most once before it would repeat, so it cannot
+    // be longer than the number of declarations plus the struct it started at.
+    // The bound is what makes this terminate: a well-formed chain ends because
+    // the Rust types would otherwise be infinitely sized, but the map it walks
+    // is written by hand and `A::base => A` names a cycle the Rust types never
+    // see. Without the bound that spins the proc macro forever with no output.
+    for _ in 0..=inlined_prefix.len() {
         if declares(&current, field) {
             return current;
         }
@@ -1082,6 +1086,7 @@ pub(crate) fn declaring_struct_of(
         };
         current = base.clone();
     }
+    current
 }
 
 /// Every `"StructLast::field"` key the three field vocabularies declare.

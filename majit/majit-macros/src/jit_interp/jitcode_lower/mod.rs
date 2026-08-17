@@ -1407,8 +1407,15 @@ impl LowererConfig {
         let mut witnesses = TokenStream::new();
         let mut current = outer.clone();
         let mut base_offset = quote! { 0usize };
+        // Bounded for the same reason the declaring-struct walk is: the map is
+        // hand-written and can name a cycle the Rust types never see.
+        let mut remaining = self.inlined_prefix.len();
         while let Some((base_field, base)) = self.inlined_prefix.get(&canonical_path_segments(&current))
         {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
             let base_field = syn::Ident::new(base_field, proc_macro2::Span::call_site());
             // `lltype.py:296-305` admits an inlined substructure only at
             // `_names[0]`, and the offsets below assume it: a redirected access
@@ -1449,6 +1456,14 @@ impl LowererConfig {
 
     /// The fields `struct_path` declares, as `(field, is_ref, size, signed)`.
     ///
+    /// All three vocabularies, because all three take a slot: an array field's
+    /// access site registers its base pointer as a layout entry of its own, so
+    /// a base that declares one and is omitted here would leave the embedding
+    /// struct's own fields numbered a slot too low, which is the collision the
+    /// prefix exists to prevent. `declares_field` reads the same three, and the
+    /// two must agree — a field the walk redirects onto a base but does not
+    /// number after it is worse than one it never redirected.
+    ///
     /// Sorted by field name. The declarations live in hash maps, whose
     /// iteration order varies per process, and an unsorted walk would emit a
     /// different token order on every compile of the same source.
@@ -1465,6 +1480,7 @@ impl LowererConfig {
             .keys()
             .map(|key| (key, true))
             .chain(self.int_fields.keys().map(|key| (key, false)))
+            .chain(self.array_fields.keys().map(|key| (key, true)))
             .filter_map(|(key, is_ref)| {
                 key.strip_prefix(&prefix).map(|field| (field, is_ref))
             })
@@ -1476,12 +1492,17 @@ impl LowererConfig {
             .map(|(field, is_ref)| {
                 let key = format!("{prefix}{field}");
                 // The same widths the access sites register: a declared integer
-                // reports its own type's width, anything else the eight-byte
+                // reports its own type's width, an array field the pointer it
+                // reaches its buffer through, and anything else the eight-byte
                 // scalar an undeclared field defaults to.
                 let (size, signed) = match self.int_fields.get(&key) {
                     Some((ty, signed)) => {
                         (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
                     }
+                    None if self.array_fields.contains_key(&key) => (
+                        quote! { ::core::mem::size_of::<usize>() },
+                        quote! { false },
+                    ),
                     None => (quote! { ::core::mem::size_of::<i64>() }, quote! { true }),
                 };
                 (
