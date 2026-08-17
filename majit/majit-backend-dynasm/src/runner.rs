@@ -304,6 +304,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         subclass_range: Some(dynasm_subclass_range),
         typeid_subclass_range: Some(dynasm_typeid_subclass_range),
         typeid_is_object: Some(dynasm_typeid_is_object),
+        is_registered_type_id: Some(dynasm_is_registered_type_id),
         can_move: Some(dynasm_can_move),
         supports_guard_gc_type,
     });
@@ -470,6 +471,10 @@ fn supports_load_effective_address() -> bool {
 
 fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_dynasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
+}
+
+fn dynasm_is_registered_type_id(typeid: u32) -> bool {
+    with_dynasm_active_gc(|gc| (typeid as usize) < gc.type_count()).unwrap_or(false)
 }
 
 /// Whether compiled `New` ops route through the active GC allocator

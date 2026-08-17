@@ -743,6 +743,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         subclass_range: Some(wasm_subclass_range),
         typeid_subclass_range: Some(wasm_typeid_subclass_range),
         typeid_is_object: Some(wasm_typeid_is_object),
+        is_registered_type_id: Some(wasm_is_registered_type_id),
         can_move: None,
         supports_guard_gc_type,
     });
@@ -1062,6 +1063,10 @@ fn wasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
 
 fn wasm_typeid_is_object(typeid: u32) -> Option<bool> {
     with_wasm_active_gc(|gc| gc.typeid_is_object(typeid)).flatten()
+}
+
+fn wasm_is_registered_type_id(typeid: u32) -> bool {
+    with_wasm_active_gc(|gc| (typeid as usize) < gc.type_count()).unwrap_or(false)
 }
 
 /// Host-side nursery allocation trampoline. Published via

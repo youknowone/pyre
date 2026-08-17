@@ -1853,6 +1853,31 @@ impl BhDescr {
         resolved.unwrap_or(raw as u32)
     }
 
+    /// Resolve the GC type id without truncating an unresolved serialized
+    /// cache key into a fabricated allocation header.  Cache misses in the
+    /// `u32` range retain the pre-existing dense-tid convention; a larger miss
+    /// cannot be a dense tid and therefore has no sound header value.
+    pub fn resolved_gc_tid_checked(&self) -> Option<u32> {
+        if let BhDescr::Array { gc_type_id, .. } = self
+            && *gc_type_id != 0
+        {
+            return Some(*gc_type_id);
+        }
+        let raw = self.get_type_id();
+        let resolved = match self {
+            BhDescr::Size { .. } => majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_struct_tid(raw),
+            BhDescr::Array { .. } => majit_ir::descr::gc_cache()
+                .lock()
+                .expect("gc_cache poisoned")
+                .resolve_array_tid(raw),
+            _ => None,
+        };
+        resolved.or_else(|| u32::try_from(raw).ok())
+    }
+
     pub fn as_itemsize(&self) -> usize {
         match self {
             BhDescr::Array { itemsize, .. } => *itemsize,
@@ -2189,5 +2214,34 @@ mod tests {
         let bh = BhDescr::from_array_descr(&array);
         assert_eq!(bh.get_type_id(), 3);
         assert_eq!(bh.resolve_gc_tid(), 9);
+    }
+
+    #[test]
+    fn checked_gc_tid_rejects_unresolved_hash_range_identity() {
+        let bh = BhDescr::Size {
+            size: 16,
+            type_id: u64::MAX,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+
+        assert_eq!(bh.resolved_gc_tid_checked(), None);
+        assert_eq!(bh.resolve_gc_tid(), u32::MAX);
+    }
+
+    #[test]
+    fn checked_gc_tid_keeps_dense_tid_cache_miss_convention() {
+        let bh = BhDescr::Size {
+            size: 16,
+            type_id: 17,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+
+        assert_eq!(bh.resolved_gc_tid_checked(), Some(17));
     }
 }

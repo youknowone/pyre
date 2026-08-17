@@ -957,6 +957,26 @@ impl TraceCtx {
         )))
     }
 
+    /// Whether the allocation descriptor can produce a collector-readable
+    /// header through the same `BhDescr` conversion used by `bh_new`.
+    pub fn new_allocation_tid_is_sound(&self, descr: &DescrRef) -> bool {
+        let Some(bh_descr) = descr_to_bh_size_descr(descr) else {
+            return false;
+        };
+        if bh_descr.is_headerless() {
+            return true;
+        }
+        let Some(type_id) = bh_descr.resolved_gc_tid_checked() else {
+            return false;
+        };
+        // A typed allocation must carry an id present in the collector's type
+        // table. Otherwise the recorded New and its concrete execution both
+        // publish an object header that the collector can only trace as garbage.
+        type_id == 0
+            || !majit_gc::gc_allocator_installed()
+            || majit_gc::is_registered_type_id(type_id)
+    }
+
     /// `pyjitpl.py:624-629 execute_new[_with_vtable]` concrete execution.
     /// RPython executes the allocation before recording the matching trace op,
     /// so later residual calls and field operations observe a real pointer

@@ -1610,6 +1610,9 @@ pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 /// via the `get_actual_typeid` seam, avoiding a second indirection
 /// through `check_is_object` (which would re-resolve the typeid).
 pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
+/// Process-global callback that checks whether a type id indexes the active
+/// collector's registered type table.
+pub type IsRegisteredTypeIdFn = fn(typeid: u32) -> bool;
 pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
 /// Process-global callback that answers `rgc.can_move(gcref)`
@@ -1624,6 +1627,7 @@ global_hook!(static ACTIVE_GET_ACTUAL_TYPEID: GetActualTypeidFn);
 global_hook!(static ACTIVE_SUBCLASS_RANGE: SubclassRangeFn);
 global_hook!(static ACTIVE_TYPEID_SUBCLASS_RANGE: TypeidSubclassRangeFn);
 global_hook!(static ACTIVE_TYPEID_IS_OBJECT: TypeidIsObjectFn);
+global_hook!(static ACTIVE_IS_REGISTERED_TYPE_ID: IsRegisteredTypeIdFn);
 global_hook!(static ACTIVE_CAN_MOVE: CanMoveFn);
 static ACTIVE_SUPPORTS_GUARD_GC_TYPE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1641,6 +1645,7 @@ pub struct ActiveGcGuardHooks {
     pub subclass_range: Option<SubclassRangeFn>,
     pub typeid_subclass_range: Option<TypeidSubclassRangeFn>,
     pub typeid_is_object: Option<TypeidIsObjectFn>,
+    pub is_registered_type_id: Option<IsRegisteredTypeIdFn>,
     pub can_move: Option<CanMoveFn>,
     pub supports_guard_gc_type: bool,
 }
@@ -1659,6 +1664,7 @@ pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
     ACTIVE_SUBCLASS_RANGE.set(hooks.subclass_range);
     ACTIVE_TYPEID_SUBCLASS_RANGE.set(hooks.typeid_subclass_range);
     ACTIVE_TYPEID_IS_OBJECT.set(hooks.typeid_is_object);
+    ACTIVE_IS_REGISTERED_TYPE_ID.set(hooks.is_registered_type_id);
     ACTIVE_CAN_MOVE.set(hooks.can_move);
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.store(
         hooks.supports_guard_gc_type,
@@ -1676,6 +1682,7 @@ fn current_gc_guard_hooks() -> ActiveGcGuardHooks {
         subclass_range: ACTIVE_SUBCLASS_RANGE.get(),
         typeid_subclass_range: ACTIVE_TYPEID_SUBCLASS_RANGE.get(),
         typeid_is_object: ACTIVE_TYPEID_IS_OBJECT.get(),
+        is_registered_type_id: ACTIVE_IS_REGISTERED_TYPE_ID.get(),
         can_move: ACTIVE_CAN_MOVE.get(),
         supports_guard_gc_type: supports_guard_gc_type(),
     }
@@ -1872,6 +1879,15 @@ pub fn typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
 /// installed.
 pub fn typeid_is_object(typeid: u32) -> Option<bool> {
     ACTIVE_TYPEID_IS_OBJECT.get().and_then(|f| f(typeid))
+}
+
+/// Whether `typeid` is present in the active collector's registered type
+/// table. Returns `false` when no backend has installed the query; callers
+/// that deliberately support a no-GC fallback must check that state first.
+pub fn is_registered_type_id(typeid: u32) -> bool {
+    ACTIVE_IS_REGISTERED_TYPE_ID
+        .get()
+        .is_some_and(|f| f(typeid))
 }
 
 /// llmodel.py:63 `supports_guard_gc_type` shim. Mirrors the active

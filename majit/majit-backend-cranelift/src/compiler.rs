@@ -438,6 +438,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         subclass_range: Some(subclass_range_via_active_runtime),
         typeid_subclass_range: Some(typeid_subclass_range_via_active_runtime),
         typeid_is_object: Some(typeid_is_object_via_active_runtime),
+        is_registered_type_id: Some(is_registered_type_id_via_active_runtime),
         can_move: Some(can_move_via_active_runtime),
         supports_guard_gc_type,
     });
@@ -1765,6 +1766,10 @@ fn typeid_subclass_range_via_active_runtime(typeid: u32) -> Option<(i64, i64)> {
 /// TYPE_INFO entry" for the executor's `GuardIsObject` arm.
 fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
     with_cranelift_gc(|gc| gc.typeid_is_object(typeid)).flatten()
+}
+
+fn is_registered_type_id_via_active_runtime(typeid: u32) -> bool {
+    with_cranelift_gc(|gc| (typeid as usize) < gc.type_count()).unwrap_or(false)
 }
 
 /// `majit_gc::AllocNurseryTypedFn` installed by `set_gc_allocator`.
