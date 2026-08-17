@@ -171,8 +171,8 @@ pub(crate) struct TracePlan {
 }
 
 impl TracePlan {
-    /// Production lowering entry point.  Register allocation consumes only the
-    /// lowered operations; reverse liveness belongs to the diagnostic plan.
+    /// Production lowering entry point. Register allocation uses only lowered
+    /// operations, while reverse liveness is for diagnostics.
     pub(crate) fn lower_ops(ops: &[Op]) -> Vec<LirOp> {
         ops.iter().map(lower_op).collect()
     }
