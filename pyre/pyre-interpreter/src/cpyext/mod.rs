@@ -33,6 +33,7 @@ pub mod object;
 pub mod pyerrors;
 pub mod pymem;
 pub mod pyobject;
+pub mod pystate;
 pub mod sequence;
 pub mod setobject;
 pub mod sliceobject;
@@ -728,6 +729,7 @@ pub fn ensure_linked() {
     std::hint::black_box(&raw const pyobject::_Py_NotImplementedStruct);
     std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
     pyobject::ensure_linked();
+    pystate::ensure_linked();
     gc::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();

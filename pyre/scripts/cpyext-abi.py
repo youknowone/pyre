@@ -128,6 +128,7 @@ STRUCTS = {
     "CPyModuleDef": "PyModuleDef", "CPyTypeSpec": "PyType_Spec",
     "CPyMethodDef": "PyMethodDef", "CPyMemberDef": "PyMemberDef",
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
+    "CPyThreadState": "PyThreadState",
 }
 
 

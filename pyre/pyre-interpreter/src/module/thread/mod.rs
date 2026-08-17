@@ -384,14 +384,94 @@ pub extern "C" fn PyThreadState_SetAsyncExc(ident: usize, w_type: PyObjectRef) -
     1
 }
 
-/// Free-threaded compatibility shims: entering Python does not acquire a GIL.
-#[unsafe(no_mangle)]
-pub extern "C" fn PyGILState_Ensure() -> i32 {
-    0
+// ── the GIL, as foreign code hands it back and forth ──────────────────────
+//
+// A thread holds the GIL for as long as it runs pyre code (`rgil`), so foreign
+// code needs both directions: a thread of its own has to take the GIL before it
+// may run any of pyre, and a thread of pyre's has to give it up before blocking
+// or nothing else would run for the duration.
+//
+// Both are the guards the runtime already uses at that boundary, held in a
+// stack because the two spellings nest -- a callback delivered from a worker
+// thread routinely runs inside the block its own caller opened.  A guard binds
+// the GIL back to the thread that gave it up, so neither stack may cross
+// threads and neither is `Send`.
+
+thread_local! {
+    /// Live [`enter_external_callback_from_foreign_thread`] guards, innermost
+    /// last: one per `PyGILState_Ensure` awaiting its `PyGILState_Release`.
+    static GIL_STATES: std::cell::RefCell<Vec<majit_gc::gc_sync::CallbackGuard>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// One entry per `PyEval_SaveThread` awaiting its `PyEval_RestoreThread`,
+    /// innermost last, and `None` where there was nothing left to give up.
+    ///
+    /// `before_external_block` is the boundary of one external call and does
+    /// not nest: upstream reaches it from `releasegil=True`, which cannot
+    /// contain another, and entering it twice trips a collector invariant.
+    /// Releasing what is already released is not something an extension may do
+    /// -- CPython reads the thread state it is detaching without checking, and
+    /// dies -- so the `None` arm is not parity but a refusal to turn that into
+    /// an abort inside the collector, where the report would name neither the
+    /// extension nor what it did.
+    static SAVED_THREADS: std::cell::RefCell<Vec<Option<majit_gc::gc_sync::BlockingGuard>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `pystate.py:390 PyGILState_Ensure`, whose wrapper carries `gil="acquire"`.
+///
+/// Takes the GIL, registering the thread with the collector when foreign code
+/// owns it and this is its first entry.  Answers which state the thread was in,
+/// so a nested call is the no-op its `PyGILState_Release` then matches.
 #[unsafe(no_mangle)]
-pub extern "C" fn PyGILState_Release(_state: i32) {}
+pub extern "C" fn PyGILState_Ensure() -> i32 {
+    let held = majit_gc::rgil::am_i_holding_the_gil();
+    let guard = enter_external_callback_from_foreign_thread();
+    GIL_STATES.with(|states| states.borrow_mut().push(guard));
+    // `PyGILState_LOCKED` when the GIL was already this thread's,
+    // `PyGILState_UNLOCKED` when acquiring it is what the release undoes.
+    if held { 0 } else { 1 }
+}
+
+/// `pystate.py:409 PyGILState_Release`.
+///
+/// Gives back whatever the matching [`PyGILState_Ensure`] took.  The state the
+/// caller passes is what upstream records for its own bookkeeping; here the
+/// guard already knows whether it took the GIL, so an unbalanced release is
+/// what the empty stack reports rather than something to infer from it.
+#[unsafe(no_mangle)]
+pub extern "C" fn PyGILState_Release(_state: i32) {
+    let guard = GIL_STATES.with(|states| states.borrow_mut().pop());
+    debug_assert!(
+        guard.is_some(),
+        "PyGILState_Release without a matching PyGILState_Ensure"
+    );
+    drop(guard);
+}
+
+/// Whether this thread holds the GIL — `pystate.py:418 PyGILState_Check`.
+pub fn gilstate_check() -> bool {
+    majit_gc::rgil::am_i_holding_the_gil()
+}
+
+/// `pystate.py:29 PyEval_SaveThread`, whose wrapper carries `gil="release"`.
+///
+/// Drops the GIL and leaves the collector's RUNNING census for as long as the
+/// caller stays outside pyre.  A thread already outside has nothing to give up,
+/// so the nested spelling is what it records rather than a second departure.
+pub fn save_thread() {
+    let guard = majit_gc::rgil::am_i_holding_the_gil().then(before_external_block);
+    SAVED_THREADS.with(|saved| saved.borrow_mut().push(guard));
+}
+
+/// `pystate.py:42 PyEval_RestoreThread`: retake what [`save_thread`] gave up.
+pub fn restore_thread() {
+    let entry = SAVED_THREADS.with(|saved| saved.borrow_mut().pop());
+    debug_assert!(
+        entry.is_some(),
+        "PyEval_RestoreThread without a matching PyEval_SaveThread"
+    );
+    drop(entry);
+}
 
 /// `pypy/module/sys/threadmappings.py:_current_frames`.
 pub(crate) fn current_frames() -> PyObjectRef {

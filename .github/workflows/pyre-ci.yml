@@ -357,7 +357,7 @@ jobs:
       # `cpyext` rides along here rather than in its own step. It is off by
       # default (see pyre-interpreter's feature table), so its tests — pyrex's
       # cpyext_smoke, cpyext_methods, cpyext_types, cpyext_unicode,
-      # cpyext_cycles and cpyext_dict_subclass, which are
+      # cpyext_cycles, cpyext_dict_subclass and cpyext_pystate, which are
       # backend-independent and compile out off
       # macOS/Linux — need SOME leg that
       # enables it, and this leg already recompiles the pyrex/pyre-interpreter

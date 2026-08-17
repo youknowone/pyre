@@ -25,6 +25,9 @@
 #include "pytypedefs.h"
 #include "object.h"
 #include "typeslots.h"
+/* Names `PyThreadState` and `PyGILState_STATE`, which entry points below take
+   and answer with. */
+#include "pystate.h"
 
 /* Every exported entry point. It sits here because the headers above
    name the types it uses, and the ones below define `static inline`

@@ -326,6 +326,19 @@ PyAPI_FUNC(void) Py_DecRef(PyObject *);
 PyAPI_FUNC(void) Py_IncRef(PyObject *);
 PyAPI_FUNC(Py_ssize_t) _PyPyre_RefCount(PyObject *);
 
+/* cpyext/pystate.rs */
+PyAPI_FUNC(void) PyEval_AcquireThread(PyThreadState *);
+PyAPI_FUNC(void) PyEval_InitThreads(void);
+PyAPI_FUNC(void) PyEval_ReleaseThread(PyThreadState *);
+PyAPI_FUNC(void) PyEval_RestoreThread(PyThreadState *);
+PyAPI_FUNC(PyThreadState *) PyEval_SaveThread(void);
+PyAPI_FUNC(int) PyEval_ThreadsInitialized(void);
+PyAPI_FUNC(int) PyGILState_Check(void);
+PyAPI_FUNC(PyThreadState *) PyGILState_GetThisThreadState(void);
+PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
+PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *);
+PyAPI_FUNC(PyThreadState *) _PyThreadState_UncheckedGet(void);
+
 /* cpyext/sequence.rs */
 PyAPI_FUNC(int) PySequence_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PySequence_Concat(PyObject *, PyObject *);

@@ -97,8 +97,9 @@ reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
 The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
 single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
-the header below. `pyrex/tests/cpyext_dict_subclass.rs` takes its expectations
-from CPython 3.14.6 running the same script against the same fixture.
+the header below. `pyrex/tests/cpyext_dict_subclass.rs` and
+`pyrex/tests/cpyext_pystate.rs` take their expectations from CPython 3.14.6
+running the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -146,6 +147,20 @@ from CPython 3.14.6 running the same script against the same fixture.
 - the object protocol (`cpyext/object.rs`) and the primitive constructors and
   accessors for `int`, `bool`, `float`, `str`, `bytes`, `tuple`, `list` and
   `dict`;
+- the GIL an extension hands back and forth (`cpyext/pystate.rs`):
+  `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS` and the
+  `Py_BLOCK_THREADS` pair, `PyEval_SaveThread` / `PyEval_RestoreThread` /
+  `PyEval_AcquireThread` / `PyEval_ReleaseThread`, `PyGILState_Ensure` /
+  `PyGILState_Release` / `PyGILState_Check` / `PyGILState_GetThisThreadState`,
+  and `PyThreadState_Get` / `PyThreadState_Swap`. These are the runtime's own
+  boundary guards: a thread holds the GIL for as long as it runs pyre code, so
+  giving it up is `before_external_block` and taking it is
+  `enter_external_callback_from_foreign_thread`, which registers a thread the
+  extension owns. `PyThreadState` is opaque, one per thread.
+  `PyGILState_Ensure` and `PyGILState_Release` are implemented in
+  `module/thread` rather than here, and declared in `pystate.h` rather than the
+  generated header, because a build without this layer exports them too — for
+  cffi's embedding header;
 - a `dict` subclass wherever `PyDict_Check` is the gate, which is every
   `PyDict_*` entry point and the keyword mapping of `PyObject_Call`. Such an
   instance is not a dict in pyre but an object holding one in a reserved layout
