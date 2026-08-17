@@ -30,7 +30,7 @@ type Mode = u32;
 /// The host's definition of a `<sys/stat.h>` macro, or the value `_stat.c`
 /// compiles in when the platform does not define it.
 macro_rules! libc_const {
-    (#[cfg($cfg:meta)] $name:ident, $fallback:expr) => {{
+    ($cfg:meta, $name:ident, $fallback:expr) => {{
         #[cfg($cfg)]
         {
             libc::$name
@@ -44,14 +44,14 @@ macro_rules! libc_const {
 
 // S_IFXXX constants (file types).  Only the names are defined by POSIX, not
 // their values, but every platform pyre builds for agrees on the common ones.
-const S_IFDIR: Mode = libc_const!(#[cfg(unix)] S_IFDIR, 0o040000);
-const S_IFCHR: Mode = libc_const!(#[cfg(unix)] S_IFCHR, 0o020000);
-const S_IFBLK: Mode = libc_const!(#[cfg(unix)] S_IFBLK, 0o060000);
-const S_IFREG: Mode = libc_const!(#[cfg(unix)] S_IFREG, 0o100000);
-const S_IFIFO: Mode = libc_const!(#[cfg(unix)] S_IFIFO, 0o010000);
-const S_IFLNK: Mode = libc_const!(#[cfg(unix)] S_IFLNK, 0o120000);
-const S_IFSOCK: Mode = libc_const!(#[cfg(unix)] S_IFSOCK, 0o140000);
-const S_IFMT: Mode = libc_const!(#[cfg(unix)] S_IFMT, 0o170000);
+const S_IFDIR: Mode = libc_const!(unix, S_IFDIR, 0o040000);
+const S_IFCHR: Mode = libc_const!(unix, S_IFCHR, 0o020000);
+const S_IFBLK: Mode = libc_const!(unix, S_IFBLK, 0o060000);
+const S_IFREG: Mode = libc_const!(unix, S_IFREG, 0o100000);
+const S_IFIFO: Mode = libc_const!(unix, S_IFIFO, 0o010000);
+const S_IFLNK: Mode = libc_const!(unix, S_IFLNK, 0o120000);
+const S_IFSOCK: Mode = libc_const!(unix, S_IFSOCK, 0o140000);
+const S_IFMT: Mode = libc_const!(unix, S_IFMT, 0o170000);
 
 /// A file type no platform pyre builds for names.  `_stat.c` defines both the
 /// constant and its `S_IS*` macro as a literal `0`, which [`is_format`]
@@ -68,44 +68,44 @@ const S_IFWHT: Mode = if cfg!(target_vendor = "apple") {
 };
 
 // S_I* file permissions.  The permission bit values are defined by POSIX.
-const S_ISUID: Mode = libc_const!(#[cfg(unix)] S_ISUID, 0o4000);
-const S_ISGID: Mode = libc_const!(#[cfg(unix)] S_ISGID, 0o2000);
+const S_ISUID: Mode = libc_const!(unix, S_ISUID, 0o4000);
+const S_ISGID: Mode = libc_const!(unix, S_ISGID, 0o2000);
 const S_ENFMT: Mode = S_ISGID;
-const S_ISVTX: Mode = libc_const!(#[cfg(unix)] S_ISVTX, 0o1000);
-const S_IRWXU: Mode = libc_const!(#[cfg(unix)] S_IRWXU, 0o0700);
-const S_IRUSR: Mode = libc_const!(#[cfg(unix)] S_IRUSR, 0o0400);
-const S_IWUSR: Mode = libc_const!(#[cfg(unix)] S_IWUSR, 0o0200);
-const S_IXUSR: Mode = libc_const!(#[cfg(unix)] S_IXUSR, 0o0100);
-const S_IRWXG: Mode = libc_const!(#[cfg(unix)] S_IRWXG, 0o0070);
-const S_IRGRP: Mode = libc_const!(#[cfg(unix)] S_IRGRP, 0o0040);
-const S_IWGRP: Mode = libc_const!(#[cfg(unix)] S_IWGRP, 0o0020);
-const S_IXGRP: Mode = libc_const!(#[cfg(unix)] S_IXGRP, 0o0010);
-const S_IRWXO: Mode = libc_const!(#[cfg(unix)] S_IRWXO, 0o0007);
-const S_IROTH: Mode = libc_const!(#[cfg(unix)] S_IROTH, 0o0004);
-const S_IWOTH: Mode = libc_const!(#[cfg(unix)] S_IWOTH, 0o0002);
-const S_IXOTH: Mode = libc_const!(#[cfg(unix)] S_IXOTH, 0o0001);
+const S_ISVTX: Mode = libc_const!(unix, S_ISVTX, 0o1000);
+const S_IRWXU: Mode = libc_const!(unix, S_IRWXU, 0o0700);
+const S_IRUSR: Mode = libc_const!(unix, S_IRUSR, 0o0400);
+const S_IWUSR: Mode = libc_const!(unix, S_IWUSR, 0o0200);
+const S_IXUSR: Mode = libc_const!(unix, S_IXUSR, 0o0100);
+const S_IRWXG: Mode = libc_const!(unix, S_IRWXG, 0o0070);
+const S_IRGRP: Mode = libc_const!(unix, S_IRGRP, 0o0040);
+const S_IWGRP: Mode = libc_const!(unix, S_IWGRP, 0o0020);
+const S_IXGRP: Mode = libc_const!(unix, S_IXGRP, 0o0010);
+const S_IRWXO: Mode = libc_const!(unix, S_IRWXO, 0o0007);
+const S_IROTH: Mode = libc_const!(unix, S_IROTH, 0o0004);
+const S_IWOTH: Mode = libc_const!(unix, S_IWOTH, 0o0002);
+const S_IXOTH: Mode = libc_const!(unix, S_IXOTH, 0o0001);
 
 // The Unix V7 synonyms.  `libc` carries them for the BSD-derived targets
 // only — glibc keeps them behind `__USE_MISC` — so Linux takes the same
 // default `_stat.c` compiles in, which is the value glibc defines anyway.
-const S_IREAD: Mode = libc_const!(#[cfg(target_vendor = "apple")] S_IREAD, 0o0400);
-const S_IWRITE: Mode = libc_const!(#[cfg(target_vendor = "apple")] S_IWRITE, 0o0200);
-const S_IEXEC: Mode = libc_const!(#[cfg(target_vendor = "apple")] S_IEXEC, 0o0100);
+const S_IREAD: Mode = libc_const!(target_vendor = "apple", S_IREAD, 0o0400);
+const S_IWRITE: Mode = libc_const!(target_vendor = "apple", S_IWRITE, 0o0200);
+const S_IEXEC: Mode = libc_const!(target_vendor = "apple", S_IEXEC, 0o0100);
 
 // Names for file flags.  These are BSD `chflags` bits, so only the Apple
 // targets have header definitions; everywhere else `_stat.c`'s defaults are
 // all there is.
-const UF_SETTABLE: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_SETTABLE, 0x0000ffff);
-const UF_NODUMP: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_NODUMP, 0x00000001);
-const UF_IMMUTABLE: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_IMMUTABLE, 0x00000002);
-const UF_APPEND: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_APPEND, 0x00000004);
-const UF_OPAQUE: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_OPAQUE, 0x00000008);
-const UF_COMPRESSED: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_COMPRESSED, 0x00000020);
-const UF_TRACKED: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_TRACKED, 0x00000040);
-const UF_HIDDEN: u32 = libc_const!(#[cfg(target_vendor = "apple")] UF_HIDDEN, 0x00008000);
-const SF_ARCHIVED: u32 = libc_const!(#[cfg(target_vendor = "apple")] SF_ARCHIVED, 0x00010000);
-const SF_IMMUTABLE: u32 = libc_const!(#[cfg(target_vendor = "apple")] SF_IMMUTABLE, 0x00020000);
-const SF_APPEND: u32 = libc_const!(#[cfg(target_vendor = "apple")] SF_APPEND, 0x00040000);
+const UF_SETTABLE: u32 = libc_const!(target_vendor = "apple", UF_SETTABLE, 0x0000ffff);
+const UF_NODUMP: u32 = libc_const!(target_vendor = "apple", UF_NODUMP, 0x00000001);
+const UF_IMMUTABLE: u32 = libc_const!(target_vendor = "apple", UF_IMMUTABLE, 0x00000002);
+const UF_APPEND: u32 = libc_const!(target_vendor = "apple", UF_APPEND, 0x00000004);
+const UF_OPAQUE: u32 = libc_const!(target_vendor = "apple", UF_OPAQUE, 0x00000008);
+const UF_COMPRESSED: u32 = libc_const!(target_vendor = "apple", UF_COMPRESSED, 0x00000020);
+const UF_TRACKED: u32 = libc_const!(target_vendor = "apple", UF_TRACKED, 0x00000040);
+const UF_HIDDEN: u32 = libc_const!(target_vendor = "apple", UF_HIDDEN, 0x00008000);
+const SF_ARCHIVED: u32 = libc_const!(target_vendor = "apple", SF_ARCHIVED, 0x00010000);
+const SF_IMMUTABLE: u32 = libc_const!(target_vendor = "apple", SF_IMMUTABLE, 0x00020000);
+const SF_APPEND: u32 = libc_const!(target_vendor = "apple", SF_APPEND, 0x00040000);
 
 // Flags `libc` does not carry for any target pyre builds for.
 const UF_NOUNLINK: u32 = 0x00000010;
@@ -117,7 +117,7 @@ const SF_DATALESS: u32 = 0x40000000;
 
 /// The Apple headers reserve the top two flag bits for the synthetic flags,
 /// so the super-user mask stops short of them.
-const SF_SETTABLE: u32 = libc_const!(#[cfg(target_vendor = "apple")] SF_SETTABLE, 0xffff0000);
+const SF_SETTABLE: u32 = libc_const!(target_vendor = "apple", SF_SETTABLE, 0xffff0000);
 
 #[cfg(target_vendor = "apple")]
 const SF_SUPPORTED: u32 = 0x009f0000;
@@ -135,17 +135,38 @@ use rustpython_host_env::nt as host_nt;
 
 #[cfg(all(windows, feature = "host_env"))]
 const FILE_ATTRIBUTES: [(&str, i64); 17] = [
-    ("FILE_ATTRIBUTE_ARCHIVE", host_nt::FILE_ATTRIBUTE_ARCHIVE as i64),
-    ("FILE_ATTRIBUTE_COMPRESSED", host_nt::FILE_ATTRIBUTE_COMPRESSED as i64),
-    ("FILE_ATTRIBUTE_DEVICE", host_nt::FILE_ATTRIBUTE_DEVICE as i64),
-    ("FILE_ATTRIBUTE_DIRECTORY", host_nt::FILE_ATTRIBUTE_DIRECTORY as i64),
-    ("FILE_ATTRIBUTE_ENCRYPTED", host_nt::FILE_ATTRIBUTE_ENCRYPTED as i64),
-    ("FILE_ATTRIBUTE_HIDDEN", host_nt::FILE_ATTRIBUTE_HIDDEN as i64),
+    (
+        "FILE_ATTRIBUTE_ARCHIVE",
+        host_nt::FILE_ATTRIBUTE_ARCHIVE as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_COMPRESSED",
+        host_nt::FILE_ATTRIBUTE_COMPRESSED as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_DEVICE",
+        host_nt::FILE_ATTRIBUTE_DEVICE as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_DIRECTORY",
+        host_nt::FILE_ATTRIBUTE_DIRECTORY as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_ENCRYPTED",
+        host_nt::FILE_ATTRIBUTE_ENCRYPTED as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_HIDDEN",
+        host_nt::FILE_ATTRIBUTE_HIDDEN as i64,
+    ),
     (
         "FILE_ATTRIBUTE_INTEGRITY_STREAM",
         host_nt::FILE_ATTRIBUTE_INTEGRITY_STREAM as i64,
     ),
-    ("FILE_ATTRIBUTE_NORMAL", host_nt::FILE_ATTRIBUTE_NORMAL as i64),
+    (
+        "FILE_ATTRIBUTE_NORMAL",
+        host_nt::FILE_ATTRIBUTE_NORMAL as i64,
+    ),
     (
         "FILE_ATTRIBUTE_NOT_CONTENT_INDEXED",
         host_nt::FILE_ATTRIBUTE_NOT_CONTENT_INDEXED as i64,
@@ -154,8 +175,14 @@ const FILE_ATTRIBUTES: [(&str, i64); 17] = [
         "FILE_ATTRIBUTE_NO_SCRUB_DATA",
         host_nt::FILE_ATTRIBUTE_NO_SCRUB_DATA as i64,
     ),
-    ("FILE_ATTRIBUTE_OFFLINE", host_nt::FILE_ATTRIBUTE_OFFLINE as i64),
-    ("FILE_ATTRIBUTE_READONLY", host_nt::FILE_ATTRIBUTE_READONLY as i64),
+    (
+        "FILE_ATTRIBUTE_OFFLINE",
+        host_nt::FILE_ATTRIBUTE_OFFLINE as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_READONLY",
+        host_nt::FILE_ATTRIBUTE_READONLY as i64,
+    ),
     (
         "FILE_ATTRIBUTE_REPARSE_POINT",
         host_nt::FILE_ATTRIBUTE_REPARSE_POINT as i64,
@@ -164,9 +191,18 @@ const FILE_ATTRIBUTES: [(&str, i64); 17] = [
         "FILE_ATTRIBUTE_SPARSE_FILE",
         host_nt::FILE_ATTRIBUTE_SPARSE_FILE as i64,
     ),
-    ("FILE_ATTRIBUTE_SYSTEM", host_nt::FILE_ATTRIBUTE_SYSTEM as i64),
-    ("FILE_ATTRIBUTE_TEMPORARY", host_nt::FILE_ATTRIBUTE_TEMPORARY as i64),
-    ("FILE_ATTRIBUTE_VIRTUAL", host_nt::FILE_ATTRIBUTE_VIRTUAL as i64),
+    (
+        "FILE_ATTRIBUTE_SYSTEM",
+        host_nt::FILE_ATTRIBUTE_SYSTEM as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_TEMPORARY",
+        host_nt::FILE_ATTRIBUTE_TEMPORARY as i64,
+    ),
+    (
+        "FILE_ATTRIBUTE_VIRTUAL",
+        host_nt::FILE_ATTRIBUTE_VIRTUAL as i64,
+    ),
 ];
 
 /// Reparse tags: `IO_REPARSE_TAG_APPEXECLINK` is one `_stat.c` defines itself
@@ -216,15 +252,19 @@ fn is_format(
 fn s_imode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     /* From Python's stat.py */
     const S_IMODE: Mode = 0o7777;
-    Ok(w_int_new(i64::from(argument_mode(args, "S_IMODE")? & S_IMODE)))
+    Ok(w_int_new(i64::from(
+        argument_mode(args, "S_IMODE")? & S_IMODE,
+    )))
 }
 
 fn s_ifmt(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_int_new(i64::from(argument_mode(args, "S_IFMT")? & S_IFMT)))
+    Ok(w_int_new(i64::from(
+        argument_mode(args, "S_IFMT")? & S_IFMT,
+    )))
 }
 
 /* file type chars according to
-   http://en.wikibooks.org/wiki/C_Programming/POSIX_Reference/sys/stat.h */
+http://en.wikibooks.org/wiki/C_Programming/POSIX_Reference/sys/stat.h */
 fn filetype(mode: Mode) -> u8 {
     let format = mode & S_IFMT;
     let is = |candidate: Mode| candidate != 0 && format == candidate;

@@ -96,12 +96,7 @@ impl Heap {
     /// Read two elements and ask `order` which of them comes first. The left
     /// one is rooted because reading the right one can box, and boxing can
     /// collect.
-    fn compare_items(
-        self,
-        left: i64,
-        right: i64,
-        order: Order,
-    ) -> Result<bool, crate::PyError> {
+    fn compare_items(self, left: i64, right: i64, order: Order) -> Result<bool, crate::PyError> {
         let _roots = push_roots();
         let left_item = pin(self.item(left)?);
         let right_item = self.item(right)?;

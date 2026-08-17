@@ -50,7 +50,9 @@ fn cannot_serialize(name: &str) -> crate::PyError {
 impl W_BZ2Compressor {
     fn compressor(&self) -> Result<&Mutex<backend::Compressor>, crate::PyError> {
         if self.backend.is_null() {
-            return Err(crate::PyError::value_error("Compressor was not initialized"));
+            return Err(crate::PyError::value_error(
+                "Compressor was not initialized",
+            ));
         }
         Ok(unsafe { &*self.backend })
     }
