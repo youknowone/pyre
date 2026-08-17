@@ -49,19 +49,35 @@ struct LocaleConvData {
 /// grouping lists already carry the trailing 0 that `_w_copy_grouping`
 /// appends to a non-empty grouping (`interp_locale.py:36-40`).
 fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
-    let d = pyre_object::w_dict_new();
-    let put_str = |k: &str, b: &[u8]| unsafe {
-        pyre_object::w_dict_setitem_str(d, k, crate::typedef::charp2uni(b));
+    // A `dict` header moves, and each of the eighteen insertions below
+    // allocates: the value, the key string `w_dict_setitem_str` builds, and
+    // the dict's own storage when it grows.  A minor collection anywhere in
+    // that run relocates the dict, so the word is read back out of a root slot
+    // for every insertion and for the return.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(pyre_object::w_dict_new());
+    // The value arrives already built.  Call arguments evaluate left to right,
+    // so reading the dict slot inline with an allocating value expression
+    // would read the slot first and hand over a pre-move word.
+    let put = |k: &str, value: pyre_object::PyObjectRef| {
+        // `grouping` is a `list`, which moves as well, and the key string is
+        // allocated after this value is handed over.
+        let value_root = pyre_object::gc_roots::push_roots();
+        let value_slot = value_root.base();
+        value_root.pin_root(value);
+        // SAFETY: the slot holds the `W_DictObject` pinned above.
+        unsafe {
+            pyre_object::w_dict_setitem_str(roots.get(dict_slot), k, value_root.get(value_slot));
+        }
     };
-    let put_int = |k: &str, v: i64| unsafe {
-        pyre_object::w_dict_setitem_str(d, k, pyre_object::w_int_new(v));
-    };
-    let put_grouping = |k: &str, v: &[i64]| unsafe {
-        pyre_object::w_dict_setitem_str(
-            d,
+    let put_str = |k: &str, b: &[u8]| put(k, crate::typedef::charp2uni(b));
+    let put_int = |k: &str, v: i64| put(k, pyre_object::w_int_new(v));
+    let put_grouping = |k: &str, v: &[i64]| {
+        put(
             k,
             pyre_object::w_list_new(v.iter().map(|&x| pyre_object::w_int_new(x)).collect()),
-        );
+        )
     };
     put_str("decimal_point", &c.decimal_point);
     put_str("thousands_sep", &c.thousands_sep);
@@ -81,7 +97,7 @@ fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
     put_int("n_sep_by_space", c.n_sep_by_space);
     put_int("p_sign_posn", c.p_sign_posn);
     put_int("n_sign_posn", c.n_sign_posn);
-    d
+    roots.get(dict_slot)
 }
 
 /// POSIX "C" locale `localeconv` defaults for builds without libc; the
