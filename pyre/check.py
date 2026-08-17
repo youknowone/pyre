@@ -852,6 +852,20 @@ def _dump_output_mismatch(actual, expected, limit=80):
     print("────────────────────")
 
 
+def _first_stderr_line(stderr):
+    """Return `"  <first non-empty stderr line>"`, or `""` when there is none.
+
+    A crash reason is otherwise just an exit code, which on a binary that dies
+    before it writes any stdout says nothing about why. The empty answer is
+    itself informative: it names a process that produced no diagnostic at all.
+    """
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line:
+            return f"  {line[:160]}"
+    return ""
+
+
 def _jit_panic_reason(stderr):
     """Return a failure reason if *stderr* shows a JIT-level Rust panic or a
     nonzero internal_compile_panics stat, else None.
@@ -2703,8 +2717,12 @@ class Check:
                 self._record(backend, False, name, f"timeout (>{effective_timeout}s)")
                 print(f"{red('TIMEOUT')}  >{effective_timeout}s")
             else:
-                self._record(backend, False, name, f"crash (exit {code})")
-                print(f"{red('CRASH')} (exit {code})")
+                # A crash whose stderr never reaches the log is undiagnosable
+                # from a CI run, and a binary that dies before it can print
+                # anything is exactly the case worth naming.
+                detail = _first_stderr_line(stderr)
+                self._record(backend, False, name, f"crash (exit {code}){detail}")
+                print(f"{red('CRASH')} (exit {code}){detail}")
             self._append_comparison(backend, name, t_cpython, t_pypy, "FAIL")
             return
 
