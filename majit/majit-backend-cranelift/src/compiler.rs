@@ -3459,6 +3459,50 @@ fn emit_call_footer_shadowstack(
         .store(MemFlagsData::trusted(), new_rst, rst_addr_val, 0);
 }
 
+/// Marks a `dispatch_key` as reaching the entry from compiled code rather than
+/// from the host `execute_token` wrapper.
+///
+/// `assembler.py:987 patch_jump_for_descr` rewrites a failing guard's branch to
+/// land inside the bridge, and `:2456-2462 closing_jump` emits a raw
+/// `JMP imm(target._ll_loop_code)` at a JUMP.  Neither site probes the stack and
+/// neither touches the shadow stack: no machine frame and no root-stack entry
+/// come into existence, because the target keeps running on the JITFRAME the
+/// source was already registered with.  Cranelift cannot branch into the middle
+/// of another function, so both transfers go through the target's function
+/// entry, and the entry prologue has to be told which kind of entry it is.  The
+/// low bits of `dispatch_key` carry the LABEL selector (0 = preamble,
+/// `label_block_id + 1` = re-enter at that LABEL); this bit carries the answer.
+///
+/// The host paths (`run_compiled_code`, `host_reentry_dispatch_key`) never set
+/// it, so they keep the full `_call_header_with_stack_check` prologue.
+const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
+
+/// `x86/assembler.py:182-184 _build_frame_realloc_slowpath` parity:
+/// `_load_shadowstack_top_in_ebx(mc, gcrootmap)` followed by
+/// `MOV_mr((ebx.value, -WORD), eax.value)`.
+///
+/// After `_frame_realloc_slowpath` the shadow-stack entry the caller pushed
+/// still names the old JITFRAME, so it is retargeted at the new one in place.
+/// An in-code entry inherits the caller's entry instead of pushing its own, so
+/// this is the only place its frame word can be refreshed.
+fn emit_shadowstack_retarget(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: CValue,
+) {
+    let word = std::mem::size_of::<usize>() as i32;
+    let rst_addr_val = builder.ins().iconst(
+        ptr_type,
+        majit_gc::shadow_stack::get_root_stack_top_addr() as i64,
+    );
+    let rst = builder
+        .ins()
+        .load(ptr_type, MemFlagsData::trusted(), rst_addr_val, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), jf_ptr, rst, -word);
+}
+
 /// x86/assembler.py:1630-1641 `genop_discard_check_memory_error` /
 /// aarch64/assembler.rs `emit_propagate_memory_error_if_null`: branch to the
 /// `propagate_exception_descr` exit when `ptr_val` is NULL.  The metainterp
@@ -6715,17 +6759,20 @@ fn emit_attached_bridge_dispatch(
     // code_ptr cell is unusable here — its call conv is not tail-callable.
     // Dynasm patches the guard branch into a jump to the bridge, so the
     // parent trace no longer contributes a separate shadowstack entry while
-    // the bridge runs.  Pop before the transfer; the bridge prologue pushes
-    // the same jitframe for its own execution and pops it on exit.
-    emit_call_footer_shadowstack(builder, ptr_type);
+    // the bridge runs — and neither does the bridge, which continues on the
+    // same jitframe the parent registered.  `IN_CODE_ENTRY_KEY_FLAG` tells the
+    // bridge's entry to inherit that entry rather than push a second one, so
+    // this side pops nothing.  The deadframe arm below keeps its own pop.
     let mut bridge_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     bridge_sig.params.push(AbiParam::new(ptr_type));
     bridge_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
     bridge_sig.returns.push(AbiParam::new(ptr_type));
     let bridge_sig_ref = builder.import_signature(bridge_sig);
     // A bridge is linear (no LABELs): it always enters at its start, so the
-    // dispatch_key is 0.
-    let bridge_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
+    // LABEL selector is 0.
+    let bridge_dispatch_key = builder
+        .ins()
+        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
     builder
         .ins()
         .return_call_indirect(bridge_sig_ref, bridge_body, &[jf_ptr, bridge_dispatch_key]);
@@ -6885,6 +6932,13 @@ fn emit_attached_loop_dispatch(
             .ins()
             .call_indirect(realloc_sig_ref, realloc_addr, &[jf_ptr, target_depth]);
     let new_jf = builder.inst_results(realloc_call)[0];
+    // x86/assembler.py:182-184 `_build_frame_realloc_slowpath`:
+    //   self._load_shadowstack_top_in_ebx(mc, gcrootmap)
+    //   mc.MOV_mr((ebx.value, -WORD), eax.value)
+    // The transfer below keeps this chain's single root-stack entry standing
+    // (the target enters in-code and pushes nothing), so the entry has to be
+    // pointed at the frame this realloc just forwarded to.
+    emit_shadowstack_retarget(builder, ptr_type, new_jf);
     builder.ins().jump(
         take_block,
         &[
@@ -6905,7 +6959,12 @@ fn emit_attached_loop_dispatch(
     // dispatch stranded a return frame.  With the bridge dispatch itself
     // now a tail-call, this loop dispatch is balanced on both x86_64 and
     // aarch64 (tail_sp_leak.rs: zero drift over 5M tail-calls).
-    emit_call_footer_shadowstack(builder, ptr_type);
+    //
+    // The shadow stack is left alone: `closing_jump` transfers to the target on
+    // the source's own JITFRAME, and `IN_CODE_ENTRY_KEY_FLAG` makes the target's
+    // entry inherit the source's root-stack entry instead of pushing a second
+    // one.  The `miss_block` fall-through below reaches the deadframe exit,
+    // which keeps its own `_call_footer_shadowstack`.
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
     // frame with the callee's — the cranelift analogue of
@@ -6923,7 +6982,10 @@ fn emit_attached_loop_dispatch(
     // target at the LABEL the JUMP names, not always the first.  The target
     // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
     // re-entry at LABEL L passes `label_block_id + 1`.
-    let dispatch_key = builder.ins().iadd_imm(lbid, 1);
+    let label_selector = builder.ins().iadd_imm(lbid, 1);
+    let dispatch_key = builder
+        .ins()
+        .bor_imm(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
     builder.ins().return_call_indirect(
         target_sig_ref,
         target_code_ptr,
@@ -9401,16 +9463,42 @@ impl CraneliftBackend {
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
+        let initial_jf_ptr = builder.block_params(entry_block)[0];
+        // `IN_CODE_ENTRY_KEY_FLAG`: a patched guard jump (assembler.py:987) and
+        // a closing jump (:2456-2462) transfer inside compiled code, so RPython
+        // runs neither `_call_header_with_stack_check` nor
+        // `_call_header_shadowstack` at the target.  Split the prologue on the
+        // flag so an in-code entry pays for neither.
+        let raw_dispatch_key = builder.block_params(entry_block)[1];
+        let in_code_bit = builder
+            .ins()
+            .band_imm(raw_dispatch_key, IN_CODE_ENTRY_KEY_FLAG as i64);
+        let zero_key = builder.ins().iconst(cl_types::I32, 0);
+        let is_in_code_entry = builder.ins().icmp(IntCC::NotEqual, in_code_bit, zero_key);
+
         // assembler.py:1080 _call_header_with_stack_check — inline
         // fast path (load stack_end/length, compare against current
         // stack slot address), calling the registered slowpath only on
         // a miss. If no stack-check addresses are registered
         // (backend-only tests), the probe is elided or falls back to
         // the combined helper.
-        let initial_jf_ptr = builder.block_params(entry_block)[0];
+        //
+        // A tail-call entry reuses the caller's machine frame, so it consumes
+        // no additional native stack and has nothing to probe.
+        let host_stack_check_block = builder.create_block();
+        let stack_check_continue = builder.create_block();
+        builder.ins().brif(
+            is_in_code_entry,
+            stack_check_continue,
+            &[],
+            host_stack_check_block,
+            &[],
+        );
+
+        builder.switch_to_block(host_stack_check_block);
+        builder.seal_block(host_stack_check_block);
         let stack_check_result = emit_stack_check_result(&mut builder, ptr_type, call_conv);
         let stack_overflow_block = builder.create_block();
-        let stack_check_continue = builder.create_block();
         builder.ins().brif(
             stack_check_result,
             stack_overflow_block,
@@ -9496,6 +9584,25 @@ impl CraneliftBackend {
                 &[initial_jf_ptr, expected_v],
             );
             let new_jf = builder.inst_results(realloc_call)[0];
+            // x86/assembler.py:182-184 `_build_frame_realloc_slowpath`:
+            //   self._load_shadowstack_top_in_ebx(mc, gcrootmap)
+            //   mc.MOV_mr((ebx.value, -WORD), eax.value)
+            // The root-stack entry still names the frame that was just
+            // forwarded.  A host entry pushes its own entry below and would
+            // overwrite whatever is retargeted here, so only an in-code entry —
+            // which inherits the caller's entry and pushes nothing — needs it.
+            let retarget_block = builder.create_block();
+            builder.ins().brif(
+                is_in_code_entry,
+                retarget_block,
+                &[],
+                frame_ok_block,
+                &[BlockArg::from(new_jf)],
+            );
+
+            builder.switch_to_block(retarget_block);
+            builder.seal_block(retarget_block);
+            emit_shadowstack_retarget(&mut builder, ptr_type, new_jf);
             builder
                 .ins()
                 .jump(frame_ok_block, &[BlockArg::from(new_jf)]);
@@ -9516,7 +9623,28 @@ impl CraneliftBackend {
         //   MOV [ebx + WORD], ebp   // jf_ptr
         //   ADD ebx, 2*WORD
         //   MOV [root_stack_top_addr], ebx
+        //
+        // Only a host entry pushes.  An in-code entry continues on the JITFRAME
+        // the transferring trace already registered, and that trace left its
+        // entry standing (`emit_attached_bridge_dispatch` /
+        // `emit_attached_loop_dispatch`), so pushing here would stack a second
+        // entry for one frame and the matching pop at the deadframe exit would
+        // leave it behind.
+        let host_shadowstack_block = builder.create_block();
+        let shadowstack_done_block = builder.create_block();
+        builder.ins().brif(
+            is_in_code_entry,
+            shadowstack_done_block,
+            &[],
+            host_shadowstack_block,
+            &[],
+        );
+        builder.switch_to_block(host_shadowstack_block);
+        builder.seal_block(host_shadowstack_block);
         emit_call_header_shadowstack(&mut builder, ptr_type, jf_ptr);
+        builder.ins().jump(shadowstack_done_block, &[]);
+        builder.switch_to_block(shadowstack_done_block);
+        builder.seal_block(shadowstack_done_block);
         // Ref root slots live in jf_frame after output/fail_args area.
         // RPython: refs are always in jf_frame; gcmap marks which slots
         // are live at each GC point (regalloc.py get_gcmap).
@@ -9970,7 +10098,12 @@ impl CraneliftBackend {
             //             fastlocals writeback and read stale values.
             // The closing-jump passes `label_block_id + 1`; key 0 is reserved
             // for the preamble so it never collides with LABEL 0's re-entry.
-            let dispatch_key = builder.block_params(entry_block)[1];
+            // `IN_CODE_ENTRY_KEY_FLAG` rides in a high bit and is masked off
+            // here so it never reaches the table.
+            let label_selector_mask = (!IN_CODE_ENTRY_KEY_FLAG) as i64;
+            let dispatch_key = builder
+                .ins()
+                .band_imm(raw_dispatch_key, label_selector_mask);
             let preamble_block = builder.create_block();
             let loaders: Vec<cranelift_codegen::ir::Block> = label_blocks
                 .iter()
