@@ -6706,6 +6706,22 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(inlined);
                 }
+                // The name resolves nowhere and the type defines `__getattr__`:
+                // inline the hook in place of the miss walk plus its frame.
+                if let Some(inlined) = try_walker_inline_getattr_hook(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
                 // A type receiver whose class-MRO value needs no descriptor
                 // binding folds to that value under receiver + version pins.
                 if spec_gate("load_type_attr", || {

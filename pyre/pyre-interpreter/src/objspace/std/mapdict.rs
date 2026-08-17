@@ -1760,6 +1760,73 @@ pub unsafe fn load_attr_fast_path(
     Some((w_type, version_tag, map, p.storageindex))
 }
 
+/// The miss twin of [`load_attr_fast_path`]: return the ingredients for
+/// inlining the receiver type's `__getattr__` hook when `name` resolves
+/// nowhere.
+///
+/// `baseobjspace::instance_getattr_hook_or_err` is the tail this stands in for
+/// (`descroperation.py:242-245`): once the descriptor protocol has produced an
+/// AttributeError, the type's `__getattr__` is looked up and called with the
+/// receiver and the name. Reaching that tail is what the two returned pins
+/// prove, and both are guards the caller owes:
+///
+///   * `version_tag` — the class lookup stays constant, so `name` keeps
+///     resolving to nothing on the type and `__getattr__` keeps resolving to
+///     the returned hook;
+///   * `map` — the instance shape stays constant, so `name` keeps being absent
+///     from this receiver's own storage.
+///
+/// Together they make the whole `object_getattr_miss` walk a compile-time
+/// answer, which is the work the fold removes; the hook itself is what the
+/// caller then inlines.
+///
+/// Returns `None` for every shape those two guards cannot cover: a non-mapdict
+/// receiver, a custom `__getattribute__`, an uncacheable `version_tag`, a name
+/// the type or the instance actually owns, or a type with no `__getattr__`.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn getattr_hook_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    // mapdict.py:1495 `if map is not None:` — also filters non-instances.
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    // mapdict.py:1496 `w_type = map.terminator.w_cls`.
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    // mapdict.py:1497-1499 — a custom `__getattribute__` runs its own lookup,
+    // which neither pin describes.
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // The miss itself. A type-level hit is refused before the map is consulted:
+    // `classify_attr` reads a `__slots__` member under the `"slot"` name rather
+    // than its own, so a descriptor found here says nothing about what
+    // `find_map_attr(name)` below would answer.
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }.is_some() {
+        return None;
+    }
+    // `classify_attr(w_type, None, false)` answers `(DICT, false)` — the
+    // no-descriptor arm (mapdict.py:1509-1510) — so this is the same
+    // `find_map_attr` call the hit path makes, read for its absence.
+    if unsafe { find_map_attr(map, Wtf8::new(name), DICT) }.is_some() {
+        return None;
+    }
+    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
+    Some((w_type, version_tag, map, w_getattr))
+}
+
 /// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
 /// a `newdict(instance=True)` dictionary rather than in header mapdict storage
 /// (`mapdict.py:1299-1303 make_instance_dict`). It applies the same

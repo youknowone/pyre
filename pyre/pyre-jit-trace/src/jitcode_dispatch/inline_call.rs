@@ -6189,6 +6189,174 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     )
 }
 
+/// Inline the receiver type's `__getattr__` hook for an attribute the type and
+/// the instance both lack — the miss twin of [`try_walker_inline_property_get`].
+///
+/// `descroperation.py:242-245` reaches the hook only after the descriptor
+/// protocol has raised, so pyre runs the whole `object_getattr_miss` walk (the
+/// `__dict__` / `__doc__` / `__class__` special names, the metaclass loops, the
+/// terminal miss) and then a fresh interpreter frame for the hook, on every
+/// access, behind one opaque `CALL_MAY_FORCE`. PyPy traces through all of it,
+/// so the miss const-folds and only the hook body is left.
+/// [`getattr_hook_fast_path`](pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path)
+/// is the oracle for that fold: the version-tag and map pins it asks for are
+/// what make the miss a compile-time answer.
+///
+/// All three spellings `get_and_call_function` binds are folded, because the
+/// version-tag pin makes the binding decision itself constant: a plain
+/// `Function` takes `funccall(w_obj, w_name)`, a `classmethod` is entered with
+/// the class the descriptor would bind, and a `staticmethod` with the name
+/// alone. A custom-descriptor hook stays on the residual.
+///
+/// The name argument is an interned immortal block rather than the fresh
+/// `w_str_new` the residual path allocates per access, which is the shape
+/// `pyopcode.py LOAD_ATTR` passes (`space.getattr(w_obj, w_name)` hands over
+/// `co_names_w[oparg]`, one object for the life of the code object).
+///
+/// A branching, raising body is admitted: a hook that raises `AttributeError`
+/// for an unknown name is the shape worth inlining, not an edge case. Same
+/// loop-header and top-frame restrictions as the sibling routes; every other
+/// shape declines to the residual (SAFE — no acceleration, unchanged
+/// semantics).
+/// The leading argument `get_and_call_function` binds ahead of the attribute
+/// name, one variant per descriptor spelling of a `__getattr__` hook.
+enum HookLeading {
+    /// Plain `Function`: `funccall(w_obj, w_name)` leads with the receiver.
+    Receiver,
+    /// `ClassMethod.__get__` leads with the class.
+    Class,
+    /// `StaticMethod.__get__` binds nothing; the name is the only argument.
+    None,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, version_tag, map, w_getattr)) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::getattr_hook_fast_path(concrete_obj, &name)
+    }) else {
+        return Ok(None);
+    };
+    // `get_and_call_function` leads the positionals with the receiver only for
+    // a plain `Function`; every other descriptor is bound through `get` first
+    // and called with the name alone.  The version-tag pin makes that binding
+    // decision a constant of the trace, so each spelling resolves to its own
+    // function and leading argument here instead of declining.
+    let (w_func, leading) = unsafe {
+        if pyre_object::function::is_classmethod(w_getattr) {
+            (
+                pyre_object::function::w_classmethod_get_func(w_getattr),
+                HookLeading::Class,
+            )
+        } else if pyre_object::function::is_staticmethod(w_getattr) {
+            (
+                pyre_object::function::w_staticmethod_get_func(w_getattr),
+                HookLeading::None,
+            )
+        } else {
+            (w_getattr, HookLeading::Receiver)
+        }
+    };
+    if w_func.is_null() {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
+        return Ok(None);
+    };
+    // The name, plus the bound leading argument when the descriptor supplies
+    // one.  Any other arity is a shape the call would reject before the body
+    // runs.
+    if nparams != usize::from(!matches!(leading, HookLeading::None)) + 1 {
+        return Ok(None);
+    }
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    // Both pins the oracle asked for, plus the layout guard its map read needs.
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+
+    let name_obj =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
+            as pyre_object::PyObjectRef;
+    let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let leading_arg = match leading {
+        // The live receiver box: baking it would collapse instances that share
+        // this shape but not this identity.
+        HookLeading::Receiver => Some((obj, concrete_obj)),
+        // The class the `w_class` guard above already pinned.
+        HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
+        HookLeading::None => None,
+    };
+    // `[__getattr__, <self-placeholder>, <bound arg>?, name]`: the method-form
+    // call header the inline plumbing expects, then the positional args.
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_func), ConcreteValue::Null];
+    let mut callee_args = Vec::with_capacity(2);
+    let mut callee_arg_concretes = Vec::with_capacity(2);
+    if let Some((arg, concrete)) = leading_arg {
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_args.push(arg);
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+    }
+    arg_concretes.push(ConcreteValue::Ref(name_obj));
+    callee_args.push(name_const);
+    callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
+    let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        getattr_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_func,
+        getattr_const,
+        w_func,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        // The class and version pins are already emitted above, alongside the
+        // map pin this route additionally owes.
+        None,
+        None,
+        // The same LOAD_ATTR entry [`try_walker_inline_property_get`] admits.
+        true,
+        false,
+        None,
+    )
+}
+
 /// Inline a `property` setter store (`obj.value = x`) after the plain-attribute
 /// mapdict store fold declines because the attribute is a data descriptor — the
 /// setter twin of [`try_walker_inline_property_get`].  Pin the receiver class +

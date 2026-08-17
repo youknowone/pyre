@@ -1,8 +1,14 @@
-# pyre-check: max-pypy-ratio=90
+# pyre-check: max-pypy-ratio=25
 # objspace.py:710 get_and_call_function: a __getattr__ (or __getattribute__)
 # defined as a classmethod or staticmethod must be bound through __get__ before
 # being called, exactly like any other special method, so it receives the
 # arguments the descriptor protocol gives it.
+#
+# Each of the three accesses below used to cost one opaque residual holding the
+# whole `object_getattr_miss` walk plus a fresh frame for the hook. Inlining
+# the hook against the version-tag and map pins that make the miss constant
+# dropped the ratio from 48.6x/59.5x (dynasm/wasm) to 7.4x/10.4x/8.7x
+# (dynasm/cranelift/wasm); the bound is twice the slowest of those, rounded up.
 
 
 class ClassmethodGetattr:
