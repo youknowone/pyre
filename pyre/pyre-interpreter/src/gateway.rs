@@ -873,22 +873,26 @@ pub unsafe fn builtin_code_call(
     // length — the split has to happen before the count is read, not only once
     // a length already mismatched.
     let arity = unsafe { (*code).fast_natural_arity } as usize;
-    if arity <= 4 {
-        // A builtin registered by arity alone declares no parameter names
-        // (`sig` is null), so it is positional-only and a keyword cannot name
-        // anything it accepts.  Checked ahead of the count, which is the order
-        // the messages come in (`','.join('a', 'b', x=1)` reports the keyword).
-        if unsafe { (*code).sig.is_null() } && crate::builtins::has_real_kwargs(kwargs) {
-            return Err(no_keyword_arguments(unsafe { &*code }, receiver));
-        }
-        if positional.len() != arity {
-            return Err(arity_mismatch(
-                unsafe { &*code },
-                receiver,
-                arity,
-                positional.len(),
-            ));
-        }
+    // A builtin registered by arity alone declares no parameter names (`sig`
+    // is null), so it is positional-only and a keyword cannot name anything it
+    // accepts.  Checked ahead of the count, which is the order the messages
+    // come in (`','.join('a', 'b', x=1)` reports the keyword).  A declared
+    // count above the fast-path ceiling is rejected here too; only the
+    // `FLATPYCALL` / `PASSTHROUGHARGS1` / `HOPELESS` markers, whose bodies read
+    // the raw slice themselves, are left to do their own checking.
+    if arity < FLATPYCALL as usize
+        && unsafe { (*code).sig.is_null() }
+        && crate::builtins::has_real_kwargs(kwargs)
+    {
+        return Err(no_keyword_arguments(unsafe { &*code }, receiver));
+    }
+    if arity <= 4 && positional.len() != arity {
+        return Err(arity_mismatch(
+            unsafe { &*code },
+            receiver,
+            arity,
+            positional.len(),
+        ));
     }
     unsafe { ((*code).func)(args) }
 }

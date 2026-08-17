@@ -101,16 +101,46 @@ fn method_arity(
     }
 }
 
+/// The `TypeError` `PyLong_AsVoidPtr` raises for something that is not an
+/// integer at all, checked before the conversion so that whatever an
+/// `__index__` of its own raises still comes through unchanged.
+fn require_int(obj: PyObjectRef) -> Result<(), crate::PyError> {
+    if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
+        && unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_none()
+    {
+        return Err(crate::PyError::type_error("an integer is required"));
+    }
+    Ok(())
+}
+
+/// A handle argument (`_Py_PARSE_UINTPTR`): the value modulo the pointer
+/// width, so a handle may be written as the negative it is or as the unsigned
+/// value it prints as.
 fn handle_w(obj: PyObjectRef) -> Result<host_overlapped::Handle, crate::PyError> {
-    Ok(crate::baseobjspace::int_w(obj)? as isize as host_overlapped::Handle)
+    require_int(obj)?;
+    Ok(crate::baseobjspace::truncatedint_w(obj)? as isize as host_overlapped::Handle)
+}
+
+/// The integer a pointer-sized value comes back as (`PyLong_FromVoidPtr`):
+/// the unsigned value, which is how a pseudo handle and a completion key that
+/// is one print.
+fn w_uintptr(value: usize) -> PyObjectRef {
+    match i64::try_from(value as u64) {
+        Ok(fits) => pyre_object::w_int_new(fits),
+        Err(_) => pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::from(
+            value as u64 as i128,
+        )),
+    }
 }
 
 fn isize_w(obj: PyObjectRef) -> Result<isize, crate::PyError> {
-    Ok(crate::baseobjspace::int_w(obj)? as isize)
+    require_int(obj)?;
+    Ok(crate::baseobjspace::truncatedint_w(obj)? as isize)
 }
 
 fn usize_w(obj: PyObjectRef) -> Result<usize, crate::PyError> {
-    Ok(crate::baseobjspace::int_w(obj)? as usize)
+    require_int(obj)?;
+    Ok(crate::baseobjspace::truncatedint_w(obj)? as usize)
 }
 
 fn u32_w(obj: PyObjectRef) -> Result<u32, crate::PyError> {
@@ -859,9 +889,7 @@ fn init_overlapped_type(ns: PyObjectRef) {
     });
     property(ns, "event", |args| {
         let state = native(arg(args, 1, "event")?)?.lock().unwrap();
-        Ok(pyre_object::w_int_new(
-            state.overlapped.hEvent as isize as i64,
-        ))
+        Ok(w_uintptr(state.overlapped.hEvent as usize))
     });
 }
 
@@ -916,7 +944,7 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
 fn connect_pipe(args: &[PyObjectRef]) -> crate::PyResult {
     let address = crate::baseobjspace::text_w(arg(args, 0, "ConnectPipe")?)?;
     host_overlapped::connect_pipe(address)
-        .map(|handle| pyre_object::w_int_new(handle as i64))
+        .map(|handle| w_uintptr(handle as usize))
         .map_err(win32_err)
 }
 
@@ -927,7 +955,7 @@ fn create_iocp(args: &[PyObjectRef]) -> crate::PyResult {
         usize_w(arg(args, 2, "CreateIoCompletionPort")?)?,
         u32_w(arg(args, 3, "CreateIoCompletionPort")?)?,
     )
-    .map(|handle| pyre_object::w_int_new(handle as i64))
+    .map(|handle| w_uintptr(handle as usize))
     .map_err(win32_err)
 }
 
@@ -942,8 +970,8 @@ fn get_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
         host_overlapped::WaitResult::Queued(status) => Ok(pyre_object::w_tuple_new(vec![
             pyre_object::w_int_new(status.error as i64),
             pyre_object::w_int_new(status.bytes_transferred as i64),
-            pyre_object::w_int_new(status.completion_key as i64),
-            pyre_object::w_int_new(status.overlapped as i64),
+            w_uintptr(status.completion_key),
+            w_uintptr(status.overlapped as usize),
         ])),
     }
 }
@@ -966,7 +994,7 @@ fn register_wait_with_queue(args: &[PyObjectRef]) -> crate::PyResult {
         usize_w(arg(args, 2, "RegisterWaitWithQueue")?)?,
         u32_w(arg(args, 3, "RegisterWaitWithQueue")?)?,
     )
-    .map(|handle| pyre_object::w_int_new(handle as i64))
+    .map(|handle| w_uintptr(handle as usize))
     .map_err(win32_err)
 }
 
@@ -1032,7 +1060,7 @@ fn create_event(args: &[PyObjectRef]) -> crate::PyResult {
         )
     };
     host_winapi::create_event_w(manual_reset, initial_state, name.as_deref())
-        .map(|handle| pyre_object::w_int_new(handle as isize as i64))
+        .map(|handle| w_uintptr(handle as usize))
         .map_err(win32_err)
 }
 
@@ -1087,14 +1115,16 @@ pub fn init(ns: PyObjectRef) {
             host_overlapped::TF_REUSE_SOCKET_FLAG as i64,
         ),
         ("INFINITE", host_winapi::INFINITE_TIMEOUT as i64),
-        (
-            "INVALID_HANDLE_VALUE",
-            host_overlapped::INVALID_HANDLE_VALUE_ISIZE as i64,
-        ),
         ("NULL", 0),
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(value));
     }
+    // The handle sentinel is `(HANDLE)-1`, which prints as the unsigned value.
+    crate::module_ns_store(
+        ns,
+        "INVALID_HANDLE_VALUE",
+        w_uintptr(host_overlapped::INVALID_HANDLE_VALUE_ISIZE as usize),
+    );
     crate::module_ns_store(ns, "Overlapped", overlapped_type());
     for (name, arity, function) in [
         ("ConnectPipe", 1, connect_pipe as crate::BuiltinCodeFn),

@@ -56,6 +56,18 @@ struct NativeOverlapped {
 // through the per-object mutex.
 unsafe impl Send for NativeOverlapped {}
 
+impl Drop for NativeOverlapped {
+    /// The event belongs to the record, so it is closed wherever the record
+    /// goes away — including the call that failed to start its operation and
+    /// drops the state it had already built.
+    fn drop(&mut self) {
+        if !self.overlapped.hEvent.is_null() {
+            let _ = host_winapi::close_handle(self.overlapped.hEvent);
+            self.overlapped.hEvent = std::ptr::null_mut();
+        }
+    }
+}
+
 #[crate::pyre_class("_winapi.Overlapped")]
 #[derive(Default)]
 pub struct W_Overlapped {
@@ -241,9 +253,7 @@ fn init_overlapped_type(ns: PyObjectRef) {
                     "event",
                     |args: &[PyObjectRef]| -> crate::PyResult {
                         let state = native(arg(args, 1, "event")?)?.lock().unwrap();
-                        Ok(pyre_object::w_int_new(
-                            state.overlapped.hEvent as isize as i64,
-                        ))
+                        Ok(super::w_handle(state.overlapped.hEvent))
                     },
                     2,
                 ),
@@ -273,9 +283,10 @@ pub fn overlapped_type() -> PyObjectRef {
 }
 
 /// Sweep the native record: an operation still in flight is cancelled and
-/// waited out before the buffer it writes into goes away, then the event is
-/// closed.  The thread's last-error value is restored so a collection does not
-/// change what the running code would read from `GetLastError`.
+/// waited out before the buffer it writes into goes away, and dropping the
+/// state then closes its event.  The thread's last-error value is restored so
+/// a collection does not change what the running code would read from
+/// `GetLastError`.
 pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
     let Some(this) = W_Overlapped::from_obj(obj) else {
         return;
@@ -285,25 +296,24 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
     }
     let backend = unsafe { Box::from_raw(this.backend) };
     this.backend = std::ptr::null_mut();
-    let mut state = backend.lock().unwrap();
     let old_error = host_winapi::get_last_error();
-    if state.pending {
-        let mut transferred: u32 = 0;
-        unsafe {
-            windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped);
-            windows_sys::Win32::System::IO::GetOverlappedResult(
-                state.handle,
-                &state.overlapped,
-                &mut transferred,
-                1,
-            );
+    {
+        let mut state = backend.lock().unwrap();
+        if state.pending {
+            let mut transferred: u32 = 0;
+            unsafe {
+                windows_sys::Win32::System::IO::CancelIoEx(state.handle, &state.overlapped);
+                windows_sys::Win32::System::IO::GetOverlappedResult(
+                    state.handle,
+                    &state.overlapped,
+                    &mut transferred,
+                    1,
+                );
+            }
+            state.pending = false;
         }
-        state.pending = false;
     }
-    if !state.overlapped.hEvent.is_null() {
-        let _ = host_winapi::close_handle(state.overlapped.hEvent);
-        state.overlapped.hEvent = std::ptr::null_mut();
-    }
+    drop(backend);
     rustpython_host_env::windows::set_last_error(old_error);
 }
 

@@ -17,17 +17,7 @@ use std::os::windows::ffi::OsStringExt;
 use widestring::WideCString;
 use windows_sys::Win32::Foundation::HANDLE;
 
-/// A handle as Python spells it — an integer, which is what every call here
-/// takes and gives back.
-fn handle(value: i64) -> HANDLE {
-    value as isize as HANDLE
-}
-
-fn w_handle(value: HANDLE) -> PyObjectRef {
-    w_int_new(value as isize as i64)
-}
-
-use super::win32_code;
+use super::{IntArg, handle_w, w_handle, win32_code};
 
 /// [`super::win32_err`] for the two file-mapping calls, which name the mapping
 /// in the error the way a failed open names its file.
@@ -121,7 +111,7 @@ fn sequence_handles(w_seq: PyObjectRef) -> Result<Vec<HANDLE>, crate::PyError> {
     let items = crate::baseobjspace::unpackiterable(w_seq, -1)?;
     let mut handles = Vec::with_capacity(items.len());
     for w_item in items {
-        handles.push(handle(crate::baseobjspace::int_w(w_item)?));
+        handles.push(handle_w(w_item, IntArg::Element)?);
     }
     Ok(handles)
 }
@@ -258,7 +248,7 @@ pub fn CopyFile2(
 #[crate::pyre_function]
 pub fn OpenProcess(
     desired_access: PyCUInt,
-    inherit_handle: PyCInt,
+    inherit_handle: PyIndexCInt,
     process_id: PyCUInt,
 ) -> Result<PyObjectRef, crate::PyError> {
     host_winapi::open_process(desired_access, inherit_handle != 0, process_id)
@@ -282,12 +272,18 @@ pub fn ExitProcess(ExitCode: PyCUInt) -> Result<(), crate::PyError> {
 /// default, the way `CreateProcess` treats its two attribute arguments.
 #[crate::pyre_function]
 pub fn CreateEventW(
-    security_attributes: PyIndexInt,
-    manual_reset: PyCInt,
-    initial_state: PyCInt,
+    security_attributes: PyObjectRef,
+    manual_reset: PyIndexCInt,
+    initial_state: PyIndexCInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _ = security_attributes;
+    let _ = handle_w(
+        security_attributes,
+        IntArg::At {
+            function: "CreateEventW",
+            position: 1,
+        },
+    )?;
     let name = wide_or_none(name)?;
     host_winapi::create_event_w(manual_reset != 0, initial_state != 0, name.as_deref())
         .map(w_handle)
@@ -299,7 +295,7 @@ pub fn CreateEventW(
 #[crate::pyre_function]
 pub fn OpenEventW(
     desired_access: PyCUInt,
-    inherit_handle: PyCInt,
+    inherit_handle: PyIndexCInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
@@ -313,24 +309,44 @@ pub fn OpenEventW(
 
 /// `_winapi.SetEvent(event)`
 #[crate::pyre_function]
-pub fn SetEvent(event: PyIndexInt) -> Result<(), crate::PyError> {
-    host_winapi::set_event(handle(event)).map_err(super::win32_err)
+pub fn SetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
+    let event = handle_w(
+        event,
+        IntArg::At {
+            function: "SetEvent",
+            position: 1,
+        },
+    )?;
+    host_winapi::set_event(event).map_err(super::win32_err)
 }
 
 /// `_winapi.ResetEvent(event)`
 #[crate::pyre_function]
-pub fn ResetEvent(event: PyIndexInt) -> Result<(), crate::PyError> {
-    host_winapi::reset_event(handle(event)).map_err(super::win32_err)
+pub fn ResetEvent(event: PyObjectRef) -> Result<(), crate::PyError> {
+    let event = handle_w(
+        event,
+        IntArg::At {
+            function: "ResetEvent",
+            position: 1,
+        },
+    )?;
+    host_winapi::reset_event(event).map_err(super::win32_err)
 }
 
 /// `_winapi.CreateMutexW(security_attributes, initial_owner, name)`
 #[crate::pyre_function]
 pub fn CreateMutexW(
-    security_attributes: PyIndexInt,
-    initial_owner: PyCInt,
+    security_attributes: PyObjectRef,
+    initial_owner: PyIndexCInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _ = security_attributes;
+    let _ = handle_w(
+        security_attributes,
+        IntArg::At {
+            function: "CreateMutexW",
+            position: 1,
+        },
+    )?;
     let name = wide_or_none(name)?;
     host_winapi::create_mutex_w(initial_owner != 0, name.as_deref())
         .map(w_handle)
@@ -342,7 +358,7 @@ pub fn CreateMutexW(
 #[crate::pyre_function]
 pub fn OpenMutexW(
     desired_access: PyCUInt,
-    inherit_handle: PyCInt,
+    inherit_handle: PyIndexCInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let name = wide(name, WideArg::Unnamed)?;
@@ -356,8 +372,15 @@ pub fn OpenMutexW(
 
 /// `_winapi.ReleaseMutex(mutex)`
 #[crate::pyre_function]
-pub fn ReleaseMutex(mutex: PyIndexInt) -> Result<(), crate::PyError> {
-    if host_winapi::release_mutex(handle(mutex)) == 0 {
+pub fn ReleaseMutex(mutex: PyObjectRef) -> Result<(), crate::PyError> {
+    let mutex = handle_w(
+        mutex,
+        IntArg::At {
+            function: "ReleaseMutex",
+            position: 1,
+        },
+    )?;
+    if host_winapi::release_mutex(mutex) == 0 {
         return Err(super::last_os_error());
     }
     Ok(())
@@ -381,7 +404,7 @@ const WAIT_TIMEOUT: u32 = 258;
 #[crate::pyre_function]
 pub fn WaitForMultipleObjects(
     handle_seq: PyObjectRef,
-    wait_flag: PyCInt,
+    wait_flag: PyIndexCInt,
     #[default(host_winapi::INFINITE_TIMEOUT)] milliseconds: PyCUInt,
 ) -> Result<i64, crate::PyError> {
     let handles = sequence_handles(handle_seq)?;
@@ -407,7 +430,7 @@ pub fn WaitForMultipleObjects(
 #[crate::pyre_function]
 pub fn BatchedWaitForMultipleObjects(
     handle_seq: PyObjectRef,
-    wait_all: PyCInt,
+    wait_all: PyIndexCInt,
     #[default(host_winapi::INFINITE_TIMEOUT)] milliseconds: PyCUInt,
 ) -> Result<PyObjectRef, crate::PyError> {
     let handles = sequence_handles(handle_seq)?;
@@ -460,12 +483,19 @@ pub fn CreateFile(
     file_name: PyObjectRef,
     desired_access: PyCUInt,
     share_mode: PyCUInt,
-    security_attributes: PyIndexInt,
+    security_attributes: PyObjectRef,
     creation_disposition: PyCUInt,
     flags_and_attributes: PyCUInt,
-    template_file: PyIndexInt,
+    template_file: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _ = (security_attributes, template_file);
+    let at = |position| IntArg::At {
+        function: "CreateFile",
+        position,
+    };
+    let _ = (
+        handle_w(security_attributes, at(4))?,
+        handle_w(template_file, at(7))?,
+    );
     let file_name = wide(file_name, WideArg::Unnamed)?;
     let _blocked = crate::module::thread::before_external_block();
     host_winapi::create_file_w(
@@ -491,9 +521,15 @@ pub fn CreateNamedPipe(
     out_buffer_size: PyCUInt,
     in_buffer_size: PyCUInt,
     default_timeout: PyCUInt,
-    security_attributes: PyIndexInt,
+    security_attributes: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _ = security_attributes;
+    let _ = handle_w(
+        security_attributes,
+        IntArg::At {
+            function: "CreateNamedPipe",
+            position: 8,
+        },
+    )?;
     let name = wide(name, WideArg::Unnamed)?;
     host_winapi::create_named_pipe_w(
         &name,
@@ -512,13 +548,20 @@ pub fn CreateNamedPipe(
 /// collect_data_timeout)` — each `None` leaves that part of the state alone.
 #[crate::pyre_function]
 pub fn SetNamedPipeHandleState(
-    named_pipe: PyIndexInt,
+    named_pipe: PyObjectRef,
     mode: PyObjectRef,
     max_collection_count: PyObjectRef,
     collect_data_timeout: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    let named_pipe = handle_w(
+        named_pipe,
+        IntArg::At {
+            function: "SetNamedPipeHandleState",
+            position: 1,
+        },
+    )?;
     host_winapi::set_named_pipe_handle_state(
-        handle(named_pipe),
+        named_pipe,
         c_uint_or_none(mode)?,
         c_uint_or_none(max_collection_count)?,
         c_uint_or_none(collect_data_timeout)?,
@@ -541,33 +584,54 @@ pub fn WaitNamedPipe(name: PyObjectRef, timeout: PyCUInt) -> Result<(), crate::P
 #[cfg(not(feature = "sandbox"))]
 #[crate::pyre_function]
 pub fn ConnectNamedPipe(
-    handle_: PyIndexInt,
+    handle_: PyObjectRef,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let pipe = handle_w(
+        handle_,
+        IntArg::At {
+            function: "ConnectNamedPipe",
+            position: 1,
+        },
+    )?;
     let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
-    super::overlapped::connect_named_pipe(handle(handle_), use_overlapped)
+    super::overlapped::connect_named_pipe(pipe, use_overlapped)
 }
 
 /// `_winapi.ReadFile(handle, size, overlapped=False)`
 #[cfg(not(feature = "sandbox"))]
 #[crate::pyre_function]
 pub fn ReadFile(
-    handle_: PyIndexInt,
+    handle_: PyObjectRef,
     size: PyCUInt,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let file = handle_w(
+        handle_,
+        IntArg::At {
+            function: "ReadFile",
+            position: 1,
+        },
+    )?;
     let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
-    super::overlapped::read_file(handle(handle_), size, use_overlapped)
+    super::overlapped::read_file(file, size, use_overlapped)
 }
 
 /// `_winapi.WriteFile(handle, buffer, overlapped=False)`
 #[cfg(not(feature = "sandbox"))]
 #[crate::pyre_function]
 pub fn WriteFile(
-    handle_: PyIndexInt,
+    handle_: PyObjectRef,
     buffer: PyObjectRef,
     #[default(pyre_object::w_bool_from(false))] overlapped: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let file = handle_w(
+        handle_,
+        IntArg::At {
+            function: "WriteFile",
+            position: 1,
+        },
+    )?;
     let use_overlapped = crate::baseobjspace::is_true(overlapped)?;
     let Some(data) = crate::baseobjspace::simple_buffer_bytes(buffer)? else {
         return Err(crate::PyError::type_error(format!(
@@ -580,17 +644,24 @@ pub fn WriteFile(
     // taken out of it before either can move.
     let bytes = data.as_bytes().to_vec();
     data.release();
-    super::overlapped::write_file(handle(handle_), &bytes, use_overlapped)
+    super::overlapped::write_file(file, &bytes, use_overlapped)
 }
 
 /// `_winapi.PeekNamedPipe(handle, size=0)` -> `(available, left_this_message)`,
 /// and `(data, available, left_this_message)` once a size is asked for.
 #[crate::pyre_function]
 pub fn PeekNamedPipe(
-    handle_: PyIndexInt,
+    handle_: PyObjectRef,
     #[default(0u32)] size: PyCUInt,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let peeked = host_winapi::peek_named_pipe(handle(handle_), (size != 0).then_some(size))
+    let pipe = handle_w(
+        handle_,
+        IntArg::At {
+            function: "PeekNamedPipe",
+            position: 1,
+        },
+    )?;
+    let peeked = host_winapi::peek_named_pipe(pipe, (size != 0).then_some(size))
         .map_err(super::win32_err)?;
     let available = w_int_new(i64::from(peeked.available));
     let left = w_int_new(i64::from(peeked.left_this_message));
@@ -610,31 +681,30 @@ pub fn PeekNamedPipe(
 /// max_size_high, max_size_low, name)`
 #[crate::pyre_function]
 pub fn CreateFileMapping(
-    file_handle: PyIndexInt,
-    security_attributes: PyIndexInt,
+    file_handle: PyObjectRef,
+    security_attributes: PyObjectRef,
     protect: PyCUInt,
     max_size_high: PyCUInt,
     max_size_low: PyCUInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let _ = security_attributes;
+    let at = |position| IntArg::At {
+        function: "CreateFileMapping",
+        position,
+    };
+    let file = handle_w(file_handle, at(1))?;
+    let _ = handle_w(security_attributes, at(2))?;
     let wide_name = wide(name, WideArg::Unnamed)?;
-    host_winapi::create_file_mapping_w(
-        handle(file_handle),
-        protect,
-        max_size_high,
-        max_size_low,
-        Some(&wide_name),
-    )
-    .map(w_handle)
-    .map_err(|error| win32_err_named(error, name))
+    host_winapi::create_file_mapping_w(file, protect, max_size_high, max_size_low, Some(&wide_name))
+        .map(w_handle)
+        .map_err(|error| win32_err_named(error, name))
 }
 
 /// `_winapi.OpenFileMapping(desired_access, inherit_handle, name)`
 #[crate::pyre_function]
 pub fn OpenFileMapping(
     desired_access: PyCUInt,
-    inherit_handle: PyCInt,
+    inherit_handle: PyIndexCInt,
     name: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let wide_name = wide(name, WideArg::Unnamed)?;
@@ -647,14 +717,21 @@ pub fn OpenFileMapping(
 /// file_offset_low, number_bytes)` -> the address of the mapped view.
 #[crate::pyre_function]
 pub fn MapViewOfFile(
-    file_map: PyIndexInt,
+    file_map: PyObjectRef,
     desired_access: PyCUInt,
     file_offset_high: PyCUInt,
     file_offset_low: PyCUInt,
     number_bytes: PyIndexInt,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let mapping = handle_w(
+        file_map,
+        IntArg::At {
+            function: "MapViewOfFile",
+            position: 1,
+        },
+    )?;
     host_winapi::map_view_of_file(
-        handle(file_map),
+        mapping,
         desired_access,
         file_offset_high,
         file_offset_low,
@@ -666,16 +743,18 @@ pub fn MapViewOfFile(
 
 /// `_winapi.UnmapViewOfFile(address)`
 #[crate::pyre_function]
-pub fn UnmapViewOfFile(address: PyIndexInt) -> Result<(), crate::PyError> {
-    host_winapi::unmap_view_of_file(address as isize).map_err(super::win32_err)
+pub fn UnmapViewOfFile(address: PyObjectRef) -> Result<(), crate::PyError> {
+    let address = handle_w(address, IntArg::Only("UnmapViewOfFile"))? as isize;
+    host_winapi::unmap_view_of_file(address).map_err(super::win32_err)
 }
 
 /// `_winapi.VirtualQuerySize(address)` -> the size of the region the address
 /// falls in, which is how a mapped view's length is recovered from the address
 /// alone.
 #[crate::pyre_function]
-pub fn VirtualQuerySize(address: PyIndexInt) -> Result<PyObjectRef, crate::PyError> {
-    host_winapi::virtual_query_size(address as isize)
+pub fn VirtualQuerySize(address: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let address = handle_w(address, IntArg::Only("VirtualQuerySize"))? as isize;
+    host_winapi::virtual_query_size(address)
         .map(|size| w_int_new(size as i64))
         .map_err(super::win32_err)
 }

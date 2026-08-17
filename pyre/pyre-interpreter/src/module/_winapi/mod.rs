@@ -26,6 +26,10 @@
 //! `ConnectNamedPipe`, `ReadFile` and `WriteFile` that produces one, which is
 //! what `multiprocessing.connection`'s `PipeConnection` is written against.
 
+use windows_sys::Win32::Foundation::HANDLE;
+
+use crate::PyError;
+
 /// Map the current thread's last OS error to an `OSError`
 /// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
 fn last_os_error() -> crate::PyError {
@@ -45,6 +49,60 @@ fn win32_err(error: std::io::Error) -> crate::PyError {
 /// the thread's.
 fn win32_code(code: u32) -> crate::PyError {
     crate::PyError::os_error_win32_syscall2(code as i32, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
+
+/// How a call names an integer argument in the `TypeError` it raises for one
+/// that is not an integer at all.
+enum IntArg<'a> {
+    /// The only parameter of `function`.
+    Only(&'a str),
+    /// Parameter `position` of `function`, counted from one.
+    At { function: &'a str, position: usize },
+    /// An element of a sequence argument, which the message does not name.
+    Element,
+}
+
+/// The value an integer parameter carries: read through `__index__`, then
+/// taken modulo the width the call passes it in.  Both `_Py_PARSE_UINTPTR`
+/// and the `DWORD` converter work that way, so a handle may be written as the
+/// negative it is or as the unsigned value it prints as, and a flag word may
+/// be written either way round too.
+fn masked_int_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<i64, PyError> {
+    if !unsafe { pyre_object::pyobject::is_int_or_long(w_value) }
+        && unsafe { crate::baseobjspace::lookup(w_value, "__index__") }.is_none()
+    {
+        let got = crate::gateway::short_type_name(w_value);
+        return Err(PyError::type_error(match argument {
+            IntArg::Only(function) => format!("{function}() argument must be int, not {got}"),
+            IntArg::At { function, position } => {
+                format!("{function}() argument {position} must be int, not {got}")
+            }
+            IntArg::Element => format!("argument must be int, not {got}"),
+        }));
+    }
+    crate::baseobjspace::truncatedint_w(w_value)
+}
+
+/// [`masked_int_w`] for a `HANDLE` parameter.
+fn handle_w(w_handle: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<HANDLE, PyError> {
+    Ok(masked_int_w(w_handle, argument)? as isize as HANDLE)
+}
+
+/// [`masked_int_w`] for a `DWORD` parameter.
+fn dword_w(w_value: pyre_object::PyObjectRef, argument: IntArg<'_>) -> Result<u32, PyError> {
+    Ok(masked_int_w(w_value, argument)? as u32)
+}
+
+/// The integer a handle comes back as (`PyLong_FromVoidPtr`): the unsigned
+/// value, which is how the pseudo handles print.
+fn w_handle(handle: HANDLE) -> pyre_object::PyObjectRef {
+    let value = handle as usize as u64;
+    match i64::try_from(value) {
+        Ok(fits) => pyre_object::w_int_new(fits),
+        Err(_) => {
+            pyre_object::longobject::w_long_new(majit_rlib::rbigint::RBigInt::from(value as i128))
+        }
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -67,17 +125,7 @@ mod process {
     use rustpython_host_env::winapi as host_winapi;
     use windows_sys::Win32::Foundation::HANDLE;
 
-    use super::win32_err;
-
-    /// A handle as Python spells it — an integer, which is what every call
-    /// here takes and gives back.
-    fn handle_w(w_handle: PyObjectRef) -> Result<HANDLE, crate::PyError> {
-        Ok(crate::baseobjspace::int_w(w_handle)? as isize as HANDLE)
-    }
-
-    fn w_handle(handle: HANDLE) -> PyObjectRef {
-        w_int_new(handle as isize as i64)
-    }
+    use super::{IntArg, handle_w, w_handle, win32_err};
 
     fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
         args.get(index).copied().ok_or_else(|| {
@@ -89,7 +137,7 @@ mod process {
     /// does not have, which is what the caller tests for before making a pipe
     /// of its own.
     pub fn get_std_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let id = crate::baseobjspace::c_uint_w(arg(args, 0, "GetStdHandle")?)?;
+        let id = super::dword_w(arg(args, 0, "GetStdHandle")?, IntArg::Only("GetStdHandle"))?;
         match host_winapi::get_std_handle(id) {
             Ok(Some(handle)) => Ok(w_handle(handle)),
             Ok(None) => Ok(w_none()),
@@ -106,7 +154,7 @@ mod process {
     /// `_winapi.GetFileType(handle)` — a console handle is the one kind that
     /// cannot be passed in an inherited handle list.
     pub fn get_file_type(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let handle = handle_w(arg(args, 0, "GetFileType")?)?;
+        let handle = handle_w(arg(args, 0, "GetFileType")?, IntArg::Only("GetFileType"))?;
         host_winapi::get_file_type(handle)
             .map(|file_type| w_int_new(file_type as i64))
             .map_err(win32_err)
@@ -137,7 +185,10 @@ mod process {
     /// count would append that terminator to the path.
     pub fn get_module_file_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         const MAX_PATH: usize = 260;
-        let module = handle_w(arg(args, 0, "GetModuleFileName")?)? as *mut core::ffi::c_void;
+        let module = handle_w(
+            arg(args, 0, "GetModuleFileName")?,
+            IntArg::Only("GetModuleFileName"),
+        )? as *mut core::ffi::c_void;
         let mut buffer = [0u16; MAX_PATH];
         let length = host_winapi::get_module_file_name(module, &mut buffer);
         if length == 0 {
@@ -152,8 +203,20 @@ mod process {
 
     /// `_winapi.TerminateProcess(handle, exit_code)`
     pub fn terminate_process(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let handle = handle_w(arg(args, 0, "TerminateProcess")?)?;
-        let exit_code = crate::baseobjspace::c_uint_w(arg(args, 1, "TerminateProcess")?)?;
+        let handle = handle_w(
+            arg(args, 0, "TerminateProcess")?,
+            IntArg::At {
+                function: "TerminateProcess",
+                position: 1,
+            },
+        )?;
+        let exit_code = super::dword_w(
+            arg(args, 1, "TerminateProcess")?,
+            IntArg::At {
+                function: "TerminateProcess",
+                position: 2,
+            },
+        )?;
         if host_winapi::terminate_process(handle, exit_code) == 0 {
             return Err(super::last_os_error());
         }
@@ -165,7 +228,13 @@ mod process {
     /// the default of; neither end is inheritable until one is duplicated
     /// into an inheritable copy.
     pub fn create_pipe(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let size = crate::baseobjspace::c_uint_w(arg(args, 1, "CreatePipe")?)?;
+        let size = super::dword_w(
+            arg(args, 1, "CreatePipe")?,
+            IntArg::At {
+                function: "CreatePipe",
+                position: 2,
+            },
+        )?;
         let (read, write) = host_winapi::create_pipe(size).map_err(win32_err)?;
         Ok(w_tuple_new(vec![w_handle(read), w_handle(write)]))
     }
@@ -173,13 +242,18 @@ mod process {
     /// `_winapi.DuplicateHandle(source_process, source, target_process,
     /// desired_access, inherit_handle, options=0)` -> handle
     pub fn duplicate_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let source_process = handle_w(arg(args, 0, "DuplicateHandle")?)?;
-        let source = handle_w(arg(args, 1, "DuplicateHandle")?)?;
-        let target_process = handle_w(arg(args, 2, "DuplicateHandle")?)?;
-        let access = crate::baseobjspace::c_uint_w(arg(args, 3, "DuplicateHandle")?)?;
-        let inherit = crate::baseobjspace::c_int_w(arg(args, 4, "DuplicateHandle")?)?;
+        const NAME: &str = "DuplicateHandle";
+        let at = |position| IntArg::At {
+            function: NAME,
+            position,
+        };
+        let source_process = handle_w(arg(args, 0, NAME)?, at(1))?;
+        let source = handle_w(arg(args, 1, NAME)?, at(2))?;
+        let target_process = handle_w(arg(args, 2, NAME)?, at(3))?;
+        let access = super::dword_w(arg(args, 3, NAME)?, at(4))?;
+        let inherit = crate::baseobjspace::index_c_int_w(arg(args, 4, NAME)?)?;
         let options = match args.get(5) {
-            Some(&w) => crate::baseobjspace::c_uint_w(w)?,
+            Some(&w) => super::dword_w(w, at(6))?,
             None => 0,
         };
         host_winapi::duplicate_handle(
@@ -437,7 +511,6 @@ crate::py_module! {
         // `DuplicateHandle` options and the handle sentinel (handleapi.h).
         "DUPLICATE_SAME_ACCESS" => 0x0000_0002,
         "DUPLICATE_CLOSE_SOURCE" => 0x0000_0001,
-        "INVALID_HANDLE_VALUE" => -1,
         "NULL" => 0,
         // `GetFileType` answers.  A console handle is the one a caller drops
         // from an inherited handle list (`Popen._filter_handle_list`).
@@ -526,9 +599,10 @@ crate::py_module! {
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
         // `import subprocess` to succeed.
-        fn CloseHandle(handle: i64) -> Result<(), crate::PyError> {
+        fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+            let handle = handle_w(handle, IntArg::Only("CloseHandle"))?;
             let ok = unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(handle as *mut _)
+                windows_sys::Win32::Foundation::CloseHandle(handle)
             };
             if ok == 0 {
                 return Err(last_os_error());
@@ -538,23 +612,37 @@ crate::py_module! {
         // `subprocess.Popen._wait`/`poll` also capture these as default
         // arguments at import time, and reach them once a launch has a
         // process to wait on.
-        fn WaitForSingleObject(handle: i64, milliseconds: i64) -> i64 {
+        fn WaitForSingleObject(
+            handle: pyre_object::PyObjectRef,
+            milliseconds: pyre_object::PyObjectRef,
+        ) -> Result<i64, crate::PyError> {
+            const NAME: &str = "WaitForSingleObject";
+            let handle = handle_w(handle, IntArg::At { function: NAME, position: 1 })?;
+            let milliseconds =
+                dword_w(milliseconds, IntArg::At { function: NAME, position: 2 })?;
             // `rpython/rlib/rwin32.py` declares this through `winexternal`,
             // whose default `releasegil='auto'` runs the native call between
             // the rffi around-handlers.  In particular, an infinite wait must
             // let the Python thread which will signal the handle run.
-            let _blocked = crate::module::thread::before_external_block();
-            unsafe {
-                windows_sys::Win32::System::Threading::WaitForSingleObject(
-                    handle as *mut _,
-                    milliseconds as u32,
-                ) as i64
+            let result = {
+                let _blocked = crate::module::thread::before_external_block();
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(
+                        handle,
+                        milliseconds,
+                    )
+                }
+            };
+            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                return Err(last_os_error());
             }
+            Ok(i64::from(result))
         }
-        fn GetExitCodeProcess(handle: i64) -> Result<i64, crate::PyError> {
+        fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> {
+            let handle = handle_w(handle, IntArg::Only("GetExitCodeProcess"))?;
             let mut code: u32 = 0;
             let ok = unsafe {
-                windows_sys::Win32::System::Threading::GetExitCodeProcess(handle as *mut _, &mut code)
+                windows_sys::Win32::System::Threading::GetExitCodeProcess(handle, &mut code)
             };
             if ok == 0 {
                 return Err(last_os_error());
@@ -563,6 +651,13 @@ crate::py_module! {
         }
     },
     extra_init: |ns| {
+        // The handle sentinel is `(HANDLE)-1` (handleapi.h), which prints as
+        // the unsigned value and so does not fit the `int_constants` table.
+        crate::module_ns_store(
+            ns,
+            "INVALID_HANDLE_VALUE",
+            w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
+        );
         // The launch half, registered by hand: the module is built without
         // `host_env` too, and there it stops at the constants and the calls
         // above.
