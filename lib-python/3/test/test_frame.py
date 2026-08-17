@@ -677,6 +677,7 @@ class FrameLocalsProxyMappingTests(mapping_tests.TestHashMappingProtocol):
         pass
 
 
+@support.cpython_only
 class TestFrameCApi(unittest.TestCase):
     def test_basic(self):
         x = 1
@@ -792,6 +793,7 @@ class TestIncompleteFrameAreInvisible(unittest.TestCase):
             # Call from C, so there is a shim frame directly above f:
             weak = operator.call(f)  # BOOM!
             # Cool, we didn't crash. Check that the callback actually happened:
+            support.gc_collect()  # For PyPy or other GCs.
             self.assertIs(catcher.unraisable.exc_type, TypeError)
         self.assertIsNone(weak())
 
