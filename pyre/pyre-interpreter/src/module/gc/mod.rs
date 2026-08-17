@@ -664,6 +664,18 @@ fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
 
+/// CPython 3.14 `_PyObject_GC_IS_TRACKED` first requires the type to carry
+/// `Py_TPFLAGS_HAVE_GC`; objects of scalar builtin types therefore never
+/// appear in `gc.get_objects()`, even though pyre's collector must manage
+/// their wider implementation structs.  Keep that implementation detail out
+/// of the CPython-facing inspector at the app-level conversion boundary.
+fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
+    let w_obj = object.0 as PyObjectRef;
+    if crate::typedef::cpython_object_is_gc(w_obj) {
+        pyre_object::gc_roots::pin_root(w_obj);
+    }
+}
+
 /// `referents.py _list_w_obj_referents`: push the app-level objects
 /// `w_obj` refers to directly onto the shadow stack. The walk looks through
 /// the interpreter-internal structs in between, so a list reports its items
@@ -1266,7 +1278,7 @@ crate::py_module! {
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
@@ -1352,7 +1364,7 @@ crate::py_module! {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
             crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
             let all_first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             let all_last = pyre_object::gc_roots::shadow_stack_len();
             // Accumulate the matches as slot indices, not as addresses: the
             // entries stay pinned in `all_first..all_last`, but a copy of one
@@ -1470,17 +1482,15 @@ crate::py_module! {
             Ok(w_none())
         },
         "is_tracked"    / 1 = |args| {
-            // CPython 3.14 `gc.is_tracked(obj)`: whether the collector
-            // traverses references out of the object. Asked of the registered
-            // type rather than of the heap the instance landed in, so an int
-            // answers the same under `PYRE_GC_INTERP`, under the JIT and on
-            // wasm as it does on the immortal path.
-            //
-            // `bytes` and `int` answer True where CPython answers False: their
-            // pyre structs carry `w_dict` and `w_weakreflifeline` slots that
-            // the collector really does follow, which the CPython objects have
-            // no equivalent of.
-            Ok(w_bool_from(majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize))))
+            // CPython 3.14 `_PyObject_GC_IS_TRACKED`: a collector-owned block
+            // is app-level tracked only when its Python type also carries
+            // `Py_TPFLAGS_HAVE_GC`.  Pyre still manages the wider Rust structs
+            // for scalar builtins internally; that storage choice must not
+            // make `int`, `str`, `bytes`, etc. observable as tracked objects.
+            Ok(w_bool_from(
+                crate::typedef::cpython_object_is_gc(args[0])
+                    && majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize)),
+            ))
         },
         "get_rpy_memory_usage" / 1 = |args| {
             // referents.py:97-104 / inspector.py:76-77.  The size is just the
