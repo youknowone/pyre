@@ -87,62 +87,69 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, le
     Ok(parser.raw_args()?.collect())
 }
 
-/// Remove the common space/tab prefix from nonblank `-c` source lines alone.
+/// Remove the common space/tab prefix from the `-c` source's nonblank lines and
+/// empty its blank ones.
+///
+/// A line is what sits between two `\n`, so a `\r` is content like any other
+/// character: `"  \r"` holds something, narrows the margin to its two spaces
+/// and keeps its carriage return, where `"  "` alone is blank. That is a
+/// narrower notion of blank than `textwrap.dedent`'s, which empties every line
+/// `str.isspace()` answers for.
 fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
-    let mut prefix: Option<&[u8]> = None;
-    for line in source.split_inclusive('\n') {
-        let bytes = line.as_bytes();
-        let mut content_end = bytes.len();
-        if bytes.last() == Some(&b'\n') {
-            content_end -= 1;
-            if content_end > 0 && bytes[content_end - 1] == b'\r' {
-                content_end -= 1;
-            }
+    fn split_newline(line: &str) -> (&str, &str) {
+        match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
         }
-        let content = &bytes[..content_end];
-        let indent_len = content
-            .iter()
-            .position(|byte| !matches!(byte, b' ' | b'\t'))
-            .unwrap_or(content.len());
-        if indent_len == content.len() {
+    }
+    fn is_blank(content: &str) -> bool {
+        content.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+    }
+
+    // The margin is the common leading run of spaces and tabs over the lines
+    // that hold something. A blank line never narrows it, and a run stops at
+    // the first character that is neither, so an indent built from any other
+    // character is not a margin at all.
+    let mut margin: Option<&str> = None;
+    let mut has_blank_line = false;
+    for line in source.split_inclusive('\n') {
+        let (content, _) = split_newline(line);
+        if is_blank(content) {
+            // An empty line is already what emptying it would produce, so it
+            // alone does not make the source need rewriting.
+            has_blank_line |= !content.is_empty();
             continue;
         }
+        let indent_len = content
+            .find(|c| !matches!(c, ' ' | '\t'))
+            .unwrap_or(content.len());
         let indent = &content[..indent_len];
-        prefix = Some(match prefix {
+        margin = Some(match margin {
             None => indent,
             Some(current) => {
                 let common_len = current
-                    .iter()
-                    .zip(indent)
+                    .bytes()
+                    .zip(indent.bytes())
                     .take_while(|(left, right)| left == right)
                     .count();
                 &current[..common_len]
             }
         });
-        if prefix.is_some_and(|prefix| prefix.is_empty()) {
-            return std::borrow::Cow::Borrowed(source);
-        }
     }
 
-    let Some(prefix) = prefix else {
+    let margin = margin.unwrap_or("");
+    if margin.is_empty() && !has_blank_line {
         return std::borrow::Cow::Borrowed(source);
-    };
+    }
     let mut dedented = String::with_capacity(source.len());
     for line in source.split_inclusive('\n') {
-        let bytes = line.as_bytes();
-        let mut content_end = bytes.len();
-        if bytes.last() == Some(&b'\n') {
-            content_end -= 1;
-            if content_end > 0 && bytes[content_end - 1] == b'\r' {
-                content_end -= 1;
-            }
+        let (content, newline) = split_newline(line);
+        if !is_blank(content) {
+            // Every line reaching here contributed its own indent to the
+            // margin, so the margin is a prefix of it.
+            dedented.push_str(&content[margin.len()..]);
         }
-        let content = &bytes[..content_end];
-        if content.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
-            dedented.push_str(line);
-        } else {
-            dedented.push_str(&line[prefix.len()..]);
-        }
+        dedented.push_str(newline);
     }
     std::borrow::Cow::Owned(dedented)
 }
@@ -2066,27 +2073,60 @@ mod tests {
     }
 
     #[test]
-    fn command_dedent_ignores_and_preserves_whitespace_only_lines() {
+    fn command_dedent_empties_whitespace_only_line_shallower_than_prefix() {
         let source = "    print(\"first\")\n  \n    print(\"second\")\n";
         assert_eq!(
             dedent_command(source).as_ref(),
-            "print(\"first\")\n  \nprint(\"second\")\n"
+            "print(\"first\")\n\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_empties_whitespace_only_line_deeper_than_prefix() {
+        let source = "    print(\"first\")\n        \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n\nprint(\"second\")\n"
+        );
+    }
+
+    #[test]
+    fn command_dedent_empties_whitespace_only_line_equal_to_prefix() {
+        let source = "    print(\"first\")\n    \n    print(\"second\")\n";
+        assert_eq!(
+            dedent_command(source).as_ref(),
+            "print(\"first\")\n\nprint(\"second\")\n"
         );
     }
 
     #[test]
     fn command_dedent_is_raw_text_and_stops_at_column_zero() {
         let source = "    text = \"\"\"\n  inside\ninside\n\"\"\"\n";
-        assert_eq!(dedent_command(source).as_ref(), source);
+        assert!(matches!(
+            dedent_command(source),
+            std::borrow::Cow::Borrowed(value) if value == source
+        ));
     }
 
     #[test]
-    fn command_dedent_preserves_crlf_line_endings() {
-        let source = "\r\n    print(\"first\")\r\n  \r\n    print(\"second\")\r\n";
-        assert_eq!(
-            dedent_command(source).as_ref(),
-            "\r\nprint(\"first\")\r\n  \r\nprint(\"second\")\r\n"
-        );
+    fn command_dedent_counts_a_carriage_return_as_content() {
+        // `"  \r"` holds something, so it narrows the margin to its two spaces
+        // and keeps the carriage return the tokenizer later normalizes away.
+        let source = "    a\r\n  \r\n    b\r\n";
+        assert_eq!(dedent_command(source).as_ref(), "  a\r\n\r\n  b\r\n");
+    }
+
+    #[test]
+    fn command_dedent_counts_whitespace_that_is_not_space_or_tab_as_content() {
+        // A form feed on its own line is content at column zero, which leaves
+        // no margin for anything to lose.
+        for content in ["\u{c}", "\u{b}", "\u{85}"] {
+            let source = format!("    a\n{content}\n    b\n");
+            assert!(
+                matches!(dedent_command(&source), std::borrow::Cow::Borrowed(value) if value == source),
+                "{content:?}"
+            );
+        }
     }
 
     #[test]
