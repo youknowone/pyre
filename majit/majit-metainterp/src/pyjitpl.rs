@@ -18188,6 +18188,28 @@ impl crate::compile::DescrContainer for MetaInterpStaticData {
     }
 }
 
+/// Snapshot the canonical `EffectInfo` object population consumed by
+/// `effectinfo.compute_bitstrings`, paired with one CallDescr that can publish
+/// each result back onto the shared [`majit_ir::effectinfo::EffectInfoCell`].
+fn unique_effect_info_snapshots(
+    all_descrs: &[DescrRef],
+) -> (Vec<majit_ir::EffectInfo>, Vec<DescrRef>) {
+    let mut owned_eis = Vec::new();
+    let mut writeback_descrs = Vec::new();
+    let mut seen_eis: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for d in all_descrs {
+        if let Some(cd) = d.as_call_descr() {
+            let ei = cd.get_extra_info();
+            let ei_id = std::ptr::from_ref(ei).addr();
+            if seen_eis.insert(ei_id) {
+                owned_eis.push(ei.clone());
+                writeback_descrs.push(d.clone());
+            }
+        }
+    }
+    (owned_eis, writeback_descrs)
+}
+
 impl MetaInterpStaticData {
     /// pyjitpl.py:2289 `self.all_descrs = self.cpu.setup_descrs()` —
     /// descr.py:25-47's dense list, indexed by `descr_index`.  opencoder /
@@ -18625,20 +18647,25 @@ impl MetaInterpStaticData {
         *self.all_descrs().lock().unwrap() = all_descrs.clone();
 
         // pyjitpl.py:2290 `effectinfo.compute_bitstrings(self.all_descrs)`.
-        // Two-pass mutation: clone each call descr's EI for the algorithm
-        // input, run compute_bitstrings, then write the new bitstrings
-        // back to the original descr via Descr::set_effect_bitstrings.
+        // Two-pass mutation: clone each distinct call descr EI for the
+        // algorithm input, run compute_bitstrings, then write the new
+        // bitstrings back through one representative descr via
+        // Descr::set_effect_bitstrings.
         // The two-pass shape avoids holding mutable borrows across the
         // 6 cached fields while compute_bitstrings is doing its
         // cross-EI partitioning.
-        let mut owned_eis: Vec<majit_ir::EffectInfo> = Vec::new();
-        let mut writeback_descrs: Vec<DescrRef> = Vec::new();
-        for d in &all_descrs {
-            if let Some(cd) = d.as_call_descr() {
-                owned_eis.push(cd.get_extra_info().clone());
-                writeback_descrs.push(d.clone());
-            }
-        }
+        //
+        // `effectinfo.py:147-148 EffectInfo._cache` returns the same EI
+        // object for every ordinary structurally-identical request, and
+        // `compute_bitstrings` consumes those canonical objects rather than
+        // one copy per CallDescr.  `intern_effect_info` gives pyre the same
+        // shared `EffectInfoCell`, so deduplicate by the address returned by
+        // `get_extra_info()` before cloning.  Every CallDescr sharing that
+        // address observes the representative writeback through the shared
+        // cell. Release-gil EIs deliberately have distinct cells, matching
+        // effectinfo.py:144-146's fresh `object()` cache breaker, and remain
+        // distinct here too.
+        let (mut owned_eis, writeback_descrs) = unique_effect_info_snapshots(&all_descrs);
         // `effectinfo.py:526 descr.ei_index = …` writes the per-class
         // index directly onto each descr Arc via interior atomic.
         // `heap.rs::field_effect_index` resolves through
@@ -19023,6 +19050,31 @@ mod metainterp_static_data_tests {
     use super::*;
     use crate::jitcode::{JitCode, JitCodeBuilder};
     use majit_translate::jitcode::JitCode as BuildJitCode;
+
+    #[test]
+    fn setup_snapshots_a_shared_effect_info_once() {
+        let first = crate::call_descr::make_call_descr_with_effect(
+            &[],
+            majit_ir::Type::Void,
+            majit_ir::EffectInfo::default(),
+        );
+        let second = crate::call_descr::make_call_descr_with_effect(
+            &[majit_ir::Type::Int],
+            majit_ir::Type::Void,
+            majit_ir::EffectInfo::default(),
+        );
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            std::ptr::from_ref(first.as_call_descr().unwrap().get_extra_info()).addr(),
+            std::ptr::from_ref(second.as_call_descr().unwrap().get_extra_info()).addr(),
+            "ordinary structurally-equal EffectInfos must share their canonical cell",
+        );
+
+        let (snapshots, writebacks) = unique_effect_info_snapshots(&[first, second]);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(writebacks.len(), 1);
+    }
 
     /// Build a placeholder `Arc<JitCode>` whose `fnaddr` matches the
     /// given address.  Real production code populates `fnaddr` via
