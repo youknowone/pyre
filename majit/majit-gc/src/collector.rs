@@ -3178,6 +3178,14 @@ impl MiniMarkGC {
     /// if this is the first request.
     fn find_shadow(&mut self, obj_addr: usize) -> usize {
         let hdr = unsafe { *((obj_addr - GcHeader::SIZE) as *const GcHeader) };
+        // A forwarded header is `FORWARDED_MARKER`, whose every flag bit reads
+        // set, so it would answer the test below and then die on the map lookup
+        // under the shadow message.  `_find_shadow`'s precondition is that the
+        // object has not been copied yet, so name the real fault here.
+        assert!(
+            !hdr.is_forwarded(),
+            "stale pointer into the nursery: find_shadow reached a forwarded header at {obj_addr:#x}"
+        );
         if hdr.has_flag(flags::HAS_SHADOW) {
             // incminimark.py:2855-2857 `ll_assert(shadow != NULL,
             // "GCFLAG_HAS_SHADOW but no shadow found")`.  HAS_SHADOW
@@ -4891,14 +4899,22 @@ impl MiniMarkGC {
         // block.  Upstream normally reaches the shadow through
         // GCFLAG_HAS_SHADOW during the leading minor; this is the equivalent
         // for pyre's oldgen-only non-moving major.
-        if self.is_in_nursery(obj_addr)
-            && unsafe { (*header_of(obj_addr)).has_flag(flags::HAS_SHADOW) }
-        {
-            let shadow_obj = *self
-                .nursery_objects_shadows
-                .get(&obj_addr)
-                .expect("GCFLAG_HAS_SHADOW but no shadow found");
-            unsafe { (*header_of(shadow_obj)).set_flag(flags::VISITED) };
+        if self.is_in_nursery(obj_addr) {
+            // Every flag bit of `FORWARDED_MARKER` reads set, so a worklist
+            // entry a minor collection forwarded would pass the shadow test
+            // below and then fail the map lookup under a message about the
+            // shadow map.  The fault is the stale worklist entry; say so.
+            assert!(
+                !unsafe { (*header_of(obj_addr)).is_forwarded() },
+                "stale major worklist entry: forwarded header at {obj_addr:#x}"
+            );
+            if unsafe { (*header_of(obj_addr)).has_flag(flags::HAS_SHADOW) } {
+                let shadow_obj = *self
+                    .nursery_objects_shadows
+                    .get(&obj_addr)
+                    .expect("GCFLAG_HAS_SHADOW but no shadow found");
+                unsafe { (*header_of(shadow_obj)).set_flag(flags::VISITED) };
+            }
         }
         let custom_trace;
         let (item_size, length_offset, fixed_size, items_have_gc_ptrs);

@@ -231,8 +231,12 @@ impl Drop for FrameAnchor {
 /// pyre's JIT-compiled code allocates W_IntObject / result boxes into the
 /// nursery (`NewWithVtable` → `gc_alloc_typed_nursery_shim`). When the
 /// nursery fills and a minor collection runs, only registered roots are
-/// forwarded — unforwarded nursery refs become stale after
-/// `Nursery::reset` zero-fills the region. The interpreter stores live
+/// forwarded — an unforwarded nursery ref is left addressing a corpse.
+/// `Nursery::reset` only rewinds the free pointer on native (it zero-fills
+/// on wasm32, and writes the 0xAA poison only when that debug mode is on),
+/// so the corpse keeps its forwarding header until something is allocated
+/// over it and the stale ref reads whichever of the two it finds. The
+/// interpreter stores live
 /// refs in `PyFrame.locals_cells_stack_w`; without this walker those
 /// slots turn into NULL-`ob_type` stale pointers on the next LOAD_FAST
 /// (reproduced by `inline_helper` n >= 10000).
