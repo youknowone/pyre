@@ -3850,15 +3850,11 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
-    // `posix.DirEntry` has four inline GC edges (`w_name`/`w_path` and the
-    // cached `w_stat`/`w_lstat`, the latter two NULL until first requested),
-    // while `posix.ScandirIterator` owns its entries list. Appended
-    // after the unconditional native owners and before the optional native
-    // tail. `posix` is
-    // compiled out on wasm32, so this registration and its census aliases are
-    // gated to match — which is why it stays last among the rclass
-    // registrations: an unconditional type after it would take a different id
-    // on wasm32 than on a native target.
+    // Register `posix.DirEntry`'s four inline GC edges and
+    // `posix.ScandirIterator`'s entries-list edge. The entries in
+    // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
+    // native-only because `posix` is absent on wasm32; registering these after
+    // unconditional rclasses keeps their type IDs stable across targets.
     #[cfg(not(target_arch = "wasm32"))]
     register_pyre_class(
         &mut gc,

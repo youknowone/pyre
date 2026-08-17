@@ -144,8 +144,7 @@ fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
     for line in source.split_inclusive('\n') {
         let (content, newline) = split_newline(line);
         if !is_blank(content) {
-            // Every line reaching here contributed its own indent to the
-            // margin, so the margin is a prefix of it.
+            // Every nonblank line contributed to `margin`, so it is a prefix.
             dedented.push_str(&content[margin.len()..]);
         }
         dedented.push_str(newline);
@@ -2109,9 +2108,6 @@ mod tests {
 
     #[test]
     fn command_dedent_leaves_a_blank_line_alone_when_there_is_no_margin() {
-        // Emptying blank lines is part of removing a margin, not something
-        // done on its own: a source with a line at column zero comes back
-        // exactly as it was written.
         let source = "x = \"\"\"a\n  \nb\"\"\"\n";
         assert!(matches!(
             dedent_command(source),
@@ -2121,8 +2117,7 @@ mod tests {
 
     #[test]
     fn command_dedent_counts_a_carriage_return_as_content() {
-        // `"  \r"` holds something, so it narrows the margin to its two spaces
-        // and keeps the carriage return the tokenizer later normalizes away.
+        // Python tokenization normalizes the retained carriage return.
         let source = "    a\r\n  \r\n    b\r\n";
         assert_eq!(dedent_command(source).as_ref(), "  a\r\n\r\n  b\r\n");
     }

@@ -14374,19 +14374,7 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
     }
 }
 
-/// baseobjspace.py:1310-1317 `issequence_w`.
-///
-/// ```python
-/// def issequence_w(self, w_obj):
-///     flag = self.type(w_obj).flag_map_or_seq
-///     if flag == 'M':
-///         return False
-///     elif flag == 'S':
-///         return True
-///     else:
-///         return (self.lookup(w_obj, '__getitem__') is not None)
-/// ```
-///
+/// Port of `ObjSpace.issequence_w` from PyPy's `baseobjspace`.
 /// The `is_dict` arm mirrors `ismapping_w`'s, for the same reason: the builtin
 /// mapping's flag may not be reachable through `typedef::r#type`, while a dict
 /// subclass carries the inherited flag.

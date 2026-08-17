@@ -54,10 +54,9 @@ pub struct W_DirEntry {
     pub enum_type: i32,
 }
 
-/// `posix.ScandirIterator` — native owner for the directory entries and the
-/// current enumeration state, matching `W_ScandirIterator.dirp` at
-/// `interp_scandir.py:88`. The typedef at `interp_scandir.py:172-179` exposes
-/// operations only, so none of these fields are instance attributes.
+/// Native owner for `posix.ScandirIterator` entries and enumeration state.
+/// PyPy's `interp_scandir.W_ScandirIterator` keeps the equivalent state on
+/// `dirp`; its typedef exposes operations rather than these fields.
 #[crate::pyre_class("posix.ScandirIterator")]
 #[derive(Default)]
 pub struct W_ScandirIterator {
@@ -988,8 +987,8 @@ pub(crate) fn fspath(
     {
         let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(fspath_descr);
-        // `interp_posix.py:3048` binds the descriptor before calling it. A
-        // non-descriptor is its own bound value.
+        // PyPy's `interp_posix._fspath` binds `__fspath__` before calling it;
+        // a non-descriptor is its own value.
         let fspath_fn = unsafe {
             crate::baseobjspace::get(
                 pyre_object::gc_roots::shadow_stack_get(fspath_slot),
@@ -4843,8 +4842,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(args[0])
     }
     fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
-        // `interp_scandir.py:111-119 _close` clears the native state that
-        // `_finalize_` tests, whether closure is explicit or due to exhaustion.
+        // `W_ScandirIterator._close` clears the state inspected by
+        // `_finalize_`, whether closure is explicit or due to exhaustion.
         if let Some(iterator) = W_ScandirIterator::from_obj(self_obj) {
             iterator.open = false;
         }
@@ -4855,9 +4854,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = args[0];
-        // `interp_scandir.py:130-132 next_w` ends the enumeration once the
-        // directory is closed, so a `close()` partway through is the end of it
-        // and the entries already read into the native owner are not handed out.
+        // `W_ScandirIterator.next_w` ends enumeration after `close()`, without
+        // yielding entries already buffered in the native owner.
         if !scandir_iter_is_open(self_obj) {
             return Err(crate::PyError::stop_iteration());
         }
@@ -4894,8 +4892,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Err(_) => "unclosed scandir iterator".to_string(),
         };
         if let Err(mut error) = crate::warn::warn_category(&message, "ResourceWarning", 1) {
-            // `interp_scandir.py:106-109 _finalize_` makes a warning promoted
-            // to an error unraisable because no exception may escape shutdown.
+            // `W_ScandirIterator._finalize_` reports a warning promoted to an
+            // error as unraisable because finalization cannot propagate it.
             error.write_unraisable(
                 pyre_object::w_none(),
                 rustpython_wtf8::Wtf8::new(""),
@@ -4945,9 +4943,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 tp,
             );
             unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
-            // `interp_scandir.py:172-180` declares no `__new__` on the typedef
-            // and `:180` sets `acceptable_as_base_class = False`.  The iterator
-            // is produced only by `scandir_fn` below, through
+            // PyPy's `W_ScandirIterator.typedef` has no `__new__` and disallows
+            // subclassing; `scandir_fn` creates instances with
             // `W_ScandirIterator::allocate_stable`.
             unsafe {
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
@@ -5111,10 +5108,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         iterator.entries = list;
         iterator.open = true;
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(it as *mut u8) };
-        // `objspace.py:486-487 allocate_instance` registers an object whose
-        // type has `hasuserdel` on the finalizer queue immediately after
-        // allocation. Native allocation bypasses that shared instance helper,
-        // so perform the same registration here.
+        // `StdObjSpace.allocate_instance` immediately queues instances whose
+        // type has `hasuserdel`. This native allocation bypasses that helper,
+        // so it must register the new iterator explicitly.
         pyre_object::gc_hook::maybe_register_finalizer(it);
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         drop(_list_scope);
@@ -5583,11 +5579,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    // Unlike `_env2interp`
-                    // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
-                    // snapshots `keys()` and `values()` before encoding pairs,
-                    // so `__fspath__` user code cannot make a second mapping
-                    // read observe a mutated mapping.
+                    // CPython 3.14 snapshots `keys()` and `values()` before
+                    // encoding; unlike PyPy's `_env2interp`, this prevents
+                    // `__fspath__` from making a second mapping read observe a
+                    // mutation performed while encoding a snapshot element.
                     let _env_roots = pyre_object::gc_roots::push_roots();
                     let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
                     let pair_count = crate::baseobjspace::len_w(
@@ -5621,10 +5616,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let values_len = values.len();
                     drop(keys);
                     drop(values);
-                    // The count is the mapping's own length, so it is whatever its
-                    // `__len__` answered. Reserve against the snapshots actually in
-                    // hand instead, and let the walk below report a count they
-                    // cannot cover.
+                    // Capacity follows the available snapshots, while iteration
+                    // still uses the mapping's reported length and rejects a
+                    // snapshot too short to cover it.
                     let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
                     for i in 0..pair_count {
                         if i >= keys_len || i >= values_len {
@@ -5636,9 +5630,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
                             values_base + i,
                         ))?;
-                        // `_env2interp` (`interp_posix.py:1762-1769`) permits
-                        // the Windows `=C:` spelling and rejects `=` only
-                        // after the first byte.
+                        // PyPy's `_env2interp` permits the Windows `=C:` form
+                        // and rejects `=` only after the first byte.
                         if key.is_empty()
                             || key.get(1..).is_some_and(|tail| tail.contains(&b'='))
                         {
@@ -6284,10 +6277,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // `_run_forking_function`
-        // (`pypy/module/posix/interp_posix.py:1559-1582`) enters the callback
-        // lifecycle immediately.  The 3.14 guard precedes that lifecycle so a
-        // refused fork takes no lock and signals no thread.
+        // PyPy's `_run_forking_function` enters the callback lifecycle
+        // immediately. CPython 3.14 checks finalization first, so a refused
+        // fork takes no callback lock and signals no thread.
         fn guard_fork_finalization() -> Result<(), crate::PyError> {
             if !crate::module::thread::is_finalizing() {
                 return Ok(());
@@ -6519,8 +6511,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // `interp_posix.py:2036-2079,2224-2245` uses the same `c_uid_t`
-        // conversion and non-retrying error path for all six id setters.
+        // PyPy's six user/group ID setters share the `c_uid_t` conversion and
+        // report syscall errors without retrying.
         #[cfg(not(feature = "sandbox"))]
         fn set_one_id(
             args: &[PyObjectRef],
@@ -8423,7 +8415,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `trailers` and `flags` are the BSD `sendfile(2)` tail. The
                 // macOS arm forwards both vectors; `flags` alone remains
                 // unused because the host wrapper exposes no flags parameter.
-                // They are all named here so an unknown keyword is an error.
+                // Listing the BSD-only parameters makes unknown keywords fail
+                // during argument binding on every platform.
                 let (bound, _kwargs) = bind_path_args(
                     args,
                     "sendfile",
@@ -8522,9 +8515,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             if unsafe { pyre_object::is_none(value) } {
                                 return Ok(None);
                             }
-                            // The vector is read by index, so it has to be a
-                            // sequence: an iterator would be consumed here and
-                            // a mapping's keys are not what is being asked for.
+                            // Indexed header/trailer vectors require a sequence;
+                            // consuming an iterator or mapping keys would change
+                            // the accepted `sendfile` argument protocol.
                             if !crate::baseobjspace::issequence_w(value) {
                                 return Err(crate::PyError::type_error(format!(
                                     "sendfile() {name} must be a sequence"
@@ -8734,11 +8727,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     return Ok(env);
                 }
-                // Unlike `_env2interp`
-                // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
-                // snapshots `keys()` and `values()` before encoding pairs,
-                // so `__fspath__` user code cannot make a second mapping
-                // read observe a mutated mapping.
+                // CPython 3.14 snapshots `keys()` and `values()` before
+                // encoding; unlike PyPy's `_env2interp`, this prevents
+                // `__fspath__` from making a second mapping read observe a
+                // mutation performed while encoding a snapshot element.
                 let _env_roots = pyre_object::gc_roots::push_roots();
                 let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
                 let pair_count = crate::baseobjspace::len_w(
@@ -8772,10 +8764,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let values_len = values.len();
                 drop(keys);
                 drop(values);
-                // The count is the mapping's own length, so it is whatever its
-                // `__len__` answered. Reserve against the snapshots actually in
-                // hand instead, and let the walk below report a count they
-                // cannot cover.
+                // Capacity follows the available snapshots, while iteration
+                // still uses the mapping's reported length and rejects a
+                // snapshot too short to cover it.
                 let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
                 for i in 0..pair_count {
                     if i >= keys_len || i >= values_len {
@@ -8787,8 +8778,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let value = crate::gateway::fsencode_bytes_w(
                         pyre_object::gc_roots::shadow_stack_get(values_base + i),
                     )?;
-                    // interp_posix.py:1762-1769 permits the Windows `=C:`
-                    // spelling and rejects `=` only after the first byte.
+                    // PyPy's `_env2interp` permits the Windows `=C:` form and
+                    // rejects `=` only after the first byte.
                     if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
                         return Err(crate::PyError::value_error(
                             "illegal environment variable name",
@@ -9922,11 +9913,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv_wide(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
-                    // Unlike `_env2interp`
-                    // (`pypy/module/posix/interp_posix.py:1757-1770`), 3.14
-                    // snapshots `keys()` and `values()` before encoding pairs,
-                    // so `__fspath__` user code cannot make a second mapping
-                    // read observe a mutated mapping.
+                    // CPython 3.14 snapshots `keys()` and `values()` before
+                    // encoding; unlike PyPy's `_env2interp`, this prevents
+                    // `__fspath__` from making a second mapping read observe a
+                    // mutation performed while encoding a snapshot element.
                     let _env_roots = pyre_object::gc_roots::push_roots();
                     let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
                     let pair_count = crate::baseobjspace::len_w(
@@ -9960,10 +9950,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let values_len = values.len();
                     drop(keys);
                     drop(values);
-                    // The count is the mapping's own length, so it is whatever its
-                    // `__len__` answered. Reserve against the snapshots actually in
-                    // hand instead, and let the walk below report a count they
-                    // cannot cover.
+                    // Capacity follows the available snapshots, while iteration
+                    // still uses the mapping's reported length and rejects a
+                    // snapshot too short to cover it.
                     let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
                     for i in 0..pair_count {
                         if i >= keys_len || i >= values_len {
@@ -9975,9 +9964,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
                             values_base + i,
                         ))?;
-                        // `_env2interp` (`interp_posix.py:1762-1769`) permits
-                        // the Windows `=C:` spelling and rejects `=` only
-                        // after the first byte.
+                        // PyPy's `_env2interp` permits the Windows `=C:` form
+                        // and rejects `=` only after the first byte.
                         if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
                             return Err(crate::PyError::value_error(
                                 "illegal environment variable name",

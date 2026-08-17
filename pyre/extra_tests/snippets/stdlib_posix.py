@@ -93,14 +93,14 @@ for cls in (FsPathNone, FsPathNoneOverride, FsPathPropertyNone):
     try:
         os.fspath(cls())
     except TypeError as exc:
-        # The object is named, not the `None` that was found in its place.
+        # A disabled `__fspath__` reports the original object's type.
         assert cls.__name__ in str(exc), (cls, exc)
         assert "NoneType" not in str(exc), (cls, exc)
     else:
         raise AssertionError("os.fspath(%s()) did not raise" % cls.__name__)
 
-    # The path converter every other entry point shares reaches the same
-    # decision, under its own wording.
+    # Builtins using the shared path converter also reject a disabled
+    # `__fspath__` as a property of the original object.
     try:
         open(cls())
     except TypeError as exc:
@@ -118,10 +118,8 @@ for cls in (FsPathNone, FsPathNoneOverride, FsPathPropertyNone):
         raise AssertionError("os.rename(%s(), ...) did not raise" % cls.__name__)
 
 
-# The user and group id setters convert through the `uid_t` unwrapper, so a
-# non-integer and a value past the 32-bit range are turned away before any
-# privilege change is attempted.  Only the rejected forms are exercised here:
-# every call below raises during conversion and reaches no syscall.
+# Every exercised user/group ID setter rejects these values during `uid_t`
+# conversion, before a privilege-changing syscall can run.
 for _name in ("setuid", "seteuid", "setgid", "setegid"):
     _setter = getattr(os, _name, None)
     if _setter is None:

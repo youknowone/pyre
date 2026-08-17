@@ -1171,14 +1171,14 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(176, typed::<crate::module::_lsprof::W_Profiler>()),
         subclass_range_alias(177, typed::<crate::module::_lsprof::W_StatsEntry>()),
         subclass_range_alias(178, typed::<crate::module::_lsprof::W_StatsSubEntry>()),
-        // `posix.DirEntry` and `posix.ScandirIterator` follow the unconditional
-        // native owners.
+        // Native-only posix aliases 179 and 180 preserve `build_gc`'s rclass
+        // registration order after the unconditional aliases.
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(179, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(180, typed::<crate::module::posix::W_ScandirIterator>()),
-        // rustls-backed `_ssl` native payloads follow in the same order
-        // `build_gc` registers them.
+        // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
+        // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
         subclass_range_alias(181, typed::<crate::module::_ssl::W_SSLContext>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]

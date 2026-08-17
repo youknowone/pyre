@@ -677,8 +677,8 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (176, Some(0)),
     (177, Some(0)),
     (178, Some(0)),
-    // `posix.DirEntry` and `posix.ScandirIterator` follow the unconditional
-    // native owners on native builds.
+    // Native-only type IDs 179 and 180 represent `posix.DirEntry` and
+    // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
     (179, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]

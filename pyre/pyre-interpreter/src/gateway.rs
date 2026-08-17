@@ -1817,8 +1817,8 @@ fn path_or_fd_w(
             let path_type =
                 crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                     .expect("a path argument has a type");
-            // `interp_posix.py:3048` binds the descriptor before calling it.
-            // A non-descriptor is its own bound value.
+            // PyPy's `interp_posix._fspath` binds `__fspath__` before calling
+            // it; a non-descriptor is its own bound value.
             let fspath_fn = crate::baseobjspace::get(
                 pyre_object::gc_roots::shadow_stack_get(fspath_slot),
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),

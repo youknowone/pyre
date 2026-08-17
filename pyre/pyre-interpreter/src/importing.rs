@@ -1214,14 +1214,10 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_int(vars_slot, "Py_DEBUG", 0);
     store_int(vars_slot, "Py_GIL_DISABLED", 1);
     store_int(vars_slot, "Py_ENABLE_SHARED", 0);
-    // With `host_env` and without the sandbox,
-    // `rustpython_host_env::os::urandom` uses `getrandom::fill` and never opens
-    // a descriptor, so the name that describes this build's entropy source is
-    // the one the host offers. The sandbox route is
-    // `host_seam::ops::urandom`, and the no-`host_env` fallback is
-    // `host::os::urandom`; both open `/dev/urandom` and therefore publish
-    // neither name. Windows draws from the cryptography provider, which
-    // neither name describes, so it also publishes neither.
+    // Publish an entropy capability only when it names the implementation:
+    // unsandboxed `host_env` uses `getrandom::fill` on Linux and getentropy on
+    // other Unix targets. Sandbox and no-`host_env` routes open `/dev/urandom`,
+    // while Windows uses its cryptography provider.
     #[cfg(all(target_os = "linux", feature = "host_env", not(feature = "sandbox")))]
     store_int(vars_slot, "HAVE_GETRANDOM_SYSCALL", 1);
     #[cfg(all(
