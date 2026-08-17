@@ -44,12 +44,19 @@ impl<'c> Lowerer<'c> {
             .iter()
             .filter(|(segments, _, _, _)| *segments == func_segments)
             .collect();
-        let mut layouts: Vec<(&syn::Path, Vec<TokenStream>)> = Vec::new();
+        let mut layouts: Vec<(syn::Path, Vec<TokenStream>)> = Vec::new();
         // `(key, element_path)` for the `field[]` declarations, deduplicated by
         // key: naming one array from two helpers of the same residual would
         // otherwise repeat its descr in the write set.
         let mut arrays: Vec<(String, &syn::Path)> = Vec::new();
         for (_, path, field, writes_elements) in writes {
+            // A write set names the descriptors an opaque call may invalidate,
+            // and a descriptor belongs to the struct that declares the field.
+            // Resolving the entry the same way an access site does is what
+            // makes the two name one descriptor: entries written against
+            // different structs that share an inlined base collapse onto it,
+            // and the grouping below merges them.
+            let path = config.declaring_struct(path, &field.to_string());
             let struct_last = path
                 .segments
                 .last()
@@ -79,7 +86,7 @@ impl<'c> Lowerer<'c> {
             let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
                 fields
             } else {
-                layouts.push((path, Vec::new()));
+                layouts.push((path.clone(), Vec::new()));
                 &mut layouts.last_mut().unwrap().1
             };
             // Same declared width the getfield/setfield lowering registers, so
@@ -112,7 +119,7 @@ impl<'c> Lowerer<'c> {
                 ),
                 None => {
                     let (size, signed, check) =
-                        super::lower_vable::field_scalar_tokens(config, &key, path, &member);
+                        super::lower_vable::field_scalar_tokens(config, &key, &path, &member);
                     (config.ref_fields.contains_key(&key), size, signed, check)
                 }
             };
@@ -137,13 +144,25 @@ impl<'c> Lowerer<'c> {
                 // SizeDescr identity.
                 let gc_managed = config.struct_gc_kind_is_managed(struct_path);
                 let tid = struct_type_id_tokens(struct_path, gc_managed);
+                // An inlined base's fields, exactly as the access sites list
+                // them. This layout is a second producer of the same struct's
+                // spec, and `index_in_parent` comes from the positions in it:
+                // a write set that named only the struct's own fields would
+                // number the first of them zero, the slot the base's first
+                // field holds for the same object, and the two would share a
+                // cache entry.
+                let (prefix_fields, prefix_witness) =
+                    config.prefix_field_entries_tokens(struct_path);
                 quote! {
-                    (
-                        ::core::mem::size_of::<#struct_path>(),
-                        #tid,
-                        #gc_managed,
-                        &[#(#fields),*],
-                    )
+                    {
+                        #prefix_witness
+                        (
+                            ::core::mem::size_of::<#struct_path>(),
+                            #tid,
+                            #gc_managed,
+                            &[#(#prefix_fields,)* #(#fields),*],
+                        )
+                    }
                 }
             })
             .collect();
