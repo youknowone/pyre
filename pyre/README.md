@@ -58,9 +58,15 @@ cargo install pyrex
 ## Building from source
 
 ```sh
+python3 scripts/install-charon.py
+python3 scripts/extract-llbc.py
 cargo build --release -p pyrex
 ./target/release/pyre script.py
 ```
+
+`install-charon.py` installs the pinned Charon version used to produce the
+LLBC artifacts; `extract-llbc.py` generates the artifacts under `build/llbc`
+that MaJIT needs during its build.
 
 ## How it works
 
