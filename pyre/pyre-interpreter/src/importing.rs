@@ -1214,15 +1214,15 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_int(vars_slot, "Py_DEBUG", 0);
     store_int(vars_slot, "Py_GIL_DISABLED", 1);
     store_int(vars_slot, "Py_ENABLE_SHARED", 0);
-    // `os.urandom` draws from a libc entropy call and never from a descriptor,
-    // so the name that describes this build's entropy source is the one the
-    // host offers. Callers read these to decide whether descriptor semantics
-    // apply at all — whether a closed or exhausted descriptor can be observed.
-    // Windows draws from the cryptography provider, which neither name
-    // describes, so it publishes neither.
-    #[cfg(target_os = "linux")]
+    // `rustpython_host_env::os::urandom` uses `getrandom::fill` and never opens
+    // a descriptor, so the name that describes this build's entropy source is
+    // the one the host offers. The sandbox route is
+    // `host_seam::ops::urandom`, which opens `/dev/urandom`; it therefore
+    // publishes neither name. Windows draws from the cryptography provider,
+    // which neither name describes, so it also publishes neither.
+    #[cfg(all(target_os = "linux", not(feature = "sandbox")))]
     store_int(vars_slot, "HAVE_GETRANDOM_SYSCALL", 1);
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(target_os = "linux"), not(feature = "sandbox")))]
     store_int(vars_slot, "HAVE_GETENTROPY", 1);
     // Pyre has no separately linkable runtime library.  Keep the build ABI
     // metadata above for wheel tags, but never invent files that are absent
