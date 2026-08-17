@@ -5071,24 +5071,20 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // is traced in a later slice.
     let jd1 = pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     d.meta_interp_mut().register_jitdriver_sd(jd1);
-    // jd1's merge-point walk (`drive_unpack_iterable_trace`) re-traces the
-    // build-time `_unpackiterable_unknown_length` jitcode, whose `BC_LIVE` ops
-    // carry offsets baked against the build-time assembler's `all_liveness`
-    // table.  jd0 traces Python bytecode (PyFrame resume path) and never reads
-    // `metainterp_sd.op_live` / `liveness_info`, so pyre otherwise leaves them
-    // unset (`op_live = 255`).  Install the build-time opcode-id table
-    // (`op_live = insns["live/"]`) + `all_liveness` byte stream into the shared
-    // `staticdata` so the jd1 walk resolves its guard snapshots
-    // (`get_list_of_active_snapshot_boxes`).  Gated on the jd1 experiment so
-    // the default build leaves jd0's staticdata byte-identical; runs here,
-    // before any trace clones the `staticdata` Arc, to satisfy the single-owner
-    // `Arc::get_mut` invariant.
-    if jd1_experiment_enabled() {
-        d.meta_interp_mut().install_liveness_from_build_parts(
-            pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
-            pyre_jit_trace::jitcode_runtime::all_liveness(),
-        );
-    }
+    // `warmspot.py metainterp_sd.finish_setup(codewriter)` always installs
+    // the assembler's opcode ids and liveness stream before either tracing or
+    // blackhole execution.  Every translated jitcode carries those ids: jd1's
+    // merge-point walk reads them while taking snapshots, and jd0's
+    // tracing-abort adoption copies them into each BlackholeInterpreter so a
+    // residual-call exception recognizes its following `live/` /
+    // `catch_exception/L`.  Leaving the default jd0 staticdata at the sentinel
+    // value 255 made a caught exception escape whenever that adoption path ran.
+    // Install the one build-time table unconditionally, before any trace clones
+    // the staticdata Arc, exactly where upstream runs finish_setup.
+    d.meta_interp_mut().install_liveness_from_build_parts(
+        pyre_jit_trace::jitcode_runtime::insns_opname_to_byte(),
+        pyre_jit_trace::jitcode_runtime::all_liveness(),
+    );
     // rlib/jit.py set_user_param — the translation-time `--jit STR`
     // option's analog. `PYRE_JIT="vec_all=1"` opts vectorization in the
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
@@ -13662,6 +13658,41 @@ mod tests {
     fn frame_global(frame: &PyFrame, name: &str) -> pyre_object::PyObjectRef {
         unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
             .unwrap_or_else(|| panic!("namespace should contain {name}"))
+    }
+
+    #[test]
+    fn driver_finish_setup_installs_blackhole_control_opcodes() {
+        let (driver, _) = driver_pair();
+        let staticdata = &driver.meta_interp().staticdata;
+        let insns = pyre_jit_trace::jitcode_runtime::insns_opname_to_byte();
+
+        assert_eq!(staticdata.op_live, i32::from(insns["live/"]));
+        assert_eq!(
+            staticdata.op_catch_exception,
+            i32::from(insns["catch_exception/L"])
+        );
+        assert_eq!(
+            staticdata.op_rvmprof_code,
+            i32::from(insns["rvmprof_code/ii"])
+        );
+        assert_eq!(
+            staticdata.liveness_info.as_slice(),
+            pyre_jit_trace::jitcode_runtime::all_liveness()
+        );
+
+        let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
+        builder.setup_cached_control_opcodes(
+            staticdata.op_live,
+            staticdata.op_catch_exception,
+            staticdata.op_rvmprof_code,
+        );
+        let blackhole = builder.acquire_interp();
+        assert_eq!(blackhole.op_live, staticdata.op_live as u8);
+        assert_eq!(
+            blackhole.op_catch_exception,
+            staticdata.op_catch_exception as u8
+        );
+        assert_eq!(blackhole.op_rvmprof_code, staticdata.op_rvmprof_code as u8);
     }
 
     #[allow(dead_code)]
