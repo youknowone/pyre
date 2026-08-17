@@ -7121,10 +7121,20 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         false,
         Some(foriter_green_key),
     );
-    if !matches!(inline, Ok(Some((DispatchOutcome::Continue, _)))) {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
+    let inline_resume_pc = match &inline {
+        Ok(Some((DispatchOutcome::Continue, next))) => *next,
+        _ => {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    };
+    // `Continue` represents either a value return at `op.next_pc`, with `dst`
+    // holding the item, or a caught `SubRaise` routed to the caller's handler
+    // target, where `dst` was not written (`pyjitpl.py:2530-2558`).  Only the
+    // value-return shape can update the FOR_ITER item bookkeeping below.
+    if inline_resume_pc != op.next_pc {
+        return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));
     }
 
     let item_op = ctx.registers_r[dst];
