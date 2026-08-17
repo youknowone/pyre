@@ -5747,7 +5747,11 @@ impl MiniMarkGC {
     ///
     /// The guard is equally load-bearing on the JIT path, which is why this
     /// entry point — not `jit_remember_young_pointer` — is what the backends'
-    /// non-array COND_CALL_GC_WB helper calls. `_reload_frame_if_necessary`
+    /// non-array COND_CALL_GC_WB helper calls for a JITFRAME base. An ordinary
+    /// store's base takes `jit_remember_young_pointer` instead
+    /// (`framework.py:538-544`), the unguarded entry the array barrier already
+    /// reaches through `jit_remember_young_pointer_from_array`.
+    /// `_reload_frame_if_necessary`
     /// (aarch64/assembler.py:967-980) re-applies the non-array barrier fast
     /// path to the *current jitframe* after every collecting helper call.
     /// Not every jitframe is nursery-allocated: the runner's entry frame, the
