@@ -3503,6 +3503,95 @@ fn emit_shadowstack_retarget(
         .store(MemFlagsData::trusted(), jf_ptr, rst, -word);
 }
 
+/// Flags for a two-slot frame access.  `trusted()` also claims 16-byte
+/// alignment, which a `Signed` slot pair does not have — a JITFRAME slot is
+/// only word-aligned — so promise no more than "cannot trap".
+fn paired_slot_flags() -> MemFlagsData {
+    MemFlagsData::new().with_notrap()
+}
+
+/// Batches consecutive JITFRAME slot stores so that two adjacent slots leave as
+/// a single `store` of an `I128`.
+///
+/// `_push_all_regs_to_frame` (x86/assembler.py:1745) writes one slot per
+/// register, and a guard exit / JUMP publish is that same shape: a run of
+/// `Signed` slots at `ITEM0 + i*WORD`.  aarch64 has `STP` for exactly this, and
+/// cranelift reaches it through an `I128` store
+/// (`aarch64/lower.isle:2767` → `aarch64_storep64`).  x86 splits an `I128` store
+/// back into the two 64-bit halves it emits today
+/// (`x64/lower.isle:3236` "store the two 64-bit halves separately"), so batching
+/// changes nothing there.
+///
+/// Only the store is deferred, never the computation of the value, so the order
+/// in which fail args are resolved is unchanged.
+#[derive(Default)]
+struct PairedSlotStores {
+    pending: Option<(i32, CValue)>,
+}
+
+impl PairedSlotStores {
+    fn store(&mut self, builder: &mut FunctionBuilder, jf_ptr: CValue, offset: i32, val: CValue) {
+        if let Some((held_ofs, held_val)) = self.pending.take() {
+            let both_word_sized = builder.func.dfg.value_type(held_val) == cl_types::I64
+                && builder.func.dfg.value_type(val) == cl_types::I64;
+            if held_ofs + 8 == offset && both_word_sized {
+                let pair = builder.ins().iconcat(held_val, val);
+                builder
+                    .ins()
+                    .store(paired_slot_flags(), pair, jf_ptr, held_ofs);
+                return;
+            }
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), held_val, jf_ptr, held_ofs);
+        }
+        self.pending = Some((offset, val));
+    }
+
+    fn flush(&mut self, builder: &mut FunctionBuilder, jf_ptr: CValue) {
+        if let Some((offset, val)) = self.pending.take() {
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), val, jf_ptr, offset);
+        }
+    }
+}
+
+/// The read direction of `PairedSlotStores`: load a run of `Signed` frame slots,
+/// taking two adjacent ones per `load` of an `I128` (`aarch64/lower.isle:2655` →
+/// `aarch64_loadp64`, i.e. `LDP`; x86 splits it into the two halves again).
+///
+/// `offsets` is in the order the caller wants the values back; only neighbours
+/// that are genuinely adjacent in the frame are paired.
+fn load_frame_slot_run(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    offsets: &[i32],
+) -> Vec<CValue> {
+    let mut vals = Vec::with_capacity(offsets.len());
+    let mut i = 0;
+    while i < offsets.len() {
+        if i + 1 < offsets.len() && offsets[i] + 8 == offsets[i + 1] {
+            let pair = builder
+                .ins()
+                .load(cl_types::I128, paired_slot_flags(), jf_ptr, offsets[i]);
+            let (lo, hi) = builder.ins().isplit(pair);
+            vals.push(lo);
+            vals.push(hi);
+            i += 2;
+        } else {
+            vals.push(builder.ins().load(
+                cl_types::I64,
+                MemFlagsData::trusted(),
+                jf_ptr,
+                offsets[i],
+            ));
+            i += 1;
+        }
+    }
+    vals
+}
+
 /// x86/assembler.py:1630-1641 `genop_discard_check_memory_error` /
 /// aarch64/assembler.rs `emit_propagate_memory_error_if_null`: branch to the
 /// `propagate_exception_descr` exit when `ptr_val` is NULL.  The metainterp
@@ -7024,6 +7113,7 @@ fn emit_guard_exit(
         .map(|ai| (ai.failargs_pos, ai))
         .collect();
 
+    let mut publish = PairedSlotStores::default();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
 
@@ -7059,9 +7149,7 @@ fn emit_guard_exit(
                     op => panic!("unsupported accum_operation '{op}'"),
                 }
             };
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), reduced, jf_ptr, offset);
+            publish.store(builder, jf_ptr, offset, reduced);
         } else {
             let val = resolve_failarg_opref(
                 builder,
@@ -7073,11 +7161,10 @@ fn emit_guard_exit(
                 ref_root_base_ofs,
                 arg_ref,
             );
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), val, jf_ptr, offset);
+            publish.store(builder, jf_ptr, offset, val);
         }
     }
+    publish.flush(builder, jf_ptr);
     // _build_failure_recovery (assembler.py:2102-2105) parity:
     //   POP [ebp + jf_gcmap]   — #2104
     //   POP [ebp + jf_descr]   — #2105
@@ -9935,14 +10022,10 @@ impl CraneliftBackend {
         // `br_table` re-entry path reads each LABEL's carried values directly
         // from the frame in its loader, so the entry block only needs the
         // host-entry inputs.
-        let entry_input_vals: Vec<CValue> = (0..num_inputs)
-            .map(|i| {
-                let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
-                builder
-                    .ins()
-                    .load(cl_types::I64, MemFlagsData::trusted(), inputs_ptr, offset)
-            })
+        let entry_input_offsets: Vec<i32> = (0..num_inputs)
+            .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
             .collect();
+        let entry_input_vals = load_frame_slot_run(&mut builder, inputs_ptr, &entry_input_offsets);
 
         // Always def_var inputargs in the entry block. When the trace
         // starts with LABEL, the LABEL block will override these via
@@ -10174,15 +10257,11 @@ impl CraneliftBackend {
                         demoted_root_syncs.push((v, home_ofs));
                     }
                 }
-                let vals: Vec<CValue> = (0..arity)
+                let carried_offsets: Vec<i32> = (0..arity)
                     .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
-                    .map(|i| {
-                        let offset = JF_FRAME_ITEM0_OFS + (i as i32) * 8;
-                        builder
-                            .ins()
-                            .load(cl_types::I64, MemFlagsData::trusted(), cur_jf, offset)
-                    })
+                    .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
                     .collect();
+                let vals = load_frame_slot_run(&mut builder, cur_jf, &carried_offsets);
                 // Ref-root re-syncs go after every dense carried-slot load:
                 // when `max_output_slots < arity` the ref-root region aliases
                 // the tail of the dense slots, and a store emitted before the
