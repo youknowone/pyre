@@ -10737,6 +10737,45 @@ impl<M: Clone> MetaInterp<M> {
         self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
     }
 
+    /// `compile.py:658-672 _DoneWithThisFrameDescr.get_result` and
+    /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
+    /// raw and typed lists every consumer of a compiled run reads.
+    ///
+    /// The slot types come from the descr the run ended on, so this is the one
+    /// step both outcomes of a compiled entry share.
+    fn decode_exit_slots(
+        backend: &BackendImpl,
+        frame: &majit_backend::DeadFrame,
+        exit_types: &[Type],
+    ) -> (ExitRawValues, ExitValues) {
+        let mut values = ExitRawValues::with_capacity(exit_types.len());
+        let mut typed_values = ExitValues::with_capacity(exit_types.len());
+        for (i, &tp) in exit_types.iter().enumerate() {
+            match tp {
+                Type::Int => {
+                    let value = backend.get_int_value(frame, i);
+                    values.push(value);
+                    typed_values.push(Value::Int(value));
+                }
+                Type::Ref => {
+                    let value = backend.get_ref_value(frame, i);
+                    values.push(value.as_usize() as i64);
+                    typed_values.push(Value::Ref(value));
+                }
+                Type::Float => {
+                    let value = backend.get_float_value(frame, i);
+                    values.push(value.to_bits() as i64);
+                    typed_values.push(Value::Float(value));
+                }
+                Type::Void => {
+                    values.push(0);
+                    typed_values.push(Value::Void);
+                }
+            }
+        }
+        (values, typed_values)
+    }
+
     /// `warmstate.py:405-419 execute_assembler(loop_token, *args)`: the run
     /// RECEIVES the token whoever decided to enter already resolved, and never
     /// looks the cell up again. Upstream hands it over the same way —
@@ -10788,6 +10827,66 @@ impl<M: Clone> MetaInterp<M> {
         // copy was paid on every call for the benefit of the guard-failure arm
         // alone.
         let exit_types: &[Type] = descr.fail_arg_types();
+        // The exit slots are read for both outcomes, so they are decoded before
+        // the split rather than once in each arm.
+        let (values, typed_values) = Self::decode_exit_slots(&self.backend, &frame, exit_types);
+
+        // `warmstate.py:404-418`: "First, a fast path to avoid raising and
+        // immediately catching a DoneWithThisFrame exception". On a final
+        // descr, upstream returns `fail_descr.get_result(cpu, deadframe)` — the
+        // exit slots and nothing else. What the general case goes on to gather
+        // is `handle_fail`'s input: which slots hold references and which hold
+        // force tokens, the guard's own status counter (`compile.py:741-745`),
+        // the loop token the guard's resume data belongs to, the frame's saved
+        // data, and the pending exception a guard exit parks in the frame. A
+        // final descr resumes nothing, is counted by nothing, and owns no
+        // resume data, so every one of those is gathered and dropped unread.
+        //
+        // Split here rather than lower down because a portal whose calls each
+        // run one compiled body to completion reaches this point once per call
+        // and never reaches the general case at all.
+        if is_finish {
+            Self::finish_compiled_run_io();
+            // The same layout the general arm synthesizes when it has no trace
+            // to build one from: a final descr carries none. The two guard-only
+            // slot lists stay empty because nothing past a final descr reads
+            // them — they exist for the blackhole resume and the bridge,
+            // neither of which a returned frame reaches. Built before the
+            // result so the descr borrow behind `exit_types` ends first.
+            let exit_layout = CompiledExitLayout {
+                rd_loop_token: green_key,
+                trace_id,
+                fail_index,
+                source_op_index: None,
+                exit_types: ExitTypes::from_slice(exit_types),
+                is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
+                gc_ref_slots: Vec::new(),
+                force_token_slots: Vec::new(),
+                recovery_layout: None,
+                resume_layout: None,
+                storage: None,
+            };
+            return Some(CompileResult {
+                values,
+                typed_values,
+                meta,
+                fail_index,
+                trace_id,
+                descr_arc,
+                is_finish,
+                is_exit_frame_with_exception,
+                exit_layout,
+                savedata: None,
+                exception: ExceptionState {
+                    exc_class: 0,
+                    exc_value: 0,
+                    ovf_flag: false,
+                },
+                status: 0,
+            });
+        }
+
         let gc_ref_slots: Vec<usize> = exit_types
             .iter()
             .enumerate()
@@ -10809,18 +10908,24 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, fail_index, back_edge_poll);
         }
 
-        let exit_arity = exit_types.len();
         // Fresh lookup, and fallible: the run can re-enter the driver through
         // a residual call and drop this green key (`jitdriver.rs:4361`
         // `remove_compiled_loop` on the unrecoverable-resume path), in which
         // case the exit falls through to the `rd_loop_token` lookup and then
         // to the synthesized default layout below.
         let compiled = self.compiled_loops.get(&green_key);
-        // FINISH descrs (singletons) have `trace_id == 0`; skip the
-        // trace lookup and synthesize the default layout per
-        // `run_compiled_detailed`.
-        let mut exit_layout = if is_finish {
-            CompiledExitLayout {
+        // Only a guard exit reaches here — a final descr returned through the
+        // fast path above — so the layout comes from the failing guard's own
+        // trace, and falls back to a synthesized one per `run_compiled_detailed`
+        // when the green key no longer holds it.
+        let mut exit_layout = compiled
+            .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+            .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+            .and_then(|(owning_key, resolved_id, trace)| {
+                Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
+            })
+            .unwrap_or_else(|| CompiledExitLayout {
                 rd_loop_token: green_key,
                 trace_id,
                 fail_index,
@@ -10828,77 +10933,22 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                // Moved rather than cloned: the `else` arm below is the only
-                // other consumer and it is mutually exclusive with this one.
                 gc_ref_slots,
                 force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
-                storage: None,
-            }
-        } else {
-            compiled
-                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-                .and_then(|(owning_key, resolved_id, trace)| {
-                    Self::compiled_exit_layout_from_trace(
-                        trace,
-                        owning_key,
-                        resolved_id,
-                        fail_index,
-                    )
-                })
-                .unwrap_or_else(|| CompiledExitLayout {
-                    rd_loop_token: green_key,
-                    trace_id,
-                    fail_index,
-                    source_op_index: None,
-                    exit_types: ExitTypes::from_slice(exit_types),
-                    is_finish,
-                    is_exception_exit: is_exit_frame_with_exception,
-                    gc_ref_slots,
-                    force_token_slots,
-                    recovery_layout: None,
-                    resume_layout: None,
-                    // The green-key index no longer holds this trace, but the
-                    // failing descr still carries the resume payload it was
-                    // compiled with (`compile.py:849 get_resumestorage`), so a
-                    // blackhole resume off this layout stays possible.
-                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                        .map(std::sync::Arc::new),
-                })
-        };
+                // The green-key index no longer holds this trace, but the
+                // failing descr still carries the resume payload it was
+                // compiled with (`compile.py:849 get_resumestorage`), so a
+                // blackhole resume off this layout stays possible.
+                storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                    .map(std::sync::Arc::new),
+            });
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
         // extend exit_layout.exit_types to match (conservative Int for extras).
         if exit_types.len() > exit_layout.exit_types.len() {
             exit_layout.exit_types.resize(exit_types.len(), Type::Int);
-        }
-        let mut values = ExitRawValues::with_capacity(exit_arity);
-        let mut typed_values = ExitValues::with_capacity(exit_arity);
-        for (i, &tp) in exit_types.iter().enumerate() {
-            match tp {
-                Type::Int => {
-                    let value = self.backend.get_int_value(&frame, i);
-                    values.push(value);
-                    typed_values.push(Value::Int(value));
-                }
-                Type::Ref => {
-                    let value = self.backend.get_ref_value(&frame, i);
-                    values.push(value.as_usize() as i64);
-                    typed_values.push(Value::Ref(value));
-                }
-                Type::Float => {
-                    let value = self.backend.get_float_value(&frame, i);
-                    values.push(value.to_bits() as i64);
-                    typed_values.push(Value::Float(value));
-                }
-                Type::Void => {
-                    values.push(0);
-                    typed_values.push(Value::Void);
-                }
-            }
         }
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
