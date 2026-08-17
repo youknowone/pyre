@@ -2377,8 +2377,14 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
+        // The receiver is already off the value stack, so this local is the
+        // only thing keeping it reachable while `getattr_str` runs arbitrary
+        // Python — and the failing branch below still has to read its type.
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.base();
+        roots.pin_root(obj);
         getattr_str(obj, name).map_err(|error| {
-            if finalize_failed_attr_receiver_now(obj) {
+            if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 // Keep this write on the live virtualizable red frame.  The
                 // opaque helper only answers the semantic type question;
                 // writing `frame.flags` inside it would race the JIT's
@@ -4739,6 +4745,11 @@ impl OpcodeStepExecutor for PyFrame {
         // could not perform) aborts the trace instead of panicking the
         // hard-asserting `pop()`.
         let obj = self.pop_value()?;
+        // Popped, so nothing but this local still reaches the receiver across
+        // the cache lookup, which runs arbitrary Python on a cache miss.
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.base();
+        roots.pin_root(obj);
         let w_value = unsafe {
             crate::objspace::std::mapdict::load_attr_caching(
                 self.pycode as PyObjectRef,
@@ -4748,7 +4759,7 @@ impl OpcodeStepExecutor for PyFrame {
             )
         }
         .map_err(|error| {
-            if finalize_failed_attr_receiver_now(obj) {
+            if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
                 self.defer_failed_attr_until_pop_except();
             }
             error

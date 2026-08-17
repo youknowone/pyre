@@ -82,6 +82,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONOPTIMIZE",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONUTF8",
+    "PYTHONWARNDEFAULTENCODING",
     "PYTHONWARNINGS",
     "PYTHONIOENCODING",
     "LC_ALL",
@@ -248,6 +249,13 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     flags.safe_path = fold_presence_flag(&flags, flags.safe_path, "PYTHONSAFEPATH");
     flags.dev_mode = fold_presence_flag(&flags, flags.dev_mode, "PYTHONDEVMODE");
     flags.inspect = fold_presence_flag(&flags, flags.inspect, "PYTHONINSPECT");
+    // app_main.py:773-774 — the variable enables it on any non-empty value,
+    // `0` included, the same way `-X warn_default_encoding` does.
+    flags.warn_default_encoding = fold_presence_flag(
+        &flags,
+        flags.warn_default_encoding,
+        "PYTHONWARNDEFAULTENCODING",
+    );
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {

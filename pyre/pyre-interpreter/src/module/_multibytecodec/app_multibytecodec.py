@@ -1,20 +1,74 @@
 """PyPy-compatible app-level surface over the cjkcodecs engine."""
 
+# These are the module's own classes, so `__module__` should say so; without
+# it the exec namespace leaves them looking like builtins.  Same reason
+# `app_operator.py` sets it.
+__name__ = "_multibytecodec"
+
+
+# `PyArg_ParseTupleAndKeywords` leaves an argument the caller omitted at the C
+# NULL its variable was initialized to, and `internal_error_callback(NULL)`
+# reads that as "strict".  An explicit `None` reaches the `s` converter
+# instead, which rejects it.  A sentinel is what keeps the two apart here.
+_OMITTED = object()
+
+
+def _codec_errors_arg(name, errors):
+    # The `errors: str(accept={str, NoneType})` the two `MultibyteCodec`
+    # methods declare: `None` is the "strict" spelling.
+    if errors is None:
+        return "strict"
+    if not isinstance(errors, str):
+        raise TypeError(
+            f"{name}() argument 'errors' must be str or None, "
+            f"not {type(errors).__name__}"
+        )
+    return errors
+
+
+def _errors_arg(name, position, errors):
+    # The plain `s` the four initializers declare: only a str, and an omitted
+    # one means "strict".
+    if errors is _OMITTED:
+        return "strict"
+    if not isinstance(errors, str):
+        # `seterror` names `None` itself rather than its type.
+        got = "None" if errors is None else type(errors).__name__
+        raise TypeError(f"{name}() argument {position} must be str, not {got}")
+    return errors
+
+
+def _codec_of(obj):
+    # `mbiencoder_init` and its three siblings read `codec` off the type, not
+    # off the instance, so the four base classes -- which carry none -- raise
+    # right here rather than at the first encode or decode.
+    codec = type(obj).codec
+    if not isinstance(codec, MultibyteCodec):
+        raise TypeError("codec is unexpected type")
+    return codec
+
 
 class MultibyteCodec:
     def __init__(self, name):
         self.name = name
 
-    def encode(self, input, errors="strict"):
-        return _encode(self.name, input, errors, True)
+    def encode(self, input, errors=None):
+        return _encode(self.name, input, _codec_errors_arg("encode", errors), True)
 
-    def decode(self, input, errors="strict"):
-        return _decode(self.name, input, errors, True)
+    def decode(self, input, errors=None):
+        return _decode(self.name, input, _codec_errors_arg("decode", errors), True)
 
 
 class MultibyteIncrementalDecoder:
-    def __init__(self, errors="strict"):
-        self.errors = "strict" if errors is None else errors
+    # The name and argument position the initializer reports a non-str
+    # `errors` under; `MultibyteStreamReader` reuses the body under its own.
+    _init_name = "IncrementalDecoder"
+    _init_errors_position = 1
+
+    def __init__(self, errors=_OMITTED):
+        cls = type(self)
+        self.errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
+        self.codec = _codec_of(self)
         self.pending = b""
         self.state = 0
 
@@ -52,8 +106,13 @@ class MultibyteIncrementalDecoder:
 
 
 class MultibyteIncrementalEncoder:
-    def __init__(self, errors="strict"):
-        self.errors = "strict" if errors is None else errors
+    _init_name = "IncrementalEncoder"
+    _init_errors_position = 1
+
+    def __init__(self, errors=_OMITTED):
+        cls = type(self)
+        self.errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
+        self.codec = _codec_of(self)
         self.pending = ""
 
     def encode(self, object, final=False):
@@ -106,12 +165,15 @@ class MultibyteIncrementalEncoder:
 
 
 class MultibyteStreamReader(MultibyteIncrementalDecoder):
-    def __new__(cls, stream, errors=None):
+    _init_name = "StreamReader"
+    _init_errors_position = 2
+
+    def __new__(cls, stream, errors=_OMITTED):
         self = object.__new__(cls)
         self.stream = stream
         return self
 
-    def __init__(self, stream, errors=None):
+    def __init__(self, stream, errors=_OMITTED):
         MultibyteIncrementalDecoder.__init__(self, errors)
 
     def __read(self, read, size):
@@ -136,12 +198,15 @@ class MultibyteStreamReader(MultibyteIncrementalDecoder):
 
 
 class MultibyteStreamWriter(MultibyteIncrementalEncoder):
-    def __new__(cls, stream, errors=None):
+    _init_name = "StreamWriter"
+    _init_errors_position = 2
+
+    def __new__(cls, stream, errors=_OMITTED):
         self = object.__new__(cls)
         self.stream = stream
         return self
 
-    def __init__(self, stream, errors=None):
+    def __init__(self, stream, errors=_OMITTED):
         MultibyteIncrementalEncoder.__init__(self, errors)
 
     def write(self, data):

@@ -143,9 +143,10 @@ fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
 fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
     let mut out = Wtf8Buf::new();
     for &unit in units {
-        if let Some(cp) = CodePoint::from_u32(unit) {
-            out.push(cp);
-        }
+        // Every unit here came from a mapping table or from a replacement the
+        // error handler already produced as text, so it is a code point.
+        // Skipping a unit that is not would drop a character silently.
+        out.push(CodePoint::from_u32(unit).expect("cjkcodecs unit is a code point"));
     }
     out
 }
