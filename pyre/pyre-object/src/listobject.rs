@@ -762,15 +762,23 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     list.set_object_items_from_vec(seed);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
+    // Take the strategy together with the block, ahead of the two `install`
+    // calls below.  `list_object_custom_trace` reaches `items` only under the
+    // Object strategy, and `IntArray::install` drops the outgoing storage
+    // through `dealloc_typed_items_block`, whose ownership query is a
+    // safepoint.  `set_object_items_from_vec` closed its own root scope on the
+    // way out, so between its store and this line the fresh block's only
+    // reference is the `items` edge the trace is still skipping — a collection
+    // in that window reclaims it and leaves `items` naming reused nursery.
+    list.strategy = ListStrategy::Object;
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
     // Object strategy reads neither typed array again, so drop both to the
     // empty form instead of installing two fresh single-slot blocks.
     list.int_items.install(IntArray::empty());
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     list.float_items.install(FloatArray::empty());
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let list = &mut *(obj as *mut W_ListObject);
-    list.strategy = ListStrategy::Object;
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
