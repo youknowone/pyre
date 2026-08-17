@@ -96,9 +96,11 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # `_ssl.enum_certificates`, and `EXCEPTION_CONTINUE_SEARCH` for the
 # `faulthandler` vectored exception handler, and `winsound`'s three calls
 # (PlaySoundW in Media_Audio, Beep and MessageBeep in
-# System_Diagnostics_Debug). Kept on the same 0.61 line
-# rustpython-host_env's nt module resolves to, so HANDLE types match at the
-# boundary.
+# System_Diagnostics_Debug), and `_winapi.NeedCurrentDirectoryForExePath`
+# (System_Environment), and the OVERLAPPED record `_winapi.Overlapped` owns
+# with the CancelIoEx/GetOverlappedResult pair that drives it (System_IO).
+# Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
+# HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -107,6 +109,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Threading",

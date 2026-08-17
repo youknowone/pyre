@@ -1164,6 +1164,14 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // buffer/result fields are traced by the ordinary object marker.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(181, typed::<crate::module::_overlapped::W_Overlapped>()),
+        // `_winapi.Overlapped` follows it: a second record of the same kind,
+        // owning its own event and transfer buffer rather than retained
+        // Python objects, so nothing of it is traced beyond the header.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        subclass_range_alias(
+            182,
+            typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
+        ),
     ]
 }
 
@@ -1182,8 +1190,10 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]
         const MMAP_HIERARCHY_SLOTS: usize = 0;
+        // `_overlapped.Overlapped` and `_winapi.Overlapped`, both of which a
+        // sandbox build leaves out.
         #[cfg(windows)]
-        const OVERLAPPED_HIERARCHY_SLOTS: usize = 1;
+        const OVERLAPPED_HIERARCHY_SLOTS: usize = 2;
         #[cfg(not(windows))]
         const OVERLAPPED_HIERARCHY_SLOTS: usize = 0;
         &hierarchy[..hierarchy.len()

@@ -701,6 +701,10 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
     (181, Some(0)),
+    // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
+    // waited on through an event of its own rather than a completion port.
+    #[cfg(windows)]
+    (182, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

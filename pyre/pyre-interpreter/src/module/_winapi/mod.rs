@@ -1,4 +1,4 @@
-//! _winapi module — partial port of `lib_pypy/_winapi.py`.
+//! _winapi module — the Win32 calls the stdlib's Windows branches reach for.
 //!
 //! The Windows build reports `sys.platform == "win32"` and installs the posix
 //! module under `os.name == "nt"`, so both the stdlib's `os.name == "nt"` and
@@ -6,29 +6,53 @@
 //! `_winapi`, and without the module `import shutil` — hence `tempfile`, and
 //! everything downstream — fails outright.
 //!
-//! The one name a shutil call then goes on to need is
-//! `NeedCurrentDirectoryForExePath`, which `shutil.which` invokes on every
-//! executable lookup; the `CopyFile2` flag and error constants round out
-//! that part of the module surface, though `shutil.copyfile` reads them
-//! only behind a `hasattr(_winapi, "CopyFile2")` probe.  `CopyFile2` is
-//! deliberately absent, so the probe fails and the generic read/write copy
-//! runs, which is the path pyre wants.  Neither name appears in
-//! `lib_pypy/_winapi.py`, which predates the stdlib revision pyre ships, so
-//! both are defined against the Win32 headers instead.
+//! `lib_pypy/_winapi.py` predates the stdlib revision pyre ships and stops
+//! well short of it, so the shapes here follow `PC/_winapi.c` and the Win32
+//! headers instead.  The module comes in three parts: the constants and the
+//! few calls made straight against `windows-sys` are below; [`process`] is
+//! the launch half `subprocess.Popen` spawns through — `CreatePipe`,
+//! `DuplicateHandle`, `GetStdHandle`, `CreateProcess`, `TerminateProcess`,
+//! `GetFileType` — and [`host`] is everything
+//! `rustpython_host_env::winapi` backs, which is the named-pipe, event,
+//! mutex, file-mapping, path and locale surface `multiprocessing`,
+//! `ntpath.normcase`, `mimetypes` and `shutil.copy2` walk.
 //!
-//! `subprocess` picks its Windows implementation on the presence of `msvcrt`
-//! (now installed), so its module body imports the process/priority constants
-//! and captures `CloseHandle`/`WaitForSingleObject`/`GetExitCodeProcess` as
-//! default arguments.  The launch itself — `CreatePipe`, `DuplicateHandle`,
-//! `GetStdHandle`, `CreateProcess`, `TerminateProcess`, `GetFileType` — is in
-//! [`process`], which is what `Popen` actually spawns through.
+//! `subprocess` picks its Windows implementation on the presence of `msvcrt`,
+//! so its module body imports the process/priority constants and captures
+//! `CloseHandle`/`WaitForSingleObject`/`GetExitCodeProcess` as default
+//! arguments.
+//!
+//! [`overlapped`] holds the `Overlapped` object and the asynchronous form of
+//! `ConnectNamedPipe`, `ReadFile` and `WriteFile` that produces one, which is
+//! what `multiprocessing.connection`'s `PipeConnection` is written against.
 
 /// Map the current thread's last OS error to an `OSError`
 /// (`PyErr_SetFromWindowsErr`): the code is the one `winerror` reports.
 fn last_os_error() -> crate::PyError {
-    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    crate::PyError::os_error_win32_syscall2(code, pyre_object::PY_NULL, pyre_object::PY_NULL)
+    win32_err(std::io::Error::last_os_error())
 }
+
+/// The `OSError` a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
+fn win32_err(error: std::io::Error) -> crate::PyError {
+    crate::PyError::os_error_win32_syscall2(
+        error.raw_os_error().unwrap_or(0),
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    )
+}
+
+/// [`win32_err`] for a call that reports its error code rather than setting
+/// the thread's.
+fn win32_code(code: u32) -> crate::PyError {
+    crate::PyError::os_error_win32_syscall2(code as i32, pyre_object::PY_NULL, pyre_object::PY_NULL)
+}
+
+#[cfg(feature = "host_env")]
+mod host;
+// The asynchronous half reaches the host's overlapped I/O directly, so a
+// sandbox build leaves it out along with `_overlapped`.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub mod overlapped;
 
 /// The process-launch half of the module, which `subprocess.Popen` walks in
 /// order: `CreatePipe` for each redirected stream, `DuplicateHandle` to make
@@ -43,14 +67,7 @@ mod process {
     use rustpython_host_env::winapi as host_winapi;
     use windows_sys::Win32::Foundation::HANDLE;
 
-    /// The OSError a failed Win32 call reports (`PyErr_SetFromWindowsErr`).
-    fn win32_err(error: std::io::Error) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(
-            error.raw_os_error().unwrap_or(0),
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-        )
-    }
+    use super::win32_err;
 
     /// A handle as Python spells it — an integer, which is what every call
     /// here takes and gives back.
@@ -334,13 +351,48 @@ mod process {
 crate::py_module! {
     "_winapi",
     int_constants: {
-        // CopyFileEx flags (winbase.h).
+        // CopyFileEx / CopyFile2 flags (winbase.h).
         "COPY_FILE_ALLOW_DECRYPTED_DESTINATION" => 0x0000_0008,
         "COPY_FILE_COPY_SYMLINK" => 0x0000_0800,
+        "COPY_FILE_DIRECTORY" => 0x0000_0080,
+        "COPY_FILE_FAIL_IF_EXISTS" => 0x0000_0001,
+        "COPY_FILE_NO_BUFFERING" => 0x0000_1000,
+        "COPY_FILE_NO_OFFLOAD" => 0x0004_0000,
+        "COPY_FILE_OPEN_SOURCE_FOR_WRITE" => 0x0000_0004,
+        "COPY_FILE_REQUEST_COMPRESSED_TRAFFIC" => 0x1000_0000,
+        "COPY_FILE_REQUEST_SECURITY_PRIVILEGES" => 0x0000_2000,
+        "COPY_FILE_RESTARTABLE" => 0x0000_0002,
+        "COPY_FILE_RESUME_FROM_PAUSE" => 0x0000_4000,
+        // The reasons a `CopyFile2` progress routine is called and the
+        // answers it may give (winbase.h).  Nothing here calls one — the
+        // extended parameters leave the callback field unset — but the
+        // constants are part of the module's surface.
+        "COPYFILE2_CALLBACK_CHUNK_STARTED" => 1,
+        "COPYFILE2_CALLBACK_CHUNK_FINISHED" => 2,
+        "COPYFILE2_CALLBACK_STREAM_STARTED" => 3,
+        "COPYFILE2_CALLBACK_STREAM_FINISHED" => 4,
+        "COPYFILE2_CALLBACK_POLL_CONTINUE" => 5,
+        "COPYFILE2_CALLBACK_ERROR" => 6,
+        "COPYFILE2_PROGRESS_CONTINUE" => 0,
+        "COPYFILE2_PROGRESS_CANCEL" => 1,
+        "COPYFILE2_PROGRESS_STOP" => 2,
+        "COPYFILE2_PROGRESS_QUIET" => 3,
+        "COPYFILE2_PROGRESS_PAUSE" => 4,
         // System error codes (winerror.h) a caller compares
         // `OSError.winerror` against to decide whether to retry.
         "ERROR_ACCESS_DENIED" => 5,
         "ERROR_PRIVILEGE_NOT_HELD" => 1314,
+        "ERROR_ALREADY_EXISTS" => 183,
+        "ERROR_BROKEN_PIPE" => 109,
+        "ERROR_IO_PENDING" => 997,
+        "ERROR_MORE_DATA" => 234,
+        "ERROR_NETNAME_DELETED" => 64,
+        "ERROR_NO_DATA" => 232,
+        "ERROR_NO_SYSTEM_RESOURCES" => 1450,
+        "ERROR_OPERATION_ABORTED" => 995,
+        "ERROR_PIPE_BUSY" => 231,
+        "ERROR_PIPE_CONNECTED" => 535,
+        "ERROR_SEM_TIMEOUT" => 121,
         // `subprocess` imports these at module load (its Windows branch, taken
         // once `msvcrt` exists) — GetStdHandle ids, ShowWindow/STARTUPINFO
         // flags, and CreateProcess creation/priority flags (winbase.h,
@@ -353,6 +405,16 @@ crate::py_module! {
         "STARTF_USESTDHANDLES" => 0x0000_0100,
         "STARTF_FORCEONFEEDBACK" => 0x0000_0040,
         "STARTF_FORCEOFFFEEDBACK" => 0x0000_0080,
+        "STARTF_USESIZE" => 0x0000_0002,
+        "STARTF_USEPOSITION" => 0x0000_0004,
+        "STARTF_USECOUNTCHARS" => 0x0000_0008,
+        "STARTF_USEFILLATTRIBUTE" => 0x0000_0010,
+        "STARTF_RUNFULLSCREEN" => 0x0000_0020,
+        "STARTF_USEHOTKEY" => 0x0000_0200,
+        "STARTF_TITLEISLINKNAME" => 0x0000_0800,
+        "STARTF_TITLEISAPPID" => 0x0000_1000,
+        "STARTF_PREVENTPINNING" => 0x0000_2000,
+        "STARTF_UNTRUSTEDSOURCE" => 0x0000_8000,
         "CREATE_NEW_CONSOLE" => 0x0000_0010,
         "CREATE_NEW_PROCESS_GROUP" => 0x0000_0200,
         "CREATE_NO_WINDOW" => 0x0800_0000,
@@ -384,18 +446,82 @@ crate::py_module! {
         "FILE_TYPE_CHAR" => 0x0002,
         "FILE_TYPE_PIPE" => 0x0003,
         "FILE_TYPE_REMOTE" => 0x8000,
-        // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h).
+        // `OpenProcess`/`DuplicateHandle` access rights (processthreadsapi.h),
+        // and the one right every waitable object grants (winnt.h).
         "PROCESS_ALL_ACCESS" => 0x001F_FFFF,
         "PROCESS_DUP_HANDLE" => 0x0000_0040,
+        "SYNCHRONIZE" => 0x0010_0000,
+        // `CreateFile` access rights, share modes and creation dispositions
+        // (winnt.h, fileapi.h).
+        "GENERIC_READ" => 0x8000_0000u32,
+        "GENERIC_WRITE" => 0x4000_0000,
+        "FILE_GENERIC_READ" => 0x0012_0089,
+        "FILE_GENERIC_WRITE" => 0x0012_0116,
+        "OPEN_EXISTING" => 3,
+        "FILE_FLAG_OVERLAPPED" => 0x4000_0000,
+        "FILE_FLAG_FIRST_PIPE_INSTANCE" => 0x0008_0000,
+        // Named pipe open modes, pipe modes and waits (winbase.h).
+        "PIPE_ACCESS_INBOUND" => 0x0000_0001,
+        "PIPE_ACCESS_DUPLEX" => 0x0000_0003,
+        "PIPE_READMODE_MESSAGE" => 0x0000_0002,
+        "PIPE_TYPE_MESSAGE" => 0x0000_0004,
+        "PIPE_WAIT" => 0x0000_0000,
+        "PIPE_UNLIMITED_INSTANCES" => 255,
+        "NMPWAIT_WAIT_FOREVER" => 0xFFFF_FFFFu32,
+        // File-mapping protections, view access rights, section attributes
+        // and the region states `VirtualQuery` reports (winnt.h, memoryapi.h).
+        "PAGE_NOACCESS" => 0x0000_0001,
+        "PAGE_READONLY" => 0x0000_0002,
+        "PAGE_READWRITE" => 0x0000_0004,
+        "PAGE_WRITECOPY" => 0x0000_0008,
+        "PAGE_EXECUTE" => 0x0000_0010,
+        "PAGE_EXECUTE_READ" => 0x0000_0020,
+        "PAGE_EXECUTE_READWRITE" => 0x0000_0040,
+        "PAGE_EXECUTE_WRITECOPY" => 0x0000_0080,
+        "PAGE_GUARD" => 0x0000_0100,
+        "PAGE_NOCACHE" => 0x0000_0200,
+        "PAGE_WRITECOMBINE" => 0x0000_0400,
+        "FILE_MAP_COPY" => 0x0000_0001,
+        "FILE_MAP_WRITE" => 0x0000_0002,
+        "FILE_MAP_READ" => 0x0000_0004,
+        "FILE_MAP_EXECUTE" => 0x0000_0020,
+        "FILE_MAP_ALL_ACCESS" => 0x000F_001F,
+        "SEC_IMAGE" => 0x0100_0000,
+        "SEC_RESERVE" => 0x0400_0000,
+        "SEC_COMMIT" => 0x0800_0000,
+        "SEC_NOCACHE" => 0x1000_0000,
+        "SEC_WRITECOMBINE" => 0x4000_0000,
+        "SEC_LARGE_PAGES" => 0x8000_0000u32,
+        "MEM_COMMIT" => 0x0000_1000,
+        "MEM_RESERVE" => 0x0000_2000,
+        "MEM_FREE" => 0x0001_0000,
+        "MEM_PRIVATE" => 0x0002_0000,
+        "MEM_MAPPED" => 0x0004_0000,
+        "MEM_IMAGE" => 0x0100_0000,
+        // `LCMapStringEx` transforms and the longest locale name it takes
+        // (winnls.h).  The four that answer with a sort key or a hash rather
+        // than text are not among them — `LCMapStringEx` rejects those.
+        "LCMAP_LOWERCASE" => 0x0000_0100,
+        "LCMAP_UPPERCASE" => 0x0000_0200,
+        "LCMAP_TITLECASE" => 0x0000_0300,
+        "LCMAP_HIRAGANA" => 0x0010_0000,
+        "LCMAP_KATAKANA" => 0x0020_0000,
+        "LCMAP_HALFWIDTH" => 0x0040_0000,
+        "LCMAP_FULLWIDTH" => 0x0080_0000,
+        "LCMAP_LINGUISTIC_CASING" => 0x0100_0000,
+        "LCMAP_SIMPLIFIED_CHINESE" => 0x0200_0000,
+        "LCMAP_TRADITIONAL_CHINESE" => 0x0400_0000,
+        "LOCALE_NAME_MAX_LENGTH" => 85,
     },
     inline_functions: {
         fn NeedCurrentDirectoryForExePath(exe_name: &str) -> bool {
-            unsafe extern "system" {
-                fn NeedCurrentDirectoryForExePathW(exe_name: *const u16) -> i32;
-            }
             let exe_name_w: Vec<u16> =
                 exe_name.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe { NeedCurrentDirectoryForExePathW(exe_name_w.as_ptr()) != 0 }
+            unsafe {
+                windows_sys::Win32::System::Environment::NeedCurrentDirectoryForExePathW(
+                    exe_name_w.as_ptr(),
+                ) != 0
+            }
         }
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
@@ -442,6 +568,7 @@ crate::py_module! {
         // above.
         #[cfg(feature = "host_env")]
         {
+            host::install(ns);
             for (name, arity, function) in [
                 ("GetStdHandle", 1, process::get_std_handle as crate::BuiltinCodeFn),
                 ("GetCurrentProcess", 0, process::get_current_process),

@@ -766,6 +766,15 @@ unsafe fn overlapped_destructor(obj_addr: usize) {
     };
 }
 
+#[cfg(all(windows, not(feature = "sandbox")))]
+unsafe fn winapi_overlapped_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_winapi::overlapped::w_overlapped_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 /// Custom trace for objects carrying the `MapdictStorageMixin` prefix
 /// (`W_ObjectObject` and native-layout Python subclasses such as
 /// `W_Random`; instance `map`+`storage`, `mapdict.py:907-910`).
@@ -3909,6 +3918,17 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, overlapped_destructor);
+    }
+    // `_winapi.Overlapped` owns the same kind of native record, waited on
+    // through its own event rather than a completion port. Sweep cancels and
+    // waits out an operation still in flight before the buffer it writes into
+    // is freed, then closes that event.
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    {
+        let descr = <pyre_interpreter::module::_winapi::overlapped::W_Overlapped
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+        gc.types.set_destructor(tid, winapi_overlapped_destructor);
     }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py:21` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
