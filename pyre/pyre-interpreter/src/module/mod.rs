@@ -136,4 +136,7 @@ pub mod time;
 pub mod unicodedata;
 #[cfg(windows)]
 pub mod winreg;
+#[allow(non_snake_case)]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub mod winsound;
 pub mod zlib;

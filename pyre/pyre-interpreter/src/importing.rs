@@ -607,6 +607,10 @@ pub fn install_builtin_modules() {
     // `msvcrt`; `getpass` reads the console through it.
     #[cfg(all(windows, feature = "host_env"))]
     pyre_install_module!(msvcrt);
+    // winsound reaches the host sound device directly, so it belongs with the
+    // other host-access modules a sandbox build leaves out.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pyre_install_module!(winsound);
     pyre_install_module!(_abc);
     pyre_install_module!(_bisect);
     pyre_install_module!(_heapq);
@@ -736,6 +740,10 @@ pub fn install_builtin_modules() {
     register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_json", crate::module::_json::init);
     register_builtin_module("_tokenize", crate::module::_tokenize::init);
+    // `_scproxy` is built only on macOS, and `urllib.request` reaches it only
+    // under `sys.platform == 'darwin'`. Registering it anywhere else puts a
+    // name in `sys.builtin_module_names` that no host has.
+    #[cfg(target_os = "macos")]
     register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
@@ -1343,6 +1351,7 @@ fn init_tracemalloc(ns: PyObjectRef) {
 /// `urllib.request.getproxies_macosx_sysconf` / `proxy_bypass_macosx_sysconf`
 /// import.  Report "no system proxy configured" so the import succeeds and
 /// proxy resolution yields an empty mapping.
+#[cfg(target_os = "macos")]
 fn init_scproxy(ns: PyObjectRef) {
     crate::module_ns_store(
         ns,
