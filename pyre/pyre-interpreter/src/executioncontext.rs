@@ -2637,6 +2637,12 @@ impl UserDelAction {
             }
             return;
         }
+        if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()
+            || pyre_object::generator::AsyncGenAThrow::from_obj(current()).is_some()
+        {
+            crate::baseobjspace::async_gen_awaitable_finalize(current());
+            return;
+        }
         if unsafe { pyre_object::generator::is_generator_or_coroutine(current()) } {
             if self.gc_disabled(current()) {
                 return;

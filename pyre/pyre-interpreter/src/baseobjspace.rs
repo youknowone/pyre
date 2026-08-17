@@ -18488,19 +18488,18 @@ fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
 pub(crate) fn async_generator_anext_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_asend_new(
-        async_gen,
-        w_none(),
-    ))
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, w_none());
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_asend_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     let value = crate::type_methods::arg_or_none(args, 1);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_asend_new(
-        async_gen, value,
-    ))
+    let awaitable = pyre_object::generator::w_async_gen_asend_new(async_gen, value);
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
@@ -18526,23 +18525,23 @@ pub(crate) fn async_generator_athrow_method(args: &[PyObjectRef]) -> PyResult {
     }
     let async_gen = args[0];
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_athrow_new(
+    let awaitable = pyre_object::generator::w_async_gen_athrow_new(
         async_gen,
         args[1],
         crate::type_methods::arg_or_none(args, 2),
         crate::type_methods::arg_or_none(args, 3),
-    ))
+    );
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 pub(crate) fn async_generator_aclose_method(args: &[PyObjectRef]) -> PyResult {
     let async_gen = args.first().copied().unwrap_or(PY_NULL);
     async_generator_init_hooks(async_gen)?;
-    Ok(pyre_object::generator::w_async_gen_athrow_new(
-        async_gen,
-        PY_NULL,
-        w_none(),
-        w_none(),
-    ))
+    let awaitable =
+        pyre_object::generator::w_async_gen_athrow_new(async_gen, PY_NULL, w_none(), w_none());
+    crate::executioncontext::register_finalizer(awaitable);
+    Ok(awaitable)
 }
 
 fn async_gen_unwrap_value(async_gen: PyObjectRef, value: PyObjectRef) -> PyResult {
@@ -18889,6 +18888,60 @@ pub(crate) fn async_gen_athrow_throw_method(args: &[PyObjectRef]) -> PyResult {
             .state = pyre_object::generator::ASYNC_GEN_STATE_CLOSED;
     }
     result
+}
+
+/// CPython 3.14 `async_gen_asend_finalize` /
+/// `async_gen_athrow_finalize`: an async-generator method awaitable that never
+/// left its initial state reports a `RuntimeWarning` from finalizer context.
+/// PyPy's tracing collector reaches the same lifetime through
+/// `W_Root.register_finalizer`; unlike CPython's refcount-triggered
+/// `tp_finalize`, the queue is drained at a GC safe point.
+pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
+    use pyre_object::generator::{
+        ASYNC_GEN_STATE_INIT, AsyncGenASend, AsyncGenAThrow, w_generator_get_qualname,
+    };
+
+    let (async_gen, method, state) = if let Some(payload) = AsyncGenASend::from_obj(awaitable) {
+        (payload.async_gen, "asend", payload.state)
+    } else if let Some(payload) = AsyncGenAThrow::from_obj(awaitable) {
+        (
+            payload.async_gen,
+            if payload.w_exc_type.is_null() {
+                "aclose"
+            } else {
+                "athrow"
+            },
+            payload.state,
+        )
+    } else {
+        return;
+    };
+    if state != ASYNC_GEN_STATE_INIT {
+        return;
+    }
+
+    let qualname = unsafe { w_generator_get_qualname(async_gen) };
+    let method_repr = unsafe { crate::display::py_repr_wtf8(w_str_new(method)) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
+    let qualname_repr = unsafe { crate::display::py_repr_wtf8(qualname) }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("'<unknown>'".to_owned()));
+    let message = crate::display::wtf8_format!(
+        "coroutine method ",
+        method_repr,
+        " of ",
+        qualname_repr,
+        " was never awaited"
+    );
+    let w_message = w_str_from_wtf8(message);
+    if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+        let repr = unsafe { crate::display::py_repr_wtf8(async_gen) }
+            .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
+        let where_desc = crate::display::wtf8_format!(
+            "Exception ignored while finalizing async generator ",
+            repr
+        );
+        err.write_unraisable(w_none(), &where_desc, async_gen);
+    }
 }
 
 /// generator.py `_finalize_` — called by the GC finalizer when a suspended generator

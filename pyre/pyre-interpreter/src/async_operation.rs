@@ -12,10 +12,12 @@ use pyre_object::PyObjectRef;
 
 use crate::PyResult;
 
-/// `aiter` / `anext` ported verbatim from app_operation.py.  The
+/// `aiter` / `anext` ported from app_operation.py.  The
 /// `_NOT_PROVIDED` sentinel stays in the intermediate namespace that both
 /// functions retain as their `__globals__`, so only the two public names
-/// need to be surfaced.
+/// need to be surfaced.  `anext` calls `__anext__` before constructing its
+/// default wrapper, matching CPython 3.14's `builtin_anext_impl` synchronous
+/// exception behavior.
 const ASYNC_OP_SRC: &str = r#"
 _NOT_PROVIDED = object()
 
@@ -47,12 +49,14 @@ def anext(iterator, default=_NOT_PROVIDED):
     except AttributeError:
         raise TypeError(f"'{type(iterator).__name__}' object is not an async iterator")
 
+    awaitable = __anext__(iterator)
+
     if default is _NOT_PROVIDED:
-        return __anext__(iterator)
+        return awaitable
 
     async def anext_impl():
         try:
-            return await __anext__(iterator)
+            return await awaitable
         except StopAsyncIteration:
             return default
 
