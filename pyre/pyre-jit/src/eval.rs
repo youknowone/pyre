@@ -3850,11 +3850,11 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
-    // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
-    // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
-    // after the last unconditional vtable-bearing object (`W_GcStats`) so only
-    // the trailing bare-`with_gc_ptrs` ids (twister, leaf storage boxes) shift,
-    // and those carry no census alias.  `posix` is
+    // `posix.DirEntry` has four inline GC edges (`w_name`/`w_path` and the
+    // cached `w_stat`/`w_lstat`, the latter two NULL until first requested),
+    // while `posix.ScandirIterator` owns its entries list. Appended
+    // after the unconditional native owners and before the optional native
+    // tail. `posix` is
     // compiled out on wasm32, so this registration and its census aliases are
     // gated to match — which is why it stays last among the rclass
     // registrations: an unconditional type after it would take a different id
@@ -3864,6 +3864,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         &mut pytype_to_tid,
         <pyre_interpreter::module::posix::W_DirEntry
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::posix::W_ScandirIterator
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `_ssl` keeps rustls objects behind opaque native pointers.  Context and

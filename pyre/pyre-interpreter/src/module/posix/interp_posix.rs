@@ -54,6 +54,18 @@ pub struct W_DirEntry {
     pub enum_type: i32,
 }
 
+/// `posix.ScandirIterator` — native owner for the directory entries and the
+/// current enumeration state, matching `W_ScandirIterator.dirp` at
+/// `interp_scandir.py:88`. The typedef at `interp_scandir.py:172-179` exposes
+/// operations only, so none of these fields are instance attributes.
+#[crate::pyre_class("posix.ScandirIterator")]
+#[derive(Default)]
+pub struct W_ScandirIterator {
+    pub entries: PyObjectRef,
+    pub index: i64,
+    pub open: bool,
+}
+
 static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
     LazyLock::new(|| Mutex::new(ApplevelForkCallbacks::default()));
 // PyPy's GIL serializes concurrent fork entry.  Pyre is free-threaded, so the
@@ -4831,20 +4843,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         Ok(args[0])
     }
     fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
-        // `interp_scandir.py:111-119 _close` clears the one piece of state
+        // `interp_scandir.py:111-119 _close` clears the native state that
         // `_finalize_` tests, whether closure is explicit or due to exhaustion.
-        // `W_ScandirIterator.dirp` is internal there, and its typedef exports
-        // only the five operations at `interp_scandir.py:172-179`. Here `_open`
-        // is an instance attribute because this builtin type's dict is also the
-        // only storage available for the older `_entries` and `_index` state.
-        // All three are therefore readable and writable; hiding only `_open`
-        // needs descriptor-backed instance storage that `typedef.rs` does not
-        // provide.
-        let _ = crate::baseobjspace::setattr_str(
-            self_obj,
-            "_open",
-            pyre_object::w_bool_from(false),
-        );
+        if let Some(iterator) = W_ScandirIterator::from_obj(self_obj) {
+            iterator.open = false;
+        }
     }
     fn scandir_iter_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         scandir_iter_mark_closed(args[0]);
@@ -4854,16 +4857,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let self_obj = args[0];
         // `interp_scandir.py:130-132 next_w` ends the enumeration once the
         // directory is closed, so a `close()` partway through is the end of it
-        // and the entries already read into `_entries` are not handed out.
+        // and the entries already read into the native owner are not handed out.
         if !scandir_iter_is_open(self_obj) {
             return Err(crate::PyError::stop_iteration());
         }
-        // The type carries an instance dict, so `_index` is writable from
-        // Python and cannot be assumed to still hold the int this iterator
-        // stored.
-        let idx =
-            crate::baseobjspace::int_w(crate::baseobjspace::getattr_str(self_obj, "_index")?)?;
-        let entries = crate::baseobjspace::getattr_str(self_obj, "_entries")?;
+        let iterator = W_ScandirIterator::from_obj(self_obj)
+            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.ScandirIterator' object"))?;
+        let idx = iterator.index;
+        let entries = iterator.entries;
         let len = unsafe { pyre_object::w_list_len(entries) } as i64;
         if idx >= len {
             scandir_iter_mark_closed(self_obj);
@@ -4873,14 +4874,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             scandir_iter_mark_closed(self_obj);
             return Err(crate::PyError::stop_iteration());
         };
-        let _ =
-            crate::baseobjspace::setattr_str(self_obj, "_index", pyre_object::w_int_new(idx + 1));
+        iterator.index = idx + 1;
         Ok(item)
     }
     fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {
-        crate::baseobjspace::getattr_str(self_obj, "_open")
-            .and_then(crate::baseobjspace::is_true)
-            .unwrap_or(false)
+        W_ScandirIterator::from_obj(self_obj).is_some_and(|iterator| iterator.open)
     }
     fn scandir_iter_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = args[0];
@@ -4911,36 +4909,46 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
             // `interp_scandir.py:173` names the typedef `'posix.ScandirIterator'`.
-            let tp = crate::typedef::make_builtin_type("posix.ScandirIterator", |ns| {
-                for (name, f) in [
-                    (
-                        "__iter__",
-                        scandir_iter_self as crate::gateway::BuiltinCodeFn,
-                    ),
-                    ("__next__", scandir_iter_next),
-                    ("__enter__", scandir_iter_self),
-                    ("__exit__", scandir_iter_close),
-                    ("close", scandir_iter_close),
-                    ("__del__", scandir_iter_del),
-                ] {
-                    let function = if name == "__del__" {
-                        crate::make_builtin_function_with_arity(name, f, 1)
-                    } else {
-                        crate::make_builtin_function(name, f)
-                    };
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                            ns, name, function,
-                        )
-                    };
-                }
-            });
-            unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+            let tp = crate::typedef::make_builtin_type_with_layout(
+                "posix.ScandirIterator",
+                |ns| {
+                    for (name, f) in [
+                        (
+                            "__iter__",
+                            scandir_iter_self as crate::gateway::BuiltinCodeFn,
+                        ),
+                        ("__next__", scandir_iter_next),
+                        ("__enter__", scandir_iter_self),
+                        ("__exit__", scandir_iter_close),
+                        ("close", scandir_iter_close),
+                        ("__del__", scandir_iter_del),
+                    ] {
+                        let function = if name == "__del__" {
+                            crate::make_builtin_function_with_arity(name, f, 1)
+                        } else {
+                            crate::make_builtin_function(name, f)
+                        };
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                                ns, name, function,
+                            )
+                        };
+                    }
+                },
+                crate::typedef::w_object(),
+                <W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            );
+            pyre_object::pyobject::set_instantiate(
+                unsafe {
+                    &*<W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
+                },
+                tp,
+            );
             unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
             // `interp_scandir.py:172-180` declares no `__new__` on the typedef
             // and `:180` sets `acceptable_as_base_class = False`.  The iterator
             // is produced only by `scandir_fn` below, through
-            // `pyre_object::w_instance_new`.
+            // `W_ScandirIterator::allocate_stable`.
             unsafe {
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
@@ -5089,18 +5097,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
             }
         }
-        // Pin the iterator so the `_entries`/`_index`/`_open` setattr
-        // allocations cannot strand it, re-reading `it`/`list` from their
-        // slots after each.
-        pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(scandir_iter_type()));
+        // Initialise the iterator type before allocating its native owner, then
+        // pin that stable owner while connecting it to the entries list.
+        let _ = scandir_iter_type();
+        pyre_object::gc_roots::pin_root(W_ScandirIterator::allocate_stable(
+            W_ScandirIterator::default(),
+        ));
         let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        let _ = crate::baseobjspace::setattr_str(it, "_entries", list);
-        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
-        let _ = crate::baseobjspace::setattr_str(it, "_index", pyre_object::w_int_new(0));
-        let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
-        let _ = crate::baseobjspace::setattr_str(it, "_open", pyre_object::w_bool_from(true));
+        let iterator = W_ScandirIterator::from_obj(it)
+            .expect("freshly allocated posix.ScandirIterator");
+        iterator.entries = list;
+        iterator.open = true;
+        unsafe { pyre_object::gc_hook::try_gc_write_barrier(it as *mut u8) };
+        // `objspace.py:486-487 allocate_instance` registers an object whose
+        // type has `hasuserdel` on the finalizer queue immediately after
+        // allocation. Native allocation bypasses that shared instance helper,
+        // so perform the same registration here.
+        pyre_object::gc_hook::maybe_register_finalizer(it);
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         drop(_list_scope);
         Ok(it)
