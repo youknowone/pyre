@@ -4114,6 +4114,25 @@ fn build_gc() -> Box<MiniMarkGC> {
         weakref_descr.ptr_offsets,
     );
 
+    // `gc.py:536-542 GcLLDescr_framework.init_size_descr` asks the
+    // gctypelayout layoutbuilder for a collector type id after the translated
+    // GC layouts are known. The baked descriptor pool is lazy in pyre, so
+    // materialize it before walking GcCache; otherwise a synthetic struct
+    // first reached by the walker would appear only after this registration
+    // point and retain its truncated structural hash as the allocation tid.
+    let baked_descrs = pyre_jit_trace::jitcode_runtime::descr_ref_table();
+    for index in 0..baked_descrs.len() {
+        baked_descrs
+            .at(index)
+            .unwrap_or_else(|| panic!("missing baked descriptor at index {index}"));
+    }
+    let _registered_synthetic_structs = majit_ir::descr::gc_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .register_unresolved_struct_tids(|size, offsets| {
+            gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
+        });
+
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice. A type with inline managed children must

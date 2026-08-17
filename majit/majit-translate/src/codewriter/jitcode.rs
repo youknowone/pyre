@@ -1875,6 +1875,11 @@ impl BhDescr {
                 .resolve_array_tid(raw),
             _ => None,
         };
+        if matches!(self, BhDescr::Size { .. })
+            && resolved.is_some_and(|tid| majit_ir::descr::struct_tid_is_unresolved(raw, tid))
+        {
+            return None;
+        }
         resolved.or_else(|| u32::try_from(raw).ok())
     }
 

@@ -273,6 +273,17 @@ pub fn path_hash(s: &str) -> u64 {
     h.finish()
 }
 
+/// Whether a struct SizeDescr still carries the truncated low word of its
+/// serialized structural identity instead of a collector-issued type id.
+///
+/// The `BhDescr::Size` wire slot carries the full `cache_key`. A value above
+/// the u32 range cannot itself be a dense collector id; if resolving that key
+/// only recovers its truncated low word, the layoutbuilder registration step
+/// has not stamped the shared descriptor yet.
+pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) -> bool {
+    serialized_cache_key > u32::MAX as u64 && resolved_tid == serialized_cache_key as u32
+}
+
 /// `path_hash` sibling that drops the leading `<crate>::` segment from
 /// `module_path` before hashing.  PyPy/RPython has no notion of a crate
 /// boundary — `lltype.Struct` identity is keyed on the Python module
@@ -1260,6 +1271,45 @@ impl GcCache {
             "descr.py:46: assert len(all_descrs) < 2**15"
         );
         all_descrs
+    }
+
+    /// Register the GC layouts of synthetic structs whose serialized
+    /// structural identity is still standing in for a collector type id.
+    ///
+    /// `gc.py:536-542 GcLLDescr_framework.init_size_descr` asks
+    /// `gctypelayout.py:333-357 TypeLayoutBuilder.get_type_id` for the
+    /// collector id and stores it on the shared SizeDescr.  Pyre performs the
+    /// collector-specific half through `register`, keeping majit-ir
+    /// independent of majit-gc.
+    pub fn register_unresolved_struct_tids(
+        &mut self,
+        mut register: impl FnMut(usize, Vec<usize>) -> u32,
+    ) -> usize {
+        let mut registered = 0;
+        for descr in &self._cache_size_order {
+            let Some(sd) = descr
+                .as_any()
+                .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
+            else {
+                continue;
+            };
+            if !sd.is_gc_managed()
+                || sd.headerless()
+                || sd.cache_key() == 0
+                || !struct_tid_is_unresolved(sd.cache_key(), sd.type_id())
+            {
+                continue;
+            }
+            let ref_offsets = sd
+                .gc_fielddescrs()
+                .iter()
+                .map(|field| field.offset())
+                .collect();
+            let tid = register(sd.size(), ref_offsets);
+            sd.set_type_id(tid);
+            registered += 1;
+        }
+        registered
     }
 
     /// `gc.py:536-542 GcLLDescr_framework.init_size_descr` analog.
@@ -5511,7 +5561,7 @@ pub struct SimpleSizeDescr {
     /// history.py:1092: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
     size: usize,
-    type_id: u32,
+    type_id: AtomicU32,
     /// `gc_cache._cache_size[LLType::Struct(cache_key)]` keyed identity
     /// — the original u64 `path_hash(module_path::Struct)` (not the
     /// dense u32 `type_id` GC tid allocated post-mint).  Stamped at
@@ -5561,7 +5611,7 @@ impl Clone for SimpleSizeDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             size: self.size,
-            type_id: self.type_id,
+            type_id: AtomicU32::new(self.type_id.load(Ordering::Relaxed)),
             cache_key: self.cache_key,
             fieldless_shell_mint: self.fieldless_shell_mint,
             is_immutable: self.is_immutable,
@@ -5581,7 +5631,7 @@ impl SimpleSizeDescr {
             index,
             descr_index: AtomicI32::new(-1),
             size,
-            type_id,
+            type_id: AtomicU32::new(type_id),
             cache_key: 0,
             fieldless_shell_mint: false,
             is_immutable: false,
@@ -5599,7 +5649,7 @@ impl SimpleSizeDescr {
             index,
             descr_index: AtomicI32::new(-1),
             size,
-            type_id,
+            type_id: AtomicU32::new(type_id),
             cache_key: 0,
             fieldless_shell_mint: false,
             is_immutable: false,
@@ -5679,9 +5729,10 @@ impl SimpleSizeDescr {
     }
 
     /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
-    /// Called by init_size_descr hook before Arc wrapping.
-    pub fn set_type_id(&mut self, type_id: u32) {
-        self.type_id = type_id;
+    /// Takes `&self` because the runtime layoutbuilder step stamps the
+    /// collector id after the baked descriptor table has shared the Arc.
+    pub fn set_type_id(&self, type_id: u32) {
+        self.type_id.store(type_id, Ordering::Relaxed);
     }
 }
 
@@ -5708,7 +5759,7 @@ impl SizeDescr for SimpleSizeDescr {
         self.size
     }
     fn type_id(&self) -> u32 {
-        self.type_id
+        self.type_id.load(Ordering::Relaxed)
     }
     fn cache_key(&self) -> u64 {
         self.cache_key
@@ -6955,6 +7006,43 @@ impl FailDescr for SimpleFailDescr {
 #[cfg(test)]
 mod register_keyed_size_authority_tests {
     use super::*;
+
+    #[test]
+    fn unresolved_synthetic_struct_layout_is_registered_and_stamped() {
+        let mut gc = GcCache::new();
+        let cache_key = 0x1234_5678_9abc_def0;
+        let fields: Vec<Arc<dyn FieldDescr>> = [0usize, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                Arc::new(SimpleFieldDescr::new_with_name(
+                    index as u32,
+                    offset,
+                    8,
+                    Type::Ref,
+                    false,
+                    ArrayFlag::Pointer,
+                    format!("ref{index}"),
+                    format!("ref{index}"),
+                )) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        let mut sd = SimpleSizeDescr::new(u32::MAX, 16, cache_key as u32);
+        sd.set_cache_key(cache_key);
+        let descr: DescrRef = Arc::new(sd.with_all_fielddescrs(fields));
+        gc.register_keyed_size(LLType::Struct(cache_key), descr.clone());
+
+        let mut observed = Vec::new();
+        let count = gc.register_unresolved_struct_tids(|size, offsets| {
+            observed.push((size, offsets));
+            42
+        });
+
+        assert_eq!(count, 1);
+        assert_eq!(observed, vec![(16, vec![0, 8])]);
+        assert_eq!(descr.as_size_descr().unwrap().type_id(), 42);
+        assert_eq!(gc.resolve_struct_tid(cache_key), Some(42));
+    }
 
     fn size_descr_at(type_id: u32, vtable: usize, offsets: &[usize]) -> DescrRef {
         let mut sd = SimpleSizeDescr::with_vtable(u32::MAX, 32, type_id, vtable);

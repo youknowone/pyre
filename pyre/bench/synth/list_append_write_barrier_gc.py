@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=46
+# pyre-check: ungated-jitstats=bridges_compiled,guard_failures
+# The realloc-boundary append leaves one bridge on the margin of the compile
+# threshold: re-running the same binary moves bridges_compiled between 4 and 5
+# (and guard_failures with it, ~196 per bridge), and the three backends
+# disagree within a single run, so neither value is a property of the tree.
 # GC stress for the in-place Object-append write barrier the tracer does NOT
 # record. `w_list_append`'s in-place arm stores a GC ref into the items block
 # and runs `list_write_barrier`; when the block is GC-managed the backend GC
