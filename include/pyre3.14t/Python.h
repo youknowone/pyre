@@ -41,6 +41,9 @@
 #include "structmember.h"
 #include "moduleobject.h"
 #include "pyerrors.h"
+/* The `%`-format engine and the three variadic entry points over it. It
+   follows `pyerrors.h` for the `PyExc_*` names it reports failures through. */
+#include "pyre_format.h"
 #include "bytesobject.h"
 #include "unicodeobject.h"
 #include "longobject.h"

@@ -98,9 +98,9 @@ The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
 single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
 the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
-`pyrex/tests/cpyext_pystate.rs` and `pyrex/tests/cpyext_object_families.rs`
-take their expectations from CPython 3.14.6 running the same script against the
-same fixture.
+`pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs` and
+`pyrex/tests/cpyext_str.rs` take their expectations from CPython 3.14.6 running
+the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -160,6 +160,22 @@ same fixture.
   reference a container owns on an item's behalf -- that one lives until the
   container's mirror dies, which is the object a weak reference must not keep
   alive;
+- the `str` operations an extension builds text with
+  (`cpyext/unicodeobject.rs`): `Concat` / `Append` / `AppendAndDel`,
+  `Substring`, `Join`, `FromOrdinal`, `FromObject`, `DecodeUTF8`,
+  `InternFromString` / `InternInPlace`, `FindChar`, `Contains`, and the five
+  comparisons `Compare` / `CompareWithASCIIString` / `RichCompare` / `Equal` /
+  `EqualToUTF8`. `PyUnicode_DecodeUTF8` decodes through `bytes.decode`, so
+  every error handler the interpreter has is reachable rather than the three
+  a hand-written decoder would name;
+- the `%`-format engine and `PyUnicode_FromFormat` / `FromFormatV` over it
+  (`pyre_format.h`), which `PyErr_Format` is now written on. The conversions
+  are assembled as `str` objects rather than as bytes, because `%6S` pads to a
+  count of characters and only the interpreter knows how many a conversion
+  produced. That is also what makes `%c` a code point, `%A` `ascii()` rather
+  than `repr()`, `%V` the one conversion taking two arguments, `%T` / `%N` a
+  type's qualified name, and a conversion this does not describe a
+  `SystemError` rather than something handed to `snprintf`;
 - the GIL an extension hands back and forth (`cpyext/pystate.rs`):
   `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS` and the
   `Py_BLOCK_THREADS` pair, `PyEval_SaveThread` / `PyEval_RestoreThread` /

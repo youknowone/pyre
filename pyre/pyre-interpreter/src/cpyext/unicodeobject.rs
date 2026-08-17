@@ -434,6 +434,433 @@ pub unsafe extern "C" fn PyUnicode_WriteChar(
     0
 }
 
+// ── the operations an extension reaches str through ─────────────────────
+
+/// `object.name(*arguments)`.
+///
+/// The attribute lookup can collect, and an argument that is a list or a dict
+/// moves when it does, so everything is pinned across it and read back after.
+fn call_method(
+    object: PyObjectRef,
+    name: &str,
+    arguments: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(object);
+    let first_argument = pyre_object::gc_roots::shadow_stack_len();
+    for &argument in arguments {
+        roots.pin_root(argument);
+    }
+    let method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        name,
+    )?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(method);
+    let reloaded: Vec<PyObjectRef> = (0..arguments.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(first_argument + index))
+        .collect();
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &reloaded,
+    )
+}
+
+/// A `str` argument, or `None` with `message` recorded as a `TypeError`.
+/// Accepts a subclass, which is what `PyUnicode_Check` answers for.
+fn str_argument(
+    object: *mut CPyObject,
+    message: impl FnOnce(&str) -> String,
+) -> Option<PyObjectRef> {
+    let value = argument(object)?;
+    if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+        let name = crate::type_methods::arg_type_name(value);
+        super::pyerrors::set_pending_error(crate::PyError::type_error(message(&name)));
+        return None;
+    }
+    Some(value)
+}
+
+/// `unicodeobject.c:1040 ensure_unicode` — the message an operand that is not
+/// a `str` is refused with where the entry point has none of its own.
+fn must_be_str(name: &str) -> String {
+    format!("must be str, not {name}")
+}
+
+/// `unicodeobject.py:961 PyUnicode_FromOrdinal` — `chr(ordinal)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut CPyObject {
+    if !(0..=0x10ffff).contains(&(ordinal as i64)) {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "chr() arg not in range(0x110000)".to_string(),
+        ));
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(pyre_object::w_str_from_codepoint(ordinal as u32))
+}
+
+/// `PyUnicode_DecodeUTF8(string, length, errors)`.
+///
+/// The error handler is the interpreter's own, reached by decoding through
+/// `bytes.decode` rather than by naming the handlers this understands.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
+    string: *const c_char,
+    length: isize,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    if string.is_null() || length < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, length as usize) };
+    let handler = if errors.is_null() {
+        "strict".to_string()
+    } else {
+        unsafe { CStr::from_ptr(errors) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(bytes);
+    super::object::result(call_method(
+        w_bytes,
+        "decode",
+        &[
+            pyre_object::w_str_new("utf-8"),
+            pyre_object::w_str_new(&handler),
+        ],
+    ))
+}
+
+/// `unicodeobject.py:716 PyUnicode_FromObject` — an exact `str`, so a subclass
+/// instance is copied and anything else is refused.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FromObject(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(value) = str_argument(object, |name| {
+        format!("Can't convert '{name}' object to str implicitly")
+    }) else {
+        return std::ptr::null_mut();
+    };
+    if super::object::is_exactly(value, &pyre_object::STR_TYPE) {
+        return pyobject::make_ref(value);
+    }
+    let copy = pyre_object::w_str_from_wtf8_managed(
+        unsafe { pyre_object::w_str_get_wtf8(value) }.to_owned(),
+    );
+    pyobject::make_ref(copy)
+}
+
+/// `unicodeobject.py:937 PyUnicode_InternFromString`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_InternFromString(text: *const c_char) -> *mut CPyObject {
+    let created = unsafe { PyUnicode_FromString(text) };
+    if created.is_null() {
+        return created;
+    }
+    let mut pointer = created;
+    unsafe { PyUnicode_InternInPlace(&raw mut pointer) };
+    pointer
+}
+
+/// `unicodeobject.py:921 PyUnicode_InternInPlace` — reference-count-neutral:
+/// the caller owns what `*pointer` names after the call exactly as it did
+/// before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_InternInPlace(pointer: *mut *mut CPyObject) {
+    if pointer.is_null() {
+        return;
+    }
+    let held = unsafe { *pointer };
+    let Some(value) = argument(held) else {
+        unsafe { super::pyerrors::PyErr_Clear() };
+        return;
+    };
+    if !super::object::is_exactly(value, &pyre_object::STR_TYPE) {
+        return;
+    }
+    let interned = unsafe { pyre_object::intern_exact_str(value) };
+    if interned == value {
+        return;
+    }
+    unsafe {
+        *pointer = pyobject::make_ref(interned);
+        pyobject::decref(held);
+    }
+}
+
+/// `unicodeobject.py:1229 PyUnicode_Concat` — `left + right`.
+///
+/// Both operands are checked here rather than left to `+`, whose own message
+/// names the operator instead of the two types.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Concat(
+    left: *mut CPyObject,
+    right: *mut CPyObject,
+) -> *mut CPyObject {
+    let Some(left) = str_argument(left, must_be_str) else {
+        return std::ptr::null_mut();
+    };
+    let Some(right) = str_argument(right, |name| {
+        format!("can only concatenate str (not \"{name}\") to str")
+    }) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(crate::baseobjspace::add(left, right))
+}
+
+/// `PyUnicode_Append(&left, right)` — `*left` becomes the concatenation, and
+/// NULL if it cannot be built.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Append(left: *mut *mut CPyObject, right: *mut CPyObject) {
+    if left.is_null() {
+        return;
+    }
+    let held = unsafe { *left };
+    if held.is_null() {
+        return;
+    }
+    let joined = unsafe { PyUnicode_Concat(held, right) };
+    unsafe {
+        pyobject::decref(held);
+        *left = joined;
+    }
+}
+
+/// `PyUnicode_AppendAndDel(&left, right)` — [`PyUnicode_Append`] and the
+/// caller's reference to `right` given up.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AppendAndDel(left: *mut *mut CPyObject, right: *mut CPyObject) {
+    unsafe {
+        PyUnicode_Append(left, right);
+        if !right.is_null() {
+            pyobject::decref(right);
+        }
+    }
+}
+
+/// `unicodeobject.py:1404 PyUnicode_Substring` — `str[start:end]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Substring(
+    object: *mut CPyObject,
+    start: isize,
+    end: isize,
+) -> *mut CPyObject {
+    let Some(value) = str_argument(object, must_be_str) else {
+        return std::ptr::null_mut();
+    };
+    if start < 0 || end < 0 {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            "string index out of range",
+        ));
+        return std::ptr::null_mut();
+    }
+    let length = unsafe { pyre_object::w_str_len(value) } as isize;
+    let start = start.min(length);
+    let end = end.clamp(start, length);
+    let cut = unsafe {
+        pyre_object::w_str_slice_codepoints(value, start as i64, 1, (end - start) as i64)
+    };
+    pyobject::make_ref(cut)
+}
+
+/// `unicodeobject.py:1312 PyUnicode_Join` — `separator.join(sequence)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Join(
+    separator: *mut CPyObject,
+    sequence: *mut CPyObject,
+) -> *mut CPyObject {
+    let Some([separator, sequence]) = super::object::arguments([separator, sequence]) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(call_method(separator, "join", &[sequence]))
+}
+
+/// `unicodeobject.py:1515 PyUnicode_FindChar` — the index of `ch`, -1 when it
+/// is not there and -2 on a bad argument.
+///
+/// `direction` is +1 to search forward and -1 to search back.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FindChar(
+    object: *mut CPyObject,
+    ch: Py_UCS4,
+    start: isize,
+    end: isize,
+    direction: c_int,
+) -> isize {
+    let Some(value) = str_argument(object, must_be_str) else {
+        return -2;
+    };
+    let length = unsafe { pyre_object::w_str_len(value) } as isize;
+    let start = start.clamp(0, length);
+    let end = end.clamp(start, length);
+    let matches = |index: isize| {
+        unsafe { pyre_object::w_str_codepoint_at(value, index as usize) }
+            .is_some_and(|point| point.to_u32() == ch)
+    };
+    let found = if direction >= 0 {
+        (start..end).find(|&index| matches(index))
+    } else {
+        (start..end).rev().find(|&index| matches(index))
+    };
+    found.unwrap_or(-1)
+}
+
+/// `unicodeobject.py:1369 PyUnicode_Contains` — `element in container`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Contains(
+    container: *mut CPyObject,
+    element: *mut CPyObject,
+) -> c_int {
+    let Some(element) = str_argument(element, |name| {
+        format!("'in <string>' requires string as left operand, not {name}")
+    }) else {
+        return -1;
+    };
+    let Some(container) = str_argument(container, must_be_str) else {
+        return -1;
+    };
+    match super::pyerrors::trap(crate::baseobjspace::contains(container, element)) {
+        Some(found) => found as c_int,
+        None => -1,
+    }
+}
+
+/// `unicodeobject.py:1219 PyUnicode_Compare` — -1, 0 or 1, and -1 with an error
+/// recorded for an argument that is not a `str`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Compare(left: *mut CPyObject, right: *mut CPyObject) -> c_int {
+    let Some([left, right]) = super::object::arguments([left, right]) else {
+        return -1;
+    };
+    if !unsafe {
+        crate::baseobjspace::isinstance_str_w(left) && crate::baseobjspace::isinstance_str_w(right)
+    } {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "Can't compare {} and {}",
+            crate::type_methods::arg_type_name(left),
+            crate::type_methods::arg_type_name(right)
+        )));
+        return -1;
+    }
+    let a = unsafe { pyre_object::w_str_get_wtf8(left) };
+    let b = unsafe { pyre_object::w_str_get_wtf8(right) };
+    match a.cmp(b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// The code points of `text` against the bytes of `right`, which is read as
+/// ISO-8859-1 so a byte above 127 still names a code point.
+fn compare_with_bytes(text: PyObjectRef, right: &[u8]) -> std::cmp::Ordering {
+    let mut bytes = right.iter();
+    for point in unsafe { pyre_object::w_str_get_wtf8(text) }.code_points() {
+        match bytes.next() {
+            None => return std::cmp::Ordering::Greater,
+            Some(&byte) => match point.to_u32().cmp(&(byte as u32)) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            },
+        }
+    }
+    match bytes.next() {
+        None => std::cmp::Ordering::Equal,
+        Some(_) => std::cmp::Ordering::Less,
+    }
+}
+
+/// `unicodeobject.py:1272 PyUnicode_CompareWithASCIIString`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
+    left: *mut CPyObject,
+    right: *const c_char,
+) -> c_int {
+    let left = unsafe { pyobject::from_ref(left) };
+    if left.is_null() || right.is_null() {
+        return -1;
+    }
+    let bytes = unsafe { CStr::from_ptr(right) }.to_bytes();
+    match compare_with_bytes(left, bytes) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `PyUnicode_RichCompare(left, right, op)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_RichCompare(
+    left: *mut CPyObject,
+    right: *mut CPyObject,
+    op: c_int,
+) -> *mut CPyObject {
+    unsafe { super::object::PyObject_RichCompare(left, right, op) }
+}
+
+/// The bytes `text` encodes to, compared against `right`.
+fn equal_to_bytes(text: *mut CPyObject, right: *const c_char, length: Option<isize>) -> c_int {
+    let text = unsafe { pyobject::from_ref(text) };
+    if text.is_null() || right.is_null() || !unsafe { crate::baseobjspace::isinstance_str_w(text) }
+    {
+        return 0;
+    }
+    let bytes = match length {
+        Some(length) if length >= 0 => unsafe {
+            std::slice::from_raw_parts(right as *const u8, length as usize)
+        },
+        _ => unsafe { CStr::from_ptr(right) }.to_bytes(),
+    };
+    // A lone surrogate has no UTF-8 spelling, so it equals no byte string.
+    match crate::baseobjspace::str_utf8_w(text) {
+        Ok(encoded) => (encoded.as_bytes() == bytes) as c_int,
+        Err(_) => {
+            unsafe { super::pyerrors::PyErr_Clear() };
+            0
+        }
+    }
+}
+
+/// `PyUnicode_EqualToUTF8(str, text)` — no exception is ever recorded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_EqualToUTF8(
+    object: *mut CPyObject,
+    text: *const c_char,
+) -> c_int {
+    equal_to_bytes(object, text, None)
+}
+
+/// `PyUnicode_EqualToUTF8AndSize(str, text, size)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_EqualToUTF8AndSize(
+    object: *mut CPyObject,
+    text: *const c_char,
+    size: isize,
+) -> c_int {
+    equal_to_bytes(object, text, Some(size))
+}
+
+/// `PyUnicode_Equal(left, right)` — 1, 0, or -1 with a `TypeError` recorded for
+/// an argument that is not a `str`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Equal(left: *mut CPyObject, right: *mut CPyObject) -> c_int {
+    let Some(left) = str_argument(left, |name| {
+        format!("first argument must be str, not {name}")
+    }) else {
+        return -1;
+    };
+    let Some(right) = str_argument(right, |name| {
+        format!("second argument must be str, not {name}")
+    }) else {
+        return -1;
+    };
+    let a = unsafe { pyre_object::w_str_get_wtf8(left) };
+    let b = unsafe { pyre_object::w_str_get_wtf8(right) };
+    (a == b) as c_int
+}
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_FromString as *const ());
     std::hint::black_box(PyUnicode_FromStringAndSize as *const ());
@@ -449,4 +876,22 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_MAX_CHAR_VALUE as *const ());
     std::hint::black_box(PyUnicode_ReadChar as *const ());
     std::hint::black_box(PyUnicode_WriteChar as *const ());
+    std::hint::black_box(PyUnicode_FromOrdinal as *const ());
+    std::hint::black_box(PyUnicode_DecodeUTF8 as *const ());
+    std::hint::black_box(PyUnicode_FromObject as *const ());
+    std::hint::black_box(PyUnicode_InternFromString as *const ());
+    std::hint::black_box(PyUnicode_InternInPlace as *const ());
+    std::hint::black_box(PyUnicode_Concat as *const ());
+    std::hint::black_box(PyUnicode_Append as *const ());
+    std::hint::black_box(PyUnicode_AppendAndDel as *const ());
+    std::hint::black_box(PyUnicode_Substring as *const ());
+    std::hint::black_box(PyUnicode_Join as *const ());
+    std::hint::black_box(PyUnicode_FindChar as *const ());
+    std::hint::black_box(PyUnicode_Contains as *const ());
+    std::hint::black_box(PyUnicode_Compare as *const ());
+    std::hint::black_box(PyUnicode_CompareWithASCIIString as *const ());
+    std::hint::black_box(PyUnicode_RichCompare as *const ());
+    std::hint::black_box(PyUnicode_EqualToUTF8 as *const ());
+    std::hint::black_box(PyUnicode_EqualToUTF8AndSize as *const ());
+    std::hint::black_box(PyUnicode_Equal as *const ());
 }

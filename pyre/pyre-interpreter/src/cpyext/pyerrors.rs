@@ -444,16 +444,6 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
     }
 }
 
-/// The non-variadic half of `PyErr_Format`; the header formats the message.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn _PyPyre_ErrFormatted(
-    w_type: *mut CPyObject,
-    message: *const c_char,
-) -> *mut CPyObject {
-    unsafe { PyErr_SetString(w_type, message) };
-    std::ptr::null_mut()
-}
-
 pub(super) fn ensure_linked() {
     ensure_mirrors_linked();
     std::hint::black_box(PyErr_SetObject as *const ());
@@ -469,5 +459,4 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_Fetch as *const ());
     std::hint::black_box(PyErr_Restore as *const ());
     std::hint::black_box(PyErr_NormalizeException as *const ());
-    std::hint::black_box(_PyPyre_ErrFormatted as *const ());
 }

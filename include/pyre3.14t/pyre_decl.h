@@ -328,7 +328,6 @@ PyAPI_FUNC(void) PyErr_Restore(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetNone(PyObject *);
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
-PyAPI_FUNC(PyObject *) _PyPyre_ErrFormatted(PyObject *, const char *);
 
 /* cpyext/pymem.rs */
 PyAPI_FUNC(void *) PyMem_Calloc(size_t, size_t);
@@ -445,19 +444,37 @@ PyAPI_FUNC(void) PyType_Modified(PyTypeObject *);
 PyAPI_FUNC(int) PyType_Ready(PyTypeObject *);
 
 /* cpyext/unicodeobject.rs */
+PyAPI_FUNC(void) PyUnicode_Append(PyObject **, PyObject *);
+PyAPI_FUNC(void) PyUnicode_AppendAndDel(PyObject **, PyObject *);
 PyAPI_FUNC(const char *) PyUnicode_AsUTF8(PyObject *);
 PyAPI_FUNC(const char *) PyUnicode_AsUTF8AndSize(PyObject *, Py_ssize_t *);
 PyAPI_FUNC(int) PyUnicode_Check(PyObject *);
 PyAPI_FUNC(int) PyUnicode_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyUnicode_Compare(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_CompareWithASCIIString(PyObject *, const char *);
+PyAPI_FUNC(PyObject *) PyUnicode_Concat(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_Contains(PyObject *, PyObject *);
 PyAPI_FUNC(void *) PyUnicode_DATA(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_DecodeUTF8(const char *, Py_ssize_t, const char *);
+PyAPI_FUNC(int) PyUnicode_Equal(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyUnicode_EqualToUTF8(PyObject *, const char *);
+PyAPI_FUNC(int) PyUnicode_EqualToUTF8AndSize(PyObject *, const char *, Py_ssize_t);
+PyAPI_FUNC(Py_ssize_t) PyUnicode_FindChar(PyObject *, Py_UCS4, Py_ssize_t, Py_ssize_t, int);
+PyAPI_FUNC(PyObject *) PyUnicode_FromObject(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_FromOrdinal(int);
 PyAPI_FUNC(PyObject *) PyUnicode_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromStringAndSize(const char *, Py_ssize_t);
 PyAPI_FUNC(Py_ssize_t) PyUnicode_GetLength(PyObject *);
 PyAPI_FUNC(unsigned int) PyUnicode_IS_ASCII(PyObject *);
+PyAPI_FUNC(PyObject *) PyUnicode_InternFromString(const char *);
+PyAPI_FUNC(void) PyUnicode_InternInPlace(PyObject **);
+PyAPI_FUNC(PyObject *) PyUnicode_Join(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyUnicode_KIND(PyObject *);
 PyAPI_FUNC(unsigned int) PyUnicode_MAX_CHAR_VALUE(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_New(Py_ssize_t, Py_UCS4);
 PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyUnicode_RichCompare(PyObject *, PyObject *, int);
+PyAPI_FUNC(PyObject *) PyUnicode_Substring(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
 
 /* cpyext/weakrefobject.rs */
