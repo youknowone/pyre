@@ -4274,6 +4274,22 @@ fn build_class_inner(
     });
     let current_kwds = || kwds_roots.as_ref().map(|(scope, slot)| scope.get(*slot));
 
+    // `bases` and `w_orig_bases` are raw copies taken before `__prepare__` and
+    // before the class body runs, and both execute Python.  A tuple does not
+    // move, but one with no heap edge is sweepable rather than merely immobile,
+    // so a copy held across those calls can name freed memory by the time
+    // `is_tuple` / `w_tuple_len` read it.  Publish both and read them back at
+    // each site that consumes them.
+    let bases_scope = pyre_object::gc_roots::push_roots();
+    let bases_slot = bases_scope.base();
+    bases_scope.pin_root(bases);
+    let orig_bases_slot = w_orig_bases.map(|w_orig_bases| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_orig_bases);
+        slot
+    });
+    let bases = || bases_scope.get(bases_slot);
+
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
     let closure = unsafe { function_get_closure(body_fn) };
@@ -4303,12 +4319,12 @@ fn build_class_inner(
                     call_with_kwargs_in_ctx(
                         take_last_exec_ctx(),
                         prepare,
-                        &[pyre_object::w_str_new(name), bases],
+                        &[pyre_object::w_str_new(name), bases()],
                         &prepare_kwds,
                     )?
                 } else {
                     clear_call_error();
-                    let r = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases]);
+                    let r = crate::call_function(prepare, &[pyre_object::w_str_new(name), bases()]);
                     if r.is_null() {
                         // __prepare__ was found but raised during execution —
                         // propagate that exception rather than silently using
@@ -4598,16 +4614,22 @@ fn build_class_inner(
 
     // compiling.py:211-212 — when __mro_entries__ rewrote the bases, expose
     // the user-declared bases via __orig_bases__ in the class namespace.
-    if let Some(w_orig_bases) = w_orig_bases {
+    if let Some(orig_bases_slot) = orig_bases_slot {
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__orig_bases__", w_orig_bases)
+            pyre_object::w_dict_setitem_str_no_proxy(
+                class_ns,
+                "__orig_bases__",
+                pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
+            )
         };
         if let Some(w_ns) = mapping_namespace {
+            // `w_str_new` allocates, so the value is read back after it.
+            let key = pyre_object::w_str_new("__orig_bases__");
             crate::baseobjspace::setitem(
                 w_ns,
-                pyre_object::w_str_new("__orig_bases__"),
-                w_orig_bases,
+                key,
+                pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
             )?;
         }
     }
@@ -4653,18 +4675,18 @@ fn build_class_inner(
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
-    let w_effective_bases = if bases.is_null()
-        || !unsafe { pyre_object::is_tuple(bases) }
-        || unsafe { pyre_object::w_tuple_len(bases) } == 0
+    let w_effective_bases = if bases().is_null()
+        || !unsafe { pyre_object::is_tuple(bases()) }
+        || unsafe { pyre_object::w_tuple_len(bases()) } == 0
     {
         let w_object = crate::typedef::w_object();
         if !w_object.is_null() {
             pyre_object::w_tuple_new(vec![w_object])
         } else {
-            bases
+            bases()
         }
     } else {
-        bases
+        bases()
     };
     // The C3 validations read `__bases__` off classic bases and
     // `create_all_slots` unpacks `__slots__`; both execute Python, so the
@@ -4765,12 +4787,12 @@ fn build_class_inner(
             // Only use kwargs path if there are actual extra kwargs
             let has_extra = unsafe { pyre_object::is_dict(kw) && pyre_object::w_dict_len(kw) > 0 };
             if has_extra {
-                call_metaclass_with_kwargs(w_metaclass, name_obj, bases, w_namespace_dict, kw)
+                call_metaclass_with_kwargs(w_metaclass, name_obj, bases(), w_namespace_dict, kw)
             } else {
-                crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
+                crate::call_function(w_metaclass, &[name_obj, bases(), w_namespace_dict])
             }
         } else {
-            crate::call_function(w_metaclass, &[name_obj, bases, w_namespace_dict])
+            crate::call_function(w_metaclass, &[name_obj, bases(), w_namespace_dict])
         };
         // If the metaclass call raised, propagate the original error rather
         // than silently producing a NULL class object.
