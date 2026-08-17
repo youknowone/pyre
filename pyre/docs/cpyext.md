@@ -206,6 +206,18 @@ the header below.
   object died is handed back through a dead queue that `tp_dealloc` drains from
   an execution-context action. `tp_dealloc` and `tp_free` therefore run, and an
   instance of a C-defined type is reclaimed.
+- the cyclic-collection protocol (`cpyext/gc.rs`): `PyObject_GC_Track` /
+  `UnTrack` and the set of blocks that declare `Py_TPFLAGS_HAVE_GC`, whose
+  `tp_traverse` reports what each one references. A collection is handed those
+  edges before it traces anything, and reads them twice: a reference another
+  block in the set supplies stops rooting on its own account, and it roots
+  again once that block's own object is known to live -- which only the settled
+  trace answers, and answering it before the trace frees objects that are
+  alive. What survives neither test is a cycle, and `clear_garbage` runs the
+  `tp_clear` that breaks it apart, the references being C fields no other layer
+  can drop. Upstream has none of this; the shape follows CPython's
+  `gcmodule.c`, and the one pypy precedent for calling a user traverse from a
+  collection is `_hpy_universal`'s tracer.
 
 The loader serializes extension initialization in the current import path;
 the complete port must move that ownership into interpreter/execution-context
@@ -213,10 +225,13 @@ state before subinterpreters or parallel no-GIL imports are enabled.
 
 Known divergences, each documented at its definition:
 
-- a reference cycle running through C leaks: a C reference marks its object as
-  surviving along with everything the object reaches, and no `rawrefcount` pass
-  consults `tp_traverse` / `tp_clear` to break such a cycle. That limit is
-  upstream's as well (`pypy/doc/discussion/rawrefcount.rst`);
+- a block whose type declares no `tp_traverse` reports no references, so a
+  reference cycle running through one leaks: with nothing to subtract, a C
+  reference marks its object as surviving along with everything the object
+  reaches. That is where the whole feature stands upstream, `rawrefcount`
+  having no pass that consults `tp_traverse` at all
+  (`pypy/doc/discussion/rawrefcount.rst`); a type that declares the protocol is
+  collected here;
 - `md_def` and `md_state` ride reserved module-dictionary keys, and the
   `PyMethodDef` pointer, the descriptor definitions and a capsule's four C
   values ride reserved carrier-dictionary keys, because pyre has no typed
@@ -276,8 +291,7 @@ Known divergences, each documented at its definition:
 
 ## What remains
 
-5. `tp_traverse` and `tp_clear`, without which a cycle through C is not
-   collectable; the *dispatch* half of vectorcall -- a type declaring
+5. The *dispatch* half of vectorcall -- a type declaring
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation

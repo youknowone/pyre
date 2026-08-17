@@ -2620,6 +2620,9 @@ impl MiniMarkGC {
         // its linked object, so the P list joins the root walk before anything
         // decides which nursery objects die.
         if self.rrc.enabled {
+            // Before the trace, not inside it: gathering the edges enters the
+            // extension.
+            self.rrc_refresh_c_edges();
             self.rrc_minor_collection_trace();
         }
 
@@ -2662,6 +2665,14 @@ impl MiniMarkGC {
 
             // incminimark.py:1859-1862: loop back if card-marked objects appeared.
             if self.card_page_shift > 0 && !self.old_objects_with_cards_set.is_empty() {
+                continue;
+            }
+            // A block's C fields are edges no field walk above can reach, and
+            // whether they root depends on whether the block's own object
+            // survived — which only the settled walk answers.  Dragging one out
+            // gives the walk more to do, so it re-enters here rather than
+            // running once.
+            if self.rrc_trace_c_edges_young() {
                 continue;
             }
             break;
@@ -2926,6 +2937,162 @@ impl MiniMarkGC {
         self.rrc.enabled
     }
 
+    /// Register the [`rawrefcount::CEdgeCensusFn`].
+    ///
+    /// Separate from [`rawrefcount_init`](Self::rawrefcount_init) because it is
+    /// optional: an embedder whose blocks never reference each other has
+    /// nothing for it to report, and without it every mirror is judged on its
+    /// bare count, which is what upstream does.
+    pub fn rawrefcount_set_c_edge_census(&mut self, census: rawrefcount::CEdgeCensusFn) {
+        self.rrc.c_edge_census = Some(census);
+    }
+
+    /// Take this collection's edges from the embedder and count, per mirror,
+    /// how many of its references the reporting blocks supply.
+    ///
+    /// The call enters the extension, so every caller must be positioned before
+    /// the phase that reads the answer rather than inside it.
+    fn rrc_refresh_c_edges(&mut self) {
+        let Some(census) = self.rrc.c_edge_census else {
+            return;
+        };
+        self.rrc.c_edges = census();
+        self.rrc.c_discount.clear();
+        for (_, referents) in &self.rrc.c_edges {
+            for &referent in referents {
+                *self.rrc.c_discount.entry(referent).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Whether `pyobject`'s count makes it root its linked object.
+    ///
+    /// `incminimark.py:3263` is the bare `rc != REFCNT_FROM_PYPY` — every
+    /// reference above the link share is one C holds, and holding it is what
+    /// roots.  The subtraction is [`rawrefcount::CEdgeCensusFn`]'s: a reference
+    /// another block in the census supplies is not one from outside the heap,
+    /// and whether *that* block's own object lives is settled by the trace, in
+    /// [`Self::mark_c_edges`], rather than assumed here.
+    fn rrc_roots_link(&self, pyobject: usize) -> bool {
+        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
+        let held = rc - rawrefcount::REFCNT_FROM_PYRE;
+        held > self.rrc.c_discount.get(&pyobject).copied().unwrap_or(0)
+    }
+
+    /// The interpreter object a census entry names, or zero once the collector
+    /// has cleared the link.
+    fn rrc_linked_object(pyobject: usize) -> usize {
+        unsafe { (*rawrefcount::pyobj(pyobject)).ob_link }
+    }
+
+    /// Whether a major has decided `obj` lives — the question
+    /// [`Self::_rrc_major_free`] asks of a mirror's link, asked one step
+    /// earlier so that what a live block references can still be marked.
+    fn rrc_object_marked(&self, obj: usize) -> bool {
+        if obj == 0 {
+            return false;
+        }
+        if !self.is_managed_heap_object(obj) {
+            return true;
+        }
+        let hdr = unsafe { header_of(obj) };
+        unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) }
+    }
+
+    /// Mark what the C fields of a block whose own object survived reference.
+    ///
+    /// The other end of the subtraction in [`Self::rrc_roots_link`]: a
+    /// reference a census block supplies stops rooting on its own account, and
+    /// this is where it roots again once that block's object is known to live.
+    /// Which is knowable only here, after ordinary marking — before it, the
+    /// question has no answer, and answering it anyway frees a live object that
+    /// nothing but a C field references.
+    ///
+    /// Reading the gathered edges rather than calling `tp_traverse` is what
+    /// keeps the extension off the collector's stack: the walk that produced
+    /// them ran before this collection traced anything.
+    ///
+    /// Returns how many objects this marked, which is what makes it a step of a
+    /// fixed point — a newly live block reports edges of its own.
+    fn mark_c_edges(&mut self) -> usize {
+        if !self.rrc.enabled || self.rrc.c_edges.is_empty() {
+            return 0;
+        }
+        let edges = std::mem::take(&mut self.rrc.c_edges);
+        let mut marked = 0usize;
+        for (block, referents) in &edges {
+            if !self.rrc_object_marked(Self::rrc_linked_object(*block)) {
+                continue;
+            }
+            for &referent in referents {
+                let obj = Self::rrc_linked_object(referent);
+                if obj == 0 || self.rrc_object_marked(obj) {
+                    continue;
+                }
+                self.seed_major_root(GcRef(obj), "rrc_c_edge");
+                while let Some(addr) = self.incr_state.gray_stack.pop() {
+                    self.mark_object(addr);
+                    marked += 1;
+                }
+            }
+        }
+        self.rrc.c_edges = edges;
+        marked
+    }
+
+    /// Whether a minor has decided `obj` lives.
+    ///
+    /// Only a nursery object can die here, and it is exactly
+    /// [`Self::_rrc_minor_free`]'s test — read before the pin sets are
+    /// swapped, so this collection's survivors are the ones still being
+    /// collected into.
+    fn rrc_young_object_alive(&self, obj: usize) -> bool {
+        if obj == 0 {
+            return false;
+        }
+        if !self.is_nursery_object_start(obj) {
+            return true;
+        }
+        if self.surviving_pinned_objects.contains(&obj) {
+            return true;
+        }
+        unsafe { (*header_of(obj)).is_forwarded() }
+    }
+
+    /// [`Self::mark_c_edges`] for a minor: drag out the nursery objects a
+    /// surviving block's C fields reference.
+    ///
+    /// Returns whether anything was dragged out, which the caller turns into
+    /// the fixed point by re-entering the walk that traces what this reached.
+    fn rrc_trace_c_edges_young(&mut self) -> bool {
+        if !self.rrc.enabled || self.rrc.c_edges.is_empty() {
+            return false;
+        }
+        let edges = std::mem::take(&mut self.rrc.c_edges);
+        let mut dragged = false;
+        for (block, referents) in &edges {
+            if !self.rrc_young_object_alive(Self::rrc_linked_object(*block)) {
+                continue;
+            }
+            for &referent in referents {
+                let obj = Self::rrc_linked_object(referent);
+                if self.rrc_young_object_alive(obj) {
+                    continue;
+                }
+                if !self.is_nursery_object_start(obj) {
+                    // Neither dead nor this collection's business: an object
+                    // outside the nursery survives every minor.
+                    continue;
+                }
+                let mut root = GcRef(obj);
+                self.drag_out_root(&mut root);
+                dragged = true;
+            }
+        }
+        self.rrc.c_edges = edges;
+        dragged
+    }
+
     /// incminimark.py:3196-3210 `rawrefcount_create_link_pypy`.
     ///
     /// Upstream files a link by two independent questions — which list (young
@@ -3009,9 +3176,10 @@ impl MiniMarkGC {
     /// the callback may only schedule the drain, not perform it.
     fn rrc_invoke_callback(&mut self) {
         if self.rrc.enabled
-            && !self.rrc.dealloc_pending.is_empty()
+            && (!self.rrc.dealloc_pending.is_empty() || self.rrc.c_garbage)
             && let Some(trigger) = self.rrc.dealloc_trigger
         {
+            self.rrc.c_garbage = false;
             trigger();
         }
     }
@@ -3037,9 +3205,8 @@ impl MiniMarkGC {
     /// [`Self::_rrc_minor_free`] then reads the forwarding bit at the *old*
     /// address to decide whether the mirror survives.
     fn _rrc_minor_trace(&mut self, pyobject: usize) {
-        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
-        if rc == rawrefcount::REFCNT_FROM_PYRE {
-            // Nothing but the link references this mirror, so the linked
+        if !self.rrc_roots_link(pyobject) {
+            // Nothing outside the census references this mirror, so the linked
             // object may die.
             return;
         }
@@ -3144,6 +3311,14 @@ impl MiniMarkGC {
             // release is what frees it.
             self.rrc.dealloc_pending.push(pyobject);
             rc = 1;
+        } else {
+            // The link died and references are left over, so they come from
+            // blocks whose own links died in this same pass — the ends of a
+            // cycle the census made collectable.  Nothing here can break it:
+            // the references live in C fields, and dropping one is the
+            // extension's `tp_clear`.  Report that there is such work, which
+            // an empty dealloc queue would otherwise not say.
+            self.rrc.c_garbage = true;
         }
         unsafe { (*header).ob_refcnt = rc };
     }
@@ -3159,8 +3334,7 @@ impl MiniMarkGC {
 
     /// incminimark.py:3356-3372 `_rrc_major_trace`.
     fn _rrc_major_trace(&mut self, pyobject: usize) {
-        let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
-        if rc == rawrefcount::REFCNT_FROM_PYRE {
+        if !self.rrc_roots_link(pyobject) {
             return;
         }
         let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
@@ -3182,8 +3356,7 @@ impl MiniMarkGC {
         debug_assert!(self.oldgen_nonmoving_active);
         let young = std::mem::take(&mut self.rrc.p_list_young);
         for &pyobject in &young {
-            let rc = unsafe { (*rawrefcount::pyobj(pyobject)).ob_refcnt };
-            if rc == rawrefcount::REFCNT_FROM_PYRE {
+            if !self.rrc_roots_link(pyobject) {
                 continue;
             }
             let obj = unsafe { (*rawrefcount::pyobj(pyobject)).ob_link };
@@ -5294,14 +5467,17 @@ impl MiniMarkGC {
         }
     }
 
-    /// Mark conditional side-table edges to a fixed point.
+    /// Mark conditional edges to a fixed point.
     ///
-    /// RPython sees an object's weakref lifeline as an ordinary field: marking
-    /// the owner immediately marks the lifeline. Pyre's temporary carrier for
+    /// Two kinds, asked together because each can answer the other. RPython
+    /// sees an object's weakref lifeline as an ordinary field: marking the
+    /// owner immediately marks the lifeline. Pyre's temporary carrier for
     /// builtin layouts is address-keyed, so it reports the same edges here,
-    /// after ordinary marking has established which owners survived. A newly
-    /// marked value may itself make another owner live, hence the fixed point.
-    fn mark_ephemeron_values_to_fixed_point(&mut self) {
+    /// after ordinary marking has established which owners survived. The C
+    /// fields of a `rawrefcount` block are conditional in the same way and for
+    /// the same reason ([`Self::mark_c_edges`]). A newly marked value may itself
+    /// make another owner live, hence the fixed point.
+    fn mark_conditional_edges_to_fixed_point(&mut self) {
         loop {
             let mut classify_owner = |owner: usize| -> Option<usize> {
                 if owner == 0 || !self.oldgen.contains(owner) {
@@ -5325,6 +5501,7 @@ impl MiniMarkGC {
                 self.mark_object(obj_addr);
                 drained += 1;
             }
+            drained += self.mark_c_edges();
             if drained == 0 {
                 break;
             }
@@ -5352,12 +5529,15 @@ impl MiniMarkGC {
         // other, and it is consulted here, after the ordinary roots and before
         // anything reads VISITED to decide what dies.
         if self.rrc.enabled {
+            // Before the trace, not inside it: gathering the edges enters the
+            // extension.
+            self.rrc_refresh_c_edges();
             self.rrc_major_collection_trace();
             if self.oldgen_nonmoving_active {
                 self.rrc_nonmoving_major_trace_young();
             }
         }
-        self.mark_ephemeron_values_to_fixed_point();
+        self.mark_conditional_edges_to_fixed_point();
         // incminimark.py:2492: this counter belongs to one finalization-order
         // pass.  `_bump_finalization_state_from_0_to_1` below repopulates it
         // with every otherwise-dead object retained for a finalizer.
@@ -5729,7 +5909,7 @@ impl MiniMarkGC {
         // field. Re-establish those edges here: `prune_ephemeron_tables` reads
         // the same VISITED bits below and would otherwise keep an entry whose
         // value nothing marked, leaving the table pointing into swept memory.
-        self.mark_ephemeron_values_to_fixed_point();
+        self.mark_conditional_edges_to_fixed_point();
 
         // PyPy clears weakrefs while queued objects are in state 2.
         if !self.old_objects_with_weakrefs.is_empty() {

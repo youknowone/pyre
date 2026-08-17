@@ -3019,6 +3019,12 @@ pub fn gc_rawrefcount_init(dealloc_trigger: rawrefcount::DeallocTriggerFn) {
     gc_sync::gc_op(|gc| gc.rawrefcount_init(dealloc_trigger));
 }
 
+/// Register the [`rawrefcount::CEdgeCensusFn`] the collector reads a block's
+/// own references from.  Upstream has no counterpart; see the type.
+pub fn gc_rawrefcount_set_c_edge_census(census: rawrefcount::CEdgeCensusFn) {
+    gc_sync::gc_op(|gc| gc.rawrefcount_set_c_edge_census(census));
+}
+
 /// `rawrefcount.py:create_link_pypy` — `pyobject` is a mirror of `obj`, and
 /// `obj` owns it: the mirror lives as long as the interpreter object does, plus
 /// as long afterwards as the C side still holds a reference.

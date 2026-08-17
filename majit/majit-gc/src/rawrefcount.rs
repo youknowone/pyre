@@ -108,7 +108,39 @@ pub(crate) struct RawRefCount {
     /// deallocator the embedder still has to run.
     pub(crate) dealloc_pending: Vec<usize>,
     pub(crate) dealloc_trigger: Option<DeallocTriggerFn>,
+    /// [`CEdgeCensusFn`], and this collection's answer from it.
+    pub(crate) c_edge_census: Option<CEdgeCensusFn>,
+    pub(crate) c_edges: Vec<(usize, Vec<usize>)>,
+    /// How many of a mirror's references are held by the blocks in
+    /// [`RawRefCount::c_edges`], keyed by mirror.
+    pub(crate) c_discount: AddressMap<isize>,
+    /// Set when a link died while the mirror kept references from the C side:
+    /// blocks that only the embedder can now break apart.
+    pub(crate) c_garbage: bool,
 }
+
+/// Answers with every block whose references the embedder can enumerate, and
+/// what each one references.
+///
+/// A mirror's count above [`REFCNT_FROM_PYRE`] otherwise means "C still holds
+/// the linked object", which a reference cycle through C defeats: the two ends
+/// of the cycle hold each other, so each reads as externally held and neither
+/// side's collector can see it.  The edges are what makes the difference
+/// visible — a reference from inside this graph is not a reference from outside
+/// it — and only the embedder can report them, because a block's references are
+/// the extension's own `tp_traverse` to walk.
+///
+/// It therefore runs *before* a collection traces anything, not during: it
+/// enters the extension, and nothing it reaches may find a half-moved heap.
+/// Mirrors do not move, so what it reads is stable either way.
+///
+/// Upstream has no counterpart.  `rawrefcount` keeps a mirror's object alive on
+/// the bare count (`incminimark.py:3259-3270`) and pypy's `cpyext` never reads
+/// `tp_traverse`, so a cycle through C is uncollectable there.  The one upstream
+/// precedent for the shape is `_hpy_universal`'s tracer
+/// (`pypy/module/_hpy_universal/interp_type.py:44,103-113`), which calls a
+/// user-defined traverse from the collector for the same reason.
+pub type CEdgeCensusFn = fn() -> Vec<(usize, Vec<usize>)>;
 
 #[cfg(test)]
 mod tests {

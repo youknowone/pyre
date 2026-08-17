@@ -10,7 +10,9 @@
 //! follows CPython's `gcmodule.c` rather than a pypy file.
 //!
 //! This module is the reporting half: which blocks participate, and what each
-//! one references. Deciding who dies is the collector's.
+//! one references. Deciding who dies is the collector's -- and once it has,
+//! [`clear_garbage`] runs the `tp_clear` that breaks the cycle apart, because
+//! the references are C fields and no other layer can drop one.
 
 use super::pyobject::CPyObject;
 use super::typeobject::{CPyTypeObject, PY_TPFLAGS_HAVE_GC};
@@ -49,6 +51,14 @@ pub(super) fn track(raw: *mut CPyObject) {
     if !has_gc(unsafe { (*raw).ob_type }) {
         return;
     }
+    // A block with no interpreter object behind it is one the collector knows
+    // nothing about, so there is nothing for it to be asked. Both routes that
+    // reach here -- `PyType_GenericAlloc` and `PyObject_Init` -- link the block
+    // first; the test is what keeps [`clear_garbage`] able to read a cleared
+    // link as "the collector freed this one's object".
+    if unsafe { (*raw).ob_pyre_link }.is_null() {
+        return;
+    }
     TRACKED.lock().insert(raw as usize);
 }
 
@@ -56,10 +66,6 @@ pub(super) fn track(raw: *mut CPyObject) {
 /// `dealloc` performs for a block that never untracked itself.
 pub(super) fn forget(raw: usize) {
     TRACKED.lock().remove(&raw);
-}
-
-pub(super) fn is_tracked(raw: *mut CPyObject) -> bool {
-    !raw.is_null() && TRACKED.lock().contains(&(raw as usize))
 }
 
 /// Every tracked block, as addresses.
@@ -164,6 +170,73 @@ pub unsafe extern "C" fn PyObject_GC_Track(object: *mut CPyObject) {
 pub unsafe extern "C" fn PyObject_GC_UnTrack(object: *mut CPyObject) {
     if !object.is_null() {
         forget(object as usize);
+    }
+}
+
+/// Every tracked block and what its `tp_traverse` reports — the collector's
+/// [`majit_gc::rawrefcount::CEdgeCensusFn`].
+///
+/// The collector reads a count above the link share as "C still holds this
+/// object". That is what a cycle defeats: two blocks holding each other each
+/// read as externally held. Handing over the edges is what lets it tell a
+/// reference from inside this graph from one from outside, and it decides
+/// nothing here — a block whose object turns out to live still roots what its
+/// fields name, which only its trace can establish.
+///
+/// A referent is usually not itself tracked: an instance of a C-defined type
+/// holding a plain Python object is the ordinary case, and that edge is exactly
+/// the one the interpreter cannot see. Only a tracked block has reportable
+/// outgoing edges, so a reference from anywhere else goes on rooting.
+///
+/// Runs with the collector borrowed, so nothing it reaches may allocate. Only
+/// mirror blocks are read, and those never move.
+pub(super) fn c_edges() -> Vec<(usize, Vec<usize>)> {
+    let tracked = tracked_blocks();
+    let mut edges = Vec::with_capacity(tracked.len());
+    for block in tracked {
+        let mut referents = Vec::new();
+        let reported = unsafe {
+            references(block as *mut CPyObject, &mut |referent| {
+                referents.push(referent as usize)
+            })
+        };
+        if reported && !referents.is_empty() {
+            edges.push((block, referents));
+        }
+    }
+    edges
+}
+
+/// `gcmodule.c:2000 delete_garbage` — break apart the blocks the collector
+/// found to be a cycle.
+///
+/// A block whose link the collector cleared has lost its interpreter object,
+/// and one still holding references after that is held by another block in the
+/// same state: the ends of a cycle. Neither can reach a count of zero while the
+/// other stands, and nothing this layer owns can drop the references — they
+/// live in C fields, and dropping one is the extension's `tp_clear`.
+///
+/// The reference taken over the whole pass is what makes it safe to run
+/// arbitrary `tp_clear` code: a peer's clear can decref any of these, and
+/// without it the first clear could free a block this pass has yet to reach.
+/// `delete_garbage` takes the same one for the same reason.
+pub(super) fn clear_garbage() {
+    let garbage: Vec<*mut CPyObject> = tracked_blocks()
+        .into_iter()
+        .map(|block| block as *mut CPyObject)
+        .filter(|&raw| unsafe { (*raw).ob_pyre_link }.is_null() && tp_clear_of(raw).is_some())
+        .collect();
+    if garbage.is_empty() {
+        return;
+    }
+    for &raw in &garbage {
+        unsafe { super::pyobject::incref(raw) };
+    }
+    for &raw in &garbage {
+        unsafe { clear(raw) };
+    }
+    for raw in garbage {
+        unsafe { super::pyobject::decref(raw) };
     }
 }
 

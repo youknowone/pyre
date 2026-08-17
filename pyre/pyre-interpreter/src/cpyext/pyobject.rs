@@ -21,9 +21,11 @@
 //!
 //! The rule's other half is that a count *above* the link share does root the
 //! object — `rawrefcount.rst`'s "mark 'p' as surviving, as well as all its
-//! dependencies".  A reference cycle that runs through a C reference therefore
-//! stays alive, upstream included: breaking one needs the type's `tp_traverse`
-//! and `tp_clear`, which no `rawrefcount` collection consults.
+//! dependencies".  Read on its own that keeps a reference cycle running through
+//! a C reference alive for good, which is where it stands upstream; what a
+//! collection here also has is the block's own references, reported by
+//! [`super::gc`] out of its `tp_traverse`, so that a reference from inside the
+//! cycle is told apart from one from outside it.
 
 use super::ForkMutex;
 use super::typeobject::CPyTypeObject;
@@ -569,6 +571,10 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
 /// mirror can decref others, which is why the queue is re-read every iteration
 /// rather than drained into a list.
 pub fn drain_dead() {
+    // First, because a block the collector could not bring to zero is one the
+    // queue never names: its remaining references are a cycle's, and breaking
+    // them is what lets the deallocators below run at all.
+    super::gc::clear_garbage();
     loop {
         let raw = majit_gc::gc_rawrefcount_next_dead() as *mut CPyObject;
         if raw.is_null() {
@@ -678,6 +684,7 @@ pub(super) unsafe fn cached_bytes(
 /// right moment.
 pub(super) fn init_rawrefcount() {
     majit_gc::gc_rawrefcount_init(schedule_drain);
+    majit_gc::gc_rawrefcount_set_c_edge_census(super::gc::c_edges);
 }
 
 /// Fired from inside a collection, so it may only schedule.
