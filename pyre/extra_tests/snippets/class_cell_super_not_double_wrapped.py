@@ -12,5 +12,3 @@ class B(A):
 result = B().f()
 
 assert result == 11
-
-assert result == 11
