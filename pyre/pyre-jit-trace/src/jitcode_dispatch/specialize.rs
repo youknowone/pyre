@@ -129,6 +129,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
         &[raised, active],
         crate::descr::w_exception_context_descr(expected_kind),
     );
+    fbw_context_chained_insert(raised);
     // The authentic helper has published the raised exception but has not
     // chained it yet during the authoritative walk.  Mirror the recorded
     // field write so that iteration observes the same context as replay.
@@ -11544,6 +11545,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         &[exc_op, active],
         crate::descr::w_exception_context_descr(kind),
     );
+    fbw_context_chained_insert(exc_op);
     // The full-body walk is also the authoritative execution of the
     // tracing iteration.  Apply the same context write to its concrete,
     // freshly-built exception that the recorded SETFIELD performs on later
@@ -11748,6 +11750,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         &[new_op, active],
         crate::descr::w_exception_context_descr(kind),
     );
+    fbw_context_chained_insert(new_op);
     // Apply the same context write to the concrete, freshly-built exception so
     // Python code reached later in this authoritative walk observes the
     // `__context__` the recorded SETFIELD performs on compiled iterations.

@@ -1926,11 +1926,31 @@ pub type RecordInlineApplicationTraceback = extern "C" fn(i64, i64, i64, i64, i6
 /// so this hook takes a PYTHON pc where the two above take a jitcode one.
 pub type RecordDiscardedLevelTraceback = extern "C" fn(i64, i64, i64);
 
+/// Runtime callback that answers the implicit `__context__` of an exception:
+/// the object its `__context__` slot must hold once the raise is recorded, or
+/// `0` when nothing is to be chained.
+///
+/// `pypy/interpreter/error.py:410-420 record_context` runs inside the
+/// interpreter's exception dispatch, so an exception whose handler is part of
+/// the trace never reaches it — the same gap the traceback hooks above close
+/// for `record_application_traceback`.  The host owns the execution context
+/// the active exception is read from, so majit keeps only this ABI hook.
+///
+/// It **answers** rather than stores because the trace records the store as a
+/// `SetfieldGc` of its own.  A callback that wrote the field itself would need
+/// an `EffectInfo` naming that write, and `make_call_descr_with_effect` rejects
+/// a non-trivial raw descr set minted after `compute_bitstrings`
+/// (`effectinfo.py:182-184`); declaring no write instead would let the
+/// optimizer answer a later `__context__` read from its pre-call cache.
+pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
+
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static RECORD_DISCARDED_LEVEL_TRACEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static RESOLVE_EXCEPTION_CONTEXT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
@@ -1954,6 +1974,34 @@ pub fn set_record_discarded_level_traceback_hook(hook: Option<RecordDiscardedLev
         hook.map_or(0, |callback| callback as usize),
         std::sync::atomic::Ordering::Release,
     );
+}
+
+pub fn set_resolve_exception_context_hook(hook: Option<ResolveExceptionContext>) {
+    RESOLVE_EXCEPTION_CONTEXT.store(
+        hook.map_or(0, |callback| callback as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub fn resolve_exception_context_hook_address() -> *const () {
+    RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire) as *const ()
+}
+
+/// The `__context__` of `exc_value`, answered through the same host hook the
+/// compiled run calls, so the one-shot recording iteration reaches the value
+/// its compiled successors will.  `0` when there is nothing to chain.
+pub fn resolve_exception_context_for_recording(exc_value: i64) -> i64 {
+    if exc_value == 0 {
+        return 0;
+    }
+    let hook = RESOLVE_EXCEPTION_CONTEXT.load(std::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        return 0;
+    }
+    // SAFETY: the stored address is a `ResolveExceptionContext` published by
+    // `set_resolve_exception_context_hook`.
+    let callback: ResolveExceptionContext = unsafe { std::mem::transmute(hook) };
+    callback(exc_value)
 }
 
 pub fn record_application_traceback_hook_address() -> *const () {

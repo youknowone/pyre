@@ -341,6 +341,24 @@ pub(crate) fn fbw_built_exc_take(op: OpRef) -> bool {
     FBW_BUILT_EXC.with(|s| s.borrow_mut().remove(&op))
 }
 
+/// Record that a raise lowering already emitted the `__context__` chaining for
+/// `op`, so the in-trace catch compensation leaves it alone.
+pub(crate) fn fbw_context_chained_insert(op: OpRef) {
+    FBW_CONTEXT_CHAINED.with(|s| {
+        s.borrow_mut().insert(op);
+    });
+}
+
+/// Whether a raise lowering already chained `op`'s `__context__`.
+///
+/// Read, never consumed: the handler that catches the exception is downstream
+/// of the raise in the same trace, and a second stamp there would both
+/// duplicate the store and hand the exception to a call — forcing the
+/// allocation the optimizer had folded away.
+pub(crate) fn fbw_context_chained_contains(op: OpRef) -> bool {
+    FBW_CONTEXT_CHAINED.with(|s| s.borrow().contains(&op))
+}
+
 /// Clear the store journal and residual-call census before a walk
 /// begins (mirrors [`bool_box_truth_reset`]).
 pub(crate) fn fbw_store_journal_reset() {
@@ -373,6 +391,7 @@ pub(crate) fn fbw_store_journal_reset() {
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
     FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
+    FBW_CONTEXT_CHAINED.with(|s| s.borrow_mut().clear());
     // B3: drop any unbalanced PUSH_EXC_INFO prev saves a
     // prior aborted walk left (an exception that propagated out without its
     // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an

@@ -5261,6 +5261,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
                     !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
                     exc,
@@ -7387,6 +7388,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
                     !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
                     exc,
@@ -7581,6 +7583,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
                     !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
                     exc,
@@ -7759,6 +7762,7 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 // at runtime as well as applying it for the recording pass.
                 let emit_runtime =
                     !record_prepend_application_traceback(ctx, exc, exc_concrete, op.pc);
+                record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                 record_inline_application_traceback(
                     ctx,
                     exc,

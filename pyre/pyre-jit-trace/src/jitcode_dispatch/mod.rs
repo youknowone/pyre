@@ -591,6 +591,78 @@ fn journaled_concrete_traceback_attach(exc_ptr: pyre_object::PyObjectRef, attach
     crate::jitcode_dispatch::fbw_traceback_journal_push_if_attached(exc_ptr, previous_head);
 }
 
+/// Record the implicit `__context__` of an exception this trace catches itself.
+///
+/// `error.py:410-420 record_context` runs inside the interpreter's exception
+/// dispatch.  A raise whose handler is part of the trace routes straight to
+/// that handler, so no interpreter dispatch ever sees the error and the chain
+/// is simply never derived — the same gap the traceback recorders above close,
+/// and the reason a hot loop raising under a live `except` reads
+/// `__context__ is None` on exactly its compiled iterations.
+///
+/// The store is not journaled the way the traceback node is.  It only fills a
+/// `__context__` the resolver reported as still unset, and an aborted walk is
+/// replayed by the interpreter, which derives the context from the same
+/// execution context and so writes the same object; a leftover store is
+/// therefore the answer the replay reaches anyway.
+///
+/// The hook only *answers* the context; the store is a `SetfieldGc` of this
+/// trace's own.  A hook that wrote the field itself would need an `EffectInfo`
+/// naming that write, and `make_call_descr_with_effect` rejects a non-trivial
+/// raw descr set minted after `compute_bitstrings` (`effectinfo.py:182-184`);
+/// declaring `default_effect_info` (`EffectInfo::MOST_GENERAL`) instead asserts
+/// "can raise, can force, writes anything", which costs a `GuardNoException`, a
+/// `GuardNotForced` and a full heapcache flush at every raise — enough to
+/// double a hot raise/catch loop.  A reading call plus an explicit store is
+/// both accurate and the shape the optimizer already models.
+fn record_inline_exception_context(ctx: &mut TraceCtx, exc: OpRef, exc_concrete: ConcreteValue) {
+    let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
+        return;
+    };
+    if exc_ptr.is_null() || !unsafe { pyre_object::is_exception(exc_ptr) } {
+        return;
+    }
+    // An exception a raise lowering already chained is not this compensation's
+    // to touch: that lowering emits `exc.w_context = ec.sys_exc_value` as IR on
+    // the still-virtual object and applies the same write to its concrete, so
+    // the store costs nothing and folds away with the exception when the
+    // handler never looks at it.  Stamping it again here would duplicate the
+    // store and, worse, hand the exception to a call, which forces the
+    // allocation the optimizer had removed.  `raise_catch_loop.py` and
+    // `synth/raise_bare_class_slot_kinds.py` both catch without touching the
+    // object, so that forcing alone doubled their execution time.
+    if fbw_context_chained_contains(exc) {
+        return;
+    }
+    let w_context =
+        majit_metainterp::resolve_exception_context_for_recording(exc_ptr as usize as i64);
+    if w_context != 0 {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(
+                exc_ptr,
+                w_context as usize as pyre_object::PyObjectRef,
+            )
+        };
+    }
+    let hook = majit_metainterp::resolve_exception_context_hook_address();
+    if !hook.is_null() && !exc.is_none() {
+        // `w_context` sits at one offset for every kind, so the recording
+        // iteration's kind names the right bytes even if a later one differs;
+        // only the descr identity the optimizer aliases on is narrower.
+        let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
+        let context_descr = crate::descr::w_exception_context_descr(kind);
+        let w_context = ctx.call_ref_typed_with_effect(
+            hook,
+            &[exc],
+            &[Type::Ref],
+            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        );
+        let context_idx = context_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[exc, w_context], context_descr);
+        ctx.heapcache_setfield_cached(exc, context_idx, w_context);
+    }
+}
+
 fn record_top_level_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -3221,6 +3293,7 @@ pub fn walk<Sym: WalkSym>(
                             exc_concrete,
                             node_position,
                         );
+                    record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                     record_inline_application_traceback(
                         ctx,
                         exc,
@@ -6263,6 +6336,15 @@ thread_local! {
     /// exception.  Reset at each FBW walk entry via `fbw_store_journal_reset`
     /// so a stale OpRef key from a prior recorder cannot leak across walks.
     static FBW_BUILT_EXC: std::cell::RefCell<std::collections::HashSet<OpRef>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// The OpRefs whose `__context__` a raise lowering already emitted as
+    /// `SetfieldGc(exc, GetfieldGcR(ec, sys_exc_value))`.  Distinct from
+    /// [`FBW_BUILT_EXC`], which `RaiseVarargs` *consumes* — by the time the
+    /// exception reaches the handler that catches it in this same trace, that
+    /// set no longer names it, and the in-trace catch compensation would
+    /// stamp the field a second time.  Reset with the other walk state.
+    static FBW_CONTEXT_CHAINED: std::cell::RefCell<std::collections::HashSet<OpRef>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 
     /// B3: LIFO stack of the previous-exception slot value
