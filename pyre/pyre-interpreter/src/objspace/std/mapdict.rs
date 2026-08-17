@@ -5157,10 +5157,24 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         if (*storage_slot).is_null() {
             return;
         }
-        let storage = *storage_slot;
-        if pyre_object::gc_hook::try_gc_owns_object(storage as *mut u8) {
+        if pyre_object::gc_hook::try_gc_owns_object(*storage_slot as *mut u8) {
             f(storage_slot as *mut PyObjectRef);
         }
+        // Both forms are needed, unlike in `list_object_custom_trace`, which
+        // picks one: handing over the field slot only forwards the block
+        // pointer, and the block is `alloc_stable`, so a minor never descends
+        // into it to reach the values.  Walking the items here is what keeps
+        // an attribute value alive; a list's items block can be young, which
+        // is what makes the either/or correct there and wrong here.
+        //
+        // The block's own tid registers `items_have_gc_ptrs`, which is not a
+        // reason to drop this walk: a declared walker is not a guarantee that
+        // the walk runs.  That flag describes what happens *when* the block is
+        // traversed, and a minor does not traverse an old-gen block at all.
+        //
+        // Read the block back out of the slot, since the call above is free to
+        // have forwarded it.
+        let storage = *storage_slot;
         // The storage block is exact-size (capacity == map.storage_needed()).
         let len = pyre_object::object_array::items_block_capacity(storage);
         let base = pyre_object::object_array::items_block_items_base(storage);
