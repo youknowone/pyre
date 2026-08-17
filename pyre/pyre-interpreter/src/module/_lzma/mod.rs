@@ -142,13 +142,24 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
             "Filter specifier must have an \"id\" entry",
         ));
     };
-    // `lzma_vli` is a `uint64_t`, but no id above `LZMA_VLI_MAX` (2**63-1)
-    // names a filter, so the index conversion covers the whole valid range.
-    let id = crate::baseobjspace::index_int_w_preserve_negative(w_id)?;
-    let Ok(id) = u64::try_from(id) else {
-        return Err(crate::PyError::value_error(
-            "cannot convert negative integer to unsigned",
-        ));
+    // `lzma_vli` is a `uint64_t`, so the id reads as an unsigned 64-bit value
+    // and one that overflows a *signed* read still converts. Whether the
+    // result names a filter is the dispatch's answer below, not this one's;
+    // only a width the type cannot hold is an overflow here.
+    let w_index = crate::baseobjspace::space_index(w_id)?;
+    let negative = || crate::PyError::value_error("cannot convert negative integer to unsigned");
+    let id = match crate::baseobjspace::int_w(w_index) {
+        Ok(value) => u64::try_from(value).map_err(|_| negative())?,
+        Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+            let big = unsafe { pyre_object::w_long_get_value(w_index) };
+            if big.get_sign() < 0 {
+                return Err(negative());
+            }
+            big.to_u64().ok_or_else(|| {
+                crate::PyError::overflow_error("Python int too large for C lzma_vli")
+            })?
+        }
+        Err(error) => return Err(error),
     };
     let kind = match id {
         backend::FILTER_LZMA1 | backend::FILTER_LZMA2 => LZMA_KIND,
@@ -193,8 +204,15 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
             other => unreachable!("filter option {other} has no slot"),
         }
     }
-    // An entry the filter does not know is what the keyword parse rejects,
-    // and a spec that cannot even be counted would not have reached it.
+    // The options are read by a keyword parse whose keyword argument is the
+    // spec itself, so a spec that is not a dict fails there — `__getitem__`
+    // alone carries it past the dict-or-dict-like gate above but no further.
+    // A dict carrying an entry the filter does not name fails there too, and
+    // that is what the count catches.
+    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { crate::baseobjspace::isinstance_w(spec(), w_dict_type) } {
+        return Err(crate::PyError::value_error(kind.message));
+    }
     let entries = crate::baseobjspace::len(spec())
         .and_then(crate::baseobjspace::int_w)
         .map_err(|_| crate::PyError::value_error(kind.message))?;
