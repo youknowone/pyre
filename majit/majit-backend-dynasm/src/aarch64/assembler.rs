@@ -1529,7 +1529,7 @@ impl<'a> AssemblerARM64<'a> {
         // already spells this gate as `if let Some(wb) = wb_descr`.
         if crate::runner::dynasm_write_barrier_descr().is_some() {
             let loc_base = crate::aarch64::registers::FP;
-            self.emit_write_barrier_fastpath_for_base(loc_base, false, None);
+            self.emit_write_barrier_fastpath_for_base(loc_base, false, true, None);
         }
     }
 
@@ -6115,13 +6115,14 @@ impl<'a> AssemblerARM64<'a> {
         // opassembler.py:996 `loc_index = arglocs[1]` — the location kind is
         // discriminated at the card-marking block, not here.
         let loc_index = arglocs.get(1).copied();
-        self.emit_write_barrier_fastpath_for_base(loc_base, is_array, loc_index);
+        self.emit_write_barrier_fastpath_for_base(loc_base, is_array, false, loc_index);
     }
 
     fn emit_write_barrier_fastpath_for_base(
         &mut self,
         loc_base: crate::regloc::RegLoc,
         is_array: bool,
+        is_frame: bool,
         loc_index: Option<Loc>,
     ) {
         // opassembler.py:917-919 asserts the descriptor is the collector's
@@ -6220,11 +6221,15 @@ impl<'a> AssemblerARM64<'a> {
                 _ => panic!("index is neither RegLoc nor ImmedLoc"),
             }
         } else {
-            // opassembler.py:968-976: non-array slow path
-            self.emit_wb_helper_call(
-                loc_base,
-                crate::runner::dynasm_write_barrier as *const () as i64,
-            );
+            // opassembler.py:968-976: non-array slow path.  The frame takes the
+            // guarded entry; an ordinary store takes the one
+            // `gc.py:295-299 get_write_barrier_fn` names.
+            let helper = if is_frame {
+                crate::runner::dynasm_write_barrier as *const () as i64
+            } else {
+                crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
+            };
+            self.emit_wb_helper_call(loc_base, helper);
         }
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);

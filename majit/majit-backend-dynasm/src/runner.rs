@@ -1270,10 +1270,33 @@ pub extern "C" fn dynasm_malloc_unicode(type_id: u64, length: u64) -> u64 {
     ))
 }
 
-/// opassembler.py:956-976: non-array write barrier slow path.
-/// Calls gc.write_barrier(obj) which is the generic barrier.
+/// opassembler.py:956-976: non-array write barrier slow path, for the case
+/// whose base is a JITFRAME.
+///
+/// `gc.write_barrier` re-checks null, nursery membership, heap membership and
+/// the pyobject-header registry before touching the remembered set. The frame
+/// is the one base that needs those: it can be a block built off the GC
+/// (`jitframe::alloc_off_gc_jitframe`), and a forwarded nursery header reads
+/// `0xFF` at the flag byte, so the inline test admits addresses the barrier
+/// must still decline.
 pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
     with_dynasm_active_gc_mut(|gc| gc.write_barrier(majit_ir::GcRef(obj_ptr as usize)));
+}
+
+/// opassembler.py:956-976: non-array write barrier slow path, for an ordinary
+/// store's base.
+///
+/// `gc.py:295-299 get_write_barrier_fn` resolves to
+/// `framework.py:538-544 gcdata.gc.remember_young_pointer`, whose own comment
+/// is "We know that 'addr_struct' has GCFLAG_TRACK_YOUNG_PTRS so far"
+/// (`incminimark.py:1538-1546`) — the inline test already made that true, so
+/// the helper neither repeats it nor guards. The base here is whatever the GC
+/// rewriter emitted `COND_CALL_GC_WB` for, which is a collector-allocated
+/// object with a real header.
+pub extern "C" fn dynasm_jit_remember_young_pointer(obj_ptr: u64) {
+    with_dynasm_active_gc_mut(|gc| {
+        gc.jit_remember_young_pointer(majit_ir::GcRef(obj_ptr as usize))
+    });
 }
 
 /// opassembler.py:953-960: array write barrier slow path.

@@ -2229,7 +2229,7 @@ impl<'a> Assembler386<'a> {
         // a correctness gap and is not yet implemented.
         if crate::runner::dynasm_write_barrier_descr().is_some() {
             let rbp_loc = Loc::Reg(crate::regloc::EBP);
-            self.emit_write_barrier_fastpath_kind(&[rbp_loc], false);
+            self.emit_write_barrier_fastpath_kind(&[rbp_loc], false, true);
         }
     }
 
@@ -7461,16 +7461,21 @@ impl<'a> Assembler386<'a> {
     fn emit_setarrayitem_gc_write_barrier(&mut self, arglocs: &[Loc]) {
         let use_array_barrier =
             crate::runner::dynasm_write_barrier_descr().is_some_and(|wb| wb.jit_wb_cards_set != 0);
-        self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier);
+        self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier, false);
     }
 
     /// x86/assembler.py:2438 _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
-        self.emit_write_barrier_fastpath_kind(arglocs, is_array);
+        self.emit_write_barrier_fastpath_kind(arglocs, is_array, false);
     }
 
-    fn emit_write_barrier_fastpath_kind(&mut self, arglocs: &[Loc], is_array: bool) {
+    fn emit_write_barrier_fastpath_kind(
+        &mut self,
+        arglocs: &[Loc],
+        is_array: bool,
+        is_frame: bool,
+    ) {
         // x86/assembler.py:2399-2401 asserts the descriptor is the collector's
         // write-barrier class. `COND_CALL_GC_WB` only exists because the GC
         // rewriter emitted it, so a missing descriptor here means the two
@@ -7589,11 +7594,15 @@ impl<'a> Assembler386<'a> {
                 _ => panic!("index is neither RegLoc nor ImmedLoc"),
             }
         } else {
-            // Non-array: generic barrier
-            self.emit_wb_helper_call_x86(
-                loc_base,
-                crate::runner::dynasm_write_barrier as *const () as i64,
-            );
+            // x86/assembler.py:2432-2436: non-array slow path.  The frame takes
+            // the guarded entry; an ordinary store takes the one
+            // `gc.py:295-299 get_write_barrier_fn` names.
+            let helper = if is_frame {
+                crate::runner::dynasm_write_barrier as *const () as i64
+            } else {
+                crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
+            };
+            self.emit_wb_helper_call_x86(loc_base, helper);
         }
 
         dynasm!(self.mc ; .arch x64 ; =>done);
