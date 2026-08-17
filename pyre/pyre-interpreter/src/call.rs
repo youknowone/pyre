@@ -5046,16 +5046,34 @@ pub(crate) fn call_init_subclass_on_bases(
     // proxy.  This matters for a custom metaclass mro() that omits the
     // nascent class: `super(w_type, w_type)` must reject that incomplete
     // hierarchy instead of manufacturing an invalid proxy.
+    // The keywords are a raw copy the collector cannot see, and `super_check`,
+    // the `__init_subclass__` lookup and a `__getattr__` under it all run
+    // Python.  A class keyword's value can be a list or a dict, so pin the
+    // pairs here and read them back where the call's keywords are built.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let flat: Vec<PyObjectRef> = init_subclass_kwargs
+        .iter()
+        .flat_map(|&(key, value)| [key, value])
+        .collect();
+    let kwarg_base = pyre_object::gc_roots::pin_roots(&flat);
     let w_objtype = crate::builtins::super_check(w_type, w_type)?;
     let w_super = pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
     // typeobject.py:1025-1026 — `args = __args__.replace_arguments([])` then
     // `space.call_args(w_func, args)`: keywords only, no positionals, and no
     // frame, because `call_args` (descroperation.py:189) never takes one.
-    let kwds: Vec<(Wtf8Buf, PyObjectRef)> = init_subclass_kwargs
-        .iter()
-        .filter(|(k, _)| unsafe { pyre_object::is_str(*k) })
-        .map(|(k, v)| (unsafe { pyre_object::w_str_get_wtf8(*k) }.to_owned(), *v))
+    let kwds: Vec<(Wtf8Buf, PyObjectRef)> = (0..init_subclass_kwargs.len())
+        .filter_map(|index| {
+            let key = pyre_object::gc_roots::shadow_stack_get(kwarg_base + index * 2);
+            if !unsafe { pyre_object::is_str(key) } {
+                return None;
+            }
+            let value = pyre_object::gc_roots::shadow_stack_get(kwarg_base + index * 2 + 1);
+            Some((
+                unsafe { pyre_object::w_str_get_wtf8(key) }.to_owned(),
+                value,
+            ))
+        })
         .collect();
     call_with_kwargs_in_ctx(take_last_exec_ctx(), w_func, &[], &kwds)?;
     Ok(())

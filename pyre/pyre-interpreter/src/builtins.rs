@@ -5896,9 +5896,21 @@ fn type_descr_new_with_metaclass(
         // re-enter the type's dict.
         let dict_obj = pyre_object::gc_roots::shadow_stack_get(dict_root);
         let set_name_entries = unsafe { pyre_object::w_dict_items(dict_obj) };
-        for (key, v) in set_name_entries {
+        // The pairs sit in a native Vec the collector does not walk and every
+        // `__set_name__` runs Python, so a class body's list and dict values
+        // move out from under the entries still to come.  Pin them and read
+        // each back at the call that consumes it.
+        let _entry_roots = pyre_object::gc_roots::push_roots();
+        let flat: Vec<PyObjectRef> = set_name_entries
+            .iter()
+            .flat_map(|&(key, value)| [key, value])
+            .collect();
+        let entry_base = pyre_object::gc_roots::pin_roots(&flat);
+        for index in 0..set_name_entries.len() {
+            let key = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2);
             if unsafe { pyre_object::is_str(key) } {
-                unsafe { crate::baseobjspace::set_name(w_type, key, v) }?;
+                let value = pyre_object::gc_roots::shadow_stack_get(entry_base + index * 2 + 1);
+                unsafe { crate::baseobjspace::set_name(w_type, key, value) }?;
             }
         }
 
