@@ -17863,14 +17863,57 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
     Some((parent, leaf))
 }
 
-/// Resolve a call to a bodyless trait declaration as dynamic dispatch.
+/// Whether the call's trait reference leaves its implementation to be
+/// selected at run time.
+///
+/// Charon records where the reference came from in its `kind`: `Dyn` for a
+/// trait object, whose vtable is the only thing that names the target, as
+/// against `Clause` (a bound on the enclosing generic, fixed by whoever
+/// instantiated it), `TraitImpl` (an impl named outright) and `BuiltinOrAuto`.
+/// Only the first is a dispatch; each of the others stands for exactly one
+/// implementation, and a family of one has nothing to select.
+///
+/// `rpbc.py:212-217` splits the same two cases on whether the row's function
+/// came out constant — `if isinstance(vlist[0], Constant): v =
+/// hop.genop('direct_call', vlist, ...)`, and only the `else` arm appends the
+/// row of graphs and emits `indirect_call`.
+///
+/// The reference arrives either inline or hash-consed: Charon writes
+/// `HashConsedValue: [id, body]` at the first occurrence and `Deduplicated:
+/// id` afterwards, so both spellings resolve to the same body.
+fn trait_ref_is_dyn(trait_ref: &serde_json::Value, llbc: &Llbc) -> bool {
+    let resolved = match trait_ref
+        .get("Deduplicated")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(id) => match llbc.dedup_body(id) {
+            Some(body) => body,
+            None => return false,
+        },
+        None => trait_ref,
+    };
+    let resolved = resolved
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|pair| pair.get(1))
+        .unwrap_or(resolved);
+    resolved.get("kind").and_then(serde_json::Value::as_str) == Some("Dyn")
+}
+
+/// Resolve a call on a trait object as dynamic dispatch.
 ///
 /// Charon keeps a call such as `self.head()` inside a trait default method as
-/// `CallKind::Trait` pointing at the declaration of `head`. When that
-/// declaration has no body, the direct `[Trait, method]` path has nothing to
-/// execute; the receiver's implementation family must select the target.
+/// `CallKind::Trait` pointing at the declaration of `head`. When the receiver
+/// is a trait object and that declaration has no body, the direct
+/// `[Trait, method]` path has nothing to execute; the receiver's
+/// implementation family must select the target.
 ///
-/// A bodyless declaration that takes no receiver is excluded. `rpbc.py`
+/// A reference the caller's instantiation already resolved is excluded, even
+/// though its declaration is equally bodyless: the implementation is unique,
+/// so the direct path names the impl's own graph and the call stays inside
+/// the inline closure. See [`trait_ref_is_dyn`].
+///
+/// A bodyless declaration that takes no receiver is excluded too. `rpbc.py`
 /// dispatches a methods-PBC on the instance the call is bound to, and the
 /// lowering below reads that instance off the call's first argument; an
 /// associated function has none, and the type it would be selected by is
@@ -17881,7 +17924,11 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     let CallKind::Trait(value) = &reg.kind else {
         return None;
     };
-    let method_id = value.as_array()?.get(2)?.as_u64()?;
+    let payload = value.as_array()?;
+    if !trait_ref_is_dyn(payload.first()?, llbc) {
+        return None;
+    }
+    let method_id = payload.get(2)?.as_u64()?;
     let declaration = llbc.fn_by_id(method_id)?;
     if declaration.unstructured().is_some() {
         return None;
@@ -23827,7 +23874,7 @@ mod tests {
     }
 
     #[test]
-    fn bodyless_trait_method_uses_indirect_dispatch() {
+    fn bodyless_trait_method_on_a_trait_object_uses_indirect_dispatch() {
         let method = serde_json::json!({
             "def_id": 1,
             "item_meta": {
@@ -23864,7 +23911,7 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
-            "kind": {"Trait": [{}, 0, 1]},
+            "kind": {"Trait": [{"kind": "Dyn"}, 0, 1]},
             "generics": {}
         }))
         .expect("fixture trait call parses");
@@ -23873,6 +23920,56 @@ mod tests {
             super::abstract_trait_call_target(&call, &llbc),
             Some(("Storage".to_string(), "head".to_string()))
         );
+    }
+
+    #[test]
+    fn bodyless_trait_method_behind_a_clause_is_not_indirect() {
+        // `fn body<H: Storage>(h: &mut H) { h.head() }`: the declaration of
+        // `head` is as bodyless as the trait-object case above, but the
+        // reference is the bound on `H`, which whoever instantiated `body`
+        // has already resolved. The implementation is unique, so the direct
+        // `[Storage, head]` path names the impl's graph and the callee stays
+        // inside the inline closure instead of becoming a residual call.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Adt": {"id": "Tuple", "generics": {"types": []}}}],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 1]}}}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
     }
 
     #[test]
@@ -23915,7 +24012,9 @@ mod tests {
         });
         let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
         let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
-            "kind": {"Trait": [{}, 0, 1]},
+            // `Dyn` so the receiver guard is what rejects this, not the
+            // reference kind.
+            "kind": {"Trait": [{"kind": "Dyn"}, 0, 1]},
             "generics": {}
         }))
         .expect("fixture trait call parses");
