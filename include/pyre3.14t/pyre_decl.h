@@ -31,6 +31,16 @@ PyAPI_FUNC(int) PyObject_CheckReadBuffer(PyObject *);
 PyAPI_FUNC(int) PyObject_CopyData(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyObject_GetBuffer(PyObject *, Py_buffer *, int);
 
+/* cpyext/bytearrayobject.rs */
+PyAPI_FUNC(char *) PyByteArray_AsString(PyObject *);
+PyAPI_FUNC(int) PyByteArray_Check(PyObject *);
+PyAPI_FUNC(int) PyByteArray_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_Concat(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_FromObject(PyObject *);
+PyAPI_FUNC(PyObject *) PyByteArray_FromStringAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyByteArray_Resize(PyObject *, Py_ssize_t);
+PyAPI_FUNC(Py_ssize_t) PyByteArray_Size(PyObject *);
+
 /* cpyext/bytesobject.rs */
 PyAPI_FUNC(char *) PyBytes_AS_STRING(void *);
 PyAPI_FUNC(char *) PyBytes_AsString(PyObject *);
@@ -55,6 +65,15 @@ PyAPI_FUNC(int) PyCapsule_SetContext(PyObject *, void *);
 PyAPI_FUNC(int) PyCapsule_SetDestructor(PyObject *, PyCapsule_Destructor);
 PyAPI_FUNC(int) PyCapsule_SetName(PyObject *, const char *);
 PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *, void *);
+
+/* cpyext/complexobject.rs */
+PyAPI_FUNC(Py_complex) PyComplex_AsCComplex(PyObject *);
+PyAPI_FUNC(int) PyComplex_Check(PyObject *);
+PyAPI_FUNC(int) PyComplex_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyComplex_FromCComplex(Py_complex);
+PyAPI_FUNC(PyObject *) PyComplex_FromDoubles(double, double);
+PyAPI_FUNC(double) PyComplex_ImagAsDouble(PyObject *);
+PyAPI_FUNC(double) PyComplex_RealAsDouble(PyObject *);
 
 /* cpyext/dictobject.rs */
 PyAPI_FUNC(int) PyDict_Check(PyObject *);
@@ -440,6 +459,17 @@ PyAPI_FUNC(unsigned int) PyUnicode_MAX_CHAR_VALUE(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_New(Py_ssize_t, Py_UCS4);
 PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
+
+/* cpyext/weakrefobject.rs */
+PyAPI_FUNC(int) PyWeakref_Check(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckProxy(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckRef(PyObject *);
+PyAPI_FUNC(int) PyWeakref_CheckRefExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_GetObject(PyObject *);
+PyAPI_FUNC(int) PyWeakref_GetRef(PyObject *, PyObject **);
+PyAPI_FUNC(int) PyWeakref_IsDead(PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_NewProxy(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyWeakref_NewRef(PyObject *, PyObject *);
 
 #ifdef __cplusplus
 }

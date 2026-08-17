@@ -725,6 +725,24 @@ pub unsafe fn isinstance_list_w(obj: PyObjectRef) -> bool {
     false
 }
 
+/// `space.isinstance_w(w_obj, space.w_bytearray)` — accepts `bytearray` and any
+/// `bytearray` subclass.  `pyre_object::is_bytearray` matches the exact tag.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn isinstance_bytearray_w(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return true;
+    }
+    if let Some(bytearray_type) = crate::typedef::gettypefor(&pyre_object::BYTEARRAY_TYPE) {
+        return unsafe { isinstance_w(obj, bytearray_type.as_ptr()) };
+    }
+    false
+}
+
 /// `space.isinstance_w(w_obj, space.w_dict)` — accepts `dict` and any `dict`
 /// subclass.  `pyre_object::is_dict` matches the exact tag and the module-dict
 /// sibling only.

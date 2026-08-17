@@ -25,9 +25,10 @@
 #include "pytypedefs.h"
 #include "object.h"
 #include "typeslots.h"
-/* Names `PyThreadState` and `PyGILState_STATE`, which entry points below take
-   and answer with. */
+/* Name the types entry points below take and answer with by value:
+   `PyThreadState` and `PyGILState_STATE`, and `Py_complex`. */
 #include "pystate.h"
+#include "complexobject.h"
 
 /* Every exported entry point. It sits here because the headers above
    name the types it uses, and the ones below define `static inline`

@@ -16,8 +16,10 @@
 ))]
 
 pub mod buffer;
+pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod capsule;
+pub mod complexobject;
 pub mod dictobject;
 pub mod floatobject;
 pub mod gc;
@@ -40,6 +42,7 @@ pub mod sliceobject;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
+pub mod weakrefobject;
 
 use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
@@ -730,6 +733,9 @@ pub fn ensure_linked() {
     std::hint::black_box(&raw const pyobject::_Py_EllipsisObject);
     pyobject::ensure_linked();
     pystate::ensure_linked();
+    bytearrayobject::ensure_linked();
+    complexobject::ensure_linked();
+    weakrefobject::ensure_linked();
     gc::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();

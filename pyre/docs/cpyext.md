@@ -97,9 +97,10 @@ reports. `PYRE_VERSION` is the interpreter's own version beside it, the slot
 The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
 single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
-the header below. `pyrex/tests/cpyext_dict_subclass.rs` and
-`pyrex/tests/cpyext_pystate.rs` take their expectations from CPython 3.14.6
-running the same script against the same fixture.
+the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
+`pyrex/tests/cpyext_pystate.rs` and `pyrex/tests/cpyext_object_families.rs`
+take their expectations from CPython 3.14.6 running the same script against the
+same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -147,6 +148,18 @@ running the same script against the same fixture.
 - the object protocol (`cpyext/object.rs`) and the primitive constructors and
   accessors for `int`, `bool`, `float`, `str`, `bytes`, `tuple`, `list` and
   `dict`;
+- `bytearray` (`cpyext/bytearrayobject.rs`), `complex`
+  (`cpyext/complexobject.rs`) and `weakref` (`cpyext/weakrefobject.rs`).
+  `PyByteArray_AsString` answers with the payload itself rather than a copy, so
+  a write through it reaches the object, with a terminating NUL in the backing
+  allocation's spare capacity; the pointer stops being current as soon as the
+  object is resized, as upstream's own comment states. `PyComplex_AsCComplex`
+  and `PyComplex_FromCComplex` pass `Py_complex` by value, where upstream
+  reaches it through a pointer because lltype cannot return a struct.
+  `PyWeakref_GetObject` borrows the referent's mirror rather than taking the
+  reference a container owns on an item's behalf -- that one lives until the
+  container's mirror dies, which is the object a weak reference must not keep
+  alive;
 - the GIL an extension hands back and forth (`cpyext/pystate.rs`):
   `Py_BEGIN_ALLOW_THREADS` / `Py_END_ALLOW_THREADS` and the
   `Py_BLOCK_THREADS` pair, `PyEval_SaveThread` / `PyEval_RestoreThread` /
