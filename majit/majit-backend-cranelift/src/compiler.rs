@@ -6221,12 +6221,13 @@ fn emit_reload_frame_if_necessary(
     let jf_ptr = builder
         .ins()
         .load(ptr_type, MemFlagsData::trusted(), rst, -word);
-    if with_cranelift_gc(|gc| gc.get_write_barrier_descr())
-        .flatten()
-        .is_some()
-    {
-        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
-    }
+    emit_jitframe_write_barrier(
+        builder,
+        ptr_type,
+        call_conv,
+        jf_ptr,
+        jitframe_write_barrier_flag(),
+    );
     jf_ptr
 }
 
@@ -6332,12 +6333,48 @@ fn emit_pop_gcmap(builder: &mut FunctionBuilder, jf_ptr: CValue, _per_call_gcmap
         .store(MemFlagsData::new(), zero, jf_ptr, JF_GCMAP_OFS);
 }
 
+fn jitframe_write_barrier_flag() -> Option<(i32, u8)> {
+    with_cranelift_gc(|gc| gc.get_write_barrier_descr())
+        .flatten()
+        .map(|descr| {
+            (
+                descr.jit_wb_if_flag_byteofs,
+                descr.jit_wb_if_flag_singlebyte,
+            )
+        })
+}
+
 fn emit_jitframe_write_barrier(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
     jf_ptr: CValue,
+    wb_flag: Option<(i32, u8)>,
 ) {
+    let Some((wb_byteofs, wb_mask)) = wb_flag else {
+        return;
+    };
+
+    // aarch64/opassembler.py:912-1021 `_write_barrier_fastpath` parity:
+    // test the object-header flag inline and call the helper only on a hit.
+    let flag_byte = builder
+        .ins()
+        .load(cl_types::I8, MemFlagsData::trusted(), jf_ptr, wb_byteofs);
+    let flag_ext = builder.ins().uextend(cl_types::I64, flag_byte);
+    let mask_val = builder.ins().iconst(cl_types::I64, wb_mask as i64);
+    let test = builder.ins().band(flag_ext, mask_val);
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let needs_wb = builder.ins().icmp(IntCC::NotEqual, test, zero);
+
+    let slow_block = builder.create_block();
+    let cont_block = builder.create_block();
+    builder
+        .ins()
+        .brif(needs_wb, slow_block, &[], cont_block, &[]);
+
+    builder.switch_to_block(slow_block);
+    builder.seal_block(slow_block);
+    builder.set_cold_block(slow_block);
     let jf_arg = ptr_arg_as_i64(builder, jf_ptr, ptr_type);
     let _ = emit_host_call(
         builder,
@@ -6347,6 +6384,10 @@ fn emit_jitframe_write_barrier(
         &[jf_arg],
         None,
     );
+    builder.ins().jump(cont_block, &[]);
+
+    builder.switch_to_block(cont_block);
+    builder.seal_block(cont_block);
 }
 
 extern "C" fn zero_memory_shim(base: u64, offset: u64, size: u64) {
@@ -7015,7 +7056,13 @@ fn emit_guard_exit(
         // aarch64/assembler.py:967-980 `_reload_frame_if_necessary`: RPython
         // emits a JITFrame write-barrier wherever a promoted frame's slots take
         // young pointers, so they remain trackable.
-        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
+        emit_jitframe_write_barrier(
+            builder,
+            ptr_type,
+            call_conv,
+            jf_ptr,
+            jitframe_write_barrier_flag(),
+        );
     }
 
     // assembler.py:2126 get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
@@ -7119,7 +7166,13 @@ fn emit_guard_exit(
         // on every walk and independent of the gcmap, so the staging store
         // above needs its own barrier. The fail-arg publish is covered by the
         // barrier that runs before the dispatch tail-calls.
-        emit_jitframe_write_barrier(builder, ptr_type, call_conv, jf_ptr);
+        emit_jitframe_write_barrier(
+            builder,
+            ptr_type,
+            call_conv,
+            jf_ptr,
+            jitframe_write_barrier_flag(),
+        );
     }
     builder
         .ins()
@@ -10989,7 +11042,13 @@ impl CraneliftBackend {
                         );
                     }
                     if info.gcmap != 0 {
-                        emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
+                        emit_jitframe_write_barrier(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            cur_jf,
+                            jitframe_write_barrier_flag(),
+                        );
                     }
                 }
 
@@ -12066,7 +12125,13 @@ impl CraneliftBackend {
                         );
                     }
                     if info.gcmap != 0 {
-                        emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
+                        emit_jitframe_write_barrier(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            cur_jf,
+                            jitframe_write_barrier_flag(),
+                        );
                     }
                     bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
@@ -12150,7 +12215,13 @@ impl CraneliftBackend {
                         );
                     }
                     if info.gcmap != 0 {
-                        emit_jitframe_write_barrier(&mut builder, ptr_type, call_conv, cur_jf);
+                        emit_jitframe_write_barrier(
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            cur_jf,
+                            jitframe_write_barrier_flag(),
+                        );
                     }
                     bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
