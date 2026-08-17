@@ -563,6 +563,8 @@ pub fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
 /// caller above it.
 #[majit_macros::dont_look_inside]
 pub fn emit_stdout(bytes: &[u8]) {
+    let bytes = crate::stdio_line_endings_bytes(bytes);
+    let bytes = bytes.as_ref();
     if crate::print_hook_emit_bytes(bytes) {
         return;
     }
@@ -601,6 +603,8 @@ pub fn flush_stdout_when_unbuffered() {
 /// `warn_category_w` liftable.
 #[majit_macros::dont_look_inside]
 pub fn emit_stderr(bytes: &[u8]) {
+    let bytes = crate::stdio_line_endings_bytes(bytes);
+    let bytes = bytes.as_ref();
     if crate::stderr_hook_emit(bytes) {
         return;
     }

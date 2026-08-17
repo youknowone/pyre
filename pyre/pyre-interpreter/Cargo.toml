@@ -93,14 +93,17 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # GetFileInformationByHandle, CreateHardLinkW and ShellExecuteW), plus the
 # WinSock entry points `_socket`'s host layer is built on, and the crypt32
 # store readers (CertOpenStore/CertEnumCertificatesInStore) behind
-# `_ssl.enum_certificates`. Kept on the same 0.61 line rustpython-host_env's
-# nt module resolves to, so HANDLE types match at the boundary.
+# `_ssl.enum_certificates`, and `EXCEPTION_CONTINUE_SEARCH` for the
+# `faulthandler` vectored exception handler. Kept on the same 0.61 line
+# rustpython-host_env's nt module resolves to, so HANDLE types match at the
+# boundary.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Threading",

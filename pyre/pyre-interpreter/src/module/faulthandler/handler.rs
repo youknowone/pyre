@@ -142,6 +142,92 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
 pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 
+/// The vectored exception handler `enable` installed, so `disable` can take it
+/// back out; 0 is "none installed".
+#[cfg(all(windows, feature = "host_env"))]
+static FAULTHANDLER_EXC_HANDLER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `faulthandler.c:280-330 faulthandler_exc_handler`.  A fatal fault on Windows
+/// arrives as a structured exception, not as a signal — a null read never
+/// reaches the `SIGSEGV` handler — so without this, `enable()` there prints
+/// nothing and the process dies at 0xc0000005 in silence.
+///
+/// Answers `EXCEPTION_CONTINUE_SEARCH` like the original: this only reports,
+/// and the handler that decides the process's fate runs after it.
+#[cfg(all(windows, feature = "host_env"))]
+unsafe extern "system" fn faulthandler_exc_handler(
+    exc_info: *mut rustpython_host_env::faulthandler::ExceptionPointers,
+) -> i32 {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+    let code = unsafe { rustpython_host_env::faulthandler::exception_code(exc_info) };
+    // `faulthandler.c:283-286`: a non-error status, and the C++ / CLR throws a
+    // running program uses for control flow, are none of this handler's
+    // business — and every Rust panic under MSVC is one of them.
+    if rustpython_host_env::faulthandler::ignore_exception(code) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // Assembled on the stack for the same reason as the signal handler's.
+    const PREFIX: &[u8] = b"Windows fatal exception: ";
+    let mut msg = [0u8; 64];
+    msg[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut end = PREFIX.len();
+    match rustpython_host_env::faulthandler::exception_description(code) {
+        Some(name) => {
+            let name = &name.as_bytes()[..name.len().min(msg.len() - end - 2)];
+            msg[end..end + name.len()].copy_from_slice(name);
+            end += name.len();
+        }
+        None => {
+            // `faulthandler.c:322-324` spells an unnamed one `code 0x` plus
+            // eight hexadecimal digits.
+            const UNNAMED: &[u8] = b"code 0x";
+            msg[end..end + UNNAMED.len()].copy_from_slice(UNNAMED);
+            end += UNNAMED.len();
+            for digit in (0..8).rev() {
+                msg[end] = b"0123456789abcdef"[((code >> (digit * 4)) & 0xf) as usize];
+                end += 1;
+            }
+        }
+    }
+    msg[end] = b'\n';
+    msg[end + 1] = b'\n';
+    let fd = FAULTHANDLER_FD.load(std::sync::atomic::Ordering::Relaxed);
+    rustpython_host_env::faulthandler::write_fd(fd, &msg[..end + 2]);
+    // `faulthandler.c:326-334`: the access violation is also delivered to the
+    // program as SIGSEGV, and reporting it twice helps nobody.
+    if rustpython_host_env::faulthandler::is_access_violation(code) {
+        rustpython_host_env::faulthandler::disable_fatal_signal(libc::SIGSEGV);
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// The exception statuses `faulthandler` publishes on Windows, spelled the way
+/// `PyModule_AddIntConstant` hands the NTSTATUS values over: as signed 32-bit
+/// ints, so `_EXCEPTION_ACCESS_VIOLATION` reads -0x3ffffffb rather than
+/// 0xc0000005.
+#[cfg(windows)]
+const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
+    ("_EXCEPTION_ACCESS_VIOLATION", EXCEPTION_ACCESS_VIOLATION),
+    ("_EXCEPTION_INT_DIVIDE_BY_ZERO", EXCEPTION_INT_DIVIDE_BY_ZERO),
+    ("_EXCEPTION_NONCONTINUABLE", 0x1),
+    ("_EXCEPTION_NONCONTINUABLE_EXCEPTION", 0xc000_0025u32 as i32),
+    ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fdu32 as i32),
+];
+
+#[cfg(windows)]
+const EXCEPTION_ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
+#[cfg(windows)]
+const EXCEPTION_INT_DIVIDE_BY_ZERO: i32 = 0xc000_0094u32 as i32;
+
+/// `faulthandler.c:1043 faulthandler_suppress_crash_report` — the crash helpers
+/// below take the process down on purpose, so the OS must not stop to offer a
+/// crash dialog first and hang a test run waiting on it.
+fn suppress_crash_report() {
+    #[cfg(all(windows, feature = "host_env"))]
+    rustpython_host_env::faulthandler::suppress_crash_report();
+}
+
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     // Stay async-signal-safe: write with raw libc::write, and reraise so the
@@ -297,6 +383,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         flags,
                     );
                     if ok {
+                        // `faulthandler.c:1049-1052` installs the exception
+                        // handler alongside the signal handlers.  A second
+                        // `enable()` must not stack another one, and the
+                        // installed handle is what `disable` needs.
+                        #[cfg(windows)]
+                        if FAULTHANDLER_EXC_HANDLER.load(std::sync::atomic::Ordering::Relaxed) == 0
+                        {
+                            FAULTHANDLER_EXC_HANDLER.store(
+                                rustpython_host_env::faulthandler::add_vectored_exception_handler(
+                                    Some(faulthandler_exc_handler),
+                                ),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                         // `handler.py:145` `self.fatal_error_w_file = w_file`.
                         set_fatal_error_file(file_slot.map_or(
@@ -333,6 +433,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 {
                     let _state = lock_faulthandler_state();
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
+                    #[cfg(windows)]
+                    rustpython_host_env::faulthandler::remove_vectored_exception_handler(
+                        FAULTHANDLER_EXC_HANDLER.swap(0, std::sync::atomic::Ordering::Relaxed),
+                    );
                     FAULTHANDLER_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                     // `handler.py:150` `self.fatal_error_w_file = None`.
                     set_fatal_error_file(pyre_object::PY_NULL);
@@ -366,13 +470,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("dump_traceback", |_| {
             // No Python-level traceback machinery — emit a placeholder
             // so callers that want a forensic dump at least see *something*
-            // instead of silent success.
-            #[cfg(unix)]
-            {
-                let msg = b"<faulthandler: pyre has no Python-level traceback yet>\n";
-                let _ =
-                    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len() as _) };
-            }
+            // instead of silent success.  Through the stderr seam, so it
+            // reaches an embedder that has no fd 2 and every host gets it, not
+            // just the ones with a `libc::write`.
+            crate::host_seam::emit_stderr(b"<faulthandler: pyre has no Python-level traceback yet>\n");
             Ok(pyre_object::w_none())
         }),
     );
@@ -537,6 +638,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if let Some(&release_gil) = args.first() {
                 let _ = crate::baseobjspace::int_w(release_gil)?;
             }
+            suppress_crash_report();
             // `handler.py:225 read_null` — null-pointer deref.
             let p: *const u8 = std::ptr::null();
             let _ = unsafe { p.read_volatile() };
@@ -556,7 +658,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if let Some(&release_gil) = args.first() {
                 let _ = crate::baseobjspace::int_w(release_gil)?;
             }
-            #[cfg(unix)]
+            suppress_crash_report();
+            // `raise` is in the Windows CRT too, and `enable` installs the
+            // fatal handlers there through `signal()`, so the software raise
+            // reaches them on either host.
+            #[cfg(any(unix, windows))]
             unsafe {
                 libc::raise(libc::SIGSEGV);
             }
@@ -569,6 +675,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "_sigfpe",
             |_| {
+                suppress_crash_report();
+                // `handler.py:233 sigfpe` raises the signal, which is what an
+                // integer division by zero traps as on unix.  Windows delivers
+                // that fault as a structured exception instead, and Rust checks
+                // the divisor rather than letting the CPU trap, so name the
+                // status the hardware would have raised.
+                #[cfg(all(windows, feature = "host_env"))]
+                rustpython_host_env::faulthandler::raise_exception(
+                    EXCEPTION_INT_DIVIDE_BY_ZERO as u32,
+                    0,
+                );
                 #[cfg(unix)]
                 unsafe {
                     libc::raise(libc::SIGFPE);
@@ -584,22 +701,52 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "_sigabrt",
             |_| {
-                #[cfg(unix)]
+                suppress_crash_report();
+                #[cfg(any(unix, windows))]
                 unsafe {
                     libc::abort();
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, windows)))]
                 Ok(pyre_object::w_none())
             },
             0,
         ),
     );
+    // `faulthandler.c:1416-1436` publishes the statuses and `_raise_exception`
+    // only where structured exceptions exist.
+    #[cfg(windows)]
+    {
+        for (name, code) in WINDOWS_EXCEPTIONS {
+            crate::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
+        }
+        crate::module_ns_store(
+            ns,
+            "_raise_exception",
+            crate::make_builtin_function("_raise_exception", |args| {
+                // `_raise_exception(code, flags=0)`.
+                let Some(&w_code) = args.first() else {
+                    return Err(crate::PyError::type_error(
+                        "_raise_exception() missing required argument 'code'",
+                    ));
+                };
+                let code = crate::baseobjspace::int_w(w_code)? as u32;
+                let flags = match args.get(1) {
+                    Some(&w_flags) => crate::baseobjspace::int_w(w_flags)? as u32,
+                    None => 0,
+                };
+                #[cfg(feature = "host_env")]
+                rustpython_host_env::faulthandler::raise_exception(code, flags);
+                Ok(pyre_object::w_none())
+            }),
+        );
+    }
     crate::module_ns_store(
         ns,
         "_stack_overflow",
         crate::make_builtin_function_with_arity(
             "_stack_overflow",
             |_| {
+                suppress_crash_report();
                 // `handler.py:240 stack_overflow` — infinite recursion.
                 fn blow() {
                     let _buf = [0u8; 4096];

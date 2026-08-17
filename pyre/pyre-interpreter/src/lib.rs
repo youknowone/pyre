@@ -105,6 +105,8 @@ pub mod host_seam {
     /// only this one.
     #[majit_macros::dont_look_inside]
     pub fn emit_stdout(bytes: &[u8]) {
+        let bytes = crate::stdio_line_endings_bytes(bytes);
+        let bytes = bytes.as_ref();
         if super::print_hook_emit_bytes(bytes) {
             return;
         }
@@ -128,6 +130,8 @@ pub mod host_seam {
     /// Emit bytes to the interpreter's stderr (fd 2).
     #[majit_macros::dont_look_inside]
     pub fn emit_stderr(bytes: &[u8]) {
+        let bytes = crate::stdio_line_endings_bytes(bytes);
+        let bytes = bytes.as_ref();
         if super::stderr_hook_emit(bytes) {
             return;
         }
@@ -1246,8 +1250,57 @@ pub fn print_hook_emit(s: &str) -> bool {
     print_hook_emit_bytes(s.as_bytes())
 }
 
+/// The newline translation the standard streams are configured for.
+///
+/// `allocate_stdio` (`module/sys/vm.rs`) builds them with `newline=None` where
+/// the host wants it, and that is the mode `TextIOWrapper.write` rewrites
+/// `'\n'` in (`module/_io/textio.rs` `write_newline`).  Neither path that
+/// actually reaches fd 1/2 goes through it — `sys.stdout.write` is an instance
+/// builtin that encodes straight to the descriptor, and diagnostics
+/// (tracebacks, warnings, the displayhook) arrive at `host_seam::emit_stdout` /
+/// `emit_stderr` — so each applies the translation itself.  It cannot move
+/// down to the descriptor write: `sys.stdout.buffer.write` is binary and stays
+/// untranslated.
+///
+/// A plain substitution, `'\r'` included: `TextIOWrapper` runs
+/// `text.replace('\n', writenl)`, so `'a\r\n'` really does come out `'a\r\r\n'`.
+pub fn stdio_line_endings(text: &str) -> std::borrow::Cow<'_, str> {
+    match stdio_line_endings_bytes(text.as_bytes()) {
+        std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(text),
+        // SAFETY: the substitution only inserts an ASCII '\r' ahead of an ASCII
+        // '\n', so well-formed utf-8 stays well-formed.
+        std::borrow::Cow::Owned(bytes) => {
+            std::borrow::Cow::Owned(unsafe { String::from_utf8_unchecked(bytes) })
+        }
+    }
+}
+
+/// [`stdio_line_endings`] for output already encoded.  Only for the diagnostic
+/// seam, whose bytes this interpreter produced as utf-8: a byte-level
+/// substitution is not safe for an arbitrary stdio encoding — utf-16 spells
+/// every ASCII character with a 0x00 beside it — which is why
+/// `sys.stdout.write` translates its text before encoding instead.
+pub fn stdio_line_endings_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !cfg!(windows) || !bytes.contains(&b'\n') {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    for &byte in bytes {
+        if byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Write a string through the print hook (if set) or stdout.
 pub fn print_output(s: &str) {
+    // `print()` writing to the unmodified `sys.stdout` short-circuits to here
+    // instead of calling its `write`, so the standard stream's newline
+    // translation has to be applied on this path too.
+    let s = stdio_line_endings(s);
+    let s = s.as_ref();
     if print_hook_emit(s) {
         return;
     }
