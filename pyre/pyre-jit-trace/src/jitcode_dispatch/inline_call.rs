@@ -2007,7 +2007,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     }
     if fbw_inline_diag_enabled() {
         eprintln!(
-            "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={}",
+            "[inline-entry] pc={} helper={:?} nrefargs={} subwalk={} dst_bank={dst_bank}",
             op.pc,
             pyre_helper,
             r_args.len(),
@@ -5500,7 +5500,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     }
 }
 
-/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+/// Whether the instantiation emit's decline reasons are being collected.
+fn type_call_diag_enabled() -> bool {
+    std::env::var("PYRE_FBW_INLINE_DIAG").is_ok()
+}
+
+/// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
+fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if type_call_diag_enabled() {
+        eprintln!("[type-call-decline] {reason}");
+    }
+    Ok(None)
+}
+
 /// Instantiate a user-defined class inside the trace instead of leaving `P()`
 /// an opaque `bh_call_fn` residual that re-enters `type_descr_call_impl`,
 /// `object.__new__` and an interpreted `__init__` frame every iteration.
@@ -5518,14 +5530,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
 /// `new_with_vtable` is a virtual, so a constructor whose result never escapes
 /// the loop optimizes away entirely, as it does upstream.
 #[allow(clippy::too_many_arguments)]
-/// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
-fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
-        eprintln!("[type-call-decline] {reason}");
-    }
-    Ok(None)
-}
-
 pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -5537,15 +5541,44 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk || dst_bank != 'r' {
+        // These three reject far more calls than the instantiations this emit is
+        // about, so name the reason only for a call that does resolve to a
+        // class, and only while the reasons are being collected — the extra
+        // resolution below is diagnostic cost, not tracing cost.
+        if type_call_diag_enabled()
+            && r_args.len() >= 2
+            && walker_concrete_ref_object(ctx, r_args[1]).is_none()
+            && walker_concrete_ref_object(ctx, r_args[0])
+                .is_some_and(|w_type| unsafe { pyre_object::is_type(w_type) })
+        {
+            return type_call_decline(if !ctx.is_authoritative_executor {
+                "not the authoritative executor"
+            } else if ctx.fbw_mode.inline_subwalk {
+                "inline sub-walk"
+            } else {
+                "destination is not a ref register"
+            });
+        }
         return Ok(None);
     }
     // `[callable, null_or_self, args...]`.  A method-form call (`null_or_self`
     // populated) never names a class as its callable.
-    if r_args.len() < 2 || walker_concrete_ref_object(ctx, r_args[1]).is_some() {
+    if r_args.len() < 2 {
         return Ok(None);
     }
+    // "No receiver" has two spellings in that slot: `call_kw` leaves it with no
+    // concrete shadow at all, `call_fn` fills it with the checked `PY_NULL`
+    // sentinel.  Reading a present shadow as a receiver rejects the whole
+    // `call_fn` spelling, which is the one an ordinary `C(...)` lowers to.
+    if walker_concrete_ref_object(ctx, r_args[1])
+        .is_some_and(|null_or_self| !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL)
+    {
+        return type_call_decline("receiver slot is populated");
+    }
     let Some(w_type) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
+        // Whether this even was an instantiation is unknowable without the
+        // callable, so the reason is reported as the open question it is.
+        return type_call_decline("callable is not a concrete ref");
     };
     if !unsafe { pyre_object::is_type(w_type) } {
         return Ok(None);
@@ -5586,7 +5619,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     }
     let w_object = pyre_interpreter::typedef::w_object();
     if w_object.is_null() {
-        return Ok(None);
+        return type_call_decline("object type unavailable");
     }
     // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
     // storage]` instance this emit builds; any other `__new__` picks its own
@@ -5616,9 +5649,9 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
 
     let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
     let mut callee_arg_concretes = Vec::with_capacity(r_args.len() - 1);
-    for &arg in &r_args[2..] {
+    for (i, &arg) in r_args[2..].iter().enumerate() {
         let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
-            return Ok(None);
+            return type_call_decline(&format!("argument {i} is not a concrete ref"));
         };
         arg_concretes.push(ConcreteValue::Ref(concrete));
         callee_arg_concretes.push(ConcreteValue::Ref(concrete));
@@ -5660,7 +5693,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         instance,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
     );
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+    if type_call_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
             op.pc,
@@ -5719,6 +5752,8 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Route `str(exc)` / `repr(exc)` through an app-level exception override.
+///
 /// Pyre's exact `str` type call follows `str_descr_new` → `builtin_str` →
 /// `exc_user_dunder_obj`; the builtin `repr` follows `builtin_repr` →
 /// `py_repr_obj`. Both paths look up the receiver dunder before builtin
