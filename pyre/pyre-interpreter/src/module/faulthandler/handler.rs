@@ -9,8 +9,8 @@
 // CPython's faulthandler dumps the Python traceback on fatal signals.
 // Pyre has no Python-level traceback machinery yet, so our handler
 // writes a short "Fatal Python error: <name>" line to the descriptor
-// `enable` was given and then restores the default disposition +
-// reraises the signal so the process dies the normal way.
+// `enable` was given and then restores the disposition the signal had
+// before `enable` + reraises it so the process dies the normal way.
 // ──────────────────────────────────────────────────────────────────────
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -144,14 +144,40 @@ pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
-    // Stay async-signal-safe: write with raw libc::write and restore the
-    // default disposition before reraising.
+    // Stay async-signal-safe: write with raw libc::write, and reraise so the
+    // process dies through the disposition the program actually had.
+    //
+    // `faulthandler.c:512-520` restores `handler->previous` and clears
+    // `handler->enabled` before writing anything, then `faulthandler.c:536-537`
+    // reraises so that handler runs.  Replacing it with SIG_DFL instead would
+    // silently drop a disposition the program installed for SIGABRT/SIGFPE/…
+    // before calling `faulthandler.enable()`.
+    //
+    // SIGSEGV keeps the default disposition.  `faulthandler.c:529-535` already
+    // refuses to hand SIGSEGV back to its previous handler, and here the
+    // previous one is the Rust runtime's stack-overflow probe, which returns
+    // without terminating when the address is not its guard page — which is
+    // every software `raise`, `_sigsegv` below included.
+    if signum != libc::SIGSEGV {
+        rustpython_host_env::faulthandler::disable_fatal_signal(signum);
+    }
     let name =
         rustpython_host_env::faulthandler::fatal_signal_name(signum).unwrap_or("unknown signal");
-    let msg = format!("Fatal Python error: {name}\n");
+    // Assembled on the stack: a `format!` here would call into the allocator,
+    // and the fault this is handling may well have come from inside it.
+    const PREFIX: &[u8] = b"Fatal Python error: ";
+    let mut msg = [0u8; 64];
+    msg[..PREFIX.len()].copy_from_slice(PREFIX);
+    let name = &name.as_bytes()[..name.len().min(msg.len() - PREFIX.len() - 1)];
+    msg[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
+    msg[PREFIX.len() + name.len()] = b'\n';
     let fd = FAULTHANDLER_FD.load(std::sync::atomic::Ordering::Relaxed);
-    rustpython_host_env::faulthandler::write_fd(fd, msg.as_bytes());
-    rustpython_host_env::faulthandler::signal_default_and_raise(signum);
+    rustpython_host_env::faulthandler::write_fd(fd, &msg[..PREFIX.len() + name.len() + 1]);
+    if signum == libc::SIGSEGV {
+        rustpython_host_env::faulthandler::signal_default_and_raise(signum);
+    } else {
+        rustpython_host_env::faulthandler::raise_signal(signum);
+    }
 }
 
 /// `handler.py:35-49 Handler.get_fileno_and_file` — resolve a

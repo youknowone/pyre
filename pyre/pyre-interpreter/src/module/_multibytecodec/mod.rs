@@ -119,6 +119,14 @@ fn wchar_consumed_to_codepoints(boundaries: &[usize], consumed: usize) -> usize 
     }
 }
 
+/// [`wchar_consumed_to_codepoints`] rounded the other way: the first code point
+/// that starts at or after `consumed`.
+fn wchar_codepoints_covering(boundaries: &[usize], consumed: usize) -> usize {
+    match boundaries.binary_search(&consumed) {
+        Ok(index) | Err(index) => index,
+    }
+}
+
 #[cfg(windows)]
 fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
     let mut out = Wtf8Buf::new();
@@ -193,19 +201,28 @@ fn decode_impl(
         };
         let start = unsafe { pypy_cjk_dec_inbuf_consumed(state.0) }.max(0) as usize;
         let end = start.saturating_add(error_size).min(input.len());
-        let replacement: &[CjkWchar] = match errors {
+        // `c_codecs.py:149-159 multibytecodec_decerror`: the three built-in
+        // modes answer inline, anything else goes to the registered handler,
+        // which also names the position decoding resumes at.
+        let (replacement, resume_end): (Vec<CjkWchar>, usize) = match errors {
             "strict" => {
                 return Err(crate::typedef::unicode_decode_error(
                     name, input, start, end, reason,
                 ));
             }
-            "ignore" => &[],
-            "replace" => &[0xfffd],
+            "ignore" => (Vec::new(), end),
+            "replace" => (vec![0xfffd], end),
             _ => {
-                crate::module::_codecs::validate_error_handler(errors)?;
-                return Err(crate::PyError::not_implemented(format!(
-                    "{name} codec does not yet support the '{errors}' error handler"
-                )));
+                let mut text = Wtf8Buf::new();
+                // `multibytecodec_decerror` folds the returned position against
+                // the buffer decoding started on and goes on decoding that one,
+                // so a handler that put different bytes on `exc.object` does not
+                // redirect it.
+                let (newpos, _swapped_object) =
+                    crate::type_methods::call_registered_decode_error_handler(
+                        errors, name, input, start, end, reason, &mut text,
+                    )?;
+                (text_to_wchars(&text).0, newpos)
             }
         };
         let result = unsafe {
@@ -213,7 +230,7 @@ fn decode_impl(
                 state.0,
                 replacement.as_ptr(),
                 replacement.len() as isize,
-                end as isize,
+                resume_end as isize,
             )
         };
         if result == MBERR_NOMEMORY {
@@ -224,6 +241,17 @@ fn decode_impl(
     let output_len = unsafe { pypy_cjk_dec_outlen(state.0) }.max(0) as usize;
     let output = unsafe { std::slice::from_raw_parts(pypy_cjk_dec_outbuf(state.0), output_len) };
     Ok((wchars_to_text(output), consumed.min(input.len())))
+}
+
+/// `c_codecs.py:293-296`: a rettype 'u' replacement is not bytes yet, it goes
+/// back through the same codec.  "strict" so a replacement the codec cannot
+/// encode raises there instead of re-entering the error handler.
+///
+/// The sub-encode runs on a fresh engine rather than a copy of the outer one
+/// (`copystate`), which the seven stateless `_codecs_jp` codecs cannot tell
+/// apart; a shift-state codec would need the state carried across.
+fn encode_replacement_text(name: &str, w_text: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    Ok(encode_impl(name, w_text, "strict", true)?.0)
 }
 
 fn encode_impl(
@@ -277,22 +305,50 @@ fn encode_impl(
             return Err(crate::PyError::runtime_error("internal codec error"));
         };
         let start_units = unsafe { pypy_cjk_enc_inbuf_consumed(state.0) }.max(0) as usize;
-        let end_units = start_units.saturating_add(error_units).min(units.len());
+        let error_units_end = start_units.saturating_add(error_units).min(units.len());
+        // The engine measures the error in wchar units, and where `wchar_t` is
+        // 16 bits an astral code point is two of them.  The span an error
+        // handler works in is code points, so a unit that is only half of one
+        // widens to the whole code point, and the engine resumes there.
         let start = wchar_consumed_to_codepoints(&boundaries, start_units);
-        let end = wchar_consumed_to_codepoints(&boundaries, end_units);
-        let replacement: &[u8] = match errors {
+        let end = wchar_codepoints_covering(&boundaries, error_units_end);
+        let end_units = boundaries[end];
+        // `c_codecs.py:280-297 multibytecodec_encerror`: `ignore` splices in
+        // nothing (rettype 'b'), `replace` and a str from a registered handler
+        // are re-encoded through the same codec first (rettype 'u'), and bytes
+        // from a handler are spliced in verbatim.  A handler also names the
+        // position to resume at as a code-point index, so it goes back through
+        // `boundaries` to reach the wchar unit the engine restarts on.
+        let (replacement, resume_units): (Vec<u8>, usize) = match errors {
             "strict" => {
                 return Err(crate::typedef::unicode_encode_error(
                     name, w_input, start, end, reason,
                 ));
             }
-            "ignore" => b"",
-            "replace" => b"?",
+            "ignore" => (Vec::new(), end_units),
+            "replace" => (encode_replacement_text(name, w_str_new("?"))?, end_units),
             _ => {
-                crate::module::_codecs::validate_error_handler(errors)?;
-                return Err(crate::PyError::not_implemented(format!(
-                    "{name} codec does not yet support the '{errors}' error handler"
-                )));
+                let (replacement, newpos) =
+                    crate::type_methods::call_registered_encode_error_handler(
+                        errors,
+                        name,
+                        w_input,
+                        boundaries.len() - 1,
+                        start,
+                        end,
+                        reason,
+                    )?;
+                let bytes = match replacement {
+                    crate::type_methods::EncodeReplacement::Bytes(bytes) => bytes,
+                    crate::type_methods::EncodeReplacement::Str(points) => {
+                        let mut text = Wtf8Buf::new();
+                        for point in points {
+                            text.push(CodePoint::from_u32(point).unwrap());
+                        }
+                        encode_replacement_text(name, w_str_from_wtf8_managed(text))?
+                    }
+                };
+                (bytes, boundaries[newpos])
             }
         };
         let result = unsafe {
@@ -300,7 +356,7 @@ fn encode_impl(
                 state.0,
                 replacement.as_ptr().cast::<i8>(),
                 replacement.len() as isize,
-                end_units as isize,
+                resume_units as isize,
             )
         };
         if result == MBERR_NOMEMORY {

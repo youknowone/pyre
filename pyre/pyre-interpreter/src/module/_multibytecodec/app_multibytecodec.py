@@ -16,6 +16,7 @@ class MultibyteIncrementalDecoder:
     def __init__(self, errors="strict"):
         self.errors = "strict" if errors is None else errors
         self.pending = b""
+        self.state = 0
 
     def decode(self, object, final=False):
         data = self.pending + object
@@ -25,12 +26,29 @@ class MultibyteIncrementalDecoder:
 
     def reset(self):
         self.pending = b""
+        self.state = 0
 
     def getstate(self):
-        return self.pending, 0
+        return self.pending, self.state
 
     def setstate(self, state):
-        self.pending = state[0]
+        # `mbidecoder_setstate` parses `(bytes, int)`; the pending buffer holds
+        # at most MAXDECPENDING bytes.
+        if not isinstance(state, tuple):
+            raise TypeError(
+                f"setstate() argument must be tuple, not {type(state).__name__}"
+            )
+        buffer, flag = state
+        if not isinstance(buffer, bytes):
+            raise TypeError("setstate() argument 1 must be bytes")
+        if not isinstance(flag, int):
+            raise TypeError("setstate() argument 2 must be int")
+        if len(buffer) > 8:
+            raise UnicodeDecodeError(
+                self.codec.name, buffer, 0, len(buffer), "pending buffer too large"
+            )
+        self.pending = buffer
+        self.state = flag
 
 
 class MultibyteIncrementalEncoder:
@@ -48,12 +66,43 @@ class MultibyteIncrementalEncoder:
         self.pending = ""
 
     def getstate(self):
-        return self.pending or 0
+        # `interp_incremental.py:152-164`.  The state is one little-endian
+        # integer over a fixed 17-byte buffer:
+        #   byte 0             length of the pending utf-8, 0..8
+        #   bytes 1..1+length  the pending code points, utf-8
+        #   the 8 bytes after  the codec state
+        # Each `encode` here runs a fresh engine that is reset when it
+        # returns, so the codec state is always its initial all-zero value.
+        pending = self.pending.encode("utf-8")
+        if len(pending) > 8:
+            raise UnicodeError("pending buffer too large")
+        buffer = bytes([len(pending)]) + pending + bytes(8)
+        return int.from_bytes(buffer, "little")
 
     def setstate(self, state):
-        # TextIOWrapper uses the initial integer state after seeking away
-        # from a pending JIS X 0213 composition.
-        self.pending = "" if state == 0 else state
+        # The `getstate` layout in reverse.  `TextIOWrapper.seek` restores the
+        # initial state as the plain int 0.  A value that does not fit the
+        # 17-byte buffer raises OverflowError out of `to_bytes`, the way
+        # `_PyLong_AsByteArray` does in `mbiencoder_setstate`.
+        if not isinstance(state, int):
+            raise TypeError(
+                f"setstate() argument must be int, not {type(state).__name__}"
+            )
+        buffer = state.to_bytes(17, "little")
+        pending_len = buffer[0]
+        if pending_len > 8:
+            raise UnicodeError("pending buffer too large")
+        pending = buffer[1 : 1 + pending_len]
+        try:
+            self.pending = pending.decode("utf-8")
+        except UnicodeDecodeError as ex:
+            raise UnicodeDecodeError(
+                "utf-8",
+                pending,
+                ex.start,
+                ex.start + 1,
+                "invalid utf-8 in setstate pending buffer",
+            ) from None
 
 
 class MultibyteStreamReader(MultibyteIncrementalDecoder):

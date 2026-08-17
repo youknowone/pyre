@@ -4358,7 +4358,7 @@ pub(crate) fn call_registered_decode_error_handler(
 /// Replacement returned by a custom encode error handler: either a str
 /// (its code points, re-encoded by the codec) or raw bytes (copied
 /// verbatim). interp_codecs.py:69-72 rettype 'u' vs 'b'.
-enum EncodeReplacement {
+pub(crate) enum EncodeReplacement {
     Str(Vec<u32>),
     Bytes(Vec<u8>),
 }
@@ -4368,9 +4368,10 @@ enum EncodeReplacement {
 /// encode error span. `start`/`end`/`char_len` are CHARACTER (code-point)
 /// indices into the source; the returned position is a character index to
 /// resume at. The caller re-encodes an `EncodeReplacement::Str` through
-/// its own codec (raising the ORIGINAL error if a replacement code point
-/// is not encodable) and copies `EncodeReplacement::Bytes` verbatim.
-fn call_registered_encode_error_handler(
+/// its own codec — the utf-* ones raise the ORIGINAL error when a
+/// replacement code point is not encodable — and copies
+/// `EncodeReplacement::Bytes` verbatim.
+pub(crate) fn call_registered_encode_error_handler(
     err_mode: &str,
     codec: &str,
     source: PyObjectRef,

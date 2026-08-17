@@ -121,7 +121,7 @@ Py_ssize_t pypy_cjk_dec_replace_on_error(struct pypy_cjk_dec_s* d,
 
 struct pypy_cjk_enc_s *pypy_cjk_enc_new(const MultibyteCodec *codec)
 {
-  struct pypy_cjk_enc_s *d = malloc(sizeof(struct pypy_cjk_enc_s));
+  struct pypy_cjk_enc_s *d = calloc(1, sizeof(struct pypy_cjk_enc_s));
   if (!d)
     return NULL;
   if (codec->encinit != NULL && codec->encinit(&d->state, codec->config) != 0)

@@ -377,12 +377,19 @@ def classify(rc: int, out: str, err: str) -> tuple[str, str]:
         if denied is not None:
             return "SKIP", denied[:120]
         tally = unittest_tally(out, err)
+        # No summary at all is the same absence of a result, one step earlier:
+        # the process exited cleanly without unittest ever reporting, so there
+        # is nothing to have passed. A module launched without a driver — an
+        # `-m` run of a file with no `__main__` block — reaches exactly this,
+        # and recording it PASS claims coverage the run never had.
+        if tally is None:
+            return "SKIP", "no unittest summary"
         # Both halves of `ran == skipped` are the same absence of a result:
         # every case opted out, or the suite was empty. libregrtest keeps a
         # state of its own for the second (`single.py:92` raises
         # `TestDidNotRun` on a run with no tests, no skips and no errors,
         # which `result.py` prints as "ran no tests").
-        if tally is not None and tally[0] == tally[1]:
+        if tally[0] == tally[1]:
             ran = tally[0]
             return "SKIP", f"ran {ran}, every test skipped" if ran else "ran no tests"
         return "PASS", ""
@@ -563,18 +570,30 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
                env: dict) -> tuple[str, str]:
     # Run in a throwaway cwd so a test writing into '.' never touches the
     # repo (the stdlib is resolved relative to the executable, not cwd).
-    with tempfile.TemporaryDirectory(prefix="pyre-cpytest-") as cwd:
-        if mode == "script" and is_package(module):
-            # A package has no `__main__.py` to run as a bare script (and
-            # running a submodule file directly breaks its relative imports);
-            # drive it through a synthesized unittest entry instead.
-            driver = Path(cwd) / "_pyre_pkg_main.py"
-            driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
-            cmd = [str(binary), str(driver)]
-        elif mode == "script" and (
-            module in DOTTED_IDENTITY_MODULES or not runs_its_own_tests(module)
-        ):
-            driver = Path(cwd) / "_pyre_dotted_main.py"
+    # `ignore_cleanup_errors` because a test that leaves a file open takes the
+    # whole run down on Windows, where an open handle blocks the unlink; the
+    # directory is disposable, and losing one is not a test result.
+    with tempfile.TemporaryDirectory(
+        prefix="pyre-cpytest-", ignore_cleanup_errors=True
+    ) as cwd:
+        # A package has no `__main__.py` to run as a bare script (and running a
+        # submodule file directly breaks its relative imports), and a file with
+        # no `__main__` block runs nothing on EITHER entry — `pyre -m test.x`
+        # imports it, defines its classes and exits 0 just as the bare script
+        # does.  Both shapes get the synthesized unittest entry in script and
+        # module mode alike; `regrtest` builds the suite itself and needs no
+        # driver.  `DOTTED_IDENTITY_MODULES` stays script-only: it exists to
+        # restore the dotted identity that `-m` already gives.
+        if mode != "regrtest" and is_package(module):
+            driver_name = "_pyre_pkg_main.py"
+        elif mode != "regrtest" and not runs_its_own_tests(module):
+            driver_name = "_pyre_dotted_main.py"
+        elif mode == "script" and module in DOTTED_IDENTITY_MODULES:
+            driver_name = "_pyre_dotted_main.py"
+        else:
+            driver_name = None
+        if driver_name is not None:
+            driver = Path(cwd) / driver_name
             driver.write_text(_DOTTED_DRIVER.format(module=module), encoding="utf-8")
             cmd = [str(binary), str(driver)]
         elif mode == "script" and module in DEFAULT_RESOURCE_MODULES:
