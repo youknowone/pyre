@@ -8497,7 +8497,14 @@ impl<M: Clone> MetaInterp<M> {
             .set_callinfocollection(self.callinfocollection.clone());
 
         let token_num = self.warm_state.alloc_token_number();
-        // `compile.py:266 jitcell_token = make_jitcell_token(jitdriver_sd)`.
+        // `compile.py:1013` — `ResumeFromInterpDescr.compile_and_attach` does
+        // `new_loop.original_jitcell_token = jitcell_token =
+        // make_jitcell_token(jitdriver_sd)`. `compile.py:392-393` dispatches
+        // `compile_and_attach` on the resumekey's class, and this is the arm
+        // without a guard resumekey, so a fresh token is the identity the
+        // trace is installed under. The token `compile.py:355-356` resolves is
+        // the optimization-time one — it carries the closing JUMP descr and
+        // the retrace budget, not the installation identity.
         let mut token =
             make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
@@ -8543,28 +8550,17 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 self.last_compiled_artifact_invalidation_flag = Some(token.invalidation_flag());
                 self.assign_guard_hashes(token.as_ref());
-                // `compile.py:237` / `compile.py:289` — every TargetToken
-                // whose LABEL or JUMP appears in `combined_ops` carries
-                // `original_jitcell_token = jitcell_token`.  In the retrace
-                // path, `combined_ops = old_front + new_body`, so the old
-                // front's TargetTokens (created under the previous
-                // jitcell_token) still point at the old number.  RPython
-                // avoids this entirely by reusing the same
-                // `loop_jitcell_token` for retrace (`compile.py:356`); pyre
-                // allocates a new `token_num` for cranelift bridge
-                // migration, so we rebind the prior tokens to the new
-                // number here.  Without this, `record_loop_or_bridge`'s
-                // JUMP arm sees `target_owner_num == old_num !=
-                // new_token.number` and records a false self-loop keepalive.
-                // `compile.py:286-296` / `:312-323` retrace path —
-                // both prior + freshly produced TargetTokens are owned
-                // by the new JCT.  Mirror their descrs onto
-                // `JitCellToken.target_tokens` for `has_compiled_targets`
-                // parity (`pyjitpl.py:3898`).
-                for target_token in &prior_front_target_tokens {
-                    target_token.set_original_jitcell_token_number(token_num);
-                    token.record_target_token(target_token.as_jump_target_descr());
-                }
+                // `compile.py:1014` `propagate_original_jitcell_token(new_loop)`,
+                // whose body at `:463-468` walks the trace's LABELs and sets
+                // each `TargetToken.original_jitcell_token` to the token this
+                // compile installs under. Both `compile_and_attach` arms run
+                // it (`:806` and `:1014`), so re-stamping is upstream's own
+                // step on this path, not a consequence of minting.
+                //
+                // Their descrs are mirrored onto `JitCellToken.target_tokens`
+                // for `has_compiled_targets` (`pyjitpl.py:3922-3923`); see the
+                // note there about upstream leaving the minted token's list
+                // empty on this arm.
                 for target_token in &unroll_opt.target_tokens {
                     target_token.set_original_jitcell_token_number(token_num);
                     token.record_target_token(target_token.as_jump_target_descr());
