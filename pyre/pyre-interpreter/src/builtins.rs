@@ -10321,21 +10321,27 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // was supplied AND the error is an AttributeError; other errors (and the
     // no-default case) propagate.  With a default the error never surfaces,
     // so that arm runs suppressed (`_PyObject_LookupAttr`).
-    let lookup = if args.len() > 2 {
-        crate::baseobjspace::lookup_attr(obj, args[1])
-    } else {
-        crate::baseobjspace::getattr(obj, args[1])
-    };
-    match lookup {
-        Ok(val) => Ok(val),
-        Err(e) => {
-            if args.len() > 2 && e.kind == crate::PyErrorKind::AttributeError {
-                Ok(args[2]) // default value
-            } else {
-                Err(e) // propagate
+    if args.len() > 2 {
+        // `args` is a native slice the gateway copied out of its own root
+        // slots: the pin keeps the default alive, but nothing rewrites this
+        // copy, and `lookup_attr` runs Python (`__getattr__`,
+        // `__getattribute__`, a property getter).  A list or dict default
+        // moves, so returning `args[2]` after the lookup hands back a pre-move
+        // address.  Scope the slot to the three-argument form: `pin_root` and
+        // `RootScope::get` are `dont_look_inside`, and the two-argument shape
+        // is the one the tracer folds.
+        let default_root = pyre_object::gc_roots::push_roots();
+        let default_base = default_root.base();
+        default_root.pin_root(args[2]);
+        return match crate::baseobjspace::lookup_attr(obj, args[1]) {
+            Ok(val) => Ok(val),
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                Ok(default_root.get(default_base))
             }
-        }
+            Err(e) => Err(e),
+        };
     }
+    crate::baseobjspace::getattr(obj, args[1])
 }
 
 /// `pypy/module/__builtin__/operation.py:191-196 setattr`:
@@ -10875,13 +10881,23 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    match crate::baseobjspace::next(args[0]) {
-        Ok(v) => Ok(v),
-        Err(e) if e.kind == crate::PyErrorKind::StopIteration && args.len() > 1 => {
-            Ok(args[1]) // default value
-        }
-        Err(e) => Err(e),
+    if args.len() > 1 {
+        // The iterator body runs Python between the gateway's pin and this
+        // return, and `args` is a native copy nothing rewrites when a list or
+        // dict default is moved -- see `builtin_getattr`.  Keep the
+        // one-argument form free of the slot.
+        let default_root = pyre_object::gc_roots::push_roots();
+        let default_base = default_root.base();
+        default_root.pin_root(args[1]);
+        return match crate::baseobjspace::next(args[0]) {
+            Ok(v) => Ok(v),
+            Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                Ok(default_root.get(default_base))
+            }
+            Err(e) => Err(e),
+        };
     }
+    crate::baseobjspace::next(args[0])
 }
 
 /// `callable(obj)` — PyPy: baseobjspace.py callable

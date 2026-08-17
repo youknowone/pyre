@@ -3080,11 +3080,12 @@ fn save_reduce(
     w_obj_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    // Recursive saves (and the reduce callbacks they invoke) relocate young
-    // objects, so pin the reduce values in a GC-walked `list` and re-read each
-    // one immediately before it is consumed.
-    let rv_len = rv.len();
-    let rv_slot = pin_items(rv.to_vec());
+    // Reach a slot before anything allocates.  The object being reduced can be
+    // a `list` subclass instance, whose header moves, and `pin_items` below
+    // builds a GC-walked `list` -- a collection point.  `pin_root` publishes
+    // whatever word it is handed and does not normalize it under a single
+    // mutator, so a pin taken after that allocation would freeze a forwarding
+    // stub into the slot and every later read of it would return the stub.
     let w_obj_slot = match w_obj_opt {
         Some(o) => {
             pyre_object::gc_roots::pin_root(o);
@@ -3092,6 +3093,11 @@ fn save_reduce(
         }
         None => None,
     };
+    // Recursive saves (and the reduce callbacks they invoke) relocate young
+    // objects, so pin the reduce values in a GC-walked `list` and re-read each
+    // one immediately before it is consumed.
+    let rv_len = rv.len();
+    let rv_slot = pin_items(rv.to_vec());
     let rv_get = |i: usize| pinned_get(rv_slot, i);
     let present = |i: usize| i < rv_len && !unsafe { pyre_object::is_none(pinned_get(rv_slot, i)) };
 

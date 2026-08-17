@@ -3842,6 +3842,21 @@ fn call_metaclass_with_kwargs(
     w_namespace_dict: PyObjectRef,
     kwargs: PyObjectRef,
 ) -> PyObjectRef {
+    // Every argument arrives as a bare word and is held across the metaclass
+    // `__new__` and `__init__` calls, both arbitrary Python.  The caller roots
+    // the namespace and reads it back immediately before this call, and that
+    // is undone the moment it is passed by value.  The namespace is a
+    // `W_DictObject`, whose header moves, so it needs the slot read back at
+    // every consumer that follows one of those calls; `w_metaclass`, `name`,
+    // `bases` and `kwargs` are stable kinds and need the scope alone, since
+    // old-gen is swept even though it does not move.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_namespace_dict);
+    pyre_object::gc_roots::pin_root(kwargs);
+    pyre_object::gc_roots::pin_root(w_metaclass);
+    pyre_object::gc_roots::pin_root(name);
+    pyre_object::gc_roots::pin_root(bases);
     if unsafe { !pyre_object::is_type(w_metaclass) } {
         // compiling.py:215-221 — `space.call_args(w_meta, Arguments(name,
         // bases, ns, **kwds))`; a non-type metaclass receives the
@@ -3932,6 +3947,10 @@ fn call_metaclass_with_kwargs(
     if instance.is_null() {
         return PY_NULL;
     }
+    // A fresh type is allocated stable, so it never moves and needs no
+    // read-back -- but until `type_call_init_type` stores it, this local is
+    // its only reference, and `__init__` below runs Python.
+    pyre_object::gc_roots::pin_root(instance);
 
     if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)
         && let Some(init_fn) =
@@ -3942,7 +3961,13 @@ fn call_metaclass_with_kwargs(
                 !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)
             };
         if is_user_fn && !kw_items.is_empty() {
-            let mut call_args = vec![instance, name, bases, w_namespace_dict];
+            // The metaclass `__new__` ran between the pin and here.
+            let mut call_args = vec![
+                instance,
+                name,
+                bases,
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            ];
             let mut names = Vec::with_capacity(kw_items.len());
             for (k, v) in &kw_items {
                 call_args.push(*v);
@@ -3973,9 +3998,15 @@ fn call_metaclass_with_kwargs(
             // to the __init_subclass__ forwarding path instead of being
             // rejected here (typeobject.py descr_call passes __args__ to a
             // builtin __init__, which tolerates them).
-            if let Err(e) =
-                call_function_impl_result(init_fn, &[instance, name, bases, w_namespace_dict])
-            {
+            if let Err(e) = call_function_impl_result(
+                init_fn,
+                &[
+                    instance,
+                    name,
+                    bases,
+                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
+                ],
+            ) {
                 set_call_error(e);
                 return PY_NULL;
             }
