@@ -9,6 +9,7 @@ use pyre_object::{
     w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
 };
 use rustpython_compiler_core::SourceLocation;
+use rustpython_compiler_core::bytecode::PyCodeLocationInfoKind;
 
 const YIELDS_INSIDE_TRY_BIT: u16 = 0x8000;
 
@@ -22,6 +23,139 @@ impl From<BytecodeCorruption> for crate::PyError {
             crate::PyErrorKind::BytecodeCorruption,
             "bytecode corruption",
         )
+    }
+}
+
+/// CPython 3.14 `_PyCodeAddressRange`, ported through RustPython's code
+/// object implementation.  This reads the authoritative `co_linetable`;
+/// `CodeObject.locations` is an execution-oriented expansion which cannot
+/// represent a missing line or column.
+struct PyCodeAddressRange<'a> {
+    ar_start: i32,
+    ar_end: i32,
+    ar_line: i32,
+    computed_line: i32,
+    reader: LineTableReader<'a>,
+}
+
+impl<'a> PyCodeAddressRange<'a> {
+    fn new(linetable: &'a [u8], first_line: i32) -> Self {
+        Self {
+            ar_start: 0,
+            ar_end: 0,
+            ar_line: -1,
+            computed_line: first_line,
+            reader: LineTableReader::new(linetable),
+        }
+    }
+
+    fn advance(&mut self) -> bool {
+        let Some(first_byte) = self.reader.read_byte() else {
+            return false;
+        };
+        if first_byte & 0x80 == 0 {
+            return false;
+        }
+
+        let code = (first_byte >> 3) & 0x0f;
+        let length = ((first_byte & 0x07) + 1) as i32;
+        self.computed_line += self.get_line_delta(code);
+        self.ar_line = if first_byte >> 3 == 0x1f {
+            -1
+        } else {
+            self.computed_line
+        };
+        self.ar_start = self.ar_end;
+        self.ar_end += length * 2;
+
+        // Every payload byte has bit 7 clear; the next header has it set.
+        while self.reader.peek_byte().is_some_and(|byte| byte & 0x80 == 0) {
+            self.reader.read_byte();
+        }
+        true
+    }
+
+    fn get_line_delta(&mut self, code: u8) -> i32 {
+        let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
+            return 0;
+        };
+        match kind {
+            PyCodeLocationInfoKind::None => 0,
+            PyCodeLocationInfoKind::Long => {
+                let delta = self.reader.read_signed_varint();
+                self.reader.read_varint();
+                self.reader.read_varint();
+                self.reader.read_varint();
+                delta
+            }
+            PyCodeLocationInfoKind::NoColumns => self.reader.read_signed_varint(),
+            PyCodeLocationInfoKind::OneLine0
+            | PyCodeLocationInfoKind::OneLine1
+            | PyCodeLocationInfoKind::OneLine2 => {
+                self.reader.read_byte();
+                self.reader.read_byte();
+                kind.one_line_delta().unwrap_or(0)
+            }
+            _ if kind.is_short() => {
+                self.reader.read_byte();
+                0
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// RustPython `LineTableReader`, matching CPython's 6-bit little-endian
+/// location-table varints.
+struct LineTableReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> LineTableReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn read_byte(&mut self) -> Option<u8> {
+        let byte = self.data.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(byte)
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.data.get(self.pos).copied()
+    }
+
+    fn read_varint(&mut self) -> u32 {
+        let Some(first) = self.read_byte() else {
+            return 0;
+        };
+        let mut value = (first & 0x3f) as u32;
+        let mut shift = 0;
+        let mut byte = first;
+        while byte & 0x40 != 0 {
+            let Some(next) = self.read_byte() else {
+                break;
+            };
+            shift += 6;
+            value |= ((next & 0x3f) as u32) << shift;
+            byte = next;
+        }
+        value
+    }
+
+    fn read_signed_varint(&mut self) -> i32 {
+        let value = self.read_varint();
+        if value & 1 != 0 {
+            -((value >> 1) as i32)
+        } else {
+            (value >> 1) as i32
+        }
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos >= self.data.len()
     }
 }
 
@@ -1103,10 +1237,16 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut line = firstlineno;
     let mut start_offset = 0usize;
-    for (index, (start, _)) in code_locations(code).iter().enumerate() {
-        let next_line = start.line.get() as i64;
+    let mut range = PyCodeAddressRange::new(
+        &code.linetable,
+        firstlineno.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+    );
+    while range.advance() {
+        // CPython's `decode_linetable` follows the computed line rather than
+        // `ar_line`, so a NO_LOCATION range does not manufacture a -1 delta.
+        let next_line = range.computed_line as i64;
         if next_line != line {
-            let offset = index * 2;
+            let offset = range.ar_start as usize;
             encode_pair(offset - start_offset, next_line - line, &mut out);
             line = next_line;
             start_offset = offset;
@@ -1496,17 +1636,79 @@ pub unsafe fn code_varname_from_oparg(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_positions")? };
-    let rows = code_locations(code)
-        .iter()
-        .map(|(start, end)| {
-            w_tuple_new(vec![
-                w_int_new(start.line.get() as i64),
-                w_int_new(end.line.get() as i64),
-                w_int_new(start.character_offset.get().saturating_sub(1) as i64),
-                w_int_new(end.character_offset.get().saturating_sub(1) as i64),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut reader = LineTableReader::new(&code.linetable);
+    let mut line = unsafe { (*(obj as *const PyCode)).co_firstlineno_raw };
+
+    while !reader.at_end() {
+        let Some(first_byte) = reader.read_byte() else {
+            break;
+        };
+        if first_byte & 0x80 == 0 {
+            break;
+        }
+
+        let code = (first_byte >> 3) & 0x0f;
+        let length = ((first_byte & 0x07) + 1) as usize;
+        let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {
+            break;
+        };
+        let (line_delta, end_line_delta, column, end_column) = match kind {
+            PyCodeLocationInfoKind::None => (0, 0, None, None),
+            PyCodeLocationInfoKind::Long => {
+                let delta = reader.read_signed_varint();
+                let end_line_delta = reader.read_varint() as i32;
+                let column = match reader.read_varint() {
+                    0 => None,
+                    value => Some((value - 1) as i32),
+                };
+                let end_column = match reader.read_varint() {
+                    0 => None,
+                    value => Some((value - 1) as i32),
+                };
+                (delta, end_line_delta, column, end_column)
+            }
+            PyCodeLocationInfoKind::NoColumns => (reader.read_signed_varint(), 0, None, None),
+            PyCodeLocationInfoKind::OneLine0
+            | PyCodeLocationInfoKind::OneLine1
+            | PyCodeLocationInfoKind::OneLine2 => {
+                let column = reader.read_byte().unwrap_or(0) as i32;
+                let end_column = reader.read_byte().unwrap_or(0) as i32;
+                (
+                    kind.one_line_delta().unwrap_or(0),
+                    0,
+                    Some(column),
+                    Some(end_column),
+                )
+            }
+            _ if kind.is_short() => {
+                let column_data = reader.read_byte().unwrap_or(0);
+                let column_group = kind.short_column_group().unwrap_or(0);
+                let column = ((column_group as i32) << 3) | ((column_data >> 4) as i32);
+                let end_column = column + (column_data & 0x0f) as i32;
+                (0, 0, Some(column), Some(end_column))
+            }
+            _ => (0, 0, None, None),
+        };
+        line += line_delta;
+
+        for _ in 0..length {
+            let (line_obj, end_line_obj) = if kind == PyCodeLocationInfoKind::None {
+                (pyre_object::w_none(), pyre_object::w_none())
+            } else {
+                (
+                    w_int_new(line as i64),
+                    w_int_new((line + end_line_delta) as i64),
+                )
+            };
+            rows.push(w_tuple_new(vec![
+                line_obj,
+                end_line_obj,
+                column.map_or_else(pyre_object::w_none, |value| w_int_new(value as i64)),
+                end_column.map_or_else(pyre_object::w_none, |value| w_int_new(value as i64)),
+            ]));
+        }
+    }
     let n = rows.len();
     Ok(w_seq_iter_new(w_list_new(rows), n))
 }
@@ -1516,21 +1718,44 @@ pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyE
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_lines")? };
-    let locations = code_locations(code);
     let mut rows = Vec::new();
-    let mut start = 0usize;
-    while start < locations.len() {
-        let line = locations[start].0.line.get();
-        let mut end = start + 1;
-        while end < locations.len() && locations[end].0.line.get() == line {
-            end += 1;
+    let first_line = unsafe { (*(obj as *const PyCode)).co_firstlineno_raw };
+    let mut range = PyCodeAddressRange::new(&code.linetable, first_line);
+    let mut pending: Option<(i32, i32, i32)> = None;
+
+    while range.advance() {
+        let start = range.ar_start;
+        let end = range.ar_end;
+        let line = range.ar_line;
+        if let Some((previous_start, _, previous_line)) = pending {
+            if previous_line == line {
+                pending = Some((previous_start, end, previous_line));
+            } else {
+                rows.push(w_tuple_new(vec![
+                    w_int_new(previous_start as i64),
+                    w_int_new(start as i64),
+                    if previous_line == -1 {
+                        pyre_object::w_none()
+                    } else {
+                        w_int_new(previous_line as i64)
+                    },
+                ]));
+                pending = Some((start, end, line));
+            }
+        } else {
+            pending = Some((start, end, line));
         }
+    }
+    if let Some((start, end, line)) = pending {
         rows.push(w_tuple_new(vec![
-            w_int_new((start * 2) as i64),
-            w_int_new((end * 2) as i64),
-            w_int_new(line as i64),
+            w_int_new(start as i64),
+            w_int_new(end as i64),
+            if line == -1 {
+                pyre_object::w_none()
+            } else {
+                w_int_new(line as i64)
+            },
         ]));
-        start = end;
     }
     let n = rows.len();
     Ok(w_seq_iter_new(w_list_new(rows), n))
