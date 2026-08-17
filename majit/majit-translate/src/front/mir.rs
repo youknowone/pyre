@@ -11942,8 +11942,8 @@ impl<'a> Lowering<'a> {
 
     /// `true` when `ty` is represented as a one-word nullable `Option`:
     /// `Option<NonNull<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
-    /// `Option<&T>` with a thin (Sized) ADT pointee, a raw pointer to a thin
-    /// nominal ADT, or a tuple payload.
+    /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
+    /// thin nominal ADT.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -11960,10 +11960,19 @@ impl<'a> Lowering<'a> {
     /// excluded as well: Charon uses the fat-pointer representation for that
     /// raw-pointer shape, so it is not a single payload word.
     ///
-    /// Tuple payloads are already heap-aggregate pointers when the `Some`
-    /// wrapper is constructed. The tuple elements do not affect this
-    /// representation: `Some(tuple)` is the tuple pointer itself and `None`
-    /// is null. Mutable references are included explicitly: Rust
+    /// Tuple payloads are EXCLUDED, and the exclusion is load-bearing.
+    /// Inside a lowered graph a constructed tuple is a heap aggregate, so
+    /// `Some(tuple)` looks like a pointer word — but every payload accepted
+    /// here is a genuine one-word Rust niche, and `Option<(A, B)>` is not:
+    /// Rust lays it out as a discriminant plus the elements. Modelling it as
+    /// one nullable word therefore breaks wherever such an `Option` is
+    /// produced or consumed outside the lowered graphs, and two tuple shapes
+    /// have no aggregate address inside them either — the unit `()` and the
+    /// checked-arithmetic `(numeric, bool)` destination, whose local carries
+    /// the scalar `.0` value ([`tyref_checked_binop_value_type`]).
+    /// `niche_option_tuple_remains_aggregate` pins the exclusion; collapsing
+    /// it regressed 12 fixtures on both native backends, one of them on
+    /// output. Mutable references are included explicitly: Rust
     /// guarantees their non-null representation, and generated
     /// `#[pyre_class]::from_obj` returns `Option<&mut Self>`. Shared
     /// references `&T` are included when the pointee is a thin (Sized)
@@ -11990,8 +11999,8 @@ impl<'a> Lowering<'a> {
     /// census (0 `slice::iter::Iter::next` heads) and 370/370 check.py. The
     /// `&mut` arm never had this exposure: iterator receivers come from
     /// `.iter()` (`core::slice::…::iter`, a SHARED borrow), never `iter_mut`.
-    /// The new raw-pointer and tuple arms match only direct payloads, not
-    /// `&RawPtr` or `&Tuple`, so they do not expand this iter-next exposure.
+    /// The raw-pointer arm matches only a direct payload, not `&RawPtr`, so
+    /// it does not expand this iter-next exposure.
     /// If a `.iter()` loop over `&[SizedStruct]` ever appears, teach
     /// iter_next the null-test shape (its matcher must accept the
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
