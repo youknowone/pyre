@@ -3480,10 +3480,12 @@ fn bh_size_spec_from_callcontrol(
     // RPython keys SizeDescrs on the low-level STRUCT object, not on an
     // annotation-side generic instantiation. Charon registers one physical
     // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
-    // `Result<U>::Ok` converge on the template variant. A tuple is different:
-    // `TupleRepr` creates one low-level GcStruct per item shape, so preserve
-    // its full `Tuple<T,...>` identity and layout.
-    let layout_owner = if majit_ir::descr::is_shaped_tuple_name(owner) {
+    // `Result<U>::Ok` converge on the template variant. Positional aggregates
+    // are different: their item types and arity define the low-level layout,
+    // so preserve the full `Tuple<T,...>` / `Array<T;N>` identity.
+    let layout_owner = if majit_ir::descr::is_shaped_tuple_name(owner)
+        || majit_ir::descr::is_shaped_array_name(owner)
+    {
         std::borrow::Cow::Borrowed(owner)
     } else {
         majit_ir::descr::strip_generic_args(owner)

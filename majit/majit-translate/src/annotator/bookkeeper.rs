@@ -2180,16 +2180,18 @@ impl Bookkeeper {
         // template key — matching `StructFieldRegistry::lookup_fields`,
         // which the bare-`reg.fields.get` here bypasses.
         //
-        // A per-shape tuple (`Tuple<FrameDebugData>`) is the exception: it has
-        // no template — `register_tuple_shape_rows` registers its concrete
-        // element spellings under the full shaped key, and stripping would
-        // look up a bare `Tuple` that carries no rows.  Without the exact
-        // lookup every `__pos_N` keeps the untyped FORCE shell
+        // A per-shape positional aggregate (`Tuple<FrameDebugData>` or
+        // `Array<PyObjectRef;2>`) is the exception: it has no template — its
+        // concrete element spellings are registered under the full shaped
+        // key, and stripping would look up a bare root that carries no rows.
+        // Without the exact lookup every `__pos_N` keeps the untyped FORCE shell
         // (`valuetype_to_someshell(Ref) -> SomeInstance(classdef=None)`), which
         // `generalize_attr` can only widen, so a reference-typed tuple element
         // stays classdef-less however precisely its writers are annotated.
         let filtered_nullable_fields: Vec<String> = {
-            if !majit_ir::descr::is_shaped_tuple_name(n) {
+            if !majit_ir::descr::is_shaped_tuple_name(n)
+                && !majit_ir::descr::is_shaped_array_name(n)
+            {
                 Vec::new()
             } else {
                 let guard = self.pyre_struct_fields.borrow();
@@ -2206,7 +2208,9 @@ impl Bookkeeper {
         let mut fields: Vec<(String, String)> = {
             let guard = self.pyre_struct_fields.borrow();
             match guard.as_ref().and_then(|r| {
-                if majit_ir::descr::is_shaped_tuple_name(n) {
+                if majit_ir::descr::is_shaped_tuple_name(n)
+                    || majit_ir::descr::is_shaped_array_name(n)
+                {
                     r.fields.get(n).cloned()
                 } else {
                     r.fields
@@ -2218,11 +2222,11 @@ impl Bookkeeper {
                 None => return Ok(()),
             }
         };
-        if majit_ir::descr::is_shaped_tuple_name(n) {
-            // Every `__pos_N` of a shaped tuple is written by the frontend's
-            // own constructor sequence (`simple_call(<host Tuple<…>>)` then one
+        if majit_ir::descr::is_shaped_tuple_name(n) || majit_ir::descr::is_shaped_array_name(n) {
+            // Every `__pos_N` of a shaped positional aggregate is written by
+            // the frontend's constructor sequence (synthetic ctor then one
             // `setattr` per element), so a projected row has to agree with the
-            // value that sequence produces.  A sum-typed element does not: the
+            // value that sequence produces. A sum-typed element does not: the
             // constructor materializes a variant INSTANCE, while
             // `project_pyre_field_type` models the spelling as the nullable
             // payload — `Option<Vec<*mut PyObject>>` projects to list-or-none

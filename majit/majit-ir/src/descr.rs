@@ -439,7 +439,7 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
     if let Some(id) = guard.get(s).copied().flatten() {
         return Some(id);
     }
-    if is_shaped_tuple_name(s) {
+    if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
         return None;
     }
     let generic_args = generic_args_span(s)?;
@@ -463,7 +463,7 @@ pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
         .trim_start_matches("&mut ")
         .trim_start_matches('&')
         .trim();
-    let template = if is_shaped_tuple_name(s) {
+    let template = if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
         std::borrow::Cow::Borrowed(s)
     } else {
         strip_generic_args(s)
@@ -582,6 +582,16 @@ pub fn canonical_struct_name(name: &str) -> String {
 /// template the way `Result<T>::Ok` does.
 pub fn is_shaped_tuple_name(name: &str) -> bool {
     name != "Tuple" && strip_instantiation_suffix(name) == "Tuple"
+}
+
+/// Is `name` an array identity carrying both its item type and fixed length
+/// (`Array<T;N>`), as opposed to the bare `Array` root?
+///
+/// RPython's fixed-size array representation is a concrete low-level
+/// allocation shape, so two item/length pairs must not share the template
+/// identity used by ordinary nominal generic ADTs.
+pub fn is_shaped_array_name(name: &str) -> bool {
+    name != "Array" && strip_instantiation_suffix(name) == "Array"
 }
 
 pub fn strip_instantiation_suffix(name: &str) -> &str {
@@ -7360,6 +7370,13 @@ mod tests {
         // caller relies on).
         assert_eq!(strip_instantiation_suffix("Color"), "Color");
         assert_eq!(strip_instantiation_suffix("module::Color"), "module::Color");
+    }
+
+    #[test]
+    fn shaped_array_name_requires_a_suffix() {
+        assert!(!is_shaped_array_name("Array"));
+        assert!(is_shaped_array_name("Array<*mut PyObject;1>"));
+        assert!(!is_shaped_array_name("module::Array<i64;2>"));
     }
 
     #[test]

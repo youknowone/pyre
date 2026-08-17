@@ -3515,6 +3515,33 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // RPython `rtyper/rtuple.py:153-169 TupleRepr.newtuple` provides the
+        // corresponding fixed-layout lowering shape: allocate the concrete
+        // aggregate, then emit one field write per item. A fixed-size Rust
+        // array with constant-index projections is represented here by that
+        // same positional `__pos_N` struct shape, so its synthetic constructor
+        // is an allocation rather than a host call.
+        //
+        // Bare `Array` is deliberately excluded: only `Array<T;N>` carries a
+        // complete low-level owner identity. The owner-path gate keeps nominal
+        // user types out of this builtin aggregate policy.
+        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
+            && owner_path.is_empty()
+            && majit_ir::descr::is_shaped_array_name(name)
+            && args.is_empty()
+            && let ValueType::Ref(Some(owner)) = result_ty
+            && op
+                .result
+                .as_ref()
+                .is_none_or(|array| !array_has_nonconstant_index_read(graph, array))
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::New {
+                    owner: owner.clone(),
+                },
+            }]);
+        }
         // RPython `rtyper` lowers a heap-carried `Result` variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
         // `jtransform`; `rewrite_op_malloc` then emits `new(descr)`.
@@ -6355,6 +6382,54 @@ fn fn_const_target_from_field_write(
         }
     }
     found
+}
+
+/// Whether `array` feeds a fixed-array `ArrayRead` whose index is not a graph
+/// constant. `resolve_to_producer_op` follows block-link aliases, so a read in
+/// a successor is matched to the constructor that produced its base.
+///
+/// The shaped aggregate allocation models constant positions as struct fields.
+/// A runtime index needs the native array path and must retain its residual
+/// constructor until that representation has a shared lowering.
+fn array_has_nonconstant_index_read(
+    graph: &FunctionGraph,
+    array: &crate::flowspace::model::Variable,
+) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::ArrayRead { base, index, .. } => Some((base, index)),
+            _ => None,
+        })
+        .any(|(base, index)| {
+            let base_is_array = crate::front::mir::resolve_to_producer_op(graph, base).and_then(
+                |(block_id, op_index)| {
+                    graph
+                        .blocks
+                        .iter()
+                        .find(|block| block.id == block_id)?
+                        .operations
+                        .get(op_index)?
+                        .result
+                        .as_ref()
+                },
+            ) == Some(array);
+            if !base_is_array {
+                return false;
+            }
+            !crate::front::mir::resolve_to_producer_op(graph, index).is_some_and(
+                |(block_id, op_index)| {
+                    graph
+                        .blocks
+                        .iter()
+                        .find(|block| block.id == block_id)
+                        .and_then(|block| block.operations.get(op_index))
+                        .is_some_and(|op| matches!(op.kind, OpKind::ConstInt(_)))
+                },
+            )
+        })
 }
 
 fn tuple_pos_field_index(name: &str) -> Option<usize> {
@@ -10976,6 +11051,135 @@ mod tests {
                 result: Some(result),
                 kind: OpKind::New { owner: allocated },
             }] if result == &result_var && allocated == &owner
+        ));
+    }
+
+    /// A fixed-size array aggregate has the same allocation-plus-positional-
+    /// writes shape as the tuple arm above. Its item type and length remain in
+    /// the owner so the resulting SizeDescr is per shape.
+    #[test]
+    fn shaped_synthetic_array_ctor_lowers_to_new() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("shaped_array_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "Array<*mut PyObject;1>".to_string();
+        let target = CallTarget::synthetic_transparent_ctor(owner.clone());
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "shaped_array_malloc",
+            &mut graph,
+        ) else {
+            panic!("shaped Array aggregate must lower to malloc");
+        };
+        assert!(matches!(
+            ops.as_slice(),
+            [SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner: allocated },
+            }] if result == &result_var && allocated == &owner
+        ));
+    }
+
+    #[test]
+    fn bare_synthetic_array_ctor_does_not_lower_to_new() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("bare_array_ctor");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_ctor("Array");
+        let result_ty = ValueType::Ref(Some("Array".into()));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "bare_array_ctor",
+            &mut graph,
+        );
+        assert!(!matches!(
+            rewritten,
+            RewriteResult::Replace(ref ops)
+                if matches!(ops.as_slice(), [SpaceOperation { kind: OpKind::New { .. }, .. }])
+        ));
+    }
+
+    #[test]
+    fn dynamically_indexed_synthetic_array_ctor_does_not_lower_to_new() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("dynamic_array_index");
+        let entry = graph.startblock;
+        let owner = "Array<i64;4>".to_string();
+        let target = CallTarget::synthetic_transparent_ctor(owner.clone());
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let array = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: target.clone(),
+                    args: vec![],
+                    result_ty: result_ty.clone(),
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(entry, index.clone());
+        graph.push_op_var(
+            entry,
+            OpKind::ArrayRead {
+                base: array.clone(),
+                index,
+                item_ty: ValueType::Int,
+                array_type_id: Some("[i64;4]".into()),
+                nolength: true,
+                pure: false,
+            },
+            true,
+        );
+        let op = graph
+            .block(entry)
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&array))
+            .unwrap()
+            .clone();
+
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "dynamic_array_index",
+            &mut graph,
+        );
+        assert!(!matches!(
+            rewritten,
+            RewriteResult::Replace(ref ops)
+                if matches!(ops.as_slice(), [SpaceOperation { kind: OpKind::New { .. }, .. }])
         ));
     }
 

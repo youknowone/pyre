@@ -1061,7 +1061,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             returns_objectptr,
         });
     }
-    register_synthetic_tuple_metadata(
+    register_synthetic_positional_metadata(
         &functions,
         &mut known_struct_names,
         &mut struct_fields,
@@ -1178,24 +1178,23 @@ fn should_lower_function(
     function_filter.is_none_or(|names| names.contains(name))
 }
 
-/// Register the low-level struct identity and fields for every non-empty MIR
-/// tuple shape that survived into a translated graph.
+/// Register the low-level struct identity and fields for every shaped MIR
+/// tuple or fixed-size array that survived into a translated graph.
 ///
 /// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
 /// [`SomeTuple`] representation (`rtyper/rtuple.py:115-125`), then
 /// `TupleRepr.newtuple` allocates that struct and writes its fields
 /// (`rtuple.py:153-169`). Charon has no `TypeDecl` row for Rust's built-in
-/// tuple aggregate, so [`derive_program_metadata`] cannot discover these
-/// layouts from the declaration table. The graph is the authoritative
+/// tuple/array aggregate, so [`derive_program_metadata`] cannot discover
+/// these layouts from the declaration table. The graph is the authoritative
 /// rtyper input here: `front::mir` has already attached the complete
-/// `Tuple<T,...>` shape to the synthetic constructor and its `__pos_N`
-/// fields.
+/// `Tuple<T,...>` / `Array<T;N>` shape to the synthetic constructor and its
+/// `__pos_N` fields.
 ///
 /// Each full shape gets its own [`StructId`]. Generic nominal ADTs share their
-/// template layout, but tuples do not: `(A,)` and `(A, B)` are distinct
-/// low-level struct objects in RPython and must not collapse onto a bare
-/// `Tuple` identity.
-fn register_synthetic_tuple_metadata(
+/// template layout, but positional aggregates do not: item type and arity are
+/// part of their low-level allocation identity.
+fn register_synthetic_positional_metadata(
     functions: &[crate::front::semantic::SemanticFunction],
     known_struct_names: &mut std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
@@ -1220,7 +1219,8 @@ fn register_synthetic_tuple_metadata(
             };
             if owner_path.is_empty()
                 && args.is_empty()
-                && majit_ir::descr::is_shaped_tuple_name(name)
+                && (majit_ir::descr::is_shaped_tuple_name(name)
+                    || majit_ir::descr::is_shaped_array_name(name))
             {
                 shapes.insert(name.clone());
             }
@@ -1228,14 +1228,17 @@ fn register_synthetic_tuple_metadata(
     }
 
     for shape in shapes {
-        let Some(inner) = shape
+        let items = if let Some(inner) = shape
             .strip_prefix("Tuple<")
             .and_then(|rest| rest.strip_suffix('>'))
-        else {
+        {
+            split_top_level_type_args(inner)
+        } else if let Some((item, len)) = shaped_array_parts(&shape) {
+            vec![item; len]
+        } else {
             continue;
         };
-        let items = split_top_level_type_args(inner);
-        if items.is_empty() {
+        if items.is_empty() && majit_ir::descr::is_shaped_tuple_name(&shape) {
             continue;
         }
         let rows: Vec<(String, String)> = items
@@ -1302,6 +1305,19 @@ fn split_top_level_type_args(input: &str) -> Vec<&str> {
         out.push(tail);
     }
     out
+}
+
+/// Split a shaped fixed-array owner (`Array<T;N>`) into its item spelling and
+/// concrete length. The last semicolon is the outer array separator, so nested
+/// array item spellings (`Array<[T;M];N>`) remain intact.
+fn shaped_array_parts(shape: &str) -> Option<(&str, usize)> {
+    let inner = shape.strip_prefix("Array<")?.strip_suffix('>')?;
+    let (item, len) = inner.rsplit_once(';')?;
+    let item = item.trim();
+    if item.is_empty() {
+        return None;
+    }
+    Some((item, len.trim().parse().ok()?))
 }
 
 fn tuple_field_value_type(type_name: &str) -> ValueType {
@@ -4831,11 +4847,11 @@ impl<'a> Lowering<'a> {
                         // Synthetic placeholders for non-Adt aggregates
                         // (`Tuple`, `Array`, `Closure`) — they have no
                         // user-defined class to resolve into.  A non-empty
-                        // tuple carries its per-shape `<…>` suffix (gate) so
-                        // its `__pos_N` attrs do not collide with other-shape
-                        // tuples on one global class; the suffix matches
+                        // tuple or array carries its per-shape `<…>` suffix
+                        // so its `__pos_N` attrs do not collide with other
+                        // shapes on one global class; the suffix matches
                         // `positional_aggregate_owner` (Site-A reads) and
-                        // `tyref_tuple_suffix` (Site-B reads).
+                        // `tyref_positional_aggregate_suffix` (Site-B reads).
                         // The per-shape `<…>` suffix is rendered from the
                         // destination place type, not the `AggregateKind` head:
                         // Charon's `AggregateKind::Adt(Tuple, …)` carries no
@@ -4847,7 +4863,7 @@ impl<'a> Lowering<'a> {
                         let leaf = format!(
                             "{}{}",
                             aggregate_ctor_name(&kind),
-                            tyref_tuple_suffix(dest_ty, self.llbc)
+                            tyref_positional_aggregate_suffix(dest_ty, self.llbc)
                         );
                         let positional = (0..arg_vars.len())
                             .map(|i| (format!("__pos_{i}"), String::new()))
@@ -5892,23 +5908,24 @@ impl<'a> Lowering<'a> {
     /// i.e. a non-Adt aggregate (tuple / array / closure) for which
     /// [`Self::resolve_aggregate_adt`] returns `None`.  The owner is
     /// exactly what the [`Rvalue::Aggregate`] arm uses as
-    /// `result_ty_owner` (`aggregate_ctor_name`, since `owner_path` is
-    /// empty for the unresolved branch), so storing it lets `.N` reads
-    /// emit a `FieldRead __pos_<N>` with the matching `owner_root`.
+    /// `result_ty_owner` (`aggregate_ctor_name` plus its per-shape suffix,
+    /// since `owner_path` is empty for the unresolved branch), so storing it
+    /// lets `.N` reads emit a `FieldRead __pos_<N>` with the matching
+    /// `owner_root`.
     /// Returns `None` for Adt aggregates: their `.field` reads already
     /// take the typed [`Self::resolve_adt_field`] path and never reach
     /// the collapse fallback.
     fn positional_aggregate_owner(&self, rvalue: &Rvalue, dest_ty: &TyRef) -> Option<String> {
         match rvalue {
             Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind).is_none() => {
-                // Suffix from `dest_ty` (the tuple `place.ty`, element types
-                // present), matching the construction-side `build_rvalue`
-                // owner and the Site-B projection read; the `AggregateKind`
-                // head carries no element `types`.
+                // Suffix from `dest_ty` (the positional aggregate's
+                // `place.ty`, element types present), matching the
+                // construction-side `build_rvalue` owner and the projection
+                // read; the `AggregateKind` head carries no element `types`.
                 Some(format!(
                     "{}{}",
                     aggregate_ctor_name(kind),
-                    tyref_tuple_suffix(dest_ty, self.llbc)
+                    tyref_positional_aggregate_suffix(dest_ty, self.llbc)
                 ))
             }
             _ => None,
@@ -17286,6 +17303,48 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .unwrap_or_default()
 }
 
+/// The per-shape suffix for a fixed-size array destination
+/// (`{"Array":[item,len]}`), including both the rendered item type and the
+/// concrete length. Charon's `AggregateKind::Array` head carries neither, so
+/// construction and positional reads derive this spelling from the same
+/// destination/place [`TyRef`]. An unresolved const-generic length is kept
+/// bare and therefore outside the shaped-array allocation rewrite.
+fn tyref_array_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
+            Some(v) => v,
+            None => return String::new(),
+        },
+    };
+    let Some(array) = value
+        .as_object()
+        .and_then(|body| body.get("Array"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|array| array.len() == 2)
+    else {
+        return String::new();
+    };
+    let item = charon_type_value_to_ast_string(&array[0], llbc, 0);
+    let len = charon_const_generic_to_string(&array[1]);
+    if item.is_empty() || len.parse::<usize>().is_err() {
+        return String::new();
+    }
+    format!("<{item};{len}>")
+}
+
+/// Per-shape suffix shared by the synthetic positional aggregate constructor
+/// and its constant-index `__pos_N` reads.
+fn tyref_positional_aggregate_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+    let tuple = tyref_tuple_suffix(ty, llbc);
+    if tuple.is_empty() {
+        tyref_array_suffix(ty, llbc)
+    } else {
+        tuple
+    }
+}
+
 /// The `<X>` enum-instantiation suffix for a destination `Option<X>` /
 /// `Result<X, E>` local `ty`.  A runtime-discriminant decomposition
 /// (`checked_neg`, `usize::try_from`) constructs the enum ROOT — no static
@@ -18767,7 +18826,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
 }
 
 /// Read an `Array` aggregate literal: given the Variable holding a
-/// `SyntheticTransparentCtor { name: "Array" }` result, collect the
+/// `SyntheticTransparentCtor { name: "Array<T;N>" }` result, collect the
 /// values written to its `__pos_0..__pos_{n-1}` fields in index order.
 /// The ctor and its element `FieldWrite`s are emitted into one block by
 /// the `Rvalue::Aggregate` array lowering, so the search is block-local
@@ -18785,7 +18844,7 @@ fn read_array_literal_elements(
         OpKind::Call {
             target: CallTarget::SyntheticTransparentCtor { name, .. },
             ..
-        } if name == "Array" => {}
+        } if name == "Array" || majit_ir::descr::is_shaped_array_name(name) => {}
         _ => return None,
     }
     let mut by_index: Vec<(usize, crate::flowspace::model::Variable)> = Vec::new();
@@ -20720,7 +20779,8 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, simplify_lowered_graph, tyref_is_raw_byte_ptr,
+        fn_ptr_family_for, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -23473,6 +23533,77 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn fixed_array_suffix_separates_item_type_and_length() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let array = |item: serde_json::Value, len: &str| {
+            TyRef::Other(serde_json::json!({ "Array": [item, len] }))
+        };
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let bool_ty = serde_json::json!({"Literal": "Bool"});
+
+        assert_eq!(
+            tyref_array_suffix(&array(i64_ty.clone(), "1"), &llbc),
+            "<i64;1>"
+        );
+        assert_eq!(tyref_array_suffix(&array(i64_ty, "2"), &llbc), "<i64;2>");
+        assert_eq!(tyref_array_suffix(&array(bool_ty, "1"), &llbc), "<bool;1>");
+        assert_eq!(shaped_array_parts("Array<[i64;2];3>"), Some(("[i64;2]", 3)));
+    }
+
+    #[test]
+    fn fixed_array_shapes_register_distinct_struct_layouts() {
+        let mut graph = FunctionGraph::new("array_shapes");
+        let entry = graph.startblock;
+        for owner in ["Array<i64;1>", "Array<bool;2>"] {
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor(owner),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some(owner.into())),
+                },
+                true,
+            );
+        }
+        let functions = vec![crate::front::semantic::SemanticFunction {
+            name: "array_shapes".into(),
+            graph,
+            return_type: None,
+            self_ty_root: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            access_directly: false,
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }];
+        let mut known = std::collections::HashSet::new();
+        let mut fields = crate::front::semantic::StructFieldRegistry::default();
+        let mut attrs = std::collections::HashMap::new();
+        let mut ids = std::collections::HashMap::new();
+        super::register_synthetic_positional_metadata(
+            &functions,
+            &mut known,
+            &mut fields,
+            &mut attrs,
+            &mut ids,
+        );
+
+        assert_eq!(
+            fields.fields["Array<i64;1>"],
+            vec![("__pos_0".into(), "i64".into())]
+        );
+        assert_eq!(
+            fields.fields["Array<bool;2>"],
+            vec![
+                ("__pos_0".into(), "bool".into()),
+                ("__pos_1".into(), "bool".into())
+            ]
+        );
+        assert_ne!(ids["Array<i64;1>"], ids["Array<bool;2>"]);
     }
 
     /// The `Vec` index fold must accept a `usize` index.
