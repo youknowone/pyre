@@ -1,5 +1,6 @@
 import gc
 import shutil
+import sys
 import tempfile
 import warnings
 import os
@@ -157,3 +158,58 @@ def _close_midway(directory):
 assert _scandir_warnings(_abandon_midway), "an abandoned scandir iterator is unclosed"
 assert not _scandir_warnings(_exhaust), "an exhausted scandir iterator is closed"
 assert not _scandir_warnings(_close_midway), "a closed scandir iterator is closed"
+
+
+# The number of variables an exec takes from its environment is the mapping's
+# own length, and `keys()` and `values()` are read by position under it, so a
+# snapshot that cannot cover that length is an error rather than a quietly
+# shorter environment.  `__getitem__` is never consulted for any of it.
+class _Env(dict):
+    def __init__(self, keys, values, size):
+        self._keys, self._values, self._size = keys, values, size
+
+    def __len__(self):
+        return self._size
+
+    def keys(self):
+        return self._keys
+
+    def values(self):
+        return self._values
+
+    def __getitem__(self, key):
+        raise AssertionError("__getitem__ must not be called")
+
+
+_MISSING = "/nonexistent-program-" + str(os.getpid())
+
+for _short in (_Env([b"A"], [b"1"], 3), _Env([b"A", b"B"], [b"1"], 2)):
+    assert_raises(IndexError, lambda e=_short: os.execve(_MISSING, ["x"], e))
+
+# The snapshots need only be iterable, and one longer than that length has its
+# tail ignored.  Reaching the exec is what says the conversion finished, so the
+# program that is not there is the error that arrives.
+for _ok in (
+    _Env((b"A",), (b"1",), 1),
+    _Env({b"A"}, [b"1"], 1),
+    _Env([b"A", b"B"], [b"1", b"2"], 1),
+):
+    assert_raises(FileNotFoundError, lambda e=_ok: os.execve(_MISSING, ["x"], e))
+
+
+# `sendfile`'s header and trailer vectors are read by index, so each has to be
+# a sequence; a generator is refused rather than consumed.  Only the BSD-shaped
+# call takes them at all.
+if sys.platform == "darwin":
+    _read_fd, _write_fd = os.pipe()
+    try:
+        for _name in ("headers", "trailers"):
+            assert_raises(
+                TypeError,
+                lambda n=_name: os.sendfile(
+                    _write_fd, _read_fd, 0, 1, **{n: (b"x" for _ in range(1))}
+                ),
+            )
+    finally:
+        os.close(_read_fd)
+        os.close(_write_fd)
