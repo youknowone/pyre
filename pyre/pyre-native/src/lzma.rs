@@ -36,13 +36,17 @@ pub const FORMAT_XZ: i32 = 1;
 pub const FORMAT_ALONE: i32 = 2;
 pub const FORMAT_RAW: i32 = 3;
 
-pub const CHECK_NONE: u32 = LZMA_CHECK_NONE;
-pub const CHECK_CRC32: u32 = LZMA_CHECK_CRC32;
-pub const CHECK_CRC64: u32 = LZMA_CHECK_CRC64;
-pub const CHECK_SHA256: u32 = LZMA_CHECK_SHA256;
-pub const CHECK_ID_MAX: u32 = LZMA_CHECK_ID_MAX;
+// A liblzma enum is `int` where the C compiler is MSVC and `unsigned` where it
+// is not, so `lzma_check`, `lzma_mode` and `lzma_match_finder` change signedness
+// with the target.  The module publishes its own `u32` surface and casts at each
+// call into the library, keeping that variance inside this file.
+pub const CHECK_NONE: u32 = LZMA_CHECK_NONE as u32;
+pub const CHECK_CRC32: u32 = LZMA_CHECK_CRC32 as u32;
+pub const CHECK_CRC64: u32 = LZMA_CHECK_CRC64 as u32;
+pub const CHECK_SHA256: u32 = LZMA_CHECK_SHA256 as u32;
+pub const CHECK_ID_MAX: u32 = LZMA_CHECK_ID_MAX as u32;
 /// `_lzmamodule.c`'s own `LZMA_CHECK_UNKNOWN`, one past the last real id.
-pub const CHECK_UNKNOWN: u32 = LZMA_CHECK_ID_MAX + 1;
+pub const CHECK_UNKNOWN: u32 = CHECK_ID_MAX + 1;
 
 pub const FILTER_LZMA1: u64 = LZMA_FILTER_LZMA1;
 pub const FILTER_LZMA2: u64 = LZMA_FILTER_LZMA2;
@@ -54,14 +58,14 @@ pub const FILTER_ARMTHUMB: u64 = LZMA_FILTER_ARMTHUMB;
 pub const FILTER_SPARC: u64 = LZMA_FILTER_SPARC;
 pub const FILTER_POWERPC: u64 = LZMA_FILTER_POWERPC;
 
-pub const MF_HC3: u32 = LZMA_MF_HC3;
-pub const MF_HC4: u32 = LZMA_MF_HC4;
-pub const MF_BT2: u32 = LZMA_MF_BT2;
-pub const MF_BT3: u32 = LZMA_MF_BT3;
-pub const MF_BT4: u32 = LZMA_MF_BT4;
+pub const MF_HC3: u32 = LZMA_MF_HC3 as u32;
+pub const MF_HC4: u32 = LZMA_MF_HC4 as u32;
+pub const MF_BT2: u32 = LZMA_MF_BT2 as u32;
+pub const MF_BT3: u32 = LZMA_MF_BT3 as u32;
+pub const MF_BT4: u32 = LZMA_MF_BT4 as u32;
 
-pub const MODE_FAST: u32 = LZMA_MODE_FAST;
-pub const MODE_NORMAL: u32 = LZMA_MODE_NORMAL;
+pub const MODE_FAST: u32 = LZMA_MODE_FAST as u32;
+pub const MODE_NORMAL: u32 = LZMA_MODE_NORMAL as u32;
 
 pub const PRESET_DEFAULT: u32 = 6;
 pub const PRESET_EXTREME: u32 = LZMA_PRESET_EXTREME;
@@ -182,13 +186,13 @@ fn lzma_options(spec: &FilterSpec) -> Result<Box<lzma_options_lzma>, LzmaError> 
         options.pb = value;
     }
     if let Some(value) = spec.mode {
-        options.mode = value;
+        options.mode = value as lzma_mode;
     }
     if let Some(value) = spec.nice_len {
         options.nice_len = value;
     }
     if let Some(value) = spec.mf {
-        options.mf = value;
+        options.mf = value as lzma_match_finder;
     }
     if let Some(value) = spec.depth {
         options.depth = value;
@@ -337,10 +341,10 @@ impl Compressor {
         };
         let raw = &mut compressor.stream.raw;
         let ret = match (format, filters) {
-            (FORMAT_XZ, None) => unsafe { lzma_easy_encoder(raw, preset, check) },
+            (FORMAT_XZ, None) => unsafe { lzma_easy_encoder(raw, preset, check as lzma_check) },
             (FORMAT_XZ, Some(specs)) => {
                 let chain = FilterChain::new(specs)?;
-                unsafe { lzma_stream_encoder(raw, chain.as_ptr(), check) }
+                unsafe { lzma_stream_encoder(raw, chain.as_ptr(), check as lzma_check) }
             }
             (FORMAT_ALONE, None) => {
                 let options = lzma_options(&FilterSpec {
@@ -537,7 +541,7 @@ impl Decompressor {
             };
             LzmaError::check(ret)?;
             if ret == LZMA_GET_CHECK || ret == LZMA_NO_CHECK {
-                self.check = lzma_get_check(&self.stream.raw);
+                self.check = lzma_get_check(&self.stream.raw) as u32;
             }
             if ret == LZMA_STREAM_END {
                 self.eof = true;
@@ -565,7 +569,7 @@ impl Decompressor {
 /// `_lzma_is_check_supported_impl`.
 #[inline(never)]
 pub fn is_check_supported(check_id: u32) -> bool {
-    xz_core::check::check::lzma_check_is_supported(check_id) != 0
+    xz_core::check::check::lzma_check_is_supported(check_id as lzma_check) != 0
 }
 
 /// `_lzma__encode_filter_properties_impl`.
