@@ -1264,21 +1264,34 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // PyPy `referents.py:112-123`: the audit event precedes argument
-            // validation and always carries -1, even for a rejected argument.
+            // CPython 3.14 `gc_get_objects_impl`: Argument Clinic converts
+            // `None` to -1 and every other value through `__index__` before
+            // the audit event; range validation follows the audit. PyPy's
+            // `referents.py:112-123` has no generation argument, so the
+            // CPython 3.14 extension wins here.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(generation);
-            crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
             let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
-            if !unsafe { is_none(generation) } {
-                return Err(crate::PyError::not_implemented(
-                    "get_objects(generation=None) accepts only None on PyPy",
+            let generation = if unsafe { is_none(generation) } {
+                -1
+            } else {
+                unsafe { crate::baseobjspace::getindex_w_index(generation)? }
+            };
+            crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(generation)])?;
+            if generation >= 3 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter must be less than the number of available generations (3)",
+                ));
+            }
+            if generation < -1 {
+                return Err(crate::PyError::value_error(
+                    "generation parameter cannot be negative",
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_cpython_tracked_object);
+            majit_gc::get_objects(generation as i8, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
@@ -1482,15 +1495,14 @@ crate::py_module! {
             Ok(w_none())
         },
         "is_tracked"    / 1 = |args| {
-            // CPython 3.14 `_PyObject_GC_IS_TRACKED`: a collector-owned block
-            // is app-level tracked only when its Python type also carries
-            // `Py_TPFLAGS_HAVE_GC`.  Pyre still manages the wider Rust structs
-            // for scalar builtins internally; that storage choice must not
-            // make `int`, `str`, `bytes`, etc. observable as tracked objects.
-            Ok(w_bool_from(
-                crate::typedef::cpython_object_is_gc(args[0])
-                    && majit_gc::is_tracked(majit_ir::GcRef(args[0] as usize)),
-            ))
+            // CPython 3.14 `PyObject_GC_IsTracked` first requires
+            // `_PyObject_IS_GC`. Pyre's collector does not dynamically
+            // untrack eligible tuples/dicts, so that type-level eligibility
+            // is also its tracked state. Some eligible objects (notably
+            // modules) are rooted outside the moving arena, while scalar Rust
+            // structs may live inside it; arena membership therefore cannot
+            // be used as the app-level answer.
+            Ok(w_bool_from(crate::typedef::cpython_object_is_gc(args[0])))
         },
         "get_rpy_memory_usage" / 1 = |args| {
             // referents.py:97-104 / inspector.py:76-77.  The size is just the
