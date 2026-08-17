@@ -8185,12 +8185,33 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // compile.py:362-367: optimize using UnrolledLoopData with start_state.
-        let prior_front_target_tokens = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
-            .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
-            .unwrap_or_default();
+        //
+        // `compile.py:355-356` resolves the retrace's token with
+        // `get_procedure_token(greenkey)` and asserts it, so a retrace runs
+        // against a token that already owns the accumulated target tokens and
+        // carrying them is that token's own state. The arm below without a
+        // resumekey has no such token: it mints one, and `compile.py:245` /
+        // `:290` give a minted token a fresh single-element list. Drain the
+        // parked tokens on both arms — `swap_remove` is what spends them — and
+        // hand them on only where a token already owns them.
+        //
+        // The binding, not the seed argument, is emptied: on the minting arm
+        // it also feeds the ownership rebind and the republication fallback
+        // further down, and that fallback fires precisely when the optimizer
+        // produced no tokens of its own.
+        let prior_front_target_tokens = {
+            let prior_front_target_tokens = self
+                .compiled_loops
+                .get(&green_key)
+                .map(|compiled| compiled.front_target_tokens.clone())
+                .or_else(|| self.pending_preamble_tokens.swap_remove(&green_key))
+                .unwrap_or_default();
+            if retrace_resumekey.is_some() {
+                prior_front_target_tokens
+            } else {
+                Vec::new()
+            }
+        };
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
@@ -8198,13 +8219,12 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
-        // `compile.py:797-811` — a retrace grown from a guard failure is
-        // installed under the source guard's own loop token, so a close onto
-        // one of that token's target tokens stays inside a single live code
-        // buffer and may be admitted. Without a resumekey the retrace mints a
-        // fresh JitCellToken below and re-stamps the prior tokens onto it, so
-        // every seeded candidate is foreign at the moment the close is chosen
-        // and none may be admitted.
+        // `AbstractResumeGuardDescr.compile_and_attach`, `compile.py:797-811`,
+        // installs a retrace grown from a guard failure under
+        // `resumekey_original_loop_token`, so a close onto one of that token's
+        // target tokens stays inside a single live code buffer and may be
+        // admitted. The arm without a resumekey seeds nothing, so it has no
+        // candidate to admit.
         unroll_opt.attach_jitcell_token_number = retrace_resumekey
             .as_ref()
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
