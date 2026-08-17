@@ -1291,9 +1291,12 @@ pub struct JitCellToken {
     /// use the accessors (not `.get()` / `.set()` directly) to keep
     /// the bit-packing invariant.
     pub retraced_count: Cell<u32>,
-    /// `history.py:433` `JitCellToken.target_tokens = None` (lazily
-    /// populated to a `list[TargetToken]` in `compile.py:286-296` /
-    /// `:312-323` once the loop is compiled).  `pyjitpl.py:3898`
+    /// `history.py:440` `JitCellToken.target_tokens = None`, the class
+    /// default, assigned a `list[TargetToken]` at exactly two sites:
+    /// `compile.py:245` in `compile_simple_loop` and `:290` in
+    /// `compile_loop`.  Those are the only writers, so a token minted
+    /// anywhere else — `compile_retrace`'s no-resumekey arm mints at
+    /// `:1013` — keeps the `None` default.  `pyjitpl.py:3922-3923`
     /// `has_compiled_targets(token)` reads this list — `bool(token)
     /// and bool(token.target_tokens)`.
     ///
@@ -1301,8 +1304,12 @@ pub struct JitCellToken {
     /// (`LoopTargetDescr` Arc; `TargetToken IS-A AbstractDescr` in
     /// PyPy, so a `DescrRef` is the matching identity).  Each
     /// successful loop / retrace populates this through
-    /// `record_target_token` so `has_compiled_loop` reads the same
-    /// signal PyPy's `has_compiled_targets` does.  The metainterp-side
+    /// `record_target_token`.  Its one reader is
+    /// [`Self::first_target_token`], the descr a bridge closes onto:
+    /// neither `has_compiled_loop` (token presence) nor pyre's
+    /// `has_compiled_targets` (the `compiled_loops` side table) reads
+    /// this list, so it is not pyre's `has_compiled_targets` signal
+    /// despite mirroring what upstream's reads.  The metainterp-side
     /// `TargetToken` value (with `virtual_state` / `short_preamble`)
     /// stays on the `CompiledEntry::front_target_tokens` list per
     /// the F.6 retirement plan — the per-target descr identity is the
@@ -1544,31 +1551,42 @@ impl JitCellToken {
         self.bridge_invalidation_flags.lock().last().cloned()
     }
 
-    /// `pyjitpl.py:3898` `has_compiled_targets(token)` —
+    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` —
     /// `bool(token) and bool(token.target_tokens)`.  PyPy reads
-    /// `token.target_tokens` (a `list[TargetToken]` populated at
-    /// `compile.py:286-296`) and treats a non-empty list as the signal
-    /// that the loop has been compiled.
+    /// `token.target_tokens` (a `list[TargetToken]` assigned at
+    /// `compile.py:245` / `:290`) and treats a non-empty list as the
+    /// signal that the loop has been compiled.
     #[inline]
     pub fn has_target_tokens(&self) -> bool {
         !self.target_tokens.lock().is_empty()
     }
 
     /// The head of `token.target_tokens` — the descr `compile.py:290`
-    /// seeds the list with, and the one `pyjitpl.py:3007` closes a bridge
-    /// onto once `has_compiled_targets` has admitted the token.  Reading it
-    /// from the token rather than from a side table keeps the target and the
-    /// gate that admitted it the same object, which is what makes the
-    /// `warmstate.py:191-196` invalidation filter cover both.
+    /// seeds the list with.  Reading it from the token rather than from a
+    /// side table keeps the target and the gate that admitted it the same
+    /// object, which is what makes the `warmstate.py:191-196` invalidation
+    /// filter cover both.
+    ///
+    /// Upstream resolves the close target later and differently:
+    /// `pyjitpl.py:3007` hands `compile_trace` the JitCellToken itself, the
+    /// JUMP carries that token as its descr, and `unroll.py:320-340` picks
+    /// among `target_tokens` by matching each one's `virtual_state`,
+    /// skipping `VirtualStatesCantMatch`.  Taking the head here is
+    /// unconditional, so a list longer than one is a list of one for
+    /// close-target purposes.
     #[inline]
     pub fn first_target_token(&self) -> Option<majit_ir::DescrRef> {
         self.target_tokens.lock().first().cloned()
     }
 
-    /// `compile.py:286-296` / `:312-323` — append a freshly minted
-    /// TargetToken's descr to `token.target_tokens`.  Idempotent on
-    /// `Arc::ptr_eq` so retrace paths that reuse `prior_front_target_tokens`
-    /// across `compile_loop` and `compile_retrace` do not duplicate.
+    /// Append a freshly minted TargetToken's descr to
+    /// `token.target_tokens`.  Idempotent on `Arc::ptr_eq` so retrace
+    /// paths that reuse `prior_front_target_tokens` do not duplicate.
+    ///
+    /// This has no single upstream counterpart: `compile.py:245` /
+    /// `:290` assign the list outright, and both are in
+    /// `compile_simple_loop` / `compile_loop`, so neither describes
+    /// what happens on the retrace path this method also serves.
     pub fn record_target_token(&self, descr: majit_ir::DescrRef) {
         let mut guard = self.target_tokens.lock();
         if !guard.iter().any(|existing| Arc::ptr_eq(existing, &descr)) {

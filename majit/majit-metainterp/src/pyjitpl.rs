@@ -7112,9 +7112,11 @@ impl<M: Clone> MetaInterp<M> {
         // exists, so `record_loop_or_bridge`'s JUMP branch
         // (`compile.py:197-199`) can read it.
         //
-        // `compile.py:286-296` `jitcell_token.target_tokens = [start_descr]
-        // + ...` — populate the JCT-side descr list for
-        // `has_compiled_targets` parity (`pyjitpl.py:3898`).
+        // `compile.py:290` `jitcell_token.target_tokens = [start_descr]` —
+        // populate the JCT-side descr list for `has_compiled_targets` parity
+        // (`pyjitpl.py:3922-3923`). The assignment is a single element, not
+        // an append; this loop reaches the same state because the seed on
+        // this path holds only the tokens this compile produced.
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token_number(token_num);
             token.record_target_token(target_token.as_jump_target_descr());
@@ -8220,10 +8222,16 @@ impl<M: Clone> MetaInterp<M> {
         // `get_procedure_token(greenkey)` and asserts it, so a retrace runs
         // against a token that already owns the accumulated target tokens and
         // carrying them is that token's own state. The arm below without a
-        // resumekey has no such token: it mints one, and `compile.py:245` /
-        // `:290` give a minted token a fresh single-element list. Drain the
-        // parked tokens on both arms — `swap_remove` is what spends them — and
-        // hand them on only where a token already owns them.
+        // resumekey has no such token: it mints one at `compile.py:1013`, and
+        // `ResumeFromInterpDescr.compile_and_attach` (`:1006-1022`) never
+        // assigns that token's `target_tokens` at all — `target_tokens` has
+        // exactly three writers upstream, the `history.py:440` class default
+        // `None` and the two assignments at `compile.py:245` and `:290`, both
+        // of which are inside `compile_simple_loop` / `compile_loop` and so
+        // are not on this route. The minted token therefore starts owning
+        // nothing. Drain the parked tokens on both arms — `swap_remove` is
+        // what spends them — and hand them on only where a token already owns
+        // them.
         //
         // The binding, not the seed argument, is emptied: on the minting arm
         // it also feeds the ownership rebind and the republication fallback
@@ -9571,7 +9579,7 @@ impl<M: Clone> MetaInterp<M> {
                     // never builds a `TargetToken`/LABEL and never adds to
                     // `jitcell_token.target_tokens`.  So a FINISH-only trace
                     // leaves `front_target_tokens` empty: `has_compiled_targets`
-                    // (`pyjitpl.py:3898` = `bool(token.target_tokens)`) is
+                    // (`pyjitpl.py:3922-3923` = `bool(token.target_tokens)`) is
                     // false, while the trace stays enterable through
                     // `has_compiled_loop`
                     // (`get_procedure_token().has_compiled_code()`, mod.rs:8273
@@ -9818,7 +9826,7 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token_number(token_num);
         // `compile.py:245 jitcell_token.target_tokens = [target_token]` —
-        // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3898`).
+        // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py:3922-3923`).
         token.record_target_token(target_token.as_jump_target_descr());
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
@@ -11543,7 +11551,7 @@ impl<M: Clone> MetaInterp<M> {
     /// reads `cell.loop_token.as_ref()` directly per F.1 audit
     /// (`tfinal_f0_f1_landed_2026_05_07`).
     ///
-    /// `pyjitpl.py:3898` `has_compiled_targets(token)` parity:
+    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` parity:
     /// `bool(token) and bool(token.target_tokens)`.  pyre stores the
     /// per-target descr identity on `JitCellToken.target_tokens`
     /// (`backend/src/lib.rs`); each successful `compile_loop` /

@@ -968,13 +968,15 @@ impl UnrollOptimizer {
                     }
                     // `compile.py:245` `jitcell_token.target_tokens = [target_token]`
                     // / `:290` `jitcell_token.target_tokens = [start_descr]` —
-                    // PyPy unconditionally publishes one preamble target token
-                    // for any successful compile path (compile_simple_loop +
-                    // compile_loop both).  Phase 2 is bypassed here (no
-                    // exported_loop_state) but the loop still compiles, so
-                    // mirror the unconditional preamble registration so that
+                    // one preamble target token published unconditionally on
+                    // whichever of the two paths ran. Those are the only two
+                    // assignments of `target_tokens` upstream, and both are
+                    // inside `compile_simple_loop` / `compile_loop`, so this
+                    // says nothing about `compile_retrace`. Phase 2 is bypassed
+                    // here (no exported_loop_state) but the loop still
+                    // compiles, so mirror the registration so that
                     // `JitCellToken.target_tokens` is non-empty at the
-                    // `has_compiled_targets` (`pyjitpl.py:3898`) read site.
+                    // `has_compiled_targets` (`pyjitpl.py:3922-3923`) read site.
                     self.ensure_preamble_target_token();
                     let loop_arity = closing_loop_contract_arity(&ops, p1_ni);
                     self.clear_compile_snapshot_roots();
