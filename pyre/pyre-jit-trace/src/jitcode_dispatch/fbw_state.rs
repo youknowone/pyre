@@ -1591,24 +1591,6 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Code keys of the callees a FOR_ITER body admitted under
-    /// [`CalleeReplaySafety::DeferredCall`], outermost first.  Non-empty for
-    /// the lifetime of such a sub-walk ([`ForiterDeferredInlineGuard`]), which
-    /// is what arms the deferred-call arm of
-    /// [`fbw_abort_nested_unjournaled_residual`].
-    static FBW_FORITER_DEFERRED_INLINE: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Callee code keys whose deferred body reached a CALL residual the lever
-    /// could not inline.  The gate declines them up front from then on, so the
-    /// backstop abort costs one attempt per callee instead of storming.
-    ///
-    /// Per-thread for the reason [`FBW_HAZARDOUS_INLINE_DENY`] spells out, and
-    /// it is only a memo: what actually keeps a deferred body honest is the
-    /// live abort in [`fbw_abort_nested_unjournaled_residual`], armed by
-    /// [`FBW_FORITER_DEFERRED_INLINE`] above.  A thread that has not yet
-    /// recorded a denial pays one extra abort per callee, never a wrong answer.
-    static FBW_FORITER_DEFERRED_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
     /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
     /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
     /// inline callsite declines them from then on, so the call residualizes
@@ -1658,49 +1640,6 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// Marks the sub-walk of a callee admitted into a FOR_ITER body under
-/// [`CalleeReplaySafety::DeferredCall`] for its whole lifetime, so a nested
-/// residual the lever could not inline can recognise the admission it breaks
-/// (and the callee to deny) rather than executing.
-pub(crate) struct ForiterDeferredInlineGuard(bool);
-
-impl ForiterDeferredInlineGuard {
-    pub(crate) fn enter(callee_code_key: usize, deferred: bool) -> Self {
-        if deferred {
-            FBW_FORITER_DEFERRED_INLINE.with(|c| c.borrow_mut().push(callee_code_key));
-        }
-        ForiterDeferredInlineGuard(deferred)
-    }
-}
-
-impl Drop for ForiterDeferredInlineGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            FBW_FORITER_DEFERRED_INLINE.with(|c| {
-                c.borrow_mut().pop();
-            });
-        }
-    }
-}
-
-/// The outermost callee the active sub-walk was admitted for under
-/// [`CalleeReplaySafety::DeferredCall`], or `None` outside such a sub-walk.
-/// Declining that callee suppresses the whole nest: a body that calls another
-/// is itself `DeferredCall`, so no admitted caller sits above it.
-fn fbw_foriter_deferred_inline_outermost() -> Option<usize> {
-    FBW_FORITER_DEFERRED_INLINE.with(|c| c.borrow().first().copied())
-}
-
-pub(crate) fn fbw_foriter_deferred_call_denied(callee_code_key: usize) -> bool {
-    FBW_FORITER_DEFERRED_DENY.with(|c| c.borrow().contains(&callee_code_key))
-}
-
-fn fbw_foriter_deny_deferred_call(callee_code_key: usize) {
-    FBW_FORITER_DEFERRED_DENY.with(|c| {
-        c.borrow_mut().insert(callee_code_key);
-    });
-}
-
 pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
     FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&callee_code_key))
 }
@@ -1711,9 +1650,9 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
     });
 }
 
-/// Whether the active inline sub-walk is one of the hazard classes the blanket
-/// nested-residual decline was masking, as opposed to a straight-line mutating
-/// callee (the #73 depth-≥2 payoff, which inlines).  Two classes decline:
+/// Whether the active inline sub-walk is the remaining hazard class the blanket
+/// nested-residual decline was masking, as opposed to an ordinary nested
+/// callee (the #73 depth-≥2 payoff, which inlines).
 ///
 /// * **Loop-bearing** — a framestack callee whose `CodeObject` has a
 ///   `FOR_ITER`.  Its side-effecting `for` consume runs concretely in the
@@ -1813,25 +1752,22 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     let in_selfrec_fold = selfrec_ca_fold_active();
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
     // A FOR_ITER-body inline admitted under `CalleeReplaySafety::DeferredCall`
-    // stands on the promise that the sub-walk commits nothing: the static scan
-    // cleared every direct heap write, leaving only Python-level CALL residuals
-    // whose callee the lever resolves here.  One that did not inline breaks the
-    // promise, so abort BEFORE it executes — every op the sub-walk has run so
-    // far is write-free, so the resume re-runs the body benignly.  Denying the
-    // admitted callee makes the next attempt decline it statically, so this
-    // costs one abort per callee rather than an abort per trace attempt.
-    let foriter_deferred_inline = fbw_foriter_deferred_inline_outermost();
+    // used to abort before the first nested residual and deny the whole callee
+    // on the next trace.  That was an entry-replay workaround: the unseeded
+    // inline frame could only resume at its caller's CALL, so executing the
+    // residual before a later abort risked applying it twice.  The inline frame
+    // is now a real red frame in the captured chain and aborts resume forward;
+    // execute and record the residual exactly as RPython's `do_residual_call`
+    // does instead of manufacturing one `loops_aborted` per callee.
     // Narrowed decline: the general depth-≥2 nested
     // residual inline is sound now that the portal-runner ABI is correct — a
-    // straight-line mutating callee inlines bit-exact.  Only two callee shapes
-    // still miscompile, both masked by the old blanket decline and captured by
-    // [`fbw_inline_callee_hazardous`]: a LOOP-BEARING callee (the FOR_ITER
-    // Option-C refused-delivery double-advance, the `foriter_exempt_*`
-    // witnesses) and a SELF-RECURSIVE callee (the hot `CALL_ASSEMBLER`
-    // recursion-bridge frame the residual trampoline cannot retain, the
-    // `wasm_ca_trampoline_decline` witness).  Both are properties of the
-    // framestack knowable at the residual decline point, so the whole trace
-    // aborts before the hazardous body is committed.  Every other nested
+    // straight-line mutating callee inlines bit-exact.  One callee shape still
+    // miscompiles, masked by the old blanket decline and captured by
+    // [`fbw_inline_callee_hazardous`]: a SELF-RECURSIVE callee whose hot
+    // `CALL_ASSEMBLER` recursion-bridge frame the residual trampoline cannot
+    // retain (the `wasm_ca_trampoline_decline` witness).  The loop-bearing
+    // half formerly checked here was an entry-replay workaround; the
+    // per-frame forward-resume handoff now owns that case.  Every other nested
     // residual inlines.  The hazard scan is last so the cheap checks
     // short-circuit it.
     // A carrier-resume sub-walk starts at the failed guard; it does not replay
@@ -1841,24 +1777,20 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         && !in_selfrec_fold
         && !in_exception_string_inline
         && !ctx.session.borrow().framestack.is_empty();
-    let hazardous_callee = if nested && foriter_deferred_inline.is_none() {
+    let hazardous_callee = if nested {
         fbw_inline_callee_hazardous(ctx)
     } else {
         None
     };
-    if nested && (foriter_deferred_inline.is_some() || hazardous_callee.is_some()) {
+    if nested && hazardous_callee.is_some() {
         if std::env::var_os("PYRE_LB_SITE").is_some() {
             // Report the decline cause too: the arm flags say which promise
             // broke, not what broke it, and once a callee body is traced
             // through, the candidates are its whole helper set.
             eprintln!(
-                "[lb-arm] pc={pc} cause={cause:?} deferred={} hazard={}",
-                foriter_deferred_inline.is_some(),
+                "[lb-arm] pc={pc} cause={cause:?} hazard={}",
                 hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
-        }
-        if let Some(callee_code_key) = foriter_deferred_inline {
-            fbw_foriter_deny_deferred_call(callee_code_key);
         }
         // Deny the named callee so the enclosing loop's next attempt
         // residualizes that call instead of re-entering this abort.  Without

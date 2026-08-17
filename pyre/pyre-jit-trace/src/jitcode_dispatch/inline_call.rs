@@ -3537,7 +3537,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     }
     // A callee `fbw_abort_nested_unjournaled_residual` already named on its
     // hazard arm residualizes from here on.  The hazard is a static property of
-    // the callee's `CodeObject` (loop-bearing / self-recursive), so re-inlining
+    // the callee's `CodeObject` (self-recursive), so re-inlining
     // it rebuilds the identical framestack and reaches the identical abort —
     // the enclosing loop is retired for a decline that belongs to the callee.
     // `warmstate.py:331` `disable_noninlinable_function` is the same answer:
@@ -3650,16 +3650,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 foriter_deferred_admit = entry_is_call_boundary
                     && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
-                    && !body_facts.has_exception_table
-                    && !fbw_foriter_deferred_call_denied(callee_code_key);
+                    && !body_facts.has_exception_table;
                 if !foriter_deferred_admit && fbw_inline_diag_enabled() {
                     eprintln!(
                         "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
-                         header={loop_header_admitted} for_iter={} exc_table={} denied={}",
+                         header={loop_header_admitted} for_iter={} exc_table={}",
                         op.pc,
                         pyre_interpreter::code_has_for_iter(callee_code),
                         body_facts.has_exception_table,
-                        fbw_foriter_deferred_call_denied(callee_code_key),
                     );
                 }
                 foriter_deferred_admit
@@ -4935,8 +4933,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
-        let _foriter_deferred =
-            ForiterDeferredInlineGuard::enter(callee_code_key, foriter_deferred_admit);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
