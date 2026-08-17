@@ -1732,12 +1732,13 @@ fn module_to_object(
     module: ast::Mod,
     source: &str,
     mode: crate::compile::Mode,
-    ast_module: PyObjectRef,
+    module_object: PyObjectRef,
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(ast_module);
+    let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
+    pyre_object::gc_roots::pin_root(module_object);
     let converter = Converter { source, ast_module };
-    match module {
+    let root = match module {
         ast::Mod::Expression(module) => converter.node(
             "Expression",
             None,
@@ -1749,96 +1750,91 @@ fn module_to_object(
             } else {
                 "Module"
             };
-            // `converter.list` allocates the `type_ignores` list, so read the
-            // body back from its own slot after that sibling is built.
-            let body_slot = converter.pin_slot(converter.stmt_list(&module.body)?);
+            let body = converter.stmt_list(&module.body)?;
             if root_name == "Module" {
                 let type_ignores = converter.list(Vec::new());
                 converter.node(
                     root_name,
                     None,
-                    &[
-                        ("body", pyre_object::gc_roots::shadow_stack_get(body_slot)),
-                        ("type_ignores", type_ignores),
-                    ],
+                    &[("body", body), ("type_ignores", type_ignores)],
                 )
             } else {
-                converter.node(
-                    root_name,
-                    None,
-                    &[("body", pyre_object::gc_roots::shadow_stack_get(body_slot))],
-                )
+                converter.node(root_name, None, &[("body", body)])
             }
         }
+    }?;
+    Ok(root.get())
+}
+
+/// A value published in [`module_to_object`]'s root scope, held as its shadow
+/// slot rather than as a pointer.
+///
+/// Every value the tree is built from is produced by a call that allocates, and
+/// a node's fields are produced one after another before the node exists to
+/// hold any of them: a `PyObjectRef` copy of the first field addresses the
+/// pre-move object by the time the last one is built.  Only the slot survives
+/// that, so nothing here passes a bare `PyObjectRef` around — a value is read
+/// out of its slot at the point it is used and nowhere earlier.
+#[derive(Clone, Copy)]
+struct Rooted(usize);
+
+impl Rooted {
+    fn get(self) -> PyObjectRef {
+        pyre_object::gc_roots::shadow_stack_get(self.0)
     }
 }
+
+type RootedResult = Result<Rooted, crate::PyError>;
 
 struct Converter<'a> {
     source: &'a str,
-    ast_module: PyObjectRef,
+    ast_module: Rooted,
 }
 
 impl Converter<'_> {
-    /// Publish `value` as a root of `module_to_object`'s scope and hand back
-    /// the published slot's contents, not the caller's copy — the pin is what
-    /// makes the collector forward it, and reading the pre-pin local back would
-    /// discard that forwarding.
-    ///
-    /// STILL OPEN: the value is fresh when it is returned, but a caller that
-    /// builds a `&[(&str, PyObjectRef)]` field array allocates for the sibling
-    /// elements before [`Converter::node`] receives it, and only the shadow
-    /// slot is forwarded across that window.  Lists are the only movable field
-    /// values here (nodes are instances, and the rest are str/int/None), so
-    /// closing it means having the list-producing helpers return slots and
-    /// `node` take them — a change across all 77 `node` call sites, not a
-    /// rooting patch.  Reproduces only under `PYPY_GC_NURSERY=1`
-    /// (`ast.unparse` emits invalid source); the default nursery is unaffected.
-    fn pin(&self, value: PyObjectRef) -> PyObjectRef {
-        let slot = self.pin_slot(value);
-        pyre_object::gc_roots::shadow_stack_get(slot)
-    }
-
-    /// `pin`, returning the slot index so a caller that runs Python between the
-    /// pin and the use can re-read the value at each use.
-    fn pin_slot(&self, value: PyObjectRef) -> usize {
+    /// Publish `value` as a root of `module_to_object`'s scope.  The pin is
+    /// what makes the collector forward it; the slot is how a later use finds
+    /// where it was forwarded to.
+    fn pin(&self, value: PyObjectRef) -> Rooted {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(value);
-        slot
+        Rooted(slot)
     }
 
-    fn list(&self, values: Vec<PyObjectRef>) -> PyObjectRef {
-        self.pin(pyre_object::w_list_new(values))
+    fn list(&self, values: Vec<Rooted>) -> Rooted {
+        // Read the members back only here: `w_list_new` pins what it is handed,
+        // so the vector it receives has to be current at the call, and building
+        // it any earlier would hand over addresses the members have left.
+        self.pin(pyre_object::w_list_new(
+            values.into_iter().map(Rooted::get).collect(),
+        ))
     }
 
-    fn string(&self, value: &str) -> PyObjectRef {
+    fn string(&self, value: &str) -> Rooted {
         self.pin(pyre_object::w_str_new(value))
     }
 
-    fn optional(&self, value: Option<PyObjectRef>) -> PyObjectRef {
-        value.unwrap_or_else(pyre_object::w_none)
+    fn none(&self) -> Rooted {
+        self.pin(pyre_object::w_none())
+    }
+
+    fn optional(&self, value: Option<Rooted>) -> Rooted {
+        value.unwrap_or_else(|| self.none())
     }
 
     fn node(
         &self,
         name: &str,
         range: Option<(u32, u32)>,
-        fields: &[(&str, PyObjectRef)],
-    ) -> crate::PyResult {
-        let node_type = crate::baseobjspace::getattr_str(self.ast_module, name)?;
-        // Every `setattr_str` below runs Python, so the node and the field
-        // values move under the loop.  Publish them and read each back at the
-        // store that consumes it.
-        let node_slot = self.pin_slot(pyre_object::w_instance_new(node_type));
-        let value_base = pyre_object::gc_roots::shadow_stack_len();
-        for &(_, value) in fields {
-            pyre_object::gc_roots::pin_root(value);
-        }
-        for (index, &(field, _)) in fields.iter().enumerate() {
-            crate::baseobjspace::setattr_str(
-                pyre_object::gc_roots::shadow_stack_get(node_slot),
-                field,
-                pyre_object::gc_roots::shadow_stack_get(value_base + index),
-            )?;
+        fields: &[(&str, Rooted)],
+    ) -> RootedResult {
+        let node_type = crate::baseobjspace::getattr_str(self.ast_module.get(), name)?;
+        let node = self.pin(pyre_object::w_instance_new(node_type));
+        // Every `setattr_str` below runs Python, so the node and the remaining
+        // field values move under the loop; each is read at the store that
+        // consumes it.
+        for &(field, value) in fields {
+            crate::baseobjspace::setattr_str(node.get(), field, value.get())?;
         }
         if let Some((start, end)) = range {
             let (lineno, col_offset) = self.location(start as usize);
@@ -1852,14 +1848,10 @@ impl Converter<'_> {
                 // Box the position before reading the node back: `w_int_new`
                 // allocates, so a receiver read ahead of it is the pre-move one.
                 let w_value = pyre_object::w_int_new(value as i64);
-                crate::baseobjspace::setattr_str(
-                    pyre_object::gc_roots::shadow_stack_get(node_slot),
-                    field,
-                    w_value,
-                )?;
+                crate::baseobjspace::setattr_str(node.get(), field, w_value)?;
             }
         }
-        Ok(pyre_object::gc_roots::shadow_stack_get(node_slot))
+        Ok(node)
     }
 
     fn location(&self, offset: usize) -> (usize, usize) {
@@ -1876,7 +1868,7 @@ impl Converter<'_> {
         )
     }
 
-    fn stmt_list(&self, stmts: &[ast::Stmt]) -> crate::PyResult {
+    fn stmt_list(&self, stmts: &[ast::Stmt]) -> RootedResult {
         stmts
             .iter()
             .map(|stmt| self.stmt(stmt))
@@ -1884,7 +1876,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn expr_list(&self, exprs: &[ast::Expr]) -> crate::PyResult {
+    fn expr_list(&self, exprs: &[ast::Expr]) -> RootedResult {
         exprs
             .iter()
             .map(|expr| self.expr(expr))
@@ -1892,7 +1884,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn name_list<T: AsRef<str>>(&self, names: &[T]) -> PyObjectRef {
+    fn name_list<T: AsRef<str>>(&self, names: &[T]) -> Rooted {
         self.list(
             names
                 .iter()
@@ -1901,7 +1893,7 @@ impl Converter<'_> {
         )
     }
 
-    fn stmt(&self, stmt: &ast::Stmt) -> crate::PyResult {
+    fn stmt(&self, stmt: &ast::Stmt) -> RootedResult {
         use ast::Stmt;
         match stmt {
             Stmt::FunctionDef(node) => {
@@ -2030,9 +2022,9 @@ impl Converter<'_> {
                     ),
                     (
                         "simple",
-                        pyre_object::w_int_new(
-                            node.runtime_simple.unwrap_or(node.simple as i32) as i64
-                        ),
+                        self.pin(pyre_object::w_int_new(
+                            node.runtime_simple.unwrap_or(node.simple as i32) as i64,
+                        )),
                     ),
                 ],
             ),
@@ -2074,7 +2066,12 @@ impl Converter<'_> {
                             ],
                         )?];
                     } else {
-                        orelse = unsafe { pyre_object::w_list_items_copy_as_vec(body) };
+                        // The members come out of the list as bare pointers, so
+                        // each is published before the next clause allocates.
+                        orelse = unsafe { pyre_object::w_list_items_copy_as_vec(body.get()) }
+                            .into_iter()
+                            .map(|item| self.pin(item))
+                            .collect();
                     }
                 }
                 self.node(
@@ -2150,9 +2147,9 @@ impl Converter<'_> {
                     ("names", self.aliases(&node.names)?),
                     (
                         "level",
-                        pyre_object::w_int_new(
-                            node.runtime_level.unwrap_or(node.level as i32) as i64
-                        ),
+                        self.pin(pyre_object::w_int_new(
+                            node.runtime_level.unwrap_or(node.level as i32) as i64,
+                        )),
                     ),
                 ],
             ),
@@ -2195,7 +2192,7 @@ impl Converter<'_> {
         }
     }
 
-    fn expr(&self, expr: &ast::Expr) -> crate::PyResult {
+    fn expr(&self, expr: &ast::Expr) -> RootedResult {
         use ast::Expr;
         match expr {
             Expr::BoolOp(n) => self.node(
@@ -2358,7 +2355,7 @@ impl Converter<'_> {
                 if n.value.is_unicode() {
                     self.string("u")
                 } else {
-                    pyre_object::w_none()
+                    self.none()
                 },
             ),
             Expr::BytesLiteral(n) => self.constant(
@@ -2366,25 +2363,21 @@ impl Converter<'_> {
                 self.pin(pyre_object::w_bytes_from_bytes(
                     &n.value.bytes().collect::<Vec<_>>(),
                 )),
-                pyre_object::w_none(),
+                self.none(),
             ),
-            Expr::NumberLiteral(n) => self.constant(
-                range(n.range),
-                self.number(&n.value)?,
-                pyre_object::w_none(),
-            ),
+            Expr::NumberLiteral(n) => {
+                self.constant(range(n.range), self.number(&n.value)?, self.none())
+            }
             Expr::BooleanLiteral(n) => self.constant(
                 range(n.range),
-                pyre_object::w_bool_from(n.value),
-                pyre_object::w_none(),
+                self.pin(pyre_object::w_bool_from(n.value)),
+                self.none(),
             ),
-            Expr::NoneLiteral(n) => {
-                self.constant(range(n.range), pyre_object::w_none(), pyre_object::w_none())
-            }
+            Expr::NoneLiteral(n) => self.constant(range(n.range), self.none(), self.none()),
             Expr::EllipsisLiteral(n) => self.constant(
                 range(n.range),
-                pyre_object::w_ellipsis(),
-                pyre_object::w_none(),
+                self.pin(pyre_object::w_ellipsis()),
+                self.none(),
             ),
             Expr::Constant(n) => self.constant(
                 range(n.range),
@@ -2466,7 +2459,7 @@ impl Converter<'_> {
         }
     }
 
-    fn fstring(&self, node: &ast::ExprFString) -> crate::PyResult {
+    fn fstring(&self, node: &ast::ExprFString) -> RootedResult {
         if let Some(values) = node.runtime_joined_str.as_deref() {
             return self.node(
                 "JoinedStr",
@@ -2511,12 +2504,12 @@ impl Converter<'_> {
         )
     }
 
-    fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<Rooted>, crate::PyError> {
         parts
             .into_iter()
             .map(|part| match part {
                 JoinedPart::Literal { start, end, value } => {
-                    self.constant((start, end), self.string(&value), pyre_object::w_none())
+                    self.constant((start, end), self.string(&value), self.none())
                 }
                 JoinedPart::Value(value) => Ok(value),
             })
@@ -2568,7 +2561,7 @@ impl Converter<'_> {
                             ("value", self.expr(&interpolation.expression)?),
                             (
                                 "conversion",
-                                pyre_object::w_int_new(conversion as i8 as i64),
+                                self.pin(pyre_object::w_int_new(conversion as i8 as i64)),
                             ),
                             ("format_spec", self.optional(format_spec)),
                         ],
@@ -2605,7 +2598,7 @@ impl Converter<'_> {
         );
     }
 
-    fn match_case(&self, case: &ast::MatchCase) -> crate::PyResult {
+    fn match_case(&self, case: &ast::MatchCase) -> RootedResult {
         self.node(
             "match_case",
             None,
@@ -2620,7 +2613,7 @@ impl Converter<'_> {
         )
     }
 
-    fn pattern(&self, pattern: &ast::Pattern) -> crate::PyResult {
+    fn pattern(&self, pattern: &ast::Pattern) -> RootedResult {
         match pattern {
             ast::Pattern::MatchValue(node) => self.node(
                 "MatchValue",
@@ -2633,9 +2626,9 @@ impl Converter<'_> {
                 &[(
                     "value",
                     match node.value {
-                        ast::Singleton::None => pyre_object::w_none(),
-                        ast::Singleton::True => pyre_object::w_bool_from(true),
-                        ast::Singleton::False => pyre_object::w_bool_from(false),
+                        ast::Singleton::None => self.none(),
+                        ast::Singleton::True => self.pin(pyre_object::w_bool_from(true)),
+                        ast::Singleton::False => self.pin(pyre_object::w_bool_from(false)),
                     },
                 )],
             ),
@@ -2715,7 +2708,7 @@ impl Converter<'_> {
         }
     }
 
-    fn pattern_list(&self, patterns: &[ast::Pattern]) -> crate::PyResult {
+    fn pattern_list(&self, patterns: &[ast::Pattern]) -> RootedResult {
         patterns
             .iter()
             .map(|pattern| self.pattern(pattern))
@@ -2723,16 +2716,11 @@ impl Converter<'_> {
             .map(|patterns| self.list(patterns))
     }
 
-    fn constant(
-        &self,
-        range: (u32, u32),
-        value: PyObjectRef,
-        kind: PyObjectRef,
-    ) -> crate::PyResult {
+    fn constant(&self, range: (u32, u32), value: Rooted, kind: Rooted) -> RootedResult {
         self.node("Constant", Some(range), &[("value", value), ("kind", kind)])
     }
 
-    fn number(&self, value: &ast::Number) -> crate::PyResult {
+    fn number(&self, value: &ast::Number) -> RootedResult {
         Ok(match value {
             ast::Number::Int(value) => {
                 // Ruff's Int stores an overflowing non-decimal literal by
@@ -2741,7 +2729,11 @@ impl Converter<'_> {
                 // with the token's radix instead of decimal int().
                 let spelling = value.to_string();
                 let source = self.string(&spelling);
-                crate::builtins::parse_int_from_str(source, &spelling, 0)?
+                self.pin(crate::builtins::parse_int_from_str(
+                    source.get(),
+                    &spelling,
+                    0,
+                )?)
             }
             ast::Number::Float(value) => self.pin(pyre_object::w_float_new(*value)),
             ast::Number::Complex { real, imag } => {
@@ -2750,10 +2742,10 @@ impl Converter<'_> {
         })
     }
 
-    fn constant_value(&self, value: &ast::ConstantValue) -> crate::PyResult {
+    fn constant_value(&self, value: &ast::ConstantValue) -> RootedResult {
         Ok(match value {
-            ast::ConstantValue::None => pyre_object::w_none(),
-            ast::ConstantValue::Boolean(value) => pyre_object::w_bool_from(*value),
+            ast::ConstantValue::None => self.none(),
+            ast::ConstantValue::Boolean(value) => self.pin(pyre_object::w_bool_from(*value)),
             ast::ConstantValue::Str(value) => self.string(value),
             ast::ConstantValue::Bytes(value) => self.pin(pyre_object::w_bytes_from_bytes(value)),
             ast::ConstantValue::Integer(value) => {
@@ -2763,19 +2755,24 @@ impl Converter<'_> {
                 // spelling, so let the same internal parser infer that radix
                 // rather than feeding a hexadecimal token to decimal int().
                 let source = self.string(value);
-                crate::builtins::parse_int_from_str(source, value, 0)?
+                self.pin(crate::builtins::parse_int_from_str(source.get(), value, 0)?)
             }
             ast::ConstantValue::Float(value) => self.pin(pyre_object::w_float_new(*value)),
             ast::ConstantValue::Complex { real, imag } => {
                 self.pin(pyre_object::w_complex_new(*real, *imag))
             }
-            ast::ConstantValue::Ellipsis => pyre_object::w_ellipsis(),
+            ast::ConstantValue::Ellipsis => self.pin(pyre_object::w_ellipsis()),
             ast::ConstantValue::Tuple(values) => {
                 let values = values
                     .iter()
                     .map(|v| self.constant_value(v))
                     .collect::<Result<Vec<_>, _>>()?;
-                self.pin(pyre_object::w_tuple_new(values))
+                // A tuple header never moves, but it is untraced until it is
+                // pinned, so its members are read only once there is nothing
+                // left to allocate before the store.
+                self.pin(pyre_object::w_tuple_new(
+                    values.into_iter().map(Rooted::get).collect(),
+                ))
             }
             ast::ConstantValue::Frozenset(_) => {
                 return Err(crate::PyError::not_implemented(
@@ -2785,12 +2782,12 @@ impl Converter<'_> {
         })
     }
 
-    fn singleton(&self, name: &str) -> crate::PyResult {
-        let typ = crate::baseobjspace::getattr_str(self.ast_module, name)?;
+    fn singleton(&self, name: &str) -> RootedResult {
+        let typ = crate::baseobjspace::getattr_str(self.ast_module.get(), name)?;
         Ok(self.pin(pyre_object::w_instance_new(typ)))
     }
 
-    fn context(&self, value: ast::ExprContext) -> crate::PyResult {
+    fn context(&self, value: ast::ExprContext) -> RootedResult {
         self.singleton(match value {
             ast::ExprContext::Load => "Load",
             ast::ExprContext::Store => "Store",
@@ -2798,13 +2795,13 @@ impl Converter<'_> {
             ast::ExprContext::Invalid => "Load",
         })
     }
-    fn boolop(&self, value: ast::BoolOp) -> crate::PyResult {
+    fn boolop(&self, value: ast::BoolOp) -> RootedResult {
         self.singleton(match value {
             ast::BoolOp::And => "And",
             ast::BoolOp::Or => "Or",
         })
     }
-    fn operator(&self, value: ast::Operator) -> crate::PyResult {
+    fn operator(&self, value: ast::Operator) -> RootedResult {
         self.singleton(match value {
             ast::Operator::Add => "Add",
             ast::Operator::Sub => "Sub",
@@ -2821,7 +2818,7 @@ impl Converter<'_> {
             ast::Operator::FloorDiv => "FloorDiv",
         })
     }
-    fn unaryop(&self, value: ast::UnaryOp) -> crate::PyResult {
+    fn unaryop(&self, value: ast::UnaryOp) -> RootedResult {
         self.singleton(match value {
             ast::UnaryOp::Invert => "Invert",
             ast::UnaryOp::Not => "Not",
@@ -2829,7 +2826,7 @@ impl Converter<'_> {
             ast::UnaryOp::USub => "USub",
         })
     }
-    fn cmpop(&self, value: ast::CmpOp) -> crate::PyResult {
+    fn cmpop(&self, value: ast::CmpOp) -> RootedResult {
         self.singleton(match value {
             ast::CmpOp::Eq => "Eq",
             ast::CmpOp::NotEq => "NotEq",
@@ -2844,14 +2841,14 @@ impl Converter<'_> {
         })
     }
 
-    fn parameters_opt(&self, parameters: Option<&ast::Parameters>) -> crate::PyResult {
+    fn parameters_opt(&self, parameters: Option<&ast::Parameters>) -> RootedResult {
         match parameters {
             Some(p) => self.parameters(p),
             None => self.parameters(&ast::Parameters::default()),
         }
     }
 
-    fn parameters(&self, p: &ast::Parameters) -> crate::PyResult {
+    fn parameters(&self, p: &ast::Parameters) -> RootedResult {
         let posonlyargs = p
             .posonlyargs
             .iter()
@@ -2908,7 +2905,7 @@ impl Converter<'_> {
         )
     }
 
-    fn parameter(&self, p: &ast::Parameter) -> crate::PyResult {
+    fn parameter(&self, p: &ast::Parameter) -> RootedResult {
         self.node(
             "arg",
             Some(range(p.range)),
@@ -2918,12 +2915,12 @@ impl Converter<'_> {
                     "annotation",
                     self.optional(p.annotation.as_deref().map(|v| self.expr(v)).transpose()?),
                 ),
-                ("type_comment", pyre_object::w_none()),
+                ("type_comment", self.none()),
             ],
         )
     }
 
-    fn keyword_list(&self, keywords: &[ast::Keyword]) -> crate::PyResult {
+    fn keyword_list(&self, keywords: &[ast::Keyword]) -> RootedResult {
         keywords
             .iter()
             .map(|k| {
@@ -2943,7 +2940,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn aliases(&self, aliases: &[ast::Alias]) -> crate::PyResult {
+    fn aliases(&self, aliases: &[ast::Alias]) -> RootedResult {
         aliases
             .iter()
             .map(|a| {
@@ -2963,7 +2960,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn with_items(&self, items: &[ast::WithItem]) -> crate::PyResult {
+    fn with_items(&self, items: &[ast::WithItem]) -> RootedResult {
         items
             .iter()
             .map(|item| {
@@ -2988,7 +2985,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn comprehensions(&self, comprehensions: &[ast::Comprehension]) -> crate::PyResult {
+    fn comprehensions(&self, comprehensions: &[ast::Comprehension]) -> RootedResult {
         comprehensions
             .iter()
             .map(|c| {
@@ -2999,7 +2996,10 @@ impl Converter<'_> {
                         ("target", self.expr(&c.target)?),
                         ("iter", self.expr(&c.iter)?),
                         ("ifs", self.expr_list(&c.ifs)?),
-                        ("is_async", pyre_object::w_int_new(c.is_async as i64)),
+                        (
+                            "is_async",
+                            self.pin(pyre_object::w_int_new(c.is_async as i64)),
+                        ),
                     ],
                 )
             })
@@ -3007,7 +3007,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn handlers(&self, handlers: &[ast::ExceptHandler]) -> crate::PyResult {
+    fn handlers(&self, handlers: &[ast::ExceptHandler]) -> RootedResult {
         handlers
             .iter()
             .map(|handler| match handler {
@@ -3031,7 +3031,7 @@ impl Converter<'_> {
             .map(|items| self.list(items))
     }
 
-    fn type_params(&self, params: Option<&ast::TypeParams>) -> crate::PyResult {
+    fn type_params(&self, params: Option<&ast::TypeParams>) -> RootedResult {
         let Some(params) = params else {
             return Ok(self.list(Vec::new()));
         };
@@ -3100,7 +3100,7 @@ fn class_name(object: PyObjectRef) -> &'static str {
 /// reaches the tree as one node, not one per piece.
 enum JoinedPart {
     Literal { start: u32, end: u32, value: String },
-    Value(PyObjectRef),
+    Value(Rooted),
 }
 
 fn push_literal(parts: &mut Vec<JoinedPart>, (start, end): (u32, u32), value: &str) {
