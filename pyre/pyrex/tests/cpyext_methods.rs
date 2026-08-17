@@ -518,6 +518,34 @@ else:
 # 'w*' asks for a writable view, which an interpreter object never exports.
 assert m.writable_buffer(bytearray(b'ab')) == 'read-only'
 
+# ── the argument formats that hand over a pointer ──────────────────────
+# Every row here was taken from CPython 3.14.6 running this same table against
+# this same fixture. The three rules they describe: 's' and 'z' take a str and
+# 's#' and 'z#' a str or a bytes; a size-less format refuses a value carrying
+# an embedded NUL, the pointer being all the caller gets; and neither takes a
+# bytearray or a memoryview, whose buffers have a release this cannot run.
+BAD_TYPE = ('refused', 'TypeError')
+BAD_VALUE = ('refused', 'ValueError')
+POINTER_ROWS = [
+    ('abc', {'s': b'abc', 'z': b'abc', 's#': b'abc', 'z#': b'abc',
+             'y': BAD_TYPE, 'y#': BAD_TYPE}),
+    ('a\0c', {'s': BAD_VALUE, 'z': BAD_VALUE, 's#': b'a\0c', 'z#': b'a\0c',
+              'y': BAD_TYPE, 'y#': BAD_TYPE}),
+    (b'abc', {'s': BAD_TYPE, 'z': BAD_TYPE, 's#': b'abc', 'z#': b'abc',
+              'y': b'abc', 'y#': b'abc'}),
+    (b'a\0c', {'s': BAD_TYPE, 'z': BAD_TYPE, 's#': b'a\0c', 'z#': b'a\0c',
+               'y': BAD_VALUE, 'y#': b'a\0c'}),
+    (bytearray(b'abc'), dict.fromkeys(('s', 'z', 's#', 'z#', 'y', 'y#'), BAD_TYPE)),
+    (memoryview(b'abc'), dict.fromkeys(('s', 'z', 's#', 'z#', 'y', 'y#'), BAD_TYPE)),
+    (None, {'s': BAD_TYPE, 'z': 'null', 's#': BAD_TYPE, 'z#': 'null',
+            'y': BAD_TYPE, 'y#': BAD_TYPE}),
+    (7, dict.fromkeys(('s', 'z', 's#', 'z#', 'y', 'y#'), BAD_TYPE)),
+]
+for value, expected in POINTER_ROWS:
+    for code, want in expected.items():
+        got = m.pointer_formats(code, value)
+        assert got == want, '%r of %r: got %r, want %r' % (code, value, got, want)
+
 print('cpyext-methods-ok')
 "#;
 

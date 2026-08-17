@@ -1573,6 +1573,42 @@ static PyObject *m_buffer_formats(PyObject *self, PyObject *args, PyObject *keyw
     return result;
 }
 
+/* The argument formats that hand over a pointer rather than a view.  The
+   answer names what came back so a Python-side comparison can say whether the
+   two agree; a refusal answers with the exception's own class name, the
+   message being the part that differs. */
+static PyObject *m_pointer_formats(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *format;
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "sO", &format, &value)) {
+        return NULL;
+    }
+    PyObject *one = PyTuple_Pack(1, value);
+    if (one == NULL) {
+        return NULL;
+    }
+    const char *text = NULL;
+    Py_ssize_t length = 0;
+    int parsed = format[1] == '#'
+                     ? PyArg_ParseTuple(one, format, &text, &length)
+                     : PyArg_ParseTuple(one, format, &text);
+    Py_DECREF(one);
+    if (!parsed) {
+        PyObject *kind = PyErr_Occurred();
+        const char *name = kind == NULL ? "(none)" : ((PyTypeObject *)kind)->tp_name;
+        PyErr_Clear();
+        return Py_BuildValue("(ss)", "refused", name);
+    }
+    if (text == NULL) {
+        return PyUnicode_FromString("null");
+    }
+    /* Without a size the pointer is a C string, and its own length is what the
+       caller would read through it. */
+    return Py_BuildValue("y#", text, format[1] == '#' ? length : (Py_ssize_t)strlen(text));
+}
+
 /* `w*` asks for a writable view.  An interpreter object only ever exports a
    read-only snapshot, so the request is refused rather than handing back a
    pointer whose writes would go nowhere. */
@@ -1596,6 +1632,7 @@ static PyMethodDef methods[] = {
     {"fast_accessors", m_fast_accessors, METH_O, "the unchecked bytes and str accessors"},
     {"buffer_formats", (PyCFunction)(void (*)(void))m_buffer_formats,
      METH_VARARGS | METH_KEYWORDS, "the buffer-filling argument formats"},
+    {"pointer_formats", m_pointer_formats, METH_VARARGS, "the 's', 'z' and 'y' argument formats"},
     {"writable_buffer", m_writable_buffer, METH_VARARGS, "the 'w*' argument format"},
     {"object_attrs", m_object_attrs, METH_VARARGS, "the generic attribute protocol"},
     {"object_values", m_object_values, METH_VARARGS, "comparison, hashing and formatting"},

@@ -118,7 +118,10 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
         Py_ssize_t length = 0;
         if (code == 'z' && Py_IsNone(arg)) {
             text = NULL;
-        } else if (code == 'y') {
+        } else if (code == 'y' || (with_size && PyBytes_Check(arg))) {
+            /* `s#` and `z#` take a read-only bytes-like object as well as a
+               str; `s` and `z` take a str alone. A `bytearray` is neither,
+               having a release the pointer this hands over cannot run. */
             char *buffer = NULL;
             if (PyBytes_AsStringAndSize(arg, &buffer, &length) < 0) {
                 return 0;
@@ -129,6 +132,14 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
             if (text == NULL) {
                 return 0;
             }
+        }
+        /* Without a size the pointer is all the caller is given, so what it
+           names has to end where the object does. */
+        if (!with_size && text != NULL && strlen(text) != (size_t)length) {
+            PyErr_SetString(PyExc_ValueError, code == 'y'
+                                                  ? "embedded null byte"
+                                                  : "embedded null character");
+            return 0;
         }
         *va_arg(*va, const char **) = text;
         if (with_size) {
