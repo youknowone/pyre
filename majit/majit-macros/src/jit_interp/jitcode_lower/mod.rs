@@ -1374,19 +1374,12 @@ impl LowererConfig {
     /// Returns `struct_path` unchanged when the struct declares the field
     /// itself, when it has no inlined base, or when nothing declared one.
     pub(super) fn declaring_struct(&self, struct_path: &syn::Path, field: &str) -> syn::Path {
-        let mut current = struct_path.clone();
-        // Bounded by the declaration chain, which cannot be cyclic without
-        // making the Rust types infinitely sized.
-        loop {
-            if self.declares_field(&current, field) {
-                return current;
-            }
-            let Some((_, base)) = self.inlined_prefix.get(&canonical_path_segments(&current))
-            else {
-                return current;
-            };
-            current = base.clone();
-        }
+        crate::jit_interp::declaring_struct_of(
+            &self.inlined_prefix,
+            |path, field| self.declares_field(path, field),
+            struct_path,
+            field,
+        )
     }
 
     /// The layout entries an inlined base contributes to the struct embedding
@@ -1515,25 +1508,7 @@ impl LowererConfig {
     }
 }
 
-/// Index `inlined_prefix` by the outer struct's full canonical segments.
-///
-/// Keyed by every segment rather than by the last one, unlike the
-/// `"Struct::field"` keys the field vocabularies use: this declaration names a
-/// type relationship, and two same-named types in different modules do not
-/// share a base.
-fn inlined_prefix_map(
-    entries: &[crate::jit_interp::InlinedPrefixEntry],
-) -> HashMap<Vec<String>, (String, syn::Path)> {
-    entries
-        .iter()
-        .map(|entry| {
-            (
-                canonical_path_segments(&entry.outer),
-                (entry.base_field.to_string(), entry.base.clone()),
-            )
-        })
-        .collect()
-}
+use crate::jit_interp::inlined_prefix_index as inlined_prefix_map;
 
 /// A path as written, for a diagnostic that has to name it.
 fn path_display(path: &Path) -> String {

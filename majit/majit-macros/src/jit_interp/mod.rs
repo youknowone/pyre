@@ -1041,6 +1041,107 @@ pub(crate) fn parse_int_fields_map(input: ParseStream) -> syn::Result<Vec<IntFie
     Ok(entries)
 }
 
+/// The struct that DECLARES `field`, following inlined leading substructures
+/// outward-in.
+///
+/// `rclass.py:987-1001 InstanceRepr.getfield` resolves a field against the repr
+/// that owns it: `if attr in self.fields` … else recurse to `self.rbase` with
+/// `force_cast=True`.  That cast is why `jtransform.py:881` always reads the
+/// descr off the declaring struct, and so why one physical field has one
+/// descriptor however many structs embed it.
+///
+/// Shared by the JIT lowerer and by both concrete-path rewriters, which walk
+/// the same source and must agree about where a field lives.  They disagree
+/// only where one stopped early, and a disagreement here is not a build error
+/// — it is a dispatch arm that silently degrades.
+///
+/// `declares` answers whether a struct declares the field itself; each caller
+/// supplies it over whatever declaration maps it holds.  Returns `struct_path`
+/// unchanged when it declares the field, when it embeds no declared base, or
+/// when nothing declared one.
+pub(crate) fn declaring_struct_of(
+    inlined_prefix: &std::collections::HashMap<Vec<String>, (String, Path)>,
+    declares: impl Fn(&Path, &str) -> bool,
+    struct_path: &Path,
+    field: &str,
+) -> Path {
+    let mut current = struct_path.clone();
+    // Terminates: the chain cannot be cyclic without making the Rust types
+    // infinitely sized.
+    loop {
+        if declares(&current, field) {
+            return current;
+        }
+        let segments: Vec<String> = current
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let Some((_, base)) = inlined_prefix.get(&segments) else {
+            return current;
+        };
+        current = base.clone();
+    }
+}
+
+/// Every `"StructLast::field"` key the three field vocabularies declare.
+///
+/// What a declaring-struct walk needs is only whether a struct declares a
+/// field, not what it declared it as, so the three maps collapse to one key
+/// set for that purpose.
+pub(crate) fn declared_field_keys(
+    ref_fields: &[RefFieldEntry],
+    int_fields: &[IntFieldEntry],
+    array_fields: &[ArrayFieldEntry],
+) -> std::collections::HashSet<String> {
+    fn key(struct_type: &Path, field: &Ident) -> String {
+        let struct_last = struct_type
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        format!("{struct_last}::{field}")
+    }
+    ref_fields
+        .iter()
+        .map(|entry| key(&entry.struct_type, &entry.field))
+        .chain(
+            int_fields
+                .iter()
+                .map(|entry| key(&entry.struct_type, &entry.field)),
+        )
+        .chain(
+            array_fields
+                .iter()
+                .map(|entry| key(&entry.struct_type, &entry.field)),
+        )
+        .collect()
+}
+
+/// Index `inlined_prefix` by the embedding struct's full canonical segments.
+///
+/// Keyed by every segment rather than by the last one the field vocabularies
+/// use: this declaration names a type relationship, and two same-named types in
+/// different modules do not share a base.
+pub(crate) fn inlined_prefix_index(
+    entries: &[InlinedPrefixEntry],
+) -> std::collections::HashMap<Vec<String>, (String, Path)> {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .outer
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect(),
+                (entry.base_field.to_string(), entry.base.clone()),
+            )
+        })
+        .collect()
+}
+
 /// Parse `inlined_prefix = { Outer::field => Base, ... }`.  Split like
 /// `ref_fields`: the last segment of `Outer::field` names the field holding the
 /// inlined base.
@@ -1750,6 +1851,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         // When `let x = StructType { f0, f1 }` and StructType is in this map,
         // the concrete path rewrites the struct literal to `allocator(f0, f1)`.
         struct_allocs: std::collections::HashMap<Vec<String>, syn::Path>,
+        // `inlined_prefix` entries: outer struct segments → (base field,
+        // base path).  Empty unless a caller declares one.
+        inlined_prefix: std::collections::HashMap<Vec<String>, (String, syn::Path)>,
+        // Every `"StructLast::field"` the three field vocabularies declare.
+        // The JIT lowerer consults the maps themselves; this walk only needs
+        // to know whether a struct declares a field, not what it declared.
+        declared_field_keys: std::collections::HashSet<String>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -1779,6 +1887,24 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             let struct_last = struct_path.segments.last()?.ident.to_string();
             let key = format!("{}::{}", struct_last, field_name);
             self.field_pointees.get(&key).cloned()
+        }
+
+        // The struct that declares `field_name`, so the emitted cast names
+        // the type the field really lives on.  The JIT lowerer redirects the
+        // same way; the two walks must agree, or this one dereferences a
+        // struct that has no such field.
+        fn declaring_struct(&self, struct_path: &syn::Path, field_name: &str) -> syn::Path {
+            declaring_struct_of(
+                &self.inlined_prefix,
+                |path, field| {
+                    path.segments.last().is_some_and(|last| {
+                        self.declared_field_keys
+                            .contains(&format!("{}::{}", last.ident, field))
+                    })
+                },
+                struct_path,
+                field_name,
+            )
         }
 
         // Record a local binding as pointing to a struct type.
@@ -1816,6 +1942,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         syn::Member::Named(id) => id.to_string(),
                         _ => String::new(),
                     };
+                    // Resolve against the struct that declares the field, so
+                    // the cast below names the type it really lives on.
+                    let struct_path = self.declaring_struct(&struct_path, &member_name);
                     let mut rhs = (*assign.right).clone();
                     self.visit_expr_mut(&mut rhs);
                     if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
@@ -1842,6 +1971,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         syn::Member::Named(id) => id.to_string(),
                         _ => String::new(),
                     };
+                    // Resolve against the struct that declares the field, so
+                    // the cast below names the type it really lives on.
+                    let struct_path = self.declaring_struct(&struct_path, &member_name);
                     let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
                     if is_ref_field {
                         // Ref-kind field → cast to usize (JIT ref bank).
@@ -1873,6 +2005,9 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                         syn::Member::Named(id) => id.to_string(),
                         _ => String::new(),
                     };
+                    // Resolve against the struct that declares the field, so
+                    // the cast below names the type it really lives on.
+                    let struct_path = self.declaring_struct(&struct_path, &member_name);
                     let is_ref_field = self.field_pointee(&struct_path, &member_name).is_some();
                     if is_ref_field {
                         // Ref-kind field → cast result to usize (JIT ref bank).
@@ -1942,7 +2077,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                             .ref_struct_of_base(&field.base)
                             .or_else(|| self.local_ref_struct_of_base(&field.base));
                         if let Some(struct_path) = struct_path
-                            && let Some(pointee) = self.field_pointee(&struct_path, &member_name)
+                            && let Some(pointee) = self.field_pointee(
+                                &self.declaring_struct(&struct_path, &member_name),
+                                &member_name,
+                            )
                         {
                             // This field is ref-kind → the local is a
                             // ref binding pointing to pointee type.
@@ -2048,10 +2186,16 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                 .collect();
             RefFieldRewriter {
                 ref_fields,
+                declared_field_keys: declared_field_keys(
+                    &config.ref_fields,
+                    &config.int_fields,
+                    &config.array_fields,
+                ),
                 field_pointees,
                 local_ref_types: std::collections::HashMap::new(),
                 call_returns: call_returns_map,
                 struct_allocs: struct_allocs_map,
+                inlined_prefix: inlined_prefix_index(&config.inlined_prefix),
             }
             .visit_block_mut(&mut block);
         }

@@ -157,7 +157,9 @@ fn rewrite_jit_inline_ref_param_fields(
     ref_params: &[(Ident, Path)],
     ref_fields: &[jit_interp::RefFieldEntry],
     array_fields: &[jit_interp::ArrayFieldEntry],
+    int_fields: &[jit_interp::IntFieldEntry],
     struct_allocs: &[(Path, Path)],
+    inlined_prefix: &[jit_interp::InlinedPrefixEntry],
 ) -> syn::Block {
     use std::collections::HashMap;
     use syn::visit_mut::VisitMut;
@@ -170,6 +172,11 @@ fn rewrite_jit_inline_ref_param_fields(
         // through it rather than reading the field itself.
         array_field_elems: HashMap<String, syn::Path>,
         struct_allocs: HashMap<Vec<String>, syn::Path>,
+        // Outer struct segments -> (base field, base path); empty unless a
+        // caller declares a leading substructure.
+        inlined_prefix: HashMap<Vec<String>, (String, syn::Path)>,
+        // Every `"StructLast::field"` this block's vocabularies declare.
+        declared_field_keys: std::collections::HashSet<String>,
     }
 
     impl InlineRefFieldRewriter {
@@ -185,6 +192,24 @@ fn rewrite_jit_inline_ref_param_fields(
             let struct_last = struct_path.segments.last()?.ident.to_string();
             let key = format!("{}::{}", struct_last, field_name);
             self.field_pointees.get(&key).cloned()
+        }
+
+        // The struct that declares `field_name`, so the emitted cast names
+        // the type it really lives on.  The JIT lowerer redirects the same
+        // way; a disagreement leaves this walk dereferencing a struct with
+        // no such field.
+        fn declaring_struct(&self, struct_path: &syn::Path, field_name: &str) -> syn::Path {
+            jit_interp::declaring_struct_of(
+                &self.inlined_prefix,
+                |path, field| {
+                    path.segments.last().is_some_and(|last| {
+                        self.declared_field_keys
+                            .contains(&format!("{}::{}", last.ident, field))
+                    })
+                },
+                struct_path,
+                field_name,
+            )
         }
 
         fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
@@ -206,6 +231,7 @@ fn rewrite_jit_inline_ref_param_fields(
             let syn::Member::Named(member) = &field.member else {
                 return;
             };
+            let struct_path = self.declaring_struct(&struct_path, &member.to_string());
             let Some(pointee) = self.field_pointee(&struct_path, &member.to_string()) else {
                 return;
             };
@@ -325,6 +351,7 @@ fn rewrite_jit_inline_ref_param_fields(
                     syn::Member::Named(id) => id.to_string(),
                     _ => String::new(),
                 };
+                let struct_path = self.declaring_struct(&struct_path, &member_name);
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut rhs);
                 if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
@@ -348,6 +375,7 @@ fn rewrite_jit_inline_ref_param_fields(
                     syn::Member::Named(id) => id.to_string(),
                     _ => String::new(),
                 };
+                let struct_path = self.declaring_struct(&struct_path, &member_name);
                 if self.field_pointee(&struct_path, &member_name).is_some() {
                     *expr = syn::parse_quote! {
                         {
@@ -401,6 +429,12 @@ fn rewrite_jit_inline_ref_param_fields(
         })
         .collect();
     let mut rewriter = InlineRefFieldRewriter {
+        inlined_prefix: jit_interp::inlined_prefix_index(inlined_prefix),
+        declared_field_keys: jit_interp::declared_field_keys(
+            ref_fields,
+            int_fields,
+            array_fields,
+        ),
         local_ref_types: ref_params
             .iter()
             .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
@@ -2530,7 +2564,9 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.ref_params,
         &args.ref_fields,
         &args.array_fields,
+        &args.int_fields,
         &args.struct_allocs,
+        &args.inlined_prefix,
     );
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
