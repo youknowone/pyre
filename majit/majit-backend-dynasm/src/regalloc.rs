@@ -1848,8 +1848,7 @@ impl<'a> RegAlloc<'a> {
         self.jump_target_descr = None;
         self.final_jump_args = None;
         self.final_jump_op_position = -1;
-        let j2_plan = crate::j2plan::TracePlan::build(self.inputargs, self.operations);
-        self.j2_ops = j2_plan.ops;
+        self.j2_ops = crate::j2plan::TracePlan::lower_ops(self.operations);
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
         // Strict parity: upstream `rpython/jit/backend/x86/reghint.py`

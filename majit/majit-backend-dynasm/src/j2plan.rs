@@ -171,8 +171,14 @@ pub(crate) struct TracePlan {
 }
 
 impl TracePlan {
+    /// Production lowering entry point.  Register allocation consumes only the
+    /// lowered operations; reverse liveness belongs to the diagnostic plan.
+    pub(crate) fn lower_ops(ops: &[Op]) -> Vec<LirOp> {
+        ops.iter().map(lower_op).collect()
+    }
+
     pub(crate) fn build(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        let lowered: Vec<LirOp> = ops.iter().map(lower_op).collect();
+        let lowered = Self::lower_ops(ops);
         let live_points = compute_live_points(&lowered);
         let max_live = live_points
             .iter()
@@ -611,10 +617,10 @@ mod tests {
         let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]);
         jump.pos.set(OpRef::int_op(4));
 
-        let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Int, 0)],
-            &[label, add, lt, guard, jump],
-        );
+        let ops = vec![label, add, lt, guard, jump];
+        let plan = TracePlan::build(&[InputArg::from_type(Type::Int, 0)], &ops);
+
+        assert_eq!(TracePlan::lower_ops(&ops), plan.ops);
 
         assert_eq!(plan.fallback_ops, 0);
         assert!(matches!(
