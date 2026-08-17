@@ -349,6 +349,7 @@ impl From<OperationError> for PyError {
             message,
             exc_object: value.w_value,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -385,6 +386,28 @@ pub struct PyError {
     /// `record_application_traceback`.  Default `true` for any
     /// normally-constructed PyError; reraise flips it off.
     pub attach_tb: bool,
+    /// `pypy/interpreter/error.py:410-420 record_context` parity — the
+    /// once-only latch for implicit `__context__` chaining:
+    ///
+    /// ```python
+    /// def record_context(self, space, ec):
+    ///     if self._context_recorded:
+    ///         return
+    ///     last = ec.sys_exc_info()
+    ///     try:
+    ///         if last is not None:
+    ///             self.chain_exceptions(space, last)
+    ///     finally:
+    ///         self._context_recorded = True
+    /// ```
+    ///
+    /// The latch is load-bearing whenever the recorded answer was "no
+    /// context": a null `__context__` cannot distinguish an error that
+    /// recorded none from one not yet recorded, so without it an outer
+    /// frame handling something of its own would hand that to an error
+    /// merely unwinding through.  Set on the first dispatch regardless of
+    /// whether an active exception was found, mirroring the `finally`.
+    pub context_recorded: bool,
     /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., reraise_lasti=-1)`
     /// parity.  RERAISE N reads the original raise-site lasti from the
     /// value stack and carries it through `RaiseWithExplicitTraceback`
@@ -544,6 +567,7 @@ impl PyError {
             message: message.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -711,6 +735,7 @@ impl PyError {
             message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -890,6 +915,7 @@ impl PyError {
             message,
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -1078,6 +1104,7 @@ impl PyError {
             message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -1119,6 +1146,7 @@ impl PyError {
             message: Wtf8Buf::new(),
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -1180,6 +1208,7 @@ impl PyError {
             message,
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -1243,6 +1272,7 @@ impl PyError {
             message,
             exc_object: exc,
             attach_tb: true,
+            context_recorded: false,
             reraise_lasti: -1,
             w_name_context: std::ptr::null_mut(),
             w_obj_context: std::ptr::null_mut(),
@@ -1617,6 +1647,7 @@ impl PyError {
                 message: Wtf8Buf::new(),
                 exc_object: obj,
                 attach_tb: true,
+                context_recorded: false,
                 reraise_lasti: -1,
                 w_name_context: std::ptr::null_mut(),
                 w_obj_context: std::ptr::null_mut(),

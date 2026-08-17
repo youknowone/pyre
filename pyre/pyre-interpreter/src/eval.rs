@@ -1779,34 +1779,17 @@ pub fn handle_exception_with_context(
     //
     // `error.py:410-420 record_context` records it once and then marks the
     // OperationError, so the frames the SAME error merely unwinds through never
-    // re-derive it.  That marking is load-bearing whenever the recorded answer
-    // was "no context": a null `__context__` does not distinguish an error that
-    // recorded none from one not yet recorded, and an outer frame handling
-    // something of its own would hand it that instead.  Pyre's witness for the
-    // unmarked state is the application traceback, which
-    // `record_application_traceback` stamps for this frame below and which is
-    // therefore still empty on exactly the frame where the error first
-    // surfaces.
-    //
-    // A thrown-in exception starts a *new* error over an exception object that
-    // already carries a traceback from wherever it was first raised, so it is
-    // unmarked at the delivery frame no matter what that object holds.
-    let record_context = match context_source {
-        ContextSource::GeneratorChain => {
-            !err.exc_object.is_null()
-                && unsafe {
-                    pyre_object::interp_exceptions::w_exception_get_traceback(err.exc_object)
-                }
-                .is_null()
-        }
-        ContextSource::ResumedFrameOnly => true,
-    };
-    if record_context {
+    // re-derive it.  `PyError::context_recorded` is that mark, and it rides the
+    // error outward because the dispatch loop moves the same value into
+    // `Err(err)` on propagation.  The mark is set below whether or not an active
+    // exception was found, mirroring the `finally`.
+    if !err.context_recorded {
         let active = match context_source {
             ContextSource::GeneratorChain => get_sys_exception(),
             ContextSource::ResumedFrameOnly => get_current_exception(),
         };
         crate::error::chain_context(err.exc_object, active);
+        err.context_recorded = true;
     }
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
