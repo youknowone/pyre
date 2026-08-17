@@ -702,6 +702,11 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    // The linking pass belongs to a whole translation input, so the
+    // multi-artefact entry point runs it once over all of them and the
+    // per-artefact builder below does not repeat it. A caller handing over a
+    // single artefact has named its whole input here, so link it here.
+    link_transparent_scalar_types(std::slice::from_ref(llbc));
     build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None, None)
 }
 
