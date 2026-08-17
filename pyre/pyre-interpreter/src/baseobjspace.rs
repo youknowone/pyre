@@ -5407,6 +5407,10 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
 ///
 /// MapdictWeakrefSupport.getweakref overrides it.
 pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { crate::pycode::is_code(obj) } {
+        let lifeline = unsafe { crate::pycode::w_code_getweakref(obj) };
+        return (!lifeline.is_null()).then_some(lifeline);
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
         return (!lifeline.is_null()).then_some(lifeline);
@@ -5465,6 +5469,10 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// MapdictWeakrefSupport.setweakref overrides it.
 pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
+    if unsafe { crate::pycode::is_code(obj) } {
+        unsafe { crate::pycode::w_code_setweakref(obj, weakreflifeline) };
+        return Ok(());
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
         return Ok(());
@@ -5524,6 +5532,10 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
 ///     pass
 /// ```
 pub fn delweakref(obj: PyObjectRef) {
+    if unsafe { crate::pycode::is_code(obj) } {
+        unsafe { crate::pycode::w_code_setweakref(obj, PY_NULL) };
+        return;
+    }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
         unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
         return;

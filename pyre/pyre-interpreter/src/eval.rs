@@ -330,6 +330,11 @@ pub unsafe fn walk_raw_code_roots(
         // PREBUILT_CODE_ROOTS, so the same direct-edge shape covers them too.
         let code = &mut *(value as *mut crate::pycode::PyCode);
         visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // typedef.py:724 `make_weakref_descr(PyCode)` adds the strong
+        // `_lifeline_` field to PyCode.  Its own rweakrefs point weakly
+        // back to this code object; tracing this edge keeps callbacks
+        // alive exactly until their owner becomes unreachable.
+        visitor(&mut *(&mut code.w_weakreflifeline as *mut PyObjectRef as *mut majit_ir::GcRef));
         // The realized `co_qualname` is an ordinary movable string object
         // shared by every function built from this code.
         visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));

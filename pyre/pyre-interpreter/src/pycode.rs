@@ -218,6 +218,12 @@ pub struct PyCode {
     /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there. Null until first
     /// stamped by `frame_stores_global`.
     pub w_globals: PyObjectRef,
+    /// `typedef.py make_weakref_descr(PyCode)` installs `_lifeline_` on
+    /// the interpreter-level class.  Keep that owner-local field here rather
+    /// than routing code objects through the fallback address-keyed table.
+    /// The lifeline owns the cached weakrefs and their callbacks and is traced
+    /// with the rest of this code object's managed children.
+    pub w_weakreflifeline: PyObjectRef,
     /// PyPy: `PyCode.hidden_applevel` (`pycode.py, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
     /// app_main bridge code.  Pyre has no such call site yet, so this
@@ -346,6 +352,8 @@ pub struct PyCode {
 pub const CODE_PTR_OFFSET: usize = std::mem::offset_of!(PyCode, code_ptr);
 /// Field offset of `w_globals` within `PyCode`.
 pub const CODE_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyCode, w_globals);
+/// Field offset of `w_weakreflifeline` within `PyCode`.
+pub const CODE_W_WEAKREFLIFELINE_OFFSET: usize = std::mem::offset_of!(PyCode, w_weakreflifeline);
 /// Field offset of `w_qualname` within `PyCode`.
 pub const CODE_W_QUALNAME_OFFSET: usize = std::mem::offset_of!(PyCode, w_qualname);
 /// Field offset of `w_name` within `PyCode`.
@@ -361,6 +369,26 @@ pub const CODE_HIDDEN_APPLEVEL_OFFSET: usize = std::mem::offset_of!(PyCode, hidd
 /// `w_code` must be a live `PyCode`.
 pub unsafe fn w_code_firstlineno_raw(w_code: PyObjectRef) -> i32 {
     unsafe { (*(w_code as *const PyCode)).co_firstlineno_raw }
+}
+
+/// `make_weakref_descr(PyCode).getweakref` — read the owner-local lifeline.
+///
+/// # Safety
+/// `w_code` must point to a live [`PyCode`].
+pub unsafe fn w_code_getweakref(w_code: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(w_code as *const PyCode)).w_weakreflifeline }
+}
+
+/// `make_weakref_descr(PyCode).setweakref` — publish the lifeline and retain
+/// the old-to-young edge when a stable-oldgen code object receives it.
+///
+/// # Safety
+/// `w_code` must point to a live [`PyCode`].
+pub unsafe fn w_code_setweakref(w_code: PyObjectRef, lifeline: PyObjectRef) {
+    unsafe {
+        (*(w_code as *mut PyCode)).w_weakreflifeline = lifeline;
+        pyre_object::gc_hook::try_gc_write_barrier(w_code as *mut u8);
+    }
 }
 
 /// `pycode.py self.co_qualname = qualname` — the shared wrapped qualified
@@ -708,6 +736,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         filename_bytes: std::ptr::null_mut(),
         filename_inherits_to_nested: false,
         w_globals: pyre_object::PY_NULL,
+        w_weakreflifeline: pyre_object::PY_NULL,
         hidden_applevel,
         fast_natural_arity,
         npure_cellvars,
