@@ -10354,7 +10354,11 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = saved_lookup;
 
     match walk_result? {
-        DispatchOutcome::SubReturn { result: None } => {}
+        DispatchOutcome::SubReturn { result } => {
+            if finish_inline_callee_return(ctx, result).is_some() {
+                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
+            }
+        }
         _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc }),
     }
 
@@ -10712,12 +10716,8 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = saved_lookup;
 
     let result = match walk_result? {
-        DispatchOutcome::SubReturn {
-            result: Some(result),
-        } => result,
-        DispatchOutcome::SubReturn { result: None } => {
-            return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc });
-        }
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })?,
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
     };
     // The Integer arm commits `ll_list_int_set_len` before it boxes, so a guard

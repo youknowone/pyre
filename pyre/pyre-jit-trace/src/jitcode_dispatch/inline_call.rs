@@ -2940,16 +2940,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         }
     };
     match walk_result {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            let concrete = concrete_from_recorded_opref(ctx, value);
-            write_ref_reg(ctx, op.pc, dst, value, concrete)?;
-            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                let concrete = concrete_from_recorded_opref(ctx, value);
+                write_ref_reg(ctx, op.pc, dst, value, concrete)?;
+                Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+            }
+            None => Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
@@ -5376,94 +5374,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     };
 
     match outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            if require_str_result
-                && !matches!(
-                    concrete_for_shadow,
-                    ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
-                )
-            {
-                // descroperation.py checks the app-level result before
-                // returning from `space.str` / `space.repr`. Re-run the
-                // original builtin call at the caller boundary so the
-                // interpreter raises its faithful TypeError; the inlined
-                // body has no committed concrete effect at this point.
-                latch_abort_call_resume(
-                    code,
-                    op,
-                    ctx,
-                    call_descr,
-                    is_top_inline,
-                    unjournaled_before_subwalk,
-                    executed_effects_before,
-                    abort_flush_call_jitcode_coord,
-                );
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            }
-            if require_exact_int_result
-                && !matches!(
-                    concrete_for_shadow,
-                    ConcreteValue::Ref(obj)
-                        if walker_is_exact_machine_int_concrete(obj)
-                )
-            {
-                // `descroperation.py:608-620 _index` validates the app-level
-                // result before its caller continues, and a long, a bool or an
-                // int subclass are all legal there — only the machine-int
-                // arithmetic downstream cannot take them.  Decline instead of
-                // aborting: the caller rewinds the emission and falls through
-                // to its residual, which re-runs the whole builtin.  That is
-                // sound because the body is admitted only when re-running it
-                // observes and changes nothing (`exc_override_sample_safe`),
-                // and it keeps a legal program from killing the enclosing
-                // loop's trace, which `callee_inline_unsupported` would.
-                return resolved_inline_decline(op.pc, line!());
-            }
-            // `descr_call` discards `__init__`'s result after checking it is
-            // None and returns the instance instead (`check_init_returned_none`).
-            // A non-None result is a TypeError the inlined body cannot raise, so
-            // give the callee back to the interpreter, which re-runs the call and
-            // raises the faithful message.  Latch the CALL boundary first, like
-            // the invalid-`str`/`repr`-result path above: the sub-walk already
-            // executed the constructor body, so a plain abort would have the
-            // interpreter replay it and repeat any effect it performed.
-            let (value, concrete_for_shadow) = match constructor_result {
-                Some(instance) => {
-                    if !matches!(concrete_for_shadow,
-                        ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
-                    {
-                        latch_abort_call_resume(
-                            code,
-                            op,
-                            ctx,
-                            call_descr,
-                            is_top_inline,
-                            unjournaled_before_subwalk,
-                            executed_effects_before,
-                            abort_flush_call_jitcode_coord,
-                        );
-                        return Err(DispatchError::callee_inline_unsupported(op.pc));
-                    }
-                    instance
-                }
-                None => (value, concrete_for_shadow),
-            };
-            if let Some(result) = intermediate_result {
-                // The caller stays pinned at its own CALL boundary, so a guard
-                // it emits after this hand-off resumes by re-entering that CALL
-                // and running the callee a second time, and its rewinding
-                // declines cut the trace without undoing what the body already
-                // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
-                // answers whether that is survivable: "a nonzero count delta
-                // means the callee attempt cannot be discarded and re-executed
-                // without risking a double".  Abort rather than decline —
-                // `latch_abort_call_resume` deliberately declines to latch the
-                // CALL when effects ran, so the interpreter resumes past it
-                // instead of re-running the effects.
-                if fbw_executed_effect_count() != executed_effects_before {
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                if require_str_result
+                    && !matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) }
+                    )
+                {
+                    // descroperation.py checks the app-level result before
+                    // returning from `space.str` / `space.repr`. Re-run the
+                    // original builtin call at the caller boundary so the
+                    // interpreter raises its faithful TypeError; the inlined
+                    // body has no committed concrete effect at this point.
                     latch_abort_call_resume(
                         code,
                         op,
@@ -5476,24 +5400,98 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
-                *result = Some((value, concrete_for_shadow));
-                return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
-            }
-            match dst_bank {
-                'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
-                'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
-                'v' => {}
-                _ => return Ok(None),
-            }
-            Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
+                if require_exact_int_result
+                    && !matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj)
+                            if walker_is_exact_machine_int_concrete(obj)
+                    )
+                {
+                    // `descroperation.py:608-620 _index` validates the app-level
+                    // result before its caller continues, and a long, a bool or an
+                    // int subclass are all legal there — only the machine-int
+                    // arithmetic downstream cannot take them.  Decline instead of
+                    // aborting: the caller rewinds the emission and falls through
+                    // to its residual, which re-runs the whole builtin.  That is
+                    // sound because the body is admitted only when re-running it
+                    // observes and changes nothing (`exc_override_sample_safe`),
+                    // and it keeps a legal program from killing the enclosing
+                    // loop's trace, which `callee_inline_unsupported` would.
+                    return resolved_inline_decline(op.pc, line!());
+                }
+                // `descr_call` discards `__init__`'s result after checking it is
+                // None and returns the instance instead (`check_init_returned_none`).
+                // A non-None result is a TypeError the inlined body cannot raise, so
+                // give the callee back to the interpreter, which re-runs the call and
+                // raises the faithful message.  Latch the CALL boundary first, like
+                // the invalid-`str`/`repr`-result path above: the sub-walk already
+                // executed the constructor body, so a plain abort would have the
+                // interpreter replay it and repeat any effect it performed.
+                let (value, concrete_for_shadow) = match constructor_result {
+                    Some(instance) => {
+                        if !matches!(concrete_for_shadow,
+                        ConcreteValue::Ref(obj) if unsafe { pyre_object::is_none(obj) })
+                        {
+                            latch_abort_call_resume(
+                                code,
+                                op,
+                                ctx,
+                                call_descr,
+                                is_top_inline,
+                                unjournaled_before_subwalk,
+                                executed_effects_before,
+                                abort_flush_call_jitcode_coord,
+                            );
+                            return Err(DispatchError::callee_inline_unsupported(op.pc));
+                        }
+                        instance
+                    }
+                    None => (value, concrete_for_shadow),
+                };
+                if let Some(result) = intermediate_result {
+                    // The caller stays pinned at its own CALL boundary, so a guard
+                    // it emits after this hand-off resumes by re-entering that CALL
+                    // and running the callee a second time, and its rewinding
+                    // declines cut the trace without undoing what the body already
+                    // did.  `FBW_EXECUTED_EFFECT_COUNT` is the odometer that
+                    // answers whether that is survivable: "a nonzero count delta
+                    // means the callee attempt cannot be discarded and re-executed
+                    // without risking a double".  Abort rather than decline —
+                    // `latch_abort_call_resume` deliberately declines to latch the
+                    // CALL when effects ran, so the interpreter resumes past it
+                    // instead of re-running the effects.
+                    if fbw_executed_effect_count() != executed_effects_before {
+                        latch_abort_call_resume(
+                            code,
+                            op,
+                            ctx,
+                            call_descr,
+                            is_top_inline,
+                            unjournaled_before_subwalk,
+                            executed_effects_before,
+                            abort_flush_call_jitcode_coord,
+                        );
+                        return Err(DispatchError::callee_inline_unsupported(op.pc));
+                    }
+                    *result = Some((value, concrete_for_shadow));
+                    return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+                }
+                match dst_bank {
+                    'r' => write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                    'i' => write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?,
+                    'v' => {}
+                    _ => return Ok(None),
+                }
                 Ok(Some((DispatchOutcome::Continue, op.next_pc)))
-            } else {
-                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-        }
+            None => {
+                if dst_bank == 'v' {
+                    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+                } else {
+                    Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+                }
+            }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -7549,6 +7547,21 @@ pub(crate) fn allocate_callee_register_banks(
     (regs_r, regs_i, regs_f, concrete_r, concrete_i)
 }
 
+/// Apply the non-exceptional frame-exit state transition and return the
+/// callee's value for caller-side shape handling.
+///
+/// `pyjitpl.py:2503-2506 finishframe` clears `last_exc_value` before
+/// `popframe()`. Because the walker stores that state per frame, the caller's
+/// slot is the one that must observe the null after the callee returns.
+pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    result: Option<OpRef>,
+) -> Option<OpRef> {
+    ctx.last_exc_value = None;
+    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    result
+}
+
 /// Seed a callee jitcode's register banks with positional args and walk
 /// its body, returning the callee's terminal [`DispatchOutcome`]
 /// (`SubReturn` / `SubRaise` / `Terminate` / `SwitchToBlackhole`).
@@ -7795,50 +7808,50 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     let callee_outcome = callee_result?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                // `inline_call_r_v/dR`
-                // (`bhimpl_inline_call_r_v` `blackhole.py`)
-                // expects a void-return callee. A `Some` return here is
-                // a codewriter shape mismatch.
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-            // inline_call_* dst writeback — `value` is the callee's
-            // SubReturn OpRef.  The callee's matching concrete shadow
-            // was dropped at sub-walk exit; `concrete_of_opref` still
-            // sees through to `constants.get_value` for callees that
-            // return a constant (e.g. `LoadConst` tail), so route via
-            // the unified shadow channel.  Non-constant returns surface
-            // as the sentinel `GcRef(usize::MAX)` → Null fallback.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    // `inline_call_r_v/dR`
+                    // (`bhimpl_inline_call_r_v` `blackhole.py`)
+                    // expects a void-return callee. A `Some` return here is
+                    // a codewriter shape mismatch.
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
-                }
-                _ => unreachable!(
-                    "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
+                let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+                // inline_call_* dst writeback — `value` is the callee's
+                // SubReturn OpRef.  The callee's matching concrete shadow
+                // was dropped at sub-walk exit; `concrete_of_opref` still
+                // sees through to `constants.get_value` for callees that
+                // return a constant (e.g. `LoadConst` tail), so route via
+                // the unified shadow channel.  Non-constant returns surface
+                // as the sentinel `GcRef(usize::MAX)` → Null fallback.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dr_kind dst_bank must be 'r', 'i' or 'v' (\
                      codewriter does not emit dR>f shape today)"
-                ),
+                    ),
+                }
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                // `inline_call_r_v/dR` expects exactly this — callee
-                // exits via `void_return/`, no SubReturn writeback.
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    // `inline_call_r_v/dR` expects exactly this — callee
+                    // exits via `void_return/`, no SubReturn writeback.
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // Same shape contract as `_r_r`: a `_r_<X>` variant promises
+                // a non-void result for the dst's `>X` slot. A void return
+                // reaching here is a codewriter shape mismatch.
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            // Same shape contract as `_r_r`: a `_r_<X>` variant promises
-            // a non-void result for the dst's `>X` slot. A void return
-            // reaching here is a codewriter shape mismatch.
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -8004,36 +8017,38 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     )?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            // dst register byte sits after descr (2B) + I-list (int_width)
-            // + R-list (ref_width) bytes.
-            let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
-            // See dispatch_inline_call_dr_kind: route the SubReturn
-            // OpRef through the unified shadow channel so constant
-            // return values propagate.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                // dst register byte sits after descr (2B) + I-list (int_width)
+                // + R-list (ref_width) bytes.
+                let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+                // See dispatch_inline_call_dr_kind: route the SubReturn
+                // OpRef through the unified shadow channel so constant
+                // return values propagate.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"
+                    ),
                 }
-                _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r', 'i' or 'v'"),
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the
@@ -8170,49 +8185,48 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
     let callee_outcome = callee_result?;
 
     match callee_outcome {
-        DispatchOutcome::SubReturn {
-            result: Some(value),
-        } => {
-            if dst_bank == 'v' {
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-            let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
-            // See dispatch_inline_call_dr_kind: route the SubReturn
-            // OpRef through the unified shadow channel so constant
-            // return values propagate.
-            let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
-            match dst_bank {
-                'i' => {
-                    write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+        DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
+            Some(value) => {
+                if dst_bank == 'v' {
+                    return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
                 }
-                'r' => {
-                    write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
-                }
-                'f' => {
-                    let len = ctx.registers_f.len();
-                    let slot =
-                        ctx.registers_f
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
+                let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+                // See dispatch_inline_call_dr_kind: route the SubReturn
+                // OpRef through the unified shadow channel so constant
+                // return values propagate.
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
+                match dst_bank {
+                    'i' => {
+                        write_int_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'r' => {
+                        write_ref_reg(ctx, op.pc, dst, value, concrete_for_shadow)?;
+                    }
+                    'f' => {
+                        let len = ctx.registers_f.len();
+                        let slot = ctx.registers_f.get_mut(dst).ok_or(
+                            DispatchError::RegisterOutOfRange {
                                 pc: op.pc,
                                 reg: dst,
                                 len,
                                 bank: "f",
-                            })?;
-                    *slot = value;
+                            },
+                        )?;
+                        *slot = value;
+                    }
+                    _ => unreachable!(
+                        "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
+                    ),
                 }
-                _ => unreachable!(
-                    "dispatch_inline_call_dirf_kind dst_bank must be 'i', 'r', 'f' or 'v'"
-                ),
+                Ok((DispatchOutcome::Continue, op.next_pc))
             }
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        DispatchOutcome::SubReturn { result: None } => {
-            if dst_bank == 'v' {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            None => {
+                if dst_bank == 'v' {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
             }
-            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
-        }
+        },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 // The handler this routes to is part of the trace, so once the

@@ -2779,8 +2779,8 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
+        last_exc_value: Some(arg_value),
+        last_exc_value_concrete: ConcreteValue::Int(123),
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2801,6 +2801,15 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     let (outcome, end_pc) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
     assert_eq!(outcome, DispatchOutcome::Terminate);
     assert_eq!(end_pc, caller_code.len());
+    assert_eq!(
+        wc.last_exc_value, None,
+        "normal inline return must clear the caller's stale exception",
+    );
+    assert_eq!(
+        wc.last_exc_value_concrete,
+        ConcreteValue::Null,
+        "normal inline return must clear the caller's concrete exception shadow",
+    );
     drop(wc);
     // dst register r5 must equal the arg the caller passed (since
     // callee's `ref_return r0` returns its registers_r[0] which
@@ -9878,6 +9887,7 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let mut regs_r = distinct_const_refs(&mut tc, 4);
+    let stale_exc = regs_r[0];
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -9898,8 +9908,8 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
+        last_exc_value: Some(stale_exc),
+        last_exc_value_concrete: ConcreteValue::Int(123),
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9919,6 +9929,8 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     let (outcome, _) =
         walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
     assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert_eq!(wc.last_exc_value, None);
+    assert_eq!(wc.last_exc_value_concrete, ConcreteValue::Null);
 }
 
 #[test]
