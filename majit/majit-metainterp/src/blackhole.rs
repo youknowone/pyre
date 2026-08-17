@@ -697,8 +697,16 @@ impl BlackholeInterpreter {
         self.tmpreg_i
     }
 
-    pub fn get_tmpreg_r(&self) -> i64 {
-        self.tmpreg_r
+    /// blackhole.py:368-373 `get_tmpreg_r`.
+    ///
+    /// Reference scratch values are GC-visible while a blackhole is running,
+    /// so consuming one must clear the slot immediately.  Leaving the last
+    /// value here keeps an otherwise-dead object alive until the whole frame
+    /// leaves blackhole mode.
+    pub fn get_tmpreg_r(&mut self) -> i64 {
+        let result = self.tmpreg_r;
+        self.tmpreg_r = 0;
+        result
     }
 
     pub fn get_tmpreg_f(&self) -> i64 {
@@ -842,7 +850,7 @@ impl BlackholeInterpreter {
     ///
     /// Rare case: the blackhole interps all returned normally
     /// (in general we get a ContinueRunningNormally exception).
-    fn done_with_this_frame(&self) -> JitException {
+    fn done_with_this_frame(&mut self) -> JitException {
         match self.return_type {
             BhReturnType::Void => JitException::DoneWithThisFrameVoid,
             BhReturnType::Int => JitException::DoneWithThisFrameInt(self.get_tmpreg_i()),
@@ -3937,6 +3945,18 @@ mod tests {
             );
         }
 
+        /// `blackhole.py:get_tmpreg_r` consumes its GC-visible scratch slot.
+        /// Keeping the value there until frame release retains a dead result
+        /// throughout any remaining blackhole execution.
+        #[test]
+        fn get_tmpreg_r_clears_the_consumed_reference() {
+            let mut bh = BlackholeInterpreter::default();
+            bh.tmpreg_r = 0x7f00_0000_9abc;
+
+            assert_eq!(bh.get_tmpreg_r(), 0x7f00_0000_9abc);
+            assert_eq!(bh.tmpreg_r, 0);
+        }
+
         /// The caught exception is reachable from the root walker while the
         /// frame's handler runs.
         ///
@@ -6135,7 +6155,7 @@ fn bhimpl_int_pop(bh: &mut BlackholeInterpreter) -> i64 {
 
 /// blackhole.py:674-676 `bhimpl_ref_pop(self): return self.get_tmpreg_r()`.
 fn bhimpl_ref_pop(bh: &mut BlackholeInterpreter) -> i64 {
-    bh.tmpreg_r
+    bh.get_tmpreg_r()
 }
 
 /// blackhole.py:677-679 `bhimpl_float_pop(self): return self.get_tmpreg_f()`.

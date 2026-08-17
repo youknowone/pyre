@@ -11324,8 +11324,12 @@ fn handle<Sym: WalkSym>(
             // lock-step with its concrete shadow.  Operand layout `>r`:
             // 1B dst.
             let (val, concrete) = {
-                let sess = ctx.session.borrow();
-                (sess.tmpreg_r, sess.tmpreg_r_concrete)
+                let mut sess = ctx.session.borrow_mut();
+                let val = sess.tmpreg_r;
+                let concrete = sess.tmpreg_r_concrete;
+                sess.tmpreg_r = OpRef::NONE;
+                sess.tmpreg_r_concrete = ConcreteValue::Null;
+                (val, concrete)
             };
             let dst = code[op.pc + 1] as usize;
             write_ref_reg(ctx, op.pc, dst, val, concrete)?;
