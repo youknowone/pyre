@@ -1123,6 +1123,9 @@ impl<'c> Lowerer<'c> {
         let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
         let headerless = config.is_headerless_struct(&struct_path);
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
+        // The inlined base's own fields, so this struct's fields are numbered
+        // after them rather than starting again at slot 0.
+        let (prefix_fields, prefix_witness) = config.prefix_field_entries_tokens(&struct_path);
         // Lower the `state.<ref_scalar>` base to a ref binding (its
         // load_state_field_ref already declares the ref identity slot live for
         // resume), then read the field off that concrete ref.
@@ -1142,12 +1145,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
@@ -1180,12 +1184,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
@@ -1257,6 +1262,9 @@ impl<'c> Lowerer<'c> {
         let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
         let headerless = config.is_headerless_struct(&struct_path);
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
+        // The inlined base's own fields, so this struct's fields are numbered
+        // after them rather than starting again at slot 0.
+        let (prefix_fields, prefix_witness) = config.prefix_field_entries_tokens(&struct_path);
         let base_reg = binding.reg;
         let result_reg = self.alloc_reg();
         if is_ref_field {
@@ -1268,12 +1276,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
@@ -1305,12 +1314,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
@@ -1413,6 +1423,12 @@ impl<'c> Lowerer<'c> {
             .config
             .is_some_and(|config| config.is_headerless_struct(&struct_path));
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
+        // The inlined base's own fields, so this struct's fields are numbered
+        // after them rather than starting again at slot 0.
+        let (prefix_fields, prefix_witness) = self
+            .config
+            .map(|config| config.prefix_field_entries_tokens(&struct_path))
+            .unwrap_or_default();
         let buffer_reg = self.alloc_reg();
         self.emit_op(
             OpMeta::linear(
@@ -1433,12 +1449,13 @@ impl<'c> Lowerer<'c> {
                 // evaluated.
                 const _: fn(&#struct_path) -> #element_type =
                     |__s| unsafe { *__s.#member };
+                #prefix_witness
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
                     #gc_managed,
                     #headerless,
-                    &[(
+                    &[#(#prefix_fields,)* (
                         ::core::mem::offset_of!(#struct_path, #member),
                         true,
                         stringify!(#member),
@@ -1721,6 +1738,9 @@ impl<'c> Lowerer<'c> {
         let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
         let headerless = config.is_headerless_struct(&struct_path);
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
+        // The inlined base's own fields, so this struct's fields are numbered
+        // after them rather than starting again at slot 0.
+        let (prefix_fields, prefix_witness) = config.prefix_field_entries_tokens(&struct_path);
         let base = self.lower_state_field_read(&field.base)?;
         if !matches!(base.kind, BindingKind::Ref) {
             return None;
@@ -1741,12 +1761,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
@@ -1777,12 +1798,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),
@@ -1849,6 +1871,9 @@ impl<'c> Lowerer<'c> {
         let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
         let headerless = config.is_headerless_struct(&struct_path);
         let tid = struct_type_id_tokens(&struct_path, gc_managed);
+        // The inlined base's own fields, so this struct's fields are numbered
+        // after them rather than starting again at slot 0.
+        let (prefix_fields, prefix_witness) = config.prefix_field_entries_tokens(&struct_path);
         let base_reg = binding.reg;
         let rhs = self.lower_value_expr(&assign.right)?;
         if is_ref_field {
@@ -1864,12 +1889,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
                             stringify!(#member),
@@ -1899,12 +1925,13 @@ impl<'c> Lowerer<'c> {
                 ),
                 quote! {
                     #__fcheck
+                    #prefix_witness
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
                         #gc_managed,
                         #headerless,
-                        &[(
+                        &[#(#prefix_fields,)* (
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
                             stringify!(#member),

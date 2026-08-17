@@ -1389,6 +1389,118 @@ impl LowererConfig {
         }
     }
 
+    /// The layout entries an inlined base contributes to the struct embedding
+    /// it, plus the witness that the base really is the leading field.
+    ///
+    /// `heaptracker.py:68-69` recurses into a nested struct when building a
+    /// struct's positional field list, so an outer struct's list begins with
+    /// the base's own fields and its own fields are numbered after them. That
+    /// numbering is load-bearing twice over: `get_fielddescr_index_in`
+    /// (`heaptracker.py:97`) assigns `index_in_parent` from it, and the
+    /// per-object field cache slots by that index. Without the base's entries
+    /// an outer struct's first own field takes slot 0 — the slot the base's
+    /// first field already occupies for the same object.
+    ///
+    /// Returns `(entries, witness)`. `entries` are `(offset, is_ref, name,
+    /// size, signed)` tuples in the shape the layout registration takes;
+    /// offsets are relative to the OUTER struct. Empty when the struct embeds
+    /// no declared base, which is the case for every struct unless a caller
+    /// declares one.
+    pub(super) fn prefix_field_entries_tokens(
+        &self,
+        outer: &syn::Path,
+    ) -> (Vec<TokenStream>, TokenStream) {
+        let mut entries = Vec::new();
+        let mut witnesses = TokenStream::new();
+        let mut current = outer.clone();
+        let mut base_offset = quote! { 0usize };
+        while let Some((base_field, base)) = self.inlined_prefix.get(&canonical_path_segments(&current))
+        {
+            let base_field = syn::Ident::new(base_field, proc_macro2::Span::call_site());
+            // `lltype.py:296-305` admits an inlined substructure only at
+            // `_names[0]`, and the offsets below assume it: a redirected access
+            // keeps the outer pointer in its register and offsets by the
+            // field's place within the base, which names the right word only
+            // when the base starts at zero.
+            let message = format!(
+                "`{}` is declared as the inlined leading substructure of `{}`, so it must be \
+                 that struct's first field at offset 0.",
+                path_display(base),
+                path_display(&current),
+            );
+            witnesses.extend(quote! {
+                const _: () = assert!(
+                    ::core::mem::offset_of!(#current, #base_field) == 0,
+                    #message,
+                );
+            });
+            let outer_to_base = quote! {
+                (#base_offset + ::core::mem::offset_of!(#current, #base_field))
+            };
+            for (field, is_ref, size, signed) in self.declared_fields_of(base) {
+                entries.push(quote! {
+                    (
+                        #outer_to_base + ::core::mem::offset_of!(#base, #field),
+                        #is_ref,
+                        stringify!(#field),
+                        #size,
+                        #signed,
+                    )
+                });
+            }
+            base_offset = outer_to_base;
+            current = base.clone();
+        }
+        (entries, witnesses)
+    }
+
+    /// The fields `struct_path` declares, as `(field, is_ref, size, signed)`.
+    ///
+    /// Sorted by field name. The declarations live in hash maps, whose
+    /// iteration order varies per process, and an unsorted walk would emit a
+    /// different token order on every compile of the same source.
+    fn declared_fields_of(
+        &self,
+        struct_path: &syn::Path,
+    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream)> {
+        let Some(last) = struct_path.segments.last() else {
+            return Vec::new();
+        };
+        let prefix = format!("{}::", last.ident);
+        let mut fields: Vec<_> = self
+            .ref_fields
+            .keys()
+            .map(|key| (key, true))
+            .chain(self.int_fields.keys().map(|key| (key, false)))
+            .filter_map(|(key, is_ref)| {
+                key.strip_prefix(&prefix).map(|field| (field, is_ref))
+            })
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+            .into_iter()
+            .map(|(field, is_ref)| {
+                let key = format!("{prefix}{field}");
+                // The same widths the access sites register: a declared integer
+                // reports its own type's width, anything else the eight-byte
+                // scalar an undeclared field defaults to.
+                let (size, signed) = match self.int_fields.get(&key) {
+                    Some((ty, signed)) => {
+                        (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
+                    }
+                    None => (quote! { ::core::mem::size_of::<i64>() }, quote! { true }),
+                };
+                (
+                    syn::Ident::new(field, proc_macro2::Span::call_site()),
+                    is_ref,
+                    size,
+                    signed,
+                )
+            })
+            .collect()
+    }
+
     /// Whether `struct_path` itself declares `field` in any of the three field
     /// vocabularies. A field in none of them is undeclared everywhere, so the
     /// walk stops at the struct it was spelled with and the default applies.
@@ -1421,6 +1533,11 @@ fn inlined_prefix_map(
             )
         })
         .collect()
+}
+
+/// A path as written, for a diagnostic that has to name it.
+fn path_display(path: &Path) -> String {
+    canonical_path_segments(path).join("::")
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {
