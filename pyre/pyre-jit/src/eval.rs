@@ -757,6 +757,22 @@ unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
     };
 }
 
+unsafe fn lzma_compressor_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_lzma::w_lzmacompressor_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
+unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_lzma::w_lzmadecompressor_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -3736,10 +3752,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         );
     }
     // `interp_bz2.py` likewise keeps each libbz2 stream and its lock on the
-    // W_Root owner.  Neither type is subclassable, so they carry no mapdict
-    // prefix and no inline GC edge beyond the header's `w_class`; the sweep
-    // destructor releases the native stream.  Unconditional, and placed with
-    // the zlib owners so their ids agree on wasm/native.
+    // W_Root owner, and `_lzma`'s two stream objects own their liblzma coder
+    // the same way.  None of the four is subclassable, so they carry no
+    // mapdict prefix and no inline GC edge beyond the header's `w_class`; the
+    // sweep destructor releases the native stream.  Unconditional, and placed
+    // with the zlib owners so their ids agree on wasm/native.
     for (descr, destructor) in [
         (
             <pyre_interpreter::module::_bz2::W_BZ2Compressor
@@ -3750,6 +3767,16 @@ fn build_gc() -> Box<MiniMarkGC> {
             <pyre_interpreter::module::_bz2::W_BZ2Decompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
+        ),
+        (
+            <pyre_interpreter::module::_lzma::W_LZMACompressor
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            lzma_compressor_destructor as majit_gc::trace::DestructorFn,
+        ),
+        (
+            <pyre_interpreter::module::_lzma::W_LZMADecompressor
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            lzma_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
     ] {
         let tid = gc.register_type(

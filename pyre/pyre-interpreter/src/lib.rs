@@ -1163,39 +1163,43 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // lock.  Unconditional, so they stay ahead of the target-gated types.
         subclass_range_alias(172, typed::<crate::module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<crate::module::_bz2::W_BZ2Decompressor>()),
+        // `_lzma`'s two stream objects own their liblzma coder, unconditional
+        // for the same reason.
+        subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
+        subclass_range_alias(175, typed::<crate::module::_lzma::W_LZMADecompressor>()),
         // `posix.DirEntry` follows the unconditional native owners.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(174, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(176, typed::<crate::module::posix::W_DirEntry>()),
         // rustls-backed `_ssl` native payloads.  They are appended after the
         // last pre-existing native class in the same order `build_gc`
         // registers them, so no established type id moves.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(175, typed::<crate::module::_ssl::W_SSLContext>()),
+        subclass_range_alias(177, typed::<crate::module::_ssl::W_SSLContext>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(176, typed::<crate::module::_ssl::W_MemoryBIO>()),
+        subclass_range_alias(178, typed::<crate::module::_ssl::W_MemoryBIO>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(177, typed::<crate::module::_ssl::W_SSLSession>()),
+        subclass_range_alias(179, typed::<crate::module::_ssl::W_SSLSession>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(178, typed::<crate::module::_ssl::W_SSLSocket>()),
+        subclass_range_alias(180, typed::<crate::module::_ssl::W_SSLSocket>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(179, typed::<crate::module::_ssl::W_Certificate>()),
+        subclass_range_alias(181, typed::<crate::module::_ssl::W_Certificate>()),
         // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
         // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(180, typed::<crate::module::mmap::W_MMap>()),
+        subclass_range_alias(182, typed::<crate::module::mmap::W_MMap>()),
         // Windows asyncio's Overlapped owner follows mmap at the native tail.
         // It is a non-subclassable builtin in Python, but still participates
         // in the rclass hierarchy because its managed header and retained
         // buffer/result fields are traced by the ordinary object marker.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(181, typed::<crate::module::_overlapped::W_Overlapped>()),
+        subclass_range_alias(183, typed::<crate::module::_overlapped::W_Overlapped>()),
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(
-            182,
+            184,
             typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
         ),
     ]

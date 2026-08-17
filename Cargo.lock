@@ -2835,6 +2835,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "x509-parser",
+ "xz-core",
  "zlib-rs",
 ]
 
@@ -5023,6 +5024,17 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "xz-core"
+version = "0.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef4d12cf9c122b2523cce22d6ab3083f4eb56d1221e5d30ddcc70fbaac553589"
+dependencies = [
+ "libc",
+ "memchr",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

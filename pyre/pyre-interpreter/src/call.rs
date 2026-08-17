@@ -3065,11 +3065,12 @@ fn call_with_kwargs_in_ctx_impl(
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
-        // The `function`, `memoryview`, and deque iterator types are
-        // non-acceptable-as-base too, but their `tp_new` functions accept
-        // keywords: FunctionType has `kwdefaults=...`, CPython 3.14 exposes
-        // `memoryview(object=...)`, and the deque iterator constructors accept
-        // (and ignore) `index=...`.  Route them through `__new__`.
+        // The `function`, `memoryview`, deque iterator, and `_lzma` stream
+        // types are non-acceptable-as-base too, but their `tp_new` functions
+        // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
+        // exposes `memoryview(object=...)`, the deque iterator constructors
+        // accept (and ignore) `index=...`, and both `_lzma` constructors take
+        // `format=`/`preset=`/`filters=`.  Route them through `__new__`.
         let accepts_keywords_despite_nonbase =
             std::ptr::eq(
                 current_type(),
@@ -3086,7 +3087,9 @@ fn call_with_kwargs_in_ctx_impl(
             ) || std::ptr::eq(
                 current_type(),
                 crate::module::_contextvars::context_var_type(),
-            ) || crate::_structseq::is_structseq_type(current_type());
+            ) || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
+                || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
+                || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
             && !unsafe { pyre_object::w_type_get_acceptable_as_base_class(current_type()) }

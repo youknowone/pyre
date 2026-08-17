@@ -170,6 +170,10 @@ zlib-rs = { version = "0.6.5", default-features = false, features = ["rust-alloc
 # libbz2-rs-sys, the pure-Rust libbz2 port from the same source as zlib-rs,
 # whose output is byte-identical to the reference C libbz2.
 bzip2 = "0.6.1"
+# liblzma backend (pyre-native only): xz-core is the pure-Rust port of
+# liblzma, with the same entry points `Modules/_lzmamodule.c` calls, so
+# `_lzma` needs no C toolchain and builds for wasm32 like the others.
+xz-core = "0.1.0-rc.0"
 # binascii transforms (pure-Rust logic).
 base64 = "0.22"
 crc32fast = "1.4"

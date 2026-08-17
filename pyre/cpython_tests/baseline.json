@@ -707,7 +707,7 @@
       "dynasm": "PASS"
     },
     "test.test_lzma": {
-      "dynasm": "CRASH"
+      "dynasm": "FAIL"
     },
     "test.test_mailbox": {
       "dynasm": "IMPORTERROR"
@@ -1433,8 +1433,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_zoneinfo": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_zstd": {
       "dynasm": "IMPORTERROR"

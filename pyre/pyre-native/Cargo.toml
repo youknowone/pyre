@@ -17,6 +17,7 @@ scrypt = { workspace = true }
 flate2 = { workspace = true, features = ["zlib-rs"] }
 zlib-rs = { workspace = true }
 bzip2 = { workspace = true }
+xz-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }

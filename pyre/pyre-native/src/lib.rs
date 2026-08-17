@@ -6,6 +6,7 @@
 
 pub mod bz2;
 pub mod hash;
+pub mod lzma;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;
 pub mod zlib;
