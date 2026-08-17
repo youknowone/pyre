@@ -16911,6 +16911,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         ],
         "open",
     )?;
+    // Bind every argument before unwrap-style conversions start.  A conversion
+    // can call Python and move objects, so the complete live argument set must
+    // already be on the shadow stack before the first such callback.
+    let argument_roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(file);
+    let mut file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_mode =
         bind_pos_or_kw(positional, kwargs, 1, "mode", "open", 2)?.unwrap_or_else(|| w_str_new("r"));
     if unsafe { !pyre_object::is_str(w_mode) } {
@@ -16922,10 +16928,6 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let mode = crate::baseobjspace::str_utf8_w(w_mode)?.to_string();
     let w_buffering = bind_pos_or_kw(positional, kwargs, 2, "buffering", "open", 3)?
         .unwrap_or_else(|| w_int_new(-1));
-    // A buffering value outside the machine-int range is an OverflowError, not a
-    // silent fallback to default buffering, so index through `space_index_w`
-    // rather than the negative-preserving sentinel converter.
-    let mut buffering = crate::builtins::space_index_w(w_buffering)?;
     let w_encoding =
         bind_pos_or_kw(positional, kwargs, 3, "encoding", "open", 4)?.unwrap_or_else(w_none);
     let w_errors =
@@ -16937,17 +16939,91 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let w_opener =
         bind_pos_or_kw(positional, kwargs, 7, "opener", "open", 8)?.unwrap_or_else(w_none);
 
-    for (name, value) in [
-        ("encoding", w_encoding),
-        ("errors", w_errors),
-        ("newline", w_newline),
+    for value in [
+        w_buffering,
+        w_encoding,
+        w_errors,
+        w_newline,
+        w_closefd,
+        w_opener,
     ] {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let opener_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let closefd_slot = opener_slot - 1;
+    let newline_slot = opener_slot - 2;
+    let errors_slot = opener_slot - 3;
+    let encoding_slot = opener_slot - 4;
+    let buffering_slot = opener_slot - 5;
+
+    // A buffering value outside the machine-int range is an OverflowError, not a
+    // silent fallback to default buffering, so index through `space_index_w`
+    // rather than the negative-preserving sentinel converter.
+    let mut buffering =
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(buffering_slot))?;
+
+    for (name, slot) in [
+        ("encoding", encoding_slot),
+        ("errors", errors_slot),
+        ("newline", newline_slot),
+    ] {
+        let value = pyre_object::gc_roots::shadow_stack_get(slot);
         if unsafe { !pyre_object::is_none(value) && !pyre_object::is_str(value) } {
             return Err(crate::PyError::type_error(format!(
                 "open() argument '{name}' must be str or None, not {}",
                 crate::type_methods::arg_type_name(value)
             )));
         }
+    }
+
+    // Argument Clinic and PyPy's unwrap_spec both convert closefd before path
+    // resolution.  Publish the bool result as well so FileIO cannot invoke a
+    // user __bool__ a second time after __fspath__.
+    let closefd =
+        crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(closefd_slot))?;
+    pyre_object::gc_roots::pin_root(w_bool_from(closefd));
+    let converted_closefd_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+    // PyPy `_open` resolves a PathLike after unwrap_spec has converted the
+    // remaining arguments, but before parsing the mode or warning about
+    // binary line buffering. Hand that exact str/bytes result to `W_FileIO`.
+    // `_open` never probes `__index__` here: `pypy/module/_io/interp_io.py:36`
+    // routes every non-str/bytes/int argument straight to `fspath`, matching
+    // the pinned CPython fallback (`lib-python/3/_pyio.py:194`, `if not
+    // isinstance(file, int): file = os.fspath(file)`). An object that defines
+    // both `__index__` and `__fspath__` must resolve through `__fspath__`
+    // only, same as main before this file did any PathLike resolution here.
+    let file_now = pyre_object::gc_roots::shadow_stack_get(file_slot);
+    if unsafe {
+        !pyre_object::is_str(file_now)
+            && !pyre_object::bytesobject::is_bytes(file_now)
+            && !pyre_object::is_int(file_now)
+    } {
+        let Some(fspath_fn) = crate::typedef::r#type(file_now).and_then(|pt| unsafe {
+            crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
+        }) else {
+            return Err(crate::PyError::type_error(format!(
+                "expected str, bytes or os.PathLike object, not {}",
+                crate::gateway::short_type_name(file_now)
+            )));
+        };
+        pyre_object::gc_roots::pin_root(fspath_fn);
+        let fspath_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let resolved = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(fspath_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(file_slot)],
+        )?;
+        if unsafe {
+            !pyre_object::is_str(resolved) && !pyre_object::bytesobject::is_bytes(resolved)
+        } {
+            return Err(crate::PyError::type_error(format!(
+                "expected {}.__fspath__() to return str or bytes, not {}",
+                crate::gateway::short_type_name(pyre_object::gc_roots::shadow_stack_get(file_slot)),
+                crate::gateway::short_type_name(resolved)
+            )));
+        }
+        pyre_object::gc_roots::pin_root(resolved);
+        file_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     }
 
     let mut reading = false;
@@ -16995,20 +17071,33 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "must have exactly one of create/read/write/append mode",
         ));
     }
-    if binary && unsafe { !pyre_object::is_none(w_encoding) } {
+    if binary
+        && unsafe { !pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(encoding_slot)) }
+    {
         return Err(crate::PyError::value_error(
             "binary mode doesn't take an encoding argument",
         ));
     }
-    if binary && unsafe { !pyre_object::is_none(w_errors) } {
+    if binary
+        && unsafe { !pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(errors_slot)) }
+    {
         return Err(crate::PyError::value_error(
             "binary mode doesn't take an errors argument",
         ));
     }
-    if binary && unsafe { !pyre_object::is_none(w_newline) } {
+    if binary
+        && unsafe { !pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(newline_slot)) }
+    {
         return Err(crate::PyError::value_error(
             "binary mode doesn't take a newline argument",
         ));
+    }
+    if binary && buffering == 1 {
+        crate::warn::warn_category(
+            "line buffering (buffering=1) isn't supported in binary mode, the default buffer size will be used",
+            "RuntimeWarning",
+            2,
+        )?;
     }
 
     let primary = if reading {
@@ -17023,7 +17112,12 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let raw_mode = format!("{primary}{}", if updating { "+" } else { "" });
     let raw = crate::call::call_function_impl_result(
         crate::module::_io::fileio_type(),
-        &[file, w_str_new(&raw_mode), w_closefd, w_opener],
+        &[
+            pyre_object::gc_roots::shadow_stack_get(file_slot),
+            w_str_new(&raw_mode),
+            pyre_object::gc_roots::shadow_stack_get(converted_closefd_slot),
+            pyre_object::gc_roots::shadow_stack_get(opener_slot),
+        ],
     )?;
     let roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(raw);
@@ -17031,7 +17125,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
     // `_open` closes the outermost constructed layer when a later layer's
     // constructor raises, so a failed `open()` never leaks the descriptor.
-    let mut close_target = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+    let mut close_target_slot = raw_slot;
     let outcome = (|| -> Result<PyObjectRef, crate::PyError> {
         let line_buffering = if buffering == 1 {
             true
@@ -17086,21 +17180,26 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         )?;
         pyre_object::gc_roots::pin_root(buffer);
         let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        close_target = pyre_object::gc_roots::shadow_stack_get(buffer_slot);
+        close_target_slot = buffer_slot;
         if binary {
             return Ok(pyre_object::gc_roots::shadow_stack_get(buffer_slot));
         }
 
         // This native open call does not add a Python frame between the user
         // and `_io.text_encoding`; one frame of warning stack depth is enough.
-        let resolved_encoding = crate::module::_io::text_encoding(w_encoding, 1)?;
+        let resolved_encoding = crate::module::_io::text_encoding(
+            pyre_object::gc_roots::shadow_stack_get(encoding_slot),
+            1,
+        )?;
+        pyre_object::gc_roots::pin_root(resolved_encoding);
+        let resolved_encoding_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let wrapper = crate::call::call_function_impl_result(
             text_io_wrapper_type(),
             &[
                 pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-                resolved_encoding,
-                w_errors,
-                w_newline,
+                pyre_object::gc_roots::shadow_stack_get(resolved_encoding_slot),
+                pyre_object::gc_roots::shadow_stack_get(errors_slot),
+                pyre_object::gc_roots::shadow_stack_get(newline_slot),
                 w_bool_from(line_buffering),
             ],
         )?;
@@ -17112,13 +17211,20 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         Err(error) => {
             // The original error takes precedence; a `close` failure here is
             // discarded (its call-error slot is cleared so it cannot leak).
-            if crate::baseobjspace::call_method(close_target, "close", &[]).is_null() {
+            if crate::baseobjspace::call_method(
+                pyre_object::gc_roots::shadow_stack_get(close_target_slot),
+                "close",
+                &[],
+            )
+            .is_null()
+            {
                 let _ = crate::call::take_call_error();
             }
             Err(error)
         }
     };
     drop(roots);
+    drop(argument_roots);
     result
 }
 
