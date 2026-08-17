@@ -17532,7 +17532,10 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
     let close = match getattr_str(w_yf, "close") {
         Ok(method) => method,
         Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(w_none()),
-        Err(err) => return Err(err),
+        Err(mut err) => {
+            err.write_unraisable(w_none(), Wtf8::new("generator/coroutine.close()"), w_none());
+            return Ok(w_none());
+        }
     };
     crate::call::call_function_impl_result(close, &[])
 }
