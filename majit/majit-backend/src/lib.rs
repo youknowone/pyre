@@ -2912,18 +2912,9 @@ pub trait Backend: Send {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
-        let addr = (struct_ptr as usize).wrapping_add(offset);
         // SAFETY: `struct_ptr` is a GC-managed struct pointer; `offset`/`size`
-        // come from the field descriptor. `write_unaligned` matches the reader.
-        unsafe {
-            match size {
-                1 => (addr as *mut u8).write_unaligned(newvalue as u8),
-                2 => (addr as *mut u16).write_unaligned(newvalue as u16),
-                4 => (addr as *mut u32).write_unaligned(newvalue as u32),
-                8 => (addr as *mut i64).write_unaligned(newvalue),
-                other => panic!("bh_setfield_gc_i: unsupported field size {other}"),
-            }
-        }
+        // come from the field descriptor.
+        unsafe { crate::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, newvalue) }
     }
     /// model.py:223 / llmodel.py:723 bh_setfield_gc_r → pointer-width store at
     /// the field offset plus the write barrier.
@@ -2935,10 +2926,11 @@ pub trait Backend: Send {
     ) {
         let offset = fielddescr.as_offset();
         majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
-        // SAFETY: see `bh_setfield_gc_i`. `usize` is the pointer-width store.
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = newvalue.0 };
+        // SAFETY: see `bh_setfield_gc_i`.
+        unsafe { crate::llmodel::write_ref_at_mem(struct_ptr as usize, offset, newvalue.0) };
         // The store target may be an old-gen object holding a young ref; the
         // active GC's barrier remembers it. No-op where no barrier is installed.
+        // This is the barrier `write_ref_at_mem` documents its callers as owing.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
     }
     /// model.py:224 / llmodel.py:728 bh_setfield_gc_f → `FLOATSTORAGE`-width
@@ -2950,9 +2942,8 @@ pub trait Backend: Send {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
-        let addr = (struct_ptr as usize).wrapping_add(offset);
         // SAFETY: see `bh_setfield_gc_i`.
-        unsafe { (addr as *mut f64).write_unaligned(newvalue) };
+        unsafe { crate::llmodel::write_float_at_mem(struct_ptr as usize, offset, newvalue) };
     }
 
     // ── model.py:209-215, 247-253 array operations ──

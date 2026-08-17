@@ -1,12 +1,18 @@
-//! AbstractLLCPU jitframe accessors —
+//! AbstractLLCPU accessors —
 //! `rpython/jit/backend/llsupport/llmodel.py` parity.
 //!
-//! Upstream these live as methods on `AbstractLLCPU`, invoked as
-//! `cpu.get_int_value(deadframe, index)`. In majit there is no
-//! `AbstractLLCPU`-equivalent trait with `self`-carried state that a
+//! Two families live here. The jitframe accessors read and write a
+//! deadframe's slots; the `*_at_mem` accessors read and write a field
+//! of a heap struct at a byte offset.
+//!
+//! Upstream both live as methods on `AbstractLLCPU`, invoked as
+//! `cpu.get_int_value(deadframe, index)` /
+//! `cpu.write_int_at_mem(struct, ofs, size, value)`. In majit there is
+//! no `AbstractLLCPU`-equivalent trait with `self`-carried state that a
 //! backend would override — every backend shares the same
-//! JITFRAME-backed deadframe layout — so the accessors are free
-//! functions keyed on a raw `*const JitFrame`.
+//! JITFRAME-backed deadframe layout and the same raw-memory field
+//! layout — so the accessors are free functions keyed on a raw
+//! `*const JitFrame` or on a base address.
 //!
 //! The `AbstractCPU` base class (rpython/jit/backend/model.py:95-133)
 //! declares the abstract contract for these accessors; all entries
@@ -105,6 +111,78 @@ pub unsafe fn get_float_value_direct(ptr: *const JitFrame, slot: usize) -> u64 {
         let base = (ptr as *const u8).add(FIRST_ITEM_OFFSET) as *const u64;
         *base.add(slot)
     }
+}
+
+/// llmodel.py:481-488 — `write_int_at_mem(gcref, ofs, size, newvalue)`.
+///
+/// Stores the low `size` bytes of `newvalue` at `base + ofs`.
+///
+/// The width is the field descriptor's, not the value's: an integer
+/// field narrower than a word is a real field, and a store that ignores
+/// `size` writes over whatever follows it in the struct.
+///
+/// Upstream walks `unroll_basic_sizes` (symbolic.py:73-77 — word, char,
+/// short, int) and falls through to
+/// `raise NotImplementedError("size = %d" % size)` when nothing
+/// matches. A size not in that set means the descriptor disagrees with
+/// the struct it describes, so this panics rather than widening the
+/// store; silently falling back to a word would corrupt the neighbour.
+///
+/// Float fields are deliberately absent from that table
+/// (symbolic.py:78 "does not contain Float ^^^ which must be
+/// special-cased") and go through [`write_float_at_mem`].
+///
+/// # Safety
+/// `base + ofs` must be a writable field of at least `size` bytes.
+pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i64) {
+    let addr = base.wrapping_add(ofs);
+    // Truncation is width-identical for the signed and unsigned member of
+    // each `unroll_basic_sizes` pair, so the store needs the size but not
+    // the sign — which is why upstream discards it (`_` at llmodel.py:482)
+    // while the matching read keeps it.
+    unsafe {
+        match size {
+            1 => (addr as *mut u8).write_unaligned(newvalue as u8),
+            2 => (addr as *mut u16).write_unaligned(newvalue as u16),
+            4 => (addr as *mut u32).write_unaligned(newvalue as u32),
+            8 => (addr as *mut i64).write_unaligned(newvalue),
+            _ => panic!(
+                "write_int_at_mem: unsupported size {size} \
+                 (llmodel.py:488 NotImplementedError)"
+            ),
+        }
+    }
+}
+
+/// llmodel.py:495-497 — `write_ref_at_mem(gcref, ofs, newvalue)`.
+///
+/// Pointer-width store. Upstream takes no `size` here: pointer fields
+/// have one width, which is why `bh_setfield_gc_r` (llmodel.py:723-725)
+/// unpacks only the offset while `bh_setfield_gc_i` unpacks the size
+/// too.
+///
+/// Upstream's trailing comment reads "the write barrier is implied
+/// above" — implied by the `llop.raw_store` that the framework GC
+/// transformer rewrites. Nothing rewrites this store, so a caller whose
+/// container may be old-generation while `newvalue` is young owes the
+/// barrier itself.
+///
+/// # Safety
+/// `base + ofs` must be a writable pointer-width field.
+pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize) {
+    unsafe { (base.wrapping_add(ofs) as *mut usize).write_unaligned(newvalue) }
+}
+
+/// llmodel.py:504-506 — `write_float_at_mem(gcref, ofs, newvalue)`.
+///
+/// `FLOATSTORAGE`-width store. Like the ref store this takes no `size`:
+/// floats are excluded from `unroll_basic_sizes` (symbolic.py:78) and
+/// `bh_setfield_gc_f` (llmodel.py:730-734) unpacks only the offset.
+///
+/// # Safety
+/// `base + ofs` must be a writable float-width field.
+pub unsafe fn write_float_at_mem(base: usize, ofs: usize, newvalue: f64) {
+    unsafe { (base.wrapping_add(ofs) as *mut f64).write_unaligned(newvalue) }
 }
 
 /// llmodel.py:248-251 — get_savedata_ref.
