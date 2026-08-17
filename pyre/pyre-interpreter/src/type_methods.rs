@@ -683,7 +683,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                     root_base + 2,
                 )) {
                     Ok(item) => item,
-                    Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(err) if err.matches_stop_iteration() => break,
                     Err(err) => return Err(err),
                 };
                 let _item_roots = pyre_object::gc_roots::push_roots();

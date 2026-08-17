@@ -1075,7 +1075,7 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
         let w_value =
             match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
                 Ok(value) => value,
-                Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                Err(err) if err.matches_stop_iteration() => break,
                 Err(err) => return Err(err),
             };
         // `_get_double` can invoke user code.  Keep the yielded object rooted

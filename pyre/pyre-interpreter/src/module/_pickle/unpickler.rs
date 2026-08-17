@@ -737,7 +737,7 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
     }
     let w_buf = match crate::baseobjspace::next(w_buffers) {
         Ok(b) => b,
-        Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+        Err(e) if e.matches_stop_iteration() => {
             return Err(unpickling_error("not enough out-of-band buffers"));
         }
         Err(e) => return Err(e),

@@ -574,6 +574,37 @@ impl PyError {
         }
     }
 
+    /// `pypy/interpreter/pyopcode.py:1303-1316` tests iterator exhaustion with
+    /// a Python-level MRO match. A flat `PyErrorKind` tag cannot express
+    /// multiple inheritance, so only exact-tagged errors use the free fast
+    /// path. An internally built error has no cached exception object and can
+    /// only name a builtin, making its tag authoritative without materialising
+    /// an object. This takes `&self` so callers can use it in match guards.
+    /// The slow-path class cache is populated only after registry lookup
+    /// succeeds, so a call before exception-class initialisation returns false
+    /// without caching absence forever.
+    pub fn matches_stop_iteration(&self) -> bool {
+        if self.kind == PyErrorKind::StopIteration {
+            return true;
+        }
+        if self.exc_object.is_null() {
+            return false;
+        }
+
+        static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+        let stop_iteration = match STOP_ITERATION_CLASS.get() {
+            Some(&class) => class as PyObjectRef,
+            None => {
+                let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
+                    return false;
+                };
+                let _ = STOP_ITERATION_CLASS.set(class as usize);
+                class
+            }
+        };
+        crate::eval::check_exc_match_against(self.exc_object, stop_iteration)
+    }
+
     pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::TypeError, msg)
     }

@@ -1417,7 +1417,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
                 pyre_object::gc_roots::pin_root(val);
                 pulled += 1;
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
             Err(e) => return Err(e),
         }
@@ -1763,7 +1763,7 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
 /// Exhaustion is signalled the same way as the range fast path: a null
 /// return that the trailing for-iter GuardNonnull catches, side-exiting to
 /// the interpreter which re-runs FOR_ITER and ends the loop (eval.rs
-/// `iter_next` maps StopIteration to exhausted). A *real* exception is
+/// `iter_next` MRO-matches StopIteration to exhausted). A *real* exception is
 /// published into BOTH the backend exception cells (so the compiled trace /
 /// blackhole GuardNoException side-exits) AND `BH_LAST_EXC_VALUE` (so the
 /// full-body walk's `execute_residual_call` returns Err and records the
@@ -1776,7 +1776,7 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
         Ok(value) => value as i64,
         // StopIteration is not a frame-level exception for FOR_ITER; return
         // null so the GuardNonnull (not GuardNoException) fires.
-        Err(err) if err.kind == PyErrorKind::StopIteration => 0,
+        Err(err) if err.matches_stop_iteration() => 0,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
             if exc_obj != PY_NULL {

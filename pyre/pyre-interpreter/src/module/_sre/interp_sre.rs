@@ -1810,7 +1810,7 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let _item_roots = pyre_object::gc_roots::push_roots();
         let w_key = match crate::baseobjspace::next(w_iterator.get()) {
             Ok(k) => RootedObject::pin(k),
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         };
         let w_value = RootedObject::pin(crate::baseobjspace::getitem(

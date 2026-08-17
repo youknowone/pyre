@@ -3046,7 +3046,7 @@ impl IterOpcodeHandler for PyFrame {
         // iter_next), not by branching the interpreter opcode implementation.
         match crate::baseobjspace::next(iter) {
             Ok(result) => Ok(Some(result)),
-            Err(e) if e.kind == PyErrorKind::StopIteration => Ok(None),
+            Err(e) if e.matches_stop_iteration() => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -3443,7 +3443,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
         let w_exc = self.pop_value()?;
         let mut err = unsafe { PyError::from_exc_object(w_exc) };
-        if err.kind != PyErrorKind::StopIteration {
+        if !err.matches_stop_iteration() {
             // CPython 3.14 `CLEANUP_THROW` installs the existing exception and
             // jumps straight to `exception_unwind`; unlike the ordinary
             // opcode-error path it does not prepend another traceback entry.
@@ -4520,7 +4520,7 @@ impl OpcodeStepExecutor for PyFrame {
                 self.push(result);
                 Ok(())
             }
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+            Err(e) if e.matches_stop_iteration() => {
                 if std::ptr::eq(self.w_yielding_from, iter) {
                     self.w_yielding_from = pyre_object::PY_NULL;
                 }
@@ -5219,6 +5219,21 @@ mod tests {
         assert!(check_exc_match_against(exc, value_error));
         assert!(!check_exc_match_against(exc, type_error));
         assert!(!check_exc_match_against(plain, value_error));
+    }
+
+    #[test]
+    fn test_pyerror_matches_stop_iteration_uses_exception_mro() {
+        let (result, frame) =
+            run_exec_frame("class VS(ValueError, StopIteration):\n    pass\nexc = VS('done')");
+        result.expect("exception subclass setup failed");
+        let exc = unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), "exc") }
+            .expect("missing exc");
+        let err = unsafe { PyError::from_exc_object(exc) };
+
+        assert_eq!(err.kind, PyErrorKind::ValueError);
+        assert!(err.matches_stop_iteration());
+        assert!(PyError::stop_iteration().matches_stop_iteration());
+        assert!(!PyError::value_error("not exhausted").matches_stop_iteration());
     }
 
     // pyre materialises the rich-compare and `__iter__` rows in

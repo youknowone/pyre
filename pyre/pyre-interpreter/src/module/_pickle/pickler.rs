@@ -2206,7 +2206,7 @@ fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
             pyre_object::gc_roots::pin_root(item);
             Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1))
         }
-        Err(e) if e.kind == crate::PyErrorKind::StopIteration => Ok(None),
+        Err(e) if e.matches_stop_iteration() => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -2225,7 +2225,7 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
         let item =
             match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
                 Ok(item) => item,
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) if e.matches_stop_iteration() => break,
                 Err(e) => return Err(e),
             };
         {
@@ -2350,7 +2350,7 @@ fn batch_appends(
 fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
     let item = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
         Ok(item) => item,
-        Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(None),
+        Err(e) if e.matches_stop_iteration() => return Ok(None),
         Err(e) => return Err(e),
     };
     pyre_object::gc_roots::pin_root(item);

@@ -2488,7 +2488,7 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     count += 1;
                 }
             }
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -5218,7 +5218,7 @@ fn min_max_sequence(
         let it_now = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
         let item = match crate::baseobjspace::next(it_now) {
             Ok(item) => item,
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         };
         pyre_object::gc_roots::shadow_stack_set(candidate_item_slot, item);
@@ -10589,7 +10589,7 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
                 pyre_object::gc_roots::pin_root(v);
                 count += 1;
             }
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -10934,9 +10934,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         default_root.pin_root(args[1]);
         return match crate::baseobjspace::next(args[0]) {
             Ok(v) => Ok(v),
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
-                Ok(default_root.get(default_base))
-            }
+            Err(e) if e.matches_stop_iteration() => Ok(default_root.get(default_base)),
             Err(e) => Err(e),
         };
     }
@@ -14965,7 +14963,7 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         match crate::baseobjspace::next(it_now) {
             Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
             Ok(_) => {}
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(false)),
+            Err(e) if e.matches_stop_iteration() => return Ok(w_bool_from(false)),
             Err(e) => return Err(e),
         }
     }
@@ -17739,7 +17737,7 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         match crate::baseobjspace::next(it_now) {
             Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
             Ok(_) => {}
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => return Ok(w_bool_from(true)),
+            Err(e) if e.matches_stop_iteration() => return Ok(w_bool_from(true)),
             Err(e) => return Err(e),
         }
     }
@@ -17879,7 +17877,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     roots.set(item_slot, v);
                     *pending = true;
                 }
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => *exhausted = true,
+                Err(e) if e.matches_stop_iteration() => *exhausted = true,
                 Err(e) => return Err(e),
             }
             Ok(())

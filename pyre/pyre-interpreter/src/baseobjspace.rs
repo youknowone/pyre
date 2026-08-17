@@ -2325,7 +2325,7 @@ pub(crate) fn sequence_index(w_container: PyObjectRef, w_item: PyObjectRef) -> P
                 }
                 index += 1;
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -2354,7 +2354,7 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, w_item: PyObjectRef) -> P
                     count += 1;
                 }
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -2383,7 +2383,7 @@ pub(crate) fn sequence_contains(
                     return Ok(true);
                 }
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -3412,7 +3412,7 @@ unsafe fn pull_iterator_tuple(
                     );
                 }
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => {
+            Err(e) if e.matches_stop_iteration() => {
                 if !strict {
                     return Ok(None);
                 }
@@ -3442,7 +3442,7 @@ unsafe fn pull_iterator_tuple(
                     .unwrap();
                     return match next(it1) {
                         Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
-                        Err(e2) if e2.kind == PyErrorKind::StopIteration => Ok(None),
+                        Err(e2) if e2.matches_stop_iteration() => Ok(None),
                         Err(e2) => Err(e2),
                     };
                 }
@@ -3459,7 +3459,7 @@ unsafe fn pull_iterator_tuple(
                     .unwrap();
                     match next(itj) {
                         Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
-                        Err(e2) if e2.kind == PyErrorKind::StopIteration => {}
+                        Err(e2) if e2.matches_stop_iteration() => {}
                         Err(e2) => return Err(e2),
                     }
                 }
@@ -4143,7 +4143,7 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     loop {
         match crate::baseobjspace::next(it) {
             Ok(w_item) => out.push(byte_w(w_item, "byte")?),
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -13375,7 +13375,7 @@ fn _unpackiterable_unknown_length(
             // inside the handler (`e` is bound once, consumed only on the
             // re-raise path), not as a match guard.
             Err(e) => {
-                if e.kind == crate::PyErrorKind::StopIteration {
+                if e.matches_stop_iteration() {
                     break;
                 }
                 return Err(e);
@@ -13990,7 +13990,7 @@ fn _unpackiterable_known_length_jitlook(
                 pyre_object::gc_roots::pin_root(w_item);
                 count += 1;
             }
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }
@@ -15223,7 +15223,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     }
                     Err(e)
                         if e.kind == crate::PyErrorKind::IndexError
-                            || e.kind == crate::PyErrorKind::StopIteration =>
+                            || e.matches_stop_iteration() =>
                     {
                         let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
                             as *mut pyre_object::W_SeqIterObject;
@@ -15450,7 +15450,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ISlice);
                         state.count = state.count.wrapping_add(1);
                     }
-                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    Err(e) if e.matches_stop_iteration() => {
                         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
                         return Err(e);
@@ -15469,7 +15469,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let iterable = state.iterable;
             let w_item = match next(iterable) {
                 Ok(w_item) => w_item,
-                Err(e) if e.kind == PyErrorKind::StopIteration => {
+                Err(e) if e.matches_stop_iteration() => {
                     let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                     pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
                     return Err(e);
@@ -15521,7 +15521,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         pyre_object::gc_roots::pin_root(item);
                         item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                     }
-                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    Err(e) if e.matches_stop_iteration() => {
                         if index == 0 {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
@@ -16218,7 +16218,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
                         (*(node as *mut pyre_object::interp_itertools::W_TeeChainedListNode))
                             .running = false;
-                        if err.kind == crate::PyErrorKind::StopIteration {
+                        if err.matches_stop_iteration() {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable))
                                 .w_chained_list = PY_NULL;
@@ -16409,7 +16409,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 } else {
                     match next(w_iter) {
                         Ok(w_obj) => w_obj,
-                        Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        Err(e) if e.matches_stop_iteration() => {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             let state =
                                 &mut *(w_self as *mut pyre_object::interp_itertools::W_ZipLongest);
@@ -16587,14 +16587,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
 
                 let item0 = match next(pyre_object::gc_roots::shadow_stack_get(iterator0_slot)) {
                     Ok(item) => item,
-                    Err(first_stop) if first_stop.kind == PyErrorKind::StopIteration => {
+                    Err(first_stop) if first_stop.matches_stop_iteration() => {
                         if !zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                         {
                             return Err(first_stop);
                         }
                         return match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                             Ok(_) => Err(strict_zip_error("zip", 1, "longer")),
-                            Err(second_stop) if second_stop.kind == PyErrorKind::StopIteration => {
+                            Err(second_stop) if second_stop.matches_stop_iteration() => {
                                 Err(first_stop)
                             }
                             Err(other) => Err(other),
@@ -16610,7 +16610,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 );
                 let item1 = match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                     Ok(item) => item,
-                    Err(second_stop) if second_stop.kind == PyErrorKind::StopIteration => {
+                    Err(second_stop) if second_stop.matches_stop_iteration() => {
                         if zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
                             return Err(strict_zip_error("zip", 1, "shorter"));
                         }
@@ -16753,7 +16753,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     pyre_object::w_list_append(it.saved, w_obj);
                     return Ok(w_obj);
                 }
-                Err(e) if e.kind == PyErrorKind::StopIteration => {
+                Err(e) if e.matches_stop_iteration() => {
                     it.index = 1;
                     if pyre_object::w_list_len(it.saved) == 0 {
                         return Err(PyError::stop_iteration());
@@ -16805,7 +16805,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     // `w_iterables = None` before re-raising.
                     let w_iterable = match next(w_iterables) {
                         Ok(w) => w,
-                        Err(e) if e.kind == PyErrorKind::StopIteration => {
+                        Err(e) if e.matches_stop_iteration() => {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             pyre_object::interp_itertools::w_chain_set_iterables(
                                 w_self,
@@ -16844,7 +16844,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let w_it = pyre_object::interp_itertools::w_chain_get_it(w_self);
                 match next(w_it) {
                     Ok(w_obj) => return Ok(w_obj),
-                    Err(e) if e.kind == PyErrorKind::StopIteration => {
+                    Err(e) if e.matches_stop_iteration() => {
                         // Sub-iterator exhausted — advance to the next iterable.
                         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         pyre_object::interp_itertools::w_chain_set_it(w_self, std::ptr::null_mut());
@@ -16987,7 +16987,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             }
             let result = match crate::call::call_function_impl_result(callable, &[]) {
                 Ok(r) => r,
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+                Err(e) if e.matches_stop_iteration() => {
                     // `calliter_iternext`: when the callable itself raises
                     // `StopIteration`, latch `it_callable` to `PY_NULL` so
                     // further `next()` stays stopped. The callable's
@@ -17146,8 +17146,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         ro::w_reversed_set_remaining(obj, -1);
                         ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
-                        if e.kind == PyErrorKind::IndexError || e.kind == PyErrorKind::StopIteration
-                        {
+                        if e.kind == PyErrorKind::IndexError || e.matches_stop_iteration() {
                             return Err(PyError::stop_iteration());
                         }
                         return Err(e);
@@ -17640,7 +17639,7 @@ pub(crate) fn resume_yield_from(
             }
             Ok(Some(value))
         }
-        Err(err) if err.kind == PyErrorKind::StopIteration => {
+        Err(err) if err.matches_stop_iteration() => {
             frame.w_yielding_from = pyre_object::PY_NULL;
             finish_yield_from(frame, err)?;
             Ok(None)
@@ -17691,8 +17690,7 @@ fn close_yield_from(w_yf: PyObjectRef) -> PyResult {
                     generator_kind(w_yf)
                 ))),
                 Err(err)
-                    if err.kind == PyErrorKind::StopIteration
-                        || err.kind == PyErrorKind::GeneratorExit =>
+                    if err.matches_stop_iteration() || err.kind == PyErrorKind::GeneratorExit =>
                 {
                     Ok(w_none())
                 }
@@ -18096,7 +18094,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
                 unsafe { generator_kind(gen_obj) }
             )))
         }
-        Err(mut e) if e.kind == PyErrorKind::StopIteration => {
+        Err(mut e) if e.matches_stop_iteration() => {
             // Python 3.13+ / 3.14: close() returns the value produced when
             // GeneratorExit is caught and the generator executes `return x`.
             let w_exc = e.to_exc_object();
@@ -19037,7 +19035,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
                     return Ok(true);
                 }
             }
-            Err(e) if e.kind == PyErrorKind::StopIteration => return Ok(false),
+            Err(e) if e.matches_stop_iteration() => return Ok(false),
             Err(e) => return Err(e),
         }
     }

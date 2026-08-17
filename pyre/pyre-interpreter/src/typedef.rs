@@ -20803,7 +20803,7 @@ fn bytearray_descr_init_value(
                     vec.push(byte);
                     pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
                 }
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) if e.matches_stop_iteration() => break,
                 Err(e) => return Err(e),
             }
         }
@@ -24122,7 +24122,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         loop {
             match crate::baseobjspace::next(it) {
                 Ok(item) => buf.push(crate::baseobjspace::byte_w(item, "bytes")?),
-                Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                Err(e) if e.matches_stop_iteration() => break,
                 Err(e) => return Err(e),
             }
         }
@@ -24246,7 +24246,7 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                         })?;
                         appended.push(b);
                     }
-                    Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(e) if e.matches_stop_iteration() => break,
                     Err(e) => return Err(e),
                 }
             }

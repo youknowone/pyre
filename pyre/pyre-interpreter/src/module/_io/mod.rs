@@ -635,7 +635,7 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
         let iterator = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         let line = match crate::baseobjspace::next(iterator) {
             Ok(line) => line,
-            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) if err.matches_stop_iteration() => break,
             Err(err) => return Err(err),
         };
         let _line_root = pyre_object::gc_roots::push_roots();
@@ -758,7 +758,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     loop {
         let line = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(sp)) {
             Ok(line) => line,
-            Err(error) if error.kind == crate::PyErrorKind::StopIteration => break,
+            Err(error) if error.matches_stop_iteration() => break,
             Err(error) => return Err(error),
         };
         length = length.saturating_add(crate::baseobjspace::len_w(line)?);

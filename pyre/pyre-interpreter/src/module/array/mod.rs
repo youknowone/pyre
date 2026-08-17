@@ -198,7 +198,7 @@ fn array_extend_iterable(
     loop {
         match crate::baseobjspace::next(w_iter) {
             Ok(w_item) => array_append(obj, w_item)?,
-            Err(e) if e.kind == PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         }
     }

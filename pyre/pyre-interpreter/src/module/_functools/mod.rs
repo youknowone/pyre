@@ -169,7 +169,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
             Ok(value) => value,
-            Err(err) if err.kind == crate::PyErrorKind::StopIteration => {
+            Err(err) if err.matches_stop_iteration() => {
                 return Err(crate::PyError::type_error(
                     "reduce() of empty iterable with no initial value",
                 ));
@@ -190,7 +190,7 @@ fn reduce(args: &[PyObjectRef]) -> crate::PyResult {
         let item =
             match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
                 Ok(value) => value,
-                Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                Err(err) if err.matches_stop_iteration() => break,
                 Err(err) => return Err(err),
             };
         // `next()` returns a raw object reference.  Keep this iteration's

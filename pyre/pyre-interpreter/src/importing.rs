@@ -5692,7 +5692,7 @@ where
     loop {
         let w_name = match crate::baseobjspace::next(w_iter) {
             Ok(v) => v,
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         };
         // pyopcode.py:2240-2255 — per-name str check.

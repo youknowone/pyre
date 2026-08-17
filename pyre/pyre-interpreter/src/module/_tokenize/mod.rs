@@ -115,7 +115,7 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, crate::PyError> {
         &[],
     ) {
         Ok(value) => value,
-        Err(err) if err.kind == crate::PyErrorKind::StopIteration => return Ok(String::new()),
+        Err(err) if err.matches_stop_iteration() => return Ok(String::new()),
         Err(err) => return Err(err),
     };
     match encoding {

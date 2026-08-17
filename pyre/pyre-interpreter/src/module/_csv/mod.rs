@@ -689,7 +689,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let w_iter = gc_roots::shadow_stack_get(iter_slot);
         let line = match crate::baseobjspace::next(w_iter) {
             Ok(l) => l,
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => {
+            Err(e) if e.matches_stop_iteration() => {
                 if state != START_RECORD
                     && state != EAT_CRNL
                     && (field_len > 0 || state == IN_QUOTED_FIELD)
@@ -1062,7 +1062,7 @@ fn writer_writerows_impl(
         let it = gc_roots::shadow_stack_get(it_slot);
         let row = match crate::baseobjspace::next(it) {
             Ok(r) => r,
-            Err(e) if e.kind == crate::PyErrorKind::StopIteration => break,
+            Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         };
         writer_writerow_impl(gc_roots::shadow_stack_get(self_slot), row)?;

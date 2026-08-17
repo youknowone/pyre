@@ -411,7 +411,7 @@ fn scanner_parse_object(
                 byte_index,
             )
             .map_err(|err| {
-                if err.kind == crate::PyErrorKind::StopIteration {
+                if err.matches_stop_iteration() {
                     scanner_decode_error(
                         "Expecting value",
                         gc_roots::shadow_stack_get(slot + 2),
@@ -543,7 +543,7 @@ fn scanner_parse_array(
             byte_index,
         )
         .map_err(|err| {
-            if err.kind == crate::PyErrorKind::StopIteration {
+            if err.matches_stop_iteration() {
                 scanner_decode_error(
                     "Expecting value",
                     gc_roots::shadow_stack_get(slot + 2),
@@ -1015,7 +1015,7 @@ fn encode_sequence(
     loop {
         let item = match crate::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot)) {
             Ok(item) => item,
-            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) if err.matches_stop_iteration() => break,
             Err(err) => return Err(err),
         };
         if first {
@@ -1130,7 +1130,7 @@ fn encode_dict(
     loop {
         let pair = match crate::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot)) {
             Ok(pair) => pair,
-            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) if err.matches_stop_iteration() => break,
             Err(err) => return Err(err),
         };
         let pair_items = crate::builtins::collect_iterable(pair)?;

@@ -358,7 +358,7 @@ pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
             crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iterator_slot));
         match item {
             Ok(item) => data.push(unsafe { crate::baseobjspace::byte_w(item, "bytes") }?),
-            Err(error) if error.kind == crate::PyErrorKind::StopIteration => break,
+            Err(error) if error.matches_stop_iteration() => break,
             Err(error) => return Err(error),
         }
     }

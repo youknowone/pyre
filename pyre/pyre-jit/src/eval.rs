@@ -6653,7 +6653,7 @@ fn drain_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyError
     let err = unsafe {
         pyre_interpreter::error::PyError::from_exc_object(exc as pyre_object::PyObjectRef)
     };
-    (err.kind != pyre_interpreter::PyErrorKind::StopIteration).then_some(err)
+    (!err.matches_stop_iteration()).then_some(err)
 }
 
 /// Drive one jd1 trace of `_unpackiterable_unknown_length`. The tracer executes
@@ -6866,7 +6866,7 @@ fn drive_unpack_iterable_trace(
                 crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
                     // StopIteration = drain complete; `ln` re-derives its own
                     // loop-exit StopIteration on its next `next()`.
-                    if err.kind != pyre_interpreter::PyErrorKind::StopIteration {
+                    if !err.matches_stop_iteration() {
                         pending_err = Some(err);
                     }
                     break;
@@ -6894,12 +6894,12 @@ fn drive_unpack_iterable_trace(
         // producer today) and is promoted instead of discarded; an exit that
         // already picked one keeps it, since that one is the earlier failure.
         if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception()
-            && err.kind != pyre_interpreter::PyErrorKind::StopIteration
+            && !err.matches_stop_iteration()
         {
             pending_err.get_or_insert(err);
         }
         if let Some(err) = crate::call_jit::take_ca_exception()
-            && err.kind != pyre_interpreter::PyErrorKind::StopIteration
+            && !err.matches_stop_iteration()
         {
             pending_err.get_or_insert(err);
         }

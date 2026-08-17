@@ -395,7 +395,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
             loop {
                 let rcls = match crate::baseobjspace::next(registry_roots.get(iterator_slot)) {
                     Ok(rcls) => rcls,
-                    Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(err) if err.matches_stop_iteration() => break,
                     Err(err) => return Err(err),
                 };
                 // A registered entry that is not a class cannot be a base
@@ -436,7 +436,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         loop {
             let scls = match crate::baseobjspace::next(walk_roots.get(iterator_slot)) {
                 Ok(scls) => scls,
-                Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                Err(err) if err.matches_stop_iteration() => break,
                 Err(err) => return Err(err),
             };
             let item_roots = pyre_object::gc_roots::push_roots();
