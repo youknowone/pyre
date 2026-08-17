@@ -11,6 +11,7 @@ try:
 except ImportError:
     pass
 
+import dis
 import sys
 import traceback
 
@@ -33,8 +34,36 @@ def bare():
         return value
 
 
+def for_iter_offset(function):
+    return next(
+        instruction.offset
+        for instruction in dis.get_instructions(function)
+        if instruction.opname == "FOR_ITER"
+    )
+
+
+# The looping frame's node must name the FOR_ITER that was in flight, not
+# whatever instruction a coarser coordinate lookup happens to land on.  Derive
+# the offset from the function's own bytecode so the check states the rule
+# instead of pinning a layout.
+expected_lasti = {
+    "enclosed": for_iter_offset(enclosed),
+    "bare": for_iter_offset(bare),
+}
+
 shapes = set()
-coordinates = set()
+loop_frame_lasti = set()
+
+
+def observe(tb):
+    shapes.add(tuple(f.name for f in traceback.extract_tb(tb)))
+    while tb is not None:
+        name = tb.tb_frame.f_code.co_name
+        if name in expected_lasti:
+            loop_frame_lasti.add((name, tb.tb_lasti))
+        tb = tb.tb_next
+
+
 for _ in range(8):
     try:
         try:
@@ -42,23 +71,19 @@ for _ in range(8):
         except AttributeError:
             raise
     except AttributeError:
-        tb = sys.exc_info()[2]
-        shapes.add(tuple(f.name for f in traceback.extract_tb(tb)))
-        coordinates.add(tuple((f.f_code.co_name, lasti) for f, lasti in traceback.walk_tb(tb)))
+        observe(sys.exc_info()[2])
 
     try:
         bare()
     except AttributeError:
-        tb = sys.exc_info()[2]
-        shapes.add(tuple(f.name for f in traceback.extract_tb(tb)))
-        coordinates.add(tuple((f.f_code.co_name, lasti) for f, lasti in traceback.walk_tb(tb)))
+        observe(sys.exc_info()[2])
 
 assert shapes == {
     ("<module>", "enclosed", "__next__"),
     ("<module>", "bare", "__next__"),
 }, sorted(shapes)
-assert coordinates == {
-    (("<module>", 338), ("enclosed", 22), ("__next__", 4)),
-    (("<module>", 170), ("bare", 22), ("__next__", 4)),
-}, sorted(coordinates)
+assert loop_frame_lasti == {
+    ("enclosed", expected_lasti["enclosed"]),
+    ("bare", expected_lasti["bare"]),
+}, sorted(loop_frame_lasti)
 print("OK")
