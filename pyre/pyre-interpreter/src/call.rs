@@ -4029,6 +4029,13 @@ fn update_bases(
     base_args: &[PyObjectRef],
     w_orig_bases: PyObjectRef,
 ) -> Result<(Vec<PyObjectRef>, bool), crate::PyError> {
+    // The entries `__mro_entries__` contributes are reachable only from the
+    // tuple it returned and from this native vector, neither of which the
+    // collector walks, while a later iteration's `getattr_str` and
+    // `__mro_entries__` call both run Python.  Pinning each returned tuple
+    // keeps its entries traced for the rest of the walk; the caller's
+    // `w_tuple_new` re-pins them before it allocates.
+    let _entry_roots = pyre_object::gc_roots::push_roots();
     let mut new_bases: Option<Vec<PyObjectRef>> = None;
     for (i, &w_base) in base_args.iter().enumerate() {
         if unsafe { pyre_object::is_type(w_base) } {
@@ -4059,6 +4066,7 @@ fn update_bases(
                         "__mro_entries__ must return a tuple",
                     ));
                 }
+                pyre_object::gc_roots::pin_root(w_new_base);
                 if new_bases.is_none() {
                     new_bases = Some(base_args[..i].to_vec());
                 }
@@ -4166,15 +4174,29 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     let name = unsafe { pyre_object::w_str_get_value(name_obj) };
     // compiling.py:166-167 — resolve __mro_entries__ before metaclass
     // inference; record the original bases for __orig_bases__ when changed.
-    let w_orig_bases = pyre_object::w_tuple_new(base_args.to_vec());
-    let (resolved_bases, bases_changed) = update_bases(base_args, w_orig_bases)?;
+    //
+    // Neither tuple has a referrer besides this frame's Rust locals until
+    // `w_type_new` stores the resolved one into `W_TypeObject.bases`, and
+    // `__mro_entries__`, `__prepare__`, the class body and the metaclass call
+    // all run in between.  A tuple is allocated stable, so it never moves and
+    // the raw copies stay valid addresses — but an unmarked stable block is
+    // still swept, and a class body long enough to span a whole major cycle
+    // frees it under the local.  Both slots therefore stay pinned until
+    // `build_class_inner`, the one consumer, returns.
+    let bases_roots = pyre_object::gc_roots::push_roots();
+    let orig_bases_slot = bases_roots.base();
+    bases_roots.pin_root(pyre_object::w_tuple_new(base_args.to_vec()));
+    let (resolved_bases, bases_changed) =
+        update_bases(base_args, bases_roots.get(orig_bases_slot))?;
     // Non-type bases are not rejected here: `__build_class__` hands the
     // resolved tuple to whichever metaclass was selected, and a metaclass
     // that is not a type may legitimately accept them.  `best_base` performs
     // the `bases must be types` check on the type-construction path.
-    let bases_tuple = pyre_object::w_tuple_new(resolved_bases);
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    bases_roots.pin_root(pyre_object::w_tuple_new(resolved_bases));
+    let bases_tuple = bases_roots.get(bases_slot);
     let w_orig_bases = if bases_changed {
-        Some(w_orig_bases)
+        Some(bases_roots.get(orig_bases_slot))
     } else {
         None
     };
@@ -4224,6 +4246,12 @@ pub(crate) fn real_build_class(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     )
 }
 
+/// `bases` and `w_orig_bases` are borrowed, not owned: the only caller,
+/// `real_build_class`, keeps both pinned for the whole of this call.  They are
+/// tuples, so they never move and the raw copies below stay valid addresses;
+/// what the caller's scope buys is that the blocks are still allocated when
+/// the class body returns.  A second caller would have to pin them the same
+/// way before calling.
 fn build_class_inner(
     body_fn: PyObjectRef,
     name: &str,

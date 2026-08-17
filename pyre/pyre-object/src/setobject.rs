@@ -742,7 +742,12 @@ pub unsafe fn w_set_difference_update_from_set(
     // storage wholesale. Besides the complexity bound, this preserves the
     // exact contains-with-hash callback direction of the upstream strategy.
     if w_set_len(dst) < w_set_len(src) {
+        // A set is old-gen and never moves, but the difference accumulator has
+        // no referrer until `w_set_copy_storage_from` below: the `eq_w` a bucket
+        // probe runs is a collection point that would otherwise sweep it.
+        let _roots = crate::gc_roots::push_roots();
         let result = w_set_new();
+        crate::gc_roots::pin_root(result);
         let dst_items = (*(dst as *const W_SetObject)).items;
         let dst_len = (*dst_items).len();
         let mut i = 0;

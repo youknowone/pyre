@@ -1362,6 +1362,13 @@ fn save_global_or_reduce(
     buf: &mut Framer,
     w_obj: PyObjectRef,
 ) -> Result<(), PyError> {
+    // The reduce protocol below runs Python — the `dispatch_table` lookup and
+    // `__reduce_ex__` — and the object being pickled can be a `list` or `dict`
+    // subclass, whose header moves.  Pin it and re-read it from the slot at the
+    // two consumers that sit after one of those calls.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_obj);
     // CPython 3.14 pickle.py dispatch[type] = save_type: only a class whose
     // exact metaclass is `type` takes this built-in dispatch entry. A class
     // with a custom metaclass must consult dispatch_table first.
@@ -1381,6 +1388,7 @@ fn save_global_or_reduce(
     // A `dispatch_table` reduce function registered for this exact type takes
     // precedence over `__reduce_ex__`.
     if let Some(w_rv) = dispatch_table_reduce(ctx, w_obj)? {
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         return save_reduce_value(ctx, buf, w_obj, w_rv);
     }
 
@@ -1392,13 +1400,26 @@ fn save_global_or_reduce(
 
     // Everything else goes through the reduce protocol.
     let w_rv = match crate::baseobjspace::findattr_result(w_obj, "__reduce_ex__")? {
-        Some(reduce_ex) => call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?,
-        None => match crate::baseobjspace::findattr_result(w_obj, "__reduce__")? {
+        Some(reduce_ex) => {
+            // A bound method the lookup minted has no other referrer, and
+            // boxing the protocol number allocates before the call reaches it.
+            pyre_object::gc_roots::pin_root(reduce_ex);
+            call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?
+        }
+        None => match crate::baseobjspace::findattr_result(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            "__reduce__",
+        )? {
             Some(reduce) => call_fn(reduce, &[])?,
             None => return Err(pickling_error("Can't pickle object: no __reduce_ex__")),
         },
     };
-    save_reduce_value(ctx, buf, w_obj, w_rv)
+    save_reduce_value(
+        ctx,
+        buf,
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        w_rv,
+    )
 }
 
 /// CPython 3.14 `pickle._Pickler.save_type`, line by line.

@@ -341,9 +341,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(out)
                 }
 
-                let rfds = collect_fds(args[0])?;
-                let wfds = collect_fds(args[1])?;
-                let xfds = collect_fds(args[2])?;
+                // `args` is a native slice the gateway copied out of its own
+                // slots: it keeps the arguments alive but cannot rewrite this
+                // copy, and each `collect_fds` runs Python twice — the
+                // iteration protocol and `fileno()`.  The three fd sequences
+                // are usually lists, whose header moves, so reading the second
+                // and third out of the slice after the first was collected
+                // hands `unpackiterable` a pre-move address.  Pin them here and
+                // read each back at its own call.
+                let arg_roots = pyre_object::gc_roots::push_roots();
+                let args_base = arg_roots.base();
+                arg_roots.pin_root(args[0]);
+                arg_roots.pin_root(args[1]);
+                arg_roots.pin_root(args[2]);
+                let rfds = collect_fds(arg_roots.get(args_base))?;
+                let wfds = collect_fds(arg_roots.get(args_base + 1))?;
+                let xfds = collect_fds(arg_roots.get(args_base + 2))?;
 
                 // The first `select()` argument: POSIX scans descriptors
                 // `0..nfds`, so it must exceed the highest one.
@@ -457,10 +470,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     pyre_object::w_list_new(items)
                 }
 
-                let r_ready = build_ready(&mut rset, &rfds);
-                let w_ready = build_ready(&mut wset, &wfds);
-                let x_ready = build_ready(&mut xset, &xfds);
-                Ok(pyre_object::w_tuple_new(vec![r_ready, w_ready, x_ready]))
+                // Each list is freshly minted and a list header moves, so the
+                // allocation the next `build_ready` performs can relocate the
+                // previous one and leave its pre-move address in the local.
+                // Pin each at its mint and read all three back where the tuple
+                // is built.
+                let roots = pyre_object::gc_roots::push_roots();
+                let ready_base = roots.base();
+                roots.pin_root(build_ready(&mut rset, &rfds));
+                roots.pin_root(build_ready(&mut wset, &wfds));
+                roots.pin_root(build_ready(&mut xset, &xfds));
+                Ok(pyre_object::w_tuple_new(vec![
+                    roots.get(ready_base),
+                    roots.get(ready_base + 1),
+                    roots.get(ready_base + 2),
+                ]))
             }
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
             {

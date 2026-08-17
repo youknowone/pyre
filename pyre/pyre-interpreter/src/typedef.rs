@@ -25967,11 +25967,15 @@ fn set_intersect_update(
         } else {
             (w_set, w_other)
         };
-        let result = pyre_object::w_set_new();
         // The three sets are old-gen allocations and keep their addresses across
-        // a collection, but their elements are young and move, so each key is
-        // re-read from the table the collector rewrites rather than carried
-        // across the `eq_w` a bucket probe can run.
+        // a collection, but staying put is not staying alive: `result` has no
+        // referrer yet, and the `eq_w` a bucket probe runs is a collection point
+        // that would sweep it.  Their elements are young and move, so each key
+        // is re-read from the table the collector rewrites rather than carried
+        // across that probe.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let result = pyre_object::w_set_new();
+        pyre_object::gc_roots::pin_root(result);
         let mut i = 0;
         while let Some(key) = pyre_object::w_set_key_at(keep, i) {
             if pyre_object::w_set_contains_key_checked(probe, key)
@@ -26027,18 +26031,30 @@ pub(crate) fn set_method_intersection(
 
     // `setobject.py` — the seed and every operand become sets, and a
     // set operand is intersected as it stands rather than rebuilt.
+    // Every set here is freshly minted with no referrer: the seed, each operand
+    // `set_newobj_intersection` builds out of a non-set, and the accumulator
+    // each `set_intersect_update` hands back — whose own root scope ends when it
+    // returns.  A set is old-gen and never moves, so the locals stay valid
+    // addresses; what they need is to survive the collection points around
+    // them, the iterable drain and the `__eq__` a bucket probe runs.
+    let _roots = pyre_object::gc_roots::push_roots();
     let mut result = set_newobj_intersection(others_w[0])?;
+    pyre_object::gc_roots::pin_root(result);
     for &w_other in &others_w[1..] {
         let w_other_as_set = if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
             w_other
         } else {
-            set_newobj_intersection(w_other)?
+            let w_fresh = set_newobj_intersection(w_other)?;
+            pyre_object::gc_roots::pin_root(w_fresh);
+            w_fresh
         };
         result = set_intersect_update(result, w_other_as_set)?;
+        pyre_object::gc_roots::pin_root(result);
     }
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
             let w_frozenset = pyre_object::w_frozenset_new();
+            pyre_object::gc_roots::pin_root(w_frozenset);
             pyre_object::w_set_copy_storage_from(w_frozenset, result);
             return Ok(w_frozenset);
         }

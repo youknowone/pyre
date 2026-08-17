@@ -187,7 +187,14 @@ fn array_extend_iterable(
             return Ok(());
         }
     }
+    // The iterator is minted here and nothing else refers to it, while `next`
+    // and `array_append` both run Python.  An iterator and an array are stable
+    // allocations, so neither address goes stale; what the scope buys is that
+    // an unmarked block is not swept out from under the loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
+    pyre_object::gc_roots::pin_root(w_iter);
     loop {
         match crate::baseobjspace::next(w_iter) {
             Ok(w_item) => array_append(obj, w_item)?,
@@ -230,6 +237,14 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             pos.len() - 1
         )));
     }
+    // `pos` is a native slice into the flat ABI's argument buffer.  The gateway
+    // keeps the arguments alive, but it does not rewrite this copy, and the 'u'
+    // deprecation warning below runs Python: a `list` or `dict` initializer is
+    // movable and leaves its pre-move address behind in the slice.  Pin the
+    // arguments here, before that warning, and read the initializer back out of
+    // its slot where it is used.
+    let _pos_roots = pyre_object::gc_roots::push_roots();
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
     let cls = pos[0];
     let canonical = crate::typedef::gettypefor(&pyre_object::interp_array::ARRAY_TYPE)
         .map_or(PY_NULL, |ty| ty.as_ptr());
@@ -284,13 +299,17 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
         )?;
     }
     let obj = arr::w_array_new(typecode, itemsize);
+    // Nothing refers to the fresh array yet and every initializer below runs
+    // Python.  An array is stable, so the local stays a valid address; the pin
+    // is what stops a major cycle sweeping it as unreachable.
+    pyre_object::gc_roots::pin_root(obj);
     // Subclass: retag the fresh array with the requested class.
     if !cls.is_null() && unsafe { pyre_object::is_type(cls) } && !std::ptr::eq(cls, canonical) {
         crate::typedef::tag_subclass_instance(obj, cls);
     }
     // Optional initializer.
     if pos.len() >= 3 {
-        let w_init = pos[2];
+        let w_init = pyre_object::gc_roots::shadow_stack_get(pos_base + 2);
         if unsafe { pyre_object::is_str(w_init) } {
             if matches!(typecode, b'u' | b'w') {
                 array_fromunicode(obj, w_init)?;

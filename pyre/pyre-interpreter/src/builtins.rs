@@ -5770,6 +5770,13 @@ fn type_descr_new_with_metaclass(
         // typeobject.py:954 — `W_TypeObject.__init__` is the site that reads
         // the bases as `bases_w or [space.w_object]`, so the `(object,)`
         // default belongs to construction and to nothing that runs before it.
+        // On the empty-bases arm this is a `(object,)` tuple minted right here
+        // with no other referrer, and it has to survive `calculate_metaclass`,
+        // the namespace copy, `validate_c3_mro`, `create_all_slots`,
+        // `__set_name__` and `__init_subclass__` before anything else refers to
+        // it.  A tuple never moves, so the plain uses below stay valid
+        // addresses; the pin is what keeps a major cycle from sweeping it.
+        let _effective_bases_roots = pyre_object::gc_roots::push_roots();
         let w_effective_bases =
             if bases.is_null() || !unsafe { is_tuple(bases) } || unsafe { w_tuple_len(bases) } == 0
             {
@@ -5782,6 +5789,7 @@ fn type_descr_new_with_metaclass(
             } else {
                 bases
             };
+        pyre_object::gc_roots::pin_root(w_effective_bases);
         // calculate_metaclass — delegate to winner if different
         let default_meta = if w_metaclass.is_null() {
             crate::typedef::w_type()

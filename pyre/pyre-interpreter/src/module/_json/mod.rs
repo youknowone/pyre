@@ -995,6 +995,12 @@ fn encode_sequence(
     level: i64,
 ) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
     let _roots = gc_roots::push_roots();
+    // `obj` is the sequence being encoded — a movable header — and the child
+    // encoders below run arbitrary Python.  The `map_err` closure must read it
+    // back out of the slot; capturing the parameter would name the pre-move
+    // address and report the type of whatever now occupies that cell.
+    let obj_slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(obj);
     let iter = crate::baseobjspace::iter(obj)?;
     let iter_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(iter);
@@ -1028,7 +1034,7 @@ fn encode_sequence(
                 err,
                 format!(
                     "when serializing {} item {item_index}",
-                    short_type_name(obj)
+                    short_type_name(gc_roots::shadow_stack_get(obj_slot))
                 ),
             )
         })?;
@@ -1086,20 +1092,32 @@ fn encode_dict(
     // CPython's encoder iterates `items()`.  Keeping the returned Python
     // iterable as the owner makes mutations from re-entrant key encoders
     // visible and avoids holding raw pointers into a mutable list.
+    //
+    // `obj` and the `items()` result are both movable headers, and the
+    // `sort_keys` attribute read, the `sorted` lookup and the sort itself all
+    // run Python between the two.  Each is pinned where it is produced and read
+    // back where it is used.
+    let _roots = gc_roots::push_roots();
+    let obj_slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(obj);
     let items = crate::call::call_function_impl_result(
         crate::baseobjspace::getattr_str(obj, "items")?,
         &[],
     )?;
-    let items = if crate::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
+    let mut items_slot = gc_roots::shadow_stack_len();
+    gc_roots::pin_root(items);
+    if crate::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
         let builtins = crate::importing::get_sys_module("builtins")
             .ok_or_else(|| PyError::runtime_error("builtins module is unavailable"))?;
         let sorted = crate::baseobjspace::getattr_str(builtins, "sorted")?;
-        crate::call::call_function_impl_result(sorted, &[items])?
-    } else {
-        items
-    };
-    let _roots = gc_roots::push_roots();
-    let iter = crate::baseobjspace::iter(items)?;
+        let sorted_items = crate::call::call_function_impl_result(
+            sorted,
+            &[gc_roots::shadow_stack_get(items_slot)],
+        )?;
+        items_slot = gc_roots::shadow_stack_len();
+        gc_roots::pin_root(sorted_items);
+    }
+    let iter = crate::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
     let iter_slot = gc_roots::shadow_stack_len();
     gc_roots::pin_root(iter);
     let item_separator = require_string(encoder_attr(self_obj, "item_separator")?)?.to_wtf8_buf();
@@ -1162,7 +1180,10 @@ fn encode_dict(
             add_json_note(
                 err,
                 crate::display::wtf8_format!(
-                    format!("when serializing {} item ", short_type_name(obj)),
+                    format!(
+                        "when serializing {} item ",
+                        short_type_name(gc_roots::shadow_stack_get(obj_slot))
+                    ),
                     key_repr
                 ),
             )
