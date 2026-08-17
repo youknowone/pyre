@@ -11199,9 +11199,13 @@ impl CodeWriter {
                         }
 
                         Instruction::PopIter => {
-                            // pop iterator: net -1
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            // pop iterator: net -1. `PyFrame::pop`
+                            // (pyframe.rs:3002-3010, `popvalue_maybe_none`
+                            // pyframe.py:411-417) writes NULL over the slot
+                            // before it lowers `valuestackdepth`, so the pop
+                            // goes through `emit_popvalue_ref!` like every
+                            // other one rather than moving the depth alone.
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                         }
 
                         // BinarySlice: obj[start:stop] — pops 3 (stop, start, obj), pushes 1 (result).
