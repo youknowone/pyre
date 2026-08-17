@@ -132,16 +132,16 @@ impl<'c> Lowerer<'c> {
         let layouts: Vec<_> = layouts
             .iter()
             .map(|(struct_path, fields)| {
-                // Raw host-owned struct (the ref-scalar's pointee, no GC header)
-                // → `is_gc_managed = false`, the same id the getfield/setfield
-                // lowering uses so the write-EI rebuilds the SAME parent
+                // The struct's own gc-kind — the same id the getfield/setfield
+                // lowering uses, so the write-EI rebuilds the SAME parent
                 // SizeDescr identity.
-                let tid = struct_type_id_tokens(struct_path, false);
+                let gc_managed = config.struct_gc_kind_is_managed(struct_path);
+                let tid = struct_type_id_tokens(struct_path, gc_managed);
                 quote! {
                     (
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
+                        #gc_managed,
                         &[#(#fields),*],
                     )
                 }
@@ -167,10 +167,9 @@ impl<'c> Lowerer<'c> {
             })
             .collect();
         Some(quote! {
-            // The residual mutates a host-owned native struct field (no
-            // GC header) → `is_gc_managed = false`, matching the
-            // getfield/setfield lowering so the write-EI rebuilds the
-            // SAME parent SizeDescr identity the getfield reads back.
+            // Each layout carries the struct's own gc-kind, matching the
+            // getfield/setfield lowering so the write-EI rebuilds the SAME
+            // parent SizeDescr identity the getfield reads back.
             majit_metainterp::residual_write_effect_info(
                 &[#(#layouts),*],
                 &[#(#arrays),*],

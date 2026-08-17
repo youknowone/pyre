@@ -2455,6 +2455,43 @@ impl GcCache {
                 // `W_BASE_EXCEPTION_DESCR_CACHE` are not — they arrive after,
                 // and a one-sided rule would reject their vtable exactly the
                 // way the other order loses it.
+                // The header shape outranks both. A cached headerless descr
+                // says this key's objects carry no type-id word ahead of the
+                // payload, and a producer that does not model that would
+                // clear the bit by arriving second. It must not: the type
+                // guard is emitted for a gc-managed descr that is NOT
+                // headerless, and it loads the word at `ref - 8` — the word a
+                // headerless object does not have, so the read lands in
+                // whatever precedes it. Losing a field or a vtable makes the
+                // descr less complete; losing this bit makes it wrong, so the
+                // bit is carried forward whatever else the incoming spec has
+                // to offer.
+                //
+                // The reverse direction is deliberately not symmetric: a
+                // headerless spec arriving over a headered one still has to
+                // win on its own merits below, because a genuinely headered
+                // struct must not be talked out of its header either.
+                let existing_headerless =
+                    existing.as_size_descr().is_some_and(SizeDescr::headerless);
+                let new_headerless = descr.as_size_descr().is_some_and(SizeDescr::headerless);
+                if existing_headerless && !new_headerless {
+                    return;
+                }
+                // Two producers reporting different gc-kinds for one key are
+                // not describing one type. Upstream cannot express this at
+                // all — `descr.py:105-127 get_size_descr` mints once per
+                // STRUCT and `lltype.py:418 _gckind` is a property of that
+                // STRUCT — so the disagreement means the key is being shared
+                // by two low-level types and every field descr under it is
+                // already ambiguous.
+                assert_eq!(
+                    existing
+                        .as_size_descr()
+                        .is_some_and(SizeDescr::is_gc_managed),
+                    descr.as_size_descr().is_some_and(SizeDescr::is_gc_managed),
+                    "two producers disagree about the gc-kind of {key:?}; \
+                     one key cannot name both a gc-managed and a raw struct",
+                );
                 match (existing_vtable != 0, new_vtable != 0) {
                     (true, false) => false,
                     (false, true) => true,

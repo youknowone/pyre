@@ -1107,9 +1107,11 @@ impl<'c> Lowerer<'c> {
             field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
-        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, a
-        // distinct descriptor id from any GC `new_struct` of the same type.
-        let tid = struct_type_id_tokens(&struct_path, false);
+        // The pointee's own gc-kind, so a `new_struct` of this type and an
+        // access to it name one descriptor id rather than two.
+        let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
+        let headerless = config.is_headerless_struct(&struct_path);
+        let tid = struct_type_id_tokens(&struct_path, gc_managed);
         // Lower the `state.<ref_scalar>` base to a ref binding (its
         // load_state_field_ref already declares the ref identity slot live for
         // resume), then read the field off that concrete ref.
@@ -1132,8 +1134,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1170,8 +1172,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
@@ -1230,7 +1232,9 @@ impl<'c> Lowerer<'c> {
             field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let ref_field_entry = config.ref_fields.get(&ref_field_key);
         let is_ref_field = ref_field_entry.is_some();
-        let tid = struct_type_id_tokens(&struct_path, false);
+        let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
+        let headerless = config.is_headerless_struct(&struct_path);
+        let tid = struct_type_id_tokens(&struct_path, gc_managed);
         let base_reg = binding.reg;
         let result_reg = self.alloc_reg();
         if is_ref_field {
@@ -1245,8 +1249,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1282,8 +1286,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
@@ -1367,7 +1371,15 @@ impl<'c> Lowerer<'c> {
             member.clone(),
             element_type.clone(),
         );
-        let tid = struct_type_id_tokens(&struct_path, false);
+        // No config means nothing was declared gc-managed or headerless,
+        // which is the same answer the raw default gave before.
+        let gc_managed = self
+            .config
+            .is_some_and(|config| config.struct_gc_kind_is_managed(&struct_path));
+        let headerless = self
+            .config
+            .is_some_and(|config| config.is_headerless_struct(&struct_path));
+        let tid = struct_type_id_tokens(&struct_path, gc_managed);
         let buffer_reg = self.alloc_reg();
         self.emit_op(
             OpMeta::linear(
@@ -1391,8 +1403,8 @@ impl<'c> Lowerer<'c> {
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
                     #tid,
-                    false,
-                    false,
+                    #gc_managed,
+                    #headerless,
                     &[(
                         ::core::mem::offset_of!(#struct_path, #member),
                         true,
@@ -1660,9 +1672,11 @@ impl<'c> Lowerer<'c> {
         let (__fsize, __fsigned, __fcheck) =
             field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
-        // Raw (headerless) ref-scalar pointee → `is_gc_managed = false`, the
-        // same id the matching getfield uses so this setfield invalidates it.
-        let tid = struct_type_id_tokens(&struct_path, false);
+        // The same id the matching getfield uses, so this setfield
+        // invalidates it — see `struct_gc_kind_is_managed`.
+        let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
+        let headerless = config.is_headerless_struct(&struct_path);
+        let tid = struct_type_id_tokens(&struct_path, gc_managed);
         let base = self.lower_state_field_read(&field.base)?;
         if !matches!(base.kind, BindingKind::Ref) {
             return None;
@@ -1686,8 +1700,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1722,8 +1736,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,
@@ -1777,7 +1791,9 @@ impl<'c> Lowerer<'c> {
         let (__fsize, __fsigned, __fcheck) =
             field_scalar_tokens(config, &ref_field_key, &struct_path, &member);
         let is_ref_field = config.ref_fields.contains_key(&ref_field_key);
-        let tid = struct_type_id_tokens(&struct_path, false);
+        let gc_managed = config.struct_gc_kind_is_managed(&struct_path);
+        let headerless = config.is_headerless_struct(&struct_path);
+        let tid = struct_type_id_tokens(&struct_path, gc_managed);
         let base_reg = binding.reg;
         let rhs = self.lower_value_expr(&assign.right)?;
         if is_ref_field {
@@ -1796,8 +1812,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             true,
@@ -1831,8 +1847,8 @@ impl<'c> Lowerer<'c> {
                     __builder.register_struct_layout(
                         ::core::mem::size_of::<#struct_path>(),
                         #tid,
-                        false,
-                        false,
+                        #gc_managed,
+                        #headerless,
                         &[(
                             ::core::mem::offset_of!(#struct_path, #member),
                             false,

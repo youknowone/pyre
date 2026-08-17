@@ -1317,6 +1317,33 @@ impl LowererConfig {
         self.headerless_structs
             .contains(&canonical_path_segments(struct_path))
     }
+
+    /// The gc-kind of a struct type — a property of the TYPE, never of the
+    /// operation reaching it.
+    ///
+    /// `lltype.py:418` keeps `_gckind` on the STRUCT itself, and
+    /// `jtransform.py:880` reads it off the struct a field belongs to rather
+    /// than off the operation touching the field. One type therefore has one
+    /// answer, and every descriptor minted for it has to give the same one:
+    /// [`struct_type_id_tokens`](super::lower_value::struct_type_id_tokens)
+    /// folds this flag into the type id, so two answers mint two identities
+    /// for a single field. An optimizer that keys its field cache by
+    /// descriptor identity then cannot see a write through one identity when
+    /// it reads through the other, and serves the value from before the write.
+    ///
+    /// A struct declared in `headerless_structs` is allocated out of the
+    /// interpreter's own GC pool, so it is gc-managed. What it lacks is the
+    /// type-id word ahead of the payload, and that absence is carried by the
+    /// descriptor's `headerless` flag — the flag the type guard actually
+    /// consults — not by a separate type id.
+    ///
+    /// Every other struct stays raw here. A type the interpreter only ever
+    /// reaches through a pointer it did not allocate is a genuinely separate
+    /// low-level type from anything it allocates itself, and two ids for the
+    /// two of them is the right answer rather than an accident.
+    pub(super) fn struct_gc_kind_is_managed(&self, struct_path: &syn::Path) -> bool {
+        self.is_headerless_struct(struct_path)
+    }
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {
