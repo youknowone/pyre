@@ -3855,8 +3855,8 @@ fn load_source_module(
             )
         }
     };
-    // The whole unit was named by this path, so the nested constants still
-    // held unrealized take the same spelling when they are boxed.
+    // The whole unit was named by this path, so recurse through the eager
+    // nested PyCode constants like PyPy `update_code_filenames`.
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
     // Root before any allocation (fresh_module_globals, the cache write) can
     // collect the freshly boxed code out from under us.
