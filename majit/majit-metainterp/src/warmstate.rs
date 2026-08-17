@@ -1209,10 +1209,21 @@ impl WarmEnterState {
     /// one candidate, so [`Self::sole_cell_key`] is exact and a caller can skip
     /// building a `GreenKey` it would only use to confirm that — which is what
     /// keeps [`Self::resolve_cell_key`] allocation-free on the entry path.
+    ///
+    /// Resolves through [`Self::lookup_chain`] and NOT through
+    /// [`Self::bucket_of`]. The argument is a raw green-key hash, which is its
+    /// own bucket; `bucket_of` maps a CELL KEY to the bucket that cell lives
+    /// in, and applying it here sends this reader to another bucket entirely
+    /// whenever the hash coincides with a live minted key — while
+    /// [`Self::sole_cell_key`], the reader whose branch this decides, keeps
+    /// reading the bucket the hash names. Upstream cannot split the two: every
+    /// reader enters at `jitcounter.lookup_chain(hash)`
+    /// (warmstate.py:459-460, :597-598, :632-633), and `lookup_chain`
+    /// (counter.py:239-240) is a bare `celltable[self._get_index(hash)]`. See
+    /// [`a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket`].
     #[inline]
     pub fn bucket_is_chained(&self, green_key_hash: u64) -> bool {
-        self.cells
-            .get(&self.bucket_of(green_key_hash))
+        self.lookup_chain(green_key_hash)
             .is_some_and(|head| head.next.is_some())
     }
 
@@ -2416,7 +2427,7 @@ impl WarmEnterState {
     /// (see [`BaseJitCell::comparekey`]) — no accept rule fixes it here.
     #[inline]
     pub fn sole_cell_key(&self, hash: u64) -> Option<u64> {
-        let head = self.cells.get(&hash)?;
+        let head = self.lookup_chain(hash)?;
         if head.next.is_some() {
             return None;
         }
@@ -2446,8 +2457,16 @@ impl WarmEnterState {
     fn mint_cell_key(&mut self, bucket: u64) -> u64 {
         loop {
             self.mint_serial = self.mint_serial.wrapping_add(1);
+            // The serial must reach the fold as the VALUE, not pre-mixed into
+            // the accumulator: `green_uhash_step(bucket ^ serial, Int, serial)`
+            // folds `(bucket ^ serial) ^ serial`, which is `bucket` again, so
+            // every retry re-proposes one number and the second mint in a
+            // bucket cannot terminate. Folded here, distinct serials give
+            // distinct candidates — xor and the odd multiplier are both
+            // bijections — so the retry walks a fresh number each time and the
+            // finite live set bounds it.
             let candidate = majit_ir::green_uhash_step(
-                bucket ^ self.mint_serial,
+                bucket,
                 majit_ir::GreenType::Int,
                 self.mint_serial as i64,
             );
@@ -5009,6 +5028,31 @@ mod tests {
         (this_prefix ^ other_prefix ^ (other.values[1] as u64)) as i64
     }
 
+    /// A two-`Int` green key beginning with `first` whose `get_uhash` is
+    /// exactly `target`.
+    ///
+    /// [`colliding_last_green`] matches another key's hash; this hits an
+    /// arbitrary number, which is what turns "every `u64` is a hash some green
+    /// key can produce" ([`WarmEnterState::mint_cell_key`]) from an assertion
+    /// into a fixture. `get_uhash` folds `x = (x ^ v) * GREEN_UHASH_MULT` over
+    /// `Int` greens (warmstate.py:584-593) and the multiplier is odd, hence
+    /// invertible mod 2^64, so the last green is `prefix ^ target * mult^-1`.
+    fn green_key_hashing_to(target: u64, first: i64) -> GreenKey {
+        use majit_ir::{GREEN_UHASH_MULT, GREEN_UHASH_SEED, GreenType, green_uhash_step};
+        // Newton iteration for the inverse of an odd multiplier mod 2^64: each
+        // step doubles the number of correct low bits, so six take 1 to 64.
+        let mut inverse: u64 = 1;
+        for _ in 0..6 {
+            inverse =
+                inverse.wrapping_mul(2u64.wrapping_sub(GREEN_UHASH_MULT.wrapping_mul(inverse)));
+        }
+        assert_eq!(GREEN_UHASH_MULT.wrapping_mul(inverse), 1);
+        let prefix = green_uhash_step(GREEN_UHASH_SEED, GreenType::Int, first);
+        let key = GreenKey::new(vec![first, (prefix ^ target.wrapping_mul(inverse)) as i64]);
+        assert_eq!(key.get_uhash(), target, "the fold must invert exactly");
+        key
+    }
+
     /// A token that answers `has_compiled_code()`, which is what both halves of
     /// the entry gate test. The payload is never read — `has_compiled_code` is
     /// `self.compiled.get().is_some()` — so its type only has to satisfy the
@@ -5200,10 +5244,13 @@ mod tests {
     /// than guessing which sibling was meant.
     ///
     /// This is the answer to the hazard the hash-only cell creators leave
-    /// behind: they install cells with `comparekey: None`
-    /// (`attach_procedure_to_interp`, `attach_tmp_callback_to_interp`,
-    /// `disable_noninlinable_function`, `mark_as_being_traced`,
-    /// `mark_force_finish_tracing`, `transition_cell`), and a cell with no
+    /// behind. That population is not a list kept in prose but a property of
+    /// one function: a creator is exactly a caller of
+    /// [`WarmEnterState::ensure_cell_by_key`], because that is the only place a
+    /// cell is installed from a bare `u64`, and it installs `comparekey: None`
+    /// since a caller holding only a number has no greens to store. Anything
+    /// reaching the celltable with a `&GreenKey` goes through
+    /// `ensure_cell_for_key` instead and stores its comparator. A cell with no
     /// comparator cannot be told from a colliding neighbour by any mechanism —
     /// upstream cannot even express the state, since `JitCell.__init__`
     /// (warmstate.py:610-616) always stores the greens.
@@ -5253,6 +5300,194 @@ mod tests {
         assert_eq!(
             ws.cell_by_key(bucket).and_then(|cell| cell.cell_key),
             Some(first_key),
+        );
+    }
+
+    /// **A bucket that has to mint twice must get two different keys.**
+    ///
+    /// [`WarmEnterState::mint_cell_key`] retries `green_uhash_step` against the
+    /// live key set, which only terminates if the candidate MOVES between
+    /// retries. Mixing the serial into the accumulator instead of passing it as
+    /// the folded value cancels it — `green_uhash_step(bucket ^ serial, Int,
+    /// serial)` folds `(bucket ^ serial) ^ serial`, which is `bucket` — so
+    /// every retry re-proposes the single number `bucket * GREEN_UHASH_MULT`.
+    /// The first mint in a bucket takes it and the second spins forever.
+    ///
+    /// Three cells in one bucket is the smallest state that asks for two mints,
+    /// and nothing exotic reaches it: `install_new_cell` (counter.py:246-256)
+    /// chains every cell whose `should_remove_jitcell` is false, so three warm
+    /// keys sharing a bucket is enough.
+    ///
+    /// **Pre-fix reading.** This test does not fail, it HANGS — the run was
+    /// killed after 11 minutes of CPU inside `mint_cell_key`'s retry loop.
+    #[test]
+    fn a_bucket_that_mints_twice_gets_two_different_keys() {
+        let mut ws = WarmEnterState::new(100);
+        let first = GreenKey::new(vec![9100, 9200]);
+        let second = GreenKey::new(vec![9300, colliding_last_green(&first, 9300)]);
+        let third = GreenKey::new(vec![9400, colliding_last_green(&first, 9400)]);
+        let bucket = first.get_uhash();
+        assert_eq!(second.get_uhash(), bucket, "fixture: one bucket");
+        assert_eq!(third.get_uhash(), bucket, "fixture: three keys");
+
+        // A procedure token each, so `should_remove_jitcell` keeps all three
+        // and the bucket really chains rather than pruning down to one.
+        let mut keys = Vec::new();
+        for key in [&first, &second, &third] {
+            let token = token_with_compiled_code(&mut ws);
+            ws.attach_procedure_to_interp_for_key(key, token);
+            keys.push(
+                ws.cell_key_for(key)
+                    .expect("each key owns the cell just installed for it"),
+            );
+        }
+
+        assert_eq!(keys[0], bucket, "the first occupant keeps the raw hash");
+        assert_ne!(keys[1], keys[0], "the second had to be minted one");
+        assert_ne!(
+            keys[2], keys[1],
+            "and the third must be minted a DIFFERENT one, or the two cells \
+             share an identity and the artifact tables indexed by it collapse",
+        );
+        assert_ne!(keys[2], keys[0]);
+        for (key, cell_key) in [&first, &second, &third].iter().zip(&keys) {
+            assert_eq!(
+                ws.cell_by_key(*cell_key).and_then(|cell| cell.cell_key),
+                Some(*cell_key),
+                "each minted key must name its own cell",
+            );
+            assert_eq!(ws.cell_key_for(key), Some(*cell_key));
+        }
+    }
+
+    /// **Two readers of one raw hash inspected two different buckets.**
+    ///
+    /// [`WarmEnterState::resolve_cell_key`] asks
+    /// [`WarmEnterState::bucket_is_chained`] whether a `GreenKey` has to be
+    /// built at all, and answers from [`WarmEnterState::sole_cell_key`] when it
+    /// does not. Both take a raw green-key hash, but they reached the celltable
+    /// by different routes: `bucket_is_chained` went through
+    /// [`WarmEnterState::bucket_of`], which maps a CELL KEY to the bucket that
+    /// cell lives in, while `sole_cell_key` indexed the celltable directly.
+    ///
+    /// The routes agree on every number that is not a live minted key, and a
+    /// minted key is reachable as a raw hash: `mint_cell_key` steps
+    /// `green_uhash_step` against the live set and every `u64` is a hash some
+    /// green key produces (see its doc), so [`green_key_hashing_to`] builds the
+    /// green key whose own hash IS the minted number. `bucket_of` then sent
+    /// `bucket_is_chained` to the minted cell's bucket while `sole_cell_key`
+    /// read the bucket the hash names — two buckets, one number, opposite
+    /// answers.
+    ///
+    /// Upstream has one route and cannot express the split: every reader starts
+    /// at `jitcounter.lookup_chain(hash)` with `hash = JitCell.get_uhash(...)`
+    /// — `maybe_compile_and_run` (warmstate.py:461-464), `get_jitcell`
+    /// (warmstate.py:596-604) and `_ensure_jit_cell_at_key`
+    /// (warmstate.py:635-641) all spell it that way — and `lookup_chain`
+    /// (counter.py:239-240) is a bare `celltable[self._get_index(hash)]` with
+    /// nothing in front of it.
+    ///
+    /// **Pre-fix reading.** Routing `bucket_is_chained` through `bucket_of`
+    /// fails the third assertion below, and substituting that one line back is
+    /// the whole difference between the two trees:
+    ///
+    /// ```text
+    /// panicked at majit/majit-metainterp/src/warmstate.rs:5446:9:
+    /// the two readers of one raw hash must describe ONE bucket: `sole_cell_key`
+    /// declined because the bucket this hash names is chained, and this answered
+    /// `unchained` about the bucket `bucket_of` sent it to instead
+    /// ```
+    ///
+    /// The assertions after it are what that costs: the entry resolves to a
+    /// cell belonging to neither the arriving key nor its sibling.
+    #[test]
+    fn a_raw_hash_equal_to_a_minted_key_resolves_through_one_bucket() {
+        let mut ws = WarmEnterState::new(100);
+
+        // A bucket that mints. A hash-only creator squats the raw hash with a
+        // comparator-less cell, so the typed writer behind it cannot match it
+        // and installs a second cell, which has to be minted a key. The squatter
+        // is cold and tokenless, so `install_new_cell`'s `should_remove_jitcell`
+        // gate (counter.py:246-256) drops it within that same call — leaving the
+        // minted cell alone in its bucket.
+        let parked = GreenKey::new(vec![7100, 7200]);
+        let parked_bucket = parked.get_uhash();
+        ws.ensure_cell_by_key(parked_bucket);
+        let parked_token = token_with_compiled_code(&mut ws);
+        ws.attach_procedure_to_interp_for_key(&parked, Arc::clone(&parked_token));
+        let minted = ws
+            .cell_key_for(&parked)
+            .expect("the typed writer's cell is reachable by its own key");
+        assert_ne!(
+            minted, parked_bucket,
+            "fixture: the squatter held the raw hash when the typed cell was \
+             filed, so that cell had to be minted a key — the minted number is \
+             the subject here",
+        );
+        assert!(
+            !ws.bucket_is_chained(parked_bucket),
+            "fixture: the squatter was pruned, so the minted cell's bucket holds \
+             exactly one cell and both routes call it unchained",
+        );
+
+        // The green key whose own hash IS that minted number, plus a sibling
+        // colliding with it, so the bucket the number names is CHAINED while
+        // the bucket `bucket_of` maps it to is not.
+        let arriving = green_key_hashing_to(minted, 8100);
+        let sibling = green_key_hashing_to(minted, 8200);
+        assert_ne!(arriving, sibling, "fixture: two different green keys");
+        let arriving_token = token_with_compiled_code(&mut ws);
+        ws.attach_procedure_to_interp_for_key(&arriving, Arc::clone(&arriving_token));
+        let sibling_token = token_with_compiled_code(&mut ws);
+        ws.attach_procedure_to_interp_for_key(&sibling, Arc::clone(&sibling_token));
+        assert!(
+            !Arc::ptr_eq(&arriving_token, &sibling_token),
+            "fixture: the two cells hold different artifacts",
+        );
+        assert!(
+            ws.lookup_chain(minted)
+                .is_some_and(|head| head.next.is_some()),
+            "fixture: the bucket this hash names holds both keys' cells",
+        );
+
+        // THE DISAGREEMENT.
+        assert_eq!(
+            ws.sole_cell_key(minted),
+            None,
+            "the bucket this hash names has two candidates, so the greens-less \
+             reader declines",
+        );
+        assert!(
+            ws.bucket_is_chained(minted),
+            "the two readers of one raw hash must describe ONE bucket: \
+             `sole_cell_key` declined because the bucket this hash names is \
+             chained, and this answered `unchained` about the bucket `bucket_of` \
+             sent it to instead",
+        );
+
+        // What that costs, end to end: the entry arrives with this hash and the
+        // greens behind it, and has to reach the arriving key's own cell.
+        let carried = ws.resolve_cell_key(minted, || arriving.clone());
+        assert!(
+            Arc::ptr_eq(
+                &ws.get_procedure_token(carried)
+                    .expect("the carried cell key names a cell"),
+                &arriving_token,
+            ),
+            "the resolve answered a key naming a cell that belongs to neither \
+             the arriving key nor its sibling",
+        );
+
+        // Non-vacuity: the raw hash has not stopped naming the parked key's
+        // cell, so answering it unchanged is answering a foreign cell.
+        assert_ne!(carried, minted);
+        assert!(
+            Arc::ptr_eq(
+                &ws.get_procedure_token(minted)
+                    .expect("the minted key names its own cell"),
+                &parked_token,
+            ),
+            "and the cell it would have answered is the parked key's",
         );
     }
 
