@@ -155,6 +155,25 @@ def _close_midway(directory):
     del iterator
 
 
+# Closing partway through ends the enumeration, so the entries that were never
+# read are not handed out afterwards.
+def _closed_iterator_stops():
+    directory = tempfile.mkdtemp()
+    try:
+        for name in ("a", "b", "c"):
+            with open(os.path.join(directory, name), "w"):
+                pass
+        iterator = os.scandir(directory)
+        next(iterator)
+        iterator.close()
+        assert_raises(StopIteration, lambda: next(iterator))
+    finally:
+        shutil.rmtree(directory)
+
+
+_closed_iterator_stops()
+
+
 assert _scandir_warnings(_abandon_midway), "an abandoned scandir iterator is unclosed"
 assert not _scandir_warnings(_exhaust), "an exhausted scandir iterator is closed"
 assert not _scandir_warnings(_close_midway), "a closed scandir iterator is closed"
