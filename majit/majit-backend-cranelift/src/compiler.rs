@@ -6375,6 +6375,13 @@ fn emit_jitframe_write_barrier(
     builder.switch_to_block(slow_block);
     builder.seal_block(slow_block);
     builder.set_cold_block(slow_block);
+    // The guarded entry, not `jit_remember_young_pointer`.  The inline test is
+    // necessary but not sufficient for a frame: it can be a block built off the
+    // GC (`jitframe::alloc_off_gc_jitframe`), and a forwarded nursery header
+    // reads 0xFF at the flag byte, so the mask fires on addresses only
+    // `do_write_barrier`'s null, `is_in_nursery`, `is_managed_heap_object` and
+    // `registered_pyobject_header` checks decline.
+    // `write_barrier_skips_forwarded_nursery_address` pins the forwarded case.
     let jf_arg = ptr_arg_as_i64(builder, jf_ptr, ptr_type);
     let _ = emit_host_call(
         builder,

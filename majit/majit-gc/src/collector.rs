@@ -5753,7 +5753,7 @@ impl MiniMarkGC {
     /// Not every jitframe is nursery-allocated: the runner's entry frame, the
     /// realloc slowpath, and the JITFRAME nursery slowpath's fallback build
     /// frames off the GC — the class `shadow_stack::register_libc_jitframe`
-    /// exists to track. Those go through `jitframe::alloc_libc_jitframe`,
+    /// exists to track. Those go through `jitframe::alloc_off_gc_jitframe`,
     /// which reserves a zeroed header word so the inline test's read at
     /// `jit_wb_if_flag_byteofs` (negative, where a header would be) stays
     /// inside the allocation and finds the flag clear. Reaching this helper
@@ -8268,7 +8268,7 @@ mod tests {
         //
         // A jitframe allocated off the GC is not in any managed generation,
         // so the word in front of it is not a header this collector owns.
-        // `jitframe::alloc_libc_jitframe` keeps that word reserved and zeroed,
+        // `jitframe::alloc_off_gc_jitframe` keeps that word reserved and zeroed,
         // which is what stops the inline test from entering the helper at all;
         // this test covers the residue — the helper being entered anyway, with
         // the flag bit set, for a block the GC does not manage. Without the
