@@ -1527,6 +1527,72 @@ pub fn init_typeobjects() {
             new_typeobject_with_base("tuple", |_| {}, object_type) as usize,
         );
 
+        // TypeDef constructor signatures live on W_TypeObject itself, not on
+        // the `__new__` descriptor.  PyPy supplies this field explicitly for
+        // list (`listobject.py:2459`) and the two functional types
+        // (`functional.py:341,434`).  Python 3.14 publishes the additional
+        // signatures below; pyre targets that newer public surface when it
+        // differs from the vendored PyPy 3.11 sources.  Types omitted here
+        // intentionally expose None (for example int, str, bytes and dict).
+        for (pytype, signature) in [
+            (
+                &pyre_object::BOOL_TYPE as *const PyType,
+                "(object=False, /)",
+            ),
+            (&pyre_object::FLOAT_TYPE as *const PyType, "(x=0, /)"),
+            (
+                &pyre_object::COMPLEX_TYPE as *const PyType,
+                "(real=0, imag=0)",
+            ),
+            (
+                &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType,
+                "(object)",
+            ),
+            (&pyre_object::LIST_TYPE as *const PyType, "(iterable=(), /)"),
+            (
+                &pyre_object::TUPLE_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::setobject::SET_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::setobject::FROZENSET_TYPE as *const PyType,
+                "(iterable=(), /)",
+            ),
+            (
+                &pyre_object::descriptor::PROPERTY_TYPE as *const PyType,
+                "(fget=None, fset=None, fdel=None, doc=None)",
+            ),
+            (
+                &pyre_object::functional::ENUMERATE_TYPE as *const PyType,
+                "(iterable, start=0)",
+            ),
+            (
+                &pyre_object::functional::REVERSED_TYPE as *const PyType,
+                "(sequence, /)",
+            ),
+            (
+                &pyre_object::functional::MAP_TYPE as *const PyType,
+                "(function, iterable, /, *iterables, strict=False)",
+            ),
+            (
+                &pyre_object::functional::FILTER_TYPE as *const PyType,
+                "(function, iterable, /)",
+            ),
+            (
+                &pyre_object::functional::ZIP_TYPE as *const PyType,
+                "(*iterables, strict=False)",
+            ),
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as usize))
+                .expect("text-signature type must already be registered")
+                as PyObjectRef;
+            unsafe { pyre_object::w_type_set_text_signature(w_typeobject, signature) };
+        }
+
         // rclass.py:739-743 parity — cache W_TypeObject on each PyType
         // so allocators can set w_class at allocation time (like RPython's
         // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).

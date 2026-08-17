@@ -4853,18 +4853,12 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
                 )),
             };
         }
-        if pyre_object::is_long_range_iter(obj) {
-            // `functional.py W_LongRangeIterator.descr_len → w_len - w_index`.
-            return Ok(pyre_object::range_bigint_to_obj(
-                pyre_object::w_long_range_iter_len(obj),
-            ));
-        }
-        if is_range_iter(obj) {
-            // `functional.py W_IntRangeIterator.descr_len` reports the
-            // stored `remaining` count directly.
-            let r = &*(obj as *const pyre_object::functional::W_IntRangeIterator);
-            return Ok(w_int_new(r.remaining.max(0)));
-        }
+        // A range iterator deliberately has `__length_hint__`, not `__len__`.
+        // `functional.py W_AbstractRangeIterator.typedef` exposes `descr_len`
+        // only under the former name, just like CPython 3.14's
+        // `range_iterator` and `longrange_iterator` type dictionaries.  Do
+        // not turn the concrete payload's remaining count into a length slot:
+        // `len(iter(range(...)))` must fall through and raise TypeError.
         // descroperation.py `_len` — `space.lookup(w_obj, '__len__')`
         // then `space.get_and_call_function(w_descr, w_obj)`.  Routed through
         // `r#type` so a true user instance, a W_Root type (e.g. `deque`), and

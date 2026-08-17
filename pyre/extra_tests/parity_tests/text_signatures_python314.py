@@ -99,6 +99,31 @@ assert str(inspect.signature(print)) == (
     "(*args, sep=' ', end='\\n', file=None, flush=False)"
 )
 
+# Constructor signatures are metadata on the type object, separate from the
+# signatures on each type's ``__new__`` descriptor.
+TYPE_EXPECTED = {
+    bool: "(object=False, /)",
+    float: "(x=0, /)",
+    complex: "(real=0, imag=0)",
+    memoryview: "(object)",
+    list: "(iterable=(), /)",
+    tuple: "(iterable=(), /)",
+    set: "(iterable=(), /)",
+    frozenset: "(iterable=(), /)",
+    property: "(fget=None, fset=None, fdel=None, doc=None)",
+    enumerate: "(iterable, start=0)",
+    reversed: "(sequence, /)",
+    map: "(function, iterable, /, *iterables, strict=False)",
+    filter: "(function, iterable, /)",
+    zip: "(*iterables, strict=False)",
+}
+
+for cls, signature in TYPE_EXPECTED.items():
+    assert cls.__text_signature__ == signature, cls
+
+for cls in (int, str, bytes, bytearray, dict, range, slice, super, type):
+    assert cls.__text_signature__ is None, cls
+
 
 # bytearray_text_signatures_python314
 

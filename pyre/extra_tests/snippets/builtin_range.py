@@ -7,6 +7,16 @@ assert len(range(10, 5)) == 0, "Range with no elements should have length = 0"
 assert len(range(10, 5, -2)) == 3, "Expected length 3, for elements: 10, 8, 6"
 assert len(range(5, 10, 2)) == 3, "Expected length 3, for elements: 5, 7, 9"
 
+# Range iterators expose their remaining count as __length_hint__, not as a
+# sequence length.  Both the machine-word and bigint iterator variants must
+# therefore reject len().
+small_iter = iter(range(3))
+assert small_iter.__length_hint__() == 3
+assert_raises(TypeError, len, small_iter)
+big_iter = iter(range(2**100))
+assert big_iter.__length_hint__() == 2**100
+assert_raises(TypeError, len, big_iter)
+
 # index tests
 assert range(10).index(6) == 6
 assert range(4, 10).index(6) == 2
