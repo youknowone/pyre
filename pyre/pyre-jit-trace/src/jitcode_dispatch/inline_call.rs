@@ -5746,6 +5746,19 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         Some((instance, ConcreteValue::Ref(concrete_instance))),
     )?;
     if inlined.is_none() {
+        // The `[type-call-inline]` line above is printed before this sub-walk is
+        // attempted, because that is where the class and the `init` shape are
+        // known — so on its own it reports that the fold *began*, not that it
+        // stood.  Say so when it does not: without this line the diagnostic
+        // reads as a successful fold on a trace that ends up carrying the whole
+        // instantiation as a residual.
+        if type_call_diag_enabled() {
+            eprintln!(
+                "[type-call-rewind] pc={} class={} why=__init__ sub-walk declined",
+                op.pc,
+                unsafe { pyre_object::w_type_get_name(w_type) },
+            );
+        }
         ctx.trace_ctx.cut_trace(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
     }
