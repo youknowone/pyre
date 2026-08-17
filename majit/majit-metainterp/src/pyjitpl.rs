@@ -7731,6 +7731,26 @@ impl<M: Clone> MetaInterp<M> {
             // `jitdriver.rs:6288` keeps an invalidated loop's target tokens on
             // purpose. Reading both halves off the token is what makes the
             // filter cover the target as well as the gate.
+            //
+            // Resolving to a TargetToken descr here, where `pyjitpl.py:3213-3214`
+            // records the JitCellToken itself, is early binding rather than a
+            // different answer. Upstream's cell-token descr is a placeholder the
+            // optimizer always consumes, in one of two ways: `unroll.py:196-199`
+            // takes `jump_to_preamble` when the target list holds one entry, and
+            // `:238-241` rewrites the descr to `cell_token.target_tokens[0]` —
+            // element zero, unconditionally, exactly what `first_target_token`
+            // answers; otherwise `:320-359` virtual-state matches and rewrites to
+            // the token it picked. Both consumers exist here:
+            // `jump_to_existing_trace_impl` (`unroll.rs`) iterates every
+            // candidate, and its `unroll.py:357-359` arm re-points this JUMP's
+            // descr at whichever token matched. So the ladder is not bypassed by
+            // binding early; only the preamble arm keeps what is recorded here.
+            //
+            // The equivalence needs the list to be unchanged between the two
+            // points, and it is: recording and optimizing are one synchronous
+            // sequence in this function (cut → record → snapshot → optimize) on
+            // the single JIT thread, and `optimize_bridge` mints no target
+            // tokens.
             let jump_descr = self
                 .warm_state
                 .get_procedure_token(green_key)
@@ -7748,6 +7768,25 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29); // compile_trace: no front target token
                 return CompileOutcome::Cancelled;
             };
+            // The descr list on the token and the value list in
+            // `compiled_loops` are two projections of one thing, written by
+            // separate statements, and nothing else checks that they agree.
+            // Upstream cannot drift because `token.target_tokens` holds the
+            // TargetTokens themselves; the split here is forced by the crate
+            // layering (`JitCellToken` lives in majit-backend, which cannot
+            // name a `VirtualState`). This asserts what that layering costs us
+            // the ability to guarantee: the head the optimizer will see is the
+            // head whose value the ladder reads.
+            debug_assert!(
+                self.compiled_loops
+                    .get(&green_key)
+                    .and_then(|compiled| compiled.front_target_tokens.first())
+                    .is_none_or(|front| majit_ir::descr_identity(
+                        &front.as_jump_target_descr()
+                    ) == majit_ir::descr_identity(&jump_descr)),
+                "compile_trace: token target-descr head disagrees with \
+                 front_target_tokens head for key={green_key}"
+            );
             ctx.recorder
                 .close_loop_with_descr(finish_args, Some(jump_descr));
         }
