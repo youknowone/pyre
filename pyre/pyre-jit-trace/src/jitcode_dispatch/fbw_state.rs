@@ -2366,6 +2366,41 @@ macro_rules! replay_dirty {
     }};
 }
 
+/// The `pc` a `[replay-dirty]` line names is an offset into the scanned
+/// callee's jitcode, and no per-function dump covers a callee — so on its own
+/// the number cannot be matched against any op.  `PYRE_FBW_REPLAY_DIRTY_BODY=1`
+/// lists each body as it is scanned, so the verdict line that follows a listing
+/// names an op within it.
+fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
+    if !fbw_inline_diag_enabled() || std::env::var_os("PYRE_FBW_REPLAY_DIRTY_BODY").is_none() {
+        return;
+    }
+    eprintln!(
+        "[replay-dirty-body] === scanning body len={} ===",
+        body_code.len()
+    );
+    for d in crate::jitcode_runtime::decoded_ops(body_code) {
+        // Every residual verdict below turns on the helper kind, and the opname
+        // alone does not separate a deferred `call_fn` from an untagged helper
+        // that declines the whole body — so name it.
+        let helper = if d.opname.starts_with("residual_call") {
+            residual_call_descr_index_in_body(body_code, &d)
+                .and_then(|i| callee_descr_refs.get(i))
+                .and_then(|descr| descr.as_call_descr())
+                .map_or_else(
+                    || " helper=<no call descr>".to_string(),
+                    |cd| format!(" helper={:?}", cd.get_extra_info().pyre_helper),
+                )
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "[replay-dirty-body]   pc={:>4} {}/{}{}",
+            d.pc, d.opname, d.argcodes, helper
+        );
+    }
+}
+
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
     exact_numeric_args: &[ExactNumericArg],
@@ -2376,6 +2411,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
     callee_descr_refs: &[DescrRef],
     method_form_deferred_helpers: bool,
 ) -> CalleeReplaySafety {
+    replay_safety_dump_body(body_code, callee_descr_refs);
     let Some(branch_targets) = body_branch_targets(body_code) else {
         replay_dirty!("BranchTargetsUndecodable", 0, "-");
     };
@@ -2547,6 +2583,12 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // reads the same value again.  Its writing twin
             // `SetCurrentException` is not here — it is journalled, and so
             // reaches the `deferred_call` arm below instead.
+            // `load_deref` is that same shape once more, and it is the one every
+            // closure body carries: `bh_load_deref_value_fn` dereferences a cell
+            // and returns its contents, writing nothing, so a replay reads the
+            // same cell again.  Its raise on an unbound free variable is no
+            // barrier — `load_global` above raises `NameError` too, and a replay
+            // raises the same one.  Its writing twin `StoreDeref` is not here.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
