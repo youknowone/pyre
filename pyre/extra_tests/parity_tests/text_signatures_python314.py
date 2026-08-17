@@ -7,6 +7,7 @@ These cases share one process and one descriptor-checking harness so adding a
 type does not duplicate the test machinery or interpreter startup.
 """
 
+import array
 import builtins
 import inspect
 import sys
@@ -452,6 +453,94 @@ for typ, names in METHODS.items():
 assert str(inspect.signature(enumerate.__next__)) == "(self, /)"
 assert str(inspect.signature(reversed.__setstate__)) == "(self, object, /)"
 assert str(inspect.signature(enumerate.__class_getitem__)) == "(object, /)"
+
+
+class Sequence:
+    def __getitem__(self, index):
+        raise IndexError
+
+
+ITERATOR_METHODS = [
+    (
+        type(iter(Sequence())),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter([])),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(reversed([])),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(b"")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter(bytearray())),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter("")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter("é")),
+        ("__iter__", "__next__", "__reduce__", "__length_hint__", "__setstate__"),
+    ),
+    (
+        type(iter(range(1))),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (
+        type(iter(range(2**100))),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__", "__setstate__"),
+    ),
+    (type(iter(set())), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (type(iter({})), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (
+        type(iter({}.values())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (type(iter({}.items())), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (type(reversed({})), ("__iter__", "__next__", "__length_hint__", "__reduce__")),
+    (
+        type(reversed({}.values())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (
+        type(reversed({}.items())),
+        ("__iter__", "__next__", "__length_hint__", "__reduce__"),
+    ),
+    (type(iter(lambda: None, None)), ("__iter__", "__next__", "__reduce__")),
+    (type(iter(memoryview(b""))), ("__iter__", "__next__")),
+    (
+        type(iter(array.array("i"))),
+        ("__iter__", "__next__", "__reduce__", "__setstate__"),
+    ),
+]
+
+for typ, names in ITERATOR_METHODS:
+    for name in names:
+        parameter = "state" if typ.__name__ == "arrayiterator" else "object"
+        expected = (
+            f"($self, {parameter}, /)" if name == "__setstate__" else "($self, /)"
+        )
+        assert typ.__dict__[name].__text_signature__ == expected, (typ, name)
+
+callable_iterator = type(iter(lambda: None, None))
+assert "__doc__" in callable_iterator.__dict__
+assert callable_iterator.__dict__["__doc__"] is None
+assert str(inspect.signature(type(iter([])).__setstate__)) == "(self, object, /)"
+assert (
+    str(inspect.signature(type(iter(array.array("i"))).__setstate__))
+    == "(self, state, /)"
+)
 
 
 # int_text_signatures_python314

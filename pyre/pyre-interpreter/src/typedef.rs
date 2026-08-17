@@ -27341,6 +27341,15 @@ fn init_set_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+        ],
+    );
 }
 
 fn generator_frame(obj: PyObjectRef) -> *mut crate::pyframe::PyFrame {
@@ -28031,6 +28040,18 @@ fn init_coroutine_wrapper_type(ns: PyObjectRef) {
 }
 
 /// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
+fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'static str)]) {
+    // PyPy's TypeDefs above remain the owner of the concrete methods.  CPython
+    // 3.14's slot wrappers and Argument Clinic descriptors additionally carry
+    // these introspection strings, so fill the corresponding Function field
+    // without replacing the PyPy-shaped carriers.
+    for &(name, text_signature) in signatures {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("iterator TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
+}
+
 fn init_sequence_iterator_type(ns: PyObjectRef) {
     // PyPy carries the `iter()` builtin documentation on the abstract typedef;
     // Python 3.14's concrete `iterator` type exposes `__doc__ is None`.
@@ -28072,6 +28093,16 @@ fn init_sequence_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 `PySeqIter_Type` restricted to `memory_iterator`'s surface:
@@ -28094,6 +28125,10 @@ fn init_memory_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[("__iter__", "($self, /)"), ("__next__", "($self, /)")],
+    );
 }
 
 /// `arrayiterator`'s Python 3.14 surface: the iteration protocol plus the
@@ -28131,12 +28166,22 @@ fn init_array_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, state, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 `PyCallIter_Type` (`callable_iterator`) surface. PyPy 3.11's
 /// `_CallableIterator` is app-level and has only the iteration methods; 3.14
 /// additionally exposes the native pickle reduction hook.
 fn init_callable_iterator_type(ns: PyObjectRef) {
+    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", pyre_object::w_none()) };
     for (name, function) in [
         (
             "__iter__",
@@ -28156,6 +28201,14 @@ fn init_callable_iterator_type(ns: PyObjectRef) {
             )
         };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+        ],
+    );
 }
 
 fn dict_iterator_receiver(
@@ -28243,6 +28296,15 @@ macro_rules! define_dict_iterator_type {
             for (name, value) in entries {
                 unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
             }
+            set_iterator_text_signatures(
+                ns,
+                &[
+                    ("__iter__", "($self, /)"),
+                    ("__next__", "($self, /)"),
+                    ("__length_hint__", "($self, /)"),
+                    ("__reduce__", "($self, /)"),
+                ],
+            );
         }
     };
 }
@@ -28378,6 +28440,16 @@ fn init_range_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 /// Python 3.14 exposes the arbitrary-precision implementation as the distinct
@@ -28409,6 +28481,16 @@ fn init_long_range_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_list_iterator_type(ns: PyObjectRef) {
@@ -28450,6 +28532,16 @@ fn init_list_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_list_reverse_iterator_type(ns: PyObjectRef) {
@@ -28491,6 +28583,16 @@ fn init_list_reverse_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 fn init_tuple_iterator_type(ns: PyObjectRef) {
@@ -28532,6 +28634,16 @@ fn init_tuple_iterator_type(ns: PyObjectRef) {
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
     }
+    set_iterator_text_signatures(
+        ns,
+        &[
+            ("__iter__", "($self, /)"),
+            ("__next__", "($self, /)"),
+            ("__length_hint__", "($self, /)"),
+            ("__reduce__", "($self, /)"),
+            ("__setstate__", "($self, object, /)"),
+        ],
+    );
 }
 
 // ── itertools.count / itertools.repeat TypeDefs ─────────────────────
