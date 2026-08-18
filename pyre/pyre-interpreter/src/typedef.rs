@@ -10441,6 +10441,18 @@ fn readonly_attribute(descr: pyre_object::PyObjectRef) -> crate::PyError {
     }
 }
 
+/// CPython 3.14 `slotdefs[]`'s single `tp_descr_get` wrapper definition.
+/// Every builtin descriptor type below publishes the same positional-only
+/// surface; keeping it here mirrors the one `TPSLOT(__get__, ...)` row rather
+/// than duplicating its signature at each PyPy TypeDef registration.
+fn make_descr_get_builtin(func: crate::gateway::BuiltinCodeFn) -> PyObjectRef {
+    crate::gateway::make_builtin_function_with_text_signature(
+        "__get__",
+        func,
+        "($self, instance, owner=None, /)",
+    )
+}
+
 /// typedef.py GetSetProperty.typedef = TypeDef("getset_descriptor", ...)
 fn init_getset_descriptor_type(ns: PyObjectRef) {
     // typedef.py GetSetProperty.descr_property_get
@@ -10470,7 +10482,7 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
+            make_descr_get_builtin(|args| {
                 crate::type_methods::arity_at_least(args, "__get__", 1)?;
                 crate::type_methods::arity_at_most(args, "__get__", 2)?;
                 let w_self = args[0];
@@ -14851,7 +14863,7 @@ fn init_slot_wrapper_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| wrap_descr_get(args, bind_slot_wrapper)),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_slot_wrapper)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15251,9 +15263,7 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
-                wrap_descr_get(args, bind_method_descriptor)
-            }),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_method_descriptor)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15416,9 +15426,7 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
-                wrap_descr_get(args, bind_classmethod_descriptor)
-            }),
+            make_descr_get_builtin(|args| wrap_descr_get(args, bind_classmethod_descriptor)),
         );
         pyre_object::w_dict_setitem_str_no_proxy(
             ns,
@@ -15866,7 +15874,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| {
+            make_descr_get_builtin(|args| {
                 let descr = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 if descr.is_null() || !unsafe { pyre_object::typedef::is_member(descr) } {
                     return Ok(pyre_object::w_none());
