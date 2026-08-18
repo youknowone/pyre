@@ -4346,6 +4346,13 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
             if u.firstunwrapped {
                 // a fresh longlong list of one element occupies a new slot
                 let unboxed = erase_unboxed(&[val]);
+                // `erase_unboxed` hands back a block nothing references yet, so
+                // it needs a root until whichever store below lands claims it.
+                // The block does not move, so one pin carries it and it is
+                // never read back.  The sibling arm needs none: its
+                // `erase_unboxed` is the argument expression of the store.
+                let _unboxed_root = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(unboxed);
                 if unsafe { (*attr).storage_needed() } > obj._mapdict_storage_length() {
                     obj._set_mapdict_increase_storage1(attr, unboxed);
                     return;
@@ -4382,10 +4389,24 @@ unsafe fn reorder_and_add<O: MapdictObject>(
     obj: &mut O,
     mut number_to_readd: usize,
     mut attr: MapRef,
-    mut w_value: PyObjectRef,
+    w_value: PyObjectRef,
 ) {
-    let mut stack: Vec<(MapRef, PyObjectRef)> =
-        Vec::with_capacity(unsafe { (*self_node).num_attributes() } * 2);
+    // The saved values pile up in a plain `Vec` and the incoming `w_value` sits
+    // in a by-value parameter, neither of which the collector walks, while the
+    // loop keeps collecting: `_mapdict_pop_attribute` does so in either arm,
+    // and a value the read had to box carries no heap edge until something
+    // stores it, so being born old-gen buys it immobility rather than survival
+    // (`alloc_typed_items_block`).  Every word here is an arbitrary attribute
+    // value, so it can equally be a `list` or a `dict` and move.  All of them
+    // live in root slots and are read back at every use.  Map nodes are not GC
+    // objects, so the map half of each saved pair stays a plain pointer.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::pin_roots(&[w_value]);
+    // mapdict.py:227 flattens the to-be-readded `(map, value)` pairs into one
+    // array indexed by `stack_index`, which reuses its cells; taking a fresh
+    // slot per push keeps the same LIFO order without the fixed bound.
+    let mut stack: Vec<(MapRef, usize)> =
+        Vec::with_capacity(unsafe { (*self_node).num_attributes() });
     loop {
         // we found the attributes further up, need to save the previous
         // values of the attributes we passed
@@ -4394,24 +4415,39 @@ unsafe fn reorder_and_add<O: MapdictObject>(
             for _ in 0..number_to_readd {
                 // current is a PlainAttribute
                 let w_self_value = unsafe { plain_direct_read(current, obj) };
-                stack.push((current, w_self_value));
+                pyre_object::gc_roots::pin_root(w_self_value);
+                stack.push((current, pyre_object::gc_roots::shadow_stack_len() - 1));
                 current = unsafe { (*current).as_plain() }.back;
                 obj._mapdict_pop_attribute(current);
             }
         }
-        unsafe { switch_map_and_write_increase_storage1(attr, obj, w_value) };
+        unsafe {
+            switch_map_and_write_increase_storage1(
+                attr,
+                obj,
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            )
+        };
 
         // readd the current top of the stack
         match stack.pop() {
             None => return,
-            Some((next_map, next_value)) => {
-                w_value = next_value;
+            Some((next_map, next_slot)) => {
+                pyre_object::gc_roots::shadow_stack_set(
+                    value_slot,
+                    pyre_object::gc_roots::shadow_stack_get(next_slot),
+                );
                 let (name, attrkind) = {
                     let p = unsafe { (*next_map).as_plain() };
                     (p.name.clone(), p.attrkind)
                 };
                 self_node = obj._get_mapdict_map();
-                let unbox_type = unsafe { pick_unbox_type(self_node, w_value) };
+                let unbox_type = unsafe {
+                    pick_unbox_type(
+                        self_node,
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    )
+                };
                 let (n, holder) =
                     unsafe { find_branch_to_move_into(self_node, &name, attrkind, unbox_type) };
                 number_to_readd = n;
@@ -5158,14 +5194,25 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let _instance_guard = instance_lock(w_obj);
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);
-        let mut items = Vec::new();
+        // Same walk as `instance_node_dict_items`, so the same bracket: a value
+        // the read had to box is named by nothing the collector walks until the
+        // `Vec` is handed on, and old-gen birth buys immobility rather than
+        // survival, so the walk's own allocations can sweep one collected
+        // earlier.  Pin each value at its read and copy the run back once the
+        // walk is over; the names are immortal interned constants.
+        let roots = pyre_object::gc_roots::push_roots();
+        let values_base = roots.base();
+        let mut items: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
         let mut curr = node_search(inst._get_mapdict_map(), DICT);
         while let Some(node) = curr {
-            items.push((
-                pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name),
-                plain_direct_read(node, &inst),
-            ));
+            let w_key = pyre_object::unicodeobject::box_str_constant(&(*node).as_plain().name);
+            let w_value = plain_direct_read(node, &inst);
+            roots.pin_root(w_value);
+            items.push((w_key, w_value));
             curr = node_search((*node).as_plain().back, DICT);
+        }
+        for (i, entry) in items.iter_mut().enumerate() {
+            entry.1 = roots.get(values_base + i);
         }
         items
     }

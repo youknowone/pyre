@@ -1793,8 +1793,7 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
     let cache_slot = roots.base();
     let cached = crate::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY);
     roots.pin_root(cached.unwrap_or_else(pyre_object::w_dict_new));
-    if cached.is_none()
-        && crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
+    if cached.is_none() && crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
     {
         pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
     }

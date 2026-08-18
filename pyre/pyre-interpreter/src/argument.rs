@@ -1122,14 +1122,14 @@ impl Arguments {
             input_argcount += take;
         }
 
-        // `w_kw_defs`, the `**kwargs` dict, the keyword values and the words
-        // already copied into `scope_w` are all read after the allocations
-        // below — the vararg tuple, the dict itself, the keyword collection,
-        // the kwonly-default lookups — and a `list` or `dict` among them moves
-        // under any of those.  A by-value parameter copy is no more a slot the
-        // collector updates than the caller's scope buffer or `Arguments`' own
-        // vectors are, so each word is pinned here, ahead of the first
-        // allocation, and read back where it is used.
+        // `w_kw_defs`, the `**kwargs` dict, the keyword values, the positional
+        // defaults and the words already copied into `scope_w` are all read
+        // after the allocations below — the vararg tuple, the dict itself, the
+        // keyword collection, the kwonly-default lookups — and a `list` or
+        // `dict` among them moves under any of those.  A by-value parameter
+        // copy is no more a slot the collector updates than the caller's scope
+        // buffer or `Arguments`' own vectors are, so each word is pinned here,
+        // ahead of the first allocation, and read back where it is used.
         let _roots = pyre_object::gc_roots::push_roots();
         let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_kw_defs);
@@ -1145,6 +1145,11 @@ impl Arguments {
                 pyre_object::gc_roots::pin_root(w_name);
             }
         }
+        // The defaults arrive as a caller-owned slice — `Function`'s `defs_w`
+        // reaches here through a borrow, and a gateway builds its own array —
+        // so the collector rewrites neither, while the run is read out one
+        // entry at a time in the defaults loop far below.
+        let defaults_base = pyre_object::gc_roots::pin_roots(defaults_w.unwrap_or_default());
         // The scope buffer keeps its own run of slots: `w_firstarg` and the
         // positional copy above are in it already, and every later store goes
         // through `store` so the refresh before `Ok(())` reads the whole scope
@@ -1321,7 +1326,9 @@ impl Arguments {
                 }
                 let defnum = (i as isize) - def_first;
                 if defnum >= 0 {
-                    store(scope_w, i, defaults_w.unwrap()[defnum as usize]);
+                    let w_default =
+                        pyre_object::gc_roots::shadow_stack_get(defaults_base + defnum as usize);
+                    store(scope_w, i, w_default);
                 } else if let Some(list) = missing_positional.as_mut() {
                     list.push(signature.argnames[i].to_string());
                 } else {

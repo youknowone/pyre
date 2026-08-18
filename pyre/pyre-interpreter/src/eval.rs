@@ -2800,10 +2800,14 @@ impl IterOpcodeHandler for PyFrame {
             // mappingproxy iterates over its backing dict's keys.
             // dictproxyobject.py:41 descr_iter → space.iter(self.w_mapping).
             // The backing mapping is a `dict`, which moves, and publishing it
-            // to the stack slot runs the frame array's write barrier, which
-            // can collect.  Pin the mapping on the read and take the operand
-            // the rest of this function dispatches on out of the root slot,
-            // not from the word that was live before the store.
+            // to the stack slot runs the frame array's write barrier, whose
+            // slow path can wait behind a foreign collection
+            // (`FixedObjectArray::set_ref` reloads both operands across it for
+            // that reason).  Pin the mapping on the read, so both the store and
+            // the operand this dispatches on come out of the root slot rather
+            // than the word that was live before the barrier.  The bracket ends
+            // with the branch: past it the mapping is the frame's own stack
+            // slot, which the collector updates.
             let iter = if pyre_object::is_dict_proxy(iter) {
                 let roots = pyre_object::gc_roots::push_roots();
                 let mapping_slot = roots.base();

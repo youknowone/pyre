@@ -1234,7 +1234,11 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         store_str(vars_slot, "INCLUDEPY", &include_py);
         store_str(vars_slot, "CONFINCLUDEPY", &include_py);
     }
-    store_int(vars_slot, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
+    store_int(
+        vars_slot,
+        "SIZEOF_VOID_P",
+        std::mem::size_of::<usize>() as i64,
+    );
     if gnuld {
         store_str(vars_slot, "GNULD", "yes");
     }

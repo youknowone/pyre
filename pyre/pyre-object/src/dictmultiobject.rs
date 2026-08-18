@@ -5731,11 +5731,7 @@ pub trait DictStrategy {
         // next use.  A `None` default slots a null word, which the root stack
         // tolerates.
         let roots = crate::gc_roots::push_roots();
-        let dict_slot = roots.publish(&[
-            w_dict,
-            w_key,
-            w_default.unwrap_or(std::ptr::null_mut()),
-        ]);
+        let dict_slot = roots.publish(&[w_dict, w_key, w_default.unwrap_or(std::ptr::null_mut())]);
         let value_slot = dict_slot + 3;
         let w_item = self.getitem(w_dict, w_key);
         if let Some(val) = w_item {

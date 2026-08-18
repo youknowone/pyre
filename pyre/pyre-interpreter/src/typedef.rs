@@ -2931,8 +2931,7 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
             if unsafe { pyre_object::is_none(roots.get(spec_loader_slot)) } {
                 return Ok(wtf8_format!("<module ", name_repr, ">"));
             }
-            let loader_repr =
-                unsafe { crate::display::py_repr_wtf8(roots.get(spec_loader_slot))? };
+            let loader_repr = unsafe { crate::display::py_repr_wtf8(roots.get(spec_loader_slot))? };
             return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
         }
         let name_repr = unsafe { crate::display::py_repr_wtf8(roots.get(name_slot))? };
