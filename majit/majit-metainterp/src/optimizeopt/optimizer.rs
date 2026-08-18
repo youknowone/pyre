@@ -3402,20 +3402,20 @@ impl Optimizer {
                 let produced_const = short_boxes.produced_const_ops(&mut ctx);
                 // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
                 // label_args + virtuals)` — read off the ShortBoxes object and
-                // carry to export_state through the ctx channel (sibling of
-                // `exported_short_boxes` below).
-                ctx.exported_short_inputargs =
-                    short_boxes.create_short_inputargs(&preview_short_args);
-                // Carry the rooted InputArgRc pool alongside, index-aligned, so
-                // the renamed boxes stay bound to live `InputArg`s across the
-                // export boundary instead of shedding to position-only boxes.
-                ctx.exported_short_inputarg_refs = short_boxes.create_short_inputarg_refs();
+                // carry to export_state through the ctx channel, together with
+                // the rooted InputArgRc pool (index-aligned, so the renamed
+                // boxes stay bound to live `InputArg`s across the export
+                // boundary instead of shedding to position-only boxes) and the
+                // short boxes below. Bound to locals here and published as one
+                // `PreviewShortState` at the group site.
+                let short_inputargs = short_boxes.create_short_inputargs(&preview_short_args);
+                let short_inputarg_refs = short_boxes.create_short_inputarg_refs();
                 // unroll.py computes virtual_state, label_args and virtuals
                 // once, then builds ShortBoxes from that exact result. Keep
                 // the same single evaluation across majit's split preview /
                 // export implementation: producing heap facts may mutate Box
                 // forwarding, so recomputing hereafter is observably different.
-                ctx.exported_short_args_state = Some((
+                let args_state = Some((
                     preview_virtual_state.clone(),
                     preview_label_args.clone(),
                     preview_virtuals.clone(),
@@ -3552,20 +3552,20 @@ impl Optimizer {
                             same_as_source: produced.same_as_source.clone(),
                         })
                     };
-                let exported_short_boxes = produced
-                    .into_iter()
-                    .filter_map(|(result, produced)| convert_produced(result, produced, false))
-                    .collect();
+                let exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp> =
+                    produced
+                        .into_iter()
+                        .filter_map(|(result, produced)| convert_produced(result, produced, false))
+                        .collect();
                 let exported_const_short_boxes = produced_const
                     .into_iter()
                     .filter_map(|produced| {
                         convert_produced(produced.res.to_opref(), produced, true)
                     })
                     .collect();
-                ctx.exported_short_boxes = exported_short_boxes;
                 ctx.exported_const_short_boxes = exported_const_short_boxes;
                 if crate::majit_log_enabled() {
-                    for entry in &ctx.exported_short_boxes {
+                    for entry in &exported_short_boxes {
                         // Print args / same_as_source as OpRefs, not via the
                         // Operands' derived Debug: a bound InputArg/Op carries a
                         // `forwarded` slot whose Debug walks the whole abstract-value
@@ -3585,6 +3585,16 @@ impl Optimizer {
                         );
                     }
                 }
+                // Publish the preview's one evaluation as a single object: the
+                // forcing above (and its side effects) stays exactly where it
+                // is, only the publication is grouped, so the three vectors can
+                // no longer drift out of alignment.
+                ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
+                    short_inputargs,
+                    short_inputarg_refs,
+                    short_boxes: exported_short_boxes,
+                    args_state,
+                });
                 let jump_arglist_oprefs: Vec<OpRef> =
                     jump.getarglist().iter().map(|a| a.to_opref()).collect();
                 let exported_int_bounds =

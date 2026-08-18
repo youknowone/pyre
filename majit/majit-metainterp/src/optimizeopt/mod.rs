@@ -540,6 +540,45 @@ fn describe_operand_for_assert(b: &Operand) -> String {
     }
 }
 
+/// The one short-preamble evaluation the preview pass performs, carried from
+/// `optimizer.rs` (where the `ShortBoxes` object lives) to
+/// `unroll.rs::export_state_with_bounds`.
+///
+/// unroll.py:466-480 computes `virtual_state`, `label_args`, `virtuals`,
+/// `short_boxes` and `short_inputargs` in one straight line. majit splits that
+/// line across the preview pass and the export site, so the preview's single
+/// evaluation travels here: producing the potential short-preamble ops mutates
+/// Box forwarding, and a second, Rust-only recomputation at the export site is
+/// observably different.
+///
+/// The whole struct is published at one site, so the three vectors below are
+/// always built together and index-aligned by construction.
+pub struct PreviewShortState {
+    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
+    /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
+    /// themselves (measured identical to the export-site `label_args +
+    /// virtuals` recompute across the corpus, 2026-06-11).
+    pub short_inputargs: Vec<OpRef>,
+    /// Rooted `InputArgRc` carriers for `short_inputargs`, index-aligned with
+    /// that vector. Keeping the strong Rc alive here preserves the renamed
+    /// inputarg producer across the export boundary; consumers that need an
+    /// operand bind the stored position directly.
+    pub short_inputarg_refs: Vec<majit_ir::InputArgRc>,
+    /// RPython shortpreamble.py: pass-collected preamble producers aligned to
+    /// the exported loop-header inputargs.
+    pub short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// The virtual-state / inputarg expansion the preview built ShortBoxes
+    /// from. Absent on the bridge arm that breaks out of the export before the
+    /// VS capture; present whenever the preview ran to completion.
+    pub args_state: Option<(
+        crate::optimizeopt::virtualstate::VirtualState,
+        Vec<OpRef>,
+        Vec<OpRef>,
+        Vec<usize>,
+        Vec<majit_ir::operand::Operand>,
+    )>,
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -682,39 +721,19 @@ pub struct OptContext {
     /// existing target token's short preamble.
     active_short_preamble_producer:
         Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
-    /// RPython shortpreamble.py: pass-collected preamble producers aligned to
-    /// the exported loop-header inputargs.
-    pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// The preview pass's short-preamble publication, produced in one group
+    /// at the end of `optimize_with_constants_and_inputs_at` and read once by
+    /// `export_state_with_bounds`. `None` means no preview ran, so the export
+    /// site recomputes everything locally.
+    pub preview_short_state: Option<PreviewShortState>,
     /// shortpreamble.py:251-253: a way to produce const boxes, e.g.
     /// `setfield_gc(p0, Const)`. We need to remember those, but they don't
     /// produce any new boxes. This list is consumed only by import-side
     /// `produce_op` replay, never by `used_boxes`: unroll.py:33-36 never
-    /// registers a const PreambleOp in `potential_extra_ops`.
+    /// registers a const PreambleOp in `potential_extra_ops`. It carries no
+    /// index alignment to the `PreviewShortState` vectors, so it stays on its
+    /// own channel.
     pub exported_const_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
-    /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
-    /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
-    /// themselves, carried from the preview pass (optimizer.rs, where the
-    /// ShortBoxes object lives) to `export_state_with_bounds` through the
-    /// same channel as `exported_short_boxes` (measured identical to the
-    /// export-site `label_args + virtuals` recompute across the corpus,
-    ///   2026-06-11).
-    pub exported_short_inputargs: Vec<OpRef>,
-    /// Rooted `InputArgRc` carriers for `exported_short_inputargs`, index-
-    /// aligned with that vector. Keeping the strong Rc alive here preserves
-    /// the renamed inputarg producer across the export boundary; consumers
-    /// that need an operand bind the stored position directly.
-    pub exported_short_inputarg_refs: Vec<majit_ir::InputArgRc>,
-    /// The single virtual-state/inputarg expansion used to build ShortBoxes in
-    /// the preview pass. RPython computes this tuple once before producing
-    /// potential short-preamble ops; carrying it prevents those ops' forwarding
-    /// mutations from changing a second, Rust-only recomputation.
-    pub exported_short_args_state: Option<(
-        crate::optimizeopt::virtualstate::VirtualState,
-        Vec<OpRef>,
-        Vec<OpRef>,
-        Vec<usize>,
-        Vec<majit_ir::operand::Operand>,
-    )>,
     /// optimizer.py: `can_replace_guards` — disable guard replacement during
     /// bridge compilation. Defaults to true for preamble.
     can_replace_guards: bool,
@@ -1735,11 +1754,8 @@ impl OptContext {
 
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
-            exported_short_boxes: Vec::new(),
+            preview_short_state: None,
             exported_const_short_boxes: Vec::new(),
-            exported_short_inputargs: Vec::new(),
-            exported_short_inputarg_refs: Vec::new(),
-            exported_short_args_state: None,
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
@@ -2362,11 +2378,8 @@ impl OptContext {
 
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
-            exported_short_boxes: Vec::new(),
+            preview_short_state: None,
             exported_const_short_boxes: Vec::new(),
-            exported_short_inputargs: Vec::new(),
-            exported_short_inputarg_refs: Vec::new(),
-            exported_short_args_state: None,
 
             imported_virtuals: Vec::new(),
             imported_label_args: None,
