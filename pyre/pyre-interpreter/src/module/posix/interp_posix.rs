@@ -5079,6 +5079,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ("__enter__", scandir_iter_self),
                         ("__exit__", scandir_iter_close),
                         ("close", scandir_iter_close),
+                        // `interp_scandir.py:172-180` keeps finalization on the
+                        // RPython-internal `_finalize_` and publishes no
+                        // `__del__`.  3.14 makes `__del__` a real entry in
+                        // `posix.ScandirIterator`'s type dict, so it is
+                        // published here, with the arity-1 binding below that
+                        // makes it callable as an ordinary method.
                         ("__del__", scandir_iter_del),
                     ] {
                         let function = if name == "__del__" {
