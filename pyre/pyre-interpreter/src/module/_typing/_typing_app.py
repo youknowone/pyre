@@ -36,6 +36,90 @@ class _PickleUsingNameMixin:
         return self.__name__
 
 
+def _immutable_type_error(cls, name):
+    return TypeError(
+        f"cannot set {name!r} attribute of immutable type "
+        f"'{cls.__module__}.{cls.__name__}'"
+    )
+
+
+class _ImmutableTypeMeta(type):
+    """CPython's ``Py_TPFLAGS_IMMUTABLETYPE`` for app-level typing types."""
+
+    def __new__(mcls, name, bases, namespace):
+        for base in bases:
+            if isinstance(base, _ImmutableTypeMeta):
+                raise TypeError(
+                    f"type '{base.__module__}.{base.__name__}' "
+                    "is not an acceptable base type"
+                )
+        return super().__new__(mcls, name, bases, namespace)
+
+    def __setattr__(cls, name, value):
+        raise _immutable_type_error(cls, name)
+
+    def __delattr__(cls, name):
+        # `type_setattro` uses the same immutable-type error for deletion.
+        raise _immutable_type_error(cls, name)
+
+
+class _Immutable:
+    """PyPy's per-instance readonly-field mixin.
+
+    CPython 3.14 keeps a managed attribute dictionary on TypeVar, ParamSpec,
+    and TypeVarTuple, but does not expose it as ``__dict__``.  Their native
+    struct members and getsets stay read-only while unrelated user attributes
+    remain writable.  ``None`` means the instance has no user dictionary.
+    """
+
+    __slots__ = ()
+
+    _readonly_attrs = None
+    _readonly_members = frozenset()
+
+    def __getattribute__(self, name):
+        if name == "__dict__":
+            qualname = f"{type(self).__module__}.{type(self).__name__}"
+            raise AttributeError(
+                f"{qualname!r} object has no attribute '__dict__'"
+            )
+        return object.__getattribute__(self, name)
+
+    def __dir__(self):
+        return [
+            name for name in object.__dir__(self)
+            if name not in {"__dict__", "__weakref__"}
+        ]
+
+    def __setattr__(self, name, value):
+        readonly = type(self)._readonly_attrs
+        if name in type(self)._readonly_members:
+            raise AttributeError("readonly attribute")
+        if readonly is not None and name in readonly:
+            qualname = f"{type(self).__module__}.{type(self).__name__}"
+            raise AttributeError(
+                f"attribute {name!r} of {qualname!r} objects is not writable"
+            )
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        readonly = type(self)._readonly_attrs
+        if name in type(self)._readonly_members:
+            raise AttributeError("readonly attribute")
+        if readonly is not None and name in readonly:
+            qualname = f"{type(self).__module__}.{type(self).__name__}"
+            raise AttributeError(
+                f"attribute {name!r} of {qualname!r} objects is not writable"
+            )
+        object.__delattr__(self, name)
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 def _evaluate_typeparam(thunk):
     # Call a PEP 695 bound / constraints thunk emitted by the compiler. A 3.14
     # thunk takes an annotation `format` argument (annotationlib.Format.VALUE
@@ -181,41 +265,61 @@ def _variance_prefix(infer_variance, covariant, contravariant):
     return '~'
 
 
-class TypeVar:
+class TypeVar(
+    _Immutable, _PickleUsingNameMixin, metaclass=_ImmutableTypeMeta
+):
     """Type variable — PEP 484 / PEP 695."""
+
+    _readonly_members = frozenset((
+        "__name__", "__covariant__", "__contravariant__",
+        "__infer_variance__",
+    ))
+    _readonly_attrs = frozenset((
+        "__bound__", "__constraints__", "__default__", "evaluate_bound",
+        "evaluate_constraints", "evaluate_default", "_bound",
+        "_constraints", "_default_value", "_evaluate_bound",
+        "_evaluate_constraints", "_evaluate_default",
+    ))
 
     def __init__(self, name, *constraints, bound=None, default=NoDefault,
                  covariant=False, contravariant=False, infer_variance=False):
-        self.__name__ = name
+        if not isinstance(name, str):
+            raise TypeError(
+                f"typevar() argument 'name' must be str, not "
+                f"{type(name).__name__}"
+            )
+        object.__setattr__(self, "__name__", name)
         if covariant and contravariant:
             raise ValueError("Bivariant types are not supported.")
         if infer_variance and (covariant or contravariant):
             raise ValueError("Variance cannot be specified with infer_variance.")
-        self.__covariant__ = bool(covariant)
-        self.__contravariant__ = bool(contravariant)
-        self.__infer_variance__ = bool(infer_variance)
-        self._default_value = default
-        self._evaluate_default = None
+        object.__setattr__(self, "__covariant__", bool(covariant))
+        object.__setattr__(self, "__contravariant__", bool(contravariant))
+        object.__setattr__(self, "__infer_variance__", bool(infer_variance))
+        object.__setattr__(self, "_default_value", default)
+        object.__setattr__(self, "_evaluate_default", None)
         if constraints and bound is not None:
             raise TypeError("Constraints cannot be combined with bound=...")
         if len(constraints) == 1:
             raise TypeError("A single constraint is not allowed")
         import typing
-        self._constraints = tuple(
+        constraints = tuple(
             typing._type_check(
                 constraint,
                 f"TypeVar(name, constraint, ...). Constraints must be types. Got {constraint!r}.",
             )
             for constraint in constraints
         )
-        self._evaluate_constraints = None
-        self._bound = (
+        object.__setattr__(self, "_constraints", constraints)
+        object.__setattr__(self, "_evaluate_constraints", None)
+        bound = (
             None
             if bound is None
             else typing._type_check(bound, "Bound must be a type.")
         )
-        self._evaluate_bound = None
-        self.__module__ = _caller_module()
+        object.__setattr__(self, "_bound", bound)
+        object.__setattr__(self, "_evaluate_bound", None)
+        object.__setattr__(self, "__module__", _caller_module())
 
     @classmethod
     def _make(cls, name, *, evaluate_bound=None, evaluate_constraints=None):
@@ -225,36 +329,46 @@ class TypeVar:
         # the enclosing scope; they are evaluated on first `__bound__` /
         # `__constraints__` access and cached (Objects/typevarobject.c).
         self = cls.__new__(cls)
-        self.__name__ = name
-        self.__covariant__ = False
-        self.__contravariant__ = False
+        object.__setattr__(self, "__name__", name)
+        object.__setattr__(self, "__covariant__", False)
+        object.__setattr__(self, "__contravariant__", False)
         # CPython 3.14 `_Py_make_typevar`: type parameters created by the
         # compiler infer variance, unlike an ordinary `TypeVar(...)` call.
-        self.__infer_variance__ = True
+        object.__setattr__(self, "__infer_variance__", True)
         # `_Py_make_typevar` leaves `default_value` NULL, which `_MISSING`
         # stands for.  A `TypeVar(...)` call instead stores the `NoDefault`
         # sentinel its signature defaults to, and the two states differ:
         # `evaluate_default` answers `None` for the first and a constant
         # evaluator over `NoDefault` for the second.
-        self._default_value = _MISSING
-        self._evaluate_default = None
-        self._constraints = _MISSING if evaluate_constraints is not None else ()
-        self._evaluate_constraints = evaluate_constraints
-        self._bound = _MISSING if evaluate_bound is not None else None
-        self._evaluate_bound = evaluate_bound
-        self.__module__ = _caller_module()
+        object.__setattr__(self, "_default_value", _MISSING)
+        object.__setattr__(self, "_evaluate_default", None)
+        object.__setattr__(
+            self, "_constraints",
+            _MISSING if evaluate_constraints is not None else (),
+        )
+        object.__setattr__(self, "_evaluate_constraints", evaluate_constraints)
+        object.__setattr__(
+            self, "_bound", _MISSING if evaluate_bound is not None else None
+        )
+        object.__setattr__(self, "_evaluate_bound", evaluate_bound)
+        object.__setattr__(self, "__module__", _caller_module())
         return self
 
     @property
     def __bound__(self):
         if self._bound is _MISSING:
-            self._bound = _evaluate_typeparam(self._evaluate_bound)
+            object.__setattr__(
+                self, "_bound", _evaluate_typeparam(self._evaluate_bound)
+            )
         return self._bound
 
     @property
     def __constraints__(self):
         if self._constraints is _MISSING:
-            self._constraints = tuple(_evaluate_typeparam(self._evaluate_constraints))
+            object.__setattr__(
+                self, "_constraints",
+                tuple(_evaluate_typeparam(self._evaluate_constraints)),
+            )
         return self._constraints
 
     @property
@@ -262,7 +376,10 @@ class TypeVar:
         if self._default_value is _MISSING:
             if self._evaluate_default is None:
                 return NoDefault
-            self._default_value = _evaluate_typeparam(self._evaluate_default)
+            object.__setattr__(
+                self, "_default_value",
+                _evaluate_typeparam(self._evaluate_default),
+            )
         return self._default_value
 
     @property
@@ -311,9 +428,6 @@ class TypeVar:
             and self._default_value is not NoDefault
         )
 
-    def __reduce__(self):
-        return self.__name__
-
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of TypeVar")
 
@@ -333,37 +447,58 @@ class TypeVar:
         raise TypeError("type 'typing.TypeVar' is not an acceptable base type")
 
 
-class ParamSpec:
+class ParamSpec(
+    _Immutable, _PickleUsingNameMixin, metaclass=_ImmutableTypeMeta
+):
     """Parameter specification variable — PEP 612."""
 
-    def __init__(self, name, *, bound=None, default=NoDefault,
+    _readonly_members = frozenset((
+        "__name__", "__bound__", "__covariant__", "__contravariant__",
+        "__infer_variance__",
+    ))
+    _readonly_attrs = frozenset((
+        "args", "kwargs", "__default__", "evaluate_default",
+        "_default_value", "_evaluate_default",
+    ))
+
+    def __init__(self, name, *, bound=_MISSING, default=NoDefault,
                  covariant=False, contravariant=False, infer_variance=False):
-        self.__name__ = name
+        if not isinstance(name, str):
+            raise TypeError(
+                f"paramspec() argument 'name' must be str, not "
+                f"{type(name).__name__}"
+            )
+        object.__setattr__(self, "__name__", name)
         if covariant and contravariant:
             raise ValueError("Bivariant types are not supported.")
         if infer_variance and (covariant or contravariant):
             raise ValueError("Variance cannot be specified with infer_variance.")
-        self.__covariant__ = bool(covariant)
-        self.__contravariant__ = bool(contravariant)
-        self.__infer_variance__ = bool(infer_variance)
-        self._default_value = default
-        self._evaluate_default = None
-        self.__bound__ = bound
-        self.__module__ = _caller_module()
+        object.__setattr__(self, "__covariant__", bool(covariant))
+        object.__setattr__(self, "__contravariant__", bool(contravariant))
+        object.__setattr__(self, "__infer_variance__", bool(infer_variance))
+        object.__setattr__(self, "_default_value", default)
+        object.__setattr__(self, "_evaluate_default", None)
+        if bound is _MISSING:
+            bound = None
+        else:
+            import typing
+            bound = typing._type_check(bound, "Bound must be a type.")
+        object.__setattr__(self, "__bound__", bound)
+        object.__setattr__(self, "__module__", _caller_module())
 
     @classmethod
     def _make(cls, name):
         # `_Py_make_paramspec`: the compiler-created parameter infers variance
         # and leaves `default_value` NULL, which `_MISSING` stands for.
         self = cls.__new__(cls)
-        self.__name__ = name
-        self.__covariant__ = False
-        self.__contravariant__ = False
-        self.__infer_variance__ = True
-        self._default_value = _MISSING
-        self._evaluate_default = None
-        self.__bound__ = None
-        self.__module__ = _caller_module()
+        object.__setattr__(self, "__name__", name)
+        object.__setattr__(self, "__covariant__", False)
+        object.__setattr__(self, "__contravariant__", False)
+        object.__setattr__(self, "__infer_variance__", True)
+        object.__setattr__(self, "_default_value", _MISSING)
+        object.__setattr__(self, "_evaluate_default", None)
+        object.__setattr__(self, "__bound__", None)
+        object.__setattr__(self, "__module__", _caller_module())
         return self
 
     @property
@@ -393,7 +528,10 @@ class ParamSpec:
         if self._default_value is _MISSING:
             if self._evaluate_default is None:
                 return NoDefault
-            self._default_value = _evaluate_typeparam(self._evaluate_default)
+            object.__setattr__(
+                self, "_default_value",
+                _evaluate_typeparam(self._evaluate_default),
+            )
         return self._default_value
 
     @property
@@ -403,9 +541,6 @@ class ParamSpec:
         if self._default_value is _MISSING:
             return None
         return _const_evaluator(self._default_value)
-
-    def __reduce__(self):
-        return self.__name__
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpec")
@@ -424,22 +559,24 @@ class ParamSpec:
                                 self.__contravariant__) + self.__name__
 
 
-class ParamSpecArgs:
+class ParamSpecArgs(_Immutable, metaclass=_ImmutableTypeMeta):
     """The args of a ParamSpec, e.g. P.args."""
 
+    __slots__ = ("__origin__", "__weakref__")
+    _readonly_members = frozenset(("__origin__",))
+
     def __init__(self, origin):
-        self.__origin__ = origin
+        object.__setattr__(self, "__origin__", origin)
 
     def __repr__(self):
-        return f"{self.__origin__.__name__}.args"
+        if type(self.__origin__) is ParamSpec:
+            return f"{self.__origin__.__name__}.args"
+        return f"{self.__origin__!r}.args"
 
     def __eq__(self, other):
-        if not isinstance(other, ParamSpecArgs):
+        if type(other) is not type(self):
             return NotImplemented
         return self.__origin__ == other.__origin__
-
-    def __hash__(self):
-        return hash((self.__origin__, "args"))
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecArgs")
@@ -448,22 +585,24 @@ class ParamSpecArgs:
         raise TypeError("type 'typing.ParamSpecArgs' is not an acceptable base type")
 
 
-class ParamSpecKwargs:
+class ParamSpecKwargs(_Immutable, metaclass=_ImmutableTypeMeta):
     """The kwargs of a ParamSpec, e.g. P.kwargs."""
 
+    __slots__ = ("__origin__", "__weakref__")
+    _readonly_members = frozenset(("__origin__",))
+
     def __init__(self, origin):
-        self.__origin__ = origin
+        object.__setattr__(self, "__origin__", origin)
 
     def __repr__(self):
-        return f"{self.__origin__.__name__}.kwargs"
+        if type(self.__origin__) is ParamSpec:
+            return f"{self.__origin__.__name__}.kwargs"
+        return f"{self.__origin__!r}.kwargs"
 
     def __eq__(self, other):
-        if not isinstance(other, ParamSpecKwargs):
+        if type(other) is not type(self):
             return NotImplemented
         return self.__origin__ == other.__origin__
-
-    def __hash__(self):
-        return hash((self.__origin__, "kwargs"))
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecKwargs")
@@ -472,24 +611,37 @@ class ParamSpecKwargs:
         raise TypeError("type 'typing.ParamSpecKwargs' is not an acceptable base type")
 
 
-class TypeVarTuple:
+class TypeVarTuple(
+    _Immutable, _PickleUsingNameMixin, metaclass=_ImmutableTypeMeta
+):
     """Type variable tuple — PEP 646."""
 
+    _readonly_members = frozenset(("__name__",))
+    _readonly_attrs = frozenset((
+        "__default__", "evaluate_default", "_default_value",
+        "_evaluate_default",
+    ))
+
     def __init__(self, name, *, default=NoDefault):
-        self.__name__ = name
-        self._default_value = default
-        self._evaluate_default = None
-        self.__module__ = _caller_module()
+        if not isinstance(name, str):
+            raise TypeError(
+                f"typevartuple() argument 'name' must be str, not "
+                f"{type(name).__name__}"
+            )
+        object.__setattr__(self, "__name__", name)
+        object.__setattr__(self, "_default_value", default)
+        object.__setattr__(self, "_evaluate_default", None)
+        object.__setattr__(self, "__module__", _caller_module())
 
     @classmethod
     def _make(cls, name):
         # `_Py_make_typevartuple` leaves `default_value` NULL, which `_MISSING`
         # stands for.
         self = cls.__new__(cls)
-        self.__name__ = name
-        self._default_value = _MISSING
-        self._evaluate_default = None
-        self.__module__ = _caller_module()
+        object.__setattr__(self, "__name__", name)
+        object.__setattr__(self, "_default_value", _MISSING)
+        object.__setattr__(self, "_evaluate_default", None)
+        object.__setattr__(self, "__module__", _caller_module())
         return self
 
     def __iter__(self):
@@ -514,7 +666,10 @@ class TypeVarTuple:
         if self._default_value is _MISSING:
             if self._evaluate_default is None:
                 return NoDefault
-            self._default_value = _evaluate_typeparam(self._evaluate_default)
+            object.__setattr__(
+                self, "_default_value",
+                _evaluate_typeparam(self._evaluate_default),
+            )
         return self._default_value
 
     @property
@@ -524,9 +679,6 @@ class TypeVarTuple:
         if self._default_value is _MISSING:
             return None
         return _const_evaluator(self._default_value)
-
-    def __reduce__(self):
-        return self.__name__
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of TypeVarTuple")
@@ -538,30 +690,7 @@ class TypeVarTuple:
         raise TypeError("type 'typing.TypeVarTuple' is not an acceptable base type")
 
 
-def _immutable_typealias_type_error(name):
-    return TypeError(
-        f"cannot set {name!r} attribute of immutable type "
-        "'typing.TypeAliasType'"
-    )
-
-
-class _TypeAliasTypeMeta(type):
-    def __new__(mcls, name, bases, namespace):
-        if any(isinstance(base, _TypeAliasTypeMeta) for base in bases):
-            raise TypeError(
-                "type 'typing.TypeAliasType' is not an acceptable base type"
-            )
-        return super().__new__(mcls, name, bases, namespace)
-
-    def __setattr__(cls, name, value):
-        raise _immutable_typealias_type_error(name)
-
-    def __delattr__(cls, name):
-        # CPython's immutable-type path reports deletion as a failed set too.
-        raise _immutable_typealias_type_error(name)
-
-
-class TypeAliasType(_PickleUsingNameMixin, metaclass=_TypeAliasTypeMeta):
+class TypeAliasType(_PickleUsingNameMixin, metaclass=_ImmutableTypeMeta):
     """A PEP 695 ``type X = ...`` alias."""
 
     __slots__ = ("_name", "_type_params", "_value", "_evaluate_value", "_module")
@@ -607,7 +736,9 @@ class TypeAliasType(_PickleUsingNameMixin, metaclass=_TypeAliasTypeMeta):
         # evaluator with `object.__setattr__`.  Keep that shape so the public
         # constructor does not grow a CPython-incompatible private keyword.
         self = object.__new__(cls)
-        cls._check_type_params(type_params)
+        # CPython `_Py_make_typealias` trusts the compiler-provided tuple and
+        # deliberately skips `typealias_check_type_params`: checking here
+        # would force lazy defaults before the alias is even constructed.
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_type_params", type_params)
         object.__setattr__(self, "_value", _MISSING)
@@ -751,8 +882,8 @@ def _intrinsic_typevar_with_constraints(name, evaluate_constraints):
 def _intrinsic_set_typeparam_default(typeparam, default):
     # CPython 3.14 `_Py_set_typeparam_default` stores the evaluator, not its
     # result.  `__default__` evaluates and caches it on first access.
-    typeparam._default_value = _MISSING
-    typeparam._evaluate_default = default
+    object.__setattr__(typeparam, "_default_value", _MISSING)
+    object.__setattr__(typeparam, "_evaluate_default", default)
     return typeparam
 
 
