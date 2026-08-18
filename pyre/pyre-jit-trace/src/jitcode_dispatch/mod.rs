@@ -1181,7 +1181,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     site: &TracebackNodeSite,
     w_next: OpRef,
     opcode_position: usize,
-) {
+) -> Result<(), DispatchError> {
     let traceback = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
         &[],
@@ -1229,13 +1229,22 @@ fn emit_traceback_node<Sym: WalkSym>(
         .static_field_index_by_name("last_instr")
         .expect("PyFrame virtualizable must contain last_instr");
     let last_instr_descr = vinfo.static_field_descr(last_instr_index);
-    ctx.trace_ctx.vable_setfield(
+    // A traceback node names an inlined callee's frame as often as the walk's
+    // own, and a frame that is not `virtualizable_boxes[-1]` sends
+    // `vable_setfield` down the `_nonstandard_virtualizable` path, which mints
+    // a PTR_EQ promote `GuardValue` internally with no resume snapshot.  Every
+    // other vable emit site pairs the call with this capture for that reason;
+    // without it the promote reaches the decoder holding
+    // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
+    let guards_before = ctx.trace_ctx.num_guards();
+    let write = ctx.trace_ctx.vable_setfield(
         opcode_position,
         site.frame,
         last_instr_descr,
         last_instr_value,
         Some(Value::Int(i64::from(site.last_instruction))),
     );
+    walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
@@ -1245,6 +1254,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .heapcache_setfield_cached(exc, traceback_descr.index(), traceback);
+    Ok(())
 }
 
 /// IR-virtual PREPEND of one `PyTraceback` node — the general-case sibling
@@ -1279,23 +1289,23 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> bool {
+) -> Result<bool, DispatchError> {
     if exc.is_none() || exc.is_constant() {
         // A `Const` exception box freezes the RECORDING iteration's address
         // (`walker_record_guard_exception` pins every raise after the first
         // one in a walk), so reading and writing `w_traceback` through it
         // would chain onto a stale object on every later iteration.  The
         // opaque hook takes the live exception as an argument instead.
-        return false;
+        return Ok(false);
     }
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return false;
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return false;
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return false;
+        return Ok(false);
     };
     if site.frame.is_none() {
         // No materialized frame for this level.  The opaque inline hook
@@ -1311,15 +1321,15 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // this walk lacks, and the vable box is not a substitute (a traceback
         // outlives the frame, so storing it demands the escape marking this
         // path does not perform).
-        return false;
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     // `tb = operror.get_traceback()`.  MUST precede the node's own store, or
     // the heapcache answers with the node being built and `w_next` self-links.
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     let w_next = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, exc, traceback_descr);
-    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position);
-    true
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// IR-virtual traceback record for an exception the walk itself built: the
@@ -1335,27 +1345,27 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> bool {
+) -> Result<bool, DispatchError> {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return false;
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return false;
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return false;
+        return Ok(false);
     };
     if site.frame.is_none() {
         // Same disposition as the prepend sibling, for the same reason: the
         // opaque inline hook fabricates a frame from the promoted callee
         // metadata, while a null one answers None and breaks every consumer
         // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
-        return false;
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
-    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position);
-    true
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -3303,7 +3313,7 @@ pub fn walk<Sym: WalkSym>(
                             exc,
                             exc_concrete,
                             node_position,
-                        );
+                        )?;
                     record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                     record_inline_application_traceback(
                         ctx,
@@ -3448,7 +3458,7 @@ pub fn walk<Sym: WalkSym>(
                             exc,
                             exc_concrete,
                             opcode_position,
-                        );
+                        )?;
                         record_inline_application_traceback(
                             ctx,
                             exc,
@@ -11542,9 +11552,9 @@ fn handle<Sym: WalkSym>(
                     // weaker node than the live one — still a node whose
                     // `tb_frame.f_code` answers the right code object.
                     let emit_runtime = if freshly_normalized {
-                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)
+                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     } else {
-                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)
+                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     };
                     record_inline_application_traceback(
                         ctx,
