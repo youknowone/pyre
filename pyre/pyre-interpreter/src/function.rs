@@ -7,6 +7,7 @@
 //! the globals pointer (no clone).
 
 use pyre_object::pyobject::*;
+use pyre_object::quasiimmut::QuasiImmutField;
 use rustpython_wtf8::Wtf8Buf;
 
 /// Type descriptor for user-defined functions.
@@ -178,6 +179,152 @@ pub struct Function {
     /// this on each BuiltinFunction; CPython 3.14 likewise exposes the
     /// defining module object from `PyCFunction_GET_SELF`.
     pub w_moduleobj: PyObjectRef,
+    /// The hidden `mutate_<name>` field `quasiimmut.py get_mutate_field_name`
+    /// synthesises for each `?` entry of `function.py:34-42
+    /// _immutable_fields_`. Upstream's rtyper makes one per declared field, so
+    /// mutating `__defaults__` revokes only the loops that folded `defs_w`;
+    /// collapsing them onto a shared slot would still be sound but would
+    /// over-invalidate.
+    ///
+    /// Inline rather than behind a storage box because a `Function` is
+    /// allocated non-moving (`try_gc_alloc_stable_raw` below), which is the
+    /// condition [`pyre_object::quasiimmut::QuasiImmutField`] documents for its
+    /// lock: a relocation would remap the mutex out from under a holder. The
+    /// five existing owners are immortal and so may leak the instance the field
+    /// owns; a function is mortal, so `FUNCTION_GC_TYPE_ID` carries
+    /// [`function_destructor`] to run their `Drop` on sweep.
+    pub mutate_code: QuasiImmutField,
+    pub mutate_w_func_globals_obj: QuasiImmutField,
+    pub mutate_closure: QuasiImmutField,
+    pub mutate_defs_w: QuasiImmutField,
+    pub mutate_name: QuasiImmutField,
+    pub mutate_w_qualname: QuasiImmutField,
+    pub mutate_w_objclass: QuasiImmutField,
+    pub mutate_w_text_signature: QuasiImmutField,
+    pub mutate_w_kw_defs: QuasiImmutField,
+}
+
+/// Every `mutate_<name>` slot on a `Function`, in declaration order.
+///
+/// Written as a macro so the struct field list, [`function_destructor`] and the
+/// accessor below cannot drift apart; a slot that one of them forgets is a
+/// silent leak or a silently un-revoked loop.
+macro_rules! for_each_quasi_immut_slot {
+    ($mac:ident) => {
+        $mac!(mutate_code);
+        $mac!(mutate_w_func_globals_obj);
+        $mac!(mutate_closure);
+        $mac!(mutate_defs_w);
+        $mac!(mutate_name);
+        $mac!(mutate_w_qualname);
+        $mac!(mutate_w_objclass);
+        $mac!(mutate_w_text_signature);
+        $mac!(mutate_w_kw_defs);
+    };
+}
+
+/// Which `_immutable_fields_` `?` entry a quasi-immutable operation names.
+///
+/// `quasiimmut.py` keys everything off the mutate-field *name*; pyre needs a
+/// value it can pass through the descr-index dispatch in
+/// `pyre-jit-trace state.rs` / `pyre-jit eval.rs`, so the name becomes a tag.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QuasiImmutSlot {
+    Code,
+    WFuncGlobalsObj,
+    Closure,
+    DefsW,
+    Name,
+    WQualname,
+    WObjclass,
+    WTextSignature,
+    WKwDefs,
+}
+
+/// The `mutate_<name>` field for one `?` entry.
+///
+/// # Safety
+/// `obj` must point at a live `Function`.
+pub unsafe fn function_quasi_immut_field<'a>(
+    obj: PyObjectRef,
+    slot: QuasiImmutSlot,
+) -> &'a QuasiImmutField {
+    let f = obj as *const Function;
+    unsafe {
+        match slot {
+            QuasiImmutSlot::Code => &(*f).mutate_code,
+            QuasiImmutSlot::WFuncGlobalsObj => &(*f).mutate_w_func_globals_obj,
+            QuasiImmutSlot::Closure => &(*f).mutate_closure,
+            QuasiImmutSlot::DefsW => &(*f).mutate_defs_w,
+            QuasiImmutSlot::Name => &(*f).mutate_name,
+            QuasiImmutSlot::WQualname => &(*f).mutate_w_qualname,
+            QuasiImmutSlot::WObjclass => &(*f).mutate_w_objclass,
+            QuasiImmutSlot::WTextSignature => &(*f).mutate_w_text_signature,
+            QuasiImmutSlot::WKwDefs => &(*f).mutate_w_kw_defs,
+        }
+    }
+}
+
+/// `quasiimmut.py:116-126 get_current_qmut_instance` — install the instance
+/// while the read is still being recorded, so a write reached later in the same
+/// trace sees a non-null mutate field and aborts the attempt.
+///
+/// # Safety
+/// `obj` must point at a live `Function`.
+pub unsafe fn function_install_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
+    if obj.is_null() {
+        return;
+    }
+    unsafe { function_quasi_immut_field(obj, slot) }.ensure_installed();
+}
+
+/// `quasiimmut.py:72-75 register_loop_token` — record a compiled loop's
+/// invalidation flag against one `?` field.
+///
+/// # Safety
+/// `obj` must point at a live `Function`.
+pub unsafe fn function_register_quasi_immut_watcher(
+    obj: PyObjectRef,
+    slot: QuasiImmutSlot,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    unsafe { function_quasi_immut_field(obj, slot) }.register_loop_token(flag);
+}
+
+/// `quasiimmut.py:129-134 make_invalidation_function._invalidate_now` — revoke
+/// every loop that folded this field. Runs BEFORE the store, the way
+/// `typeobject.rs w_type_set_version_tag` calls its notify first.
+///
+/// # Safety
+/// `obj` must be null or point at a live `Function`.
+pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
+    if obj.is_null() {
+        return;
+    }
+    unsafe { function_quasi_immut_field(obj, slot) }.invalidate();
+}
+
+/// Drop glue for the inline `mutate_<name>` slots, registered on
+/// `FUNCTION_GC_TYPE_ID`.
+///
+/// Touches only those slots. The `name` box is off-GC storage reclaimed by its
+/// own tid's drop glue, so this must not reach it — a holder destructor that
+/// did would double-free a box swept before its owner.
+///
+/// # Safety
+/// `addr` must point at a live `Function` the collector is reclaiming, exactly
+/// once.
+pub unsafe fn function_destructor(addr: usize) {
+    let f = addr as *mut Function;
+    macro_rules! drop_slot {
+        ($field:ident) => {
+            unsafe { std::ptr::drop_in_place(&raw mut (*f).$field) }
+        };
+    }
+    for_each_quasi_immut_slot!(drop_slot);
 }
 
 /// function.py:706 — `class BuiltinFunction(Function): can_change_code = False`
@@ -600,6 +747,16 @@ pub(crate) fn function_new_impl(
         w_text_signature: PY_NULL,
         w_new_self: PY_NULL,
         w_moduleobj: PY_NULL,
+        // `quasiimmut.py:116-126` — null until the first loop registers.
+        mutate_code: QuasiImmutField::new(),
+        mutate_w_func_globals_obj: QuasiImmutField::new(),
+        mutate_closure: QuasiImmutField::new(),
+        mutate_defs_w: QuasiImmutField::new(),
+        mutate_name: QuasiImmutField::new(),
+        mutate_w_qualname: QuasiImmutField::new(),
+        mutate_w_objclass: QuasiImmutField::new(),
+        mutate_w_text_signature: QuasiImmutField::new(),
+        mutate_w_kw_defs: QuasiImmutField::new(),
     };
 
     // A `BuiltinCode`-backed function is a permanent type / module slot (the

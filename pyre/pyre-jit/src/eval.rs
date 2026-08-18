@@ -1904,15 +1904,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
     // builtins (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
-    // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
-    // function's `name` box is reclaimed by its own tid's drop glue (off-GC
-    // storage); a holder destructor would double-free a box swept before
-    // its owner.
-    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_interpreter::function::Function>(),
-        object_tid,
-        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // both PyTypes to `function_tid`. The destructor reclaims only the inline
+    // `mutate_<name>` slots (`function.py:34-42 _immutable_fields_`), which the
+    // function owns outright: a mortal function's `name` box is reclaimed by
+    // its own tid's drop glue (off-GC storage), and reaching it from here would
+    // double-free a box swept before its owner.
+    let function_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_interpreter::function::Function>(),
+            object_tid,
+            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+        )
+        .with_destructor_fn(pyre_interpreter::function::function_destructor),
+    );
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
