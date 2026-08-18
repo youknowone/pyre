@@ -76,6 +76,25 @@ fn run_runtime_program(
     output
 }
 
+/// Assert a runtime subprocess exited 0, reporting enough to diagnose the
+/// failure from a CI log alone.
+///
+/// `run_runtime_program` has already claimed a death by signal, so what
+/// reaches here is a child that chose its own nonzero status. Which run it
+/// was, what status it chose, and what it had written to stdout are all part
+/// of that answer, and stderr alone carries none of them — a runner that
+/// reports on stdout and exits 1 otherwise fails with an empty message.
+#[track_caller]
+fn assert_ran_ok(label: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn stat_value(stderr: &str, name: &str) -> u64 {
     stderr
         .split_whitespace()
@@ -107,11 +126,7 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
         let bench = "global_reassign.py";
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-        assert!(
-            dynasm_run.status.success(),
-            "dynasm failed for {bench}:\n{}",
-            String::from_utf8_lossy(&dynasm_run.stderr)
-        );
+        assert_ran_ok(&format!("dynasm {bench}"), &dynasm_run);
         let wasm_run = run_runtime_program(
             &wasm_runner,
             &script,
@@ -122,10 +137,7 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
             ],
         );
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-        assert!(
-            wasm_run.status.success(),
-            "wasm failed for {bench}:\n{stderr}"
-        );
+        assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
         assert_eq!(
             wasm_run.stdout, dynasm_run.stdout,
             "wasm output diverged from dynasm for {bench}:\n{stderr}"
@@ -160,11 +172,7 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
     }
 
     let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-    assert!(
-        dynasm_run.status.success(),
-        "dynasm failed:\n{}",
-        String::from_utf8_lossy(&dynasm_run.stderr)
-    );
+    assert_ran_ok("dynasm raise/catch", &dynasm_run);
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
     let wasm_run = run_runtime_program(
         &wasm_runner,
@@ -176,7 +184,7 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
         ],
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-    assert!(wasm_run.status.success(), "wasm failed:\n{stderr}");
+    assert_ran_ok("wasm raise/catch", &wasm_run);
     assert_eq!(
         wasm_run.stdout, dynasm_run.stdout,
         "wasm raise/catch output diverged from dynasm:\n{stderr}"
@@ -205,7 +213,7 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
         );
     }
     let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-    assert!(dynasm_run.status.success(), "dynasm recursive fib failed");
+    assert_ran_ok("dynasm recursive fib", &dynasm_run);
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
     let wasm_run = run_runtime_program(
         &wasm_runner,
@@ -219,10 +227,7 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
         ],
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-    assert!(
-        wasm_run.status.success(),
-        "wasm recursive fib failed:\n{stderr}"
-    );
+    assert_ran_ok("wasm recursive fib", &wasm_run);
     assert_eq!(
         wasm_run.stdout, dynasm_run.stdout,
         "wasm recursive fib output diverged from dynasm:\n{stderr}"
@@ -259,7 +264,7 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     }
 
     let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-    assert!(dynasm_run.status.success(), "dynasm fannkuch failed");
+    assert_ran_ok("dynasm fannkuch", &dynasm_run);
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
     let wasm_run = run_runtime_program(
         &wasm_runner,
@@ -271,7 +276,7 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
         ],
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-    assert!(wasm_run.status.success(), "wasm fannkuch failed:\n{stderr}");
+    assert_ran_ok("wasm fannkuch", &wasm_run);
     assert_eq!(
         wasm_run.stdout, dynasm_run.stdout,
         "wasm fannkuch output diverged from dynasm:\n{stderr}"
@@ -302,11 +307,7 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     }
 
     let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-    assert!(
-        dynasm_run.status.success(),
-        "dynasm failed:\n{}",
-        String::from_utf8_lossy(&dynasm_run.stderr)
-    );
+    assert_ran_ok("dynasm terminal-decline", &dynasm_run);
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
     let wasm_run = run_runtime_program(
         &wasm_runner,
@@ -319,7 +320,7 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
         ],
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-    assert!(wasm_run.status.success(), "wasm failed:\n{stderr}");
+    assert_ran_ok("wasm terminal-decline", &wasm_run);
     assert_eq!(
         wasm_run.stdout, dynasm_run.stdout,
         "forced terminal-decline wasm output diverged from dynasm\nwasm stderr:\n{stderr}"
@@ -358,7 +359,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     ] {
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-        assert!(dynasm_run.status.success(), "dynasm failed for {bench}");
+        assert_ran_ok(&format!("dynasm {bench}"), &dynasm_run);
         let wasm_run = run_runtime_program(
             &wasm_runner,
             &script,
@@ -369,10 +370,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
             ],
         );
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-        assert!(
-            wasm_run.status.success(),
-            "wasm failed for {bench}:\n{stderr}"
-        );
+        assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
         assert_eq!(
             wasm_run.stdout, dynasm_run.stdout,
             "wasm output diverged from dynasm for {bench}:\n{stderr}"
