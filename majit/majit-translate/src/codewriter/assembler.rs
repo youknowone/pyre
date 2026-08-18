@@ -3717,8 +3717,15 @@ fn bh_all_field_specs_for_struct_into(
             .map(|fs| fs.to_vec())
             .unwrap_or_default();
         for fl in &layout.fields {
+            // Header words are skipped against the owner that declares them,
+            // which is the nested owner once the walk has descended. They are
+            // not part of the positional census (`heaptracker.py:51`), so a
+            // list that keeps them numbers every following field two slots
+            // past where `get_fielddescr_index_in` puts it — and the index a
+            // descr is minted with is then a position in a different list
+            // than the one attached to it as the parent.
             if fl.field_type == majit_ir::value::Type::Void
-                || fl.name == "typeptr"
+                || crate::codewriter::heaptracker::is_header_word(owner, &fl.name)
                 || fl.name.starts_with("c__pad")
             {
                 continue;
@@ -3782,7 +3789,8 @@ fn bh_all_field_specs_for_struct_into(
         }
         let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
-        let is_skipped_field = field_name == "typeptr" || field_name.starts_with("c__pad");
+        let is_skipped_field = crate::codewriter::heaptracker::is_header_word(owner, field_name)
+            || field_name.starts_with("c__pad");
         if !is_skipped_field {
             if field_flag == majit_ir::descr::ArrayFlag::Struct {
                 // `heaptracker.py:68-69` recursive flatten for nested
