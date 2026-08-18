@@ -17888,23 +17888,15 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
 ///
 /// The reference arrives either inline or hash-consed: Charon writes
 /// `HashConsedValue: [id, body]` at the first occurrence and `Deduplicated:
-/// id` afterwards, so both spellings resolve to the same body.
+/// id` afterwards. [`traitref_unwrap`] resolves both, and resolves them in a
+/// loop — either spelling can nest inside the other, so peeling one of each
+/// in a fixed order would leave a wrapper standing and make the `kind` read
+/// miss. Missing it declines the call, which is safe but would make the
+/// classification depend on how Charon happened to serialize the reference.
 fn trait_ref_is_dyn(trait_ref: &serde_json::Value, llbc: &Llbc) -> bool {
-    let resolved = match trait_ref
-        .get("Deduplicated")
-        .and_then(serde_json::Value::as_u64)
-    {
-        Some(id) => match llbc.dedup_body(id) {
-            Some(body) => body,
-            None => return false,
-        },
-        None => trait_ref,
+    let Some(resolved) = traitref_unwrap(trait_ref, llbc, 0) else {
+        return false;
     };
-    let resolved = resolved
-        .get("HashConsedValue")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|pair| pair.get(1))
-        .unwrap_or(resolved);
     resolved.get("kind").and_then(serde_json::Value::as_str) == Some("Dyn")
 }
 
@@ -23978,6 +23970,60 @@ mod tests {
         .expect("fixture trait call parses");
 
         assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
+    }
+
+    #[test]
+    fn a_hash_consed_trait_ref_wrapping_a_deduplicated_one_still_reads_dyn() {
+        // Charon's two indirections nest: the reference arrives as
+        // `HashConsedValue: [id, {Deduplicated: n}]`. Peeling one of each in a
+        // fixed order leaves the inner `Deduplicated` standing, the `kind`
+        // read misses, and a genuine trait-object call is declined — a
+        // classification that would then depend on how the reference happened
+        // to be serialized. The receiver type below registers body 9 so the
+        // inner hop has somewhere to land.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"HashConsedValue": [9, {"kind": "Dyn"}]}],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"HashConsedValue": [7, {"Deduplicated": 9}]}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(
+            super::abstract_trait_call_target(&call, &llbc),
+            Some(("Storage".to_string(), "head".to_string()))
+        );
     }
 
     #[test]
