@@ -3786,7 +3786,13 @@ impl OptUnroll {
                     // built: short-preamble ops embed the Const value
                     // directly in `op.args`, mirroring RPython's
                     // `shortpreamble.py` which has no parallel side table.
-                    if let Some(builder) = optimizer.short_preamble_producer.as_ref() {
+                    //
+                    // Replay can abort mid-way and leave the builder partial,
+                    // so publishing it would persist a short preamble later
+                    // bridges and retraces consume.
+                    if !ctx.has_pending_invalid_loop()
+                        && let Some(builder) = optimizer.short_preamble_producer.as_ref()
+                    {
                         target_token.short_preamble = Some(builder.build_short_preamble_struct());
                     }
                 } else {
