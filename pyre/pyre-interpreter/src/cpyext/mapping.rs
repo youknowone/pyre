@@ -95,6 +95,68 @@ pub unsafe extern "C" fn PyMapping_DelItemString(
     0
 }
 
+/// Read `object[key]` into `*result`, answering 1 when the key was there, 0
+/// when it was not and -1 on failure.
+///
+/// The missing key is answered rather than raised, which is the whole point of
+/// the call: a `KeyError` the lookup raised is swallowed, any other failure is
+/// not.
+///
+/// # Safety
+/// `result` must be null or a writable `PyObject *`.
+unsafe fn optional_item(
+    object: PyObjectRef,
+    key: PyObjectRef,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    let found = match crate::baseobjspace::getitem(object, key) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind == crate::PyErrorKind::KeyError => Ok(None),
+        Err(error) => Err(error),
+    };
+    unsafe { super::dictobject::get_item_ref(found, result) }
+}
+
+/// `PyMapping_GetOptionalItem(obj, key, &result)`.
+///
+/// # Safety
+/// `result` must be null or a writable `PyObject *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMapping_GetOptionalItem(
+    object: *mut CPyObject,
+    key: *mut CPyObject,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    super::object::realize_all([object, key]);
+    let (Some(object), Some(key)) = (argument(object), argument(key)) else {
+        if !result.is_null() {
+            unsafe { *result = std::ptr::null_mut() };
+        }
+        return -1;
+    };
+    unsafe { optional_item(object, key, result) }
+}
+
+/// `PyMapping_GetOptionalItemString(obj, key, &result)`.
+///
+/// # Safety
+/// `key` must be NUL-terminated and `result` null or a writable `PyObject *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyMapping_GetOptionalItemString(
+    object: *mut CPyObject,
+    key: *const c_char,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    super::object::realize_all([object]);
+    let (Some(key), Some(object)) = (key_of(key), argument(object)) else {
+        if !result.is_null() {
+            unsafe { *result = std::ptr::null_mut() };
+        }
+        return -1;
+    };
+    unsafe { optional_item(object, key, result) }
+}
+
 /// `PyMapping_HasKey` swallows the lookup's exception, as CPython's does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMapping_HasKey(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
@@ -169,5 +231,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyMapping_SetItemString as *const ());
     std::hint::black_box(PyMapping_DelItemString as *const ());
     std::hint::black_box(PyMapping_HasKey as *const ());
+    std::hint::black_box(PyMapping_GetOptionalItem as *const ());
+    std::hint::black_box(PyMapping_GetOptionalItemString as *const ());
     std::hint::black_box(PyMapping_HasKeyString as *const ());
 }

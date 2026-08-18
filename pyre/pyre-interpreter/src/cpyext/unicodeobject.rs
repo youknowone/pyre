@@ -446,37 +446,6 @@ pub unsafe extern "C" fn PyUnicode_WriteChar(
 
 // ── the operations an extension reaches str through ─────────────────────
 
-/// `object.name(*arguments)`.
-///
-/// The attribute lookup can collect, and an argument that is a list or a dict
-/// moves when it does, so everything is pinned across it and read back after.
-fn call_method(
-    object: PyObjectRef,
-    name: &str,
-    arguments: &[PyObjectRef],
-) -> Result<PyObjectRef, crate::PyError> {
-    let roots = pyre_object::gc_roots::push_roots();
-    let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(object);
-    let first_argument = pyre_object::gc_roots::shadow_stack_len();
-    for &argument in arguments {
-        roots.pin_root(argument);
-    }
-    let method = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(object_slot),
-        name,
-    )?;
-    let method_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(method);
-    let reloaded: Vec<PyObjectRef> = (0..arguments.len())
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(first_argument + index))
-        .collect();
-    crate::call::call_function_impl_result(
-        pyre_object::gc_roots::shadow_stack_get(method_slot),
-        &reloaded,
-    )
-}
-
 /// A `str` argument, or `None` with `message` recorded as a `TypeError`.
 /// Accepts a subclass, which is what `PyUnicode_Check` answers for.
 fn str_argument(
@@ -537,7 +506,7 @@ fn decode_through(
     let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, length as usize) };
     let handler = error_handler(errors);
     let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(bytes);
-    super::object::result(call_method(
+    super::object::result(super::object::call_method(
         w_bytes,
         "decode",
         &[
@@ -558,7 +527,7 @@ fn encode_through(object: *mut CPyObject, encoding: &str, errors: *const c_char)
         return std::ptr::null_mut();
     }
     let handler = error_handler(errors);
-    super::object::result(call_method(
+    super::object::result(super::object::call_method(
         value,
         "encode",
         &[
@@ -1240,7 +1209,7 @@ pub unsafe extern "C" fn PyUnicode_Join(
     let Some([separator, sequence]) = super::object::arguments([separator, sequence]) else {
         return std::ptr::null_mut();
     };
-    super::object::result(call_method(separator, "join", &[sequence]))
+    super::object::result(super::object::call_method(separator, "join", &[sequence]))
 }
 
 /// `unicodeobject.py:1515 PyUnicode_FindChar` — the index of `ch`, -1 when it

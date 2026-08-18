@@ -118,9 +118,9 @@ the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs`,
 `pyrex/tests/cpyext_warnings.rs`, `pyrex/tests/cpyext_conversions.rs`,
 `pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs`,
-`pyrex/tests/cpyext_small.rs` and `pyrex/tests/cpyext_locks.rs` take their
-expectations from CPython 3.14.6 running the same script against the same
-fixture.
+`pyrex/tests/cpyext_small.rs`, `pyrex/tests/cpyext_locks.rs` and
+`pyrex/tests/cpyext_writer.rs` take their expectations from CPython 3.14.6
+running the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -213,6 +213,29 @@ fixture.
   one hide the other, and `Py_FatalError` over the exported
   `_Py_FatalErrorFunc`, a macro so that the report names the function the
   caller gave up in;
+- the `str` an extension builds piece by piece (`cpyext/unicodewriter.rs`):
+  `PyUnicodeWriter_Create` / `Discard` / `Finish` and the writes
+  `WriteChar` / `WriteUTF8` / `WriteASCII` / `WriteWideChar` / `WriteUCS4` /
+  `WriteStr` / `WriteRepr` / `WriteSubstring`, plus the variadic
+  `PyUnicodeWriter_Format` written on the header over the `%`-format engine
+  already there. The handle is opaque, so what it holds is this layer's own
+  text rather than a partly built `str`: nothing is an object until `Finish`
+  is asked for one, and a writer that is discarded made none. A refused write
+  leaves the writer holding exactly what it held before it, so the caller may
+  still finish or discard it;
+- the container entry points that answer *whether* the key was there beside
+  the value (`cpyext/dictobject.rs`, `cpyext/mapping.rs`,
+  `cpyext/listobject.rs`, `cpyext/bytesobject.rs`): `PyDict_Pop` /
+  `PyDict_PopString`, which take the key out and hand back a new reference,
+  and answer the miss without hashing the key at all when the dictionary is
+  empty; `PyMapping_GetOptionalItem` / `GetOptionalItemString`, which swallow
+  the `KeyError` a lookup raised and let every other failure through;
+  `PyList_Clear` and `PyList_Extend`, which reach the `list` type's own
+  methods rather than a subclass override; `PyDictProxy_New`, the read-only
+  view `types.MappingProxyType` builds, over anything with `__getitem__` that
+  is not a list or a tuple; and `PyBytes_Join` / `PyBytes_Concat` /
+  `PyBytes_ConcatAndDel`, the last two replacing the reference the caller
+  handed over with the concatenation and leaving NULL there when it fails;
 - the small entry points beside them (`cpyext/unicodeobject.rs`,
   `cpyext/dictobject.rs`, `cpyext/object.rs`, `cpyext/typeobject.rs`,
   `cpyext/genericaliasobject.rs`): the locale codec `PyUnicode_DecodeLocale` /
@@ -551,7 +574,7 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 746 public
    `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 455 are present, counting every form `Python.h` offers one
+   underscore -- 460 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like

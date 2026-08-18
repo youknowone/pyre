@@ -348,6 +348,133 @@ pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
 }
 
+/// `PyBytes_Join(sep, iterable)` — `sep.join(iterable)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyBytes_Join(
+    separator: *mut CPyObject,
+    iterable: *mut CPyObject,
+) -> *mut CPyObject {
+    super::object::realize_all([separator, iterable]);
+    if separator.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let (Some(separator), Some(iterable)) = (argument(separator), argument(iterable)) else {
+        return std::ptr::null_mut();
+    };
+    if !unsafe { crate::baseobjspace::isinstance_bytes_w(separator) } {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "sep: expected bytes, got {}",
+            crate::type_methods::arg_type_name(separator)
+        )));
+        return std::ptr::null_mut();
+    }
+    // The concrete `join`, so a subclass override is not consulted.
+    let separator = match super::pyerrors::trap(bytes_of(separator)) {
+        Some(separator) => separator,
+        None => return std::ptr::null_mut(),
+    };
+    super::object::result(super::object::call_method(separator, "join", &[iterable]))
+}
+
+/// The bytes a side of a concatenation contributes, or `None` when the object
+/// exports none -- which is what the concatenation refuses over.
+fn concat_bytes(value: PyObjectRef) -> Result<Option<Vec<u8>>, crate::PyError> {
+    if unsafe { pyre_object::bytesobject::is_bytes(value) } {
+        return Ok(Some(
+            unsafe { pyre_object::bytesobject::w_bytes_data(value) }.to_vec(),
+        ));
+    }
+    let Some(buffer) = crate::baseobjspace::full_ro_buffer_bytes(value)? else {
+        return Ok(None);
+    };
+    let data = buffer.as_bytes().to_vec();
+    buffer.release();
+    Ok(Some(data))
+}
+
+/// `PyBytes_Concat(&bytes, other)` — replace `*pv` with `*pv + other`.
+///
+/// Nothing is answered: a failure is a NULL left behind in `*pv` with the
+/// error recorded, and the reference `*pv` held is given up either way.  A
+/// NULL `other` is the caller asking for the left side to be dropped.
+///
+/// Both sides are read as buffers rather than added, so `__radd__` is never
+/// consulted and a right side that exports no buffer is the refusal rather
+/// than an unsupported operand.
+///
+/// # Safety
+/// `pv` must be a writable `PyObject *` holding a reference this call takes
+/// over.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyBytes_Concat(pv: *mut *mut CPyObject, w: *mut CPyObject) {
+    if pv.is_null() {
+        return;
+    }
+    let left = unsafe { *pv };
+    if left.is_null() {
+        return;
+    }
+    if w.is_null() {
+        unsafe {
+            *pv = std::ptr::null_mut();
+            pyobject::decref(left);
+        }
+        return;
+    }
+    super::object::realize_all([left, w]);
+    let joined = match (argument(left), argument(w)) {
+        (Some(left), Some(right)) => super::pyerrors::trap(concatenated(left, right)),
+        _ => None,
+    };
+    unsafe {
+        *pv = match joined {
+            Some(joined) => pyobject::make_ref(joined),
+            None => std::ptr::null_mut(),
+        };
+        pyobject::decref(left);
+    }
+}
+
+/// The `bytes` holding `left` followed by `right`, or the one refusal both
+/// sides share when either exports no buffer.
+fn concatenated(left: PyObjectRef, right: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    // Reading a buffer runs the exporter's own code, so both names are taken
+    // before that and both objects are pinned across it.
+    let left_name = crate::type_methods::arg_type_name(left);
+    let right_name = crate::type_methods::arg_type_name(right);
+    let refusal =
+        || crate::PyError::type_error(format!("can't concat {right_name} to {left_name}"));
+    let roots = pyre_object::gc_roots::push_roots();
+    let left_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(left);
+    let right_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(right);
+    let Some(tail) = concat_bytes(pyre_object::gc_roots::shadow_stack_get(right_slot))? else {
+        return Err(refusal());
+    };
+    let Some(mut data) = concat_bytes(pyre_object::gc_roots::shadow_stack_get(left_slot))? else {
+        return Err(refusal());
+    };
+    data.extend_from_slice(&tail);
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&data))
+}
+
+/// `PyBytes_ConcatAndDel(&bytes, other)` — [`PyBytes_Concat`] that also gives
+/// up the reference to `other`.
+///
+/// # Safety
+/// `pv` must be a writable `PyObject *`, and both references are taken over.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyBytes_ConcatAndDel(pv: *mut *mut CPyObject, w: *mut CPyObject) {
+    unsafe {
+        PyBytes_Concat(pv, w);
+        if !w.is_null() {
+            pyobject::decref(w);
+        }
+    }
+}
+
 /// `PyBytes_FromObject(object)` — [`bytes_of`] as an entry point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_FromObject(object: *mut CPyObject) -> *mut CPyObject {
@@ -397,6 +524,9 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyBytes_AsString as *const ());
     std::hint::black_box(PyBytes_AsStringAndSize as *const ());
     std::hint::black_box(PyBytes_Size as *const ());
+    std::hint::black_box(PyBytes_Join as *const ());
+    std::hint::black_box(PyBytes_Concat as *const ());
+    std::hint::black_box(PyBytes_ConcatAndDel as *const ());
     std::hint::black_box(PyBytes_FromObject as *const ());
     std::hint::black_box(PyBytes_AS_STRING as *const ());
     std::hint::black_box(PyBytes_Check as *const ());

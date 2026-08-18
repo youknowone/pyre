@@ -172,6 +172,25 @@ pub unsafe extern "C" fn PyList_Reverse(object: *mut CPyObject) -> c_int {
     list_method(crate::type_methods::list_method_reverse, &[value])
 }
 
+/// `PyList_Clear(list)` — drop every item.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_Clear(object: *mut CPyObject) -> c_int {
+    let Some(value) = internal_list(object) else {
+        return -1;
+    };
+    list_method(crate::type_methods::list_method_clear, &[value])
+}
+
+/// `PyList_Extend(list, iterable)` — append everything `iterable` yields.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyList_Extend(object: *mut CPyObject, iterable: *mut CPyObject) -> c_int {
+    super::object::realize_all([object, iterable]);
+    let (Some(value), Some(iterable)) = (internal_list(object), argument(iterable)) else {
+        return -1;
+    };
+    list_method(crate::type_methods::list_method_extend, &[value, iterable])
+}
+
 /// `PyList_AsTuple(list)` — `tuple(list)` (`listobject.py:120-124`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_AsTuple(object: *mut CPyObject) -> *mut CPyObject {
@@ -246,6 +265,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyList_Append as *const ());
     std::hint::black_box(PyList_GetItemRef as *const ());
     std::hint::black_box(PyList_Insert as *const ());
+    std::hint::black_box(PyList_Clear as *const ());
+    std::hint::black_box(PyList_Extend as *const ());
     std::hint::black_box(PyList_Sort as *const ());
     std::hint::black_box(PyList_Reverse as *const ());
     std::hint::black_box(PyList_AsTuple as *const ());

@@ -156,6 +156,7 @@ STRUCTS = {
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
     "CPyThreadState": "PyThreadState", "CPyComplex": "Py_complex",
     "CPyMutex": "PyMutex",
+    "CPyUnicodeWriter": "PyUnicodeWriter",
 }
 
 

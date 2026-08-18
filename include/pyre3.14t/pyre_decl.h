@@ -47,9 +47,12 @@ PyAPI_FUNC(char *) PyBytes_AsString(PyObject *);
 PyAPI_FUNC(int) PyBytes_AsStringAndSize(PyObject *, char **, Py_ssize_t *);
 PyAPI_FUNC(int) PyBytes_Check(PyObject *);
 PyAPI_FUNC(int) PyBytes_CheckExact(PyObject *);
+PyAPI_FUNC(void) PyBytes_Concat(PyObject **, PyObject *);
+PyAPI_FUNC(void) PyBytes_ConcatAndDel(PyObject **, PyObject *);
 PyAPI_FUNC(PyObject *) PyBytes_FromObject(PyObject *);
 PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *, Py_ssize_t);
+PyAPI_FUNC(PyObject *) PyBytes_Join(PyObject *, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *);
 PyAPI_FUNC(int) _PyBytes_Resize(PyObject **, Py_ssize_t);
 
@@ -77,6 +80,7 @@ PyAPI_FUNC(double) PyComplex_ImagAsDouble(PyObject *);
 PyAPI_FUNC(double) PyComplex_RealAsDouble(PyObject *);
 
 /* cpyext/dictobject.rs */
+PyAPI_FUNC(PyObject *) PyDictProxy_New(PyObject *);
 PyAPI_FUNC(int) PyDict_Check(PyObject *);
 PyAPI_FUNC(int) PyDict_CheckExact(PyObject *);
 PyAPI_FUNC(void) PyDict_Clear(PyObject *);
@@ -95,6 +99,8 @@ PyAPI_FUNC(int) PyDict_Merge(PyObject *, PyObject *, int);
 PyAPI_FUNC(int) PyDict_MergeFromSeq2(PyObject *, PyObject *, int);
 PyAPI_FUNC(PyObject *) PyDict_New(void);
 PyAPI_FUNC(int) PyDict_Next(PyObject *, Py_ssize_t *, PyObject **, PyObject **);
+PyAPI_FUNC(int) PyDict_Pop(PyObject *, PyObject *, PyObject **);
+PyAPI_FUNC(int) PyDict_PopString(PyObject *, const char *, PyObject **);
 PyAPI_FUNC(int) PyDict_SetDefaultRef(PyObject *, PyObject *, PyObject *, PyObject **);
 PyAPI_FUNC(int) PyDict_SetItem(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PyDict_SetItemString(PyObject *, const char *, PyObject *);
@@ -152,6 +158,8 @@ PyAPI_FUNC(int) PyList_Append(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyList_AsTuple(PyObject *);
 PyAPI_FUNC(int) PyList_Check(PyObject *);
 PyAPI_FUNC(int) PyList_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyList_Clear(PyObject *);
+PyAPI_FUNC(int) PyList_Extend(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyList_GetItem(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyList_GetItemRef(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyList_GetSlice(PyObject *, Py_ssize_t, Py_ssize_t);
@@ -220,6 +228,8 @@ PyAPI_FUNC(PyObject *) _PyLong_FromByteArray(const unsigned char *, size_t, int,
 PyAPI_FUNC(int) PyMapping_Check(PyObject *);
 PyAPI_FUNC(int) PyMapping_DelItemString(PyObject *, const char *);
 PyAPI_FUNC(PyObject *) PyMapping_GetItemString(PyObject *, const char *);
+PyAPI_FUNC(int) PyMapping_GetOptionalItem(PyObject *, PyObject *, PyObject **);
+PyAPI_FUNC(int) PyMapping_GetOptionalItemString(PyObject *, const char *, PyObject **);
 PyAPI_FUNC(int) PyMapping_HasKey(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyMapping_HasKeyString(PyObject *, const char *);
 PyAPI_FUNC(PyObject *) PyMapping_Items(PyObject *);
@@ -555,6 +565,19 @@ PyAPI_FUNC(Py_UCS4) PyUnicode_ReadChar(PyObject *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyUnicode_RichCompare(PyObject *, PyObject *, int);
 PyAPI_FUNC(PyObject *) PyUnicode_Substring(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
+
+/* cpyext/unicodewriter.rs */
+PyAPI_FUNC(PyUnicodeWriter *) PyUnicodeWriter_Create(Py_ssize_t);
+PyAPI_FUNC(void) PyUnicodeWriter_Discard(PyUnicodeWriter *);
+PyAPI_FUNC(PyObject *) PyUnicodeWriter_Finish(PyUnicodeWriter *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteASCII(PyUnicodeWriter *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteChar(PyUnicodeWriter *, Py_UCS4);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteRepr(PyUnicodeWriter *, PyObject *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteStr(PyUnicodeWriter *, PyObject *);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteSubstring(PyUnicodeWriter *, PyObject *, Py_ssize_t, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteUCS4(PyUnicodeWriter *, Py_UCS4 *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteUTF8(PyUnicodeWriter *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyUnicodeWriter_WriteWideChar(PyUnicodeWriter *, const wchar_t *, Py_ssize_t);
 
 /* cpyext/warnings.rs */
 PyAPI_FUNC(int) PyErr_WarnEx(PyObject *, const char *, Py_ssize_t);

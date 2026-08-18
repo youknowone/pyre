@@ -40,6 +40,9 @@ typedef struct Py_buffer Py_buffer;
 typedef PyObject PyLongObject;
 typedef PyObject PyUnicodeObject;
 typedef void (*PyCapsule_Destructor)(PyObject *);
+/* The buffer a `str` is written into piece by piece.  Opaque: only this
+   runtime ever looks inside one. */
+typedef struct PyUnicodeWriter PyUnicodeWriter;
 
 #ifdef __cplusplus
 }

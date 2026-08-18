@@ -96,6 +96,37 @@ pub(super) fn result(value: Result<PyObjectRef, crate::PyError>) -> *mut CPyObje
     }
 }
 
+/// `object.name(*arguments)`.
+///
+/// The attribute lookup can collect, and an argument that is a list or a dict
+/// moves when it does, so everything is pinned across it and read back after.
+pub(super) fn call_method(
+    object: PyObjectRef,
+    name: &str,
+    arguments: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(object);
+    let first_argument = pyre_object::gc_roots::shadow_stack_len();
+    for &argument in arguments {
+        roots.pin_root(argument);
+    }
+    let method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(object_slot),
+        name,
+    )?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(method);
+    let reloaded: Vec<PyObjectRef> = (0..arguments.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(first_argument + index))
+        .collect();
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &reloaded,
+    )
+}
+
 /// The attribute name an entry point was handed, as the `str` it must be.
 fn attribute_name(name: *mut CPyObject) -> Option<PyObjectRef> {
     let name = argument(name)?;

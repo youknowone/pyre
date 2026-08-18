@@ -47,6 +47,7 @@ pub mod sysmodule;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
+pub mod unicodewriter;
 pub mod warnings;
 pub mod weakrefobject;
 
@@ -752,6 +753,7 @@ pub fn ensure_linked() {
     gc::ensure_linked();
     genericaliasobject::ensure_linked();
     lock::ensure_linked();
+    unicodewriter::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();

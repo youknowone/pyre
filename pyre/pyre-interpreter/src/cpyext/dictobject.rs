@@ -25,18 +25,37 @@ pub unsafe extern "C" fn PyDict_New() -> *mut CPyObject {
 /// it also wraps a mapping `resolve_dict_backing` would hand back.
 fn dict_argument(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     let value = argument(object)?;
-    let backing = if unsafe { crate::baseobjspace::isinstance_dict_w(value) } {
-        crate::type_methods::resolve_dict_backing(value)
-    } else {
-        pyre_object::PY_NULL
-    };
-    if backing.is_null() {
-        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
-            "{function}(): dict expected"
-        )));
+    match dict_backing(value) {
+        Some(backing) => Some(backing),
+        None => {
+            super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+                "{function}(): dict expected"
+            )));
+            None
+        }
+    }
+}
+
+/// The concrete mapping behind a value that passes `PyDict_Check`, with
+/// nothing recorded when it does not -- the caller says what a refusal is.
+fn dict_backing(value: PyObjectRef) -> Option<PyObjectRef> {
+    if !unsafe { crate::baseobjspace::isinstance_dict_w(value) } {
         return None;
     }
-    Some(backing)
+    let backing = crate::type_methods::resolve_dict_backing(value);
+    (!backing.is_null()).then_some(backing)
+}
+
+/// A `dict`, or the `SystemError` `PyErr_BadInternalCall` records -- the
+/// refusal the entry points that grew a `PyObject **` out-parameter make,
+/// rather than the `TypeError` the older ones make.
+fn internal_dict(object: *mut CPyObject) -> Option<PyObjectRef> {
+    let value = argument(object)?;
+    let backing = dict_backing(value);
+    if backing.is_none() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+    }
+    backing
 }
 
 fn key_name(name: *const c_char) -> Option<String> {
@@ -199,6 +218,9 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyDict_DelItem as *const ());
     std::hint::black_box(PyDict_Size as *const ());
     std::hint::black_box(PyDict_Contains as *const ());
+    std::hint::black_box(PyDict_Pop as *const ());
+    std::hint::black_box(PyDict_PopString as *const ());
+    std::hint::black_box(PyDictProxy_New as *const ());
     std::hint::black_box(PyDict_Check as *const ());
     std::hint::black_box(PyDict_CheckExact as *const ());
 }
@@ -288,7 +310,7 @@ pub unsafe extern "C" fn PyDict_GetItemWithError(
 ///
 /// # Safety
 /// `out` must be null or a writable `PyObject *`.
-unsafe fn get_item_ref(
+pub(super) unsafe fn get_item_ref(
     found: Result<Option<PyObjectRef>, crate::PyError>,
     out: *mut *mut CPyObject,
 ) -> c_int {
@@ -412,6 +434,87 @@ pub unsafe extern "C" fn PyDict_GetItemStringRef(
     };
     let found = Ok(unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(dict, &name) });
     unsafe { get_item_ref(found, result) }
+}
+
+/// Take `key` out of `dict`, answering 1 when it was there, 0 when it was
+/// not and -1 on failure.
+///
+/// # Safety
+/// `result` must be null or a writable `PyObject *`.
+unsafe fn pop_from(dict: PyObjectRef, key: PyObjectRef, result: *mut *mut CPyObject) -> c_int {
+    // An empty dictionary is answered without hashing the key, so a key that
+    // cannot be hashed is a miss there rather than a `TypeError`.
+    if unsafe { pyre_object::dictmultiobject::w_dict_len(dict) } == 0 {
+        return unsafe { get_item_ref(Ok(None), result) };
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(dict);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(key);
+    let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+    let found = unsafe {
+        pyre_object::dictmultiobject::w_dict_pop_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+        )
+    }
+    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key));
+    unsafe { get_item_ref(found, result) }
+}
+
+/// `PyDict_Pop(dict, key, &result)` — 1 when the key was there and has been
+/// removed, 0 when it was not, -1 on failure.
+///
+/// A NULL `result` throws the value away, which is how a caller spells
+/// "remove it if it is there".
+///
+/// # Safety
+/// `result` must be null or a writable `PyObject *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDict_Pop(
+    object: *mut CPyObject,
+    key: *mut CPyObject,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    super::object::realize_all([object, key]);
+    let (Some(dict), Some(key)) = (internal_dict(object), argument(key)) else {
+        if !result.is_null() {
+            unsafe { *result = std::ptr::null_mut() };
+        }
+        return -1;
+    };
+    unsafe { pop_from(dict, key, result) }
+}
+
+/// `PyDict_PopString(dict, key, &result)`.
+///
+/// # Safety
+/// `key` must be NUL-terminated and `result` null or a writable `PyObject *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDict_PopString(
+    object: *mut CPyObject,
+    key: *const c_char,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    super::object::realize_all([object]);
+    let (Some(name), Some(dict)) = (key_name(key), internal_dict(object)) else {
+        if !result.is_null() {
+            unsafe { *result = std::ptr::null_mut() };
+        }
+        return -1;
+    };
+    unsafe { pop_from(dict, pyre_object::w_str_new(&name), result) }
+}
+
+/// `PyDictProxy_New(mapping)` — the read-only view `types.MappingProxyType`
+/// builds, over anything with `__getitem__` that is not a list or a tuple.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDictProxy_New(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(mapping) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(crate::typedef::mappingproxy_from_mapping(mapping))
 }
 
 /// Build one of the three view lists.  Upstream answers a `list` rather than a

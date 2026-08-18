@@ -72,6 +72,24 @@ static inline Py_UCS4 _PyPyre_UnicodeRead(int kind, const void *data,
    reference declaration is. */
 #define PyUnicode_READY(op) ((void)(op), 0)
 
+/* `PyUnicodeWriter_Format` is written here rather than exported: it is
+   variadic, and the format engine it needs already sits in `pyre_format.h`.
+   The formatted string is written into the writer and then given up. */
+static inline int PyUnicodeWriter_Format(PyUnicodeWriter *writer,
+                                         const char *format, ...)
+{
+    va_list vargs;
+    va_start(vargs, format);
+    PyObject *formatted = PyUnicode_FromFormatV(format, vargs);
+    va_end(vargs);
+    if (formatted == NULL) {
+        return -1;
+    }
+    int written = PyUnicodeWriter_WriteStr(writer, formatted);
+    Py_DECREF(formatted);
+    return written;
+}
+
 #ifdef __cplusplus
 }
 #endif

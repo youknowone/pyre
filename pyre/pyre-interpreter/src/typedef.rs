@@ -8551,6 +8551,14 @@ fn mappingproxy_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             ));
         }
     };
+    mappingproxy_from_mapping(w_mapping)
+}
+
+/// The read-only proxy over `w_mapping`, which has to expose `__getitem__`
+/// and be neither a list nor a tuple (`dictproxyobject.py:20-27`).
+pub(crate) fn mappingproxy_from_mapping(
+    w_mapping: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let has_getitem = r#type(w_mapping)
         .map(|t| {
             unsafe { crate::baseobjspace::lookup_in_type(t.as_ptr(), "__getitem__") }.is_some()
