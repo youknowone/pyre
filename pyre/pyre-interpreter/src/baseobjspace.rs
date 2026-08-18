@@ -10938,8 +10938,13 @@ pub(crate) unsafe fn get(
         }
     }
 
-    // property: PyPy W_Property.get → call fget(obj)
-    if is_property(descr) {
+    // property: PyPy W_Property.get → call fget(obj).  Exact type only, for
+    // the reason `descroperation.py:169-176` gives its own shortcut: calling
+    // the accessor in place of `type(w_descr).__get__` is licensed only where
+    // the type cannot have overridden `__get__`.  A subclass falls through to
+    // the general MRO lookup at the end of this function, which finds either
+    // its override or `property`'s own typedef entry.
+    if is_exact_property(descr) {
         // W_Property.get receives `space.w_None` for class access.  Internally
         // that state is a null pointer so the actual None singleton can still
         // be a property-bearing instance.
@@ -11053,7 +11058,8 @@ unsafe fn set(
     // raise AttributeError ("can't set attribute") rather than falling
     // through to the instance dict (`descrobject.c property_descr_set`,
     // mirrored at `pypy/module/__builtin__/descriptor.py W_Property.set`).
-    if is_property(descr) {
+    // Exact type only — see the `__get__` twin.
+    if is_exact_property(descr) {
         let fset = w_property_get_fset(descr);
         if fset.is_null() || is_none(fset) {
             return Err(property_no_accessor(descr, obj, "setter")?);
@@ -11105,18 +11111,13 @@ unsafe fn set(
         return Ok(true);
     }
 
-    // General __set__: look up on descriptor's type MRO.  GetSetProperty
-    // is no longer INSTANCE_TYPE-shaped (it carries `GETSET_DESCRIPTOR
-    // _TYPE` so its GetSetProperty payload is GC-traced), so resolve
-    // the type through `crate::typedef::r#type` rather than the
-    // `is_instance` branch.
-    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
-        crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr())
-    } else if is_instance(descr) {
-        w_instance_get_type(descr)
-    } else {
-        std::ptr::null_mut()
-    };
+    // General __set__: `space.lookup(w_descr, '__set__')` is an MRO lookup on
+    // whatever `type(w_descr)` is, so resolve the type the same way for every
+    // descriptor kind — the `__get__` twin at the end of `get` already does.
+    // The narrower `is_getset_property` / `is_instance` pair this replaces left
+    // a native-layout subclass instance (a `property` subclass, say) with a
+    // null type and so no MRO lookup at all.
+    let descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if !descr_type.is_null()
         && let Some(set_fn) = lookup_in_type_where(descr_type, "__set__")
         && !set_fn.is_null()
@@ -11131,8 +11132,8 @@ unsafe fn set(
 ///
 /// descroperation.py `space.delete(w_descr, w_obj)`
 unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyError> {
-    // property: call fdel(obj)
-    if is_property(descr) {
+    // property: call fdel(obj).  Exact type only — see the `__get__` twin.
+    if is_exact_property(descr) {
         let fdel = w_property_get_fdel(descr);
         if fdel.is_null() || is_none(fdel) {
             return Err(property_no_accessor(descr, obj, "deleter")?);
@@ -11177,16 +11178,9 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
         }
         return Ok(());
     }
-    // General __delete__: look up on descriptor's type MRO — same
-    // shape as `set` above (resolve type through `r#type` so non-
-    // INSTANCE_TYPE descriptors like `GetSetProperty` are reached).
-    let descr_type = if pyre_object::typedef::is_getset_property(descr) {
-        crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr())
-    } else if is_instance(descr) {
-        w_instance_get_type(descr)
-    } else {
-        std::ptr::null_mut()
-    };
+    // General __delete__: look up on descriptor's type MRO — same shape as
+    // `set` above.
+    let descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if !descr_type.is_null()
         && let Some(del_fn) = lookup_in_type_where(descr_type, "__delete__")
         && !del_fn.is_null()

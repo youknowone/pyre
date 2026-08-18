@@ -353,6 +353,29 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
     py_type_check(obj, &PROPERTY_TYPE)
 }
 
+/// `type(obj) is property`, as opposed to [`is_property`]'s layout test.
+///
+/// `descroperation.py:169-176 get_and_call_function` spells out why the
+/// difference decides who may take an accessor shortcut: `typ = type(w_descr)`
+/// then `if typ is Function or typ is FunctionWithFixedCode`, with
+/// "isinstance(typ, Function) would not be correct here".  Everything else
+/// reaches its accessor through `space.get`, i.e. `type(w_descr).__get__` off
+/// the MRO — so calling `fget` in place of `__get__` is licensed only when the
+/// descriptor's type is `property` itself and cannot have overridden it.
+///
+/// The two answers really do separate: `property_descr_new` allocates through
+/// [`w_property_new`], which sets `w_class` to `property`, and calls
+/// `tag_subclass_instance` — the only writer of `w_class` — solely when the
+/// requested type is not `property`.  `ob_type`, which [`is_property`] reads,
+/// stays the shared layout word either way.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_exact_property(obj: PyObjectRef) -> bool {
+    unsafe { is_property(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&PROPERTY_TYPE)) }
+}
+
 #[cfg(test)]
 mod property_tests {
     use super::*;

@@ -1960,7 +1960,11 @@ unsafe fn property_descr_fast_path(
         return None;
     }
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }?;
-    if !unsafe { pyre_object::descriptor::is_property(w_descr) } {
+    // Exact type: the fold calls `fget`/`fset` directly, which stands in for
+    // `type(w_descr).__get__` only where that cannot have been overridden
+    // (`descroperation.py:169-176`).  A `property` subclass keeps the base
+    // layout and retags only `w_class`, so the layout test admits it.
+    if !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
         return None;
     }
     Some((w_type, version_tag, w_descr))
