@@ -6814,40 +6814,51 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
 /// whether to clear the bitstrings.  A half-populated EI would clear them
 /// while `extraeffect` still claims concrete effects, and the next
 /// `check_readonly_descr_field` would then read a `None` bitstring.
+/// `effectinfo.py:285-292` wildcard: the shape to fall back to whenever the
+/// concrete sets cannot be rebuilt faithfully.  Conservative in the sound
+/// direction — `has_random_effects()` makes every heap consumer assume the
+/// call touched everything.
+///
+/// Both raw-set families have to be cleared, not just the compacted one.
+/// `EffectInfo::default()` seeds every `_*_descrs_*` with `Some(vec![])` and
+/// serde skips them, so a deserialized EI arrives carrying empty concrete sets;
+/// leaving those behind states "writes nothing" — the bottom of the lattice —
+/// next to an `extraeffect` saying "writes everything".  Readers that consult
+/// the raw set directly (`writes_field_descr_by_identity`, which
+/// `OptHeap::force_from_effectinfo` uses before `compute_bitstrings` has run)
+/// would take the unsound half, and `compute_bitstrings` asserts the
+/// biconditional outright (`effectinfo.py:484-489`).
+fn degrade_to_random_effects(ei: &mut majit_ir::EffectInfo) {
+    ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
+    // effectinfo.py:364-365 — the wildcard forces can_collect.
+    ei.can_collect = true;
+    // `call.py:284-286` states it outright: "random_effects implies
+    // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
+    // `can_invalidate=True`, and so is pyre's own `EffectInfo::MOST_GENERAL`.
+    // Without this a degraded EI is a shape upstream cannot construct —
+    // random effects with `check_can_invalidate()` still false — and
+    // `check_can_invalidate` is read on a path `has_random_effects()` does not
+    // cover (`heap.py:457-459`; `_seen_guard_not_invalidated` is otherwise only
+    // reset in `__init__`, `heap.py:341`), so a quasi-immutable guard would
+    // survive a call the wildcard says invalidates everything.
+    ei.can_invalidate = true;
+    ei._readonly_descrs_fields = None;
+    ei._write_descrs_fields = None;
+    ei._readonly_descrs_arrays = None;
+    ei._write_descrs_arrays = None;
+    ei._readonly_descrs_interiorfields = None;
+    ei._write_descrs_interiorfields = None;
+    ei.readonly_descrs_fields = None;
+    ei.write_descrs_fields = None;
+    ei.readonly_descrs_arrays = None;
+    ei.write_descrs_arrays = None;
+    ei.readonly_descrs_interiorfields = None;
+    ei.write_descrs_interiorfields = None;
+    ei.single_write_descr_array = None;
+}
+
 pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
-    // `effectinfo.py:285-292` wildcard: the shape to fall back to whenever
-    // the concrete sets cannot be rebuilt faithfully.  Conservative in the
-    // sound direction — `has_random_effects()` makes every heap consumer
-    // assume the call touched everything.
-    fn degrade(ei: &mut majit_ir::EffectInfo) {
-        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
-        // effectinfo.py:364-365 — the wildcard forces can_collect.
-        ei.can_collect = true;
-        // `call.py:284-286` states it outright: "random_effects implies
-        // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
-        // `can_invalidate=True`, and so is pyre's own
-        // `EffectInfo::MOST_GENERAL`.  Without this a degraded EI is a shape
-        // upstream cannot construct — random effects with
-        // `check_can_invalidate()` still false — and `check_can_invalidate`
-        // is read on a path `has_random_effects()` does not cover
-        // (`heap.py:457-459`; `_seen_guard_not_invalidated` is otherwise only
-        // reset in `__init__`, `heap.py:341`), so a quasi-immutable guard
-        // would survive a call the wildcard says invalidates everything.
-        ei.can_invalidate = true;
-        ei._readonly_descrs_fields = None;
-        ei._write_descrs_fields = None;
-        ei._readonly_descrs_arrays = None;
-        ei._write_descrs_arrays = None;
-        ei._readonly_descrs_interiorfields = None;
-        ei._write_descrs_interiorfields = None;
-        ei.readonly_descrs_fields = None;
-        ei.write_descrs_fields = None;
-        ei.readonly_descrs_arrays = None;
-        ei.write_descrs_arrays = None;
-        ei.readonly_descrs_interiorfields = None;
-        ei.write_descrs_interiorfields = None;
-        ei.single_write_descr_array = None;
-    }
+    use degrade_to_random_effects as degrade;
 
     // `descr_set_keys` is the build-process -> runtime-process wire channel
     // for the six raw sets skipped by serde.  Consume it here: after the
@@ -6952,18 +6963,11 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
 /// descriptor reference EffectInfo deliberately keeps after compaction
 /// (`effectinfo.py:201-206`), so that singleton alone remains live.
 pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
-    fn degrade(ei: &mut majit_ir::EffectInfo) {
-        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
-        ei.can_collect = true;
-        ei.can_invalidate = true;
-        ei.readonly_descrs_fields = None;
-        ei.write_descrs_fields = None;
-        ei.readonly_descrs_arrays = None;
-        ei.write_descrs_arrays = None;
-        ei.readonly_descrs_interiorfields = None;
-        ei.write_descrs_interiorfields = None;
-        ei.single_write_descr_array = None;
-    }
+    // Shared with `rehydrate_effect_info` rather than spelled out again: the
+    // two had drifted, and this one was clearing only the compacted sets while
+    // the six `_*_descrs_*` kept the `Some(vec![])` that `EffectInfo::default()`
+    // seeds and serde skips.
+    use degrade_to_random_effects as degrade;
 
     let Some(keys) = ei.descr_set_keys.take() else {
         if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
@@ -7116,6 +7120,62 @@ pub fn make_interior_field_descr(
     ));
     majit_ir::descr_registry::register_interior_field(interior.clone());
     interior
+}
+
+#[cfg(test)]
+mod degrade_shape_tests {
+    use super::*;
+
+    /// `effectinfo.py:149-162` makes the six raw sets `None` **iff** the EI is
+    /// `EF_RANDOM_EFFECTS`, and `compute_bitstrings` (`effectinfo.py:484-489`)
+    /// asserts that biconditional.  Both degrade paths therefore have to clear
+    /// the `_*_descrs_*` family as well as the compacted one — `serde(skip)`
+    /// plus `EffectInfo::default()` means a deserialized EI arrives with
+    /// `Some(vec![])` in all six, and an EI left holding those while
+    /// `extraeffect` says random effects reads as "writes nothing" through
+    /// `writes_field_descr_by_identity`, the unsound direction.
+    #[test]
+    fn both_degrade_paths_clear_the_raw_sets_too() {
+        for (label, prepare) in [
+            (
+                "prepare_frozen_effect_info",
+                prepare_frozen_effect_info as fn(&mut majit_ir::EffectInfo),
+            ),
+            (
+                "rehydrate_effect_info",
+                rehydrate_effect_info as fn(&mut majit_ir::EffectInfo),
+            ),
+        ] {
+            // A concrete classification with no key channel — the shape whose
+            // sets cannot be rebuilt, so it must fall back to the wildcard.
+            let mut ei = majit_ir::EffectInfo {
+                extraeffect: majit_ir::ExtraEffect::CanRaise,
+                descr_set_keys: None,
+                ..majit_ir::EffectInfo::default()
+            };
+            // The premise: `default()` really does seed the raw sets, so
+            // clearing them is not vacuous.
+            assert!(ei._write_descrs_fields.is_some(), "{label}: premise");
+
+            prepare(&mut ei);
+
+            assert_eq!(
+                ei.extraeffect,
+                majit_ir::ExtraEffect::RandomEffects,
+                "{label}"
+            );
+            assert!(ei._readonly_descrs_fields.is_none(), "{label}");
+            assert!(ei._write_descrs_fields.is_none(), "{label}");
+            assert!(ei._readonly_descrs_arrays.is_none(), "{label}");
+            assert!(ei._write_descrs_arrays.is_none(), "{label}");
+            assert!(ei._readonly_descrs_interiorfields.is_none(), "{label}");
+            assert!(ei._write_descrs_interiorfields.is_none(), "{label}");
+            assert!(ei.write_descrs_fields.is_none(), "{label}");
+            assert!(ei.single_write_descr_array.is_none(), "{label}");
+            assert!(ei.can_collect, "{label}");
+            assert!(ei.can_invalidate, "{label}");
+        }
+    }
 }
 
 #[cfg(test)]
