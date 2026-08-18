@@ -117,9 +117,10 @@ the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
 `pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs`,
 `pyrex/tests/cpyext_warnings.rs`, `pyrex/tests/cpyext_conversions.rs`,
-`pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs` and
-`pyrex/tests/cpyext_small.rs` take their expectations from CPython 3.14.6
-running the same script against the same fixture.
+`pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs`,
+`pyrex/tests/cpyext_small.rs` and `pyrex/tests/cpyext_locks.rs` take their
+expectations from CPython 3.14.6 running the same script against the same
+fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -190,6 +191,28 @@ running the same script against the same fixture.
 - `PyImport_ImportModuleAttr` / `PyImport_ImportModuleAttrString`
   (`cpyext/import_.rs`), the import-then-`getattr` pair a C caller reaching
   into Python uses;
+- the locks an extension holds while it works (`cpyext/lock.rs`,
+  `include/pyre3.14t/lock.h`, `include/pyre3.14t/pythread.h`): the one-byte
+  `PyMutex` the caller embeds, whose uncontended take and release are the
+  header's own compare-exchange and whose contended halves are exported; and
+  the allocated `PyThread_type_lock` with `PyThread_acquire_lock` /
+  `acquire_lock_timed` / `release_lock` / `free_lock`, which is the binary
+  semaphore one thread may hand to another rather than an owned mutex. Every
+  wait that can block runs inside `gc_sync::before_external_block` -- the same
+  region `Py_BEGIN_ALLOW_THREADS` puts a thread in -- so a thread asleep on a
+  lock gives the GIL up and stops being one a collection waits for;
+- `_PyBytes_Resize` (`cpyext/bytesobject.rs`), which is how a caller that took
+  a buffer for an upper bound cuts it down to what it wrote. A mirror
+  `PyBytes_FromStringAndSize(NULL, n)` handed out has no `bytes` behind it
+  yet, so its buffer is resized where it lies and the same block is written
+  back; a mirror that has one gets a new `bytes`, the object being immutable.
+  Bytes past the old length are zero, where upstream leaves them holding
+  whatever the allocator had if it can resize in place;
+- `_PyErr_ChainExceptions1` (`cpyext/pyerrors.rs`), which makes what a caller
+  just caught the context of whatever is already pending rather than letting
+  one hide the other, and `Py_FatalError` over the exported
+  `_Py_FatalErrorFunc`, a macro so that the report names the function the
+  caller gave up in;
 - the small entry points beside them (`cpyext/unicodeobject.rs`,
   `cpyext/dictobject.rs`, `cpyext/object.rs`, `cpyext/typeobject.rs`,
   `cpyext/genericaliasobject.rs`): the locale codec `PyUnicode_DecodeLocale` /
@@ -498,6 +521,13 @@ Known divergences, each documented at its definition:
   prefixed with the function name `_PyPyre_ArgError` was given, where CPython
   numbers the argument instead and leaves the function out when the format
   carries no `:name`;
+- `PyErr_BadInternalCall()` names the caller's own file and line, as its macro
+  spelling does; a call made inside the runtime has no such place to name and
+  reaches the plain entry point, so the same mistake reads differently
+  depending on which side made it;
+- `PyThread_acquire_lock_timed` never answers `PY_LOCK_INTR`: its wait is not
+  interruptible, so a caller that loops on that status simply never goes round
+  again;
 - `PyErr_WarnExplicitFormat` defaults a NULL category to `RuntimeWarning`,
   which the entry point it shares its core with already does. CPython's is the
   one spelling in the family that skips that default and hands the NULL
@@ -521,7 +551,7 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 746 public
    `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 448 are present, counting every form `Python.h` offers one
+   underscore -- 455 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like

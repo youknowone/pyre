@@ -28,6 +28,8 @@
 /* Name the types entry points below take and answer with by value:
    `PyThreadState` and `PyGILState_STATE`, and `Py_complex`. */
 #include "pystate.h"
+#include "lock.h"
+#include "pythread.h"
 #include "complexobject.h"
 
 /* Every exported entry point. It sits here because the headers above

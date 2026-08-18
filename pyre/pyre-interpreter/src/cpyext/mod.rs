@@ -28,6 +28,7 @@ pub mod genericaliasobject;
 pub mod import_;
 pub mod iterator;
 pub mod listobject;
+pub mod lock;
 pub mod longobject;
 pub mod mapping;
 pub mod methodobject;
@@ -750,6 +751,7 @@ pub fn ensure_linked() {
     weakrefobject::ensure_linked();
     gc::ensure_linked();
     genericaliasobject::ensure_linked();
+    lock::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();

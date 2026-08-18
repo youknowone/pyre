@@ -107,6 +107,16 @@ static inline int PyOS_snprintf(char *str, size_t size, const char *format, ...)
     return written;
 }
 
+/* Name the caller's own file and line in the report, the way the reference
+   header does.  A call made inside the runtime has no such place to name and
+   reaches the plain entry point instead. */
+#define PyErr_BadInternalCall() _PyErr_BadInternalCall(__FILE__, __LINE__)
+
+/* End the process, reporting a caller that cannot go on.  A macro so that the
+   report names the function it gave up in, the way the reference header's is. */
+PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *func, const char *message);
+#define Py_FatalError(message) _Py_FatalErrorFunc(__func__, message)
+
 /* An instance's class.  The two classification spellings beside it --
    `PyExceptionClass_Check` and `PyExceptionInstance_Check` -- are entry points
    rather than flag tests, since a pyre type mirror carries no `tp_flags` bit

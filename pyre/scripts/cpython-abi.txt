@@ -1,6 +1,6 @@
 # The declarations pyre's extension ABI is measured against.
 # Written by scripts/cpyext-abi.py snapshot; do not edit by hand.
-# source: CPython 3.14 Include/*.h and Include/cpython/*.h
+# source: CPython 3.14.7 Include/*.h and Include/cpython/*.h
 
 # [declarations]
 PyAIter_Check :: PyObject * -> int
@@ -1401,9 +1401,43 @@ _Py_stats :: PyStats *
 
 # [typedefs]
 DictKeysKind :: int
+ENABLE_SPECIALIZATION_FT :: ENABLE_SPECIALIZATION
 FILE_INFO_BY_NAME_CLASS :: int
 JitSymType :: int
+MAP_BOT_SHIFT :: ARENA_BITS
+MAP_MID_BITS :: INTERIOR_BITS
+MAP_TOP_BITS :: INTERIOR_BITS
+MAXPATHLEN :: PATH_MAX
+MAXPENDINGCALLS :: PENDINGCALLSARRAYSIZE
+MAXPENDINGCALLSLOOP :: MAXPENDINGCALLS
+MI_COMMIT_MASK_FIELD_BITS :: MI_SIZE_BITS
+MI_DEBUG_FREED :: PYMEM_DEADBYTE
+MI_DEBUG_PADDING :: PYMEM_FORBIDDENBYTE
+MI_DEBUG_UNINIT :: PYMEM_CLEANBYTE
+MI_PRIM_THREAD_ID :: _Py_ThreadId
+MI_SEGMENT_ALIGN :: MI_SEGMENT_SIZE
+NATIVE_TSS_KEY_T :: pthread_key_t
+PATH_MAX :: MAXPATHLEN
+PYMEM_ALLOC :: PYOBJ_ALLOC
+PYOBJ_ALLOC :: PYRAW_ALLOC
+PY_AUDIT_READ :: Py_AUDIT_READ
+PY_CXX_CONST :: const
+PY_INT32_T :: int32_t
+PY_INT64_T :: int64_t
+PY_INVALID_STACK_EFFECT :: INT_MAX
+PY_LLONG_MAX :: LLONG_MAX
+PY_LLONG_MIN :: LLONG_MIN
+PY_LONG_LONG :: long long
+PY_RELEASE_LEVEL :: PY_RELEASE_LEVEL_FINAL
+PY_SIZE_MAX :: SIZE_MAX
+PY_SSIZE_T_MAX :: SSIZE_MAX
+PY_TIMEOUT_T :: long long
+PY_UINT32_T :: uint32_t
+PY_UINT64_T :: uint64_t
+PY_ULLONG_MAX :: ULLONG_MAX
 PY_UNICODE_TYPE :: wchar_t
+PY_WRITE_RESTRICTED :: _Py_WRITE_RESTRICTED
+PyBUF_WRITEABLE :: PyBUF_WRITABLE
 PyCFunction :: void *
 PyCFunctionFast :: void *
 PyCFunctionFastWithKeywords :: void *
@@ -1415,6 +1449,13 @@ PyCodeEvent :: int
 PyCode_WatchCallback :: void *
 PyContextEvent :: int
 PyContext_WatchCallback :: void *
+PyCriticalSection2_Begin :: _PyCriticalSection2_Begin
+PyCriticalSection2_BeginMutex :: _PyCriticalSection2_BeginMutex
+PyCriticalSection2_End :: _PyCriticalSection2_End
+PyCriticalSection_Begin :: _PyCriticalSection_Begin
+PyCriticalSection_BeginMutex :: _PyCriticalSection_BeginMutex
+PyCriticalSection_End :: _PyCriticalSection_End
+PyDescr_COMMON :: PyDescrObject d_common
 PyDict_WatchCallback :: void *
 PyDict_WatchEvent :: int
 PyEnvironmentErrorObject :: PyOSErrorObject
@@ -1422,27 +1463,70 @@ PyFrameState :: int
 PyFunction_WatchCallback :: void *
 PyFunction_WatchEvent :: int
 PyGILState_STATE :: int
+PyHASH_IMAG :: PyHASH_MULTIPLIER
 PyLockStatus :: int
+PyLong_AsPid :: PyLong_AsInt
+PyLong_FromPid :: PyLong_FromLong
+PyMODINIT_FUNC :: Py_EXPORTED_SYMBOL PyObject*
 PyMUTEX_T :: CRITICAL_SECTION
+PyMapping_Length :: PyMapping_Size
 PyMemAllocatorDomain :: int
 PyMemAllocatorName :: int
 PyModInitFunction :: void *
+PyMutex_IsLocked :: _PyMutex_IsLocked
+PyMutex_Lock :: _PyMutex_Lock
+PyMutex_Unlock :: _PyMutex_Unlock
 PyOS_sighandler_t :: void *
+PyOS_stricmp :: stricmp
+PyOS_strnicmp :: strnicmp
+PyObject_DEL :: PyObject_Free
+PyObject_Del :: PyObject_Free
+PyObject_FREE :: PyObject_Free
+PyObject_Length :: PyObject_Size
+PyObject_MALLOC :: PyObject_Malloc
+PyObject_REALLOC :: PyObject_Realloc
 PyRefTracer :: void *
 PyRefTracerEvent :: int
 PySendResult :: int
+PySequence_In :: PySequence_Contains
+PySequence_Length :: PySequence_Size
+PyStackRef_AsPyObjectBorrow :: BITS_TO_PTR_MASKED
+PyStackRef_FromPyObjectNewMortal :: PyStackRef_FromPyObjectNew
+PyStackRef_NULL_BITS :: Py_TAG_REFCNT
+PyStackRef_XCLOSE :: PyStackRef_CLOSE
 PyStructSequence :: PyTupleObject
+PyStructSequence_GET_ITEM :: PyStructSequence_GetItem
+PyStructSequence_SET_ITEM :: PyStructSequence_SetItem
 PyThread_handle_t :: Py_uintptr_t
 PyThread_ident_t :: unsigned long long
+PyThread_type_lock :: void *
+PyTime_MAX :: INT64_MAX
+PyTime_MIN :: INT64_MIN
 PyTime_t :: int64_t
 PyType_WatchCallback :: void *
+PyUnstable_Long_CompactValue :: _PyLong_CompactValue
+PyUnstable_Long_IsCompact :: _PyLong_IsCompact
 PyWindowsErrorObject :: PyOSErrorObject
+Py_ALWAYS_INLINE :: __forceinline
 Py_AuditHookFunction :: void *
+Py_HASH_ALGORITHM :: Py_HASH_SIPHASH13
+Py_HUGE_VAL :: HUGE_VAL
+Py_MEMCPY :: memcpy
+Py_NSIG :: _SIG_MAXSIG
 Py_OpenCodeHookFunction :: void *
+Py_PACK_FULL_VERSION :: _Py_PACK_FULL_VERSION
+Py_RETURN_FALSE :: return Py_False
+Py_RETURN_NONE :: return Py_None
+Py_RETURN_NOTIMPLEMENTED :: return Py_NotImplemented
+Py_RETURN_TRUE :: return Py_True
+Py_TAG_DEFERRED :: Py_TAG_REFCNT
+Py_TP_USE_SPEC :: NULL
 Py_UCS1 :: uint8_t
 Py_UCS2 :: uint16_t
 Py_UCS4 :: uint32_t
 Py_UNICODE :: wchar_t
+Py_UNICODE_SIZE :: SIZEOF_WCHAR_T
+Py_VA_COPY :: va_copy
 Py_hash_t :: Py_ssize_t
 Py_intptr_t :: intptr_t
 Py_ssize_clean_t :: Py_ssize_t
@@ -1450,6 +1534,111 @@ Py_ssize_t :: ssize_t
 Py_tracefunc :: void *
 Py_uhash_t :: size_t
 Py_uintptr_t :: uintptr_t
+READONLY :: Py_READONLY
+READ_RESTRICTED :: Py_AUDIT_READ
+SIZEOF_PY_HASH_T :: SIZEOF_SIZE_T
+SIZEOF_PY_UHASH_T :: SIZEOF_SIZE_T
+T_BOOL :: Py_T_BOOL
+T_BYTE :: Py_T_BYTE
+T_CHAR :: Py_T_CHAR
+T_DOUBLE :: Py_T_DOUBLE
+T_FLOAT :: Py_T_FLOAT
+T_INT :: Py_T_INT
+T_LONG :: Py_T_LONG
+T_LONGLONG :: Py_T_LONGLONG
+T_NONE :: _Py_T_NONE
+T_OBJECT :: _Py_T_OBJECT
+T_OBJECT_EX :: Py_T_OBJECT_EX
+T_PYSSIZET :: Py_T_PYSSIZET
+T_SHORT :: Py_T_SHORT
+T_STRING :: Py_T_STRING
+T_STRING_INPLACE :: Py_T_STRING_INPLACE
+T_UBYTE :: Py_T_UBYTE
+T_UINT :: Py_T_UINT
+T_ULONG :: Py_T_ULONG
+T_ULONGLONG :: Py_T_ULONGLONG
+T_USHORT :: Py_T_USHORT
+_BUILD_INTERPOLATION :: BUILD_INTERPOLATION
+_BUILD_LIST :: BUILD_LIST
+_BUILD_MAP :: BUILD_MAP
+_BUILD_SET :: BUILD_SET
+_BUILD_SLICE :: BUILD_SLICE
+_BUILD_STRING :: BUILD_STRING
+_BUILD_TEMPLATE :: BUILD_TEMPLATE
+_BUILD_TUPLE :: BUILD_TUPLE
+_CALL_INTRINSIC_1 :: CALL_INTRINSIC_1
+_CALL_INTRINSIC_2 :: CALL_INTRINSIC_2
+_CALL_ISINSTANCE :: CALL_ISINSTANCE
+_CALL_LIST_APPEND :: CALL_LIST_APPEND
+_CHECK_EG_MATCH :: CHECK_EG_MATCH
+_CHECK_EXC_MATCH :: CHECK_EXC_MATCH
+_CONVERT_VALUE :: CONVERT_VALUE
+_COPY :: COPY
+_COPY_FREE_VARS :: COPY_FREE_VARS
+_DELETE_ATTR :: DELETE_ATTR
+_DELETE_DEREF :: DELETE_DEREF
+_DELETE_FAST :: DELETE_FAST
+_DELETE_GLOBAL :: DELETE_GLOBAL
+_DELETE_NAME :: DELETE_NAME
+_DELETE_SUBSCR :: DELETE_SUBSCR
+_DICT_MERGE :: DICT_MERGE
+_DICT_UPDATE :: DICT_UPDATE
+_END_FOR :: END_FOR
+_END_SEND :: END_SEND
+_EXIT_INIT_CHECK :: EXIT_INIT_CHECK
+_FORMAT_SIMPLE :: FORMAT_SIMPLE
+_FORMAT_WITH_SPEC :: FORMAT_WITH_SPEC
+_GET_AITER :: GET_AITER
+_GET_ANEXT :: GET_ANEXT
+_GET_AWAITABLE :: GET_AWAITABLE
+_GET_ITER :: GET_ITER
+_GET_LEN :: GET_LEN
+_GET_YIELD_FROM_ITER :: GET_YIELD_FROM_ITER
+_IMPORT_FROM :: IMPORT_FROM
+_IMPORT_NAME :: IMPORT_NAME
+_INSTRUMENTED_FOR_ITER :: INSTRUMENTED_FOR_ITER
+_INSTRUMENTED_INSTRUCTION :: INSTRUMENTED_INSTRUCTION
+_INSTRUMENTED_JUMP_FORWARD :: INSTRUMENTED_JUMP_FORWARD
+_INSTRUMENTED_LINE :: INSTRUMENTED_LINE
+_INSTRUMENTED_NOT_TAKEN :: INSTRUMENTED_NOT_TAKEN
+_INSTRUMENTED_POP_JUMP_IF_FALSE :: INSTRUMENTED_POP_JUMP_IF_FALSE
+_INSTRUMENTED_POP_JUMP_IF_NONE :: INSTRUMENTED_POP_JUMP_IF_NONE
+_INSTRUMENTED_POP_JUMP_IF_NOT_NONE :: INSTRUMENTED_POP_JUMP_IF_NOT_NONE
+_INSTRUMENTED_POP_JUMP_IF_TRUE :: INSTRUMENTED_POP_JUMP_IF_TRUE
+_IS_OP :: IS_OP
+_LIST_APPEND :: LIST_APPEND
+_LIST_EXTEND :: LIST_EXTEND
+_LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN :: LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN
+_LOAD_BUILD_CLASS :: LOAD_BUILD_CLASS
+_LOAD_COMMON_CONSTANT :: LOAD_COMMON_CONSTANT
+_LOAD_CONST :: LOAD_CONST
+_LOAD_CONST_IMMORTAL :: LOAD_CONST_IMMORTAL
+_LOAD_CONST_MORTAL :: LOAD_CONST_MORTAL
+_LOAD_DEREF :: LOAD_DEREF
+_LOAD_FAST_AND_CLEAR :: LOAD_FAST_AND_CLEAR
+_LOAD_FAST_BORROW_LOAD_FAST_BORROW :: LOAD_FAST_BORROW_LOAD_FAST_BORROW
+_LOAD_FAST_CHECK :: LOAD_FAST_CHECK
+_LOAD_FAST_LOAD_FAST :: LOAD_FAST_LOAD_FAST
+_LOAD_FROM_DICT_OR_DEREF :: LOAD_FROM_DICT_OR_DEREF
+_LOAD_FROM_DICT_OR_GLOBALS :: LOAD_FROM_DICT_OR_GLOBALS
+_LOAD_LOCALS :: LOAD_LOCALS
+_LOAD_NAME :: LOAD_NAME
+_LOAD_SUPER_ATTR_ATTR :: LOAD_SUPER_ATTR_ATTR
+_LOAD_SUPER_ATTR_METHOD :: LOAD_SUPER_ATTR_METHOD
+_MAKE_CELL :: MAKE_CELL
+_MAKE_FUNCTION :: MAKE_FUNCTION
+_MAP_ADD :: MAP_ADD
+_MATCH_CLASS :: MATCH_CLASS
+_MATCH_KEYS :: MATCH_KEYS
+_MATCH_MAPPING :: MATCH_MAPPING
+_MATCH_SEQUENCE :: MATCH_SEQUENCE
+_NOP :: NOP
+_POP_EXCEPT :: POP_EXCEPT
+_POP_TOP :: POP_TOP
+_PUSH_EXC_INFO :: PUSH_EXC_INFO
+_PUSH_NULL :: PUSH_NULL
+_PY_READ_MAX :: INT_MAX
+_PY_WRITE_MAX :: INT_MAX
 _PyCFunctionFast :: PyCFunctionFast
 _PyCFunctionFastWithKeywords :: PyCFunctionFastWithKeywords
 _PyCodeLocationInfoKind :: int
@@ -1457,14 +1646,41 @@ _PyCompile_optype :: int
 _PyConfigGILEnum :: int
 _PyConfigInitEnum :: int
 _PyFrameEvalFunction :: void *
+_PyGC_Head_UNUSED :: PyGC_Head
 _PyGC_Reason :: int
+_PyHASH_BITS :: PyHASH_BITS
+_PyHASH_IMAG :: PyHASH_IMAG
+_PyHASH_INF :: PyHASH_INF
+_PyHASH_MODULUS :: PyHASH_MODULUS
+_PyHASH_MULTIPLIER :: PyHASH_MULTIPLIER
 _PyLocals_Kind :: unsigned char
 _PyLockFlags :: int
 _PyMonitoringEventSet :: uint32_t
+_PyObject_CallMethodNoArgs :: PyObject_CallMethodNoArgs
+_PyObject_CallMethodOneArg :: PyObject_CallMethodOneArg
+_PyObject_CallOneArg :: PyObject_CallOneArg
+_PyObject_FastCallDict :: PyObject_VectorcallDict
+_PyObject_Vectorcall :: PyObject_Vectorcall
+_PyObject_VectorcallMethod :: PyObject_VectorcallMethod
 _PyPropertyObject :: propertyobject
 _PyTime_round_t :: int
+_PyVectorcall_Function :: PyVectorcall_Function
 _PyXI_errcode :: int
+_Py_DECREF_BUILTINS :: Py_DECREF
+_Py_DECREF_CODE :: Py_DECREF
+_Py_DECREF_DICT :: Py_DECREF
+_Py_DECREF_TYPE :: Py_DECREF
+_Py_DLOPEN_FLAGS :: RTLD_NOW
+_Py_IMMORTAL_REFCNT_LOCAL :: UINT32_MAX
+_Py_INCREF_BUILTINS :: Py_INCREF
+_Py_INCREF_CODE :: Py_INCREF
+_Py_INCREF_DICT :: Py_INCREF
+_Py_INCREF_TYPE :: Py_INCREF
+_Py_NULL :: nullptr
+_Py_TPFLAGS_HAVE_VECTORCALL :: Py_TPFLAGS_HAVE_VECTORCALL
+_Py_USING_STD :: using namespace std
 _Py_add_pending_call_result :: int
+_Py_atomic_load_ptr_consume :: _Py_atomic_load_ptr_acquire
 _Py_block_ty :: int
 _Py_comprehension_ty :: int
 _Py_error_handler :: int
@@ -1479,8 +1695,35 @@ _Py_mimalloc_heap_id :: int
 _Py_pending_call_func :: void *
 _Py_sighandler_t :: PyOS_sighandler_t
 _Py_simple_func :: void *
+_Py_stat_struct :: stat
+_Py_thread_local :: thread_local
+_RESUME_CHECK :: RESUME_CHECK
+_RETURN_GENERATOR :: RETURN_GENERATOR
+_RETURN_VALUE :: RETURN_VALUE
+_SETUP_ANNOTATIONS :: SETUP_ANNOTATIONS
+_SET_ADD :: SET_ADD
+_SET_FUNCTION_ATTRIBUTE :: SET_FUNCTION_ATTRIBUTE
+_SET_UPDATE :: SET_UPDATE
+_STORE_DEREF :: STORE_DEREF
+_STORE_FAST_LOAD_FAST :: STORE_FAST_LOAD_FAST
+_STORE_FAST_STORE_FAST :: STORE_FAST_STORE_FAST
+_STORE_GLOBAL :: STORE_GLOBAL
+_STORE_NAME :: STORE_NAME
+_SWAP :: SWAP
+_TO_BOOL_BOOL :: TO_BOOL_BOOL
+_TO_BOOL_INT :: TO_BOOL_INT
+_TO_BOOL_NONE :: TO_BOOL_NONE
+_UNARY_INVERT :: UNARY_INVERT
+_UNARY_NEGATIVE :: UNARY_NEGATIVE
+_UNARY_NOT :: UNARY_NOT
+_UNPACK_EX :: UNPACK_EX
+_WITH_EXCEPT_START :: WITH_EXCEPT_START
+_YIELD_VALUE :: YIELD_VALUE
 _py_validate_type :: void *
+alias_ty :: void *
 allocfunc :: void *
+arg_ty :: void *
+arguments_ty :: void *
 atexit_callbackfunc :: void *
 atexit_datacallbackfunc :: void *
 binaryfunc :: void *
@@ -1488,6 +1731,9 @@ binaryopactionfunc :: void *
 binaryopguardfunc :: void *
 boolop_ty :: int
 cmpop_ty :: int
+comprehension_ty :: void *
+const_pointer :: void *
+constant :: void *
 conversion_func :: void *
 delayed_dealloc_cb :: void *
 descrgetfunc :: void *
@@ -1495,7 +1741,9 @@ descrsetfunc :: void *
 destructor :: void *
 digit :: uint32_t
 dl_funcptr :: void *
+excepthandler_ty :: void *
 expr_context_ty :: int
+expr_ty :: void *
 freefunc :: void *
 gcvisitobjects_t :: void *
 getattrfunc :: void *
@@ -1505,6 +1753,7 @@ getiterfunc :: void *
 getname :: void *
 getter :: void *
 hashfunc :: void *
+identifier :: void *
 init_state :: void *
 initproc :: void *
 inquiry :: void *
@@ -1512,10 +1761,18 @@ intrinsic_func1 :: void *
 intrinsic_func2 :: void *
 iternextfunc :: void *
 jit_func :: void *
+keyword_ty :: void *
 lenfunc :: void *
 m_init :: void *
 malloc :: void *
+match_case_ty :: void *
 mi_arena_id_t :: int
+mi_assert_expensive :: mi_assert
+mi_assert_internal :: mi_assert
+mi_attr_noexcept :: noexcept
+mi_cdecl :: __cdecl
+mi_decl_nodiscard :: _NODISCARD
+mi_decl_thread :: __thread
 mi_delayed_t :: int
 mi_encoded_t :: uintptr_t
 mi_memkind_t :: int
@@ -1529,12 +1786,17 @@ mi_ssize_t :: int64_t
 mi_tagged_segment_t :: uintptr_t
 mi_thread_free_t :: uintptr_t
 mi_threadid_t :: size_t
+mod_ty :: void *
 msc_intptr_t :: LONG64
 newfunc :: void *
+object :: void *
 objobjargproc :: void *
 objobjproc :: void *
 operator_ty :: int
+pattern_ty :: void *
 perf_status_t :: int
+pointer :: void *
+poolp :: void *
 printfunc :: Py_ssize_t
 pthread_key_t :: unsigned
 pthread_t :: unsigned
@@ -1552,15 +1814,22 @@ ssizeargfunc :: void *
 ssizeobjargproc :: void *
 ssizessizeargfunc :: void *
 ssizessizeobjargproc :: void *
+static_assert :: _Static_assert
+stmt_ty :: void *
+string :: void *
 stwodigits :: int64_t
 ternaryfunc :: void *
 traverseproc :: void *
 twodigits :: uint64_t
+type_ignore_ty :: void *
+type_param_ty :: void *
+uint :: pymem_uint
 unaryfunc :: void *
 unaryop_ty :: int
 value_type :: T
 vectorcallfunc :: void *
 visitproc :: void *
+withitem_ty :: void *
 wrapperfunc :: void *
 wrapperfunc_kwds :: void *
 xid_freefunc :: void *

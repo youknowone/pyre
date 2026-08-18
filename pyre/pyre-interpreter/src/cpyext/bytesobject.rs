@@ -139,6 +139,82 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     );
 }
 
+/// `_PyBytes_Resize(&v, newsize)` — give what `*pv` names the new length,
+/// writing back whatever object answers it now.
+///
+/// A mirror [`PyBytes_FromStringAndSize`] handed out with a NULL text is still
+/// a buffer its caller is filling, and this is how that caller cuts it down to
+/// the length it actually wrote: the buffer is resized where it lies and the
+/// same block is written back, there being no `bytes` yet to replace.  For a
+/// mirror that already has one, the object is immutable, so the answer is a
+/// new `bytes` and the old reference is released.
+///
+/// Bytes past the old length are zero.  Upstream leaves them holding whatever
+/// the allocator had when it can resize in place, and zeroes them when it
+/// cannot; the caller writes them before reading them either way.
+///
+/// # Safety
+/// `pv` must be a writable `PyObject *` holding a reference this call takes
+/// over.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyBytes_Resize(pv: *mut *mut CPyObject, newsize: isize) -> c_int {
+    if pv.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let raw = unsafe { *pv };
+    let pending = pending_buffer(raw).map(|(_, length)| length);
+    let current = match pending {
+        Some(length) => Some(length),
+        None if raw.is_null() => None,
+        None => argument(raw)
+            .filter(|&value| unsafe { pyre_object::bytesobject::is_bytes(value) })
+            .map(|value| unsafe { pyre_object::bytesobject::w_bytes_len(value) }),
+    };
+    let (Some(current), true) = (current, newsize >= 0) else {
+        // The reference is given up whatever went wrong, which is what lets
+        // the caller write `if (_PyBytes_Resize(&v, n) < 0) return NULL;`.
+        unsafe {
+            *pv = std::ptr::null_mut();
+            if !raw.is_null() {
+                pyobject::decref(raw);
+            }
+            super::pyerrors::PyErr_BadInternalCall();
+        }
+        return -1;
+    };
+    let newsize = newsize as usize;
+    if current == newsize {
+        return 0;
+    }
+    if pending.is_some() {
+        // No object exists yet, so there is nothing to replace: the block
+        // stays and only what C is writing into changes size.
+        if unsafe { pyobject::resize_cached_bytes(raw, newsize) }.is_none() {
+            unsafe { super::pyerrors::PyErr_NoMemory() };
+            return -1;
+        }
+        return 0;
+    }
+    let Some(value) = argument(raw) else {
+        return -1;
+    };
+    let data = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
+    let mut resized: Vec<u8> = Vec::new();
+    if resized.try_reserve_exact(newsize).is_err() {
+        unsafe { super::pyerrors::PyErr_NoMemory() };
+        return -1;
+    }
+    resized.extend_from_slice(&data[..current.min(newsize)]);
+    resized.resize(newsize, 0);
+    let replacement = pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(&resized));
+    unsafe {
+        *pv = replacement;
+        pyobject::decref(raw);
+    }
+    if replacement.is_null() { -1 } else { 0 }
+}
+
 fn bytes_argument(object: *mut CPyObject, function: &str) -> Option<pyre_object::PyObjectRef> {
     let value = argument(object)?;
     if !unsafe { pyre_object::bytesobject::is_bytes(value) } {
@@ -317,6 +393,7 @@ pub unsafe extern "C" fn PyBytes_CheckExact(object: *mut CPyObject) -> c_int {
 pub(super) fn ensure_linked() {
     std::hint::black_box(PyBytes_FromString as *const ());
     std::hint::black_box(PyBytes_FromStringAndSize as *const ());
+    std::hint::black_box(_PyBytes_Resize as *const ());
     std::hint::black_box(PyBytes_AsString as *const ());
     std::hint::black_box(PyBytes_AsStringAndSize as *const ());
     std::hint::black_box(PyBytes_Size as *const ());

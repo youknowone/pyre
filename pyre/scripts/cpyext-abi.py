@@ -143,6 +143,9 @@ SCALARS = {
     # Named aliases the Rust side spells the same way the header does, so the
     # comparison is against the reference name rather than its width.
     "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t",
+    # A Rust function that never returns has no C spelling of its own: the
+    # header declares it `void` and marks the fact separately.
+    "!": "void",
 }
 
 STRUCTS = {
@@ -152,6 +155,7 @@ STRUCTS = {
     "CPyMethodDef": "PyMethodDef", "CPyMemberDef": "PyMemberDef",
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
     "CPyThreadState": "PyThreadState", "CPyComplex": "Py_complex",
+    "CPyMutex": "PyMutex",
 }
 
 
@@ -195,6 +199,16 @@ def read_exports():
 FUNCTION_POINTER = re.compile(r"typedef\s+[^;]*?\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(", re.S)
 ENUM = re.compile(r"typedef\s+enum\b[^;{]*\{.*?\}\s*([A-Za-z_]\w*)\s*;", re.S)
 ALIAS = re.compile(r"typedef\s+([A-Za-z_][\w \t]*?)\s+([A-Za-z_]\w*)\s*;")
+# `typedef void *PyThread_type_lock;` -- the alias names a pointer, which the
+# word-only ALIAS above cannot see because of the star.
+POINTER_ALIAS = re.compile(
+    r"typedef\s+(?:(?:struct|union|enum)\s+)?[A-Za-z_][\w \t]*?\s*\*\s*([A-Za-z_]\w*)\s*;")
+# `#define PY_TIMEOUT_T long long` -- an object-like macro whose body is only
+# type words stands for a type the same way a typedef does.
+TYPE_MACRO = re.compile(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+"
+                        r"((?:unsigned|signed|const|long|short|int|char|float|double|void"
+                        r"|[A-Za-z_]\w*)(?:[ \t]+(?:unsigned|signed|long|short|int|char"
+                        r"|float|double|void|[A-Za-z_]\w*))*[ \t]*\**)[ \t]*$", re.M)
 
 
 INLINE = re.compile(
@@ -277,6 +291,12 @@ def read_typedefs(paths):
             base = " ".join(match.group(1).split())
             if not base.startswith(("struct", "enum", "union")):
                 table.setdefault(match.group(2), base)
+        for match in POINTER_ALIAS.finditer(text):
+            table.setdefault(match.group(1), "void *")
+        for match in TYPE_MACRO.finditer(text):
+            name, base = match.group(1), " ".join(match.group(2).split())
+            if name != base:
+                table.setdefault(name, base)
     return table
 
 

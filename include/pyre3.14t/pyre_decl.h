@@ -51,6 +51,7 @@ PyAPI_FUNC(PyObject *) PyBytes_FromObject(PyObject *);
 PyAPI_FUNC(PyObject *) PyBytes_FromString(const char *);
 PyAPI_FUNC(PyObject *) PyBytes_FromStringAndSize(const char *, Py_ssize_t);
 PyAPI_FUNC(Py_ssize_t) PyBytes_Size(PyObject *);
+PyAPI_FUNC(int) _PyBytes_Resize(PyObject **, Py_ssize_t);
 
 /* cpyext/capsule.rs */
 PyAPI_FUNC(int) PyCapsule_CheckExact(PyObject *);
@@ -161,6 +162,17 @@ PyAPI_FUNC(int) PyList_SetItem(PyObject *, Py_ssize_t, PyObject *);
 PyAPI_FUNC(int) PyList_SetSlice(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *);
 PyAPI_FUNC(int) PyList_Sort(PyObject *);
+
+/* cpyext/lock.rs */
+PyAPI_FUNC(int) PyMutex_IsLocked(PyMutex *);
+PyAPI_FUNC(void) PyMutex_Lock(PyMutex *);
+PyAPI_FUNC(void) PyMutex_Unlock(PyMutex *);
+PyAPI_FUNC(int) PyThread_acquire_lock(PyThread_type_lock, int);
+PyAPI_FUNC(PyLockStatus) PyThread_acquire_lock_timed(PyThread_type_lock, PY_TIMEOUT_T, int);
+PyAPI_FUNC(PyThread_type_lock) PyThread_allocate_lock(void);
+PyAPI_FUNC(void) PyThread_free_lock(PyThread_type_lock);
+PyAPI_FUNC(unsigned long) PyThread_get_thread_ident(void);
+PyAPI_FUNC(void) PyThread_release_lock(PyThread_type_lock);
 
 /* cpyext/longobject.rs */
 PyAPI_FUNC(PyObject *) PyBool_FromLong(long);
@@ -369,6 +381,9 @@ PyAPI_FUNC(void) PyErr_SetNone(PyObject *);
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetRaisedException(PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
+PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *, int);
+PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
+PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *, const char *);
 
 /* cpyext/pymem.rs */
 PyAPI_FUNC(void *) PyMem_Calloc(size_t, size_t);

@@ -333,6 +333,28 @@ pub unsafe extern "C" fn PyErr_BadInternalCall() {
     ));
 }
 
+/// The spelling the header's `PyErr_BadInternalCall()` macro expands to, so
+/// that the report names the caller's own file and line.
+///
+/// A call made from inside this layer has no such place to name and goes
+/// through the plain entry point above, which is why the same mistake reads
+/// differently depending on which side made it.
+///
+/// # Safety
+/// `filename` must be null or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyErr_BadInternalCall(filename: *const c_char, lineno: c_int) {
+    if filename.is_null() {
+        unsafe { PyErr_BadInternalCall() };
+        return;
+    }
+    let filename = unsafe { CStr::from_ptr(filename) }.to_string_lossy();
+    set_pending_error(crate::PyError::new(
+        crate::PyErrorKind::SystemError,
+        format!("{filename}:{lineno}: bad argument to internal function"),
+    ));
+}
+
 /// `PyErr_GivenExceptionMatches` for the pending exception.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_ExceptionMatches(expected: *mut CPyObject) -> c_int {
@@ -785,7 +807,61 @@ pub unsafe extern "C" fn PyErr_NormalizeException(
     }
 }
 
+/// `_PyErr_ChainExceptions1(exc)` — make `exc` the indicator, or the context
+/// of whatever is already pending.
+///
+/// The reference is stolen either way.  A caller reaches for this having just
+/// caught something of its own: the error it is about to report must not hide
+/// the one that was already on its way out.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyErr_ChainExceptions1(exception: *mut CPyObject) {
+    if exception.is_null() {
+        return;
+    }
+    let pending = unsafe { PyErr_GetRaisedException() };
+    if pending.is_null() {
+        unsafe { PyErr_SetRaisedException(exception) };
+        return;
+    }
+    unsafe { super::exception::PyException_SetContext(pending, exception) };
+    unsafe { PyErr_SetRaisedException(pending) };
+}
+
+/// End the process, reporting `message` the way a caller that cannot go on
+/// does.
+///
+/// There is nothing to raise here: the caller's invariant is already broken,
+/// and the exception machinery is one of the things it may have broken.
+pub(super) fn fatal_error(function: Option<&str>, message: &str) -> ! {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr().lock();
+    let _ = match function {
+        Some(function) => writeln!(stderr, "Fatal Python error: {function}: {message}"),
+        None => writeln!(stderr, "Fatal Python error: {message}"),
+    };
+    let _ = stderr.flush();
+    std::process::abort()
+}
+
+/// `Py_FatalError(message)`, which the header spells as this so that the
+/// report names the function the caller gave up in.
+///
+/// # Safety
+/// `function` may be null; `message` must be null or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_FatalErrorFunc(function: *const c_char, message: *const c_char) -> ! {
+    let text = |pointer: *const c_char| {
+        (!pointer.is_null()).then(|| unsafe { CStr::from_ptr(pointer) }.to_string_lossy())
+    };
+    fatal_error(
+        text(function).as_deref(),
+        text(message).as_deref().unwrap_or("<message unavailable>"),
+    )
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(_PyErr_ChainExceptions1 as *const ());
+    std::hint::black_box(_Py_FatalErrorFunc as *const ());
     ensure_mirrors_linked();
     std::hint::black_box(PyErr_SetObject as *const ());
     std::hint::black_box(PyErr_SetString as *const ());
@@ -795,6 +871,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_NoMemory as *const ());
     std::hint::black_box(PyErr_BadArgument as *const ());
     std::hint::black_box(PyErr_BadInternalCall as *const ());
+    std::hint::black_box(_PyErr_BadInternalCall as *const ());
     std::hint::black_box(PyErr_ExceptionMatches as *const ());
     std::hint::black_box(PyErr_GivenExceptionMatches as *const ());
     std::hint::black_box(PyErr_Fetch as *const ());

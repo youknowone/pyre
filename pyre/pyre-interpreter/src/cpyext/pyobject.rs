@@ -703,6 +703,35 @@ pub(super) unsafe fn cached_bytes(
     (entry.as_ptr() as *const c_char, entry.len() - 1)
 }
 
+/// Give a mirror's cached bytes a new length, keeping what still fits and
+/// zeroing what is new, and answer the address the caller reads from now.
+///
+/// The address moves, the box being replaced.  That is what resizing the tail
+/// an object carries does upstream too, and the caller re-reads it through
+/// `PyBytes_AS_STRING(*pv)` afterwards either way.
+///
+/// `None` is a request there was no room for; a mirror with nothing cached
+/// cannot reach this, the only caller being a resize of a buffer it handed
+/// out.
+///
+/// # Safety
+/// `raw` must be a live mirror whose bytes are already cached.
+pub(super) unsafe fn resize_cached_bytes(
+    raw: *mut CPyObject,
+    size: usize,
+) -> Option<*const c_char> {
+    let mut cache = BYTE_CACHE.lock();
+    let entry = cache.get_mut(&(raw as usize))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    if bytes.try_reserve_exact(size + 1).is_err() {
+        return None;
+    }
+    bytes.extend_from_slice(&entry[..(entry.len() - 1).min(size)]);
+    bytes.resize(size + 1, 0);
+    *entry = bytes.into_boxed_slice();
+    Some(entry.as_ptr() as *const c_char)
+}
+
 /// `state.py:106-107` — give the collector the callback it fires when it has
 /// queued mirrors, before anything can create the first link.
 ///
