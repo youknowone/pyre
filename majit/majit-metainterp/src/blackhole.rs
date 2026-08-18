@@ -2645,7 +2645,7 @@ pub fn run_forever(
     bh: BlackholeInterpreter,
     current_exc: i64,
 ) -> JitException {
-    run_forever_with_portal(builder, bh, current_exc, None, None, None)
+    run_forever_with_portal(builder, bh, current_exc, None, None, None, None)
 }
 
 /// blackhole.py:1752 _run_forever with optional portal runner callback.
@@ -2668,6 +2668,7 @@ pub fn run_forever_with_portal(
     mut current_exc: i64,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
     on_enter_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64)>,
     mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     loop {
@@ -2717,6 +2718,18 @@ pub fn run_forever_with_portal(
 
         // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
+        // `pyopcode.py:239-241 RETURN_VALUE` (`frame_finished_execution = True`)
+        // and `pyopcode.py:184 handle_operation_error` (the same store on the
+        // no-handler propagation): the level reached here has returned to its
+        // caller by one of those two routes, so its frame's execution is over.
+        // Threaded from the interpreter side for the same reason as
+        // `on_enter_level` — the transition is a property of the embedder's
+        // frame object, which majit-metainterp cannot name.  The bottommost
+        // level never arrives: it leaves through `handle_jitexception`'s
+        // propagating arm, which returns above.
+        if let Some(on_leave_level) = on_leave_level {
+            on_leave_level(bh.virtualizable_ptr);
+        }
         builder.release_interp(bh);
         // blackhole.py:1760
         // RPython: blackholeinterp = blackholeinterp.nextblackholeinterp
@@ -2747,6 +2760,17 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// the resumed frame chain.  Threaded from the interpreter side because
     /// majit-metainterp cannot reference `ExecutionContext`.
     pub on_enter_level: Option<&'a dyn Fn(i64)>,
+    /// The `frame_finished_execution` store `pyopcode.py:239-241 RETURN_VALUE`
+    /// and `pyopcode.py:184 handle_operation_error` perform before leaving a
+    /// frame.  Threaded from the interpreter side for the same reason as
+    /// [`Self::on_enter_level`]; called once per level that returns to its
+    /// caller, with that level's `virtualizable_ptr`.
+    ///
+    /// Set it only alongside [`Self::per_frame`], which is what makes that
+    /// pointer name the level's OWN frame.  Without it every level shares the
+    /// portal's virtualizable, and a nested level would hand back the frame
+    /// ABOVE it — marking a caller that is still running as finished.
+    pub on_leave_level: Option<&'a dyn Fn(i64)>,
 }
 
 pub fn convert_and_run_from_pyjitpl(
@@ -2761,6 +2785,7 @@ pub fn convert_and_run_from_pyjitpl(
     let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
     let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let on_enter_level = config.as_ref().and_then(|config| config.on_enter_level);
+    let on_leave_level = config.as_ref().and_then(|config| config.on_leave_level);
 
     for (frame_index, frame) in framestack.frames.iter().enumerate() {
         let mut cur_bh = builder.acquire_interp();
@@ -2807,6 +2832,7 @@ pub fn convert_and_run_from_pyjitpl(
         current_exc,
         None,
         on_enter_level,
+        on_leave_level,
         terminal_out,
     );
     majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
@@ -4220,6 +4246,7 @@ mod tests {
                 inner,
                 0,
                 Some(&portal_runner),
+                None,
                 None,
                 None,
             );

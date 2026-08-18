@@ -3109,6 +3109,10 @@ fn try_adopt_multi_frame_blackhole(
     let set_topframeref = |frame_ptr: i64| unsafe {
         (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
     };
+    // `pyopcode.py:239-241 RETURN_VALUE` / `pyopcode.py:184
+    // handle_operation_error`: mark each level finished as it returns to its
+    // caller, the store the walker performs at the `*_return` jitcode ops.
+    let finish_level = |frame_ptr: i64| crate::state::finish_blackhole_level_frame(frame_ptr);
     // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
     // full-coverage dispatch table, not the inline-call-only builder.
     let (mut mf_builder, _unwired) =
@@ -3135,6 +3139,7 @@ fn try_adopt_multi_frame_blackhole(
         latched.raising_exception,
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64)),
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.
@@ -4102,16 +4107,22 @@ fn run_perfn_walk<Sym: WalkSym>(
         // carrier, which resumes the OUTER frame at its CALL rather than
         // inside the discarded callee attempt.  The nested-residual variant
         // marked `blackhole_required: true` owns a complete per-frame image
-        // and so passes `leaves_complete_image`, but the handoff finishes the
-        // callee inside the blackhole, which has no counterpart to
-        // `PyFrame.finish_value`'s `frame_finished_execution` store — the
-        // walker emits that store itself (`finish_current_frame_execution`)
-        // and the interpreter performs it on RETURN_VALUE, while the
-        // blackhole does neither.  A frame that outlives the call then reads
-        // back as still executing, which `parity_tests/`
-        // `jit_inline_traceback_frame_clear.py` catches on
-        // `sys._getframe().clear()` once the loop compiles.  Restore the
-        // carrier for it until the blackhole can publish that transition;
+        // and so passes `leaves_complete_image`, but the image it hands the
+        // blackhole is not a valid forward resume for every shape that reaches
+        // it.  Two `bench/synth` fixtures are the standing witnesses, both
+        // wrong-code rather than a decline: `inline_subwalk_user_iterator`
+        // (the inlined callee's return value comes back as an untyped ref, so
+        // the caller's `acc += v` raises `TypeError: ... 'int' and 'object'`)
+        // and `list_append_write_barrier_gc` (`stack underflow during
+        // interpreter peek` — the resumed frame's operand stack is short).
+        // `PYRE_WALKABORT_OFF=1` is the control: both pass with the leg
+        // disabled.  The `frame_finished_execution` store the handoff used to
+        // skip is NO LONGER one of the reasons — the drive now performs it at
+        // every level it leaves (`state::finish_blackhole_level_frame`, wired
+        // as `on_leave_level`), which is what
+        // `parity_tests/jit_inline_traceback_frame_clear.py` needs on
+        // `sys._getframe().clear()`.  Restore the carrier for this variant
+        // until the two image defects above are closed;
         // `ForceQuasiImmutable` resumes AT the forcing opcode via
         // `flush_qmut_abort_state` (arm below), which re-runs the write the
         // walk stopped in front of instead of finishing the frame past it.

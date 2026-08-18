@@ -1019,6 +1019,37 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     })
 }
 
+/// `PyFrame.frame_finished_execution = True` for a blackhole level that has
+/// returned to its caller.
+///
+/// `pyopcode.py:239-241 RETURN_VALUE` performs this store before raising
+/// `Return`, and `pyopcode.py:184 handle_operation_error` performs it on the
+/// no-handler propagation out of the frame; upstream both live in the
+/// `dispatch_bytecode` graph, so the jitcode carries the store and pyjitpl and
+/// the blackhole each execute it.  Pyre builds its jitcodes per CodeObject
+/// rather than from interpreter graphs, so the transition is modelled once per
+/// executor instead: the walker emits it at the `*_return` jitcode ops
+/// (`jitcode_dispatch::finish_current_frame_execution`) and the blackhole
+/// calls this at each level it leaves.  Without it a frame that outlives the
+/// call — reached through `sys._getframe()` or a retained traceback — reads
+/// back as still executing and refuses `frame.clear()`.
+///
+/// A zero pointer is the inlined level whose frame was never materialized, the
+/// state upstream reaches by keeping the MIFrame virtual; there is no object to
+/// mark and no observer that could ask.
+pub fn finish_blackhole_level_frame(frame_ptr: i64) {
+    if frame_ptr == 0 {
+        return;
+    }
+    // SAFETY: the caller resolved this from the blackhole level's own
+    // `virtualizable_ptr`, which `convert_and_run_from_pyjitpl` fills from the
+    // per-level concrete frame list, and the level is being torn down here so
+    // no other borrow of it is live.
+    unsafe {
+        (*(frame_ptr as *mut pyre_interpreter::PyFrame)).set_frame_finished_execution(true);
+    }
+}
+
 /// `majit_metainterp::blackhole::LiveMarkerHook` implementation: stamp the
 /// instruction the blackhole is about to replay into the frame's `last_instr`.
 ///

@@ -310,6 +310,7 @@ pub fn drive_multi_frame_blackhole(
     raising_exception: bool,
     per_frame: Option<&[(i64, usize)]>,
     on_enter_level: Option<&dyn Fn(i64)>,
+    on_leave_level: Option<&dyn Fn(i64)>,
 ) -> MultiFrameBlackholeResult {
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
@@ -361,6 +362,7 @@ pub fn drive_multi_frame_blackhole(
             virtualizable_stack_base,
             per_frame,
             on_enter_level,
+            on_leave_level,
         }),
         Some(&mut terminal),
     );
@@ -2306,6 +2308,7 @@ impl<S: JitState> JitDriver<S> {
             staticdata,
             last_exc_value,
             raising_exception,
+            None,
             None,
             None,
         );
@@ -8051,6 +8054,7 @@ impl<S: JitState> JitDriver<S> {
                                     crate::jitexc::JitException,
                                 >
                         }),
+                        None,
                         None,
                         None,
                     );
