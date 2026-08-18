@@ -8306,25 +8306,50 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:362-367: optimize using UnrolledLoopData with start_state.
         //
-        // `compile.py:355-356` resolves the retrace's token with
-        // `get_procedure_token(greenkey)` and asserts it, so a retrace runs
-        // against a token that already owns the accumulated target tokens and
-        // carrying them is that token's own state. The arm below without a
-        // resumekey has no such token: it mints one at `compile.py:1013`, and
-        // `ResumeFromInterpDescr.compile_and_attach` (`:1006-1022`) never
-        // assigns that token's `target_tokens` at all — `target_tokens` has
-        // exactly three writers upstream, the `history.py:440` class default
-        // `None` and the two assignments at `compile.py:245` and `:290`, both
-        // of which are inside `compile_simple_loop` / `compile_loop` and so
-        // are not on this route. The minted token therefore starts owning
-        // nothing. Drain the parked tokens on both arms — `swap_remove` is
-        // what spends them — and hand them on only where a token already owns
-        // them.
+        // Upstream seeds candidate visibility unconditionally.
+        // `compile.py:355-356` resolves `loop_jitcell_token =
+        // metainterp.get_procedure_token(greenkey)` before any resumekey
+        // is consulted, `:359` records the closing JUMP under that token,
+        // and `unroll.py:321-325` walks its whole `target_tokens` list.
+        // `unroll.py:297`
+        // `jitcelltoken.target_tokens.append(target_token)` then adds the
+        // retrace's own token to that same list, so the accumulation
+        // happens inside the optimizer, not in either `compile_and_attach`
+        // arm; the resumekey is first read at `:393`. The arm without one
+        // is in fact the arm that wants those candidates most:
+        // `compile.py:1007-1009` describes what it installs as "a bridge
+        // going from the interpreter to previously-compiled code ... not a
+        // loop at all but ends in a jump to the target loop".
         //
-        // The binding, not the seed argument, is emptied: on the minting arm
-        // it also feeds the ownership rebind and the republication fallback
-        // further down, and that fallback fires precisely when the optimizer
-        // produced no tokens of its own.
+        // Emptying the seed on that arm is therefore a deliberate
+        // deviation, not a port. It is deliberate because pyre does not
+        // implement that install: the minting arm replaces the front door
+        // with a standalone artifact, and the close gate in
+        // `jump_to_existing_trace_impl` admits a foreign target only when
+        // it belongs to the artifact this compile attaches to — which on
+        // this arm is none, so every seeded candidate is inadmissible
+        // however it got here. A seed can thus never buy an admitted
+        // close. Its only live consumers are the loop that rebinds each
+        // token through `set_original_jitcell_token_number` and the
+        // republication that hands them on as the next entry's
+        // `front_target_tokens` — the route by which a retired loop lends
+        // its labels to the loop that replaced it.
+        //
+        // Two further consumers change with it, and are meant to. The
+        // virtual-state pick falls back to the exported state rather than
+        // a prior token's, and the `jump_to_preamble` fallback targets
+        // this compile's own token rather than the prior preamble. Both
+        // follow from the same install semantics: a replacement front door
+        // has no business reusing the state of a close it will never make.
+        //
+        // The binding, not the seed argument, is emptied: on the minting
+        // arm it also feeds the ownership rebind and the republication
+        // fallback further down, and that fallback fires precisely when
+        // the optimizer produced no tokens of its own. Both arms still
+        // drain the park, but only nominally — this function has already
+        // required a live `compiled_loops` entry, and the park is filled
+        // only when no such entry exists, so the `or_else` can drain
+        // nothing a live entry does not already shadow.
         let prior_front_target_tokens = {
             let prior_front_target_tokens = self
                 .compiled_loops
