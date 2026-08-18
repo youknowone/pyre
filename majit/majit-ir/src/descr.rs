@@ -197,6 +197,11 @@ pub enum LLType {
     Func {
         arg_classes: String,
         result_type: Type,
+        /// `descr.py:665` keys on the RAW result char, so `'S'` (singlefloat)
+        /// and `'L'` do not share a descr with the `'i'`/`'f'` they normalise
+        /// to.  Callers holding only a `Type` pass the char that `Type`
+        /// derives, which leaves their key partition unchanged.
+        result_class: char,
         /// descr.py:664: result_signed = get_type_flag(RESULT) == FLAG_SIGNED
         result_signed: bool,
         /// descr.py:662: result_size = symbolic.get_size(RESULT_ERASED, tsc)
@@ -637,11 +642,24 @@ pub fn strip_generic_args(name: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The arg-class char a `Type` derives, for callers that never saw the raw
+/// codewriter char.  `'S'` and `'L'` normalise INTO `Type::Int`/`Type::Float`,
+/// so this direction can only produce the four plain classes.
+pub fn result_class_of(result_type: Type) -> char {
+    match result_type {
+        Type::Int => 'i',
+        Type::Ref => 'r',
+        Type::Float => 'f',
+        Type::Void => 'v',
+    }
+}
+
 impl LLType {
     /// descr.py:665: get_call_descr key tuple.
     pub fn func_key(
         arg_types: &[Type],
         result_type: Type,
+        result_class: char,
         result_signed: bool,
         result_size: usize,
         effect: &Arc<crate::effectinfo::EffectInfoCell>,
@@ -658,6 +676,7 @@ impl LLType {
         LLType::Func {
             arg_classes,
             result_type,
+            result_class,
             result_signed,
             result_size,
             effect_info_identity: Arc::as_ptr(effect) as usize,
@@ -2343,7 +2362,14 @@ impl GcCache {
         effect: EffectInfo,
     ) -> DescrRef {
         let effect = crate::effectinfo::intern_effect_info(effect);
-        let key = LLType::func_key(&arg_types, result_type, result_signed, result_size, &effect);
+        let key = LLType::func_key(
+            &arg_types,
+            result_type,
+            result_class_of(result_type),
+            result_signed,
+            result_size,
+            &effect,
+        );
         // descr.py:667-668: cache hit
         if let Some(descr) = self._cache_call.get(&key) {
             return descr.clone();
@@ -6446,17 +6472,11 @@ impl SimpleCallDescr {
         result_size: usize,
         effect: EffectInfo,
     ) -> Self {
-        let result_class = match result_type {
-            Type::Int => 'i',
-            Type::Ref => 'r',
-            Type::Float => 'f',
-            Type::Void => 'v',
-        };
         Self::new_with_result_class(
             index,
             arg_types,
             result_type,
-            result_class,
+            result_class_of(result_type),
             result_signed,
             result_size,
             effect,
@@ -6491,17 +6511,11 @@ impl SimpleCallDescr {
         result_size: usize,
         effect: Arc<crate::effectinfo::EffectInfoCell>,
     ) -> Self {
-        let result_class = match result_type {
-            Type::Int => 'i',
-            Type::Ref => 'r',
-            Type::Float => 'f',
-            Type::Void => 'v',
-        };
         Self::new_with_effect_cell_and_result_class(
             index,
             arg_types,
             result_type,
-            result_class,
+            result_class_of(result_type),
             result_signed,
             result_size,
             effect,

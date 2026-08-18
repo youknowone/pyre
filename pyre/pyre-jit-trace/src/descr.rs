@@ -7048,6 +7048,11 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
         majit_metainterp::make_call_descr_sized_with_translated_effect(
             &arg_types,
             result_type,
+            // `descr.py:524-526 get_result_type()` — the raw char, same as the
+            // non-translated arm below.  Dropping it here would collapse `'S'`
+            // onto `'i'` and `'L'` onto `'f'` for every descr that carries a
+            // translated EffectInfo id.
+            bh.result_type,
             bh.result_signed,
             result_size,
             translated_id,

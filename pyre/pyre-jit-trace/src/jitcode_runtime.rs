@@ -843,6 +843,10 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
     majit_metainterp::make_call_descr_sized_with_translated_effect(
         &arg_types,
         result_type,
+        // `descr.py:524-526 get_result_type()` keeps the raw char, so a
+        // rehydrated descr reports `'S'`/`'L'` rather than the class its
+        // normalised `result_type` derives.
+        bh.result_type,
         bh.result_signed,
         bh.result_size,
         bh.translated_effect_info_id
