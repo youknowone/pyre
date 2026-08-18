@@ -241,17 +241,30 @@ pub enum QuasiImmutSlot {
     WKwDefs,
 }
 
-/// The `mutate_<name>` field for one `?` entry.
+/// The `mutate_<name>` field for one `?` entry, or `None` when `obj` does not
+/// carry the `Function` layout the slot lives in.
+///
+/// Reaching a slot casts `obj` to `*const Function`, so the carrier test is the
+/// precondition for the cast, not a convenience. `is_function_carrier` is the
+/// right predicate rather than a bare `FUNCTION_TYPE` comparison: the four
+/// types `function_new_impl` stamps — `function`, `builtin_function_or_method`,
+/// `method_descriptor`, `wrapper_descriptor` — all allocate a real `Function`
+/// whose slots are initialised, and skipping any of them would leave a write
+/// unannounced. Under-invalidation is the unsound direction; over-invalidation
+/// is not (`quasiimmut.py:85-110`).
 ///
 /// # Safety
-/// `obj` must point at a live `Function`.
+/// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_quasi_immut_field<'a>(
     obj: PyObjectRef,
     slot: QuasiImmutSlot,
-) -> &'a QuasiImmutField {
+) -> Option<&'a QuasiImmutField> {
+    if obj.is_null() || !unsafe { is_function_carrier(obj) } {
+        return None;
+    }
     let f = obj as *const Function;
     unsafe {
-        match slot {
+        Some(match slot {
             QuasiImmutSlot::Code => &(*f).mutate_code,
             QuasiImmutSlot::WFuncGlobalsObj => &(*f).mutate_w_func_globals_obj,
             QuasiImmutSlot::Closure => &(*f).mutate_closure,
@@ -261,7 +274,7 @@ pub unsafe fn function_quasi_immut_field<'a>(
             QuasiImmutSlot::WObjclass => &(*f).mutate_w_objclass,
             QuasiImmutSlot::WTextSignature => &(*f).mutate_w_text_signature,
             QuasiImmutSlot::WKwDefs => &(*f).mutate_w_kw_defs,
-        }
+        })
     }
 }
 
@@ -270,28 +283,26 @@ pub unsafe fn function_quasi_immut_field<'a>(
 /// trace sees a non-null mutate field and aborts the attempt.
 ///
 /// # Safety
-/// `obj` must point at a live `Function`.
+/// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_install_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
-    if obj.is_null() {
-        return;
+    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
+        field.ensure_installed();
     }
-    unsafe { function_quasi_immut_field(obj, slot) }.ensure_installed();
 }
 
 /// `quasiimmut.py:72-75 register_loop_token` — record a compiled loop's
 /// invalidation flag against one `?` field.
 ///
 /// # Safety
-/// `obj` must point at a live `Function`.
+/// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_register_quasi_immut_watcher(
     obj: PyObjectRef,
     slot: QuasiImmutSlot,
     flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    if obj.is_null() {
-        return;
+    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
+        field.register_loop_token(flag);
     }
-    unsafe { function_quasi_immut_field(obj, slot) }.register_loop_token(flag);
 }
 
 /// `quasiimmut.py:129-134 make_invalidation_function._invalidate_now` — revoke
@@ -299,12 +310,11 @@ pub unsafe fn function_register_quasi_immut_watcher(
 /// `typeobject.rs w_type_set_version_tag` calls its notify first.
 ///
 /// # Safety
-/// `obj` must be null or point at a live `Function`.
+/// `obj` must be null or point at a live `PyObject`.
 pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
-    if obj.is_null() {
-        return;
+    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
+        field.invalidate();
     }
-    unsafe { function_quasi_immut_field(obj, slot) }.invalidate();
 }
 
 /// Drop glue for the inline `mutate_<name>` slots, registered on
