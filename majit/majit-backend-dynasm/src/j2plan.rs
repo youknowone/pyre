@@ -620,30 +620,36 @@ mod tests {
         let ops = vec![label, add, lt, guard, jump];
         let plan = TracePlan::build(&[InputArg::from_type(Type::Int, 0)], &ops);
 
-        assert_eq!(TracePlan::lower_ops(&ops), plan.ops);
+        let lowered = TracePlan::lower_ops(&ops);
+        assert_eq!(
+            lowered,
+            vec![
+                LirOp::Label { args: vec![i0] },
+                LirOp::IntBin {
+                    kind: IntBinKind::Add,
+                    dst: OpRef::int_op(1),
+                    lhs: i0,
+                    rhs: c1,
+                },
+                LirOp::IntCmp {
+                    kind: IntCmpKind::SignedLt,
+                    dst: OpRef::int_op(2),
+                    lhs: OpRef::int_op(1),
+                    rhs: c10,
+                },
+                LirOp::Guard {
+                    kind: GuardKind::True,
+                    args: vec![OpRef::int_op(2)],
+                    fail_args: vec![OpRef::int_op(1)],
+                },
+                LirOp::Jump {
+                    args: vec![OpRef::int_op(1)],
+                },
+            ]
+        );
+        assert_eq!(lowered, plan.ops);
 
         assert_eq!(plan.fallback_ops, 0);
-        assert!(matches!(
-            plan.ops[1],
-            LirOp::IntBin {
-                kind: IntBinKind::Add,
-                ..
-            }
-        ));
-        assert!(matches!(
-            plan.ops[2],
-            LirOp::IntCmp {
-                kind: IntCmpKind::SignedLt,
-                ..
-            }
-        ));
-        assert!(matches!(
-            plan.ops[3],
-            LirOp::Guard {
-                kind: GuardKind::True,
-                ..
-            }
-        ));
     }
 
     #[test]
