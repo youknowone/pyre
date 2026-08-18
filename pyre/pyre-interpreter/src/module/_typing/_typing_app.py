@@ -27,6 +27,15 @@ def _caller_module():
         return None
 
 
+class _PickleUsingNameMixin:
+    """PyPy's name-based reducer for runtime typing objects."""
+
+    __slots__ = ()
+
+    def __reduce__(self):
+        return self.__name__
+
+
 def _evaluate_typeparam(thunk):
     # Call a PEP 695 bound / constraints thunk emitted by the compiler. A 3.14
     # thunk takes an annotation `format` argument (annotationlib.Format.VALUE
@@ -529,20 +538,129 @@ class TypeVarTuple:
         raise TypeError("type 'typing.TypeVarTuple' is not an acceptable base type")
 
 
-class TypeAliasType:
+def _immutable_typealias_type_error(name):
+    return TypeError(
+        f"cannot set {name!r} attribute of immutable type "
+        "'typing.TypeAliasType'"
+    )
+
+
+class _TypeAliasTypeMeta(type):
+    def __new__(mcls, name, bases, namespace):
+        if any(isinstance(base, _TypeAliasTypeMeta) for base in bases):
+            raise TypeError(
+                "type 'typing.TypeAliasType' is not an acceptable base type"
+            )
+        return super().__new__(mcls, name, bases, namespace)
+
+    def __setattr__(cls, name, value):
+        raise _immutable_typealias_type_error(name)
+
+    def __delattr__(cls, name):
+        # CPython's immutable-type path reports deletion as a failed set too.
+        raise _immutable_typealias_type_error(name)
+
+
+class TypeAliasType(_PickleUsingNameMixin, metaclass=_TypeAliasTypeMeta):
     """A PEP 695 ``type X = ...`` alias."""
 
-    def __init__(self, name, value, *, type_params=(), _evaluate_value=None):
-        self.__name__ = name
-        self._value = value
-        self._evaluate_value = _evaluate_value
-        self.__type_params__ = tuple(type_params)
-        self.__module__ = _caller_module()
+    __slots__ = ("_name", "_type_params", "_value", "_evaluate_value", "_module")
+
+    def __init__(self, name, value, *, type_params=()):
+        if not isinstance(name, str):
+            raise TypeError(
+                f"typealias() argument 'name' must be str, not "
+                f"{type(name).__name__}"
+            )
+        if not isinstance(type_params, tuple):
+            raise TypeError("type_params must be a tuple")
+        self._check_type_params(type_params)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_type_params", type_params)
+        object.__setattr__(self, "_value", value)
+        object.__setattr__(self, "_evaluate_value", None)
+        object.__setattr__(self, "_module", _caller_module())
+
+    @staticmethod
+    def _check_type_params(type_params):
+        default_seen = False
+        for param in type_params:
+            if not (
+                type(param) is TypeVar
+                or type(param) is ParamSpec
+                or type(param) is TypeVarTuple
+            ):
+                raise TypeError(f"Expected a type param, got {param!r}")
+            default = param.__default__
+            if default is NoDefault:
+                if default_seen:
+                    raise TypeError(
+                        f"non-default type parameter '{param!r}' "
+                        "follows default type parameter"
+                    )
+            else:
+                default_seen = True
+
+    @classmethod
+    def _from_evaluator(cls, name, type_params, evaluate_value):
+        # PyPy's `_make_typealiastype` allocates first and installs the lazy
+        # evaluator with `object.__setattr__`.  Keep that shape so the public
+        # constructor does not grow a CPython-incompatible private keyword.
+        self = object.__new__(cls)
+        cls._check_type_params(type_params)
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_type_params", type_params)
+        object.__setattr__(self, "_value", _MISSING)
+        object.__setattr__(self, "_evaluate_value", evaluate_value)
+        # `_Py_make_typealias` stores no module.  The `__module__` getter
+        # derives it from the evaluator function when first observed.
+        object.__setattr__(self, "_module", _MISSING)
+        return self
+
+    def __getattribute__(self, name):
+        if name == "__module__":
+            module = object.__getattribute__(self, "_module")
+            if module is not _MISSING:
+                return module
+            evaluate_value = object.__getattribute__(self, "_evaluate_value")
+            return getattr(evaluate_value, "__module__", None)
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if name == "__name__":
+            raise AttributeError("readonly attribute")
+        if name in {
+            "__module__", "__parameters__", "__type_params__", "__value__",
+            "evaluate_value",
+        }:
+            raise AttributeError(
+                f"attribute {name!r} of 'typing.TypeAliasType' objects "
+                "is not writable"
+            )
+        raise AttributeError(
+            f"'typing.TypeAliasType' object has no attribute {name!r} "
+            "and no __dict__ for setting new attributes"
+        )
+
+    def __delattr__(self, name):
+        # The native object uses the same read-only/no-dict paths for writes
+        # and deletions.
+        self.__setattr__(name, None)
+
+    @property
+    def __name__(self):
+        return self._name
+
+    @property
+    def __type_params__(self):
+        return self._type_params
 
     @property
     def __value__(self):
         if self._value is _MISSING:
-            self._value = _evaluate_typeparam(self._evaluate_value)
+            object.__setattr__(
+                self, "_value", _evaluate_typeparam(self._evaluate_value)
+            )
         return self._value
 
     @property
@@ -553,7 +671,25 @@ class TypeAliasType:
 
     @property
     def __parameters__(self):
-        return self.__type_params__
+        if not self._type_params:
+            return ()
+        if not any(type(param) is TypeVarTuple for param in self._type_params):
+            # CPython's `unpack_typevartuples` returns the original tuple when
+            # there is nothing to unpack.
+            return self._type_params
+        result = []
+        for param in self._type_params:
+            if type(param) is TypeVarTuple:
+                # PyPy spells this `result.extend(param)`: TypeVarTuple's
+                # one-item iterator produces typing.Unpack[param].
+                result.extend(param)
+            else:
+                result.append(param)
+        return tuple(result)
+
+    def __iter__(self):
+        import typing
+        yield typing.Unpack[self]
 
     def __getitem__(self, args):
         if not self.__type_params__:
@@ -633,14 +769,4 @@ def _intrinsic_typealias(args):
     name, type_params, value = args
     if type_params is None:
         type_params = ()
-    alias = TypeAliasType(
-        name, _MISSING, type_params=type_params, _evaluate_value=value
-    )
-    # The constructor is called through this intrinsic helper, so its ordinary
-    # two-frame caller lookup sees the helper's private ``typing`` globals.
-    # CPython records the namespace executing the TYPEALIAS intrinsic instead.
-    try:
-        alias.__module__ = sys._getframe(1).f_globals.get('__name__')
-    except (AttributeError, ValueError):
-        alias.__module__ = None
-    return alias
+    return TypeAliasType._from_evaluator(name, type_params, value)
