@@ -13,6 +13,29 @@ parent, leaf = os.path.split(directory)
 
 SHOW = 'import sys; print(sys.executable)'
 
+
+def report(spelling, cwd=None):
+    """Spawn through `spelling` and hand back the child's `sys.executable`.
+
+    The directory is entered rather than passed as `subprocess.run(cwd=...)`:
+    that argument moves the child once it exists, and a relative program name
+    is looked up before then, against this process's own directory.
+    """
+    previous = os.getcwd()
+    if cwd is not None:
+        os.chdir(cwd)
+    try:
+        result = subprocess.run(
+            [spelling, '-c', SHOW],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        os.chdir(previous)
+    assert result.returncode == 0, (spelling, result.stderr)
+    return result.stdout.decode().strip()
+
+
 spellings = [
     # Relative, resolved against the cwd.
     (os.path.join(os.curdir, name), directory),
@@ -22,14 +45,7 @@ spellings = [
 ]
 
 for spelling, cwd in spellings:
-    result = subprocess.run(
-        [spelling, '-c', SHOW],
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert result.returncode == 0, (spelling, result.stderr)
-    reported = result.stdout.decode().strip()
+    reported = report(spelling, cwd)
 
     assert os.path.isabs(reported), (spelling, reported)
     parts = reported.split(os.sep)
@@ -37,29 +53,24 @@ for spelling, cwd in spellings:
     assert os.pardir not in parts, (spelling, reported)
     assert os.path.samefile(reported, sys.executable), (spelling, reported)
 
-# `resolvedirof` is what follows links; the invoked spelling is not, so a
-# symlinked executable answers with the link.  `samefile` cannot see the
-# difference -- it resolves both sides -- so this compares the strings.
-with tempfile.TemporaryDirectory() as tmp:
-    # The container is resolved up front so that the only unresolved link left
-    # in the comparison is the one under test -- on darwin the temporary
-    # directory itself sits under a symlinked `/var`, which the child's own cwd
-    # reports resolved.
-    tmp = os.path.realpath(tmp)
-    link = os.path.join(tmp, 'pyre-link')
-    os.symlink(sys.executable, link)
-
-    for spelling, cwd in ((link, None), (os.path.join(os.curdir, 'pyre-link'), tmp)):
-        result = subprocess.run(
-            [spelling, '-c', SHOW],
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert result.returncode == 0, (spelling, result.stderr)
-        assert result.stdout.decode().strip() == link, (spelling, result.stdout)
-
 if os.name == 'posix':
+    # `resolvedirof` is what follows links; the invoked spelling is not, so a
+    # symlinked executable answers with the link.  `samefile` cannot see the
+    # difference -- it resolves both sides -- so this compares the strings.
+    # Windows is left out because creating a symlink there needs a privilege
+    # an ordinary account does not hold.
+    with tempfile.TemporaryDirectory() as tmp:
+        # The container is resolved up front so that the only unresolved link
+        # left in the comparison is the one under test -- on darwin the
+        # temporary directory itself sits under a symlinked `/var`, which the
+        # child's own cwd reports resolved.
+        tmp = os.path.realpath(tmp)
+        link = os.path.join(tmp, 'pyre-link')
+        os.symlink(sys.executable, link)
+
+        assert report(link) == link, link
+        assert report(os.path.join(os.curdir, 'pyre-link'), tmp) == link, link
+
     # `..` directly under the root names nothing, so it is dropped rather than
     # carried.  A path opening with exactly two slashes is the host's to
     # interpret and keeps both; three or more collapse to one.
@@ -70,10 +81,4 @@ if os.name == 'posix':
         (os.sep * 3 + stripped, sys.executable),
     ]
     for spelling, expected in rooted:
-        result = subprocess.run(
-            [spelling, '-c', SHOW],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert result.returncode == 0, (spelling, result.stderr)
-        assert result.stdout.decode().strip() == expected, (spelling, result.stdout)
+        assert report(spelling) == expected, spelling
