@@ -1142,10 +1142,7 @@ mod handle_class {
                 return Ok(());
             }
             if state.daemon && is_finalizing() {
-                let cls = crate::builtins::lookup_exc_class("PythonFinalizationError")
-                    .expect("PythonFinalizationError must be installed");
-                let exc = crate::builtins::exc_exception_new(&[cls])?;
-                return Err(unsafe { crate::PyError::from_exc_object(exc) });
+                return Err(crate::builtins::finalization_error(None));
             }
             let _blocked = before_external_block();
             match duration {

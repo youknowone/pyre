@@ -6303,11 +6303,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if !crate::module::thread::is_finalizing() {
                 return Ok(());
             }
-            let cls = crate::builtins::lookup_exc_class("PythonFinalizationError")
-                .expect("PythonFinalizationError must be installed");
-            let message = pyre_object::w_str_new("can't fork at interpreter shutdown");
-            let exc = crate::builtins::exc_exception_new(&[cls, message])?;
-            Err(unsafe { crate::PyError::from_exc_object(exc) })
+            Err(crate::builtins::finalization_error(Some(
+                "can't fork at interpreter shutdown",
+            )))
         }
 
         // os.fork() -> child pid in parent, 0 in child

@@ -9394,6 +9394,32 @@ pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     registry.get(name).copied().map(|cls| cls as PyObjectRef)
 }
 
+/// The `PythonFinalizationError` for an operation refused at interpreter
+/// shutdown, carrying `message` as its argument when one is given.
+///
+/// Every caller reaches this only while `thread::is_finalizing()` holds, which
+/// is exactly when the registry [`lookup_exc_class`] reads may already be torn
+/// down. Naming the class with `expect` there ends the process instead of
+/// refusing the operation, so a missing class falls back to the base the
+/// registration gives it — `PythonFinalizationError` is made on
+/// `runtime_error` — and the `except RuntimeError` that would have caught it
+/// still does.
+pub fn finalization_error(message: Option<&str>) -> crate::PyError {
+    let Some(cls) = lookup_exc_class("PythonFinalizationError") else {
+        return crate::PyError::runtime_error(
+            message.unwrap_or("Operation blocked during Python finalization."),
+        );
+    };
+    let args = match message {
+        Some(message) => vec![cls, pyre_object::w_str_new(message)],
+        None => vec![cls],
+    };
+    match exc_exception_new(&args) {
+        Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
+        Err(err) => err,
+    }
+}
+
 /// Look up the reusable prebuilt instance for a builtin exception
 /// class, addressed by `ExcKind` name.  Mirrors RPython's
 /// `rpython/rtyper/exceptiondata.py:34-45 get_standard_ll_exc_instance`
