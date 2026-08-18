@@ -4854,6 +4854,18 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     if pyre_interpreter::eval::validate_check_exc_match_class(match_type).is_err() {
         return Ok(None);
     }
+    // The answer depends on `space.type(exc)`, and `typedef::type` reaches an
+    // exception's class through the kind registry whenever the `w_class` slot
+    // still holds the generic stub. The guard below can only pin a class the
+    // slot itself holds, so decline the registry answer rather than emit a
+    // guard that pins something else.
+    let Some(exc_class) = pyre_interpreter::typedef::r#type(exc) else {
+        return Ok(None);
+    };
+    let exc_class = exc_class.as_ptr();
+    if !std::ptr::eq(unsafe { (*exc).w_class }, exc_class) {
+        return Ok(None);
+    }
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
     // classes. Inlined here.
@@ -4870,9 +4882,12 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // elements are what the match actually reads and what a rebinding would
     // change, so guarding them is both sound and stable across the
     // re-allocation.
+    //
+    // A known class does not stand in for the pin: every class object shares
+    // the one `type` layout, so `is_class_known` on the clause operand says
+    // only that it is a class and leaves which class free to change.
     if !match_op.is_constant()
         && !walker_guard_exc_match_tuple_items(ctx, op_pc, match_op, match_type)?
-        && !ctx.trace_ctx.heap_cache().is_class_known(match_op)
     {
         let expected = ctx.trace_ctx.const_ref(match_type as i64);
         ctx.trace_ctx
@@ -4882,19 +4897,39 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(match_op, expected);
     }
-    // Defensive `GuardClass` on the exception when its class is not yet
-    // known (the construct fold marks it known, so this is a no-op for a
-    // virtual inline-built exc; it pins the class for any other exc that
-    // reaches this fold).
-    if !exc_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
-        let exc_class_ptr = unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type };
-        let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[exc_op, cls_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    // Pin the exception's Python-level class, the value the match walked the
+    // MRO of. `GuardClass` alone cannot do it: every exception of one
+    // `ExcKind` carries the same `ob_type`, so `class A(Exception)` and
+    // `class B(Exception)` share a layout and one's recorded answer would
+    // replay for the other. The layout guard still comes first — it is what
+    // makes the `w_class` read below name the field it was recorded against.
+    if !exc_op.is_constant() {
+        if !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
+            let exc_layout =
+                unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type } as i64;
+            let layout_const = ctx.trace_ctx.const_int(exc_layout);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[exc_op, layout_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(exc_op, exc_layout);
+        }
+        let w_class_op =
+            walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
+        let expected = ctx.trace_ctx.const_ref(exc_class as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[w_class_op, expected],
+        )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(exc_op, exc_class_ptr as usize as i64);
+            .replace_box(w_class_op, expected);
     }
 
     // The match is a constant at trace time: emit the immortal bool
