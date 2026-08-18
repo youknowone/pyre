@@ -377,8 +377,21 @@ pub fn combine_starargs_wrapped(
     w_stararg: PyObjectRef,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    match crate::baseobjspace::fixedview(w_stararg, -1) {
+    // `fixedview` iterates the star argument, which runs Python — a generator
+    // body or a subtype `__iter__`.  The words the caller already put in
+    // `arguments_w` and these by-value parameters are native copies no root
+    // walker updates, so they are published before the unpack and read back
+    // after it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_base = pyre_object::gc_roots::pin_roots(&arguments_w[..]);
+    let star_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_stararg);
+    pyre_object::gc_roots::pin_root(w_function);
+    let w_stararg = || pyre_object::gc_roots::shadow_stack_get(star_slot);
+    let w_function = || pyre_object::gc_roots::shadow_stack_get(star_slot + 1);
+    match crate::baseobjspace::fixedview(w_stararg(), -1) {
         Ok(args_w) => {
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut arguments_w[..]);
             // argument.py:104 — `self.arguments_w = self.arguments_w + args_w`.
             arguments_w.extend(args_w);
             Ok(())
@@ -388,11 +401,11 @@ pub fn combine_starargs_wrapped(
             // `"argument after * must be an iterable, not %T"`; other
             // errors propagate.
             if e.kind == crate::PyErrorKind::TypeError
-                && !crate::baseobjspace::is_iterable(w_stararg)
+                && !crate::baseobjspace::is_iterable(w_stararg())
             {
-                let tp = type_name_of(w_stararg);
+                let tp = type_name_of(w_stararg());
                 Err(raise_type_error(
-                    w_function,
+                    w_function(),
                     format!("argument after * must be an iterable, not {tp}"),
                 ))
             } else {
@@ -463,6 +476,16 @@ pub fn combine_starstarargs_wrapped(
     pyre_object::gc_roots::pin_root(w_function);
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    // The pairs the caller already accepted are in the same position: native
+    // vectors that this merge both reads (the duplicate check) and outlives.
+    // They are published here and read back before each of those uses; the
+    // merge only appends, so the published prefix keeps its indices.
+    let names_base = pyre_object::gc_roots::pin_roots(&keyword_names_out[..]);
+    let values_base = pyre_object::gc_roots::pin_roots(&keywords_out[..]);
+    let refresh_out = |names: &mut Vec<PyObjectRef>, values: &mut Vec<PyObjectRef>| {
+        pyre_object::gc_roots::shadow_stack_copy_range(names_base, &mut names[..]);
+        pyre_object::gc_roots::shadow_stack_copy_range(values_base, &mut values[..]);
+    };
     // argument.py:109 — fast path via view_as_kwargs.  Both halves of
     // the tuple are `Option`; PyPy's base default is `(None, None)`
     // while the kwargsdict-aware override returns `(Some, Some)`.
@@ -470,6 +493,7 @@ pub fn combine_starstarargs_wrapped(
     if let Some(names) = fast_names {
         let values = fast_values
             .expect("baseobjspace.py:1159 view_as_kwargs returns matching Some/Some or None/None");
+        refresh_out(keyword_names_out, keywords_out);
         // argument.py:111-119 — merge with optional duplicate check.
         if !keyword_names_out.is_empty() {
             check_not_duplicate_kwargs(keyword_names_out, &names, &values, w_function())?;
@@ -578,6 +602,7 @@ pub fn combine_starstarargs_wrapped(
     let mut keywords_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; n];
     // argument.py:142-144 — slow-path body fills name/value buffers,
     // checking for duplicates against keyword_names_out (existing).
+    refresh_out(keyword_names_out, keywords_out);
     let existing: Option<&[PyObjectRef]> = if keyword_names_out.is_empty() {
         None
     } else {
@@ -593,6 +618,7 @@ pub fn combine_starstarargs_wrapped(
         w_function(),
     )?;
     // argument.py:145-150 — merge into the running output buffers.
+    refresh_out(keyword_names_out, keywords_out);
     keyword_names_out.extend(keyword_names_w);
     keywords_out.extend(keywords_w);
     Ok(())
@@ -761,8 +787,17 @@ impl Arguments {
         w_starstararg: Option<PyObjectRef>,
         w_function: PyObjectRef,
     ) -> Result<(), crate::PyError> {
+        // Unpacking `*` runs Python, so the mapping the `**` arm has yet to
+        // read, the callable and the positional words the first arm leaves in
+        // `arguments_w` are published here and read back where the second arm
+        // uses them; none of the three sits in storage a root walker updates.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_starstararg.unwrap_or(pyre_object::PY_NULL));
+        pyre_object::gc_roots::pin_root(w_function);
         // argument.py:87-88 — `if w_stararg is not None: self._combine_starargs_wrapped(...)`.
         if let Some(w_star) = w_stararg {
+            let w_function = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             combine_starargs_wrapped(&mut self.arguments_w, w_star, w_function)?;
         }
         // argument.py:89-90 — `if w_starstararg is not None: self._combine_starstarargs_wrapped(...)`.
@@ -773,10 +808,17 @@ impl Arguments {
         // the helper runs whether or not it produced any keys, mirroring
         // PyPy's unconditional `self.keyword_names_w = ...` at lines
         // 145-150.
-        if let Some(w_starstar) = w_starstararg {
+        if w_starstararg.is_some() {
+            let args_base = pyre_object::gc_roots::pin_roots(&self.arguments_w[..]);
             let mut names = self.keyword_names_w.take().unwrap_or_default();
             let mut values = self.keywords_w.take().unwrap_or_default();
-            combine_starstarargs_wrapped(&mut names, &mut values, w_starstar, w_function)?;
+            combine_starstarargs_wrapped(
+                &mut names,
+                &mut values,
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            )?;
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut self.arguments_w[..]);
             self.keyword_names_w = Some(names);
             self.keywords_w = Some(values);
         }
@@ -1080,6 +1122,39 @@ impl Arguments {
             input_argcount += take;
         }
 
+        // `w_kw_defs`, the `**kwargs` dict, the keyword values and the words
+        // already copied into `scope_w` are all read after the allocations
+        // below — the vararg tuple, the dict itself, the keyword collection,
+        // the kwonly-default lookups — and a `list` or `dict` among them moves
+        // under any of those.  A by-value parameter copy is no more a slot the
+        // collector updates than the caller's scope buffer or `Arguments`' own
+        // vectors are, so each word is pinned here, ahead of the first
+        // allocation, and read back where it is used.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_kw_defs);
+        let keywords_base = pyre_object::gc_roots::shadow_stack_len();
+        if let Some(values) = self.keywords_w.as_ref() {
+            for &w_value in values {
+                pyre_object::gc_roots::pin_root(w_value);
+            }
+        }
+        let names_base = pyre_object::gc_roots::shadow_stack_len();
+        if let Some(names) = self.keyword_names_w.as_ref() {
+            for &w_name in names {
+                pyre_object::gc_roots::pin_root(w_name);
+            }
+        }
+        // The scope buffer keeps its own run of slots: `w_firstarg` and the
+        // positional copy above are in it already, and every later store goes
+        // through `store` so the refresh before `Ok(())` reads the whole scope
+        // back at its current addresses.
+        let scope_base = pyre_object::gc_roots::pin_roots(&scope_w[..]);
+        let store = |scope_w: &mut [PyObjectRef], index: usize, w_value: PyObjectRef| {
+            scope_w[index] = w_value;
+            pyre_object::gc_roots::shadow_stack_set(scope_base + index, w_value);
+        };
+
         // argument.py:222-236 — *vararg collection.
         if signature.has_vararg() {
             let args_left = co_argcount - upfront;
@@ -1095,20 +1170,23 @@ impl Arguments {
                 Vec::new()
             };
             let loc = co_argcount + co_kwonlyargcount;
-            scope_w[loc] = pyre_object::w_tuple_new(starargs_w);
+            let w_stararg = pyre_object::w_tuple_new(starargs_w);
+            store(scope_w, loc, w_stararg);
         } else if avail > co_argcount {
             too_many_args = true;
         }
 
         // argument.py:238-242 — **kwargs dict allocation.
+        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
+        let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
         let mut w_kwds: PyObjectRef = pyre_object::PY_NULL;
         if signature.has_kwarg() {
             // PyPy: `space.newdict(kwargs=True)` produces a kwargs-strategy
             // dict; pyre's W_DictObject lacks the strategy variant so a
             // plain dict is used (TODO: add kwargs strategy).
-            w_kwds = pyre_object::dictmultiobject::w_dict_new();
-            let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
-            scope_w[kwarg_loc] = w_kwds;
+            pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
+            w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
+            store(scope_w, kwarg_loc, w_kwds);
         }
 
         // argument.py:244-271 — keyword arg matching.
@@ -1131,10 +1209,16 @@ impl Arguments {
             if num_remainingkwds > 0 {
                 if !w_kwds.is_null() {
                     // argument.py:266-268 — collect overflow into **kwarg.
+                    // The helper pins whatever slice it is handed, so it takes
+                    // the published words rather than the ones the vector has
+                    // been holding since the two allocations above.
+                    let values_w: Vec<PyObjectRef> = (0..keywords_w.unwrap().len())
+                        .map(|i| pyre_object::gc_roots::shadow_stack_get(keywords_base + i))
+                        .collect();
                     collect_keyword_args(
                         keyword_names_w.unwrap(),
-                        keywords_w.unwrap(),
-                        w_kwds,
+                        &values_w,
+                        pyre_object::gc_roots::shadow_stack_get(kwds_slot),
                         &mapping,
                     )?;
                 } else {
@@ -1191,7 +1275,10 @@ impl Arguments {
                     let kwds_index = mapping[j];
                     j += 1;
                     if kwds_index >= 0 {
-                        scope_w[i] = keywords_w.unwrap()[kwds_index as usize];
+                        let w_value = pyre_object::gc_roots::shadow_stack_get(
+                            keywords_base + kwds_index as usize,
+                        );
+                        store(scope_w, i, w_value);
                     }
                 }
             }
@@ -1234,7 +1321,7 @@ impl Arguments {
                 }
                 let defnum = (i as isize) - def_first;
                 if defnum >= 0 {
-                    scope_w[i] = defaults_w.unwrap()[defnum as usize];
+                    store(scope_w, i, defaults_w.unwrap()[defnum as usize]);
                 } else if let Some(list) = missing_positional.as_mut() {
                     list.push(signature.argnames[i].to_string());
                 } else {
@@ -1260,8 +1347,11 @@ impl Arguments {
                 // dict with a subclass `__getitem__` raising e.g.
                 // `RuntimeError` surfaces here instead of being
                 // mis-classified as "default missing".
-                match crate::baseobjspace::finditem_str(w_kw_defs, name)? {
-                    Some(w_def) => scope_w[i] = w_def,
+                match crate::baseobjspace::finditem_str(
+                    pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
+                    name,
+                )? {
+                    Some(w_def) => store(scope_w, i, w_def),
                     None => {
                         if let Some(list) = missing_kwonly.as_mut() {
                             list.push(name.to_string());
@@ -1286,6 +1376,12 @@ impl Arguments {
             }
         }
 
+        // The collection points above have all run by now, so the buffer takes
+        // the scope's current addresses instead of keeping the ones it was
+        // filled with.  The early `return Err(...)` paths skip this refresh and
+        // leave pre-move words in the buffer; that is sound only because every
+        // caller drops `scope_w` unread on an error.
+        pyre_object::gc_roots::shadow_stack_copy_range(scope_base, scope_w);
         Ok(())
     }
 
@@ -1436,15 +1532,38 @@ impl Arguments {
     /// ```
     pub fn topacked(&self) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
         let w_args = pyre_object::w_tuple_new(self.arguments_w.clone());
-        let w_kwds = pyre_object::dictmultiobject::w_dict_new();
+        // Each `setitem` below hashes a key, can grow the dictionary's storage
+        // and can run a subclass `__setitem__`, so every turn is a collection
+        // point.  The dictionary moves under one, and the names and values sit
+        // in native vectors no root walker updates, so the whole set is
+        // published before the first turn and read back on the turn that uses
+        // it.  A tuple is allocated stable, so `w_args` only needs the one pin
+        // that keeps it alive across the same run.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(w_args);
+        let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
         if let (Some(names), Some(values)) =
             (self.keyword_names_w.as_ref(), self.keywords_w.as_ref())
         {
+            // `zip` stops at the shorter side; the pinned pairs match it.
+            let npairs = names.len().min(values.len());
+            let pairs_base = pyre_object::gc_roots::shadow_stack_len();
             for (w_key, w_value) in names.iter().zip(values.iter()) {
-                crate::baseobjspace::setitem(w_kwds, *w_key, *w_value)?;
+                pyre_object::gc_roots::pin_root(*w_key);
+                pyre_object::gc_roots::pin_root(*w_value);
+            }
+            for i in 0..npairs {
+                let w_key = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
+                let w_value = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+                crate::baseobjspace::setitem(
+                    pyre_object::gc_roots::shadow_stack_get(kwds_slot),
+                    w_key,
+                    w_value,
+                )?;
             }
         }
-        Ok((w_args, w_kwds))
+        Ok((w_args, pyre_object::gc_roots::shadow_stack_get(kwds_slot)))
     }
 }
 
@@ -1595,12 +1714,34 @@ pub fn collect_keyword_args(
     w_kwds: PyObjectRef,
     kwds_mapping: &[isize],
 ) -> Result<(), crate::PyError> {
+    // Every `setitem` is a collection point, so the dictionary and the pairs it
+    // forwards are published before the first one and read back at each turn.
+    // A name the mapping claimed keeps an empty pair of slots so the two loops
+    // agree on the index.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_kwds);
+    let pairs_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..keyword_names_w.len() {
+        if mapping_contains(kwds_mapping, i as isize) {
+            pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            continue;
+        }
+        pyre_object::gc_roots::pin_root(keyword_names_w[i]);
+        pyre_object::gc_roots::pin_root(keywords_w[i]);
+    }
     for i in 0..keyword_names_w.len() {
         if mapping_contains(kwds_mapping, i as isize) {
             continue;
         }
-        let w_key = keyword_names_w[i];
-        crate::baseobjspace::setitem(w_kwds, w_key, keywords_w[i])?;
+        let w_key = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(kwds_slot),
+            w_key,
+            w_value,
+        )?;
     }
     Ok(())
 }

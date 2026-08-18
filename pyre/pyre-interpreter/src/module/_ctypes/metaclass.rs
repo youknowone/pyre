@@ -471,18 +471,36 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
         set_type_attr(cls, "__ctype_le__", cls);
         set_type_attr(cls, "__ctype_be__", cls);
     } else if endian_capable && own_dict_get(cls, "_ctypes_native_peer").is_none() {
-        let ns = pyre_object::w_dict_new();
+        // The namespace `dict` moves: each insertion allocates the key string
+        // and may grow the dict, and building the swapped class allocates
+        // throughout, so the word is read back out of a root slot at every use.
+        // The allocated values arrive already built — call arguments evaluate
+        // left to right, so reading the slot inline with an allocating value
+        // expression would hand the store a pre-move address.
+        let roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = roots.base();
+        roots.pin_root(pyre_object::w_dict_new());
+        let w_tc = pyre_object::w_str_new(&tc);
         unsafe {
-            pyre_object::w_dict_setitem_str(ns, "_type_", pyre_object::w_str_new(&tc));
-            pyre_object::w_dict_setitem_str(ns, "_swappedbytes_", pyre_object::w_bool_from(true));
-            pyre_object::w_dict_setitem_str(ns, "_ctypes_native_peer", cls);
+            pyre_object::w_dict_setitem_str(roots.get(ns_slot), "_type_", w_tc);
+            pyre_object::w_dict_setitem_str(
+                roots.get(ns_slot),
+                "_swappedbytes_",
+                pyre_object::w_bool_from(true),
+            );
+            pyre_object::w_dict_setitem_str(roots.get(ns_slot), "_ctypes_native_peer", cls);
         }
         let bases = unsafe { pyre_object::typeobject::w_type_get_bases(cls) };
         let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
+        let w_name = pyre_object::w_str_new(name);
         let swapped = crate::call::type_call_instantiate(
             pycsimpletype_type(),
-            &[pyre_object::w_str_new(name), bases, ns],
+            &[w_name, bases, roots.get(ns_slot)],
         )?;
+        // The new class does not move, but nothing references it until the
+        // first `set_type_attr` below completes and that store allocates its
+        // key string, so it takes one pin for liveness.
+        roots.pin_root(swapped);
         if cfg!(target_endian = "little") {
             set_type_attr(cls, "__ctype_le__", cls);
             set_type_attr(cls, "__ctype_be__", swapped);
@@ -595,14 +613,21 @@ fn promote_anonymous_fields(
                 cf_usize(child, "byte_size"),
                 cf_usize(child, "index"),
             );
-            let d = crate::baseobjspace::getdict_native(promoted);
+            // The promoted field's `dict` moves and each copied entry
+            // allocates the key string, so the word is read back out of a
+            // root slot on every iteration.  `promoted` does not move but is
+            // unreferenced until `set_type_attr` below, so it takes one pin.
+            let roots = pyre_object::gc_roots::push_roots();
+            roots.pin_root(promoted);
+            let d_slot = roots.base() + 1;
+            roots.pin_root(crate::baseobjspace::getdict_native(promoted));
             unsafe {
                 for key in ["size", "bit_size", "bit_offset", "is_bitfield"] {
                     if let Some(value) = pyre_object::w_dict_getitem_str(
                         crate::baseobjspace::getdict_native(child),
                         key,
                     ) {
-                        pyre_object::w_dict_setitem_str(d, key, value);
+                        pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value);
                     }
                 }
             }
@@ -758,6 +783,13 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     // StgInfo: POINTER(Complete) must remain the type made while Complete was
     // incomplete (including its frozen PEP 3118 "&B" format).
     let cached_pointer_type = stginfo::stginfo_of(cls).and_then(stginfo::stginfo_pointer_type);
+    // `_fields_` is accepted as a `list` as well as a tuple, and a `list`
+    // moves; the whole layout pass below allocates before the sequence is
+    // stored back on the class, so it is pinned here and read back at that
+    // store.
+    let fields_roots = pyre_object::gc_roots::push_roots();
+    let fields_slot = fields_roots.base();
+    fields_roots.pin_root(fields);
     let entries = field_entries(fields)?;
     let anonymous = anonymous_names(cls)?;
 
@@ -904,30 +936,32 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let (field_offset, size, align, bitfield) = pending[index];
         mark_type_final(entry.ty, size, align);
         let cf = cfield_new(&entry.name, entry.ty, field_offset, size, index);
-        let d = crate::baseobjspace::getdict_native(cf);
+        // The descriptor's `dict` moves and each insertion allocates both the
+        // value and the key string, so the word is read back out of a root
+        // slot with the value already built.  `cf` does not move but is
+        // unreferenced until `set_type_attr` below, so it takes one pin.
+        let roots = pyre_object::gc_roots::push_roots();
+        roots.pin_root(cf);
+        let d_slot = roots.base() + 1;
+        roots.pin_root(crate::baseobjspace::getdict_native(cf));
+        let put = |key: &str, value: PyObjectRef| {
+            // SAFETY: the slot holds the descriptor dict pinned above.
+            unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
+        };
         if let Some((bits, bit_offset)) = bitfield {
-            unsafe {
-                pyre_object::w_dict_setitem_str(
-                    d,
-                    "size",
-                    pyre_object::w_int_new(((bits << 16) | bit_offset) as i64),
-                );
-                pyre_object::w_dict_setitem_str(d, "bit_size", pyre_object::w_int_new(bits as i64));
-                pyre_object::w_dict_setitem_str(
-                    d,
-                    "bit_offset",
-                    pyre_object::w_int_new(bit_offset as i64),
-                );
-                pyre_object::w_dict_setitem_str(d, "is_bitfield", pyre_object::w_bool_from(true));
-            }
+            put(
+                "size",
+                pyre_object::w_int_new(((bits << 16) | bit_offset) as i64),
+            );
+            put("bit_size", pyre_object::w_int_new(bits as i64));
+            put("bit_offset", pyre_object::w_int_new(bit_offset as i64));
+            put("is_bitfield", pyre_object::w_bool_from(true));
         }
         if anonymous
             .iter()
             .any(|anonymous_name| anonymous_name == &entry.name)
         {
-            unsafe {
-                pyre_object::w_dict_setitem_str(d, "is_anonymous", pyre_object::w_bool_from(true));
-            }
+            put("is_anonymous", pyre_object::w_bool_from(true));
         }
         set_type_attr(cls, &entry.name, cf);
     }
@@ -963,7 +997,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     stginfo::stginfo_set(cls, new_info);
 
     // Store the raw `_fields_` so the metaclass getset can return it.
-    set_type_attr(cls, "_fields_", fields);
+    set_type_attr(cls, "_fields_", fields_roots.get(fields_slot));
     Ok(pyre_object::w_none())
 }
 
@@ -1065,26 +1099,34 @@ fn cfield_new(
     index: usize,
 ) -> PyObjectRef {
     let inst = pyre_object::w_instance_new(cfield_type());
-    let d = crate::baseobjspace::getdict_native(inst);
-    unsafe {
-        pyre_object::w_dict_setitem_str(d, "name", pyre_object::w_str_new(name));
-        pyre_object::w_dict_setitem_str(d, "proto", proto);
-        pyre_object::w_dict_setitem_str(d, "type", proto);
-        pyre_object::w_dict_setitem_str(d, "offset", pyre_object::w_int_new(offset as i64));
-        pyre_object::w_dict_setitem_str(d, "byte_offset", pyre_object::w_int_new(offset as i64));
-        pyre_object::w_dict_setitem_str(d, "size", pyre_object::w_int_new(size as i64));
-        pyre_object::w_dict_setitem_str(d, "byte_size", pyre_object::w_int_new(size as i64));
-        let bit_size = BigInt::from(size) * BigInt::from(8u8);
-        pyre_object::w_dict_setitem_str(
-            d,
-            "bit_size",
-            pyre_object::longobject::w_long_new(bit_size),
-        );
-        pyre_object::w_dict_setitem_str(d, "bit_offset", pyre_object::w_int_new(0));
-        pyre_object::w_dict_setitem_str(d, "is_bitfield", pyre_object::w_bool_from(false));
-        pyre_object::w_dict_setitem_str(d, "is_anonymous", pyre_object::w_bool_from(false));
-        pyre_object::w_dict_setitem_str(d, "index", pyre_object::w_int_new(index as i64));
-    }
+    // The instance `dict` moves, and every insertion below allocates: the
+    // value, the key string `w_dict_setitem_str` builds, and the dict's own
+    // storage when it grows.  A minor collection anywhere in that run
+    // relocates the dict, so the word is read back out of a root slot for
+    // each insertion.  `inst` does not move, but nothing else references it
+    // while the run allocates, so it takes one pin for liveness.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(inst);
+    // The dict lands in the slot after `inst`.
+    let d_slot = roots.base() + 1;
+    roots.pin_root(crate::baseobjspace::getdict_native(inst));
+    let put = |key: &str, value: PyObjectRef| {
+        // SAFETY: the slot holds the instance dict pinned above.
+        unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
+    };
+    put("name", pyre_object::w_str_new(name));
+    put("proto", proto);
+    put("type", proto);
+    put("offset", pyre_object::w_int_new(offset as i64));
+    put("byte_offset", pyre_object::w_int_new(offset as i64));
+    put("size", pyre_object::w_int_new(size as i64));
+    put("byte_size", pyre_object::w_int_new(size as i64));
+    let bit_size = BigInt::from(size) * BigInt::from(8u8);
+    put("bit_size", pyre_object::longobject::w_long_new(bit_size));
+    put("bit_offset", pyre_object::w_int_new(0));
+    put("is_bitfield", pyre_object::w_bool_from(false));
+    put("is_anonymous", pyre_object::w_bool_from(false));
+    put("index", pyre_object::w_int_new(index as i64));
     inst
 }
 
@@ -1469,6 +1511,10 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
         byte_size as usize,
         index.max(0) as usize,
     );
+    // `field` does not move, but nothing else references it before the return
+    // and the argument decoding below allocates, so it takes one pin.
+    let field_roots = pyre_object::gc_roots::push_roots();
+    field_roots.pin_root(field);
     let bit_size = get("bit_size", 7)?
         .map(crate::baseobjspace::int_w)
         .transpose()?;
@@ -1486,12 +1532,19 @@ fn cfield_new_internal(args: &[PyObjectRef]) -> PyResult {
                 byte_size * 8,
             )));
         }
-        let d = crate::baseobjspace::getdict_native(field);
-        unsafe {
-            pyre_object::w_dict_setitem_str(d, "bit_size", pyre_object::w_int_new(bits));
-            pyre_object::w_dict_setitem_str(d, "bit_offset", pyre_object::w_int_new(bit_offset));
-            pyre_object::w_dict_setitem_str(d, "is_bitfield", pyre_object::w_bool_from(true));
-        }
+        // The field's `dict` moves and each insertion allocates both the value
+        // and the key string, so the word is read back out of a root slot with
+        // the value already built.
+        let roots = pyre_object::gc_roots::push_roots();
+        let d_slot = roots.base();
+        roots.pin_root(crate::baseobjspace::getdict_native(field));
+        let put = |key: &str, value: PyObjectRef| {
+            // SAFETY: the slot holds the field dict pinned above.
+            unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), key, value) };
+        };
+        put("bit_size", pyre_object::w_int_new(bits));
+        put("bit_offset", pyre_object::w_int_new(bit_offset));
+        put("is_bitfield", pyre_object::w_bool_from(true));
     }
     Ok(field)
 }
@@ -1517,7 +1570,15 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }
-    unsafe { pyre_object::w_dict_setitem_str(d, "_b_", pyre_object::w_bytearray_new(size)) };
+    // The instance `dict` moves and the buffer allocates, so the buffer is
+    // built first and the dict word is read back out of a root slot for the
+    // store; `obj` does not move and takes one pin for liveness.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(obj);
+    let d_slot = roots.base() + 1;
+    roots.pin_root(d);
+    let buffer = pyre_object::w_bytearray_new(size);
+    unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), "_b_", buffer) };
     Ok(obj)
 }
 
@@ -1538,20 +1599,41 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
     if args.is_empty() {
         return Err(crate::PyError::type_error("__init__ requires self"));
     }
+    // The argument slice is the caller's own native array, which no root
+    // walker updates, so an initialiser that moves is named by its pre-move
+    // address once an earlier `setattr_str` has allocated.  Pin every argument
+    // and take the movable operands back out of their slots.
+    let roots = pyre_object::gc_roots::push_roots();
+    let args_slot = roots.base();
+    for &arg in args {
+        roots.pin_root(arg);
+    }
     let obj = args[0];
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let pos_len = pos.len();
+    // The keyword carrier, when present, is the trailing argument.
+    let kw_slot = kwargs.map(|_| args_slot + args.len() - 1);
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let names = field_names_base_first(cls);
 
-    if pos.len() > names.len() {
+    if pos_len > names.len() {
         return Err(crate::PyError::type_error("too many initializers"));
     }
-    for (i, &val) in pos.iter().enumerate() {
-        crate::baseobjspace::setattr_str(obj, &names[i], val)?;
+    for i in 0..pos_len {
+        crate::baseobjspace::setattr_str(obj, &names[i], roots.get(args_slot + 1 + i))?;
     }
 
-    if let Some(kw) = kwargs {
-        for (key_obj, val) in unsafe { pyre_object::w_dict_items(kw) } {
+    if let Some(kw_slot) = kw_slot {
+        // `w_dict_items` returns a native `Vec` snapshot the collector does not
+        // update either, and a string-keyed strategy mints its key objects
+        // there, so each pair takes a pin and the values are read back.
+        let items = unsafe { pyre_object::w_dict_items(roots.get(kw_slot)) };
+        let items_slot = pyre_object::gc_roots::shadow_stack_len();
+        for &(key_obj, val) in &items {
+            roots.pin_root(key_obj);
+            roots.pin_root(val);
+        }
+        for (i, &(key_obj, _)) in items.iter().enumerate() {
             if !unsafe { pyre_object::is_str(key_obj) } {
                 continue;
             }
@@ -1561,13 +1643,13 @@ fn structure_init(args: &[PyObjectRef]) -> PyResult {
             }
             // Duplicate positional + keyword assignment for the same field.
             if let Some(pos_idx) = names.iter().position(|n| *n == key)
-                && pos_idx < pos.len()
+                && pos_idx < pos_len
             {
                 return Err(crate::PyError::type_error(format!(
                     "duplicate values for field '{key}'"
                 )));
             }
-            crate::baseobjspace::setattr_str(obj, &key, val)?;
+            crate::baseobjspace::setattr_str(obj, &key, roots.get(items_slot + i * 2 + 1))?;
         }
     }
     Ok(pyre_object::w_none())
@@ -1702,29 +1784,39 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
 
 /// `ctype * n` — cache lookup on `(ctype, n)`, else create `ctype_Array_n`.
 fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
-    let cache = match crate::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY) {
-        Some(d) => d,
-        None => {
-            let d = pyre_object::w_dict_new();
-            if crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, d) {
-                pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
-            }
-            d
-        }
-    };
-    if let Some(found) = unsafe { pyre_object::w_dict_getitem(cache, n as i64) } {
+    // Both dicts below move.  Storing the cache on `elem`'s dict keeps it
+    // reachable but leaves a plain local naming the pre-move address, and the
+    // class construction that sits between the cache read and the cache write
+    // allocates throughout — so both words live in root slots and are read
+    // back at every use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let cache_slot = roots.base();
+    let cached = crate::type_dict_lookup(elem, ARRAY_TYPE_CACHE_KEY);
+    roots.pin_root(cached.unwrap_or_else(pyre_object::w_dict_new));
+    if cached.is_none()
+        && crate::type_dict_store(elem, ARRAY_TYPE_CACHE_KEY, roots.get(cache_slot))
+    {
+        pyre_object::gc_hook::try_gc_write_barrier(elem as *mut u8);
+    }
+    if let Some(found) = unsafe { pyre_object::w_dict_getitem(roots.get(cache_slot), n as i64) } {
         return Ok(found);
     }
     let name = format!("{}_Array_{}", type_name(elem), n);
-    let ns = pyre_object::w_dict_new();
+    let ns_roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = ns_roots.base();
+    ns_roots.pin_root(pyre_object::w_dict_new());
+    let w_length = pyre_object::w_int_new(n as i64);
     unsafe {
-        pyre_object::w_dict_setitem_str(ns, "_type_", elem);
-        pyre_object::w_dict_setitem_str(ns, "_length_", pyre_object::w_int_new(n as i64));
+        pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_type_", elem);
+        pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_length_", w_length);
     }
     let bases = pyre_object::w_tuple_new(vec![array_type()]);
-    let args = [pyre_object::w_str_new(&name), bases, ns];
-    let new_cls = crate::call::type_call_instantiate(pycarraytype_type(), &args)?;
-    unsafe { pyre_object::w_dict_setitem(cache, n as i64, new_cls) };
+    let w_name = pyre_object::w_str_new(&name);
+    let new_cls = crate::call::type_call_instantiate(
+        pycarraytype_type(),
+        &[w_name, bases, ns_roots.get(ns_slot)],
+    )?;
+    unsafe { pyre_object::w_dict_setitem(roots.get(cache_slot), n as i64, new_cls) };
     Ok(new_cls)
 }
 
@@ -1762,7 +1854,14 @@ fn array_new(args: &[PyObjectRef]) -> PyResult {
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }
-    unsafe { pyre_object::w_dict_setitem_str(d, "_b_", pyre_object::w_bytearray_new(size)) };
+    // The instance `dict` moves under the buffer allocation; `obj` does not
+    // move and takes one pin for liveness.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(obj);
+    let d_slot = roots.base() + 1;
+    roots.pin_root(d);
+    let buffer = pyre_object::w_bytearray_new(size);
+    unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), "_b_", buffer) };
     Ok(obj)
 }
 
@@ -2190,8 +2289,15 @@ fn pointer_new(args: &[PyObjectRef]) -> PyResult {
     if d.is_null() {
         return Err(crate::PyError::type_error("ctypes instance has no dict"));
     }
+    // The instance `dict` moves under the buffer allocation; `obj` does not
+    // move and takes one pin for liveness.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(obj);
+    let d_slot = roots.base() + 1;
+    roots.pin_root(d);
     let psize = host_ctypes::pointer_size();
-    unsafe { pyre_object::w_dict_setitem_str(d, "_b_", pyre_object::w_bytearray_new(psize)) };
+    let buffer = pyre_object::w_bytearray_new(psize);
+    unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), "_b_", buffer) };
     Ok(obj)
 }
 

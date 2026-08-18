@@ -827,6 +827,11 @@ fn init_string_module(ns: PyObjectRef) {
                 FieldType::Index(n) => pyre_object::w_int_new(n as i64),
                 FieldType::Keyword(s) => pyre_object::w_str_from_wtf8(s),
             };
+            // A `str` and an `int` never move, so `first` is never read back,
+            // but nothing else refers to it while the parts below allocate:
+            // one liveness pin covers it to the end of the call.
+            let roots = pyre_object::gc_roots::push_roots();
+            roots.pin_root(first);
             let rest = parts
                 .into_iter()
                 .map(|part| match part {
@@ -874,28 +879,30 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
         ns,
         "config_vars",
         crate::make_builtin_function("config_vars", |_| {
-            let vars = pyre_object::w_dict_new();
+            // A `dict` header moves, and every store allocates the key, the
+            // value, and the dict's own storage when it grows, so the word is
+            // read back out of a root slot per store.  Call arguments evaluate
+            // left to right, so the key and value are bound before that read.
+            let roots = pyre_object::gc_roots::push_roots();
+            let vars_slot = roots.base();
+            roots.pin_root(pyre_object::w_dict_new());
             let so_ext = extension_abi_suffix();
             unsafe {
                 for (name, value) in [("Py_DEBUG", 0), ("Py_GIL_DISABLED", 1)] {
-                    pyre_object::w_dict_store(
-                        vars,
-                        pyre_object::w_str_new(name),
-                        pyre_object::w_int_new(value),
-                    );
+                    let w_key = pyre_object::w_str_new(name);
+                    let w_value = pyre_object::w_int_new(value);
+                    pyre_object::w_dict_store(roots.get(vars_slot), w_key, w_value);
                 }
                 for (name, value) in [
                     ("SOABI", soabi_middle(&so_ext)),
                     ("EXT_SUFFIX", so_ext.clone()),
                 ] {
-                    pyre_object::w_dict_store(
-                        vars,
-                        pyre_object::w_str_new(name),
-                        pyre_object::w_str_new(&value),
-                    );
+                    let w_key = pyre_object::w_str_new(name);
+                    let w_value = pyre_object::w_str_new(&value);
+                    pyre_object::w_dict_store(roots.get(vars_slot), w_key, w_value);
                 }
             }
-            Ok(vars)
+            Ok(roots.get(vars_slot))
         }),
     );
 }
@@ -1062,21 +1069,27 @@ fn quote_for_cflags(path: &str) -> String {
 /// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
 /// turn, so a cross-compilation snapshot still overrides it.
 fn init_sysconfigdata(ns: PyObjectRef) {
-    fn store_str(vars: PyObjectRef, key: &str, value: &str) {
+    // These take the root slot rather than the dict itself: a word passed by
+    // value goes stale the moment the key or the value allocates.
+    fn store_str(vars_slot: usize, key: &str, value: &str) {
         unsafe {
+            let w_key = pyre_object::w_str_new(key);
+            let w_value = pyre_object::w_str_new(value);
             pyre_object::w_dict_store(
-                vars,
-                pyre_object::w_str_new(key),
-                pyre_object::w_str_new(value),
+                pyre_object::gc_roots::shadow_stack_get(vars_slot),
+                w_key,
+                w_value,
             );
         }
     }
-    fn store_int(vars: PyObjectRef, key: &str, value: i64) {
+    fn store_int(vars_slot: usize, key: &str, value: i64) {
         unsafe {
+            let w_key = pyre_object::w_str_new(key);
+            let w_value = pyre_object::w_int_new(value);
             pyre_object::w_dict_store(
-                vars,
-                pyre_object::w_str_new(key),
-                pyre_object::w_int_new(value),
+                pyre_object::gc_roots::shadow_stack_get(vars_slot),
+                w_key,
+                w_value,
             );
         }
     }
@@ -1152,20 +1165,22 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         String::new()
     };
 
-    let vars = pyre_object::w_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let vars_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
     // `_init_non_posix` derives the same `t` from `Py_GIL_DISABLED` below.
     // The lower-case `abiflags` that forms the include and site-packages
     // directory names is a separate variable, read from `sys.abiflags`
     // (`sysconfig:545`), and stays empty: the release tree has no `t` suffix
     // on its stdlib directory for `site.py:409` to find.
-    store_str(vars, "ABIFLAGS", "t");
-    store_str(vars, "SOABI", &soabi);
+    store_str(vars_slot, "ABIFLAGS", "t");
+    store_str(vars_slot, "SOABI", &soabi);
     // Deprecated in Python 3, kept for backward compatibility.
-    store_str(vars, "SO", &so_ext);
-    store_str(vars, "MULTIARCH", multiarch());
-    store_str(vars, "CC", &cc);
-    store_str(vars, "CXX", &cxx);
-    store_str(vars, "OPT", "-DNDEBUG -O2");
+    store_str(vars_slot, "SO", &so_ext);
+    store_str(vars_slot, "MULTIARCH", multiarch());
+    store_str(vars_slot, "CC", &cc);
+    store_str(vars_slot, "CXX", &cxx);
+    store_str(vars_slot, "OPT", "-DNDEBUG -O2");
     // `setuptools`' vendored `_distutils.sysconfig._get_python_inc_posix_prefix`
     // builds the include directory as `include/<impl><version><abiflags>` with
     // `<impl>` chosen by `IS_PYPY = '__pypy__' in sys.builtin_module_names`.
@@ -1179,24 +1194,24 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         cflags.push_str(" -I");
         cflags.push_str(&quote_for_cflags(&include_py));
     }
-    store_str(vars, "CFLAGS", &cflags);
-    store_str(vars, "CCSHARED", "-fPIC");
-    store_str(vars, "LDFLAGS", &ldflags);
-    store_str(vars, "LDSHARED", &ldshared);
-    store_str(vars, "LDCXXSHARED", &ldcxxshared);
-    store_str(vars, "EXT_SUFFIX", &so_ext);
-    store_str(vars, "SHLIB_SUFFIX", ".so");
-    store_str(vars, "AR", "ar");
-    store_str(vars, "ARFLAGS", "rc");
-    store_str(vars, "EXE", "");
-    store_str(vars, "VERSION", "3.14");
-    store_str(vars, "LDVERSION", "3.14");
+    store_str(vars_slot, "CFLAGS", &cflags);
+    store_str(vars_slot, "CCSHARED", "-fPIC");
+    store_str(vars_slot, "LDFLAGS", &ldflags);
+    store_str(vars_slot, "LDSHARED", &ldshared);
+    store_str(vars_slot, "LDCXXSHARED", &ldcxxshared);
+    store_str(vars_slot, "EXT_SUFFIX", &so_ext);
+    store_str(vars_slot, "SHLIB_SUFFIX", ".so");
+    store_str(vars_slot, "AR", "ar");
+    store_str(vars_slot, "ARFLAGS", "rc");
+    store_str(vars_slot, "EXE", "");
+    store_str(vars_slot, "VERSION", "3.14");
+    store_str(vars_slot, "LDVERSION", "3.14");
     // cpyext never uses Py_DEBUG.  Pyre runs its mutators without a global
     // interpreter lock.  Py_ENABLE_SHARED at 1 would add a python shared
     // object to link lines as `-lpython3.x`.
-    store_int(vars, "Py_DEBUG", 0);
-    store_int(vars, "Py_GIL_DISABLED", 1);
-    store_int(vars, "Py_ENABLE_SHARED", 0);
+    store_int(vars_slot, "Py_DEBUG", 0);
+    store_int(vars_slot, "Py_GIL_DISABLED", 1);
+    store_int(vars_slot, "Py_ENABLE_SHARED", 0);
     // Pyre has no separately linkable runtime library.  Keep the build ABI
     // metadata above for wheel tags, but never invent files that are absent
     // from the installation.
@@ -1208,7 +1223,7 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         "CONFINCLUDEPY",
         "LIBDIR",
     ] {
-        store_str(vars, key, "");
+        store_str(vars_slot, key, "");
     }
     // The headers are the one entry above a build can have: they exist in a
     // `cpyext` build and nowhere else, so the empty default stands until there
@@ -1216,12 +1231,12 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     // `_distutils` — meson-python, scikit-build, CMake's FindPython — read
     // `INCLUDEPY` directly.
     if !include_py.is_empty() {
-        store_str(vars, "INCLUDEPY", &include_py);
-        store_str(vars, "CONFINCLUDEPY", &include_py);
+        store_str(vars_slot, "INCLUDEPY", &include_py);
+        store_str(vars_slot, "CONFINCLUDEPY", &include_py);
     }
-    store_int(vars, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
+    store_int(vars_slot, "SIZEOF_VOID_P", std::mem::size_of::<usize>() as i64);
     if gnuld {
-        store_str(vars, "GNULD", "yes");
+        store_str(vars_slot, "GNULD", "yes");
     }
     #[cfg(target_os = "macos")]
     {
@@ -1231,9 +1246,9 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         // pypa/wheel, and check the interaction with `build_cffi_imports.py`
         // before removing it.  Keep it in sync with DARWIN_VERSION_MIN in
         // `rpython/translator/platform/darwin.py` and `Lib/_osx_support.py`.
-        store_int(vars, "WITH_DYLD", 1);
+        store_int(vars_slot, "WITH_DYLD", 1);
         store_str(
-            vars,
+            vars_slot,
             "MACOSX_DEPLOYMENT_TARGET",
             if arch == "arm64" { "11.0" } else { "10.15" },
         );
@@ -1241,7 +1256,12 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     // Python 3.14's relocation check reads these from the generated data.
     unsafe {
         for key in ["prefix", "exec_prefix", "srcdir"] {
-            pyre_object::w_dict_store(vars, pyre_object::w_str_new(key), base_prefix_str);
+            let w_key = pyre_object::w_str_new(key);
+            pyre_object::w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(vars_slot),
+                w_key,
+                base_prefix_str,
+            );
         }
     }
     // Keep PyPy's relocatable zoneinfo search rooted at `base_prefix`.  The
@@ -1276,14 +1296,21 @@ fn init_sysconfigdata(ns: PyObjectRef) {
             joined.push(path);
         }
         unsafe {
+            let w_key = pyre_object::w_str_new("TZPATH");
+            let w_value =
+                pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined));
             pyre_object::w_dict_store(
-                vars,
-                pyre_object::w_str_new("TZPATH"),
-                pyre_object::w_str_from_wtf8(crate::gateway::fsdecode_os_str_wtf8(&joined)),
+                pyre_object::gc_roots::shadow_stack_get(vars_slot),
+                w_key,
+                w_value,
             );
         }
     }
-    crate::module_ns_store(ns, "build_time_vars", vars);
+    crate::module_ns_store(
+        ns,
+        "build_time_vars",
+        pyre_object::gc_roots::shadow_stack_get(vars_slot),
+    );
 }
 
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
@@ -1362,20 +1389,19 @@ fn init_scproxy(ns: PyObjectRef) {
         ns,
         "_get_proxy_settings",
         crate::make_builtin_function("_get_proxy_settings", |_| {
-            let d = pyre_object::w_dict_new();
+            // The `dict` moves across the allocations each store makes.
+            let roots = pyre_object::gc_roots::push_roots();
+            let d_slot = roots.base();
+            roots.pin_root(pyre_object::w_dict_new());
             unsafe {
-                pyre_object::w_dict_store(
-                    d,
-                    pyre_object::w_str_new("exclude_simple"),
-                    pyre_object::w_bool_from(false),
-                );
-                pyre_object::w_dict_store(
-                    d,
-                    pyre_object::w_str_new("exceptions"),
-                    pyre_object::w_list_new(Vec::new()),
-                );
+                let w_key = pyre_object::w_str_new("exclude_simple");
+                let w_value = pyre_object::w_bool_from(false);
+                pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
+                let w_key = pyre_object::w_str_new("exceptions");
+                let w_value = pyre_object::w_list_new(Vec::new());
+                pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
             }
-            Ok(d)
+            Ok(roots.get(d_slot))
         }),
     );
 }
@@ -2615,11 +2641,17 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
         .lock()
         .unwrap()
         .insert(name.to_string(), module as usize);
-    // Keep the Python-visible sys.modules dict in sync.
+    // Keep the Python-visible sys.modules dict in sync.  The read is fresh —
+    // the collector walks that cell — but the `dict` moves, and the key string
+    // minted below can be the collection that moves it.
     let dict = sys_modules_dict();
     if !dict.is_null() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = roots.base();
+        roots.pin_root(dict);
+        let w_key = pyre_object::w_str_new(name);
         unsafe {
-            pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module);
+            pyre_object::w_dict_store(roots.get(dict_slot), w_key, module);
         }
     }
 }
@@ -2985,10 +3017,17 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     // a possibly-young dict; rescan on the next minor collection.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
+    // The cell just stored is walked; the parameter is a bare local the
+    // collector never updates, and every iteration below mints a key string
+    // and may grow the dict.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(dict);
     // Populate with all modules already in the cache.
     for (name, &module) in SYS_MODULES.lock().unwrap().iter() {
+        let w_key = pyre_object::w_str_new(name);
         unsafe {
-            pyre_object::w_dict_store(dict, pyre_object::w_str_new(name), module as PyObjectRef);
+            pyre_object::w_dict_store(roots.get(dict_slot), w_key, module as PyObjectRef);
         }
     }
 }

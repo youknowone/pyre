@@ -228,9 +228,17 @@ impl<'a> MiniXmlParser<'a> {
     fn parse_xml_decl(&mut self) -> Result<(), crate::PyError> {
         let event_pos = self.pos;
         self.expect("<?xml")?;
+        // `encoding` and `standalone` are freshly minted and reachable only
+        // from these locals, while the rest of the loop, the position update
+        // and the handler call all allocate and can run Python — a collection
+        // that completes in that window would reclaim them.  Each mint takes
+        // one liveness pin; neither kind moves, so the locals stay current and
+        // are never read back.  `w_none()` is a singleton and needs nothing.
+        let roots = pyre_object::gc_roots::push_roots();
         let mut version = String::new();
         let mut encoding = w_none();
         let mut standalone = w_int_new(-1);
+        roots.pin_root(standalone);
         loop {
             self.skip_ws();
             if self.consume("?>") {
@@ -246,9 +254,13 @@ impl<'a> MiniXmlParser<'a> {
             let value = self.read_quoted()?;
             match key.as_str() {
                 "version" => version = value,
-                "encoding" => encoding = w_str_new(&value),
+                "encoding" => {
+                    encoding = w_str_new(&value);
+                    roots.pin_root(encoding);
+                }
                 "standalone" => {
                     standalone = w_int_new(if value == "yes" { 1 } else { 0 });
+                    roots.pin_root(standalone);
                 }
                 _ => {}
             }
@@ -348,6 +360,12 @@ impl<'a> MiniXmlParser<'a> {
         self.expect("<!DOCTYPE")?;
         self.skip_ws();
         let name = self.read_name()?;
+        // The two identifiers are minted here and used again only at the very
+        // end, past the not-standalone callback, the internal subset and the
+        // start-doctype handler — all of which run Python.  Nothing else refers
+        // to them in between, so each mint takes one liveness pin; a `str` does
+        // not move, so the locals stay current.  `w_none()` needs nothing.
+        let roots = pyre_object::gc_roots::push_roots();
         let mut sysid = w_none();
         let mut pubid = w_none();
         let mut has_internal_subset = false;
@@ -356,12 +374,15 @@ impl<'a> MiniXmlParser<'a> {
             self.expect("PUBLIC")?;
             self.skip_ws();
             pubid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(pubid);
             self.skip_ws();
             sysid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
             sysid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(sysid);
         }
         self.skip_ws();
         if crate::baseobjspace::getattr_str(self.parser, "_pyre_not_standalone_pending")
@@ -435,6 +456,13 @@ impl<'a> MiniXmlParser<'a> {
         };
         let name = self.read_name()?;
         self.skip_ws();
+        // Every identifier this declaration mints is reachable only from its
+        // local until the handler call at the end, and the reads that follow —
+        // another `read_quoted`, the position update, the handler itself — both
+        // allocate and run Python.  Each mint takes one liveness pin; strings do
+        // not move, so no local is read back.  `base` stays the `w_none()`
+        // singleton, which needs nothing.
+        let roots = pyre_object::gc_roots::push_roots();
         let mut value = w_none();
         let mut base = w_none();
         let mut sysid = w_none();
@@ -444,10 +472,12 @@ impl<'a> MiniXmlParser<'a> {
             let v = self.read_quoted()?;
             self.internal_entities.insert(name.clone(), v.clone());
             value = w_str_new(&v);
+            roots.pin_root(value);
         } else if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
             pubid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(pubid);
             self.skip_ws();
             let system = self.read_quoted()?;
             self.external_entities.insert(
@@ -458,6 +488,7 @@ impl<'a> MiniXmlParser<'a> {
                 ),
             );
             sysid = w_str_new(&system);
+            roots.pin_root(sysid);
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
@@ -465,12 +496,14 @@ impl<'a> MiniXmlParser<'a> {
             self.external_entities
                 .insert(name.clone(), (system.clone(), None));
             sysid = w_str_new(&system);
+            roots.pin_root(sysid);
         }
         self.skip_ws();
         if self.starts_with("NDATA") {
             self.expect("NDATA")?;
             self.skip_ws();
             notation = w_str_new(&self.read_name()?);
+            roots.pin_root(notation);
         }
         self.skip_until_gt()?;
         let _ = &mut base;
@@ -524,12 +557,19 @@ impl<'a> MiniXmlParser<'a> {
                 _ => {}
             }
         }
+        // The content model is a fresh `tuple` that nothing but this local
+        // refers to while the position update writes three parser slots and the
+        // handler runs Python; a collection completing there would reclaim it.
+        // One liveness pin at the mint — a tuple does not move, so the local
+        // stays current.
+        let roots = pyre_object::gc_roots::push_roots();
         let model = w_tuple_new(vec![
             w_int_new(2),
             w_int_new(0),
             w_none(),
             w_tuple_new(vec![]),
         ]);
+        roots.pin_root(model);
         self.set_event_position(event_pos);
         self.call_handler("ElementDeclHandler", &[w_str_new(&name), model])
     }
@@ -580,20 +620,28 @@ impl<'a> MiniXmlParser<'a> {
         self.skip_ws();
         let name = self.read_name()?;
         self.skip_ws();
+        // Both identifiers are minted here and held across the remaining
+        // `read_quoted` calls, the position update and the handler, all of which
+        // allocate or run Python.  One liveness pin per mint; a `str` does not
+        // move, so the locals stay current and `w_none()` needs nothing.
+        let roots = pyre_object::gc_roots::push_roots();
         let mut sysid = w_none();
         let mut pubid = w_none();
         if self.starts_with("PUBLIC") {
             self.expect("PUBLIC")?;
             self.skip_ws();
             pubid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(pubid);
             self.skip_ws();
             if matches!(self.peek_char(), Some('"' | '\'')) {
                 sysid = w_str_new(&self.read_quoted()?);
+                roots.pin_root(sysid);
             }
         } else if self.starts_with("SYSTEM") {
             self.expect("SYSTEM")?;
             self.skip_ws();
             sysid = w_str_new(&self.read_quoted()?);
+            roots.pin_root(sysid);
         }
         self.skip_until_gt()?;
         self.set_event_position(event_pos);
@@ -642,9 +690,17 @@ impl<'a> MiniXmlParser<'a> {
                 self.apply_namespace_decls(&attrs, &mut ns_declared)?;
                 let name = self.expand_name(&raw_name, false)?;
                 let expanded_attrs = self.expand_attributes(&attrs)?;
-                let w_attrs = self.convert_attributes(&expanded_attrs);
+                // The attribute container is a `dict` or a `list`, both of which
+                // move, and the position update and the interned element name
+                // that follow allocate.  Pin it on creation and read it back out
+                // of the root slot at the call; the name is built into a local
+                // first, since the argument list evaluates left to right.
+                let roots = pyre_object::gc_roots::push_roots();
+                let attrs_slot = roots.base();
+                roots.pin_root(self.convert_attributes(&expanded_attrs));
                 self.set_event_position(event_pos);
-                self.call_handler("StartElementHandler", &[self.intern_string(&name), w_attrs])?;
+                let w_name = self.intern_string(&name);
+                self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
                 self.set_event_position(self.pos);
                 self.call_handler("EndElementHandler", &[self.intern_string(&name)])?;
                 self.end_namespace_scope(ns_declared)?;
@@ -659,9 +715,12 @@ impl<'a> MiniXmlParser<'a> {
                 let expanded_attrs = self.expand_attributes(&attrs)?;
                 self.stack.push(name.clone());
                 self.ns_stack.push(ns_declared);
-                let w_attrs = self.convert_attributes(&expanded_attrs);
+                let roots = pyre_object::gc_roots::push_roots();
+                let attrs_slot = roots.base();
+                roots.pin_root(self.convert_attributes(&expanded_attrs));
                 self.set_event_position(event_pos);
-                self.call_handler("StartElementHandler", &[self.intern_string(&name), w_attrs])?;
+                let w_name = self.intern_string(&name);
+                self.call_handler("StartElementHandler", &[w_name, roots.get(attrs_slot)])?;
                 return Ok(());
             }
             let attr_name = self.read_name()?;
@@ -736,19 +795,41 @@ impl<'a> MiniXmlParser<'a> {
         let ordered = crate::baseobjspace::getattr_str(self.parser, "ordered_attributes")
             .map(is_true_obj)
             .unwrap_or(false);
+        // Both arms convert one attribute at a time and hold what they have
+        // already converted across the next conversion's allocations.
+        // `intern_string` hands back whatever the caller's intern map holds under
+        // the name, so a name can be a `list` or a `dict`, whose header moves,
+        // and a fresh value string has no heap edge until the container takes it.
+        // Every converted word is therefore pinned at its mint and read back at
+        // the call that consumes it.
         if ordered {
-            let mut items = Vec::with_capacity(attrs.len() * 2);
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.base();
             for (name, value) in attrs {
-                items.push(self.intern_string(name));
-                items.push(w_str_new(value));
+                roots.pin_root(self.intern_string(name));
+                roots.pin_root(w_str_new(value));
             }
-            w_list_new(items)
+            // `w_list_new` pins the vector it is handed, so the vector is built
+            // out of the slots at the call rather than while the members are
+            // still allocating.
+            w_list_new((0..attrs.len() * 2).map(|i| roots.get(base + i)).collect())
         } else {
-            let w_attrs = w_dict_new();
+            // The dict's storage allocates as it grows and its header moves with
+            // it, so it takes a slot of its own.  The value string is built into
+            // a local first — call arguments evaluate left to right, so reading
+            // the slots inline with it would take their addresses before it
+            // allocates.
+            let roots = pyre_object::gc_roots::push_roots();
+            let attrs_slot = roots.base();
+            roots.pin_root(w_dict_new());
             for (name, value) in attrs {
-                unsafe { w_dict_store(w_attrs, self.intern_string(name), w_str_new(value)) };
+                let name_roots = pyre_object::gc_roots::push_roots();
+                let name_slot = name_roots.base();
+                name_roots.pin_root(self.intern_string(name));
+                let w_value = w_str_new(value);
+                unsafe { w_dict_store(roots.get(attrs_slot), name_roots.get(name_slot), w_value) };
             }
-            w_attrs
+            roots.get(attrs_slot)
         }
     }
 
@@ -808,10 +889,22 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn call_handler(&mut self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+        // The handler lookup below is a full `getattr`, and the flush hands
+        // buffered text to a Python handler; both run Python and so can collect,
+        // and an attribute `dict` or `list` in `args` moves under either.  A
+        // plain Rust slice is not a place the collector updates, so the argument
+        // words are pinned before the lookup and read back out of their root
+        // slots at the call.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        for &arg in args {
+            roots.pin_root(arg);
+        }
         if name != "CharacterDataHandler" && self.handler_is_set(name) {
             self.flush_character_buffer()?;
         }
-        self.call_handler_raw(name, args)
+        let args: Vec<PyObjectRef> = (0..args.len()).map(|i| roots.get(base + i)).collect();
+        self.call_handler_raw(name, &args)
     }
 
     fn call_handler_raw(&self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
@@ -1048,6 +1141,13 @@ impl<'a> MiniXmlParser<'a> {
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
+        // A handler held on the class comes back as a freshly bound method that
+        // only this local names, and the base lookup below is a full `getattr`
+        // that can run Python.  Pin it for the window between the two; a method
+        // does not move, so the local is not read back.  `base` needs nothing:
+        // it is the parser's own attribute and stays reachable through it.
+        let roots = pyre_object::gc_roots::push_roots();
+        roots.pin_root(handler);
         let base = crate::baseobjspace::getattr_str(self.parser, "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let ret = crate::call::call_function_impl_result(
@@ -1087,6 +1187,12 @@ impl<'a> MiniXmlParser<'a> {
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
+        // A class-held handler is a freshly bound method named only by this
+        // local, and the base lookup that follows is a full `getattr`, so it
+        // takes one liveness pin.  `sysid` / `pubid` are the caller's, pinned
+        // there for the whole doctype.
+        let roots = pyre_object::gc_roots::push_roots();
+        roots.pin_root(handler);
         let base = crate::baseobjspace::getattr_str(self.parser, "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let ret = crate::call::call_function_impl_result(handler, &[w_none(), base, sysid, pubid])?;
@@ -1097,18 +1203,31 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn intern_string(&self, value: &str) -> PyObjectRef {
+        // Nothing holds the new string until the map takes it, and everything
+        // below can collect, so it gets one liveness pin at its mint; a `str`
+        // does not move, so the local stays current.
+        let value_roots = pyre_object::gc_roots::push_roots();
         let w_value = w_str_new(value);
+        value_roots.pin_root(w_value);
         let Ok(intern) = crate::baseobjspace::getattr_str(self.parser, "intern") else {
             return w_value;
         };
         if unsafe { is_none(intern) } {
             return w_value;
         }
+        // The intern map is a caller-supplied `dict`, whose header moves.  A
+        // borrowed-str probe compares against whatever a colliding bucket
+        // holds, so a stored non-string key can reach a user `__eq__`; that
+        // runs Python and can collect, leaving the local naming the pre-move
+        // address.  The map is read back out of its root slot for both uses.
+        let roots = pyre_object::gc_roots::push_roots();
+        let intern_slot = roots.base();
+        roots.pin_root(intern);
         unsafe {
-            if let Some(existing) = w_dict_getitem_str(intern, value) {
+            if let Some(existing) = w_dict_getitem_str(roots.get(intern_slot), value) {
                 existing
             } else {
-                w_dict_setitem_str(intern, value, w_value);
+                w_dict_setitem_str(roots.get(intern_slot), value, w_value);
                 w_value
             }
         }
@@ -1371,6 +1490,13 @@ fn parse_impl(
     data: PyObjectRef,
     isfinal: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `data` can be the fresh chunk a Python `read()` just returned, named
+    // only by this parameter, and the pending-input lookup below runs a full
+    // `getattr` before it is decoded.  One liveness pin; a `str`/`bytes` does
+    // not move, so the parameter stays current.  `parser` is the receiver and
+    // stays reachable through the caller.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(data);
     if crate::baseobjspace::getattr_str(parser, "_pyre_finished")
         .map(is_true_obj)
         .unwrap_or(false)
@@ -1453,6 +1579,11 @@ fn call_foreign_dtd_handler(
     if handler.is_null() || unsafe { is_none(handler) } {
         return Ok(());
     }
+    // A class-held handler is a freshly bound method named only by this local,
+    // and the base lookup that follows is a full `getattr`, so it takes one
+    // liveness pin.
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(handler);
     let base = crate::baseobjspace::getattr_str(parser, "_pyre_base").unwrap_or_else(|_| w_none());
     let ret = crate::call::call_function_impl_result(handler, &[w_none(), base, sysid, pubid])?;
     if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
@@ -1491,6 +1622,13 @@ fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyE
     if let Some(cls) = crate::builtins::lookup_exc_class("pyexpat.error") {
         let args = [cls, w_str_new(&msg)];
         if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+            // The fresh exception is named only by this local while the three
+            // stores below build their values and grow its attribute storage.
+            // One liveness pin at the mint; an exception instance does not move,
+            // so the local stays current.  `cls` is the registered class and
+            // stays reachable through the registry.
+            let roots = pyre_object::gc_roots::push_roots();
+            roots.pin_root(exc);
             crate::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
             crate::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
             crate::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
@@ -1547,7 +1685,13 @@ mod xmlparser_class {
                 self_obj: PyObjectRef,
                 file: PyObjectRef,
             ) -> Result<PyObjectRef, crate::PyError> {
+                // `read` comes back as a freshly bound method that only this
+                // local names, and it is reused after every chunk is parsed —
+                // arbitrary Python runs in between.  One liveness pin; a method
+                // does not move, so the local stays current.
+                let roots = pyre_object::gc_roots::push_roots();
                 let read = crate::baseobjspace::getattr_str(file, "read")?;
+                roots.pin_root(read);
                 let mut result = w_int_new(1);
                 loop {
                     let data = crate::call::call_function_impl_result(read, &[w_int_new(2048)])?;
@@ -1648,7 +1792,13 @@ mod xmlparser_class {
                 context: PyObjectRef,
                 #[default(w_none())] encoding: PyObjectRef,
             ) -> PyObjectRef {
+                // The fresh sub-parser is named only by this local while its
+                // default slots are installed and the parent's configuration is
+                // copied over, both of which allocate and read attributes; it
+                // takes one liveness pin, and an instance does not move.
+                let roots = pyre_object::gc_roots::push_roots();
                 let parser = w_instance_new(xmlparser_class::type_object());
+                roots.pin_root(parser);
                 init_parser_slots(parser);
                 copy_parser_config(self_obj, parser);
                 crate::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(true));
@@ -1758,7 +1908,18 @@ fn parser_create3(
     namespace_separator: PyObjectRef,
     intern: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `intern` is whatever the caller passed, so it can be a `dict`, whose
+    // header moves; the instance and its slot defaults below allocate all the
+    // way down.  Pin it on entry and read it back for the store, or the parser
+    // would keep a pre-move address.  The absent marker is a null word, which a
+    // walker treats as no root.  The fresh parser is named only by its local
+    // across the same run — every default slot it is given allocates — so it
+    // takes one liveness pin; an instance does not move and is not read back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let intern_slot = roots.base();
+    roots.pin_root(intern);
     let parser = w_instance_new(xmlparser_class::type_object());
+    roots.pin_root(parser);
     init_parser_slots(parser);
     if unsafe { !is_none(encoding) } {
         if unsafe { !is_str(encoding) } {
@@ -1800,6 +1961,7 @@ fn parser_create3(
     // `init_parser_slots` installed that new dictionary already, so an omitted
     // argument has nothing to write and the two named cases write themselves;
     // `intern_string` reads `None` back as "do not intern".
+    let intern = roots.get(intern_slot);
     if !intern.is_null() {
         crate::baseobjspace::setdictvalue_native(parser, "intern", intern);
     }
@@ -1931,7 +2093,14 @@ const ERROR_NAMES: &[&str] = &[
 fn make_namespace(name: &'static str) -> PyObjectRef {
     let tp = crate::typedef::make_builtin_type(name, |_| {});
     unsafe { typeobject::w_type_set_hasdict(tp, true) };
+    // The fresh instance is named only by this local while the name store below
+    // builds its string and installs the instance's attribute storage, so it
+    // takes one liveness pin; an instance does not move, so the local stays
+    // current.  `tp` is pinned by `w_instance_new` for its own allocation and is
+    // held by the instance afterwards.
+    let roots = pyre_object::gc_roots::push_roots();
     let obj = w_instance_new(tp);
+    roots.pin_root(obj);
     crate::baseobjspace::setdictvalue_native(obj, "__name__", w_str_new(name));
     obj
 }
@@ -1973,7 +2142,13 @@ crate::py_module! {
         }
 
         // model — content-model integer constants.
+        // Each submodule object is a fresh instance named only by its local
+        // while the constants below are built and written into it, and every
+        // one of those stores allocates.  Each takes one liveness pin at its
+        // mint; an instance does not move, so the locals stay current.
+        let ns_roots = pyre_object::gc_roots::push_roots();
         let model = make_namespace("pyexpat.model");
+        ns_roots.pin_root(model);
         for (name, value) in MODEL_CONSTANTS {
             crate::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
         }
@@ -1982,8 +2157,19 @@ crate::py_module! {
         // errors — XML_ERROR_* message strings plus the `codes`
         // (message -> code) and `messages` (code -> message) maps.
         let errors = make_namespace("pyexpat.errors");
-        let codes = w_dict_new();
-        let messages = w_dict_new();
+        ns_roots.pin_root(errors);
+        // Both maps are dicts, whose headers move, and every iteration of the
+        // loop allocates: the message string, the code objects, the key strings
+        // the stores build, and each dict's own storage as it grows.  They are
+        // pinned on creation and read back out of their root slots at each use.
+        // The values are built into locals first — call arguments evaluate left
+        // to right, so reading a slot inline would take the address before the
+        // value allocates.
+        let error_map_roots = pyre_object::gc_roots::push_roots();
+        let codes_slot = error_map_roots.base();
+        error_map_roots.pin_root(w_dict_new());
+        let messages_slot = codes_slot + 1;
+        error_map_roots.pin_root(w_dict_new());
         for (idx, name) in ERROR_NAMES.iter().enumerate() {
             // ERROR_NAMES[0] is XML_ERROR_NONE (no message); codes start at 1.
             if idx == 0 {
@@ -1992,12 +2178,16 @@ crate::py_module! {
             let (msg, code) = ERROR_TABLE[idx - 1];
             let w_msg = w_str_new(msg);
             crate::baseobjspace::setdictvalue_native(errors, name, w_msg);
-            unsafe {
-                w_dict_setitem_str(codes, msg, w_int_new(code));
-                w_dict_store(messages, w_int_new(code), w_msg);
-            }
+            let w_code = w_int_new(code);
+            let codes = error_map_roots.get(codes_slot);
+            unsafe { w_dict_setitem_str(codes, msg, w_code) };
+            let w_key = w_int_new(code);
+            let messages = error_map_roots.get(messages_slot);
+            unsafe { w_dict_store(messages, w_key, w_msg) };
         }
+        let codes = error_map_roots.get(codes_slot);
         crate::baseobjspace::setdictvalue_native(errors, "codes", codes);
+        let messages = error_map_roots.get(messages_slot);
         crate::baseobjspace::setdictvalue_native(errors, "messages", messages);
         crate::module_ns_store(ns, "errors", errors);
 

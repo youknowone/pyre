@@ -12,16 +12,28 @@ crate::py_module! {
         // `interp_errno.py` builds `errorcode = {code: name, ...}`
         // alongside each exported constant.  We populate it incrementally
         // as we register the constants below.
-        let errorcode = pyre_object::w_dict_new();
-        crate::module_ns_store(ns, "errorcode", errorcode);
+        //
+        // A `dict` header moves, and every registration allocates: the
+        // constant's `int`, the name `str`, the key string each namespace
+        // store builds, and the dict's own storage as it grows.  A minor
+        // collection anywhere in that run relocates the dict — being reachable
+        // from the module namespace keeps it alive but does not hold it still
+        // — so the word lives in a root slot and is read back for every
+        // insertion.  `ns` is a module dict, which is allocated stable, so it
+        // stays valid across the same run.
+        let roots = pyre_object::gc_roots::push_roots();
+        let errorcode_slot = roots.base();
+        roots.pin_root(pyre_object::w_dict_new());
+        crate::module_ns_store(ns, "errorcode", roots.get(errorcode_slot));
         let mut store = |name: &str, value: i64| {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(value));
+            // Call arguments evaluate left to right, so the key and the value
+            // are built first: reading the dict slot inline with them would
+            // read it before those allocations and hand over a pre-move word.
+            let w_code = pyre_object::w_int_new(value);
+            let w_name = pyre_object::w_str_new(name);
             unsafe {
-                pyre_object::w_dict_store(
-                    errorcode,
-                    pyre_object::w_int_new(value),
-                    pyre_object::w_str_new(name),
-                );
+                pyre_object::w_dict_store(roots.get(errorcode_slot), w_code, w_name);
             }
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]

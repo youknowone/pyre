@@ -347,6 +347,11 @@ pub(super) fn simple_from_param(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
         new_simplecdata_obj(cls, &tc, Some(value))?
     };
+    // A converted temporary is reachable only from here, and both the address
+    // lookup and the carrier allocate — the address is into its buffer, so the
+    // instance has to outlive them.  It does not move, so one pin is enough.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(converted);
     let addr = cdata_addr(converted)
         .ok_or_else(|| crate::PyError::type_error("ctypes instance has no buffer"))?;
     Ok(super::interp_ctypes::make_carg(addr, converted))
@@ -375,9 +380,19 @@ pub(super) fn new_simplecdata_obj(
 ) -> Result<PyObjectRef, crate::PyError> {
     let size = host_ctypes::simple_type_size(tc).ok_or_else(invalid_type_code_error)?;
     let obj = new_cdata_obj_from_bytes(cls, size, &[])?;
+    // The new instance is reachable only from this frame while `encode_value_into`
+    // runs, and that call can run Python.  It does not move, so it is pinned once
+    // and never re-read; the bytearray rides along through the instance dict.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(obj);
     let ba = cdata_buffer(obj).expect("new cdata object has a backing buffer");
     // Encode after the instance exists so a `char*` keepalive can attach to it.
     if let Some(v) = value {
+        // `v` is an arbitrary object, so under `"O"` it can be a `list` or a
+        // `dict`, both of which move: pin it before the encode and read the slot
+        // back where it is stored.
+        let v_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(v);
         let mut bytes = encode_value_into(tc, v, obj, "0")?;
         if unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
             bytes.reverse();
@@ -388,6 +403,7 @@ pub(super) fn new_simplecdata_obj(
         }
         if matches!(tc, "z" | "Z" | "O") {
             let d = crate::baseobjspace::getdict_native(obj);
+            let v = pyre_object::gc_roots::shadow_stack_get(v_slot);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, v) };
         }
     }
@@ -399,8 +415,15 @@ pub(super) fn new_cdata_obj_from_bytes(
     size: usize,
     bytes: &[u8],
 ) -> Result<PyObjectRef, crate::PyError> {
+    // Until the store below links them, the bytearray and the instance are
+    // reachable only from this frame, and `w_instance_new`, `getdict_native`
+    // and the store each allocate.  Neither kind moves, so one pin apiece keeps
+    // them live and no word has to be re-read.
     let ba = pyre_object::w_bytearray_new(size);
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(ba);
     let obj = pyre_object::w_instance_new(cls);
+    pyre_object::gc_roots::pin_root(obj);
     let d = crate::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return Err(crate::PyError::type_error(
@@ -454,6 +477,12 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = args[2];
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let tc = type_code_of(cls).ok_or_else(|| crate::PyError::type_error("abstract class"))?;
+    // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
+    // `dict`, both of which move, and `encode_value_into` can run Python: pin it
+    // and read the slot back where it is stored.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value);
     let mut bytes = encode_value_into(&tc, value, obj, "0")?;
     if unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
         bytes.reverse();
@@ -461,6 +490,7 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     cdata_write(obj, 0, &bytes);
     if matches!(tc.as_str(), "z" | "Z" | "O") {
         let d = crate::baseobjspace::getdict_native(obj);
+        let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
         unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, value) };
     }
     Ok(pyre_object::w_none())
@@ -811,28 +841,53 @@ pub(super) fn make_subview(
     field_offset: usize,
     size: usize,
 ) -> PyObjectRef {
+    // The fresh instance is reachable only from this frame, so it is pinned for
+    // its lifetime; it does not move, so its word is never re-read.  An instance
+    // dictionary does move, and every store below allocates, so that is pinned
+    // and read back at each store.  Each value is built into a local first: call
+    // arguments evaluate left to right, so an inline allocating value would
+    // consume a pre-move dictionary word.
+    let _roots = pyre_object::gc_roots::push_roots();
     let inst = pyre_object::w_instance_new(proto);
+    pyre_object::gc_roots::pin_root(inst);
     let d = crate::baseobjspace::getdict_native(inst);
     if d.is_null() {
         return inst;
     }
+    pyre_object::gc_roots::pin_root(d);
+    let d_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
         if let Some(ba) = cdata_buffer(parent) {
-            pyre_object::w_dict_setitem_str(d, CDATA_BUFFER_KEY, ba);
             pyre_object::w_dict_setitem_str(
-                d,
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
+                CDATA_BUFFER_KEY,
+                ba,
+            );
+            let w_offset = pyre_object::w_int_new((boff(parent) + field_offset) as i64);
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
                 BOFF_KEY,
-                pyre_object::w_int_new((boff(parent) + field_offset) as i64),
+                w_offset,
             );
         } else if let Some(addr) = baddr(parent) {
+            let w_address = pyre_object::w_int_new((addr + field_offset) as i64);
             pyre_object::w_dict_setitem_str(
-                d,
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
                 BADDR_KEY,
-                pyre_object::w_int_new((addr + field_offset) as i64),
+                w_address,
             );
         }
-        pyre_object::w_dict_setitem_str(d, BSZ_KEY, pyre_object::w_int_new(size as i64));
-        pyre_object::w_dict_setitem_str(d, BBASE_KEY, parent);
+        let w_size = pyre_object::w_int_new(size as i64);
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(d_slot),
+            BSZ_KEY,
+            w_size,
+        );
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(d_slot),
+            BBASE_KEY,
+            parent,
+        );
     }
     inst
 }
@@ -845,10 +900,21 @@ pub(super) fn make_indexed_subview(
     index: usize,
 ) -> PyObjectRef {
     let view = make_subview(proto, parent, field_offset, size);
+    // `make_subview` dropped its own root bracket on the way out, so the view is
+    // reachable only from this frame again across the lookup and the store.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(view);
     let d = crate::baseobjspace::getdict_native(view);
     if !d.is_null() {
+        pyre_object::gc_roots::pin_root(d);
+        let d_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_index = pyre_object::w_int_new(index as i64);
         unsafe {
-            pyre_object::w_dict_setitem_str(d, BINDEX_KEY, pyre_object::w_int_new(index as i64));
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
+                BINDEX_KEY,
+                w_index,
+            );
         }
     }
     view
@@ -864,14 +930,34 @@ pub(super) fn make_at_address(
     size: usize,
     base: PyObjectRef,
 ) -> PyObjectRef {
+    // The fresh instance is reachable only from this frame across the lookup and
+    // the stores below; it does not move, so one pin covers it.
+    let _roots = pyre_object::gc_roots::push_roots();
     let inst = pyre_object::w_instance_new(proto);
+    pyre_object::gc_roots::pin_root(inst);
     let d = crate::baseobjspace::getdict_native(inst);
     if !d.is_null() {
+        pyre_object::gc_roots::pin_root(d);
+        let d_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         unsafe {
-            pyre_object::w_dict_setitem_str(d, BADDR_KEY, pyre_object::w_int_new(address as i64));
-            pyre_object::w_dict_setitem_str(d, BSZ_KEY, pyre_object::w_int_new(size as i64));
+            let w_address = pyre_object::w_int_new(address as i64);
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
+                BADDR_KEY,
+                w_address,
+            );
+            let w_size = pyre_object::w_int_new(size as i64);
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(d_slot),
+                BSZ_KEY,
+                w_size,
+            );
             if !base.is_null() && !pyre_object::is_none(base) {
-                pyre_object::w_dict_setitem_str(d, BBASE_KEY, base);
+                pyre_object::w_dict_setitem_str(
+                    pyre_object::gc_roots::shadow_stack_get(d_slot),
+                    BBASE_KEY,
+                    base,
+                );
             }
         }
     }
@@ -912,28 +998,29 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     }
     root = pyre_object::gc_roots::shadow_stack_get(root_slot);
     let mut d = crate::baseobjspace::getdict_native(root);
-    let objs = match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
-        Some(o) if !o.is_null() && unsafe { pyre_object::is_dict(o) } => o,
+    // An existing keepalive dictionary is reused; any other holder is replaced,
+    // and a `bytes` one drops its keepalive count on the way out.
+    let existing = match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
+        Some(o) if !o.is_null() && unsafe { pyre_object::is_dict(o) } => Some(o),
         Some(previous) if !previous.is_null() && !unsafe { pyre_object::is_none(previous) } => {
             if unsafe { pyre_object::is_bytes(previous) } {
                 unsafe { pyre_object::bytesobject::w_bytes_dec_ctypes_keepalive_refs(previous) };
             }
-            let nd = pyre_object::w_dict_new();
-            root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-            d = crate::baseobjspace::getdict_native(root);
-            unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, nd) };
-            nd
+            None
         }
-        _ => {
-            let nd = pyre_object::w_dict_new();
-            root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-            d = crate::baseobjspace::getdict_native(root);
-            unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, nd) };
-            nd
-        }
+        _ => None,
     };
-    pyre_object::gc_roots::pin_root(objs);
-    let objs_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let objs_slot = pyre_object::gc_roots::shadow_stack_len();
+    match existing {
+        Some(objs) => pyre_object::gc_roots::pin_root(objs),
+        None => {
+            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+            root = pyre_object::gc_roots::shadow_stack_get(root_slot);
+            d = crate::baseobjspace::getdict_native(root);
+            let nd = pyre_object::gc_roots::shadow_stack_get(objs_slot);
+            unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, nd) };
+        }
+    }
     let objs = pyre_object::gc_roots::shadow_stack_get(objs_slot);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     unsafe {
@@ -945,6 +1032,8 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
         if pyre_object::is_bytes(obj) {
             pyre_object::bytesobject::w_bytes_inc_ctypes_keepalive_refs(obj);
         }
+        let objs = pyre_object::gc_roots::shadow_stack_get(objs_slot);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         pyre_object::w_dict_setitem_str(objs, &composite_key, obj)
     };
 }
@@ -958,16 +1047,18 @@ pub(super) fn objects_for_keep(value: PyObjectRef) -> PyObjectRef {
     let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut d = crate::baseobjspace::getdict_native(value);
     if d.is_null() {
-        return value;
+        return pyre_object::gc_roots::shadow_stack_get(value_slot);
     }
     match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
         Some(objects) if !objects.is_null() && !unsafe { pyre_object::is_none(objects) } => objects,
         _ => {
-            let objects = pyre_object::w_dict_new();
+            let objects_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
             let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
             d = crate::baseobjspace::getdict_native(value);
+            let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
             unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, objects) };
-            objects
+            pyre_object::gc_roots::shadow_stack_get(objects_slot)
         }
     }
 }
@@ -1000,9 +1091,12 @@ fn keep_alive(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
         }
     }
     root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let d = crate::baseobjspace::getdict_native(root);
     if !d.is_null() {
+        // Read the holder back only after the dictionary lookup: that lookup can
+        // materialise the dict view and collect, which would leave an earlier
+        // read holding a pre-move word.
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         unsafe { pyre_object::w_dict_setitem_str(d, &format!("_keep_{key}"), obj) };
     }
 }
@@ -1048,25 +1142,32 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
             && !unsafe { pyre_object::is_none(objects) }
             && !unsafe { pyre_object::is_dict(objects) }
     }) {
+        // A non-dict holder is whatever was stored under `_objects_`, so it can
+        // be a `list` that moves; the lookup that follows can collect, so it is
+        // pinned here and read back at the store.
+        let holder_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(objects);
         let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
         let result_dict = crate::baseobjspace::getdict_native(result);
         if !result_dict.is_null() {
+            let objects = pyre_object::gc_roots::shadow_stack_get(holder_slot);
             unsafe { pyre_object::w_dict_setitem_str(result_dict, OBJECTS_KEY, objects) };
         }
         return;
     }
-    let objects = match existing {
-        Some(objects) if !objects.is_null() && unsafe { pyre_object::is_dict(objects) } => objects,
+    let objects_slot = pyre_object::gc_roots::shadow_stack_len();
+    match existing {
+        Some(objects) if !objects.is_null() && unsafe { pyre_object::is_dict(objects) } => {
+            pyre_object::gc_roots::pin_root(objects)
+        }
         _ => {
-            let objects = pyre_object::w_dict_new();
+            pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
             root = pyre_object::gc_roots::shadow_stack_get(root_slot);
             source_dict = crate::baseobjspace::getdict_native(root);
+            let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
             unsafe { pyre_object::w_dict_setitem_str(source_dict, OBJECTS_KEY, objects) };
-            objects
         }
-    };
-    pyre_object::gc_roots::pin_root(objects);
-    let objects_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    }
     let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     let identity_key = pyre_object::w_int_new(source as usize as i64);
     pyre_object::gc_roots::pin_root(identity_key);
@@ -1076,9 +1177,9 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
     let identity_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
     unsafe { pyre_object::w_dict_store(objects, identity_key, source) };
     let result = pyre_object::gc_roots::shadow_stack_get(result_slot);
-    let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
     let result_dict = crate::baseobjspace::getdict_native(result);
     if !result_dict.is_null() {
+        let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
         unsafe { pyre_object::w_dict_setitem_str(result_dict, OBJECTS_KEY, objects) };
     }
 }
@@ -1228,7 +1329,12 @@ pub(super) fn encode_value_into(
         let copy =
             pyre_object::bytesobject::w_bytes_from_bytes(&host_ctypes::null_terminated_bytes(raw));
         // Retain the copy before reading its address, so a GC triggered while
-        // inserting the keepalive cannot leave the stored pointer stale.
+        // inserting the keepalive cannot leave the stored pointer stale.  Until
+        // `keep_alive` links it into the root, only this frame holds the copy and
+        // `keep_ref` allocates, so pin it for that window; it does not move, so
+        // the word is never re-read.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(copy);
         keep_ref(dest, key, value);
         keep_alive(dest, key, copy);
         let addr = unsafe { pyre_object::bytesobject::w_bytes_data(copy).as_ptr() } as usize;
@@ -1242,6 +1348,8 @@ pub(super) fn encode_value_into(
         let raw = unsafe { pyre_object::w_str_get_wtf8(value) };
         let copy =
             pyre_object::w_bytearray_from_bytes(&host_ctypes::wchar_null_terminated_bytes(raw));
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(copy);
         keep_ref(dest, key, value);
         keep_alive(dest, key, copy);
         let addr =

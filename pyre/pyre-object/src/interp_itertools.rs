@@ -1119,17 +1119,21 @@ pub struct W_Cycle {
 /// `w_iterable` must already be an iterator (`cycle`'s registrar applies
 /// `space.iter`).  Allocates an empty `saved` list.
 pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
-    let _roots = crate::gc_roots::push_roots();
-    crate::gc_roots::pin_root(w_iterable);
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).  Minting
+    // `saved` allocates, and a self-iterating `list` subclass reaches here as
+    // a movable header, so `w_iterable` is read back out of its root slot
+    // rather than from the parameter copy that collection left pre-move.
+    let roots = crate::gc_roots::push_roots();
+    let iterable_slot = roots.base();
+    roots.pin_root(w_iterable);
     let saved = crate::listobject::w_list_new(Vec::new());
-    crate::gc_roots::pin_root(saved);
+    roots.pin_root(saved);
     W_Cycle::allocate_stable(W_Cycle {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        w_iterable,
+        w_iterable: roots.get(iterable_slot),
         saved,
         index: 0,
     })

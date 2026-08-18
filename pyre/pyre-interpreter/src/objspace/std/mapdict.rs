@@ -3550,10 +3550,28 @@ unsafe fn maybe_migrate_to_boxed<O: MapdictObject>(
 /// # Safety
 /// `attr_node` must point to a live `PlainAttribute`; `obj` to a live carrier.
 unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut Object) {
-    let w_value = unsafe { plain_direct_read(attr_node, obj) };
+    // The carrier's storage is a plain `Vec` no collector updates, and the read
+    // below boxes an unboxed attribute. Publish the values already copied,
+    // copy them back once the read is done, and only then hand `add_attr` a
+    // storage it is free to re-lay-out.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let storage_slot = pyre_object::gc_roots::pin_roots(&new_obj.storage);
+    let value_slot =
+        pyre_object::gc_roots::pin_roots(&[unsafe { plain_direct_read(attr_node, obj) }]);
+    for (i, slot) in new_obj.storage.iter_mut().enumerate() {
+        *slot = pyre_object::gc_roots::shadow_stack_get(storage_slot + i);
+    }
     let p = unsafe { (*attr_node).as_plain() };
     let map = new_obj._get_mapdict_map();
-    unsafe { add_attr(map, new_obj, &p.name, p.attrkind, w_value) };
+    unsafe {
+        add_attr(
+            map,
+            new_obj,
+            &p.name,
+            p.attrkind,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        )
+    };
 }
 
 /// mapdict.py:326-330 `Terminator.copy` / 472-475 `PlainAttribute.copy` — build
@@ -3653,10 +3671,21 @@ unsafe fn node_delete<O: MapdictObject>(
             // — mapdict.py:403-407 swallows KeyError), then return an empty
             // carrier on this terminator (`Terminator.copy(self, obj)`).
             TerminatorKind::Devolved if attrkind == DICT => {
+                // The backing dict moves and the key is allocated after it has
+                // been resolved, so it is published and read back at the delete.
+                let _roots = pyre_object::gc_roots::push_roots();
                 let w_dict = obj.getdict();
-                let backing = crate::type_methods::resolve_dict_backing(w_dict);
+                let backing_slot =
+                    pyre_object::gc_roots::pin_roots(&[crate::type_methods::resolve_dict_backing(
+                        w_dict,
+                    )]);
                 let w_key = pyre_object::w_str_from_wtf8(name.to_owned());
-                unsafe { pyre_object::w_dict_delitem(backing, w_key) };
+                unsafe {
+                    pyre_object::w_dict_delitem(
+                        pyre_object::gc_roots::shadow_stack_get(backing_slot),
+                        w_key,
+                    )
+                };
                 Some(unsafe { node_copy(self_node, obj) })
             }
             _ => None,
@@ -3714,16 +3743,43 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
 ) -> Object {
     if unsafe { (*self_node).is_plain() } {
         let p = unsafe { (*self_node).as_plain() };
+        // The dict moves and both steps before this node's store allocate: the
+        // recursion fills in every node closer to the terminator, and boxing
+        // this node's name runs once its value has already been read. Publish
+        // the dict and the value and read both back at the store.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
         // mapdict.py:494/503 — recurse into `back` first.
-        let mut new_obj = unsafe { node_materialize_dict(p.back, obj, w_dict) };
+        let mut new_obj = unsafe {
+            node_materialize_dict(
+                p.back,
+                obj,
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            )
+        };
         if p.attrkind == DICT {
             // mapdict.py:495-497/504-506 — move the DICT attribute into the
             // materialised dict (`dict_w[space.newtext(name)] =
             // self._prim_direct_read(obj)`). `plain_direct_read` performs that
             // prim read, boxing the slot when the attribute is unboxed.
-            let w_value = unsafe { plain_direct_read(self_node, obj) };
+            //
+            // The carrier the recursion returned holds every lower node's value
+            // in a plain `Vec` the collector does not update, and nothing
+            // touches it here, so the run copies back index for index.
+            let storage_slot = pyre_object::gc_roots::pin_roots(&new_obj.storage);
+            let value_slot =
+                pyre_object::gc_roots::pin_roots(&[unsafe { plain_direct_read(self_node, obj) }]);
             let w_attr = pyre_object::unicodeobject::box_str_constant(&p.name);
-            unsafe { pyre_object::w_dict_store(w_dict, w_attr, w_value) };
+            unsafe {
+                pyre_object::w_dict_store(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    w_attr,
+                    pyre_object::gc_roots::shadow_stack_get(value_slot),
+                )
+            };
+            for (i, slot) in new_obj.storage.iter_mut().enumerate() {
+                *slot = pyre_object::gc_roots::shadow_stack_get(storage_slot + i);
+            }
         } else {
             // mapdict.py:499/508 — keep the non-DICT attribute on the carrier.
             unsafe { copy_attr(self_node, obj, &mut new_obj) };
@@ -4407,10 +4463,20 @@ unsafe fn write_terminator<O: MapdictObject>(
         TerminatorKind::Devolved if attrkind == DICT => {
             // mapdict.py:390-396: the devolved terminator writes DICT attributes
             // into the materialised instance dict (`space.setitem_str(
-            // obj.getdict(space), name, w_value)`).
+            // obj.getdict(space), name, w_value)`).  `getdict` builds the
+            // wrapper when the SPECIAL slot is still empty, so the incoming
+            // value is published across it and read back at the store.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let value_slot = pyre_object::gc_roots::pin_roots(&[w_value]);
             let w_dict = obj.getdict();
             let backing = crate::type_methods::resolve_dict_backing(w_dict);
-            unsafe { pyre_object::w_dict_setitem_wtf8(backing, name, w_value) };
+            unsafe {
+                pyre_object::w_dict_setitem_wtf8(
+                    backing,
+                    name,
+                    pyre_object::gc_roots::shadow_stack_get(value_slot),
+                )
+            };
             return true;
         }
         _ => {}
@@ -4634,12 +4700,21 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
+    // The read boxes an unboxed slot, so each allocation stales the values
+    // already collected; pin them as they are read and copy the run back.
+    let roots = pyre_object::gc_roots::push_roots();
+    let values_base = roots.base();
     let mut vals: Vec<PyObjectRef> = Vec::new();
     let mut i: usize = 0;
     while i < nodes.len() {
         let node = nodes[i];
-        vals.push(plain_direct_read(node, &inst));
+        let w_value = plain_direct_read(node, &inst);
+        roots.pin_root(w_value);
+        vals.push(w_value);
         i += 1;
+    }
+    for (i, slot) in vals.iter_mut().enumerate() {
+        *slot = roots.get(values_base + i);
     }
     vals
 }
@@ -4658,6 +4733,12 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
+    // Every iteration allocates — `box_str_constant` on an intern miss, the
+    // read on an unboxed slot — so a value collected earlier goes stale while
+    // the walk is still running. Pin each value at its read and copy the run
+    // back once the walk is over; the names are immortal interned constants.
+    let roots = pyre_object::gc_roots::push_roots();
+    let values_base = roots.base();
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();
     let mut i: usize = 0;
     while i < nodes.len() {
@@ -4665,8 +4746,12 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
         let name = &(*node).as_plain().name;
         let w_key = pyre_object::unicodeobject::box_str_constant(name);
         let w_value = plain_direct_read(node, &inst);
+        roots.pin_root(w_value);
         out.push((w_key, w_value));
         i += 1;
+    }
+    for (i, entry) in out.iter_mut().enumerate() {
+        entry.1 = roots.get(values_base + i);
     }
     out
 }
@@ -4700,15 +4785,27 @@ unsafe fn mapdict_strategy_unerase(w_dict: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     use pyre_object::dictmultiobject::DictStrategy;
+    // A `dict` moves and `get_empty_storage` allocates, so the wrapper is
+    // published before the new storage is built: a `&mut` taken beforehand
+    // would write both fields to the pre-move address. The instance does not
+    // move, but overwriting `dstorage` severs the dict's only edge to it, so it
+    // is published for liveness across the materialisation that follows.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
     // w_obj = self.unerase(w_dict.dstorage) — the backing instance.
-    let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
+    let w_obj =
+        unsafe { mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
+    pyre_object::gc_roots::pin_root(w_obj);
     // dict_w = strategy.unerase(strategy.get_empty_storage()); set_strategy(Object);
     // w_dict.dstorage = strategy.erase(dict_w).
-    let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
+    let dstorage = pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.get_empty_storage();
+    let dict = unsafe {
+        &mut *(pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut pyre_object::W_DictObject)
+    };
+    dict.dstorage = dstorage;
     dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
     // materialize_r_dict(space, w_obj, dict_w).
-    unsafe { materialize_dict(w_obj, w_dict) };
+    unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }
 
 /// `MapDictStrategy.switch_to_text_strategy` (mapdict.py:1148-1155) — the
@@ -4721,12 +4818,19 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
 #[majit_macros::dont_look_inside]
 pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     use pyre_object::dictmultiobject::DictStrategy;
-    let w_obj = unsafe { mapdict_strategy_unerase(w_dict) };
-    let dict = unsafe { &mut *(w_dict as *mut pyre_object::W_DictObject) };
-    dict.dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
+    let w_obj =
+        unsafe { mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
+    pyre_object::gc_roots::pin_root(w_obj);
+    let dstorage = pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+    let dict = unsafe {
+        &mut *(pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut pyre_object::W_DictObject)
+    };
+    dict.dstorage = dstorage;
     dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
     // materialize_str_dict(space, w_obj, str_dict).
-    unsafe { materialize_dict(w_obj, w_dict) };
+    unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }
 
 /// mapdict.py:1123-1279 `MapDictStrategy` — the dict strategy a user instance's
@@ -4803,8 +4907,17 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         if pyre_object::_never_equal_to_string(w_key) {
             return None;
         }
-        self.switch_to_object_strategy(w_dict);
-        pyre_object::w_dict_lookup(w_dict, w_key)
+        // A `dict` moves, and the switch allocates the object storage and
+        // materialises every attribute into it, so the receiver and the key are
+        // published across it and read back at the lookup.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_key]);
+        let key_slot = dict_slot + 1;
+        self.switch_to_object_strategy(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        pyre_object::w_dict_lookup(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        )
     }
 
     /// mapdict.py:1168-1170 `getitem_str` — `w_obj.getdictvalue(space, key)`.
@@ -4829,8 +4942,16 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         }
         // Non-string key: it cannot be a mapdict node, so degrade to the
         // object strategy before storing.
-        self.switch_to_object_strategy(w_dict);
-        pyre_object::w_dict_store(w_dict, w_key, w_value);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_key, w_value]);
+        let key_slot = dict_slot + 1;
+        let value_slot = dict_slot + 2;
+        self.switch_to_object_strategy(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        pyre_object::w_dict_store(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
     }
 
     /// mapdict.py:1172-1175 `setitem_str` — `flag = w_obj.setdictvalue(...);
@@ -4849,19 +4970,35 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         w_key: PyObjectRef,
         w_default: PyObjectRef,
     ) -> PyObjectRef {
+        // The string arm allocates as well: reading an unboxed attribute boxes
+        // it. `w_key`'s WTF-8 view stays valid across both arms because a `str`
+        // does not move.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_key, w_default]);
+        let key_slot = dict_slot + 1;
+        let default_slot = dict_slot + 2;
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             let key = pyre_object::w_str_get_wtf8(w_key);
-            if let Some(w_result) =
-                instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), key)
-            {
+            if let Some(w_result) = instance_node_getdictvalue(
+                mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)),
+                key,
+            ) {
                 return w_result;
             }
-            instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), key, w_default);
-            return w_default;
+            instance_node_setdictvalue(
+                mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot)),
+                key,
+                pyre_object::gc_roots::shadow_stack_get(default_slot),
+            );
+            return pyre_object::gc_roots::shadow_stack_get(default_slot);
         }
-        self.switch_to_object_strategy(w_dict);
-        pyre_object::dictmultiobject::w_dict_setdefault_checked(w_dict, w_key, w_default)
-            .unwrap_or(w_default)
+        self.switch_to_object_strategy(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        pyre_object::dictmultiobject::w_dict_setdefault_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(default_slot),
+        )
+        .unwrap_or_else(|_| pyre_object::gc_roots::shadow_stack_get(default_slot))
     }
 
     /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
@@ -4878,8 +5015,14 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         if pyre_object::_never_equal_to_string(w_key) {
             return false;
         }
-        self.switch_to_object_strategy(w_dict);
-        pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.delitem(w_dict, w_key)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_key]);
+        let key_slot = dict_slot + 1;
+        self.switch_to_object_strategy(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+        pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY.delitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        )
     }
 
     /// mapdict.py:1213-1220 `length`.
@@ -4909,7 +5052,12 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 
     /// mapdict.py:1227-1235 `popitem`.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
-        let w_obj = mapdict_strategy_unerase(w_dict);
+        // The receiver is a `dict` and moves; it is published before the first
+        // allocation below rather than alongside the carrier further down,
+        // because a pin taken after a collection would freeze a pre-move word.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
+        let w_obj = mapdict_strategy_unerase(pyre_object::gc_roots::shadow_stack_get(dict_slot));
         let _instance_guard = instance_lock(w_obj);
         ensure_mapdict_initialized(w_obj);
         let inst = mapdict_carrier(w_obj);
@@ -4931,7 +5079,6 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         // a Rust local. Pin the carrier and the two results and read them back
         // from the shadow stack after every such call. `map`, `curr` and `key`
         // need no pin: map nodes are not GC-allocated.
-        let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[w_obj]);
         let key_slot =
             pyre_object::gc_roots::pin_roots(&[pyre_object::unicodeobject::box_str_constant(key)]);
@@ -4944,7 +5091,10 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         // the two the same way.
         let mut inst = mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         maybe_migrate_to_boxed(map, &mut inst, key, DICT);
-        self.delitem(w_dict, pyre_object::gc_roots::shadow_stack_get(key_slot));
+        self.delitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+        );
         Some((
             pyre_object::gc_roots::shadow_stack_get(key_slot),
             pyre_object::gc_roots::shadow_stack_get(value_slot),
@@ -4955,14 +5105,33 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         use pyre_object::dictmultiobject::DictStrategy;
 
-        let copy = pyre_object::w_dict_new_with(
+        // Both dicts move, and every step after the receiver arrives collects:
+        // the copy and its storage are allocated, materialising the items boxes
+        // each unboxed attribute, and a store hashes its key through `__hash__`.
+        // Publish the receiver and the copy and read each back at its use. The
+        // item values are published as one run before the first store, because
+        // a store that relocates one of them would leave every entry still to
+        // come naming a pre-move address; the names are interned constants,
+        // which do not move.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
+        let copy_slot = pyre_object::gc_roots::pin_roots(&[pyre_object::w_dict_new_with(
             &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
             pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage(),
-        );
-        for (w_key, w_value) in instance_node_dict_items(mapdict_strategy_unerase(w_dict)) {
-            pyre_object::w_dict_store(copy, w_key, w_value);
+        )]);
+        let items = instance_node_dict_items(mapdict_strategy_unerase(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ));
+        let values: Vec<PyObjectRef> = items.iter().map(|&(_, w_value)| w_value).collect();
+        let values_slot = pyre_object::gc_roots::pin_roots(&values);
+        for (i, &(w_key, _)) in items.iter().enumerate() {
+            pyre_object::w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(copy_slot),
+                w_key,
+                pyre_object::gc_roots::shadow_stack_get(values_slot + i),
+            );
         }
-        copy
+        pyre_object::gc_roots::shadow_stack_get(copy_slot)
     }
 
     /// mapdict.py:1268-1276 iterator order.

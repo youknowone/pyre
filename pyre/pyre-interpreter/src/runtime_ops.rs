@@ -729,8 +729,18 @@ pub fn store_slice_values(
     stop: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
+    // `w_slice_new` allocates and holds neither the receiver nor the stored
+    // value, so a `list` / `dict` in either relocates while the slice is built.
+    // The bounds it does hold are pinned by the constructor itself; the fresh
+    // slice reaches the heap only through `setitem`, so it takes one pin.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    let value_slot = obj_slot + 1;
+    roots.publish(&[obj, value]);
+    roots.normalize(obj_slot, 2);
     let slice = pyre_object::w_slice_new(start, stop, pyre_object::w_none());
-    crate::baseobjspace::setitem(obj, slice, value)?;
+    roots.pin_root(slice);
+    crate::baseobjspace::setitem(roots.get(obj_slot), slice, roots.get(value_slot))?;
     Ok(())
 }
 
@@ -746,6 +756,19 @@ pub fn binary_slice_values(
     stop: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
     unsafe {
+        // `eval_slice_index` may run a user `__index__`, and every arm below
+        // allocates: a `list` / `dict` operand relocates across either.  The
+        // three operands are published as one livevar set and read back at the
+        // consumers that follow a collection point; a `str` / `tuple` receiver
+        // is proven non-moving by its type test, so those arms keep the word.
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.base();
+        let (start_slot, stop_slot) = (obj_slot + 1, obj_slot + 2);
+        roots.publish(&[obj, start, stop]);
+        roots.normalize(obj_slot, 3);
+        let obj = roots.get(obj_slot);
+        let start = roots.get(start_slot);
+        let stop = roots.get(stop_slot);
         if pyre_object::is_list(obj) {
             let len = pyre_object::w_list_len(obj) as i64;
             let s = if pyre_object::is_none(start) {
@@ -753,6 +776,7 @@ pub fn binary_slice_values(
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
+            let stop = roots.get(stop_slot);
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
@@ -760,12 +784,20 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            let mut items = Vec::new();
+            // A fetch off an unboxed strategy boxes the element it returns, so
+            // the elements accumulate in root slots: a plain `Vec` is scanned by
+            // nothing while the next box is allocated.  The block is read back
+            // as one indexed run once no further allocation separates it from
+            // the constructor, which pins the whole item set itself.
+            let items_base = pyre_object::gc_roots::shadow_stack_len();
+            let mut fetched = 0usize;
             for i in s..e {
-                if let Some(v) = pyre_object::w_list_getitem(obj, i as i64) {
-                    items.push(v);
+                if let Some(v) = pyre_object::w_list_getitem(roots.get(obj_slot), i as i64) {
+                    roots.pin_root(v);
+                    fetched += 1;
                 }
             }
+            let items = (0..fetched).map(|i| roots.get(items_base + i)).collect();
             return Ok(pyre_object::w_list_new(items));
         }
         if pyre_object::is_str(obj) {
@@ -784,6 +816,7 @@ pub fn binary_slice_values(
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
+            let stop = roots.get(stop_slot);
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
@@ -806,6 +839,7 @@ pub fn binary_slice_values(
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
+            let stop = roots.get(stop_slot);
             let e = if pyre_object::is_none(stop) {
                 len
             } else {
@@ -813,18 +847,26 @@ pub fn binary_slice_values(
             };
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
-            let mut items = Vec::new();
+            // The arity-2 specialisations box their payload on fetch, the same
+            // allocating fetch the `list` arm accumulates in root slots.
+            let items_base = pyre_object::gc_roots::shadow_stack_len();
+            let mut fetched = 0usize;
             for i in s..e {
                 if let Some(v) = pyre_object::w_tuple_getitem(obj, i as i64) {
-                    items.push(v);
+                    roots.pin_root(v);
+                    fetched += 1;
                 }
             }
+            let items = (0..fetched).map(|i| roots.get(items_base + i)).collect();
             return Ok(pyre_object::w_tuple_new(items));
         }
         // Fall back to slice(start, stop) → getitem dispatch.
         // Handles bytes, bytearray, instances with __getitem__, etc.
         let slice_obj = pyre_object::sliceobject::w_slice_new(start, stop, pyre_object::w_none());
-        crate::baseobjspace::getitem(obj, slice_obj)
+        // The receiver is live across that allocation, and the fresh slice has
+        // no heap edge until `getitem` stores it.
+        roots.pin_root(slice_obj);
+        crate::baseobjspace::getitem(roots.get(obj_slot), slice_obj)
     }
 }
 
@@ -1304,7 +1346,22 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
             };
             return Err(PyError::value_error(msg));
         }
-        return (0..count).map(|idx| sequence_getitem(seq, idx)).collect();
+        // A fetch off an unboxed `list` strategy boxes the element, and a `str`
+        // fetch builds the one-character string, so every turn allocates: the
+        // receiver relocates and a plain accumulator is scanned by nothing.
+        // Publish both and rebuild the flat return from the slots, as the
+        // iterator loop below does.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(seq);
+        let seq = || pyre_object::gc_roots::shadow_stack_get(seq_slot);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        for idx in 0..count {
+            pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
+        }
+        return Ok((0..count)
+            .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
+            .collect());
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
     // baseobjspace.py:1031 _unpackiterable_known_length_jitlook.  pyopcode.py:872
@@ -1387,22 +1444,32 @@ pub fn unpack_ex_slots(
     after: usize,
     value: PyObjectRef,
 ) -> Result<Vec<PyObjectRef>, PyError> {
+    // `collect_iterable` runs the iterator's `__next__` on every turn and the
+    // starred middle `list` is allocated part-way through the split, so neither
+    // `value` nor the element words may stay in plain natives across them: a
+    // `list` / `dict` among them relocates and the native copy names the
+    // pre-move address.  Publish them and read every operand back out of the
+    // slots, as `unpack_sequence_exact` does for the same split.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(value);
+    let value = || pyre_object::gc_roots::shadow_stack_get(value_slot);
     let elements: Vec<PyObjectRef> = unsafe {
-        if is_tuple(value) {
-            pyre_object::w_tuple_items_copy_as_vec(value)
-        } else if is_list(value) {
-            pyre_object::w_list_items_copy_as_vec(value)
+        if is_tuple(value()) {
+            pyre_object::w_tuple_items_copy_as_vec(value())
+        } else if is_list(value()) {
+            pyre_object::w_list_items_copy_as_vec(value())
         } else {
             // pyopcode.py:884 UNPACK_EX wraps `fixedview` in a
             // TypeError → "cannot unpack non-iterable %T object" remap.
             // `collect_iterable` is the `fixedview` analog (iter + next
             // loop), so any TypeError it raises is remapped here.
-            match crate::builtins::collect_iterable(value) {
+            match crate::builtins::collect_iterable(value()) {
                 Ok(items) => items,
                 Err(e) if e.kind == PyErrorKind::TypeError => {
                     return Err(PyError::type_error(format!(
                         "cannot unpack non-iterable {} object",
-                        crate::baseobjspace::object_functionstr_type_name(value)
+                        crate::baseobjspace::object_functionstr_type_name(value())
                     )));
                 }
                 Err(e) => return Err(e),
@@ -1417,16 +1484,21 @@ pub fn unpack_ex_slots(
             elements.len()
         )));
     }
+    let elements_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &elements {
+        pyre_object::gc_roots::pin_root(item);
+    }
+    let element = |index: usize| pyre_object::gc_roots::shadow_stack_get(elements_base + index);
     let middle_len = elements.len() - min_expected;
+    let middle: Vec<PyObjectRef> = (before..before + middle_len).map(element).collect();
+    let middle_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(w_list_new(middle));
+    // Head and tail are read back only after the middle list exists, so the
+    // returned slots all carry post-move words.
     let mut slots = Vec::with_capacity(before + 1 + after);
-    for &item in elements.iter().take(before) {
-        slots.push(item);
-    }
-    let middle: Vec<PyObjectRef> = elements[before..before + middle_len].to_vec();
-    slots.push(w_list_new(middle));
-    for i in 0..after {
-        slots.push(elements[before + middle_len + i]);
-    }
+    slots.extend((0..before).map(element));
+    slots.push(pyre_object::gc_roots::shadow_stack_get(middle_slot));
+    slots.extend((before + middle_len..elements.len()).map(element));
     Ok(slots)
 }
 

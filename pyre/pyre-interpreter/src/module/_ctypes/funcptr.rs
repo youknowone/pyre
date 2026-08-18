@@ -323,6 +323,13 @@ fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::
     if d.is_null() {
         return Err(crate::PyError::type_error("pointer instance has no dict"));
     }
+    // The instance dict moves, and the bytearray allocated below is a
+    // collection point, so the dict word is read back out of a root slot at the
+    // store.  The null check stays ahead of the bracket, leaving the error path
+    // rootless.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(d);
     let psize = host_ctypes::pointer_size();
     let ba = pyre_object::w_bytearray_new(psize);
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
@@ -333,7 +340,11 @@ fn wrap_pointer_result(rt: PyObjectRef, p: usize) -> Result<PyObjectRef, crate::
     let n = bytes.len().min(psize);
     unsafe {
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
-        pyre_object::w_dict_setitem_str(d, "_b_", ba);
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            "_b_",
+            ba,
+        );
     }
     Ok(obj)
 }

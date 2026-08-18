@@ -2799,11 +2799,18 @@ impl IterOpcodeHandler for PyFrame {
         unsafe {
             // mappingproxy iterates over its backing dict's keys.
             // dictproxyobject.py:41 descr_iter → space.iter(self.w_mapping).
+            // The backing mapping is a `dict`, which moves, and publishing it
+            // to the stack slot runs the frame array's write barrier, which
+            // can collect.  Pin the mapping on the read and take the operand
+            // the rest of this function dispatches on out of the root slot,
+            // not from the word that was live before the store.
             let iter = if pyre_object::is_dict_proxy(iter) {
-                let mapping = pyre_object::w_dict_proxy_get_mapping(iter);
+                let roots = pyre_object::gc_roots::push_roots();
+                let mapping_slot = roots.base();
+                roots.pin_root(pyre_object::w_dict_proxy_get_mapping(iter));
                 let tos = self.valuestackdepth - 1;
-                self.set_locals_w(tos, mapping);
-                mapping
+                self.set_locals_w(tos, roots.get(mapping_slot));
+                roots.get(mapping_slot)
             } else {
                 iter
             };

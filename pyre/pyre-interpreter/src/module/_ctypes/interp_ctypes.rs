@@ -780,15 +780,24 @@ fn comerror_init(
             positional.len()
         )));
     };
-    crate::baseobjspace::setattr_str(w_self, "hresult", *hresult)?;
-    crate::baseobjspace::setattr_str(w_self, "text", *text)?;
-    crate::baseobjspace::setattr_str(w_self, "details", *details)?;
-    // `args = args[1:]`, so the hresult is reachable only through its slot.
-    crate::baseobjspace::setattr_str(
-        w_self,
-        "args",
-        pyre_object::tupleobject::w_tuple_new(vec![*text, *details]),
-    )?;
+    // Every `setattr_str` allocates its key string and may run a Python
+    // `__setattr__`, and the argument slice is a plain array no root walker
+    // updates, so a `list` or `dict` argument in it goes stale after the first
+    // store.  Pin the three before that store and read them back at each use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let args_slot = roots.base();
+    roots.pin_root(*hresult);
+    roots.pin_root(*text);
+    roots.pin_root(*details);
+    crate::baseobjspace::setattr_str(w_self, "hresult", roots.get(args_slot))?;
+    crate::baseobjspace::setattr_str(w_self, "text", roots.get(args_slot + 1))?;
+    crate::baseobjspace::setattr_str(w_self, "details", roots.get(args_slot + 2))?;
+    // `args = args[1:]`, so the hresult is reachable only through its attribute.
+    let w_args = pyre_object::tupleobject::w_tuple_new(vec![
+        roots.get(args_slot + 1),
+        roots.get(args_slot + 2),
+    ]);
+    crate::baseobjspace::setattr_str(w_self, "args", w_args)?;
     Ok(pyre_object::w_none())
 }
 
@@ -969,9 +978,19 @@ pub(super) fn make_carg(addr: usize, obj: pyre_object::PyObjectRef) -> pyre_obje
     let carg = pyre_object::w_instance_new(carg_type());
     let d = crate::baseobjspace::getdict_native(carg);
     if !d.is_null() {
+        // The instance dictionary moves under a minor collection and both
+        // stores allocate — the address value, the key string each store
+        // builds, and the dictionary's own storage when it grows — so it is
+        // pinned on acquisition and read back for every store.  The address is
+        // hoisted out of the call: arguments evaluate left to right, so an
+        // inline slot read would precede that allocation and go stale.
+        let roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = roots.base();
+        roots.pin_root(d);
+        let ptr = pyre_object::w_int_new(addr as i64);
         unsafe {
-            pyre_object::w_dict_setitem_str(d, "_ptr", pyre_object::w_int_new(addr as i64));
-            pyre_object::w_dict_setitem_str(d, "_obj", obj);
+            pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_ptr", ptr);
+            pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_obj", obj);
         }
     }
     carg

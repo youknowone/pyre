@@ -360,7 +360,14 @@ pub unsafe fn dict_entries_insert_object(
     key: PyObjectRef,
     value: PyObjectRef,
 ) {
-    entries.insert(object_key_for(key), value);
+    // `object_key_for` hashes through the key's `__hash__`, so the caller's
+    // `value` word is already handed over when the collection runs.  Publish it
+    // here and insert the reloaded one.
+    let roots = crate::gc_roots::push_roots();
+    let value_slot = roots.base();
+    roots.pin_root(value);
+    let object_key = object_key_for(key);
+    entries.insert(object_key, roots.get(value_slot));
 }
 
 /// The stored key's object word at an entry index, `None` once the walk has
@@ -2127,14 +2134,22 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
         // (`setitem_str` keeps `newtext(key)` for the inserted key only —
         // `dictmultiobject.py:1220-1221`).  A new-key wrap dispatches through
         // `dict_keys_equal` so str subclasses honour their `__eq__`/`__hash__`.
+        // The receiver and its storage are non-moving, but a movable `w_value`
+        // is only a by-value copy of the guard's slot, and both the probe (a
+        // str-subclass `__eq__`) and the miss arm's key wrap collect before the
+        // store — so hold the value in a slot of its own and read it back at
+        // whichever arm writes it.
+        let roots = crate::gc_roots::push_roots();
+        let value_slot = roots.base();
+        roots.pin_root(w_value);
         let entries = w_module_dict_object_storage_mut(obj);
         match dict_entries_index_of_str(entries, key) {
             Some(idx) => {
-                dict_entries_value_set_at(entries, idx, w_value);
+                dict_entries_value_set_at(entries, idx, roots.get(value_slot));
             }
             None => {
                 let w_key = crate::w_str_new(key);
-                dict_entries_insert_object(entries, w_key, w_value);
+                dict_entries_insert_object(entries, w_key, roots.get(value_slot));
                 w_dict_bump_keys_version(obj);
             }
         };
@@ -4571,9 +4586,21 @@ pub unsafe fn w_dict_length_int_strategy(obj: PyObjectRef) -> usize {
 /// Same as [`w_dict_length_int_strategy`].
 pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_int_storage(obj)
-        .iter()
-        .map(|(&k, &v)| (crate::w_int_new(k), v))
+    // The result is a Rust-heap Vec the collector never walks and one key is
+    // wrapped per entry, so a pair pushed early would be pre-move by the next
+    // wrap.  Accumulate the run in root slots — each value re-read from the
+    // traced storage after its own iteration's wrap — and copy it out at the
+    // end.
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let entries = w_dict_int_storage(obj);
+    let len = entries.len();
+    for i in 0..len {
+        let w_key = crate::w_int_new(*entries.get_index(i).unwrap().0);
+        roots.publish(&[w_key, *entries.get_index(i).unwrap().1]);
+    }
+    (0..len)
+        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
         .collect()
 }
 
@@ -4593,7 +4620,12 @@ pub unsafe fn w_dict_nth_item_int_strategy(
     let (k, v) = w_dict_int_storage(obj)
         .get_index(index)
         .map(|(&k, &v)| (k, v))?;
-    Some((crate::w_int_new(k), v))
+    // Wrapping the key collects, and `v` is a bare local by then.
+    let roots = crate::gc_roots::push_roots();
+    let value_slot = roots.base();
+    roots.pin_root(v);
+    let w_key = crate::w_int_new(k);
+    Some((w_key, roots.get(value_slot)))
 }
 
 /// Internal helper: `IntDictStrategy::clear` body —
@@ -4627,19 +4659,47 @@ pub unsafe fn w_dict_clear_int_strategy(obj: PyObjectRef) {
 /// `w_dict` must be a valid `W_DictObject` on `INT_DICT_STRATEGY`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
-    let dict = &mut *(w_dict as *mut W_DictObject);
+    // Three separate hazards, one bracket.  The receiver moves, so the field
+    // stores at the end must go through a reloaded word.  Each wrapped key is
+    // minted inside the loop and is reachable from nothing the collector walks
+    // until the new table is attached.  And the new table is a Rust-heap map:
+    // a pair copied into it early would be pre-move by the next iteration's
+    // mint.  So the run is accumulated in root slots and the table is filled
+    // from those slots once every allocation is behind us.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(w_dict);
     // Borrow the old typed box (its field stays live, so it is traced
     // while the migration allocates keys); after the store the box is
     // unreachable and the sweep reclaims it.
-    let old = &*(dict.dstorage as *const IntDictStorage);
-    let mut new_map = ObjectDictStorage::with_capacity(old.len());
-    for (&k, &v) in old.iter() {
+    let old = &*((*(w_dict as *const W_DictObject)).dstorage as *const IntDictStorage);
+    let len = old.len();
+    let mut hashes = Vec::with_capacity(len);
+    let pairs_base = dict_slot + 1;
+    for i in 0..len {
+        let k = *old.get_index(i).unwrap().0;
         let w_key = crate::w_int_new(k);
-        new_map.insert(object_key_for(w_key), v);
+        let object_key = object_key_for(w_key);
+        // Take the value only now: the old table is traced, so re-reading the
+        // slot after this iteration's allocations yields the current word.
+        let v = *old.get_index(i).unwrap().1;
+        hashes.push(object_key.hash);
+        roots.publish(&[object_key.obj, v]);
     }
-    dict.dstorage =
-        crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
-            as *mut u8;
+    // The empty box is allocated before the fill so the last collection point
+    // is behind the pairs being copied out of their slots.
+    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        ObjectDictStorage::with_capacity(len),
+        object_dict_storage_gc_type_id(),
+    );
+    let new_map = &mut *new_storage;
+    for (i, &hash) in hashes.iter().enumerate() {
+        let obj = roots.get(pairs_base + 2 * i);
+        let value = roots.get(pairs_base + 2 * i + 1);
+        new_map.insert(ObjectKey { hash, obj }, value);
+    }
+    let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
+    dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
 }
 
@@ -4725,9 +4785,17 @@ pub unsafe fn w_dict_length_bytes_strategy(obj: PyObjectRef) -> usize {
 /// Same as [`w_dict_bytes_storage`].
 pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_bytes_storage(obj)
-        .iter()
-        .map(|(k, v)| (crate::w_bytes_from_bytes(k.as_slice()), *v))
+    // Accumulated in root slots for [`w_dict_items_int_strategy`]'s reason.
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.base();
+    let entries = w_dict_bytes_storage(obj);
+    let len = entries.len();
+    for i in 0..len {
+        let w_key = crate::w_bytes_from_bytes(entries.get_index(i).unwrap().0.as_slice());
+        roots.publish(&[w_key, *entries.get_index(i).unwrap().1]);
+    }
+    (0..len)
+        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
         .collect()
 }
 
@@ -4743,8 +4811,12 @@ pub unsafe fn w_dict_nth_item_bytes_strategy(
     let entries = w_dict_bytes_storage(obj);
     let (k, v) = entries.get_index(index)?;
     let key_bytes = k.clone();
-    let value = *v;
-    Some((crate::w_bytes_from_bytes(key_bytes.as_slice()), value))
+    // Wrapping the key collects, and `value` is a bare local by then.
+    let roots = crate::gc_roots::push_roots();
+    let value_slot = roots.base();
+    roots.pin_root(*v);
+    let w_key = crate::w_bytes_from_bytes(key_bytes.as_slice());
+    Some((w_key, roots.get(value_slot)))
 }
 
 /// Internal helper: `BytesDictStrategy::clear` body.
@@ -4768,16 +4840,34 @@ pub unsafe fn w_dict_clear_bytes_strategy(obj: PyObjectRef) {
 /// `w_dict` must be a valid `W_DictObject` on `BYTES_DICT_STRATEGY`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
-    let dict = &mut *(w_dict as *mut W_DictObject);
-    let old = &*(dict.dstorage as *const BytesDictStorage);
-    let mut new_map = ObjectDictStorage::with_capacity(old.len());
-    for (k, v) in old.iter() {
-        let w_key = crate::w_bytes_from_bytes(k.as_slice());
-        new_map.insert(object_key_for(w_key), *v);
+    // Rooted exactly as [`w_dict_switch_int_to_object_strategy`] is, for the
+    // same three reasons.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(w_dict);
+    let old = &*((*(w_dict as *const W_DictObject)).dstorage as *const BytesDictStorage);
+    let len = old.len();
+    let mut hashes = Vec::with_capacity(len);
+    let pairs_base = dict_slot + 1;
+    for i in 0..len {
+        let w_key = crate::w_bytes_from_bytes(old.get_index(i).unwrap().0.as_slice());
+        let object_key = object_key_for(w_key);
+        let v = *old.get_index(i).unwrap().1;
+        hashes.push(object_key.hash);
+        roots.publish(&[object_key.obj, v]);
     }
-    dict.dstorage =
-        crate::gc_storage::gc_alloc_storage_box(new_map, object_dict_storage_gc_type_id())
-            as *mut u8;
+    let new_storage = crate::gc_storage::gc_alloc_storage_box(
+        ObjectDictStorage::with_capacity(len),
+        object_dict_storage_gc_type_id(),
+    );
+    let new_map = &mut *new_storage;
+    for (i, &hash) in hashes.iter().enumerate() {
+        let obj = roots.get(pairs_base + 2 * i);
+        let value = roots.get(pairs_base + 2 * i + 1);
+        new_map.insert(ObjectKey { hash, obj }, value);
+    }
+    let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
+    dict.dstorage = new_storage as *mut u8;
     dict.dstrategy = &OBJECT_DICT_STRATEGY_REF;
 }
 
@@ -4959,10 +5049,19 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
         let storage = &*w_module_dict_get_storage(obj);
+        // Wrapping a name allocates, so a value zipped in before a later wrap
+        // would be pre-move in the Rust-heap result.  Wrap every name into a
+        // root slot first, then walk the values — which the cell storage keeps
+        // traced — with no allocation left to run.
+        let roots = crate::gc_roots::push_roots();
+        let keys_base = roots.base();
+        for k in strategy.getiterkeys(storage) {
+            roots.pin_root(crate::w_str_new(k));
+        }
         strategy
-            .getiterkeys(storage)
-            .zip(strategy.getitervalues(storage))
-            .map(|(k, v)| (crate::w_str_new(k), v))
+            .getitervalues(storage)
+            .enumerate()
+            .map(|(i, v)| (roots.get(keys_base + i), v))
             .collect()
     }
 }
@@ -5545,11 +5644,20 @@ pub trait DictStrategy {
         w_key: PyObjectRef,
         w_value: PyObjectRef,
     ) -> PyObjectRef {
+        // `getitem` hashes the key, so all three by-value words are stale by
+        // the time the store runs — and the default is handed back after the
+        // store, which allocates again.  Slot them and read back at each use.
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.publish(&[w_dict, w_key, w_value]);
         if let Some(w_result) = self.getitem(w_dict, w_key) {
             return w_result;
         }
-        self.setitem(w_dict, w_key, w_value);
-        w_value
+        self.setitem(
+            roots.get(dict_slot),
+            roots.get(dict_slot + 1),
+            roots.get(dict_slot + 2),
+        );
+        roots.get(dict_slot + 2)
     }
 
     /// `dictmultiobject.py:506-514 w_keys` — collect all keys.
@@ -5618,14 +5726,26 @@ pub trait DictStrategy {
         w_default: Option<PyObjectRef>,
     ) -> Result<PyObjectRef, DictPopError> {
         // dictmultiobject.py:624-634
+        // `getitem` hashes the key and `delitem` allocates, so the receiver,
+        // the key, the default and the fetched value are each stale at their
+        // next use.  A `None` default slots a null word, which the root stack
+        // tolerates.
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.publish(&[
+            w_dict,
+            w_key,
+            w_default.unwrap_or(std::ptr::null_mut()),
+        ]);
+        let value_slot = dict_slot + 3;
         let w_item = self.getitem(w_dict, w_key);
         if let Some(val) = w_item {
-            if !self.delitem(w_dict, w_key) {
+            roots.pin_root(val);
+            if !self.delitem(roots.get(dict_slot), roots.get(dict_slot + 1)) {
                 return Err(DictPopError);
             }
-            Ok(val)
-        } else if let Some(d) = w_default {
-            Ok(d)
+            Ok(roots.get(value_slot))
+        } else if w_default.is_some() {
+            Ok(roots.get(dict_slot + 2))
         } else {
             Err(DictPopError)
         }
@@ -5642,10 +5762,16 @@ pub trait DictStrategy {
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
+        // `items` and `delitem` both allocate, so the receiver is stale before
+        // the removal and the returned pair is stale after it.
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.base();
+        roots.pin_root(w_dict);
         let mut items = self.items(w_dict);
         let (w_key, w_value) = items.pop()?;
-        self.delitem(w_dict, w_key);
-        Some((w_key, w_value))
+        let pair_base = roots.publish(&[w_key, w_value]);
+        self.delitem(roots.get(dict_slot), roots.get(pair_base));
+        Some((roots.get(pair_base), roots.get(pair_base + 1)))
     }
 
     /// `dictmultiobject.py:556-557 getiterreversed` — iterate
@@ -5672,11 +5798,25 @@ pub trait DictStrategy {
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
-        let new_dict = crate::dictmultiobject::w_dict_new();
-        for (k, v) in self.items(w_dict) {
-            crate::dictmultiobject::w_dict_store(new_dict, k, v);
+        // The materialised pairs sit in a Rust-heap Vec the collector never
+        // walks and the fresh dict moves under every store, so the whole run
+        // is published before the dict is minted and each word is read back at
+        // the store that consumes it.
+        let roots = crate::gc_roots::push_roots();
+        let pairs_base = roots.base();
+        let items = self.items(w_dict);
+        for &(k, v) in &items {
+            roots.publish(&[k, v]);
         }
-        new_dict
+        let new_slot = roots.publish(&[crate::dictmultiobject::w_dict_new()]);
+        for i in 0..items.len() {
+            crate::dictmultiobject::w_dict_store(
+                roots.get(new_slot),
+                roots.get(pairs_base + 2 * i),
+                roots.get(pairs_base + 2 * i + 1),
+            );
+        }
+        roots.get(new_slot)
     }
 
     /// `dictmultiobject.py:548-552 clear` — reset to EmptyDictStrategy.
@@ -6789,20 +6929,37 @@ impl DictStrategy for UnicodeDictStrategy {
     /// key then dispatches to `setitem`.  UnicodeDictStrategy keeps
     /// str keys on the fast path; no promotion.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        let dict = &mut *(w_dict as *mut W_DictObject);
-        let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
-        match dict_entries_index_of_str(entries, key) {
+        // This is the one `setitem_str` that both collects and stores itself:
+        // the membership probe can run a str-subclass `__eq__` (and its no-hook
+        // arm wraps the key), and a miss mints the persistent key.  A dict
+        // header moves, and these parameters are by-value copies of the caller's
+        // words, so the root bracket the entry point holds does not update them
+        // — publish the receiver and the value here and read both slots back
+        // after the probe and after the mint.
+        let roots = crate::gc_roots::push_roots();
+        let dict_slot = roots.publish(&[w_dict, w_value]);
+        let value_slot = dict_slot + 1;
+        let found = dict_entries_index_of_str(w_dict_object_storage(w_dict), key);
+        match found {
             Some(idx) => {
-                let (_, stored_value) = entries.get_index_mut(idx).unwrap();
-                *stored_value = w_value;
+                let w_value = roots.get(value_slot);
+                let entries = w_dict_object_storage_mut(roots.get(dict_slot));
+                *entries.get_index_mut(idx).unwrap().1 = w_value;
             }
             None => {
+                // Mint before reading either slot: call arguments evaluate left
+                // to right, so a slot read written inline with the mint would be
+                // taken before the collection that invalidates it.
                 let stored_key = object_key_for_new_str(key);
+                let w_value = roots.get(value_slot);
+                let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
+                let entries =
+                    &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
                 dict_entries_insert_hashed(entries, stored_key.hash, stored_key.obj, w_value);
                 dict.keys_version = dict.keys_version.wrapping_add(1);
             }
         };
-        dict_write_barrier(w_dict);
+        dict_write_barrier(roots.get(dict_slot));
     }
 
     /// `dictmultiobject.py:1315-1318 getitem_str` override.

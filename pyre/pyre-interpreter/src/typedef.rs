@@ -2394,7 +2394,11 @@ fn new_typeobject_with_base_and_layout(
     }
     let bases = w_tuple_new(vec![base]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    // The type object it allocates is what the namespace has to survive: the
+    // word handed over is stored in the new type, but this frame's copy is
+    // pre-move, so the probes below take a fresh read.
     let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype);
+    let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // typeobject.py:1273-1280 setup_builtin_type:
     //   parent_layout = w_bestbase.layout
@@ -2486,6 +2490,7 @@ pub fn make_builtin_type_with_bases(
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype);
+    let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     unsafe {
         let parent_layout = pyre_object::w_type_get_layout_ptr(base);
@@ -2838,13 +2843,21 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // exercises one), so projecting through `w_str_get_value` would both lose
     // the upstream storage shape and panic on a valid Python `str`.
     unsafe { pyre_object::w_module_set_name(self_, w_name) };
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(self_) };
+    // The module dict moves and each store allocates — the key string it
+    // interns and the storage when it grows — so the destination is read back
+    // for every one of them.  `w_doc` is an arbitrary object the caller
+    // supplied and rides the same run; `w_name` is a `str` and never moves.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::w_module_get_w_dict(self_) });
+    let doc_slot = dict_slot + 1;
+    roots.pin_root(w_doc);
     unsafe {
-        pyre_object::w_dict_setitem_str(w_dict, "__name__", w_name);
-        pyre_object::w_dict_setitem_str(w_dict, "__doc__", w_doc);
-        pyre_object::w_dict_setitem_str(w_dict, "__package__", pyre_object::w_none());
-        pyre_object::w_dict_setitem_str(w_dict, "__loader__", pyre_object::w_none());
-        pyre_object::w_dict_setitem_str(w_dict, "__spec__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "__name__", w_name);
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "__doc__", roots.get(doc_slot));
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "__package__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "__loader__", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "__spec__", pyre_object::w_none());
     }
     Ok(pyre_object::w_none())
 }
@@ -2877,31 +2890,55 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
         let result = crate::call::call_function_impl_result(repr_fn, &[module])?;
         return Ok(crate::baseobjspace::text_wtf8_w(result)?.to_wtf8_buf());
     }
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-    let loader = crate::baseobjspace::finditem_str(w_dict, "__loader__")?;
-    if let Some(spec) = crate::baseobjspace::finditem_str(w_dict, "__spec__")?
-        && !spec.is_null()
+    // The module dict moves, and every lookup and `repr` below runs Python.
+    // The dict and each value that outlives one of those calls ride the shadow
+    // stack; a missing key is pinned as the null word its consumers already
+    // test for.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::w_module_get_w_dict(module) });
+    let loader_slot = dict_slot + 1;
+    roots.pin_root(
+        crate::baseobjspace::finditem_str(roots.get(dict_slot), "__loader__")?.unwrap_or(PY_NULL),
+    );
+    let spec_slot = loader_slot + 1;
+    roots.pin_root(
+        crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__")?.unwrap_or(PY_NULL),
+    );
+    let spec = roots.get(spec_slot);
+    if !spec.is_null()
         && !unsafe { pyre_object::is_none(spec) }
         && crate::baseobjspace::is_true(spec)?
     {
-        let mut name = crate::baseobjspace::getattr_str(spec, "name")?;
+        let mut name = crate::baseobjspace::getattr_str(roots.get(spec_slot), "name")?;
         if unsafe { pyre_object::is_none(name) } {
             name = pyre_object::w_str_new("?");
         }
-        let origin = crate::baseobjspace::getattr_str(spec, "origin")?;
-        if unsafe { pyre_object::is_none(origin) } {
-            let spec_loader = crate::baseobjspace::getattr_str(spec, "loader")?;
-            let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-            if unsafe { pyre_object::is_none(spec_loader) } {
+        let name_slot = spec_slot + 1;
+        roots.pin_root(name);
+        let origin_slot = name_slot + 1;
+        roots.pin_root(crate::baseobjspace::getattr_str(
+            roots.get(spec_slot),
+            "origin",
+        )?);
+        if unsafe { pyre_object::is_none(roots.get(origin_slot)) } {
+            let spec_loader_slot = origin_slot + 1;
+            roots.pin_root(crate::baseobjspace::getattr_str(
+                roots.get(spec_slot),
+                "loader",
+            )?);
+            let name_repr = unsafe { crate::display::py_repr_wtf8(roots.get(name_slot))? };
+            if unsafe { pyre_object::is_none(roots.get(spec_loader_slot)) } {
                 return Ok(wtf8_format!("<module ", name_repr, ">"));
             }
-            let loader_repr = unsafe { crate::display::py_repr_wtf8(spec_loader)? };
+            let loader_repr =
+                unsafe { crate::display::py_repr_wtf8(roots.get(spec_loader_slot))? };
             return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
         }
-        let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-        let has_location = crate::baseobjspace::getattr_str(spec, "has_location")?;
+        let name_repr = unsafe { crate::display::py_repr_wtf8(roots.get(name_slot))? };
+        let has_location = crate::baseobjspace::getattr_str(roots.get(spec_slot), "has_location")?;
         if crate::baseobjspace::is_true(has_location)? {
-            let origin_repr = unsafe { crate::display::py_repr_wtf8(origin)? };
+            let origin_repr = unsafe { crate::display::py_repr_wtf8(roots.get(origin_slot))? };
             return Ok(wtf8_format!(
                 "<module ",
                 name_repr,
@@ -2910,22 +2947,20 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
                 ">"
             ));
         }
-        let origin_str = unsafe { crate::display::py_str_wtf8(origin)? };
+        let origin_str = unsafe { crate::display::py_str_wtf8(roots.get(origin_slot))? };
         return Ok(wtf8_format!("<module ", name_repr, " (", origin_str, ")>"));
     }
-    let name = crate::baseobjspace::finditem_str(w_dict, "__name__")?
+    let name = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__name__")?
         .unwrap_or_else(|| pyre_object::w_str_new("?"));
     let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
-    if let Some(filename) = crate::baseobjspace::finditem_str(w_dict, "__file__")? {
+    if let Some(filename) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__file__")? {
         let file_repr = unsafe { crate::display::py_repr_wtf8(filename)? };
         return Ok(wtf8_format!(
             "<module ", name_repr, " from ", file_repr, ">"
         ));
     }
-    if let Some(loader) = loader
-        && !loader.is_null()
-        && !unsafe { pyre_object::is_none(loader) }
-    {
+    let loader = roots.get(loader_slot);
+    if !loader.is_null() && !unsafe { pyre_object::is_none(loader) } {
         let loader_repr = unsafe { crate::display::py_repr_wtf8(loader)? };
         return Ok(wtf8_format!("<module ", name_repr, " (", loader_repr, ")>"));
     }
@@ -2954,7 +2989,13 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // module.py:164 — deliberately perform ordinary attribute lookup rather
     // than reading `self.w_dict`: a ModuleType subclass may shadow
     // `__dict__`, in which case the resulting non-dict is a TypeError.
-    let w_dict = crate::baseobjspace::getattr_str(module, "__dict__")?;
+    // The mapping is a `dict` and moves, and the `__dir__` probe below runs
+    // Python, so it is pinned where the lookup produces it and read back for
+    // the listing that follows the probe.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(crate::baseobjspace::getattr_str(module, "__dict__")?);
+    let w_dict = roots.get(dict_slot);
     if w_dict.is_null()
         || (!unsafe { pyre_object::is_dict(w_dict) }
             && !unsafe { pyre_object::dictmultiobject::is_module_dict(w_dict) }
@@ -2967,10 +3008,10 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             ".__dict__ is not a dictionary"
         )));
     }
-    if let Some(w_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")? {
+    if let Some(w_dir) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__dir__")? {
         return crate::call::call_function_impl_result(w_dir, &[]);
     }
-    crate::builtins::builtin_list_ctor(&[w_dict])
+    crate::builtins::builtin_list_ctor(&[roots.get(dict_slot)])
 }
 
 fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -2982,7 +3023,10 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(annotations) = crate::baseobjspace::finditem_str(w_dict, "__annotations__")? {
         return Ok(annotations);
     }
-    let annotations = match crate::baseobjspace::finditem_str(w_dict, "__annotate__")? {
+    let annotations = match crate::baseobjspace::finditem_str(
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        "__annotate__",
+    )? {
         Some(annotate) if !annotate.is_null() && !unsafe { pyre_object::is_none(annotate) } => {
             let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(annotate);
@@ -3061,12 +3105,19 @@ fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
-    let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-    if let Some(annotate) = crate::baseobjspace::finditem_str(w_dict, "__annotate__")? {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::w_module_get_w_dict(module) });
+    if let Some(annotate) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__annotate__")?
+    {
         return Ok(annotate);
     }
     let none = pyre_object::w_none();
-    crate::baseobjspace::setitem(w_dict, pyre_object::w_str_new("__annotate__"), none)?;
+    // Allocate the key first: call arguments evaluate left to right, so
+    // reading the dict slot ahead of `w_str_new` would hand the store a
+    // pre-move word.
+    let annotate_key = pyre_object::w_str_new("__annotate__");
+    crate::baseobjspace::setitem(roots.get(dict_slot), annotate_key, none)?;
     Ok(none)
 }
 
@@ -3548,9 +3599,23 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // run.  `__dict_data__` is pyre's reserved layout-slot equivalent, so
     // write it through object.__setattr__'s terminal path rather than
     // dispatching a subclass override.
+    //
+    // Nothing references the instance until the backing mapping is installed,
+    // and both that allocation and the attribute store are collection points.
+    // Its allocation is stable, so the word never moves and needs no read
+    // back — the pin is what keeps a major collection from reclaiming it.
+    // The mapping is a `dict` and does move, so it is pinned at the mint and
+    // read back where the store consumes it.
+    let _roots = pyre_object::gc_roots::push_roots();
     let instance = pyre_object::w_instance_new(cls);
-    let backing = pyre_object::w_dict_new();
-    crate::baseobjspace::object_setattr(instance, "__dict_data__", backing)?;
+    pyre_object::gc_roots::pin_root(instance);
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    crate::baseobjspace::object_setattr(
+        instance,
+        "__dict_data__",
+        pyre_object::gc_roots::shadow_stack_get(backing_slot),
+    )?;
     Ok(instance)
 }
 /// boolobject.py descr_new — bool.__new__(cls, obj=False)
@@ -4857,19 +4922,41 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // positional-only argument passed as keyword argument: 'iterable'",
     // `set(x=1)` → "set.__init__() got an unexpected keyword argument 'x'".
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
-    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
-    if let Some(dict) = kwargs {
-        for (key, val) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
-            if key.as_str() == Ok("__pyre_kw__") {
-                continue;
+    // The argument columns live in a borrowed slice and an owned `Vec`, neither
+    // of which the collector rewrites, and each keyword name allocated below
+    // can move a `list` or `dict` still waiting in them.  Both columns are
+    // published before the first of those allocations and read back where the
+    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
+    // its pin is liveness only.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    let (keyword_names_w, keyword_values_base) = match kwargs {
+        Some(dict) => {
+            let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+                .into_iter()
+                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
+                .collect();
+            let values: Vec<PyObjectRef> = entries.iter().map(|(_, value)| *value).collect();
+            let base = pyre_object::gc_roots::pin_roots(&values);
+            let mut names = Vec::with_capacity(entries.len());
+            for (key, _) in entries {
+                let w_name = pyre_object::w_str_from_wtf8(key);
+                pyre_object::gc_roots::pin_root(w_name);
+                names.push(w_name);
             }
-            keyword_names_w.push(pyre_object::w_str_from_wtf8(key));
-            keywords_w.push(val);
+            (names, base)
         }
-    }
+        None => (Vec::new(), 0),
+    };
+    let keywords_w: Vec<PyObjectRef> = (0..keyword_names_w.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(keyword_values_base + index))
+        .collect();
+    let positional_w: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
+        .collect();
     let signature = crate::gateway::Signature::new(vec!["self", "iterable"], None, None, 0, 2);
-    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let arguments =
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
     let defaults = [pyre_object::w_none()];
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
@@ -4880,12 +4967,15 @@ fn set_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(&defaults),
         pyre_object::PY_NULL,
     )?;
-    let w_iterable = scope_w[1];
+    let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(scope_w[1]);
 
     // setobject.py `_initialize_set` — `w_obj.clear()` drops the
     // storage in one go, then the iterable populates it when it is not None
-    // (the parsed default).
+    // (the parsed default).  Dropping the storage allocates the empty
+    // replacement, so the iterable is read back after it.
     unsafe { pyre_object::w_set_clear(set_obj) };
+    let w_iterable = pyre_object::gc_roots::shadow_stack_get(iterable_slot);
     if !w_iterable.is_null() && !unsafe { pyre_object::is_none(w_iterable) } {
         set_init_from_iterable(set_obj, w_iterable)?;
     }
@@ -6113,7 +6203,16 @@ fn init_str_type(ns: PyObjectRef) {
                         )));
                     }
 
-                    let d = pyre_object::w_dict_new();
+                    // A `dict` header moves, and every store below allocates
+                    // its key and, when the mapping grows, the dict's own
+                    // storage.  The fresh word is pinned at the mint and the
+                    // receiver read back per store, with each allocating
+                    // argument hoisted into a local first: call arguments
+                    // evaluate left to right, so an inline mint would hand over
+                    // a receiver read before it ran.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let d_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
                     if args.len() >= 2 {
                         if !unsafe { pyre_object::is_str(args[0]) } {
                             return Err(crate::PyError::type_error(
@@ -6143,21 +6242,29 @@ fn init_str_type(ns: PyObjectRef) {
                             ));
                         }
                         for (xc, yc) in x.code_points().zip(y.code_points()) {
+                            // Nothing references the key while the value is
+                            // being built, so it takes a liveness pin; an `int`
+                            // never moves, so it is not read back.
+                            let _pair = pyre_object::gc_roots::push_roots();
+                            let key = pyre_object::w_int_new(xc.to_u32() as i64);
+                            pyre_object::gc_roots::pin_root(key);
+                            let value = pyre_object::w_int_new(yc.to_u32() as i64);
                             unsafe {
                                 pyre_object::w_dict_store(
-                                    d,
-                                    pyre_object::w_int_new(xc.to_u32() as i64),
-                                    pyre_object::w_int_new(yc.to_u32() as i64),
+                                    pyre_object::gc_roots::shadow_stack_get(d_slot),
+                                    key,
+                                    value,
                                 );
                             }
                         }
                         if args.len() == 3 {
                             let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
                             for zc in z.code_points() {
+                                let key = pyre_object::w_int_new(zc.to_u32() as i64);
                                 unsafe {
                                     pyre_object::w_dict_store(
-                                        d,
-                                        pyre_object::w_int_new(zc.to_u32() as i64),
+                                        pyre_object::gc_roots::shadow_stack_get(d_slot),
+                                        key,
                                         pyre_object::w_none(),
                                     );
                                 }
@@ -6174,7 +6281,16 @@ fn init_str_type(ns: PyObjectRef) {
                             // `w_dict_items` dispatches through `is_module_dict`
                             // so `str.maketrans(some_module.__dict__)` walks the
                             // strategy storage when handed a W_ModuleDictObject.
-                            for (k, v) in pyre_object::w_dict_items(src) {
+                            // Its owned `Vec` is not a slot the collector
+                            // rewrites, so the pairs still waiting in it are
+                            // rooted before the first store.
+                            let entries = pyre_object::w_dict_items(src);
+                            let flat: Vec<PyObjectRef> =
+                                entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+                            let pair_base = pyre_object::gc_roots::pin_roots(&flat);
+                            for index in 0..entries.len() {
+                                let k =
+                                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2);
                                 let ord_key = if pyre_object::is_int(k) {
                                     k
                                 } else if pyre_object::is_str(k) {
@@ -6192,11 +6308,17 @@ fn init_str_type(ns: PyObjectRef) {
                                         "keys in translate table must be strings or integers",
                                     ));
                                 };
-                                pyre_object::w_dict_store(d, ord_key, v);
+                                pyre_object::w_dict_store(
+                                    pyre_object::gc_roots::shadow_stack_get(d_slot),
+                                    ord_key,
+                                    pyre_object::gc_roots::shadow_stack_get(
+                                        pair_base + index * 2 + 1,
+                                    ),
+                                );
                             }
                         }
                     }
-                    Ok(d)
+                    Ok(pyre_object::gc_roots::shadow_stack_get(d_slot))
                 },
                 "(x, y=<unrepresentable>, z=<unrepresentable>, /)"
             ),
@@ -6381,6 +6503,40 @@ fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             .checked_add(keys_size)
             .ok_or_else(crate::builtins::reservation_failed)? as i64,
     ))
+}
+
+/// The result `dictmultiobject.py:288 descr_or` builds as `descr_copy`
+/// followed by `descr_update`: a fresh mapping holding `base`'s entries with
+/// `overlay`'s on top.  `:295 descr_ror` is the same with the two swapped, and
+/// a null operand is the "no backing mapping" case both skip.
+///
+/// The destination `dict` moves, and `w_dict_store` allocates when the storage
+/// grows or the strategy is promoted, so the destination is pinned at the mint
+/// and read back for every store.  `w_dict_items` hands back an owned `Vec`,
+/// which is not a slot the collector rewrites — the pairs still waiting in it
+/// are rooted before the first store of their round.
+fn dict_or_new(base: PyObjectRef, overlay: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dst_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    for source in [base, overlay] {
+        if source.is_null() {
+            continue;
+        }
+        let entries = unsafe { pyre_object::w_dict_items(source) };
+        let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+        let pair_base = pyre_object::gc_roots::pin_roots(&flat);
+        for index in 0..entries.len() {
+            unsafe {
+                pyre_object::w_dict_store(
+                    pyre_object::gc_roots::shadow_stack_get(dst_slot),
+                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2),
+                    pyre_object::gc_roots::shadow_stack_get(pair_base + index * 2 + 1),
+                );
+            }
+        }
+    }
+    pyre_object::gc_roots::shadow_stack_get(dst_slot)
 }
 
 fn init_dict_type(ns: PyObjectRef) {
@@ -6812,16 +6968,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     // `descr_copy` then `descr_update`: copy LHS, overlay
                     // RHS — both reads go through `w_dict_items`, matching
                     // PyPy's storage-strategy delitem/iter parity.
-                    let dst = pyre_object::w_dict_new();
-                    if !src.is_null() {
-                        for (k, v) in unsafe { pyre_object::w_dict_items(src) } {
-                            unsafe { pyre_object::w_dict_store(dst, k, v) };
-                        }
-                    }
-                    for (k, v) in unsafe { pyre_object::w_dict_items(other) } {
-                        unsafe { pyre_object::w_dict_store(dst, k, v) };
-                    }
-                    Ok(dst)
+                    Ok(dict_or_new(src, other))
                 },
                 2,
             ),
@@ -6842,16 +6989,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
                     }
-                    let dst = pyre_object::w_dict_new();
-                    for (k, v) in unsafe { pyre_object::w_dict_items(other) } {
-                        unsafe { pyre_object::w_dict_store(dst, k, v) };
-                    }
-                    if !self_.is_null() {
-                        for (k, v) in unsafe { pyre_object::w_dict_items(self_) } {
-                            unsafe { pyre_object::w_dict_store(dst, k, v) };
-                        }
-                    }
-                    Ok(dst)
+                    Ok(dict_or_new(other, self_))
                 },
                 2,
             ),
@@ -16160,11 +16298,27 @@ fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let function = positional[1];
     unsafe { pyre_object::function::w_staticmethod_set_func(sm, function) };
-    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
+    // The instance dict moves, the lookup runs Python once per name, and the
+    // key string is allocated after the value arrives — so the dict, the
+    // wrapped object and each fetched value are read back out of root slots at
+    // the store rather than out of the locals that produced them.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
+    let function_slot = dict_slot + 1;
+    roots.pin_root(function);
     for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
-        match crate::baseobjspace::getattr_str(function, name) {
+        match crate::baseobjspace::getattr_str(roots.get(function_slot), name) {
             Ok(value) => {
-                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+                let value_roots = pyre_object::gc_roots::push_roots();
+                let value_slot = value_roots.base();
+                value_roots.pin_root(value);
+                let key = w_str_new(name);
+                crate::baseobjspace::setitem(
+                    roots.get(dict_slot),
+                    key,
+                    value_roots.get(value_slot),
+                )?;
             }
             Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
             Err(err) => return Err(err),
@@ -16224,14 +16378,22 @@ fn staticmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn staticmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
     let sm = staticmethod_require(obj, name)?;
-    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
-    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+    // The instance dict moves, and both the probe and the fallback lookup run
+    // Python before the store; the fetched value is minted before the key
+    // string, so it rides a slot too and is read back at the store and at the
+    // return.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
+    if let Some(value) = crate::baseobjspace::finditem_str(roots.get(dict_slot), name)? {
         return Ok(value);
     }
     let function = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
-    let value = crate::baseobjspace::getattr_str(function, name)?;
-    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
-    Ok(value)
+    let value_slot = dict_slot + 1;
+    roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
+    let key = w_str_new(name);
+    crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
+    Ok(roots.get(value_slot))
 }
 
 fn staticmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
@@ -16244,9 +16406,16 @@ fn staticmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
-    let value = args.get(2).copied().unwrap_or(PY_NULL);
-    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
-    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    // Allocating the key after both words are pinned is what keeps the store
+    // from receiving pre-move addresses: call arguments evaluate left to
+    // right, so an inline `w_str_new` would run after the dict was read.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
+    let value_slot = dict_slot + 1;
+    roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
+    let key = w_str_new(name);
+    crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
 }
 
@@ -16260,8 +16429,11 @@ fn staticmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn staticmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
-    let w_dict = unsafe { pyre_object::function::w_staticmethod_getdict(sm) };
-    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
+    let key = w_str_new(name);
+    if let Err(err) = crate::baseobjspace::delitem(roots.get(dict_slot), key) {
         if err.kind == crate::PyErrorKind::KeyError {
             return Err(crate::PyError::attribute_error(format!(
                 "'staticmethod' object has no attribute '{name}'"
@@ -16473,11 +16645,24 @@ fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let function = positional[1];
     unsafe { pyre_object::function::w_classmethod_set_func(cm, function) };
-    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
+    // The `staticmethod.__init__` bracket, for the same reasons.
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
+    let function_slot = dict_slot + 1;
+    roots.pin_root(function);
     for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
-        match crate::baseobjspace::getattr_str(function, name) {
+        match crate::baseobjspace::getattr_str(roots.get(function_slot), name) {
             Ok(value) => {
-                crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+                let value_roots = pyre_object::gc_roots::push_roots();
+                let value_slot = value_roots.base();
+                value_roots.pin_root(value);
+                let key = w_str_new(name);
+                crate::baseobjspace::setitem(
+                    roots.get(dict_slot),
+                    key,
+                    value_roots.get(value_slot),
+                )?;
             }
             Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
             Err(err) => return Err(err),
@@ -16526,14 +16711,18 @@ fn classmethod_isabstract(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn classmethod_wrapped_attr_get(obj: PyObjectRef, name: &str) -> crate::PyResult {
     let cm = classmethod_require(obj, name)?;
-    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
-    if let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)? {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
+    if let Some(value) = crate::baseobjspace::finditem_str(roots.get(dict_slot), name)? {
         return Ok(value);
     }
     let function = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
-    let value = crate::baseobjspace::getattr_str(function, name)?;
-    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
-    Ok(value)
+    let value_slot = dict_slot + 1;
+    roots.pin_root(crate::baseobjspace::getattr_str(function, name)?);
+    let key = w_str_new(name);
+    crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
+    Ok(roots.get(value_slot))
 }
 
 fn classmethod_annotations_get(args: &[PyObjectRef]) -> crate::PyResult {
@@ -16546,9 +16735,13 @@ fn classmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn classmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
-    let value = args.get(2).copied().unwrap_or(PY_NULL);
-    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
-    crate::baseobjspace::setitem(w_dict, w_str_new(name), value)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
+    let value_slot = dict_slot + 1;
+    roots.pin_root(args.get(2).copied().unwrap_or(PY_NULL));
+    let key = w_str_new(name);
+    crate::baseobjspace::setitem(roots.get(dict_slot), key, roots.get(value_slot))?;
     Ok(w_none())
 }
 
@@ -16562,8 +16755,11 @@ fn classmethod_annotate_set(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn classmethod_wrapped_attr_del(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let cm = classmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
-    let w_dict = unsafe { pyre_object::function::w_classmethod_getdict(cm) };
-    if let Err(err) = crate::baseobjspace::delitem(w_dict, w_str_new(name)) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
+    let key = w_str_new(name);
+    if let Err(err) = crate::baseobjspace::delitem(roots.get(dict_slot), key) {
         if err.kind == crate::PyErrorKind::KeyError {
             return Err(crate::PyError::attribute_error(format!(
                 "'classmethod' object has no attribute '{name}'"
@@ -26001,13 +26197,21 @@ pub(crate) fn set_method_intersection(
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
-    let mut others_w: Vec<pyre_object::PyObjectRef> = args.to_vec();
+    // An operand column copied into a plain `Vec` is not something the
+    // collector rewrites, and both loops below run Python for every entry —
+    // `len_w` calls a user `__len__`, the drain calls `__iter__` — so a `list`
+    // or `dict` operand waiting its turn would be intersected at a pre-move
+    // address.  The column is published once and every operand is read back
+    // from its slot when its turn comes; the seed swap becomes an index
+    // permutation over those slots rather than a move inside a `Vec`.
+    let operand_roots = pyre_object::gc_roots::push_roots();
+    let operand_base = pyre_object::gc_roots::pin_roots(args);
 
-    // find smallest set in others_w to reduce comparisons
+    // find smallest set in the operands to reduce comparisons
     let mut startindex = 0usize;
     let mut startlength: i64 = -1;
-    for i in 0..others_w.len() {
-        let length = match crate::baseobjspace::len_w(others_w[i]) {
+    for i in 0..args.len() {
+        let length = match crate::baseobjspace::len_w(operand_roots.get(operand_base + i)) {
             Ok(length) => length,
             Err(e)
                 if e.kind == crate::PyErrorKind::TypeError
@@ -26022,7 +26226,14 @@ pub(crate) fn set_method_intersection(
             startlength = length;
         }
     }
-    others_w.swap(0, startindex);
+    let operand = |position: usize| {
+        let index = match position {
+            0 => startindex,
+            p if p == startindex => 0,
+            p => p,
+        };
+        operand_roots.get(operand_base + index)
+    };
 
     // `setobject.py` — the seed and every operand become sets, and a
     // set operand is intersected as it stands rather than rebuilt.
@@ -26033,9 +26244,10 @@ pub(crate) fn set_method_intersection(
     // addresses; what they need is to survive the collection points around
     // them, the iterable drain and the `__eq__` a bucket probe runs.
     let _roots = pyre_object::gc_roots::push_roots();
-    let mut result = set_newobj_intersection(others_w[0])?;
+    let mut result = set_newobj_intersection(operand(0))?;
     pyre_object::gc_roots::pin_root(result);
-    for &w_other in &others_w[1..] {
+    for position in 1..args.len() {
+        let w_other = operand(position);
         let w_other_as_set = if unsafe { pyre_object::is_set_or_frozenset(w_other) } {
             w_other
         } else {
@@ -26065,7 +26277,13 @@ pub(crate) fn set_method_difference(
     if args.is_empty() {
         return Ok(pyre_object::w_set_new());
     }
+    // The copy has no referrer yet and the update below drains each operand
+    // through Python, so it needs the same lifetime pin the intersection
+    // accumulator takes.  A set never moves, so one pin is the whole fix and
+    // the word stays usable as it stands.
+    let _roots = pyre_object::gc_roots::push_roots();
     let result = set_copy_real(args[0]);
+    pyre_object::gc_roots::pin_root(result);
     let mut update_args: Vec<pyre_object::PyObjectRef> = vec![result];
     update_args.extend_from_slice(&args[1..]);
     set_method_difference_update(&update_args)?;
@@ -26082,12 +26300,18 @@ pub(crate) fn set_method_symmetric_difference(
     };
     crate::type_methods::arity_exact(args, name, 1)?;
     // `setobject.py symmetric_difference` wraps the computed storage
-    // in a set of self's class.
+    // in a set of self's class.  Each set below is freshly minted with no
+    // referrer and outlives a further allocation, so each takes the
+    // lifetime pin the intersection path takes; sets never move.
+    let _roots = pyre_object::gc_roots::push_roots();
     let w_other_as_set = set_operand_as_set(args[1])?;
+    pyre_object::gc_roots::pin_root(w_other_as_set);
     let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
+    pyre_object::gc_roots::pin_root(w_new);
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
             let w_frozenset = pyre_object::w_frozenset_new();
+            pyre_object::gc_roots::pin_root(w_frozenset);
             pyre_object::w_set_copy_storage_from(w_frozenset, w_new);
             return Ok(w_frozenset);
         }
@@ -28084,19 +28308,31 @@ fn itertools_constructor_scope_kwonly(
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
     let cls = positional.first().copied().unwrap_or(PY_NULL);
     let positional = positional.get(1..).unwrap_or(&[]);
-    let mut keyword_names_w = Vec::new();
-    let mut keywords_w = Vec::new();
-    if let Some(dict) = kwargs {
-        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
-            if key.as_str() == Ok("__pyre_kw__") {
-                continue;
+    // The positional slice and the entry `Vec` are not slots the collector
+    // rewrites, and the names and defaults dict allocated below can move a
+    // `list` or `dict` waiting in either.  Both columns are published before
+    // the first of those allocations and read back where the `Arguments` copy
+    // is taken; a keyword name is a `str` and never moves, so its pin is
+    // liveness only.
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    let (keyword_names_w, keyword_values_base) = match kwargs {
+        Some(dict) => {
+            let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+                .into_iter()
+                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
+                .collect();
+            let values: Vec<PyObjectRef> = entries.iter().map(|(_, value)| *value).collect();
+            let base = pyre_object::gc_roots::pin_roots(&values);
+            let mut names = Vec::with_capacity(entries.len());
+            for (key, _) in entries {
+                let w_name = pyre_object::w_str_from_wtf8(key);
+                pyre_object::gc_roots::pin_root(w_name);
+                names.push(w_name);
             }
-            let w_name = pyre_object::w_str_from_wtf8(key);
-            pyre_object::gc_roots::pin_root(w_name);
-            keyword_names_w.push(w_name);
-            keywords_w.push(value);
+            (names, base)
         }
-    }
+        None => (Vec::new(), 0),
+    };
     let positional_default_count = defaults.len().saturating_sub(kwonlyargcount);
     let w_kw_defs = if kwonlyargcount == 0 {
         PY_NULL
@@ -28117,7 +28353,14 @@ fn itertools_constructor_scope_kwonly(
         unsafe { pyre_object::gc_roots::shadow_stack_get(kw_defs_slot) }
     };
     let signature = crate::gateway::Signature::new(names, None, None, kwonlyargcount, 0);
-    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
+    let keywords_w: Vec<PyObjectRef> = (0..keyword_names_w.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(keyword_values_base + index))
+        .collect();
+    let positional_w: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
+        .collect();
+    let arguments =
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(
         PY_NULL,
@@ -28802,32 +29045,62 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(cls);
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut keyword_names_w = Vec::new();
-    let mut keywords_w = Vec::new();
-    if let Some(dict) = kwargs {
-        for (key, value) in unsafe { pyre_object::w_dict_str_entries_wtf8(dict) } {
-            if key.as_str() == Ok("__pyre_kw__") {
-                continue;
+    // The positional column is a borrowed slice, not a slot the collector
+    // rewrites either, and the keyword names and defaults below all allocate
+    // before the parse reads it — so it is published alongside the keyword
+    // values and read back at the same point.
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    // The entries come back in an owned `Vec`, which is not a slot the
+    // collector rewrites, and every allocation between here and the parse can
+    // move a value sitting in it.  The value column is published as one root
+    // set before the first of those allocations and read back where the
+    // `Arguments` copy is taken; a keyword name is a `str` and never moves, so
+    // its pin is liveness only.
+    let (keyword_names_w, keyword_values_base) = match kwargs {
+        Some(dict) => {
+            let entries: Vec<_> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
+                .into_iter()
+                .filter(|(key, _)| key.as_str() != Ok("__pyre_kw__"))
+                .collect();
+            let values: Vec<PyObjectRef> = entries.iter().map(|(_, value)| *value).collect();
+            let base = pyre_object::gc_roots::pin_roots(&values);
+            let mut names = Vec::with_capacity(entries.len());
+            for (key, _) in entries {
+                let w_name = pyre_object::w_str_from_wtf8(key);
+                pyre_object::gc_roots::pin_root(w_name);
+                names.push(w_name);
             }
-            let w_name = pyre_object::w_str_from_wtf8(key);
-            pyre_object::gc_roots::pin_root(w_name);
-            keyword_names_w.push(w_name);
-            keywords_w.push(value);
+            (names, base)
         }
-    }
+        None => (Vec::new(), 0),
+    };
     let signature =
         crate::gateway::Signature::new(vec!["iterable", "n", "strict"], None, None, 1, 0);
-    let arguments = crate::argument::Arguments::with_kw(positional, &keyword_names_w, &keywords_w);
     let w_kw_defaults = pyre_object::w_dict_new();
+    // A `dict` header moves, and the insertion below allocates both the key
+    // string and the dict's storage, so the pin has to be taken on the fresh
+    // word and the receiver read back out of the slot.  `w_bool_from` hands
+    // back an immortal singleton, so evaluating it after that read allocates
+    // nothing.
+    pyre_object::gc_roots::pin_root(w_kw_defaults);
+    let kw_defaults_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
         pyre_object::w_dict_setitem_str_no_proxy(
-            w_kw_defaults,
+            pyre_object::gc_roots::shadow_stack_get(kw_defaults_slot),
             "strict",
             pyre_object::w_bool_from(false),
         )
     };
-    pyre_object::gc_roots::pin_root(w_kw_defaults);
-    let kw_defaults_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let keywords_w: Vec<PyObjectRef> = (0..keyword_names_w.len())
+        .map(|index| unsafe {
+            pyre_object::gc_roots::shadow_stack_get(keyword_values_base + index)
+        })
+        .collect();
+    let positional_w: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| unsafe { pyre_object::gc_roots::shadow_stack_get(positional_base + index) })
+        .collect();
+    let arguments =
+        crate::argument::Arguments::with_kw(&positional_w, &keyword_names_w, &keywords_w);
     let mut scope_w = vec![PY_NULL; signature.scope_length()];
     arguments.parse_into_scope(PY_NULL, &mut scope_w, "batched", &signature, None, unsafe {
         pyre_object::gc_roots::shadow_stack_get(kw_defaults_slot)
@@ -30283,7 +30556,15 @@ fn descr_del_dict(
     if unsafe { pyre_object::is_exception(w_obj) } {
         return Err(crate::PyError::type_error("__dict__ may not be deleted"));
     }
-    crate::baseobjspace::setdict(w_obj, pyre_object::w_dict_new())?;
+    // A `list` subclass instance is a real `W_ListObject` and moves, so the
+    // receiver is pinned and the replacement mapping is built before the slot
+    // is read — an inline `w_dict_new()` would run after the receiver had
+    // already been evaluated.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.base();
+    roots.pin_root(w_obj);
+    let w_dict = pyre_object::w_dict_new();
+    crate::baseobjspace::setdict(roots.get(obj_slot), w_dict)?;
     Ok(pyre_object::w_none())
 }
 

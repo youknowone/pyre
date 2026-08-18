@@ -15496,6 +15496,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let result_len = pyre_object::w_list_len(lst);
             let mut result_slots = Vec::with_capacity(result_len);
             for index in 0..result_len {
+                // Reading an element out of an unboxed list boxes it, and that
+                // allocation can relocate the list itself, so the owner supplies
+                // it again on every step instead of a word carried across.
+                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let lst = (*(w_self as *const pyre_object::interp_itertools::W_Product)).lst;
                 let item = pyre_object::w_list_getitem(lst, index as i64)
                     .expect("product result in range");
                 pyre_object::gc_roots::pin_root(item);
