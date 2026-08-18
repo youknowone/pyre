@@ -156,9 +156,13 @@ mod super_tests {
 
 /// Python property descriptor object.
 ///
-/// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc]`
+/// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc |
+/// fget_watchers | fset_watchers]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY")]
 pub struct W_Property {
+    /// `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
+    /// "w_fdel?"]` declares all three quasi-immutable; the hidden watcher
+    /// fields below implement the `?` for the two a fold bakes.
     pub fget: PyObjectRef,
     pub fset: PyObjectRef,
     pub fdel: PyObjectRef,
@@ -175,6 +179,23 @@ pub struct W_Property {
     /// was copied from `fget.__doc__` (descriptor.py:196-204); `_copy`
     /// uses it to drop the inherited doc when the getter is replaced.
     pub getter_doc: bool,
+    /// The hidden `mutate_w_fget` field for `descriptor.py:175
+    /// _immutable_fields_ = ["w_fget?", ...]` — see [`crate::quasiimmut`].
+    ///
+    /// Holds no GC pointers, so the derived `PTR_OFFSETS` has nothing to walk
+    /// here.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
+    /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
+    /// stated precondition: the lock cannot be remapped out from under a
+    /// holder.  A property the collector reclaims without a prior invalidation
+    /// leaks its instance box, the same bounded leak `W_TypeObject` carries,
+    /// because a GC object's `Drop` never runs.
+    ///
+    /// `w_fdel?` is declared upstream on the same line and gets no watcher
+    /// here: no fold bakes `fdel`, so nothing would ever register on it.  A
+    /// `__delete__` fold must add the third one rather than bake without it.
+    pub fget_watchers: crate::quasiimmut::QuasiImmutField,
+    /// The `w_fset?` twin of [`Self::fget_watchers`].
+    pub fset_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Allocate a new property object.
@@ -214,6 +235,8 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
                     w_doc: PY_NULL,
                     w_name: PY_NULL,
                     getter_doc: false,
+                    fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
+                    fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
                 },
             );
         }
@@ -228,6 +251,8 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         w_doc: PY_NULL,
         w_name: PY_NULL,
         getter_doc: false,
+        fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
     })
 }
 
@@ -269,6 +294,19 @@ pub unsafe fn w_property_reinit(
     fdel: PyObjectRef,
 ) {
     let prop = obj as *mut W_Property;
+    // `rclass.py:715-718 hook_setfield` emits `jit_force_quasi_immutable`
+    // ahead of every store to a `?` field, so the accessors this replaces stop
+    // being trace constants before they stop being the live values.  Nothing
+    // else revokes them: re-initialising an installed descriptor changes no
+    // type's version tag, which is the only other pin a fold over `obj.name`
+    // holds.  The `is_installed` test is `pyjitpl.py:1112`'s
+    // `mutatebox.nonnull()` — a property no loop watches pays one load.
+    if (*prop).fget != fget && (*prop).fget_watchers.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fget_watchers);
+    }
+    if (*prop).fset != fset && (*prop).fset_watchers.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fset_watchers);
+    }
     (*prop).fget = fget;
     (*prop).fset = fset;
     (*prop).fdel = fdel;
@@ -276,6 +314,69 @@ pub unsafe fn w_property_reinit(
     (*prop).w_name = PY_NULL;
     (*prop).getter_doc = false;
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// `quasiimmut.py:116-126 get_current_qmut_instance` for
+/// `descriptor.py:175`'s `w_fget?` — install the instance at RECORD time so a
+/// write reached later in the same trace sees it.  The
+/// [`w_type_install_quasi_immut`](crate::typeobject::w_type_install_quasi_immut)
+/// shape.
+///
+/// # Safety
+/// `obj` must point to a live [`W_Property`].
+pub unsafe fn w_property_install_fget_watcher(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const W_Property))
+        .fget_watchers
+        .ensure_installed();
+}
+
+/// The `w_fset?` twin of [`w_property_install_fget_watcher`].
+///
+/// # Safety
+/// `obj` must point to a live [`W_Property`].
+pub unsafe fn w_property_install_fset_watcher(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const W_Property))
+        .fset_watchers
+        .ensure_installed();
+}
+
+/// `quasiimmut.py:72-75 register_loop_token` for `w_fget?` — record a compiled
+/// loop's invalidation flag so `property.__init__` revokes it.
+///
+/// # Safety
+/// `obj` must point to a live [`W_Property`].
+pub unsafe fn w_property_register_fget_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const W_Property))
+        .fget_watchers
+        .register_loop_token(flag);
+}
+
+/// The `w_fset?` twin of [`w_property_register_fget_watcher`].
+///
+/// # Safety
+/// `obj` must point to a live [`W_Property`].
+pub unsafe fn w_property_register_fset_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const W_Property))
+        .fset_watchers
+        .register_loop_token(flag);
 }
 
 /// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot

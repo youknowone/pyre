@@ -6377,10 +6377,12 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let holder_attr = pyre_jit_trace::descr::holder_attr_descr().index();
     let holder_typ = pyre_jit_trace::descr::holder_typ_descr().index();
     let audit_holder_hooks = pyre_jit_trace::descr::audit_holder_hooks_descr().index();
+    let property_fget = pyre_jit_trace::descr::property_fget_descr().index();
+    let property_fset = pyre_jit_trace::descr::property_fset_descr().index();
     // Hoisted because each accessor clones a `LazyLock` descr; the index also
     // decides which type `dep_ptr` is cast to, so the chain below ends in a
     // fail-loud default rather than reinterpreting a headerless map node as a
-    // `W_TypeObject`.  These seven plus the nine `Function` fields
+    // `W_TypeObject`.  These nine plus the nine `Function` fields
     // `function_quasi_immut_slot` resolves are every quasi-immutable descr this
     // binary mints — see the same reasoning on `state.rs
     // install_quasiimmut_field`.
@@ -6419,6 +6421,16 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
             } else if field_index == audit_holder_hooks {
                 pyre_interpreter::module::sys::vm::audit_holder_register_hooks_watcher(
                     dep_ptr as *const _,
+                    &flag,
+                );
+            } else if field_index == property_fget {
+                pyre_object::descriptor::w_property_register_fget_watcher(
+                    dep_ptr as pyre_object::PyObjectRef,
+                    &flag,
+                );
+            } else if field_index == property_fset {
+                pyre_object::descriptor::w_property_register_fset_watcher(
+                    dep_ptr as pyre_object::PyObjectRef,
                     &flag,
                 );
             } else if let Some(slot) = pyre_jit_trace::descr::function_quasi_immut_slot(field_index)

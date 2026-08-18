@@ -6200,7 +6200,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, fget)) = (unsafe {
+    let Some((w_type, version_tag, w_descr, fget)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_get_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -6230,7 +6230,12 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_obj),
     ];
     let fget_const = ctx.trace_ctx.const_ref(fget as i64);
-    try_walker_inline_resolved_user_call(
+    // Everything below emits, and the callee inline has decline paths of its
+    // own past this point, so keep a rewind point the way the type-call fold
+    // does.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
+    let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -6260,7 +6265,12 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
         // read (same allowance the exception `__str__`/`__repr__` override uses).
         false,
         None,
-    )
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 /// Inline the receiver type's `__getattr__` hook for an attribute the type and
@@ -6503,7 +6513,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, fset)) = (unsafe {
+    let Some((w_type, version_tag, w_descr, fset)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_set_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
@@ -6542,7 +6552,10 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_value),
     ];
     let fset_const = ctx.trace_ctx.const_ref(fset as i64);
-    try_walker_inline_resolved_user_call(
+    // Rewind point for the same reason as the getter twin.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fset_descr())?;
+    let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -6571,7 +6584,12 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
         true,
         false,
         None,
-    )
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 /// Whether a concrete object is the canonical machine-word `int` layout that

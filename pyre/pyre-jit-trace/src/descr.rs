@@ -69,6 +69,20 @@ const HOLDER_TYP_INDEX: u32 = MAPDICT_DESCR_TAG | 3;
 // `descr.rs`).
 const AUDIT_HOLDER_HOOKS_INDEX: u32 = MAPDICT_DESCR_TAG | 4;
 
+// `W_Property.fget` / `.fset` are `PyObjectRef` at the first two offsets past
+// the object header — the single most crowded coordinate in the tree, since
+// every `W_*` class's first reference field lands there.  A
+// `stable_field_index(offset, size, type, signed)` would therefore name a
+// layout, not an owner, and the index is what selects the pointer cast in
+// `install_quasiimmut_field` / `register_quasi_immutable_deps`.  Reserved for
+// the same reason as the map-node block above, in a tag of its own because the
+// owner here IS a `PyObject` and the reasoning that groups those four does not
+// apply.  Disjoint from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT,
+// `object.typeptr` (0x6000_0000), the native mapdict block, and the GC tid.
+const PROPERTY_DESCR_TAG: u32 = 0x5100_0000;
+const PROPERTY_FGET_INDEX: u32 = PROPERTY_DESCR_TAG;
+const PROPERTY_FSET_INDEX: u32 = PROPERTY_DESCR_TAG | 1;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -3288,6 +3302,63 @@ static AUDIT_HOLDER_HOOKS_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
 
 pub fn audit_holder_hooks_descr() -> DescrRef {
     AUDIT_HOLDER_HOOKS_FIELD_DESCR.clone()
+}
+
+/// `descriptor.py:175 W_Property._immutable_fields_ = ["w_fget?", "w_fset?",
+/// "w_fdel?"]` — the property's getter slot.
+///
+/// The LOAD_ATTR property fold inlines `fget(obj)` against a descriptor the
+/// receiver's class + `_version_tag?` already pin, which makes the descriptor
+/// object constant but says nothing about its accessor slots: `__init__` on an
+/// installed property replaces them in place and bumps no type's version.  The
+/// `?` is what covers the slot, and it costs a `QUASIIMMUT_FIELD` marker plus
+/// one `GUARD_NOT_INVALIDATED` per trace rather than a load and a `GUARD_VALUE`
+/// per iteration — see [`walker_pin_type_version_tag`](crate::jitcode_dispatch)
+/// for why the difference is load-bearing across a residual call.
+///
+/// A marker only: the fold never loads through the baked descriptor pointer,
+/// which is what keeps it clear of the baked-`ConstPtr` hazard that made the
+/// inline-call path skip its `Function.code` reads for a constant callable.
+static PROPERTY_FGET_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            PROPERTY_FGET_INDEX,
+            core::mem::offset_of!(pyre_object::descriptor::W_Property, fget),
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "W_Property.fget".to_string(),
+            "fget".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn property_fget_descr() -> DescrRef {
+    PROPERTY_FGET_FIELD_DESCR.clone()
+}
+
+/// The `w_fset?` twin of [`PROPERTY_FGET_FIELD_DESCR`], read by the STORE_ATTR
+/// property fold.
+static PROPERTY_FSET_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            PROPERTY_FSET_INDEX,
+            core::mem::offset_of!(pyre_object::descriptor::W_Property, fset),
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "W_Property.fset".to_string(),
+            "fset".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn property_fset_descr() -> DescrRef {
+    PROPERTY_FSET_FIELD_DESCR.clone()
 }
 
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs:34-46`) — the instance

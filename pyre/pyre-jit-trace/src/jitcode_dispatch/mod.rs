@@ -8626,6 +8626,34 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+/// The `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
+/// "w_fdel?"]` twin of [`walker_pin_type_version_tag`]: pin the accessor slot
+/// a property fold is about to bake.
+///
+/// The receiver pins the folds already hold — class, `w_class`, and the type's
+/// `_version_tag?` — make the DESCRIPTOR a compile-time answer, and stop
+/// there: `property.__init__` on an installed descriptor replaces `fget`/
+/// `fset` in place and bumps no type's version, so without this the trace kept
+/// calling the previous getter.  Upstream covers exactly that gap with the `?`
+/// on the slots themselves.
+///
+/// A marker, never a load: the descriptor is a baked `ConstPtr`, and reading a
+/// field through one is the hazard `try_walker_inline_resolved_user_call`'s
+/// `guards_the_callee_function` gate exists to avoid.  `record_quasiimmut_field`
+/// dereferences the owner only at record and compile time, and a property is
+/// allocated non-moving, so both reads see the object where the constant says
+/// it is.
+fn walker_pin_property_accessor<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_descr: pyre_object::PyObjectRef,
+    field: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
+    let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 /// The `celldict.py:34 _immutable_fields_ = ["version?"]` twin of
 /// [`walker_pin_type_version_tag`]: pin the module namespace's strategy version
 /// so the folds that bake a slot's stored cell (or the absence of a name) are
