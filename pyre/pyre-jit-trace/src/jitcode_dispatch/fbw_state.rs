@@ -1335,12 +1335,39 @@ pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
 
 /// Mark the walk as carrying a recorded-but-unexecuted side effect only
 /// the legacy replay applies.
+///
+/// The mark decides which walk-end roads stay open, and a walk that also
+/// executed an unrecoverable effect has none left, so the useful question at
+/// a stuck walk is which residual took this branch.  Six call sites forward a
+/// cause here and the flag itself keeps no provenance; `PYRE_UNJOURNALED_SITE`
+/// names the caller, in the shape `PYRE_LB_SITE` uses for the callee-inline
+/// declines.
+#[track_caller]
 pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
+    if std::env::var_os("PYRE_UNJOURNALED_SITE").is_some() {
+        let loc = std::panic::Location::caller();
+        let declined_at = super::residual_call::last_declined_symbolic_site()
+            .map(|(l, op)| format!("{}:{} opcode={op:?}", l.file(), l.line()))
+            .unwrap_or_else(|| "?".to_owned());
+        eprintln!(
+            "[unjournaled-site] {}:{} cause={cause:?} executed={} declined_at={declined_at}",
+            loc.file(),
+            loc.line(),
+            fbw_executed_effect_count(),
+        );
+    }
     match cause {
         ResidualDecline::ValueUnavailable => {
             FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(true));
         }
         ResidualDecline::Symbolic => FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(true)),
+        // Nothing to mark: an elidable call applies no effect, so there is no
+        // pending write for a replay to be the only carrier of.  Setting the
+        // flag here would be read as "this walk still owes an effect" and shut
+        // every no-replay walk-end road, leaving a walk that had already
+        // executed unrecoverable effects with replay as its only exit — which
+        // re-applies them.
+        ResidualDecline::PureUnfolded => {}
     }
 }
 

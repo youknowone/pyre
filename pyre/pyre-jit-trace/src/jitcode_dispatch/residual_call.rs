@@ -2432,6 +2432,35 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
     }
 }
 
+/// The symbolic decline, minted in one place so it carries provenance.
+///
+/// Ten preconditions inside [`try_execute_residual_call_via_executor`] end in
+/// this same value, and the walk only learns that ONE of them fired.  That is
+/// enough while the decline is benign, but a decline taken after the walk has
+/// already executed an unrecoverable effect leaves the walk with no sound
+/// walk-end road, and then which precondition fired is the question.  Record
+/// the caller and the opcode it refused for `PYRE_UNJOURNALED_SITE` to print.
+#[track_caller]
+fn declined_symbolic(call_opcode: OpCode) -> ResidualExecOutcome {
+    // Read the caller OUTSIDE the closure: a closure body is not
+    // `#[track_caller]`, so `Location::caller()` inside one names the closure.
+    let site = std::panic::Location::caller();
+    DECLINED_SYMBOLIC_SITE.with(|c| c.set(Some((site, call_opcode))));
+    ResidualExecOutcome::Declined(ResidualDecline::Symbolic)
+}
+
+thread_local! {
+    static DECLINED_SYMBOLIC_SITE: std::cell::Cell<
+        Option<(&'static std::panic::Location<'static>, OpCode)>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+/// Where the last symbolic decline of this thread was taken, for diagnostics.
+pub(crate) fn last_declined_symbolic_site()
+-> Option<(&'static std::panic::Location<'static>, OpCode)> {
+    DECLINED_SYMBOLIC_SITE.with(|c| c.get())
+}
+
 pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
@@ -2477,7 +2506,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // diagnostic-probe runs leave the flag `false` so the call is
     // recorded symbolically without re-running its side effects.
     if !ctx.is_authoritative_executor {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     let plain_or_loopinvariant = matches!(
         call_opcode,
@@ -2502,11 +2531,24 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN
     );
+    // The `CallPure*` shapes reach this dispatcher too, against what the
+    // callers' comments assume: `try_fold_pure_call_via_executor` runs first
+    // and answers only the calls whose every argbox carries a value, and the
+    // rest arrive here.  They are declined like any other opcode this executor
+    // does not run, but they are declined for a different reason and owe a
+    // different follow-up, so name it.
+    let is_pure = matches!(
+        call_opcode,
+        OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
+    );
+    if is_pure {
+        return Ok(ResidualExecOutcome::Declined(ResidualDecline::PureUnfolded));
+    }
     if !plain_or_loopinvariant && !is_may_force {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     if allboxes.is_empty() {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     // Same funcbox-must-be-const invariant as `try_fold_pure_call_via_executor`:
     // a non-const funcbox carries a stale stamp and dereferencing it as a
@@ -2515,7 +2557,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // implicitly requires constness too (residual_call descrs always
     // carry a fixed funcptr at translation time).
     if !allboxes[0].is_constant() {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     // The LOAD_CONST helper (oopspec `LoadConst`) has a dedicated fold in the
     // residual_call dispatchers: when the const index AND the code pointer
@@ -2529,12 +2571,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `w_code_get_ptr` and faults.  Leave it symbolic, mirroring the fold's
     // "falls through to the generic record" contract.
     if call_descr.get_extra_info().pyre_helper == majit_ir::PyreHelperKind::LoadConst {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     let funcptr_val = ctx.trace_ctx.box_value(allboxes[0]);
     let func_ptr = match funcptr_val {
         Some(majit_ir::Value::Int(addr)) => addr,
-        _ => return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic)),
+        _ => return Ok(declined_symbolic(call_opcode)),
     };
     // Safety gate — reject `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
@@ -2550,7 +2592,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // range test would misclassify every real funcptr on aarch64 Linux,
     // whose 48-bit VA maps code at 0xaaab…/0xffff…).
     if majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor
     // (`pop`/`push`/`peek`/`peek_at`) reads or mutates the live frame's
@@ -2565,7 +2607,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // frame whose operand stack the compiled trace's preceding pushes have
     // populated.
     if pyre_interpreter::is_pyframe_operand_stack_accessor(func_ptr as usize) {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     // The `list_write_barrier` residual (the #171 object-append fold's Object
     // arm leaves it as a residual because it is `#[dont_look_inside]`) is pure
@@ -2583,7 +2625,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // so it never participates in the metainterp's side-effect analysis.
     let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
-        return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+        return Ok(declined_symbolic(call_opcode));
     }
     // A void residual (CALL_N family) is a side effect with no result box, so
     // `do_residual_call` executes it EAGERLY during the walk and resumes the
@@ -2716,7 +2758,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             continue;
         }
         if matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) && arg == 0 {
-            return Ok(ResidualExecOutcome::Declined(ResidualDecline::Symbolic));
+            return Ok(declined_symbolic(call_opcode));
         }
     }
     // #57 (Finding #1, in-place container mutation): an in-flight FOR_ITER
@@ -6078,8 +6120,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
-        // this dispatcher (they fold via the pure-call executor).
+        // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
+        // dispatcher too when its fold could not answer, and declines as
+        // `PureUnfolded` — no effect, so no such obligation.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
@@ -7242,8 +7285,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
-        // this dispatcher (they fold via the pure-call executor).
+        // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
+        // dispatcher too when its fold could not answer, and declines as
+        // `PureUnfolded` — no effect, so no such obligation.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
@@ -7489,8 +7533,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // A decline leaves the call recorded symbolically WITHOUT running
         // it — a side effect only the legacy replay applies, so the
         // walk-end no-replay commit must stay off for this trace (see
-        // `fbw_has_unjournaled_effect`).  Pure/elidable calls never reach
-        // this dispatcher (they fold via the pure-call executor).
+        // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
+        // dispatcher too when its fold could not answer, and declines as
+        // `PureUnfolded` — no effect, so no such obligation.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {

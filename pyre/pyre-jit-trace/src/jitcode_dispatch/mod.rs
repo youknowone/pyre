@@ -5127,6 +5127,11 @@ pub fn bool_box_truth_reset() {
 pub(crate) enum ResidualDecline {
     ValueUnavailable,
     Symbolic,
+    /// A `CallPure*` the fold could not answer, because some argbox is still
+    /// symbolic.  Recording it and moving on IS the tracing behaviour — an
+    /// elidable call has no effect for anything to apply later — so unlike the
+    /// other two this decline leaves no obligation behind.
+    PureUnfolded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
