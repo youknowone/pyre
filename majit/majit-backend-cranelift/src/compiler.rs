@@ -6054,6 +6054,67 @@ fn emit_host_call(
     return_type.map(|_| builder.inst_results(call)[0])
 }
 
+/// `regalloc.py before_call()`: write the paired `GUARD_NOT_FORCED`'s fail
+/// args into the jitframe slots the guard's resume data names, so a callee
+/// that forces this frame reads the values the resume decoder expects.
+/// `force_token_to_dead_frame` hands `jf_frame` straight to
+/// `ResumeDataDirectReader`, whose `TAGBOX(n)` items index these slots; a slot
+/// left unwritten is decoded as whatever the entry left there.
+///
+/// `call_result` is the not-yet-bound result variable of the call being
+/// emitted: a fail arg naming it has no value yet, so it is stored as 0.
+/// `history.py:227/268/314` Const fail args carry their value inline and never
+/// alias the result, so only body-namespace refs take that branch.
+#[allow(clippy::too_many_arguments)]
+fn spill_guard_fail_args(
+    builder: &mut FunctionBuilder,
+    info: &GuardInfo,
+    call_result: u32,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+    jf_ptr: CValue,
+    constants: &indexmap::IndexMap<u32, i64>,
+    ref_root_slots: &[(u32, usize)],
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+) {
+    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+        let raw = if !arg_ref.is_constant()
+            && arg_ref.raw() == call_result
+            && !constants.contains_key(&arg_ref.raw())
+        {
+            builder.ins().iconst(cl_types::I64, 0)
+        } else {
+            resolve_failarg_opref(
+                builder,
+                constants,
+                jf_ptr,
+                ref_root_slots,
+                stale_ref_vars,
+                demoted_failarg_slots,
+                ref_root_base_ofs,
+                arg_ref,
+            )
+        };
+        builder.ins().store(
+            MemFlagsData::trusted(),
+            raw,
+            jf_ptr,
+            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+        );
+    }
+    if info.gcmap != 0 {
+        emit_jitframe_write_barrier(
+            builder,
+            ptr_type,
+            call_conv,
+            jf_ptr,
+            jitframe_write_barrier_flag(),
+        );
+    }
+}
+
 /// assembler.py:1348-1367 _push_all_regs_to_frame:
 /// Save all defined GC ref variables to jf_frame slots before a call
 /// that may trigger GC. The per-call gcmap (from get_gcmap) tells the
@@ -10524,7 +10585,7 @@ impl CraneliftBackend {
                 jf_ptr = builder.ins().get_pinned_reg(ptr_type);
             }
 
-            let paired_may_force = matches!(
+            let paired_guard_not_forced = matches!(
                 op.opcode,
                 OpCode::CallMayForceI
                     | OpCode::CallMayForceR
@@ -10533,8 +10594,12 @@ impl CraneliftBackend {
                     | OpCode::CallReleaseGilI
                     | OpCode::CallReleaseGilF
                     | OpCode::CallReleaseGilN
+                    | OpCode::CallAssemblerI
+                    | OpCode::CallAssemblerR
+                    | OpCode::CallAssemblerF
+                    | OpCode::CallAssemblerN
             );
-            // Both emitters below publish the paired GUARD_NOT_FORCED's Ref
+            // The three emitters below publish the paired GUARD_NOT_FORCED's Ref
             // fail-args into the dense `jf_frame` area *before* the call
             // (regalloc.py:812-820 `before_call`, which spills through the
             // frame manager so those boxes stay in `fm.bindings` and every
@@ -10543,7 +10608,7 @@ impl CraneliftBackend {
             // otherwise leaves the just-written copies holding pre-collection
             // addresses that `force_token_to_dead_frame` and the guard's exit
             // republish.
-            let pre_call_failarg_slots: &[usize] = if paired_may_force {
+            let pre_call_failarg_slots: &[usize] = if paired_guard_not_forced {
                 guard_infos
                     .get(guard_idx)
                     .filter(|info| info.source_op_index == op_idx + 1)
@@ -11922,6 +11987,30 @@ impl CraneliftBackend {
                         builder
                             .ins()
                             .store(MemFlagsData::trusted(), zero, cur_jf, JF_DESCR_OFS);
+                        // regalloc.py before_call() parity, as the
+                        // `call_may_force` / `call_release_gil` arms do: the
+                        // descr stored above is what `force` copies into
+                        // `jf_descr`, so the slots that descr's resume data
+                        // indexes have to hold this guard's fail args before
+                        // the callee runs.  A callee that reaches
+                        // `force_virtualizable_token` on this frame otherwise
+                        // decodes a `TAGBOX` against slots the entry left
+                        // behind — the entry's own reds — and writes them into
+                        // the virtualizable's static fields.
+                        spill_guard_fail_args(
+                            &mut builder,
+                            info,
+                            vi,
+                            ptr_type,
+                            call_conv,
+                            cur_jf,
+                            &constants,
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     }
 
                     // rewrite.py:613-653 gen_malloc_frame parity:
@@ -12345,45 +12434,19 @@ impl CraneliftBackend {
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
                     // values if the callee forces the frame.
-                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        // The call result (vi) is not yet available — write 0.
-                        // history.py:227/268/314: Const fail_args carry value
-                        // inline and never alias the call-result body var
-                        // `vi`. Only body-namespace refs participate in the
-                        // `raw == vi` not-yet-bound check.
-                        let raw = if !arg_ref.is_constant()
-                            && arg_ref.raw() == vi
-                            && !constants.contains_key(&arg_ref.raw())
-                        {
-                            builder.ins().iconst(cl_types::I64, 0)
-                        } else {
-                            resolve_failarg_opref(
-                                &mut builder,
-                                &constants,
-                                cur_jf,
-                                &ref_root_slots,
-                                &stale_ref_vars,
-                                &demoted_failarg_slots,
-                                ref_root_base_ofs,
-                                arg_ref,
-                            )
-                        };
-                        builder.ins().store(
-                            MemFlagsData::trusted(),
-                            raw,
-                            cur_jf,
-                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
-                        );
-                    }
-                    if info.gcmap != 0 {
-                        emit_jitframe_write_barrier(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            cur_jf,
-                            jitframe_write_barrier_flag(),
-                        );
-                    }
+                    spill_guard_fail_args(
+                        &mut builder,
+                        info,
+                        vi,
+                        ptr_type,
+                        call_conv,
+                        cur_jf,
+                        &constants,
+                        &ref_root_slots,
+                        &stale_ref_vars,
+                        &demoted_failarg_slots,
+                        ref_root_base_ofs,
+                    );
                     bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
@@ -12436,44 +12499,19 @@ impl CraneliftBackend {
                     // regalloc.py before_call() parity: spill fail_args to
                     // jf_frame so force_token_to_dead_frame() reads correct
                     // values if the callee forces the frame.
-                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-                        // history.py:227/268/314: Const fail_args carry value
-                        // inline and never alias the call-result body var
-                        // `vi`. Only body-namespace refs participate in the
-                        // `raw == vi` not-yet-bound check.
-                        let raw = if !arg_ref.is_constant()
-                            && arg_ref.raw() == vi
-                            && !constants.contains_key(&arg_ref.raw())
-                        {
-                            builder.ins().iconst(cl_types::I64, 0)
-                        } else {
-                            resolve_failarg_opref(
-                                &mut builder,
-                                &constants,
-                                cur_jf,
-                                &ref_root_slots,
-                                &stale_ref_vars,
-                                &demoted_failarg_slots,
-                                ref_root_base_ofs,
-                                arg_ref,
-                            )
-                        };
-                        builder.ins().store(
-                            MemFlagsData::trusted(),
-                            raw,
-                            cur_jf,
-                            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
-                        );
-                    }
-                    if info.gcmap != 0 {
-                        emit_jitframe_write_barrier(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            cur_jf,
-                            jitframe_write_barrier_flag(),
-                        );
-                    }
+                    spill_guard_fail_args(
+                        &mut builder,
+                        info,
+                        vi,
+                        ptr_type,
+                        call_conv,
+                        cur_jf,
+                        &constants,
+                        &ref_root_slots,
+                        &stale_ref_vars,
+                        &demoted_failarg_slots,
+                        ref_root_base_ofs,
+                    );
                     bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
