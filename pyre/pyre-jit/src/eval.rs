@@ -9100,14 +9100,24 @@ fn maybe_compile_and_run(
     if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
-    // `WarmEnterState::maybe_compile` is the port of warmstate.py's complete
-    // JitCell decision: token lookup, DONT_TRACE_HERE retry, dead-token
-    // cleanup, and counter tick. Keeping that policy in one symbol prevents
-    // the eval entry point from assigning different semantics to its flags.
+    // `WarmEnterState::maybe_compile_decision` is the port of warmstate.py's
+    // complete JitCell decision: token lookup, DONT_TRACE_HERE retry,
+    // dead-token cleanup, and counter tick. Keeping that policy in one symbol
+    // prevents the eval entry point from assigning different semantics to its
+    // flags.
+    //
+    // The decision alone, without the `cell.flags |= JC_TRACING` that
+    // warmstate.py:441 makes with it: upstream marks the cell in the same
+    // `bound_reached` that runs the trace, and pyre marks it there too —
+    // `MetaInterp::bound_reached` reaches the cell through
+    // `force_start_tracing_for_key`. Marking it here as well makes that call
+    // read this door's own mark and decline with `AlreadyTracing`, so the
+    // trace this door just decided on never starts and the counter it reset
+    // never re-arms the location.
     match driver
         .meta_interp_mut()
         .warm_state_mut()
-        .maybe_compile(green_key)
+        .maybe_compile_decision(green_key)
     {
         majit_metainterp::warmstate::HotResult::StartTracing => {
             if driver

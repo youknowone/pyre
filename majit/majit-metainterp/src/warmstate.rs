@@ -707,7 +707,7 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_threshold)
     }
 
-    pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
+    pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
             let has_procedure_token = cell.get_procedure_token().is_some();
@@ -723,7 +723,7 @@ impl WarmEnterState {
             }
             if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
             {
-                return self.start_tracing_cell(cell_key);
+                return HotResult::StartTracing;
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
             // procedure token that has since been invalidated — that dead entry
@@ -752,7 +752,25 @@ impl WarmEnterState {
             return HotResult::NotHot;
         }
 
-        self.start_tracing_cell(cell_key)
+        HotResult::StartTracing
+    }
+
+    /// [`Self::maybe_compile_decision`] followed by the mark that
+    /// `warmstate.py:441` makes once the decision is taken:
+    /// `cell.flags |= JC_TRACING | JC_TRACING_OCCURRED`, immediately before
+    /// the `try:` that runs the trace.
+    ///
+    /// Callers that go straight from the answer into `setup_tracing` want
+    /// this form. A caller that instead delegates to a tracing entry point
+    /// which makes its own decision — `MetaInterp::bound_reached` reaches the
+    /// same cell through [`Self::force_start_tracing_for_key`] — must take the
+    /// decision alone, or that second call reads the mark this one left and
+    /// answers `AlreadyTracing` for the trace it was asked to start.
+    pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
+        match self.maybe_compile_decision(cell_key) {
+            HotResult::StartTracing => self.start_tracing_cell(cell_key),
+            other => other,
+        }
     }
 
     /// warmstate.py:446-511 `WarmEnterState.maybe_compile_and_run` —
