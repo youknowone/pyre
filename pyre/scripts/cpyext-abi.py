@@ -281,7 +281,12 @@ def command_snapshot(args):
 
 def command_check(args):
     declarations, typedefs = load_record()
-    disagree, converted = [], []
+    # An entry point CPython does not declare is ordinary -- the macros it
+    # spells over struct fields have to be calls here.  One that differs from a
+    # declared name only in case is not: it is a misspelling, and an extension
+    # calling the real name finds no symbol.
+    by_lowercase = {n.lower(): n for n in declarations}
+    disagree, converted, misspelled = [], [], []
     checked = {"export": 0, "header inline": 0}
     entry_points = [("export", f"cpyext/{m}.rs", n, p, r)
                     for m, n, p, r in read_exports()]
@@ -289,6 +294,9 @@ def command_check(args):
                      for h, n, p, r in read_header_inlines()]
     for kind, where_defined, name, params, ret in entry_points:
         if name not in declarations:
+            spelled = by_lowercase.get(name.lower())
+            if spelled is not None:
+                misspelled.append((where_defined, name, spelled))
             converted.append((where_defined, name))
             continue
         theirs, their_ret = declarations[name]
@@ -302,13 +310,15 @@ def command_check(args):
     print(f"{checked['export']} exports and {checked['header inline']} header "
           f"inlines checked against the recorded CPython ABI; "
           f"{len(converted)} have no CPython declaration")
+    for where_defined, name, spelled in misspelled:
+        print(f"\n{name} is spelled {spelled} by CPython  [{where_defined}]")
     for where_defined, name, ours, theirs, where in disagree:
         print(f"\n{name} disagrees on its {where}  [{where_defined}]")
         print(f"    pyre    ({', '.join(ours)})")
         print(f"    cpython ({', '.join(theirs)})")
-    if disagree:
-        print(f"\n{len(disagree)} entry point(s) do not match the C declaration "
-              f"an extension is compiled against.")
+    if disagree or misspelled:
+        print(f"\n{len(disagree) + len(misspelled)} entry point(s) do not match "
+              f"the C declaration an extension is compiled against.")
         return 1
     print("every entry point matches.")
     return 0

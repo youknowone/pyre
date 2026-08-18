@@ -131,7 +131,7 @@ PyAPI_FUNC(PyObject *) PyImport_ImportModule(const char *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleNoBlock(const char *);
 
 /* cpyext/iterator.rs */
-PyAPI_FUNC(int) PyAiter_Check(PyObject *);
+PyAPI_FUNC(int) PyAIter_Check(PyObject *);
 PyAPI_FUNC(int) PyIter_Check(PyObject *);
 PyAPI_FUNC(PyObject *) PyIter_Next(PyObject *);
 PyAPI_FUNC(int) PyIter_NextItem(PyObject *, PyObject **);

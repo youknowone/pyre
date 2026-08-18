@@ -261,7 +261,7 @@ fixture.
 - the `tp_as_async` table as `__await__` / `__aiter__` / `__anext__`, with
   `am_send` reached through `PyIter_Send`, and the iterator entry points
   `PyObject_GetIter`, `PyObject_SelfIter`, `PyIter_Check`, `PyIter_Next`,
-  `PyIter_NextItem`, `PyObject_GetAIter` and `PyAiter_Check`
+  `PyIter_NextItem`, `PyObject_GetAIter` and `PyAIter_Check`
   (`cpyext/iterator.rs`);
 - the concrete `list`, `tuple` and `slice` protocols (`cpyext/listobject.rs`,
   `cpyext/tupleobject.rs`, `cpyext/sliceobject.rs`): all of `listobject.h` and
@@ -406,7 +406,7 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 747 public
    `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 407 are present, counting every form `Python.h` offers one
+   underscore -- 408 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like

@@ -71,7 +71,7 @@ pub unsafe extern "C" fn PyIter_Check(object: *mut CPyObject) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyAiter_Check(object: *mut CPyObject) -> c_int {
+pub unsafe extern "C" fn PyAIter_Check(object: *mut CPyObject) -> c_int {
     has_method(object, "__anext__")
 }
 
@@ -211,7 +211,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyObject_GetIter as *const ());
     std::hint::black_box(PyObject_SelfIter as *const ());
     std::hint::black_box(PyIter_Check as *const ());
-    std::hint::black_box(PyAiter_Check as *const ());
+    std::hint::black_box(PyAIter_Check as *const ());
     std::hint::black_box(PyIter_Next as *const ());
     std::hint::black_box(PyIter_NextItem as *const ());
     std::hint::black_box(PyObject_GetAIter as *const ());
