@@ -103,8 +103,8 @@ pub fn trace_unbox_int(
     use majit_ir::OpCode;
     // GUARD_CLASS(box, cls): guard takes object box directly,
     // backend loads typeptr at offset 0 (llgraph/runner.py:1245).
-    // Production callers (`trace_unbox_int_with_resume_descr`,
-    // `trace_unbox_float_with_resume`) already emit the GuardClass via
+    // Callers that route through `trace_unbox_int_with_resume_descr`
+    // already emit the GuardClass via
     // `frame.generate_guard` — by the time control reaches here,
     // `is_class_known(obj)` returns true and this branch is dead.  In
     // unit tests (`pyre/pyre-jit/src/trace_verify.rs`) the GuardClass is

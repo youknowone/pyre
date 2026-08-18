@@ -1,12 +1,12 @@
 //! `WalkerFrameOps` trait — abstraction over the small surface of
-//! `MIFrame` methods that the strategy-aware STORE_SUBSCR specialization
-//! emits.  The trait lets the shared strategy helpers
-//! (`generated_list_setitem_by_strategy`,
-//! `generated_list_setslice_same_len_by_strategy`,
-//! `generated_store_subscr_value`, and the `store_subscr_value` body in
-//! `trace_opcode.rs`) run against either `MIFrame` or the walker
-//! `WalkContext`, so both implementations emit the same
-//! `guard_class`+`SETARRAYITEM_GC`-family shape.
+//! `MIFrame` methods a trace-recording helper needs, so one helper body
+//! can run against either `MIFrame` or the walker `WalkContext` and emit
+//! the same guard-and-record shape from both.
+//!
+//! Its only remaining consumer is `state.rs`'s
+//! `trace_unbox_int_with_resume{,_descr}`, which today is reached from a
+//! unit test alone; the strategy-aware STORE_SUBSCR helpers this trait was
+//! introduced for have been deleted.
 //!
 //! ## Trait shape — `self`-only signatures, `ctx` reached via accessor
 //!

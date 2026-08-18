@@ -7968,8 +7968,7 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
 }
 
 /// Walker-native unbox of a fits-int `W_LongObject` operand into a raw i64 —
-/// the long analogue of [`walker_unbox_int`], mirroring
-/// [`crate::state::trace_unbox_long_with_resume`] but emitting the walker
+/// the long analogue of [`walker_unbox_int`], emitting the walker
 /// snapshot guards.  `is_plain_int1` accepts a `W_LongObject` whose BigInt
 /// fits a machine word (`type(w_obj) is W_LongObject and w_obj._fits_int()`,
 /// listobject.py), and `plain_int_w` unwraps it via `_int_w`:

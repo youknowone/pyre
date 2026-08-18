@@ -11890,8 +11890,8 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
 }
 
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
-/// helper residual_call (oopspec `StoreSubscr`, void result).  Ports
-/// `generated_store_subscr_value` → `generated_list_setitem_by_strategy`
+/// helper residual_call (oopspec `StoreSubscr`, void result).  Records the
+/// strategy-dispatched list store inline
 /// for the object-, int-, and float-storage list strategies with a non-negative
 /// concrete index (and a type-matching value for the unboxed strategies): `guard_class LIST` +
 /// `guard_value(strategy)` + unbox index + `IntLt` bounds guard + unbox
