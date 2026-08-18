@@ -5585,7 +5585,13 @@ pub fn delweakref(obj: PyObjectRef) {
 
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
-    getattr_str_impl(obj, name, true, false)
+    getattr_str_impl(obj, name, true, false).map_err(|mut err| {
+        // PyPy 9883bb2a9d `DescrOperation.getattr`: enrich an AttributeError
+        // only after the complete `__getattribute__` / `__getattr__` chain has
+        // failed, preserving a more specific inner lookup's existing context.
+        err.enrich_attribute_error_str(obj, name);
+        err
+    })
 }
 
 /// Shared body of `space.getattr` and the bare `object.__getattribute__` slot.
@@ -6403,13 +6409,24 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        getattr_str(obj, unsafe {
-            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
-        })
+    let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        // `getattr_str_impl` rather than `getattr_str`: this entry point already
+        // holds the wrapped name, so the enrichment below can hand it over
+        // directly instead of letting `enrich_attribute_error_str` allocate a
+        // fresh one, matching the `w_name`-taking `DescrOperation.getattr`.
+        getattr_str_impl(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            true,
+            false,
+        )
     } else {
         unsafe { getattr_surrogate(obj, w_name, name) }
-    }
+    };
+    result.map_err(|mut err| {
+        err.enrich_attribute_error(obj, w_name);
+        err
+    })
 }
 
 /// `_PyObject_LookupAttr` — the full `space.getattr` protocol for a caller

@@ -623,6 +623,75 @@ impl PyError {
         err
     }
 
+    /// PyPy `error.py:725-737 enrich_attribute_error` / CPython 3.14
+    /// `_PyObject_SetAttributeErrorContext`: an `AttributeError` escaping a
+    /// public attribute lookup gets the receiver and requested name when (and
+    /// only when) neither slot was already supplied by an inner lookup or by
+    /// the exception constructor.  In particular, an explicit `name=None` or
+    /// `obj=None` is a populated slot in CPython and must not be overwritten.
+    pub fn enrich_attribute_error(&mut self, w_obj: PyObjectRef, w_name: PyObjectRef) {
+        if self.kind != PyErrorKind::AttributeError || w_obj.is_null() || w_name.is_null() {
+            return;
+        }
+        if self.exc_object.is_null() {
+            if self.w_name_context.is_null() && self.w_obj_context.is_null() {
+                self.w_name_context = w_name;
+                self.w_obj_context = w_obj;
+            }
+            return;
+        }
+        unsafe {
+            let current_name =
+                pyre_object::interp_exceptions::w_exception_get_name(self.exc_object);
+            let current_obj =
+                pyre_object::interp_exceptions::w_exception_get_attr_obj(self.exc_object);
+            if current_name.is_null() && current_obj.is_null() {
+                pyre_object::interp_exceptions::w_exception_set_name(self.exc_object, w_name);
+                pyre_object::interp_exceptions::w_exception_set_attr_obj(self.exc_object, w_obj);
+            }
+        }
+    }
+
+    /// String-taking companion for pyre's optimized `getattr_str` path. PyPy
+    /// already carries a wrapped `w_name`; pyre delays that allocation until
+    /// an un-enriched AttributeError actually escapes. Root the receiver and
+    /// error payload while constructing it because the precise collector does
+    /// not scan this Rust `PyError` local.
+    pub fn enrich_attribute_error_str(&mut self, w_obj: PyObjectRef, name: &str) {
+        if self.kind != PyErrorKind::AttributeError || w_obj.is_null() {
+            return;
+        }
+        let missing = if self.exc_object.is_null() {
+            self.w_name_context.is_null() && self.w_obj_context.is_null()
+        } else {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_name(self.exc_object).is_null()
+                    && pyre_object::interp_exceptions::w_exception_get_attr_obj(self.exc_object)
+                        .is_null()
+            }
+        };
+        if !missing {
+            return;
+        }
+
+        let _roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = if self.exc_object.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(self.exc_object);
+            Some(slot)
+        };
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_obj);
+        let w_name = pyre_object::w_str_new(name);
+        if let Some(slot) = exc_slot {
+            self.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
+        let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        self.enrich_attribute_error(w_obj, w_name);
+    }
+
     pub fn value_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::ValueError, msg)
     }
