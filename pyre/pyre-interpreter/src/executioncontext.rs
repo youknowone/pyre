@@ -936,6 +936,14 @@ impl ExecutionContext {
         }
     }
 
+    /// CPython decrefs the removed value inside a DELETE opcode.  Pyre's
+    /// tracing collector reproduces that observable finalizer boundary with a
+    /// reachability pass after the container/frame slot has been cleared.
+    pub fn finalize_discarded_reference_now(&mut self) {
+        pyre_object::gc_hook::try_gc_collect_oldgen();
+        self._run_finalizers_now();
+    }
+
     /// Consume a failed-attribute finalization request after the live red
     /// frame has cleared its own dispatch flag.  This boundary has no live
     /// opcode temporaries outside the published PyFrame roots.
@@ -2647,13 +2655,29 @@ impl UserDelAction {
             if self.gc_disabled(current()) {
                 return;
             }
-            if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
-                report_error(
-                    self.base.space,
-                    &error,
-                    rustpython_wtf8::Wtf8::new(""),
-                    current(),
+            if let Err(mut error) = crate::baseobjspace::generator_finalize(current()) {
+                // CPython 3.14 `_PyGen_Finalize` reports close failures with
+                // `PyErr_FormatUnraisable`, whose hook object is None and
+                // whose message names the generator itself.
+                let w_exc = error.to_exc_object();
+                let frame = crate::eval::current_frame();
+                if !frame.is_null() {
+                    unsafe {
+                        crate::pytraceback::record_application_traceback(
+                            w_exc,
+                            frame,
+                            (*frame).last_instr as i64,
+                        )
+                    };
+                }
+                let repr = unsafe { crate::display::py_repr_wtf8(current()) }
+                    .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
+                let where_desc = crate::display::wtf8_format!(
+                    "Exception ignored while closing generator ",
+                    repr
                 );
+                report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
+                crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
             // pyframe.py:75-76/276-279 stores this back-reference as
             // `f_generator_wref` in translated PyPy.  The collector has
