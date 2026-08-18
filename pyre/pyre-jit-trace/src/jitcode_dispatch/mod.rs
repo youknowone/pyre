@@ -7331,7 +7331,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
     let resid_raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
-            fbw_abort_nested_unjournaled_residual(ctx, pc)?;
+            fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
             fbw_mark_unjournaled_effect(cause);
             false
         }

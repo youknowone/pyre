@@ -2624,6 +2624,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // GC rewrite pass after optimization (`backend/llsupport/rewrite.py:948`),
     // so it never participates in the metainterp's side-effect analysis.
     let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
+    // The void bookkeeping residuals a descent into a translated body meets
+    // before it reaches any real work: a stack check and a `OnceLock` lazy
+    // init, both of which reach the same state when re-run.  Joined into
+    // `provably_side_effect_free` below rather than repeated at each
+    // accounting, so every consumer of that predicate — the nested sub-walk
+    // decline included — reads one answer.  Before a callee body was traced
+    // through, these ran inside one opaque residual that the caller's own
+    // recognisers could exempt whole; tracing splits them out, and each split
+    // piece has to carry the exemption the whole used to.
+    let is_rerunnable_bookkeeping =
+        pyre_interpreter::is_rerunnable_bookkeeping_residual(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(declined_symbolic(call_opcode));
     }
@@ -3100,6 +3111,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         majit_ir::PyreHelperKind::NewtupleFromArray | majit_ir::PyreHelperKind::NewlistFromArray
     );
     let provably_side_effect_free = reentrant_residual
+        || is_rerunnable_bookkeeping
         || helper == majit_ir::PyreHelperKind::ForIterNext
         || observed_exact_scalar_str
         || observed_exact_str_iter
@@ -3121,7 +3133,23 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // false, and rollback would miss that concrete mutation.  The helper no-ops
     // on an empty session framestack, so top-level depth-1 behavior is unchanged.
     if !provably_side_effect_free {
-        fbw_abort_nested_unjournaled_residual(ctx, op_pc)?;
+        if std::env::var_os("PYRE_LB_SITE").is_some() {
+            // The decline cause the gate prints is `None` on this arm, so name
+            // the callee here instead: once a body is traced through, the
+            // residual that fails the predicate is one of its whole helper set.
+            let name = pyre_interpreter::jit_trace_fnaddrs()
+                .iter()
+                .find(|(_, a)| *a == func_ptr as i64)
+                .map(|(n, _)| *n);
+            eprintln!(
+                "[lb-exec] pc={op_pc} helper={helper:?} extraeffect={:?} elidable={} \
+                 rtype={:?} fn={name:?}",
+                ei.extraeffect,
+                ei.check_is_elidable(),
+                call_descr.result_type(),
+            );
+        }
+        fbw_abort_nested_unjournaled_residual(ctx, op_pc, None)?;
     }
     // `vinfo.tracing_before_residual_call(virtualizable)`
     // heap half: every decline gate has now passed, so the helper WILL
@@ -6126,7 +6154,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
             }
@@ -7291,7 +7319,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
             }
@@ -7539,7 +7567,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
-                fbw_abort_nested_unjournaled_residual(ctx, op.pc)?;
+                fbw_abort_nested_unjournaled_residual(ctx, op.pc, Some(cause))?;
                 fbw_mark_unjournaled_effect(cause);
                 false
             }

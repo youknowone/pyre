@@ -1346,9 +1346,18 @@ pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
 pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
     if std::env::var_os("PYRE_UNJOURNALED_SITE").is_some() {
         let loc = std::panic::Location::caller();
-        let declined_at = super::residual_call::last_declined_symbolic_site()
-            .map(|(l, op)| format!("{}:{} opcode={op:?}", l.file(), l.line()))
-            .unwrap_or_else(|| "?".to_owned());
+        // Only a `Symbolic` decline records a site, so read the cell only for
+        // that cause: on any other one it still holds whichever earlier
+        // symbolic decline happened to run last, and reporting that would name
+        // an unrelated residual as this mark's origin.
+        let declined_at = match cause {
+            ResidualDecline::Symbolic => super::residual_call::last_declined_symbolic_site()
+                .map_or_else(
+                    || "?".to_owned(),
+                    |(l, op)| format!("{}:{} opcode={op:?}", l.file(), l.line()),
+                ),
+            _ => "n/a".to_owned(),
+        };
         eprintln!(
             "[unjournaled-site] {}:{} cause={cause:?} executed={} declined_at={declined_at}",
             loc.file(),
@@ -1729,7 +1738,19 @@ fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> 
 pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
+    cause: Option<ResidualDecline>,
 ) -> Result<(), DispatchError> {
+    // `cause` is `None` when the residual is about to EXECUTE and `Some` when
+    // it declined and was left recorded.  A `PureUnfolded` decline records an
+    // elidable call the fold could not answer: it applies no effect, so it
+    // leaves the sub-walk's "commits nothing" promise intact and there is
+    // nothing for a resume to double — the same reason
+    // `fbw_mark_unjournaled_effect` sets no flag for it.  The other two causes
+    // leave a recorded-but-unexecuted write only the legacy replay applies,
+    // which is what this decline exists to refuse.
+    if matches!(cause, Some(ResidualDecline::PureUnfolded)) {
+        return Ok(());
+    }
     // RPython `do_residual_call` runs the residual executor at any framestack
     // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
@@ -1772,8 +1793,11 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     };
     if nested && (foriter_deferred_inline.is_some() || hazardous_callee.is_some()) {
         if std::env::var_os("PYRE_LB_SITE").is_some() {
+            // Report the decline cause too: the arm flags say which promise
+            // broke, not what broke it, and once a callee body is traced
+            // through, the candidates are its whole helper set.
             eprintln!(
-                "[lb-arm] pc={pc} deferred={} hazard={}",
+                "[lb-arm] pc={pc} cause={cause:?} deferred={} hazard={}",
                 foriter_deferred_inline.is_some(),
                 hazardous_callee.is_some(),
             );

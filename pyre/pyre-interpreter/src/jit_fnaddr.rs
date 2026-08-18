@@ -334,6 +334,53 @@ pub fn is_list_write_barrier(addr: usize) -> bool {
     addrs.contains(&(addr as i64))
 }
 
+/// Void-returning bookkeeping residuals whose re-execution reaches the same
+/// state, the [`is_list_write_barrier`] category for helpers that are not GC
+/// barriers.
+///
+/// The FBW effect accounting proxies "writes live heap" by a `Void` result
+/// type, because a void residual has no value for the walk to carry and is
+/// therefore usually a store.  These two are the void residuals a descent into
+/// a translated body meets first, and for both the proxy is wrong:
+///
+/// * `stack_check` only READS — the recursion depth counter and the stack
+///   bounds — and raises on overflow; the counter is bumped around calls, not
+///   here.  Its slow path revises a cached stack bound, which recomputes to
+///   the same answer.
+/// * `ensure_object_subclass_ranges_initialized` is a `OnceLock` lazy init,
+///   idempotent by construction, and every production entry point has already
+///   run the full initialisation before a trace executes, so the residual is a
+///   no-op there.
+///
+/// Neither leaves anything for a replay to double, so counting them keeps a
+/// walk that met only these from taking any of the no-replay walk-end roads —
+/// the abort then falls back to the legacy entry replay, which re-applies
+/// whatever the walk really did commit.
+///
+/// This is deliberately NOT an `#[elidable]` annotation: elidability licenses
+/// the optimizer to FOLD the call away, and `stack_check` must actually run to
+/// raise `RecursionError`.  Re-runnability and foldability are different
+/// questions, and only the former is asked here.
+///
+/// Matches the registered fnaddr for the same address-stability reason as
+/// [`is_list_write_barrier`].
+pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static RERUNNABLE_ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = RERUNNABLE_ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::stack_check::stack_check")
+                    || path.ends_with("::pyobject::ensure_object_subclass_ranges_initialized")
+                    || *path == "pyre_object::ensure_object_subclass_ranges_initialized"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
