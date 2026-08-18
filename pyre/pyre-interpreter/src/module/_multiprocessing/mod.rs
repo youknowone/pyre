@@ -416,7 +416,10 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     } else {
         return Err(crate::PyError::type_error("SemLock: name must be a string"));
     };
-    let unlink = crate::baseobjspace::is_true(args[5])?;
+    // `unwrap_spec(unlink=int)` (interp_semaphore.py:572) — the flag is
+    // converted the same way `kind`, `value` and `maxvalue` beside it are,
+    // so a type whose `__bool__` and `__index__` disagree does not decide it.
+    let unlink = crate::baseobjspace::int_w(args[5])? != 0;
     // interp_semaphore.py:574-575.
     if kind != RECURSIVE_MUTEX && kind != SEMAPHORE {
         return Err(crate::PyError::value_error("unrecognized kind"));

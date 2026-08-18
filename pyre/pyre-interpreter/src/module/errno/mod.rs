@@ -118,23 +118,14 @@ crate::py_module! {
                 ("ECONNREFUSED", host_errno::ECONNREFUSED),
                 ("EHOSTDOWN", host_errno::EHOSTDOWN),
                 ("EHOSTUNREACH", host_errno::EHOSTUNREACH),
-                // `interp_errno.py` also declares these, and every platform
-                // pyre builds for supplies them: unix through `libc`,
-                // windows through the `WSA`-derived aliases `host_env`
-                // re-exports under their plain names (`errno.rs`
-                // `reexport_wsa!`), which is the same mapping
-                // `interp_errno.py` performs for `win_errors`.
+                // `interp_errno.py` declares these in the same list, and
+                // every platform pyre builds for defines them in its own
+                // `errno.h`.
                 ("EILSEQ", host_errno::EILSEQ),
                 ("ECANCELED", host_errno::ECANCELED),
                 ("ENOTSUP", host_errno::ENOTSUP),
                 ("EOWNERDEAD", host_errno::EOWNERDEAD),
                 ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
-                ("ESTALE", host_errno::ESTALE),
-                ("EUSERS", host_errno::EUSERS),
-                ("EREMOTE", host_errno::EREMOTE),
-                ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
-                ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
-                ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
             ];
             for (name, value) in entries {
                 store(name, *value as i64);
@@ -142,6 +133,21 @@ crate::py_module! {
             #[cfg(unix)]
             {
                 let unix_entries: &[(&str, i32)] = &[
+                    // Declared in the same list, and supplied by `libc` here.
+                    // Windows reaches them only through `win_errors`
+                    // (`interp_errno.py:91-101`), which registers the `WSA`
+                    // spelling, adds the stripped name as a second binding
+                    // and leaves the reverse mapping naming the `WSA` one.
+                    // This module exports no `WSA` name to carry that reverse
+                    // entry, so storing the stripped names there would answer
+                    // `errorcode[code]` with a spelling the declaration never
+                    // assigns.
+                    ("ESTALE", host_errno::ESTALE),
+                    ("EUSERS", host_errno::EUSERS),
+                    ("EREMOTE", host_errno::EREMOTE),
+                    ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
+                    ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
+                    ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
                     ("ENOTBLK", host_errno::ENOTBLK),
                     ("ETXTBSY", host_errno::ETXTBSY),
                     ("ENOMSG", host_errno::ENOMSG),
