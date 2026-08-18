@@ -8505,6 +8505,29 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
         frame
     };
+    // A hop whose `f_backref` is a live `JitVirtualRef` names another INLINED
+    // frame, and this walk publishes a forced pair only for the level it owns
+    // (`pyjitpl.py:3349-3367 vrefs_after_residual_call`).  The emitted
+    // `jit_force_virtual` then reaches a vref the optimizer materialises with a
+    // null `forced` field, so the hop lands on whatever that read produces
+    // rather than on the caller's frame.  Scan the record-time chain for one
+    // before anything is emitted: the seed below forces the walk's own vref for
+    // real and finishes its pair, so a later decline would leave the residual
+    // `getframe` a shorter chain than the interpreter's.  Non-virtual slots
+    // hold the frame pointer itself (`_jit_vref.py:40`), so following them here
+    // forces nothing.
+    {
+        let mut scan = frame;
+        for _ in 0..depth_value {
+            let raw = unsafe { (*scan).f_backref };
+            if raw.is_null()
+                || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) }
+            {
+                return Ok(None);
+            }
+            scan = raw;
+        }
+    }
 
     // --- emit the specialized IR (walker-native) ---
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -8574,12 +8597,12 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     let mut cur_op = vable_op;
     let mut cur_ptr = frame;
     for _ in 0..depth_value {
+        let raw_ptr = unsafe { (*cur_ptr).f_backref };
         let raw_op = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             cur_op,
             crate::descr::pyframe_f_backref_descr(),
         );
-        let raw_ptr = unsafe { (*cur_ptr).f_backref };
         ctx.trace_ctx.set_opref_concrete(
             raw_op,
             majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
