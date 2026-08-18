@@ -13008,36 +13008,69 @@ pub fn call(
     w_args: PyObjectRef,
     w_kwds: Option<PyObjectRef>,
 ) -> PyObjectRef {
-    if let Some(w_kwargs) = w_kwds
-        && !w_kwargs.is_null()
-        && !unsafe { is_none(w_kwargs) }
-    {
-        panic!("call with kwargs is not yet implemented in pyre");
-    }
+    // baseobjspace.py:1213-1215 — the packed objects remain live while
+    // `Arguments.frompacked` expands `*args` / `**kwargs`, either of which can
+    // execute Python and collect.  RPython's GC transform roots these locals;
+    // publish and reload the corresponding raw pointers explicitly.
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = roots.base();
+    roots.pin_root(callable);
+    roots.pin_root(w_args);
+    roots.pin_root(w_kwds.unwrap_or(PY_NULL));
+    let callable = || roots.get(root_base);
+    let w_args = || roots.get(root_base + 1);
+    let w_kwds = || roots.get(root_base + 2);
 
-    let mut args = Vec::new();
-    unsafe {
-        if is_tuple(w_args) {
-            let len = w_tuple_len(w_args);
-            args.reserve(len);
-            for i in 0..len {
-                if let Some(arg) = w_tuple_getitem(w_args, i as i64) {
-                    args.push(arg);
-                }
-            }
-        } else if is_list(w_args) {
-            let len = w_list_len(w_args);
-            args.reserve(len);
-            for i in 0..len {
-                if let Some(arg) = w_list_getitem(w_args, i as i64) {
-                    args.push(arg);
-                }
-            }
-        } else if !w_args.is_null() {
-            panic!("call() expects tuple or list positional arguments");
+    let args = crate::argument::Arguments::frompacked(
+        (!w_args().is_null()).then_some(w_args()),
+        (!w_kwds().is_null()).then_some(w_kwds()),
+    );
+    let args = match args {
+        Ok(args) => args,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            return PY_NULL;
+        }
+    };
+    match call_args(callable(), &args) {
+        Ok(result) => result,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            PY_NULL
         }
     }
-    call_function(callable, &args)
+}
+
+/// PyPy `descroperation.py:189 call_args` — dispatch one structured
+/// `Arguments` instance without flattening its keyword half.
+pub fn call_args(
+    callable: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    if let (Some(keyword_names_w), Some(keywords_w)) =
+        (args.keyword_names_w.as_ref(), args.keywords_w.as_ref())
+        && !keyword_names_w.is_empty()
+    {
+        debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+        let mut kwargs = Vec::with_capacity(keyword_names_w.len());
+        for (&name, &value) in keyword_names_w.iter().zip(keywords_w.iter()) {
+            if unsafe { !is_str(name) } {
+                return Err(PyError::type_error("keywords must be strings"));
+            }
+            kwargs.push((unsafe { w_str_get_wtf8(name) }.to_owned(), value));
+        }
+        return crate::call::call_with_kwargs_in_ctx(
+            crate::call::getexecutioncontext(),
+            callable,
+            &args.arguments_w,
+            &kwargs,
+        );
+    }
+    crate::call::call_callable_in_ctx(
+        crate::call::getexecutioncontext(),
+        callable,
+        &args.arguments_w,
+    )
 }
 
 /// PyPy: baseobjspace.py `call_obj_args` — add a leading object before args.
@@ -19778,6 +19811,43 @@ pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_expands_packed_arguments_and_keywords() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        crate::call::clear_call_error();
+
+        let kwargs = w_dict_new();
+        setitem(kwargs, w_str_new("answer"), w_int_new(42)).unwrap();
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(kwargs));
+        assert!(!result.is_null(), "dict(**kwargs) must return a dict");
+        assert!(crate::call::take_call_error().is_none());
+        let value = unsafe { w_dict_getitem_str(result, "answer") }.expect("keyword stored");
+        assert_eq!(unsafe { w_int_get_value(value) }, 42);
+    }
+
+    #[test]
+    fn call_reports_packed_shape_errors_instead_of_panicking() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+
+        crate::call::clear_call_error();
+        let result = call(dict_type, w_int_new(1), None);
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-iterable *args error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        assert!(error.message_text().contains("argument after *"));
+
+        crate::call::clear_call_error();
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(w_none()));
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-mapping **kwargs error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        assert!(error.message_text().contains("argument after **"));
+    }
 
     #[test]
     fn uint_and_truncatedint_use_rbigint_word_conversions() {
