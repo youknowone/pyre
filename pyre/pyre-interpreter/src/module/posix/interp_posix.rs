@@ -94,6 +94,77 @@ fn require_env_mapping(
     )))
 }
 
+/// The `key=value` byte entries an exec takes from `mapping`, in the order its
+/// `keys()` and `values()` hold them.
+///
+/// Both sequences are snapshotted before any element is encoded, so a
+/// `__fspath__` running during the encoding cannot make a later read observe a
+/// mutation it performed.  How many variables there are is the mapping's own
+/// `len()`, so a snapshot too short to cover it is an error rather than a
+/// quietly shorter environment.
+///
+/// `function` names the caller in the errors, and `accepts_none` spells the
+/// message for an entry point that also takes `None` — what `None` means is
+/// decided before the call, never here.
+fn collect_env_entries(
+    mapping: PyObjectRef,
+    function: &str,
+    accepts_none: bool,
+) -> Result<Vec<Vec<u8>>, crate::PyError> {
+    let _env_roots = pyre_object::gc_roots::push_roots();
+    let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
+    require_env_mapping(
+        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+        function,
+        accepts_none,
+    )?;
+    let pair_count =
+        crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(mapping_slot))? as usize;
+    let mut bases = [0usize; 2];
+    let mut lengths = [0usize; 2];
+    for (i, method) in ["keys", "values"].into_iter().enumerate() {
+        let sequence = crate::baseobjspace::call_method(
+            pyre_object::gc_roots::shadow_stack_get(mapping_slot),
+            method,
+            &[],
+        );
+        if sequence.is_null() {
+            return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                crate::PyError::type_error(format!("{function}: env must be a mapping"))
+            }));
+        }
+        let items = crate::baseobjspace::unpackiterable(sequence, -1)?;
+        bases[i] = pyre_object::gc_roots::pin_roots(&items);
+        lengths[i] = items.len();
+    }
+    // Capacity follows the available snapshots, while iteration still uses the
+    // mapping's reported length and rejects a snapshot too short to cover it.
+    let mut env = Vec::with_capacity(pair_count.min(lengths[0]).min(lengths[1]));
+    for i in 0..pair_count {
+        if i >= lengths[0] || i >= lengths[1] {
+            return Err(crate::PyError::index_error("list index out of range"));
+        }
+        let key = crate::gateway::fsencode_bytes_w(pyre_object::gc_roots::shadow_stack_get(
+            bases[0] + i,
+        ))?;
+        let value = crate::gateway::fsencode_bytes_w(pyre_object::gc_roots::shadow_stack_get(
+            bases[1] + i,
+        ))?;
+        // PyPy's `_env2interp` permits the Windows `=C:` form and rejects `=`
+        // only after the first byte.
+        if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
+            return Err(crate::PyError::value_error(
+                "illegal environment variable name",
+            ));
+        }
+        let mut entry = key;
+        entry.push(b'=');
+        entry.extend_from_slice(&value);
+        env.push(entry);
+    }
+    Ok(env)
+}
+
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 fn sysconf_names() -> &'static [(&'static str, i32)] {
     &[
@@ -5643,80 +5714,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array(&argv);
 
-                    // CPython 3.14 snapshots `keys()` and `values()` before
-                    // encoding; unlike PyPy's `_env2interp`, this prevents
-                    // `__fspath__` from making a second mapping read observe a
-                    // mutation performed while encoding a snapshot element.
-                    let _env_roots = pyre_object::gc_roots::push_roots();
-                    let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
-                    require_env_mapping(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "execve",
-                        false,
-                    )?;
-                    let pair_count = crate::baseobjspace::len_w(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                    )? as usize;
-                    let keys_obj = crate::baseobjspace::call_method(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "keys",
-                        &[],
-                    );
-                    if keys_obj.is_null() {
-                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                            crate::PyError::type_error("execve: env must be a mapping")
-                        }));
-                    }
-                    let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-                    let values_obj = crate::baseobjspace::call_method(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "values",
-                        &[],
-                    );
-                    if values_obj.is_null() {
-                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                            crate::PyError::type_error("execve: env must be a mapping")
-                        }));
-                    }
-                    let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
-                    let values_base = pyre_object::gc_roots::pin_roots(&values);
-                    let keys_len = keys.len();
-                    let values_len = values.len();
-                    drop(keys);
-                    drop(values);
-                    // Capacity follows the available snapshots, while iteration
-                    // still uses the mapping's reported length and rejects a
-                    // snapshot too short to cover it.
-                    let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
-                    for i in 0..pair_count {
-                        if i >= keys_len || i >= values_len {
-                            return Err(crate::PyError::index_error("list index out of range"));
-                        }
-                        let key = extract_path(pyre_object::gc_roots::shadow_stack_get(
-                            keys_base + i,
-                        ))?;
-                        let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
-                            values_base + i,
-                        ))?;
-                        // PyPy's `_env2interp` permits the Windows `=C:` form
-                        // and rejects `=` only after the first byte.
-                        if key.is_empty()
-                            || key.get(1..).is_some_and(|tail| tail.contains(&b'='))
-                        {
-                            return Err(crate::PyError::value_error(
-                                "illegal environment variable name",
-                            ));
-                        }
-                        let mut entry = key;
-                        entry.push(b'=');
-                        entry.extend_from_slice(&value);
-                        env.push(std::ffi::CString::new(entry).map_err(|_| {
-                            crate::PyError::value_error(
-                                "execve() environment contains an embedded null byte",
-                            )
-                        })?);
-                    }
+                    let env = collect_env_entries(args[2], "execve", false)?
+                        .into_iter()
+                        .map(|entry| {
+                            std::ffi::CString::new(entry).map_err(|_| {
+                                crate::PyError::value_error(
+                                    "execve() environment contains an embedded null byte",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let env_ptrs = exec_pointer_array(&env);
                     let errno = host_posix::exec_replace(
                         &[command_c],
@@ -8777,97 +8784,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // CPython's posix_spawn accepts None as "inherit environ";
                 // subprocess._posix_spawn uses exactly this form when Popen
                 // was called without an explicit env mapping.
-                if unsafe { pyre_object::is_none(mapping) } {
-                    let mut env = Vec::new();
-                    for (key, value) in host_os::vars_os() {
-                        let key = key.as_encoded_bytes();
-                        let value = value.as_encoded_bytes();
-                        let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
-                        entry.extend_from_slice(key);
-                        entry.push(b'=');
-                        entry.extend_from_slice(value);
-                        env.push(std::ffi::CString::new(entry).map_err(|_| {
+                let entries = if unsafe { pyre_object::is_none(mapping) } {
+                    host_os::vars_os()
+                        .map(|(key, value)| {
+                            let key = key.as_encoded_bytes();
+                            let value = value.as_encoded_bytes();
+                            let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
+                            entry.extend_from_slice(key);
+                            entry.push(b'=');
+                            entry.extend_from_slice(value);
+                            entry
+                        })
+                        .collect()
+                } else {
+                    collect_env_entries(mapping, "posix_spawn", true)?
+                };
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        std::ffi::CString::new(entry).map_err(|_| {
                             crate::PyError::value_error(
                                 "posix_spawn() environment contains an embedded null byte",
                             )
-                        })?);
-                    }
-                    return Ok(env);
-                }
-                // CPython 3.14 snapshots `keys()` and `values()` before
-                // encoding; unlike PyPy's `_env2interp`, this prevents
-                // `__fspath__` from making a second mapping read observe a
-                // mutation performed while encoding a snapshot element.
-                let _env_roots = pyre_object::gc_roots::push_roots();
-                let mapping_slot = pyre_object::gc_roots::pin_roots(&[mapping]);
-                require_env_mapping(
-                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                    "posix_spawn",
-                    true,
-                )?;
-                let pair_count = crate::baseobjspace::len_w(
-                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                )? as usize;
-                let keys_obj = crate::baseobjspace::call_method(
-                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                    "keys",
-                    &[],
-                );
-                if keys_obj.is_null() {
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::type_error("posix_spawn: env must be a mapping")
-                    }));
-                }
-                let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-                let values_obj = crate::baseobjspace::call_method(
-                    pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                    "values",
-                    &[],
-                );
-                if values_obj.is_null() {
-                    return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                        crate::PyError::type_error("posix_spawn: env must be a mapping")
-                    }));
-                }
-                let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
-                let values_base = pyre_object::gc_roots::pin_roots(&values);
-                let keys_len = keys.len();
-                let values_len = values.len();
-                drop(keys);
-                drop(values);
-                // Capacity follows the available snapshots, while iteration
-                // still uses the mapping's reported length and rejects a
-                // snapshot too short to cover it.
-                let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
-                for i in 0..pair_count {
-                    if i >= keys_len || i >= values_len {
-                        return Err(crate::PyError::index_error("list index out of range"));
-                    }
-                    let key = crate::gateway::fsencode_bytes_w(
-                        pyre_object::gc_roots::shadow_stack_get(keys_base + i),
-                    )?;
-                    let value = crate::gateway::fsencode_bytes_w(
-                        pyre_object::gc_roots::shadow_stack_get(values_base + i),
-                    )?;
-                    // PyPy's `_env2interp` permits the Windows `=C:` form and
-                    // rejects `=` only after the first byte.
-                    if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
-                        return Err(crate::PyError::value_error(
-                            "illegal environment variable name",
-                        ));
-                    }
-                    let mut entry = Vec::with_capacity(key.len() + 1 + value.len());
-                    entry.extend_from_slice(&key);
-                    entry.push(b'=');
-                    entry.extend_from_slice(&value);
-                    env.push(std::ffi::CString::new(entry).map_err(|_| {
-                        crate::PyError::value_error(
-                            "posix_spawn() environment contains an embedded null byte",
-                        )
-                    })?);
-                }
-                Ok(env)
+                        })
+                    })
+                    .collect()
             }
             fn collect_cstring_seq(
                 obj: pyre_object::PyObjectRef,
@@ -9985,81 +9926,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let argv = exec_argv_wide(args[1], "execve")?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
 
-                    // CPython 3.14 snapshots `keys()` and `values()` before
-                    // encoding; unlike PyPy's `_env2interp`, this prevents
-                    // `__fspath__` from making a second mapping read observe a
-                    // mutation performed while encoding a snapshot element.
-                    let _env_roots = pyre_object::gc_roots::push_roots();
-                    let mapping_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
-                    require_env_mapping(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "execve",
-                        false,
-                    )?;
-                    let pair_count = crate::baseobjspace::len_w(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                    )? as usize;
-                    let keys_obj = crate::baseobjspace::call_method(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "keys",
-                        &[],
-                    );
-                    if keys_obj.is_null() {
-                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                            crate::PyError::type_error("execve: env must be a mapping")
-                        }));
-                    }
-                    let keys = crate::baseobjspace::unpackiterable(keys_obj, -1)?;
-                    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
-                    let values_obj = crate::baseobjspace::call_method(
-                        pyre_object::gc_roots::shadow_stack_get(mapping_slot),
-                        "values",
-                        &[],
-                    );
-                    if values_obj.is_null() {
-                        return Err(crate::call::take_call_error().unwrap_or_else(|| {
-                            crate::PyError::type_error("execve: env must be a mapping")
-                        }));
-                    }
-                    let values = crate::baseobjspace::unpackiterable(values_obj, -1)?;
-                    let values_base = pyre_object::gc_roots::pin_roots(&values);
-                    let keys_len = keys.len();
-                    let values_len = values.len();
-                    drop(keys);
-                    drop(values);
-                    // Capacity follows the available snapshots, while iteration
-                    // still uses the mapping's reported length and rejects a
-                    // snapshot too short to cover it.
-                    let mut env = Vec::with_capacity(pair_count.min(keys_len).min(values_len));
-                    for i in 0..pair_count {
-                        if i >= keys_len || i >= values_len {
-                            return Err(crate::PyError::index_error("list index out of range"));
-                        }
-                        let key = extract_path(pyre_object::gc_roots::shadow_stack_get(
-                            keys_base + i,
-                        ))?;
-                        let value = extract_path(pyre_object::gc_roots::shadow_stack_get(
-                            values_base + i,
-                        ))?;
-                        // PyPy's `_env2interp` permits the Windows `=C:` form
-                        // and rejects `=` only after the first byte.
-                        if key.is_empty() || key.get(1..).is_some_and(|tail| tail.contains(&b'=')) {
-                            return Err(crate::PyError::value_error(
-                                "illegal environment variable name",
-                            ));
-                        }
-                        let mut entry = key;
-                        entry.push(b'=');
-                        entry.extend_from_slice(&value);
-                        env.push(
+                    let env = collect_env_entries(args[2], "execve", false)?
+                        .into_iter()
+                        .map(|entry| {
                             widestring::WideCString::from_os_str(&*os_str_from_bytes(&entry))
                                 .map_err(|_| {
                                     crate::PyError::value_error(
                                         "execve() environment contains an embedded null byte",
                                     )
-                                })?,
-                        );
-                    }
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
                     let env_ptrs = exec_pointer_array_wide(&env);
                     unsafe {
                         libc::wexecve(command_w.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
