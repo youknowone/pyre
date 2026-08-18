@@ -10416,6 +10416,30 @@ impl CraneliftBackend {
                     // deopt-only (never use_var'd in the body), so the loop header
                     // must not reload it every iteration.  Its home is seeded on
                     // the fall-through/loader edges and read directly by guards.
+                    // A kept param whose raw is NOT frame-resident needs no
+                    // ref-root store here: `regalloc.py` publishes a reference to
+                    // its frame home at `before_call()`, not at a LABEL, and every
+                    // reader agrees.  A guard's map is
+                    // `allocate_gcmap(&failarg_ref_slots)` and so never names the
+                    // ref-root region; `get_gcmap`, which does name it, is a
+                    // call-site map that `spill_ref_roots` refreshes on the
+                    // instruction before; and `resolve_failarg_opref` reaches the
+                    // raw through `use_var`.  Storing every one of them here put a
+                    // store per live reference on the loop header, i.e. on every
+                    // iteration of the loop.
+                    //
+                    // A raw carried in `demoted_failarg_slots` is the exception and
+                    // still has to be reconciled.  That map is trace-global while
+                    // `loop_phi_keep` is per LABEL, so a raw demoted at an earlier
+                    // LABEL can be a kept block param at this one — and for that
+                    // raw the home, not the SSA value, is what the readers use:
+                    // `get_gcmap` marks it with no liveness test, `spill_ref_roots`
+                    // and `reload_ref_roots` refuse to write it, and
+                    // `resolve_failarg_opref` tests the demoted offset before it
+                    // falls back to `use_var`.  Nothing else writes that word on a
+                    // loader re-entry, so dropping the store would leave the
+                    // collector tracing a slot this entry never wrote and guard
+                    // exits publishing an earlier iteration's object.
                     let mut param_idx = 0usize;
                     let mut label_param_sync_jf_ptr = None;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
@@ -10435,17 +10459,20 @@ impl CraneliftBackend {
                             && !arg_ref.is_constant()
                             && !constants.contains_key(&arg_ref.to_opref().raw())
                         {
-                            builder.def_var(var(arg_ref.to_opref().raw()), param);
-                            sync_ref_root_var(
-                                &mut builder,
-                                ptr_type,
-                                &mut label_param_sync_jf_ptr,
-                                &ref_root_slots,
-                                arg_ref.to_opref().raw(),
-                                param,
-                                ref_root_base_ofs,
-                                &mut synced_ref_vars,
-                            );
+                            let raw = arg_ref.to_opref().raw();
+                            builder.def_var(var(raw), param);
+                            if is_demoted_failarg(&demoted_failarg_slots, raw) {
+                                sync_ref_root_var(
+                                    &mut builder,
+                                    ptr_type,
+                                    &mut label_param_sync_jf_ptr,
+                                    &ref_root_slots,
+                                    raw,
+                                    param,
+                                    ref_root_base_ofs,
+                                    &mut synced_ref_vars,
+                                );
+                            }
                         }
                     }
                     // Entering the body LABEL (not the first label): body is
