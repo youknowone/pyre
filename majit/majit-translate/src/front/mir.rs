@@ -978,6 +978,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             &body,
             static_addrs,
             &struct_field_attrs,
+            &dont_look_inside,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2123,6 +2124,20 @@ pub(crate) fn struct_field_attrs_of(
     struct_field_attrs
 }
 
+/// The `#[dont_look_inside]` marker set for this LLBC, keyed
+/// `strip_crate_prefix(name_path())` — the same derivation the
+/// whole-program loop harvests inline for the return-token stamp.
+/// Recovered per call on the standalone lowering entries so their
+/// call-target builder declines the `CallTarget::Method` hint for the
+/// same residual callees the whole-program build does.
+pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
+    crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+        .into_iter()
+        .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
+        .map(|(path, _)| path)
+        .collect()
+}
+
 pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -2135,7 +2150,21 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
             fd.item_meta.name_path()
         ))
     })?;
-    lower_unstructured_with_static_addrs_and_attrs(llbc, fd, &u, static_addrs, struct_field_attrs)
+    // Standalone entry (the reader / tests / on-demand `GraphBodyProvider`):
+    // harvest the residual marker set from this LLBC so the call-target
+    // builder makes the SAME Method-hint decline the whole-program loop makes.
+    // The hot whole-program path passes its precomputed set directly to
+    // `lower_unstructured_with_static_addrs_and_attrs`, so this per-call
+    // harvest is only paid on the standalone paths.
+    let dont_look_inside = dont_look_inside_set_of(llbc);
+    lower_unstructured_with_static_addrs_and_attrs(
+        llbc,
+        fd,
+        &u,
+        static_addrs,
+        struct_field_attrs,
+        &dont_look_inside,
+    )
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -2151,6 +2180,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -2568,7 +2598,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // the monotonic one — unless `PYRE_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
-        let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
+        let mut lo = Lowering::new(
+            llbc,
+            name.clone(),
+            u,
+            static_addrs,
+            fd.generics.as_ref(),
+            dont_look_inside,
+        )?;
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -2600,7 +2637,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             }
         }
     }
-    let mut lo = Lowering::new(llbc, name.clone(), u, static_addrs, fd.generics.as_ref())?;
+    let mut lo = Lowering::new(
+        llbc,
+        name.clone(),
+        u,
+        static_addrs,
+        fd.generics.as_ref(),
+        dont_look_inside,
+    )?;
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -2618,7 +2662,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // inputargs), which is order-independent.  RPO only resolves the
         // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(llbc, name, u, static_addrs, fd.generics.as_ref())?;
+            let mut lo = Lowering::new(
+                llbc,
+                name,
+                u,
+                static_addrs,
+                fd.generics.as_ref(),
+                dont_look_inside,
+            )?;
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
@@ -2860,6 +2911,16 @@ struct IndexElemAlias {
 struct Lowering<'a> {
     graph: FunctionGraph,
     llbc: &'a Llbc,
+    /// Harvested `#[dont_look_inside]` marker set (keyed
+    /// `strip_crate_prefix(name_path())`, the same spelling
+    /// `stamp_return_token` uses at the whole-program registration loop).
+    /// A residual-marked inherent method must not route as
+    /// `CallTarget::Method`: that surfaces `getattr(recv, method)` on a
+    /// classed receiver whose classdict carries no method source, which
+    /// blocks at annotate. The call-target builder declines the Method
+    /// hint for a callee in this set so it routes as a `FunctionPath` the
+    /// registry resolves to the same residual fnaddr.
+    dont_look_inside: &'a std::collections::HashSet<String>,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
     arg_count: usize,
@@ -3072,6 +3133,7 @@ impl<'a> Lowering<'a> {
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
         generics: Option<&serde_json::Value>,
+        dont_look_inside: &'a std::collections::HashSet<String>,
     ) -> Result<Self, LowerError> {
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
@@ -3222,6 +3284,7 @@ impl<'a> Lowering<'a> {
         Ok(Self {
             graph,
             llbc,
+            dont_look_inside,
             body,
             static_addrs,
             arg_count,
@@ -9759,6 +9822,25 @@ impl<'a> Lowering<'a> {
                         return (segments, None);
                     }
                     let method_hint = self.impl_method_owner(fd);
+                    // A `#[dont_look_inside]` inherent method is a residual
+                    // call, not a trace target. Routing it as
+                    // `CallTarget::Method` surfaces `getattr(recv, method)`
+                    // on a classed receiver whose classdict carries no
+                    // method source, which blocks at annotate
+                    // (`complete_pending_blocks failed: Blocked block`).
+                    // Decline the Method hint for such a callee so it routes
+                    // as a `FunctionPath` the registry resolves to the same
+                    // residual fnaddr — the getattr surface vanishes and the
+                    // enclosing carrier annotates with no annotator change.
+                    let method_hint = if method_hint.is_some()
+                        && self
+                            .dont_look_inside
+                            .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+                    {
+                        None
+                    } else {
+                        method_hint
+                    };
                     // An impl-block associated function (the method
                     // gate rejected it — no `self` receiver) is
                     // spelled `[<qualified owner>, <fn>]`, the key the
