@@ -13405,7 +13405,8 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_list_new(items))
 }
 
-/// `id(obj)` — PyPy: baseobjspace.py id → object identity as int
+/// `operation.py:84-88 id(space, w_object)` — `space.id`, then the
+/// `builtins.id` audit event.
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
@@ -13418,10 +13419,22 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // to `compute_unique_id`, which incminimark implements through
     // `id_or_identityhash` (incminimark.py) so nursery moves preserve it.
     let obj = args[0];
-    Ok(match crate::function::immutable_unique_id(obj) {
+    let w_res = match crate::function::immutable_unique_id(obj) {
         Some(w_id) => w_id,
         None => w_int_new(pyre_object::gc_hook::gc_identity_hash(obj as usize) as i64),
-    })
+    };
+    // `operation.py:87 space.audit("builtins.id", [w_res])`, emitted after the
+    // id is computed so a hook sees the value the call is about to return.
+    if crate::module::sys::vm::audit_hooks_armed() {
+        // The event-name wrap and the hooks are both collection points, and the
+        // result reaches them only as a copied pointer.  Root it across the
+        // emit and read the answer back out of its slot.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let res_slot = pyre_object::gc_roots::pin_roots(&[w_res]);
+        crate::module::sys::vm::audit("builtins.id", &[w_res])?;
+        return Ok(pyre_object::gc_roots::shadow_stack_get(res_slot));
+    }
+    Ok(w_res)
 }
 
 /// `hash(obj)` — PyPy: `descroperation.py:1006 hash`.
