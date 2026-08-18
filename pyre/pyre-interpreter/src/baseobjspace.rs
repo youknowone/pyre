@@ -14490,9 +14490,15 @@ unsafe fn builtin_iter_override(
     obj: PyObjectRef,
     base: &'static pyre_object::PyType,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    // `lookup_where_pair` walks the MRO and fills the method cache, so the
+    // receiver must survive that step to be the one handed to the override.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
     let Some(method) = (unsafe { builtin_iter_replacement(obj, base) }) else {
         return Ok(None);
     };
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     // descroperation.py:339-341 — an explicit `__iter__ = None` override marks
     // the subclass non-iterable even though the lookup succeeds.
     if unsafe { is_none(method) } {
@@ -14520,6 +14526,17 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             obj
         }
     };
+    // Every builtin arm below asks `builtin_iter_override` whether a heap
+    // subtype replaced `__iter__` before it builds its cursor, and that lookup
+    // allocates — the override arm runs Python outright. The receiver reaches
+    // this frame as a plain argument, so nothing here roots it: a caller that
+    // popped it off its value stack first leaves the collection with no
+    // reference at all, and the cursor is then built over reclaimed memory.
+    // Publish it once for the whole call and read it back where a movable
+    // kind is consumed after that lookup.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
     // `pypy/objspace/std/dictmultiobject.py`
     // `W_BaseDictMultiIterObject` line-by-line port — pyre's
     // `W_BaseDictMultiIterObject`
@@ -14552,7 +14569,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::LIST_TYPE)? {
                 return Ok(w_iter);
             }
-            return Ok(pyre_object::w_list_iter_new(obj));
+            return Ok(pyre_object::w_list_iter_new(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            ));
         }
         if is_tuple(obj) {
             if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::TUPLE_TYPE)? {
@@ -14615,8 +14634,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::DICT_TYPE)? {
                 return Ok(w_iter);
             }
+            // The cursor stores this dict and outlives the frame, so the read
+            // has to name the copy the lookup above may have left behind.
             return Ok(pyre_object::dictmultiobject::w_dict_view_iterator_new(
-                obj,
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
                 pyre_object::dictmultiobject::DictViewKind::Keys,
             ));
         }
