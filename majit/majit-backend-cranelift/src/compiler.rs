@@ -10523,18 +10523,22 @@ impl CraneliftBackend {
                     // store per live reference on the loop header, i.e. on every
                     // iteration of the loop.
                     //
-                    // A raw carried in `demoted_failarg_slots` is the exception and
-                    // still has to be reconciled.  That map is trace-global while
-                    // `loop_phi_keep` is per LABEL, so a raw demoted at an earlier
-                    // LABEL can be a kept block param at this one — and for that
-                    // raw the home, not the SSA value, is what the readers use:
-                    // `get_gcmap` marks it with no liveness test, `spill_ref_roots`
-                    // and `reload_ref_roots` refuse to write it, and
-                    // `resolve_failarg_opref` tests the demoted offset before it
-                    // falls back to `use_var`.  Nothing else writes that word on a
-                    // loader re-entry, so dropping the store would leave the
-                    // collector tracing a slot this entry never wrote and guard
-                    // exits publishing an earlier iteration's object.
+                    // A raw carried in `demoted_failarg_slots` is the exception
+                    // and still has to be reconciled, in either home kind.  That
+                    // map is trace-global while `loop_phi_keep` is per LABEL, so a
+                    // raw demoted at an earlier LABEL can be a kept block param at
+                    // this one — and for that raw the home, not the SSA value, is
+                    // what the readers use: `resolve_failarg_opref` tests the
+                    // demoted offset before it falls back to `use_var`, and for a
+                    // ref home `get_gcmap` marks it with no liveness test while
+                    // `spill_ref_roots` and `reload_ref_roots` refuse to write it.
+                    // A loader re-entry refreshes only the dense carried slot this
+                    // block param arrives in, so without a store here the home
+                    // keeps the earlier LABEL's seed: the collector would trace a
+                    // ref slot this entry never wrote, and a guard below this
+                    // LABEL would publish an earlier iteration's value.  A demoted
+                    // non-ref is never in `ref_root_slots`, so `sync_ref_root_var`
+                    // emits nothing for it and its home takes the store directly.
                     let mut param_idx = 0usize;
                     let mut label_param_sync_jf_ptr = None;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
@@ -10557,16 +10561,31 @@ impl CraneliftBackend {
                             let raw = arg_ref.to_opref().raw();
                             builder.def_var(var(raw), param);
                             if is_demoted_failarg(&demoted_failarg_slots, raw) {
-                                sync_ref_root_var(
-                                    &mut builder,
-                                    ptr_type,
-                                    &mut label_param_sync_jf_ptr,
-                                    &ref_root_slots,
-                                    raw,
-                                    param,
-                                    ref_root_base_ofs,
-                                    &mut synced_ref_vars,
-                                );
+                                if ref_root_slots.iter().any(|(idx, _)| *idx == raw) {
+                                    sync_ref_root_var(
+                                        &mut builder,
+                                        ptr_type,
+                                        &mut label_param_sync_jf_ptr,
+                                        &ref_root_slots,
+                                        raw,
+                                        param,
+                                        ref_root_base_ofs,
+                                        &mut synced_ref_vars,
+                                    );
+                                } else {
+                                    let offset =
+                                        demoted_failarg_offset(&demoted_failarg_slots, raw)
+                                            .expect("demoted failarg has a frame home");
+                                    let value = coerce_ty(&mut builder, param, cl_types::I64);
+                                    let jf_ptr = cached_pinned_reg(
+                                        &mut builder,
+                                        ptr_type,
+                                        &mut label_param_sync_jf_ptr,
+                                    );
+                                    builder
+                                        .ins()
+                                        .store(MemFlagsData::new(), value, jf_ptr, offset);
+                                }
                             }
                         }
                     }
