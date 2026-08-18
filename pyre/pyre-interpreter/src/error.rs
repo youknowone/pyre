@@ -1003,7 +1003,7 @@ impl PyError {
     /// full stop `FormatMessageW` appends removed.  Reporting the bare code is
     /// the answer for a code the system cannot describe.
     #[cfg(windows)]
-    fn win32_strerror(winerror: i32) -> String {
+    pub(crate) fn win32_strerror(winerror: i32) -> String {
         #[cfg(feature = "host_env")]
         if let Some(message) =
             rustpython_host_env::windows::format_error_message(Some(winerror as u32))

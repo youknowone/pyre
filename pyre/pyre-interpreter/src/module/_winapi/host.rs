@@ -226,8 +226,12 @@ pub fn CreateJunction(src_path: PyObjectRef, dst_path: PyObjectRef) -> Result<()
 /// `_winapi.CopyFile2(existing_file_name, new_file_name, flags,
 /// progress_routine=None)`
 ///
-/// `progress_routine` is accepted and never called: the callback belongs in
-/// `CopyFile2`'s extended parameters, and that field is left unset.
+/// `progress_routine` is accepted and never called, which is what
+/// `_winapi.CopyFile2`'s own documentation states: "reserved for future use,
+/// but is currently not implemented.  Its value is ignored."  The parameter
+/// exists so a caller only has to test for `CopyFile2` itself, and the code
+/// that would put the callback in the extended parameters is commented out
+/// upstream.
 #[crate::pyre_function]
 pub fn CopyFile2(
     existing_file_name: PyObjectRef,
@@ -398,9 +402,13 @@ const WAIT_TIMEOUT: u32 = 258;
 
 /// `_winapi.WaitForMultipleObjects(handle_seq, wait_flag, milliseconds)`
 ///
-/// The reserved slot is where the interruption event goes upstream — pyre has
-/// no Windows event behind its SIGINT flag, so the slot stays empty and a wait
-/// runs to its timeout instead of ending in `InterruptedError`.
+/// The reserved slot is where `_PyOS_SigintEvent()` goes upstream.  pyre
+/// installs no OS signal handler on Windows at all — `pypysig_setflag` is a
+/// `#[cfg(unix)]` body and its Windows twin declines — so there is no SIGINT
+/// flag for an event to stand beside, the slot stays empty, and a wait runs to
+/// its timeout instead of ending in `InterruptedError`.  Wiring one in belongs
+/// with Windows signal delivery, not here; `lib_pypy/_winapi.py:379` leaves
+/// the same gap.
 #[crate::pyre_function]
 pub fn WaitForMultipleObjects(
     handle_seq: PyObjectRef,

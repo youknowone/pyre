@@ -73,6 +73,38 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
     Ok(units)
 }
 
+/// `PyErr_SetExcFromWindowsErr(PyExc_RuntimeError, 0)` — a `RuntimeError`
+/// carrying the arguments the OSError constructor takes: errno 0, the system's
+/// own text for the code, no filename, the code as a signed int, no second
+/// filename.  `RuntimeError` reads none of them and keeps the five as `args`.
+fn win32_runtime_error(code: u32) -> crate::PyError {
+    let message = crate::PyError::win32_strerror(code as i32);
+    let Some(cls) = crate::builtins::lookup_exc_class("RuntimeError") else {
+        return crate::PyError::runtime_error(message);
+    };
+    // Building an argument can collect, so each one is pinned as it is made:
+    // a Rust array of raw references is not something the collector updates.
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.base();
+    roots.pin_root(cls);
+    roots.pin_root(pyre_object::w_int_new(0));
+    roots.pin_root(pyre_object::w_str_new(&message));
+    roots.pin_root(pyre_object::w_none());
+    roots.pin_root(pyre_object::w_int_new(i64::from(code as i32)));
+    roots.pin_root(pyre_object::w_none());
+    let args = [
+        roots.get(cls_slot + 1),
+        roots.get(cls_slot + 2),
+        roots.get(cls_slot + 3),
+        roots.get(cls_slot + 4),
+        roots.get(cls_slot + 5),
+    ];
+    match crate::call::call_function_impl_result(roots.get(cls_slot), &args) {
+        Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
+        Err(error) => error,
+    }
+}
+
 crate::py_module! {
     "winsound",
     int_constants: {
@@ -187,12 +219,17 @@ crate::py_module! {
             }
             Ok(())
         }
-        // The BOOL is dropped: a sound id the system has no sound for is not
-        // an error, it just plays nothing.
-        fn MessageBeep(#[default(0i32)] type_: PyIndexCInt) {
-            unsafe {
-                windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(type_ as u32);
+        fn MessageBeep(#[default(0i32)] type_: PyIndexCInt) -> Result<(), crate::PyError> {
+            let beeped = {
+                let _blocked = crate::module::thread::before_external_block();
+                unsafe { windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(type_ as u32) }
+            };
+            if beeped == 0 {
+                return Err(win32_runtime_error(unsafe {
+                    windows_sys::Win32::Foundation::GetLastError()
+                }));
             }
+            Ok(())
         }
     }
 }

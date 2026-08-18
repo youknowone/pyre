@@ -3225,9 +3225,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // descriptor instead of going through `TextIOWrapper.write`, so it
     // substitutes the line separator itself — on the text, before encoding,
     // because at the byte level a utf-16 stdio encoding would be corrupted.
-    // The substitution is the one the stream is configured for and is read
-    // back from it, so a `reconfigure(newline=...)` reaches this path too.
-    // The count the caller gets back stays the length of what it passed in.
+    // The substitution is the one the stream is configured for, so a
+    // `reconfigure(newline=...)` reaches this path too.  It is resolved by
+    // name off `sys`, the way `live_stdio_encoding_errors` beside it resolves
+    // the encoding and the error handler: the function sits in the stream's
+    // instance dictionary rather than being bound to it, so it is handed the
+    // text and nothing else.  The count the caller gets back stays the length
+    // of what it passed in.
     fn encode_stdio_text(
         w_text: PyObjectRef,
         stream_name: &str,
