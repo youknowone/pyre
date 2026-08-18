@@ -107,8 +107,14 @@
 //!       (`inline_call.rs::walker_ec_enter`).  They still iterate zero
 //!       times for a callee the walker inlines without seeding a frame:
 //!       such a level has no frame object to take a `jit.virtual_ref`
-//!       of, where upstream's `perform_call` builds one for every
-//!       inlined call (`pyjitpl.py:2445-2476, 1862-1874`).
+//!       of.  Upstream always has one because it inlines the
+//!       interpreter's own frame construction as traced code, so the
+//!       app-level frame is an ordinary virtual the optimizer keeps —
+//!       and `ExecutionContext.enter`
+//!       (`executioncontext.py:88-89`) takes the vref of THAT.  Not of
+//!       the `MIFrame` `perform_call` → `newframe` pushes
+//!       (`pyjitpl.py:2445-2476, 1862-1874`), which is the tracer's own
+//!       register frame and never carries a vref.
 //!    b. **Codewriter-side**: `direct_assembler_call` + KEEPALIVE on
 //!       vablebox (`pyjitpl.py:3589-3609 + 2080-2081`). Walker's
 //!       residual_call dispatchers never receive `assembler_call=True`

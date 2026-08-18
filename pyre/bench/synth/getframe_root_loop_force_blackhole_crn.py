@@ -40,8 +40,8 @@
 # (`getframe_root_loop_force_blackhole_crn_declined`), which repeats this shape
 # at a force the fold declines and records 5 adopts / 5 aborts.
 #
-# Its effects are idempotent, though, which is exactly what hid the residual
-# heap half of a post-drive decline — see the `_nonidempotent` sibling.
+# The drive's effects are idempotent, though, which is exactly what hid the
+# residual heap half of a post-drive decline — see the `_nonidempotent` sibling.
 import sys
 
 
