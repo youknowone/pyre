@@ -1622,16 +1622,33 @@ fn format_render(
     use rustpython_common::format::{
         FieldName, FieldNamePart, FieldType, FormatParseError, FromTemplate,
     };
+    // A gateway hands a builtin its arguments as a native array rebuilt from
+    // root slots immediately before the indirect call
+    // (`call_builtin_code_positional`), so that array is right once and then
+    // frozen. Every field after the first is resolved once this loop has run
+    // `__getattr__` / `__repr__` / `__format__`, and a minor collection there
+    // relocates a young argument while leaving the array holding its pre-move
+    // address. Publish the run and both keyword sources here and read each one
+    // back at its use; the absent source takes a slot too, so the two indices
+    // stay fixed whichever spelling the caller used.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(kwargs_dict.unwrap_or(pyre_object::PY_NULL));
+    let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(mapping.unwrap_or(pyre_object::PY_NULL));
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
-        if let Some(m) = mapping {
+        if mapping.is_some() {
             // `newformat.format_method(... w_mapping, True)` resolves
             // `{name}` via `space.getitem(mapping, w_key)` per
             // `newformat.py:Template.get_value`; KeyError propagates
             // to the caller (no silent default).
+            let m = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
             let w_key = pyre_object::w_str_new(name);
             return crate::baseobjspace::getitem(m, w_key).map(Some);
         }
-        if let Some(dict) = kwargs_dict {
+        if kwargs_dict.is_some() {
+            let dict = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
             let v = unsafe { pyre_object::w_dict_getitem_str(dict, name) };
             return Ok(v);
         }
@@ -1695,7 +1712,7 @@ fn format_render(
                 *numbering = Some(true);
                 let idx = *auto_idx;
                 *auto_idx += 1;
-                index_positional(positional, idx)?
+                index_positional(positional_base, positional.len(), idx)?
             }
             FieldType::Index(idx) => {
                 if let Some(true) = *numbering {
@@ -1705,7 +1722,7 @@ fn format_render(
                     ));
                 }
                 *numbering = Some(false);
-                index_positional(positional, idx)?
+                index_positional(positional_base, positional.len(), idx)?
             }
             FieldType::Keyword(name) => {
                 let name_str = name.as_str().unwrap_or("");
@@ -1756,15 +1773,33 @@ fn format_render(
         // A spec containing `{` is itself a template: render it (sharing the
         // numbering state and the recursion budget) before applying it.
         let resolved_spec = if format_spec.as_bytes().contains(&b'{') {
-            format_render(
+            // The chain walk above ran Python, so every argument reachable
+            // only through this frame's native slice is a pre-move copy —
+            // including `val`, which the conversion below still needs. Hand
+            // the nested render the reloaded run (it publishes what it is
+            // given, so passing the stale slice would launder the stale words
+            // into its own roots) and read `val` back once it returns.
+            let inner = pyre_object::gc_roots::push_roots();
+            let val_slot = inner.base();
+            inner.pin_root(val);
+            let reloaded: Vec<PyObjectRef> = (0..positional.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(positional_base + i))
+                .collect();
+            let kwargs_now =
+                kwargs_dict.map(|_| pyre_object::gc_roots::shadow_stack_get(kwargs_slot));
+            let mapping_now =
+                mapping.map(|_| pyre_object::gc_roots::shadow_stack_get(mapping_slot));
+            let spec = format_render(
                 format_spec,
-                positional,
-                kwargs_dict,
-                mapping,
+                &reloaded,
+                kwargs_now,
+                mapping_now,
                 auto_idx,
                 numbering,
                 depth - 1,
-            )?
+            )?;
+            val = inner.get(val_slot);
+            spec
         } else {
             format_spec.clone()
         };
@@ -1933,12 +1968,17 @@ fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError>
 
 /// Fetch positional argument `idx`, raising the `str.format` IndexError for
 /// an out-of-range replacement index.
-fn index_positional(positional: &[PyObjectRef], idx: usize) -> Result<PyObjectRef, crate::PyError> {
-    positional.get(idx).copied().ok_or_else(|| {
-        crate::PyError::index_error(format!(
-            "Replacement index {idx} out of range for positional args tuple"
-        ))
-    })
+///
+/// The read goes through the run `format_render` published, so the value is
+/// the one the last collection left behind rather than the address the
+/// gateway's native argument array froze.
+fn index_positional(base: usize, len: usize, idx: usize) -> Result<PyObjectRef, crate::PyError> {
+    if idx < len {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(base + idx));
+    }
+    Err(crate::PyError::index_error(format!(
+        "Replacement index {idx} out of range for positional args tuple"
+    )))
 }
 
 /// Map a template parse error to the matching `str.format` ValueError.
