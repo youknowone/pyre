@@ -10458,12 +10458,31 @@ impl CraneliftBackend {
                                 demoted_failarg_slots.insert(raw, home_ofs);
                             }
                         }
+                        // Same rule as the local JUMP below: an arg an earlier
+                        // LABEL demoted has no maintained SSA value in the body
+                        // — `spill_ref_roots` / `reload_ref_roots` skip it
+                        // precisely because its ref-root slot is the copy the
+                        // collector forwards. Reading `use_var` here would hand
+                        // this later LABEL's parameter the address the value had
+                        // before the last collection, and the header's
+                        // `sync_ref_root_var` would then write that dead address
+                        // back over the live one.
+                        let mut fallthrough_jf_ptr = None;
                         let vals: Vec<CValue> = ops[op_idx]
                             .getarglist()
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| loop_phi_keep.is_none_or(|keep| keep[*i]))
-                            .map(|(_, r)| resolve_opref(&mut builder, &constants, r.to_opref()))
+                            .map(|(_, r)| {
+                                resolve_local_jump_arg(
+                                    &mut builder,
+                                    &constants,
+                                    ptr_type,
+                                    &mut fallthrough_jf_ptr,
+                                    &demoted_failarg_slots,
+                                    r.to_opref(),
+                                )
+                            })
                             .collect();
                         let args = block_args_to(&mut builder, *label_block, &vals);
                         builder.ins().jump(*label_block, &args);
