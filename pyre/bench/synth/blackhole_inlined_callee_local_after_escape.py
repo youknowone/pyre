@@ -1,4 +1,19 @@
-# Guard for what an adopted multi-frame blackhole chain owes its inner levels.
+# Output guard for an inlined callee whose local is read back after the frame
+# escapes.  This file no longer reaches an adopt of any kind: since the
+# constant-depth `sys._getframe` fold (#1096) its committed baselines read
+# `fbw_blackhole_adopted_single_frame=0`, `loops_aborted=0`, `loops_compiled=2`
+# on all three backends.  Before the fold they read 5 / 5 / 1 -- five
+# SINGLE-frame adopts.  `fbw_blackhole_adopted_multi_frame` is 0 here today and
+# was 0 before the fold too, so despite the wording this file carried for a
+# while, it has never taken the multi-frame arm.  That arm is pinned elsewhere,
+# by `getframe_inline_subwalk_multiframe` and
+# `getframe_while_inlined_callee_subwalk` among others, all recording a nonzero
+# `fbw_blackhole_adopted_multi_frame` on all three backends.
+#
+# The blackhole obligations described below are carried by the `_declined`
+# sibling (`blackhole_inlined_callee_local_after_escape_declined`), which repeats
+# this shape at a force the fold declines and records 5 adopts / 5 aborts.  What
+# survives here is the printed answer.
 #
 # An inlined callee assigns a local, the frame then escapes through a residual
 # `sys._getframe()`, and an attribute read POSITIONED AFTER that escape reads the
