@@ -647,6 +647,37 @@ impl PyreMarshalBag {
         self.errors.remember(error);
         wire::MarshalError::BadType
     }
+
+    /// Room for a container the decoder publishes before it reads what goes
+    /// in it.  RustPython's runtime bag asks for this room explicitly because
+    /// the length comes from untrusted marshal input; mirror that shape so an
+    /// impossible reservation becomes MemoryError rather than an allocator
+    /// abort.
+    fn placeholder_elements(&self, len: usize) -> Result<Vec<PyObjectRef>, wire::MarshalError> {
+        let mut elements = Vec::new();
+        elements
+            .try_reserve_exact(len)
+            .map_err(|_| self.remember_python_error(PyError::memory_error("")))?;
+        elements.resize(len, PY_NULL);
+        Ok(elements)
+    }
+
+    fn make_runtime_code(
+        &self,
+        code: CodeObject<ConstantData>,
+        constants: Vec<Rooted>,
+        raw_code_bytes: Option<Vec<u8>>,
+    ) -> Result<Rooted, wire::MarshalError> {
+        let code = Rooted::new(crate::pycode::box_code_constant(&code));
+        // `box_code_constant` allocates, so read each constant out of its
+        // shadow-stack slot only now. PyPy gives the complete decoded wrapped
+        // list to `PyCode.__init__`; replace the compiler-boundary eager values
+        // with those exact marshal objects.
+        let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
+        unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
+        unsafe { crate::pycode::set_co_code_bytes(code.get(), raw_code_bytes) };
+        Ok(code)
+    }
 }
 
 impl wire::MarshalBag for PyreMarshalBag {
@@ -706,8 +737,9 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_tuple_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
+        let elements = self.placeholder_elements(len)?;
         Ok(Some(Rooted::new(tupleobject::w_tuple_new_array_backed(
-            vec![PY_NULL; len],
+            elements,
         ))))
     }
 
@@ -723,7 +755,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
-        Ok(Rooted::new(crate::pycode::box_code_object(code)))
+        Ok(Rooted::new(crate::pycode::box_code_constant(&code)))
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
@@ -740,10 +772,8 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_list_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
-        Ok(Some(Rooted::new(listobject::w_list_new_object(vec![
-            PY_NULL;
-            len
-        ]))))
+        let elements = self.placeholder_elements(len)?;
+        Ok(Some(Rooted::new(listobject::w_list_new_object(elements))))
     }
 
     fn set_list_item(
@@ -878,14 +908,28 @@ impl wire::MarshalBag for PyreMarshalBag {
         code: CodeObject<ConstantData>,
         constants: Vec<Rooted>,
     ) -> Result<Rooted, wire::MarshalError> {
-        let code = Rooted::new(crate::pycode::box_code_object(code));
-        // `box_code_object` allocates, so read each constant out of its
-        // shadow-stack slot only now.  Only the slots the compiler
-        // representation cannot reproduce are stored; the rest realize
-        // lazily like a fresh compile's.
-        let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
-        unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
-        Ok(code)
+        self.make_runtime_code(code, constants, None)
+    }
+
+    fn code_units_from_bytes(
+        &self,
+        code_bytes: &[u8],
+    ) -> Result<crate::bytecode::CodeUnits, wire::MarshalError> {
+        crate::pycode::decode_code_units(code_bytes)
+            .map(|(instructions, _)| instructions)
+            .map_err(|()| wire::MarshalError::InvalidBytecode)
+    }
+
+    fn make_code_with_constants_and_bytes(
+        &self,
+        code: CodeObject<ConstantData>,
+        constants: Vec<Rooted>,
+        code_bytes: Vec<u8>,
+    ) -> Result<Rooted, wire::MarshalError> {
+        let raw_code_bytes = crate::pycode::decode_code_units(&code_bytes)
+            .ok()
+            .and_then(|(_, raw)| raw);
+        self.make_runtime_code(code, constants, raw_code_bytes)
     }
 
     // `deserialize_code_value_inner` reads a code object's fields as bag

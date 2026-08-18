@@ -1069,7 +1069,7 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
 ///
 /// A null slot means every opcode is representable by compiler-core and its
 /// canonical `original_bytes()` is authoritative.
-unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+pub(crate) unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     let slot = unsafe { &mut (*(obj as *mut PyCode)).co_code_bytes };
     if let Some(bytes) = bytes {
         if slot.is_null() {
@@ -2187,10 +2187,21 @@ unsafe fn read_code_units(
         return Err(crate::PyError::type_error("co_code must be a bytes object"));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(v) };
+    decode_code_units(bytes)
+        .map_err(|()| crate::PyError::value_error("co_code length must be a multiple of 2"))
+}
+
+/// Decode public `co_code` bytes into compiler-core's execution storage while
+/// retaining an exact fallback for opcode values its enum cannot represent.
+///
+/// The marshal runtime bag calls this same boundary, so `CodeType`,
+/// `code.replace` and marshal loading cannot disagree about which bytes are
+/// deferred to dispatch as `Instruction::Reserved`.
+pub(crate) fn decode_code_units(
+    bytes: &[u8],
+) -> Result<(crate::bytecode::CodeUnits, Option<Vec<u8>>), ()> {
     if bytes.len() % 2 != 0 {
-        return Err(crate::PyError::value_error(
-            "co_code length must be a multiple of 2",
-        ));
+        return Err(());
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
     let mut preserve_raw = false;
