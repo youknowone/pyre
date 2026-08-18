@@ -6776,6 +6776,20 @@ macro_rules! crt_call {
 }
 pub(crate) use crt_call;
 
+/// Clear the C runtime errno, so the next `crt_errno` describes the call made
+/// in between rather than whichever one last set the cell.  A caller needs
+/// this wherever the runtime reports through errno on a return value that is
+/// also a legitimate success (`strftime` answering zero for both a rejected
+/// directive and an empty result).  Windows-only, which is where the runtime
+/// keeps a cell of its own that `std::io::Error::last_os_error` does not read.
+#[cfg(windows)]
+pub(crate) fn clear_crt_errno() {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::os::clear_errno();
+    }
+}
+
 /// The errno the last C runtime call reported.
 pub(crate) fn crt_errno() -> i32 {
     #[cfg(all(windows, feature = "host_env"))]

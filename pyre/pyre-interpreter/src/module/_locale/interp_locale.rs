@@ -310,6 +310,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 let cat = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                // The MSVC runtime reports a category outside its own
+                // `LC_MIN..=LC_MAX` through the invalid parameter handler,
+                // whose default action ends the process before `setlocale`
+                // can return.  Answer the range here so the call raises
+                // instead.  That pair is `LC_ALL..=LC_TIME`, the numbering
+                // the constants above are published from.
+                #[cfg(windows)]
+                if !(libc::LC_ALL..=libc::LC_TIME).contains(&cat) {
+                    return Err(locale_error("invalid locale category"));
+                }
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())

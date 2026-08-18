@@ -1292,6 +1292,17 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tm = _gettmarg(&args[1..], true)?;
     _checktm(&tm)?;
 
+    // The MSVC runtime accepts only [1; 9999] here and reports anything else
+    // through its invalid parameter handler, whose default action ends the
+    // process before the caller can see a return value.  `tm_year + 1900` is
+    // the year `_gettmarg` was given, so this cannot overflow.
+    #[cfg(windows)]
+    if tm.tm_year + 1900 < 1 || 9999 < tm.tm_year + 1900 {
+        return Err(crate::PyError::value_error(
+            "strftime() requires year in [1; 9999]",
+        ));
+    }
+
     let fmt_wtf8 = unsafe {
         if !is_str(fmt) {
             return Err(crate::PyError::type_error(
@@ -1399,12 +1410,23 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let mut buf = vec![0u8; 256];
         unsafe {
             loop {
-                let n = strftime(
+                // A directive the runtime does not accept reaches its invalid
+                // parameter handler, which ends the process unless it is
+                // silenced; silenced, the call returns zero and sets `EINVAL`
+                // instead.  The cell has to start clear for that read to
+                // describe this call rather than an earlier one.
+                crate::builtins::clear_crt_errno();
+                let n = crate::builtins::crt_call!(strftime(
                     buf.as_mut_ptr() as *mut libc::c_char,
                     buf.len(),
                     c_fmt.as_ptr(),
                     &msvc_tm,
-                );
+                ));
+                // A rejected directive is neither a buffer too small for the
+                // result nor the empty-result case below.
+                if n == 0 && crate::builtins::crt_errno() == libc::EINVAL {
+                    return Err(crate::PyError::value_error("Invalid format string"));
+                }
                 if n != 0 {
                     // The same recovery as the unix arm above: unrecognised
                     // directive bytes are echoed verbatim, so a format that is
