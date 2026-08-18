@@ -99,9 +99,9 @@ single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
 the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
-`pyrex/tests/cpyext_str.rs` and `pyrex/tests/cpyext_exceptions.rs` take their
-expectations from CPython 3.14.6 running the same script against the same
-fixture.
+`pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs` and
+`pyrex/tests/cpyext_warnings.rs` take their expectations from CPython 3.14.6
+running the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -128,7 +128,9 @@ fixture.
   `pyobject.py:330-337` reaches the type descriptor's `realize`. The type tests
   and the length are answered from the buffer, so asking them mid-fill does not
   decide the contents early;
-- the C exception indicator (`cpyext/pyerrors.rs`): 37 `PyExc_*` class mirrors
+- the C exception indicator (`cpyext/pyerrors.rs`): 69 `PyExc_*` class mirrors
+  -- every one CPython declares outside `MS_WINDOWS`, `PyExc_EnvironmentError`
+  and `PyExc_IOError` among them, both resolving to `OSError` --
   and `PyErr_SetString` / `SetObject` / `SetNone` / `Occurred` / `Clear` /
   `Fetch` / `Restore` / `ExceptionMatches` / `NoMemory` / `BadArgument` /
   `BadInternalCall`, plus the `PyErr_Format` half the header cannot do. The
@@ -170,6 +172,18 @@ fixture.
   points check nothing; `SetTraceback` does go through `setattr`, that slot
   being type-checked in C too. `PyExceptionInstance_Class` stays the macro it
   is upstream;
+- the warnings entry points (`cpyext/warnings.rs`): `PyErr_WarnEx`,
+  `PyErr_WarnExplicit` and `PyErr_WarnExplicitObject`, with the variadic
+  `PyErr_WarnFormat`, `PyErr_ResourceWarning` and `PyErr_WarnExplicitFormat`
+  written in the header over the two exported cores `_PyPyre_WarnUnicode` and
+  `_PyPyre_WarnExplicitMessage`, for the reason the argument parsers are there
+  too: rustc's `c_variadic` is unstable. They hand their arguments to the same `do_warn` /
+  `do_warn_explicit` the `_warnings` module runs, so the filters, the
+  `__warningregistry__` deduplication and `warnings.catch_warnings(record=True)`
+  all see a warning an extension issued. Two consequences are visible from C: a
+  NULL category is `RuntimeWarning`, and the category is never checked -- it is
+  called with the message, so a class that is not a `Warning` is emitted under
+  that class and one that is not callable refuses;
 - the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
   `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
   `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
@@ -388,6 +402,11 @@ Known divergences, each documented at its definition:
   object it belongs to moves and the foreign memory does not;
 - a `memoryview` that is never released never ends its export, pyre having no
   reference counting to end it at the last drop;
+- `PyErr_WarnExplicitFormat` defaults a NULL category to `RuntimeWarning`,
+  which the entry point it shares its core with already does. CPython's is the
+  one spelling in the family that skips that default and hands the NULL
+  straight to `warn_explicit`, which calls it -- measured as a segfault -- so
+  there is no behaviour there to match;
 - three `rawrefcount` passes diverge from `incminimark.py` because the
   collector they sit in is not the one upstream wrote them for, each documented
   at its definition in `majit-gc/src/collector.rs`: the non-moving major
@@ -403,16 +422,17 @@ Known divergences, each documented at its definition:
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 747 public
+   pyre does not take; and the remaining generated API. Of the 749 public
    `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 408 are present, counting every form `Python.h` offers one
+   underscore -- 412 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like
    aliases on the other; on the same header the corrected count is 293, so
    this figure moved by 49. The 749/342 recorded after that was measured
-   before the four slices below it.) The figure counts only that population,
+   before the four slices below it, and the 747 after that was the same
+   census over the 3.14.6 headers -- 3.14.7 declares two more.) The figure counts only that population,
    so the
    private `_PyLong_*ByteArray` pair and the unchecked accessor macros the
    extensions below need do not appear in it;

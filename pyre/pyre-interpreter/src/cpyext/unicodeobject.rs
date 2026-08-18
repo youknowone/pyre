@@ -45,12 +45,22 @@ fn from_utf8_bytes(bytes: &[u8]) -> *mut CPyObject {
     match std::str::from_utf8(bytes) {
         Ok(text) => pyobject::make_ref(pyre_object::w_str_new(text)),
         Err(error) => {
-            super::pyerrors::set_pending_error(crate::PyError::new(
-                crate::PyErrorKind::UnicodeDecodeError,
-                format!(
-                    "'utf-8' codec can't decode byte at position {}",
-                    error.valid_up_to()
+            let start = error.valid_up_to();
+            // The five arguments a decode error carries, so the instance reads
+            // back the way the `utf-8` decoder's own does rather than as a
+            // message with an empty `str()`.
+            let (end, reason) = match error.error_len() {
+                None => (bytes.len(), "unexpected end of data"),
+                Some(length) => (
+                    start + length,
+                    match matches!(bytes[start], 0x00..=0x7f | 0xc2..=0xf4) {
+                        true => "invalid continuation byte",
+                        false => "invalid start byte",
+                    },
                 ),
+            };
+            super::pyerrors::set_pending_error(crate::typedef::unicode_decode_error(
+                "utf-8", bytes, start, end, reason,
             ));
             std::ptr::null_mut()
         }

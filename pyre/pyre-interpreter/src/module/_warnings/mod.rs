@@ -216,7 +216,7 @@ fn setup_context(
         let globals = crate::importing::get_sys_module("sys")
             .map(|module| unsafe { w_module_get_w_dict(module) })
             .unwrap_or_else(w_dict_new);
-        (w_str_new("sys"), 1, globals)
+        (w_str_new("<sys>"), 0, globals)
     } else {
         let frame = unsafe { &*frame };
         (
@@ -645,7 +645,21 @@ pub(crate) fn do_warn_explicit(
     let source_slot = pin_root_slot(source);
 
     let input_module = pyre_object::gc_roots::shadow_stack_get(input_module_slot);
-    let module = if input_module.is_null() || unsafe { is_none(input_module) } {
+    // A warning issued this late during shutdown has lost the `warnings`
+    // module, so no filter can be matched and there is nothing safe to do
+    // with it.
+    if !input_module.is_null() && unsafe { is_none(input_module) } {
+        return Ok(());
+    }
+    let registry = pyre_object::gc_roots::shadow_stack_get(registry_slot);
+    if !registry.is_null()
+        && unsafe { !crate::baseobjspace::isinstance_dict_w(registry) && !is_none(registry) }
+    {
+        return Err(PyError::type_error(
+            "'registry' must be a dict or None".to_owned(),
+        ));
+    }
+    let module = if input_module.is_null() {
         let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
         if unsafe { !is_str(filename) } {
             // Preserve `space.fsencode_w`'s TypeError for non-text filenames.

@@ -358,7 +358,8 @@ jobs:
       # default (see pyre-interpreter's feature table), so its tests — pyrex's
       # cpyext_smoke, cpyext_methods, cpyext_types, cpyext_unicode,
       # cpyext_cycles, cpyext_dict_subclass, cpyext_pystate,
-      # cpyext_object_families, cpyext_str and cpyext_exceptions, which are
+      # cpyext_object_families, cpyext_str, cpyext_exceptions and
+      # cpyext_warnings, which are
       # backend-independent and compile out off
       # macOS/Linux — need SOME leg that
       # enables it, and this leg already recompiles the pyrex/pyre-interpreter

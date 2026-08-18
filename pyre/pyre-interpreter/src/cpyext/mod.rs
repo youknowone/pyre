@@ -43,6 +43,7 @@ pub mod sliceobject;
 pub mod tupleobject;
 pub mod typeobject;
 pub mod unicodeobject;
+pub mod warnings;
 pub mod weakrefobject;
 
 use parking_lot::ReentrantMutex;
@@ -736,6 +737,7 @@ pub fn ensure_linked() {
     pystate::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
+    warnings::ensure_linked();
     exception::ensure_linked();
     weakrefobject::ensure_linked();
     gc::ensure_linked();

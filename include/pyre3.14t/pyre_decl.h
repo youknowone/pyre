@@ -498,6 +498,13 @@ PyAPI_FUNC(PyObject *) PyUnicode_RichCompare(PyObject *, PyObject *, int);
 PyAPI_FUNC(PyObject *) PyUnicode_Substring(PyObject *, Py_ssize_t, Py_ssize_t);
 PyAPI_FUNC(int) PyUnicode_WriteChar(PyObject *, Py_ssize_t, Py_UCS4);
 
+/* cpyext/warnings.rs */
+PyAPI_FUNC(int) PyErr_WarnEx(PyObject *, const char *, Py_ssize_t);
+PyAPI_FUNC(int) PyErr_WarnExplicit(PyObject *, const char *, const char *, int, const char *, PyObject *);
+PyAPI_FUNC(int) PyErr_WarnExplicitObject(PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
+PyAPI_FUNC(int) _PyPyre_WarnExplicitMessage(PyObject *, PyObject *, const char *, int, const char *, PyObject *);
+PyAPI_FUNC(int) _PyPyre_WarnUnicode(PyObject *, PyObject *, PyObject *, Py_ssize_t);
+
 /* cpyext/weakrefobject.rs */
 PyAPI_FUNC(int) PyWeakref_Check(PyObject *);
 PyAPI_FUNC(int) PyWeakref_CheckProxy(PyObject *);
