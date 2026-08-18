@@ -721,6 +721,14 @@ static inline PyObject *Py_BuildValue(const char *format, ...)
     return value;
 }
 
+/* The same build over a list the caller already opened, which is how a
+   variadic entry point of its own passes its arguments on. */
+static inline PyObject *Py_VaBuildValue(const char *format, va_list va)
+{
+    const char *cursor = format;
+    return _PyPyre_BuildValue(&cursor, &va);
+}
+
 #ifdef __cplusplus
 }
 #endif

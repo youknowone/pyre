@@ -128,6 +128,8 @@ PyAPI_FUNC(PyObject *) PyImport_AddModuleRef(const char *);
 PyAPI_FUNC(PyObject *) PyImport_GetModule(PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_Import(PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModule(const char *);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttr(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttrString(const char *, const char *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleNoBlock(const char *);
 
 /* cpyext/iterator.rs */
@@ -336,6 +338,7 @@ PyAPI_FUNC(PyObject *) PyOS_FSPath(PyObject *);
 /* cpyext/pyerrors.rs */
 PyAPI_FUNC(int) PyErr_BadArgument(void);
 PyAPI_FUNC(void) PyErr_BadInternalCall(void);
+PyAPI_FUNC(int) PyErr_CheckSignals(void);
 PyAPI_FUNC(void) PyErr_Clear(void);
 PyAPI_FUNC(int) PyErr_ExceptionMatches(PyObject *);
 PyAPI_FUNC(void) PyErr_Fetch(PyObject **, PyObject **, PyObject **);
@@ -348,6 +351,10 @@ PyAPI_FUNC(void) PyErr_NormalizeException(PyObject **, PyObject **, PyObject **)
 PyAPI_FUNC(PyObject *) PyErr_Occurred(void);
 PyAPI_FUNC(void) PyErr_Restore(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetExcInfo(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrno(PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilename(PyObject *, const char *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObject(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetFromErrnoWithFilenameObjects(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetHandledException(PyObject *);
 PyAPI_FUNC(PyObject *) PyErr_SetImportError(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyErr_SetImportErrorSubclass(PyObject *, PyObject *, PyObject *, PyObject *);
@@ -428,6 +435,9 @@ PyAPI_FUNC(int) PySlice_GetIndices(PyObject *, Py_ssize_t, Py_ssize_t *, Py_ssiz
 PyAPI_FUNC(int) PySlice_GetIndicesEx(PyObject *, Py_ssize_t, Py_ssize_t *, Py_ssize_t *, Py_ssize_t *, Py_ssize_t *);
 PyAPI_FUNC(PyObject *) PySlice_New(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PySlice_Unpack(PyObject *, Py_ssize_t *, Py_ssize_t *, Py_ssize_t *);
+
+/* cpyext/sysmodule.rs */
+PyAPI_FUNC(int) PySys_AuditTuple(const char *, PyObject *);
 
 /* cpyext/tupleobject.rs */
 PyAPI_FUNC(int) PyTuple_Check(PyObject *);

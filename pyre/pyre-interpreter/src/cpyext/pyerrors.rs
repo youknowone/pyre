@@ -798,6 +798,139 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_ExceptionMatches as *const ());
     std::hint::black_box(PyErr_GivenExceptionMatches as *const ());
     std::hint::black_box(PyErr_Fetch as *const ());
+    // ── the failed syscall ──────────────────────────────────────────────────
+
+    /// `PyErr_CheckSignals` — run whatever a signal handler left pending.
+    ///
+    /// The handler is Python code, so it can raise; a raise is what the `-1`
+    /// reports, and the exception it raised is left pending.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn PyErr_CheckSignals() -> c_int {
+        match crate::module::signal::interp_signal::checksignals_now() {
+            Ok(()) => 0,
+            Err(error) => {
+                set_pending_error(error);
+                -1
+            }
+        }
+    }
+
+    /// `pyerrors.py:PyErr_SetFromErrnoWithFilename` — the family's body, over a
+    /// code its callers read before anything that could overwrite it.
+    ///
+    /// The class is the caller's and it is *called*, so the exception is whatever
+    /// calling it answers with rather than an `OSError` this layer built: a
+    /// subclass declaring its own `__init__` sees the same arguments it would from
+    /// Python.  Every spelling answers NULL, having raised.
+    unsafe fn set_from_errno(
+        code: c_int,
+        exc: *mut CPyObject,
+        filename: *mut CPyObject,
+        second_filename: *mut CPyObject,
+    ) -> *mut CPyObject {
+        // A syscall interrupted by a signal is the handler's to report first, and
+        // the handler raising is what leaves this with nothing of its own to say.
+        if code == libc::EINTR && unsafe { PyErr_CheckSignals() } != 0 {
+            return std::ptr::null_mut();
+        }
+        super::object::realize_all([exc, filename, second_filename]);
+        let Some(class) = class_argument(exc) else {
+            return std::ptr::null_mut();
+        };
+        // `errno` unset is a syscall that failed without recording which way.
+        let message = match code {
+            0 => "Error".to_owned(),
+            code => crate::PyError::clean_strerror(code),
+        };
+        let roots = pyre_object::gc_roots::push_roots();
+        let class_slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(class);
+        let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(unsafe { pyobject::from_ref(filename) });
+        let second_slot = pyre_object::gc_roots::shadow_stack_len();
+        roots.pin_root(unsafe { pyobject::from_ref(second_filename) });
+
+        let mut arguments = vec![
+            pyre_object::w_int_new(code as i64),
+            pyre_object::w_str_new(&message),
+        ];
+        let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
+        if !filename.is_null() {
+            arguments.push(filename);
+            let second = pyre_object::gc_roots::shadow_stack_get(second_slot);
+            if !second.is_null() {
+                // The `winerror` slot, 0 off Windows, which is what makes a second
+                // filename the fifth argument rather than the fourth.
+                arguments.push(pyre_object::w_int_new(0));
+                arguments.push(second);
+            }
+        }
+        let arguments = pyre_object::tupleobject::w_tuple_new(arguments);
+        set_normalized(
+            pyre_object::gc_roots::shadow_stack_get(class_slot),
+            arguments,
+        );
+        std::ptr::null_mut()
+    }
+
+    /// The code a failed syscall left behind, read before anything else runs.
+    fn current_errno() -> c_int {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn PyErr_SetFromErrno(exc: *mut CPyObject) -> *mut CPyObject {
+        unsafe {
+            set_from_errno(
+                current_errno(),
+                exc,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn PyErr_SetFromErrnoWithFilenameObject(
+        exc: *mut CPyObject,
+        filename: *mut CPyObject,
+    ) -> *mut CPyObject {
+        unsafe { set_from_errno(current_errno(), exc, filename, std::ptr::null_mut()) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn PyErr_SetFromErrnoWithFilenameObjects(
+        exc: *mut CPyObject,
+        filename: *mut CPyObject,
+        second_filename: *mut CPyObject,
+    ) -> *mut CPyObject {
+        unsafe { set_from_errno(current_errno(), exc, filename, second_filename) }
+    }
+
+    /// The `const char *` spelling, whose filename is a path rather than text.
+    ///
+    /// Decoding it is a call of its own, so the code is read in front of it: the
+    /// C body restores `errno` afterwards for the same reason.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn PyErr_SetFromErrnoWithFilename(
+        exc: *mut CPyObject,
+        filename: *const c_char,
+    ) -> *mut CPyObject {
+        let code = current_errno();
+        if filename.is_null() {
+            return unsafe {
+                set_from_errno(code, exc, std::ptr::null_mut(), std::ptr::null_mut())
+            };
+        }
+        let name = unsafe { super::unicodeobject::PyUnicode_DecodeFSDefault(filename) };
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        let answer = unsafe { set_from_errno(code, exc, name, std::ptr::null_mut()) };
+        unsafe { pyobject::decref(name) };
+        answer
+    }
+
     std::hint::black_box(PyErr_Restore as *const ());
     std::hint::black_box(PyErr_NormalizeException as *const ());
 }

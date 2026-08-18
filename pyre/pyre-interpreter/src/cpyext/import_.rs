@@ -75,6 +75,37 @@ pub unsafe extern "C" fn PyImport_Import(name: *mut CPyObject) -> *mut CPyObject
     result(import_module(&text))
 }
 
+/// `import.c:4276 PyImport_ImportModuleAttr` — one attribute of a module
+/// imported for it, which is the shape a C caller reaching into Python has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_ImportModuleAttr(
+    module_name: *mut CPyObject,
+    attribute_name: *mut CPyObject,
+) -> *mut CPyObject {
+    let module = unsafe { PyImport_Import(module_name) };
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    let attribute = unsafe { super::object::PyObject_GetAttr(module, attribute_name) };
+    unsafe { pyobject::decref(module) };
+    attribute
+}
+
+/// The `const char *` spelling of the pair.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_ImportModuleAttrString(
+    module_name: *const c_char,
+    attribute_name: *const c_char,
+) -> *mut CPyObject {
+    let module = unsafe { PyImport_ImportModule(module_name) };
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    let attribute = unsafe { super::object::PyObject_GetAttrString(module, attribute_name) };
+    unsafe { pyobject::decref(module) };
+    attribute
+}
+
 /// `PyImport_AddModuleRef` — the module under `name`, created empty when
 /// `sys.modules` does not have it yet.
 ///
@@ -123,4 +154,6 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyImport_Import as *const ());
     std::hint::black_box(PyImport_AddModuleRef as *const ());
     std::hint::black_box(PyImport_GetModule as *const ());
+    std::hint::black_box(PyImport_ImportModuleAttr as *const ());
+    std::hint::black_box(PyImport_ImportModuleAttrString as *const ());
 }

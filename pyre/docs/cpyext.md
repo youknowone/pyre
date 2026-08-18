@@ -41,7 +41,8 @@ An extension includes `Python.h`; that file is only the include list, and the
 content is split by topic the way `pypy/module/cpyext/include` and CPython's
 own `Include` are -- `object.h`, `longobject.h`, `modsupport.h`, and so on, one
 per `cpyext` module. `pytypedefs.h` names the shared types once so no
-declaration waits on a definition.
+declaration waits on a definition, and `audit.h` carries the variadic
+`PySys_Audit` the way CPython's own `Include/audit.h` does.
 
 `pyre_decl.h` holds every exported entry point and **is generated** by
 `scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
@@ -172,6 +173,22 @@ same fixture.
   `_PyErr_SetObject` does, so the C caller's error does not hide it; `Restore`
   does not, the exception it is handed being an older one rather than a new
   raise;
+- the exception a failed syscall becomes (`cpyext/pyerrors.rs`):
+  `PyErr_SetFromErrno` and its three filename spellings, plus
+  `PyErr_CheckSignals` over the signal state the interpreter already keeps.
+  The class is *called* rather than consulted, as `errors.c:899` does, so
+  `OSError` maps the code to its own subclass and a class outside the family
+  is built from the same `(errno, strerror)` pair; a second filename is the
+  fifth argument, the fourth being the Windows code that is 0 here. The
+  `const char *` filename spelling reads the code before decoding the path,
+  the decode being a call that can overwrite it;
+- the audit events (`cpyext/sysmodule.rs`, `include/pyre3.14t/audit.h`):
+  `PySys_AuditTuple` and the variadic `PySys_Audit` over it, which reach the
+  same hooks `sys.addaudithook` installs. A hook is Python code, so a raise
+  is what the `-1` reports;
+- `PyImport_ImportModuleAttr` / `PyImport_ImportModuleAttrString`
+  (`cpyext/import_.rs`), the import-then-`getattr` pair a C caller reaching
+  into Python uses;
 - the *handled* exception beside it: `PyErr_GetHandledException` /
   `SetHandledException` and the triple spelling `PyErr_GetExcInfo` /
   `SetExcInfo`. The read walks the suspended generators' saved slots, so it
@@ -481,7 +498,7 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 746 public
    `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 434 are present, counting every form `Python.h` offers one
+   underscore -- 442 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like

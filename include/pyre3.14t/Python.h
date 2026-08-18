@@ -59,6 +59,7 @@
 #include "pycapsule.h"
 #include "import.h"
 #include "modsupport.h"
+#include "audit.h"
 #include "abstract.h"
 
 #endif /* !PYRE_PYTHON_H */
