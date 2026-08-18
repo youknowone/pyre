@@ -408,6 +408,11 @@ pub struct Optimizer {
     /// the extended builder's home without merging those stages.
     pub short_preamble_producer:
         Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>,
+    /// MetaInterp's `Option<usize>` publication slot for this producer. While
+    /// the builder is on loan to OptContext, the slot is re-pointed at
+    /// `OptContext.active_short_preamble_producer` so the root walker always
+    /// follows the builder's current home.
+    pub(crate) published_short_preamble_producer_slot: Option<usize>,
     /// RPython unroll.py: `label_args = import_state(...)`.
     /// The peeled loop's LABEL must use these args, not the phase-1 end_args.
     pub imported_label_args: Option<Vec<OpRef>>,
@@ -1490,6 +1495,7 @@ impl Optimizer {
             imported_short_preamble: None,
             imported_short_preamble_builder: None,
             short_preamble_producer: None,
+            published_short_preamble_producer_slot: None,
             imported_label_args: None,
             patchguardop: None,
             skip_flush: false,

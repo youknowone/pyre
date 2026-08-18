@@ -4347,6 +4347,17 @@ impl OptContext {
         self.active_short_preamble_producer.as_mut()
     }
 
+    /// Address of the active producer's storage for the MetaInterp root
+    /// walker. This field has the same
+    /// `Option<ExtendedShortPreambleBuilder>` type as
+    /// `Optimizer.short_preamble_producer`, so either address is valid for
+    /// the walker's cast while the builder is moved between them.
+    pub(crate) fn active_short_preamble_producer_slot_addr(&mut self) -> usize {
+        (&mut self.active_short_preamble_producer
+            as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
+            as usize
+    }
+
     pub fn build_active_short_preamble(
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {

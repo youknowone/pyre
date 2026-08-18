@@ -393,17 +393,61 @@ pub struct UnrollOptimizer {
 /// `MetaInterp.compile_short_preamble_producer`.
 pub(crate) struct PublishedShortPreambleProducer {
     slot: Option<usize>,
+    previous: Option<usize>,
 }
 
 impl Drop for PublishedShortPreambleProducer {
     fn drop(&mut self) {
         if let Some(addr) = self.slot {
             // SAFETY: the same address pyjitpl installed for this compile, on
-            // the same thread as the registered root walker. Writing `None`
-            // here is what keeps the walker from reading the optimizer local
-            // after it is dropped.
+            // the same thread as the registered root walker. Restoring the
+            // previous value preserves an outer publication and keeps the
+            // walker from reading the optimizer local after it is dropped.
             unsafe {
-                *(addr as *mut Option<usize>) = None;
+                *(addr as *mut Option<usize>) = self.previous;
+            }
+        }
+    }
+}
+
+/// Temporarily publishes the context storage while an extended short-preamble
+/// builder is on loan from its optimizer. The two storage fields have the same
+/// `Option<ExtendedShortPreambleBuilder>` type, which is required by the root
+/// walker's cast.
+struct ActiveShortPreambleProducerPublication {
+    slot: Option<usize>,
+    optimizer_producer_slot: usize,
+}
+
+impl ActiveShortPreambleProducerPublication {
+    fn new(optimizer: &mut crate::optimizeopt::optimizer::Optimizer, ctx: &mut OptContext) -> Self {
+        let optimizer_producer_slot = (&mut optimizer.short_preamble_producer
+            as *mut Option<crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder>)
+            as usize;
+        let slot = optimizer.published_short_preamble_producer_slot;
+        if let Some(addr) = slot {
+            // SAFETY: `publish_short_preamble_producer` installed this
+            // MetaInterp-owned slot for the current optimizer on the same
+            // thread as the registered root walker.
+            unsafe {
+                *(addr as *mut Option<usize>) =
+                    Some(ctx.active_short_preamble_producer_slot_addr());
+            }
+        }
+        Self {
+            slot,
+            optimizer_producer_slot,
+        }
+    }
+}
+
+impl Drop for ActiveShortPreambleProducerPublication {
+    fn drop(&mut self) {
+        if let Some(addr) = self.slot {
+            // SAFETY: the builder has returned to the optimizer before this
+            // guard drops, so the published address again names its storage.
+            unsafe {
+                *(addr as *mut Option<usize>) = Some(self.optimizer_producer_slot);
             }
         }
     }
@@ -506,7 +550,8 @@ impl UnrollOptimizer {
     }
 
     /// Publish the address of `optimizer.short_preamble_producer` to the
-    /// registered root walker, and withdraw it when the returned guard drops.
+    /// registered root walker, and restore the prior publication when the
+    /// returned guard drops.
     ///
     /// The guard is not optional. The published address points into the
     /// caller's `Optimizer` local, which dies when the unroll call returns;
@@ -519,13 +564,16 @@ impl UnrollOptimizer {
         &self,
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ) -> PublishedShortPreambleProducer {
+        let mut previous = None;
         if let Some(addr) = self.compile_short_preamble_producer_slot {
             // SAFETY: pyjitpl installs this address from
             // `MetaInterp.compile_short_preamble_producer` for the duration
             // of one compile. Unroll phases run on the same thread as the
             // registered root walker.
             unsafe {
-                *(addr as *mut Option<usize>) = Some(
+                let slot = &mut *(addr as *mut Option<usize>);
+                previous = *slot;
+                *slot = Some(
                     (&mut optimizer.short_preamble_producer
                         as *mut Option<
                             crate::optimizeopt::shortpreamble::ExtendedShortPreambleBuilder,
@@ -533,8 +581,11 @@ impl UnrollOptimizer {
                 );
             }
         }
+        optimizer.published_short_preamble_producer_slot =
+            self.compile_short_preamble_producer_slot;
         PublishedShortPreambleProducer {
             slot: self.compile_short_preamble_producer_slot,
+            previous,
         }
     }
 
@@ -3711,6 +3762,7 @@ impl OptUnroll {
                         return None;
                     }
                     ctx.activate_short_preamble_producer(builder);
+                    let publication = ActiveShortPreambleProducerPublication::new(optimizer, ctx);
                     extra = Self::inline_short_preamble(
                         &short_jump_args,
                         &target_args,
@@ -3718,19 +3770,24 @@ impl OptUnroll {
                         optimizer,
                         ctx,
                     );
+                    // Return the builder to its optimizer storage before
+                    // anything reads it. Dropping the guard below re-points
+                    // the walker there, and `build_short_preamble_struct`
+                    // must run with the builder rooted where the walker looks.
                     if let Some(builder) = ctx.take_active_short_preamble_producer() {
-                        // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
-                        // rides inline on the OpRef. Production no longer
-                        // seeds `ctx.const_pool`
-                        // (`merge_backend_constants_from_ctx` asserts the
-                        // pool is empty at export), so the cross-compile
-                        // `loop_constants` snapshot is no longer built:
-                        // short-preamble ops embed the Const value
-                        // directly in `op.args`, mirroring RPython's
-                        // `shortpreamble.py` which has no parallel side
-                        // table.
-                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
                         optimizer.short_preamble_producer = Some(builder);
+                    }
+                    drop(publication);
+                    // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
+                    // rides inline on the OpRef. Production no longer seeds
+                    // `ctx.const_pool` (`merge_backend_constants_from_ctx`
+                    // asserts the pool is empty at export), so the
+                    // cross-compile `loop_constants` snapshot is no longer
+                    // built: short-preamble ops embed the Const value
+                    // directly in `op.args`, mirroring RPython's
+                    // `shortpreamble.py` which has no parallel side table.
+                    if let Some(builder) = optimizer.short_preamble_producer.as_ref() {
+                        target_token.short_preamble = Some(builder.build_short_preamble_struct());
                     }
                 } else {
                     extra = Self::inline_short_preamble(
