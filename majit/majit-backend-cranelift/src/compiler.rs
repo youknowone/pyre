@@ -10858,18 +10858,6 @@ impl CraneliftBackend {
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let a = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(vi), a);
-                    if op.opcode == OpCode::SameAsR {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            a,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 // PyPy `assembler.py:1528-1529` (x86) /
@@ -11929,21 +11917,6 @@ impl CraneliftBackend {
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
-                    if let Some(result) = call_result
-                        && op.result_type() == Type::Ref
-                        && !force_tokens.contains(&vi)
-                    {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 OpCode::CallAssemblerI
@@ -12409,18 +12382,6 @@ impl CraneliftBackend {
 
                     if op.result_type() != Type::Void {
                         builder.def_var(var(vi), merged_result);
-                        if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
-                            sync_ref_root_var(
-                                &mut builder,
-                                ptr_type,
-                                &mut None,
-                                &ref_root_slots,
-                                vi,
-                                merged_result,
-                                ref_root_base_ofs,
-                                &mut synced_ref_vars,
-                            );
-                        }
                     }
                     mark_ref_roots_synced(&mut synced_ref_vars, &live_ref_root_slots);
                 }
@@ -13460,18 +13421,6 @@ impl CraneliftBackend {
                         op.opcode,
                     )?;
                     builder.def_var(var(vi), result);
-                    if value_type == Type::Ref {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
                 OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                     let scale = resolve_constant_i64(
@@ -13518,18 +13467,6 @@ impl CraneliftBackend {
                         op.opcode,
                     )?;
                     builder.def_var(var(vi), result);
-                    if value_type == Type::Ref {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
                 OpCode::RawLoadI | OpCode::RawLoadF => {
                     let descr = op.getdescr().expect("raw load op must have a descriptor");
@@ -14380,18 +14317,6 @@ impl CraneliftBackend {
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), obj);
-                    if op.opcode == OpCode::VirtualRefR {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            obj,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 // ── Vector guards ──
@@ -15005,17 +14930,18 @@ impl CraneliftBackend {
                                 vtable_off_i32,
                             );
                         }
+                        // An op that defines a Ref does not write its ref-root home here,
+                        // and no reader misses that store.  A demoted raw's definition
+                        // always precedes the LABEL that demotes it — `compute_loop_phi_keep`
+                        // refuses to demote a raw redefined after the LABEL — and that
+                        // LABEL's fall-through seeding writes the same word with the same
+                        // value just before it records the demotion, so an eager store here
+                        // is subsumed.  Ahead of that seeding the raw is not demoted yet, so
+                        // it follows the ordinary discipline: `spill_ref_roots` over the live
+                        // slot list immediately precedes every `emit_push_gcmap`, under the
+                        // predicate `get_gcmap` itself applies.  Guard maps name dense
+                        // fail-arg slots only, never a home.
                         builder.def_var(var(vi), result);
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
                         let alloc_fn = builder
@@ -15041,16 +14967,6 @@ impl CraneliftBackend {
                             );
                         }
                         builder.def_var(var(vi), result);
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
                     }
                 }
                 OpCode::NewArray | OpCode::NewArrayClear => {
@@ -15095,16 +15011,6 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Integer sign extension ──
@@ -15169,16 +15075,6 @@ impl CraneliftBackend {
                             .ins()
                             .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Thread-local reference get ──
@@ -15196,16 +15092,6 @@ impl CraneliftBackend {
                     )
                     .expect("jit_threadlocalref_get must return a value");
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Load from GC table ──
@@ -15284,16 +15170,6 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
                 // All OpCode variants are explicitly handled above.
                 // This arm is unreachable but kept for forward-compatibility
