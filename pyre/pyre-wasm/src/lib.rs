@@ -351,12 +351,20 @@ pub extern "C" fn pyre_jit_bridge_diag(i: u32) -> u64 {
     majit_backend_wasm::bridge_diag(i as usize)
 }
 
-/// Packed `(needed, available)` geometry for an inline-module trial that did
-/// not fit its owner's frozen frame.  The host formats this diagnostic only.
+/// Packed `(kind, needed, available)` geometry for an inline-module trial that
+/// did not fit its owner's frozen frame. The host formats this diagnostic only.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_jit_inline_geometry_diag(i: u32) -> u64 {
     majit_backend_wasm::inline_geometry_diag(i as usize)
+}
+
+/// Number of inline geometry failures, including entries beyond the retained
+/// diagnostic records.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_inline_geometry_count() -> u64 {
+    majit_backend_wasm::inline_geometry_count()
 }
 
 /// Test-only control plane for the terminal-declined CALL_ASSEMBLER regression.

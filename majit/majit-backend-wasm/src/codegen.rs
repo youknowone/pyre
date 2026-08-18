@@ -1035,16 +1035,38 @@ impl LabelResumeData {
         self.capture_by_id.get(r.raw() as usize).copied().flatten()
     }
 
+    fn shortage(&self, frame: FrameGeometry) -> Option<super::FrameShortage> {
+        if self.ref_slots > frame.label_ref_slots {
+            return Some(super::FrameShortage::new(
+                super::FrameShortageKind::LabelResumeRefSlots,
+                self.ref_slots,
+                frame.label_ref_slots,
+            ));
+        }
+        for storage in self.capture_by_id.iter().flatten() {
+            match storage {
+                LabelCaptureStorage::ValueSlot(slot) if *slot >= frame.value_slots => {
+                    return Some(super::FrameShortage::new(
+                        super::FrameShortageKind::LabelResumeCaptureSlots,
+                        slot + 1,
+                        frame.value_slots,
+                    ));
+                }
+                LabelCaptureStorage::RefSlot(slot) if *slot >= frame.label_ref_slots => {
+                    return Some(super::FrameShortage::new(
+                        super::FrameShortageKind::LabelResumeCaptureSlots,
+                        slot + 1,
+                        frame.label_ref_slots,
+                    ));
+                }
+                LabelCaptureStorage::ValueSlot(_) | LabelCaptureStorage::RefSlot(_) => {}
+            }
+        }
+        None
+    }
+
     fn supported_by(&self, frame: FrameGeometry) -> bool {
-        self.ref_slots <= frame.label_ref_slots
-            && self
-                .capture_by_id
-                .iter()
-                .flatten()
-                .all(|storage| match storage {
-                    LabelCaptureStorage::ValueSlot(slot) => *slot < frame.value_slots,
-                    LabelCaptureStorage::RefSlot(slot) => *slot < frame.label_ref_slots,
-                })
+        self.shortage(frame).is_none()
     }
 
     fn frame_offset(&self, storage: LabelCaptureStorage, frame: FrameGeometry) -> u64 {
@@ -2365,13 +2387,17 @@ pub fn build_wasm_module(
     let max_value_slots =
         normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
+        let shortage = super::FrameShortage::new(
+            super::FrameShortageKind::FrameValueSlots,
+            max_value_slots,
+            frame.value_slots,
+        );
         if !inlined_bridges.is_empty() {
-            super::record_inline_geometry(max_value_slots, frame.value_slots);
+            super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
         }
         return Err(BackendError::Unsupported(format!(
-            "wasm backend: {max_value_slots} frame value slots exceed frozen frame layout \
-             ({})",
-            frame.value_slots,
+            "wasm backend: {} frame value slots exceed frozen frame layout ({})",
+            shortage.needed, shortage.available,
         )));
     }
 
@@ -2398,16 +2424,37 @@ pub fn build_wasm_module(
         &label_resume.captured_refs,
     );
     let num_ref_homes = ref_homes.len();
-    if num_ref_homes > frame.ordinary_home_slots() || !label_resume.supported_by(*frame) {
-        if !inlined_bridges.is_empty() {
-            super::record_inline_geometry(num_ref_homes, frame.ordinary_home_slots());
-        }
-        return Err(BackendError::Unsupported(format!(
-            "wasm backend: {num_ref_homes} ordinary ref homes and {} LABEL ref captures exceed frozen frame layout ({}, {})",
-            label_resume.ref_slots,
+    let shortage = if num_ref_homes > frame.ordinary_home_slots() {
+        Some(super::FrameShortage::new(
+            super::FrameShortageKind::OrdinaryRefHomes,
+            num_ref_homes,
             frame.ordinary_home_slots(),
-            frame.label_ref_slots,
-        )));
+        ))
+    } else {
+        label_resume.shortage(*frame)
+    };
+    if let Some(shortage) = shortage {
+        if !inlined_bridges.is_empty() {
+            super::record_inline_geometry(shortage.kind, shortage.needed, shortage.available);
+        }
+        let reason = match shortage.kind {
+            super::FrameShortageKind::OrdinaryRefHomes => format!(
+                "wasm backend: {} ordinary ref homes exceed frozen frame layout ({})",
+                shortage.needed, shortage.available,
+            ),
+            super::FrameShortageKind::LabelResumeRefSlots => format!(
+                "wasm backend: {} LABEL ref captures exceed label resume layout ({} label ref slots)",
+                shortage.needed, shortage.available,
+            ),
+            super::FrameShortageKind::LabelResumeCaptureSlots => format!(
+                "wasm backend: {} LABEL capture slots exceed label resume layout ({})",
+                shortage.needed, shortage.available,
+            ),
+            super::FrameShortageKind::FrameValueSlots => {
+                unreachable!("value-slot shortage was checked above")
+            }
+        };
+        return Err(BackendError::Unsupported(reason));
     }
 
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`): `bridge_finish_fi` is

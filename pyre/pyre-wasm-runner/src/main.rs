@@ -684,7 +684,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
         // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
         // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline,
-        // 16=forced terminal-decline regression hook.
+        // 16=forced terminal-decline regression hook. 48=inline LABEL-resume
+        // layout decline.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
             let labels = [
                 "entered",
@@ -735,6 +736,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "bridge_param_decl_source_frame",
                 "bridge_param_decl_arity",
                 "bridge_param_label_suppressed",
+                "inline_decl_label_resume_layout",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -750,11 +752,32 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             for i in 0..3 {
                 let packed = geometry.call(&mut store, i).unwrap_or(0);
                 if packed != 0 {
-                    parts.push(format!("{}:{}/{}", i + 1, packed >> 32, packed as u32));
+                    let kind = match (packed >> 48) as u8 {
+                        1 => "frame_value_slots",
+                        2 => "ordinary_ref_homes",
+                        3 => "label_resume_ref_slots",
+                        4 => "label_resume_capture_slots",
+                        _ => "unknown",
+                    };
+                    let needed = (packed >> 24) & 0x00ff_ffff;
+                    let available = packed & 0x00ff_ffff;
+                    parts.push(format!("{}:{kind}={needed}/{available}", i + 1));
                 }
             }
             if !parts.is_empty() {
-                eprintln!("[jit-stats] inline_geometry {}", parts.join(" "));
+                let count = instance
+                    .get_typed_func::<(), u64>(&mut store, "pyre_jit_inline_geometry_count")
+                    .ok()
+                    .and_then(|count| count.call(&mut store, ()).ok());
+                match count {
+                    Some(count) => eprintln!(
+                        "[jit-stats] inline_geometry records={}/{} {}",
+                        parts.len(),
+                        count,
+                        parts.join(" ")
+                    ),
+                    None => eprintln!("[jit-stats] inline_geometry {}", parts.join(" ")),
+                }
             }
         }
         // Per-walk full-body-walk census (diagnostic). Prints the same record

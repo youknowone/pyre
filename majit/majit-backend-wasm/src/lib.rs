@@ -83,29 +83,67 @@ use std::sync::{Arc, Mutex};
 /// because the source module has frame-only dispatch; 46 = parameter entry
 /// declined because the source guard and bridge input arities disagree; 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
-pub static BRIDGE_DIAG: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
+/// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame.
+pub static BRIDGE_DIAG: [AtomicU64; 49] = [const { AtomicU64::new(0) }; 49];
 
-/// The first three inline geometry failures, packed as `(needed, available)`.
-/// They expose a frozen-layout shortage without changing the compile result.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub(crate) enum FrameShortageKind {
+    FrameValueSlots = 1,
+    OrdinaryRefHomes = 2,
+    LabelResumeRefSlots = 3,
+    LabelResumeCaptureSlots = 4,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FrameShortage {
+    pub(crate) kind: FrameShortageKind,
+    pub(crate) needed: usize,
+    pub(crate) available: usize,
+}
+
+impl FrameShortage {
+    pub(crate) const fn new(kind: FrameShortageKind, needed: usize, available: usize) -> Self {
+        Self {
+            kind,
+            needed,
+            available,
+        }
+    }
+}
+
+/// The first three inline geometry failures, packed as
+/// `(kind: u8, needed: u24, available: u24)`. They expose a frozen-layout
+/// shortage without changing the compile result.
 static INLINE_GEOMETRY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-pub(crate) fn record_inline_geometry(needed: usize, available: usize) {
+pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
+    const FIELD_MASK: u64 = (1 << 24) - 1;
+
     let index = INLINE_GEOMETRY_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
     if let Some(slot) = INLINE_GEOMETRY.get(index) {
         slot.store(
-            ((needed as u64) << 32) | available as u64,
+            ((kind as u64) << 48)
+                | ((needed as u64).min(FIELD_MASK) << 24)
+                | (available as u64).min(FIELD_MASK),
             Ordering::Relaxed,
         );
     }
 }
 
-/// Read a packed `(needed, available)` inline geometry failure.
+/// Read a packed `(kind, needed, available)` inline geometry failure.
 pub fn inline_geometry_diag(index: usize) -> u64 {
     INLINE_GEOMETRY
         .get(index)
         .map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
+
+/// Number of inline geometry failures, including records beyond the three
+/// diagnostics retained in [`INLINE_GEOMETRY`].
+pub fn inline_geometry_count() -> u64 {
+    INLINE_GEOMETRY_COUNT.load(Ordering::Relaxed)
 }
 
 pub fn inline_trial_errors() -> String {
@@ -3301,6 +3339,8 @@ impl majit_backend::Backend for WasmBackend {
                                 diag_bump(40);
                             } else if reason.contains("ordinary ref homes") {
                                 diag_bump(41);
+                            } else if reason.contains("label resume layout") {
+                                diag_bump(48);
                             } else if reason
                                 .contains("inlined bridge stream has no local loop LABEL")
                             {
