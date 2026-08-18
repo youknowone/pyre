@@ -19113,6 +19113,22 @@ mod metainterp_static_data_tests {
             "ordinary structurally-equal EffectInfos must share their canonical cell",
         );
 
+        // The dedup keeps one writeback descr per cell, so `finish_setup_descrs`
+        // publishes `compute_bitstrings`' answer through that representative
+        // only.  Every other descr on the same cell has to observe it, or the
+        // ones that were deduped away would run on unpublished bitstrings.
+        first.as_call_descr().unwrap().set_effect_bitstrings(
+            Some(vec![0b0000_0011]),
+            Some(vec![0b0000_0101]),
+            None,
+            None,
+            None,
+            None,
+        );
+        let observed = second.as_call_descr().unwrap().get_extra_info();
+        assert_eq!(observed.readonly_descrs_fields, Some(vec![0b0000_0011]));
+        assert_eq!(observed.write_descrs_fields, Some(vec![0b0000_0101]));
+
         let (snapshots, writebacks) = unique_effect_info_snapshots(&[first, second]);
 
         assert_eq!(snapshots.len(), 1);

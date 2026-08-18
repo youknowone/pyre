@@ -294,9 +294,25 @@ impl Clone for EffectInfoCell {
 ///
 /// PyPy constructs one canonical EffectInfo object for each structural raw-set
 /// key and the call-descr cache stores that object by identity.  Keep the same
-/// process-global ownership here.  A small insertion-ordered vector is enough
-/// for the translated population and, unlike a second structural key, does not
-/// duplicate all six raw descriptor sets merely to find the canonical cell.
+/// process-global ownership here — `LLType::func_key` keys on this cell's
+/// address for exactly that reason, so anything that splits a cell mints a
+/// distinct call descr.
+///
+/// Upstream's `_cache` is a dict; this is an insertion-ordered vector scanned
+/// linearly, the shape `AGENTS.md`'s container rule allows for a small key
+/// space.  Measured, rather than assumed: the population tops out between 32
+/// and 63 distinct EffectInfos, and the heaviest workload tried (`test_pickle`,
+/// 999 tests) took 6,519 lookups for 44,266 candidate comparisons — about seven
+/// per lookup, most exiting on the first three integer fields.  A keyed map
+/// would have to duplicate all six raw descriptor sets to find the cell it
+/// replaces.
+///
+/// The key is `EffectInfo` equality, which carries `pyre_helper`.  Upstream has
+/// no such field, and it must stay in: the walker matches a helper by that tag
+/// on the descr's EffectInfo because it cannot match by fnaddr (`pyre-jit`'s
+/// `flatten.rs`), so two helpers with identical effect sets but different tags
+/// must not share a cell — one call site would be handed the other's tag and
+/// re-emit the wrong specialization.
 ///
 /// `effectinfo.py:144-146` deliberately bypasses the cache for release-gil
 /// targets by appending a fresh `object()` to the key; those calls receive a
@@ -308,6 +324,18 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
 
     static CACHE: LazyLock<Mutex<Vec<Arc<EffectInfoCell>>>> =
         LazyLock::new(|| Mutex::new(Vec::new()));
+    // `effectinfo.py:143-146` destructures `tgt_func, tgt_saveerr` but appends
+    // the fresh-object breaker only `if tgt_func`, so `tgt_saveerr` never
+    // enters the key, and upstream's only null-target value is
+    // `_NO_CALL_RELEASE_GIL_TARGET = (NULL, 0)`.  The early return above took
+    // every non-null target, so normalise the half no reader can reach from
+    // here: `is_call_release_gil` tests `tgt_func` alone, and the two sites
+    // that do consume the pair assert a resolved address first.  Without this,
+    // a `(0, save_err)` left by an unresolved `resolve_call_release_gil_target`
+    // would key its own cell and mint a call descr upstream would have merged.
+    let mut effect_info = effect_info;
+    effect_info.call_release_gil_target = EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
+
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = cache.iter().find(|existing| existing.get() == &effect_info) {
         return existing.clone();
@@ -2157,6 +2185,26 @@ mod compute_bitstrings_tests {
         let first = intern_effect_info(effect_info.clone());
         let second = intern_effect_info(effect_info);
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    /// `effectinfo.py:143-146` reads `tgt_saveerr` out of the pair but never
+    /// puts it in the key, so a null target carrying a stray `save_err` must
+    /// not buy its own canonical cell — and therefore its own call descr.
+    #[test]
+    fn effect_info_cache_ignores_save_err_on_a_null_release_gil_target() {
+        let mut with_save_err = EffectInfo::default();
+        with_save_err.call_release_gil_target = (0, 3);
+        // The premise the normalisation exists for: equality does split on the
+        // pair, so without it the two below would land in separate cells.
+        assert_ne!(with_save_err, EffectInfo::default());
+
+        let plain = intern_effect_info(EffectInfo::default());
+        let stray = intern_effect_info(with_save_err);
+        assert!(Arc::ptr_eq(&plain, &stray));
+        assert_eq!(
+            stray.get().call_release_gil_target,
+            EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        );
     }
 
     /// Two EIs share a fielddescr in their write set; the descr's
