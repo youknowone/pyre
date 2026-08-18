@@ -17,7 +17,9 @@ on:
         type: boolean
 
 concurrency:
-  group: translate-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  # One group per PR and one per tracked branch, so a newer commit cancels the
+  # predecessor's run on `main` as well as inside a PR.
+  group: translate-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:

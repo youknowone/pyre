@@ -24,9 +24,9 @@ on:
         default: false
         type: boolean
 
-# Limit tests to latest commit on branches other than main
+# Limit tests to the latest commit on every branch, `main` included
 concurrency:
-  group: rpython-unit-tests-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  group: rpython-unit-tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 
