@@ -9350,10 +9350,20 @@ fn make_exception_group_type(
 fn register_exc_class(name: &'static str, cls: PyObjectRef) -> PyObjectRef {
     let registry =
         EXC_CLASS_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let canonical = *registry.entry(name).or_insert(cls as usize) as PyObjectRef;
+    // The map lookup is all this lock covers.  Everything below reaches the
+    // object heap, whose dict locks are striped -- two unrelated dictionaries
+    // can share one -- so a thread holding a dict lock and waiting for this
+    // registry closes a cycle against the thread that holds the registry and
+    // wants a dict.  A plain mutex is invisible to the collector's
+    // stop-the-world handshake as well, so nothing breaks that wait.
+    let canonical = {
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *registry.entry(name).or_insert(cls as usize) as PyObjectRef
+    };
+    // Both of these are first-writer-wins on their own, so a second thread
+    // arriving at the same class repeats them rather than racing them.
     crate::typedef::stamp_exception_method_owners(canonical, name);
     if let Some(kind) = pyre_object::interp_exceptions::exc_kind_from_name(name) {
         let by_kind = pyre_object::interp_exceptions::register_exc_class_for_kind(kind, canonical);
@@ -18601,6 +18611,35 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Several threads installing the builtins at once all finish.
+    ///
+    /// `register_exc_class` used to hold its registry mutex across the method
+    /// stamping below it, which takes the striped dict locks.  A thread
+    /// already holding one of those stripes and waiting for the registry
+    /// closed a cycle with the thread holding the registry and waiting for a
+    /// stripe, and neither side could give way.  A deadlock has no failing
+    /// assertion of its own, so the wait is given a deadline and the threads
+    /// are never joined: one that is stuck must not take the harness with it.
+    #[test]
+    fn concurrent_builtin_installs_all_finish() {
+        const THREADS: usize = 4;
+        let (report, finished) = std::sync::mpsc::channel();
+        for _ in 0..THREADS {
+            let report = report.clone();
+            std::thread::spawn(move || {
+                let dict = new_builtin_module_dict();
+                let _ = report.send(!dict.is_null());
+            });
+        }
+        drop(report);
+        for index in 0..THREADS {
+            match finished.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(built) => assert!(built, "thread {index} built no builtins dictionary"),
+                Err(error) => panic!("only {index} of {THREADS} threads finished: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn in_memory_file_write_overwrites_at_the_seek_position() {
