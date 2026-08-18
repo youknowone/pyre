@@ -1209,15 +1209,37 @@ fn init_sysconfigdata(ns: PyObjectRef) {
     store_int(vars_slot, "Py_DEBUG", 0);
     store_int(vars_slot, "Py_GIL_DISABLED", 1);
     store_int(vars_slot, "Py_ENABLE_SHARED", 0);
-    // Publish an entropy capability only when it names the implementation:
-    // unsandboxed `host_env` uses `getrandom::fill` on Linux and getentropy on
-    // other Unix targets. Sandbox and no-`host_env` routes open `/dev/urandom`,
-    // while Windows uses its cryptography provider.
-    #[cfg(all(target_os = "linux", feature = "host_env", not(feature = "sandbox")))]
+    // Publish an entropy capability only when it names the call this build
+    // makes. Unsandboxed `host_env` reaches the host through `getrandom::fill`,
+    // which picks its backend per target: `getrandom(2)` for the first set
+    // below, `getentropy(2)` for the second. A target in neither set makes
+    // neither call — the iOS family goes through `CCRandomGenerateBytes`,
+    // NetBSD resolves `getrandom` at runtime and reads a sysctl when it is
+    // absent, and Haiku, Redox, NTO and AIX open `/dev/urandom` — so it
+    // publishes no name, and neither do the sandbox and no-`host_env` routes,
+    // which open `/dev/urandom`, or Windows, which uses its cryptography
+    // provider.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "illumos",
+            target_os = "solaris",
+            target_os = "hurd",
+        ),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     store_int(vars_slot, "HAVE_GETRANDOM_SYSCALL", 1);
     #[cfg(all(
-        unix,
-        not(target_os = "linux"),
+        any(
+            target_os = "macos",
+            target_os = "openbsd",
+            target_os = "vita",
+            target_os = "emscripten",
+        ),
         feature = "host_env",
         not(feature = "sandbox")
     ))]
