@@ -3162,7 +3162,13 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         let cell = unsafe { majit_ir::recover_fail_descr_cell(jf_force_descr as usize) };
         cell.descr.clone()
     };
-    deadframe_from_jitframe(jf_gcref, fail_descr, None)
+    // `llmodel.py:280-284 force` returns the resolved frame itself.  The frame
+    // is the one the compiled run is executing in — still on the JF shadow
+    // stack, inside the residual call that armed `jf_force_descr` — so this
+    // deadframe borrows it: the call site pushed `jf_gcmap` before the call and
+    // clears it with `pop_gcmap` on return, and releasing it here would leave
+    // the frame's spilled `Ref` slots untraced for the rest of the call.
+    DeadFrame::JitFrame(JitFrameDeadFrame::borrowing(jf_gcref, fail_descr, None))
 }
 
 fn deadframe_from_jitframe(
