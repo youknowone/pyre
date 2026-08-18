@@ -13,6 +13,79 @@ use std::sync::OnceLock;
 const GETSIZEOF_DOC: &str = "getsizeof(object [, default]) -> int\n\n\
 Return the size of object in bytes.";
 
+/// The ids `sys.monitoring.use_tool_id` accepts, one below the first id the
+/// runtime reserves for itself (`PY_MONITORING_SYS_PROFILE_ID`).
+const MONITORING_TOOL_COUNT: usize = 6;
+
+/// `interp->monitoring_tool_names` — the name each claimed tool id was
+/// registered under, or NULL while the id is free.
+///
+/// The event machinery below is inert, but *ownership* is not: `get_tool`
+/// reports it, `bdb` consults it before installing its tracer, and it is what
+/// makes a second `cProfile.Profile.enable()` fail instead of silently
+/// displacing the first.  Held as raw addresses and forwarded by
+/// [`walk_monitoring_tool_roots`], since a name is an ordinary movable str.
+static MONITORING_TOOL_NAMES: [std::sync::atomic::AtomicUsize; MONITORING_TOOL_COUNT] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; MONITORING_TOOL_COUNT];
+
+/// Forward the claimed tool names for the process-global root walk.
+pub fn walk_monitoring_tool_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    for slot in MONITORING_TOOL_NAMES.iter() {
+        let addr = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if addr == 0 {
+            continue;
+        }
+        let mut root = majit_ir::GcRef(addr);
+        visitor(&mut root);
+        slot.store(root.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `check_valid_tool` — reject an id outside the claimable range before it is
+/// used to index the table.
+fn monitoring_tool_id_w(w_tool_id: PyObjectRef) -> Result<usize, crate::PyError> {
+    let tool_id = crate::builtins::space_index_w(w_tool_id)?;
+    if !(0..MONITORING_TOOL_COUNT as i64).contains(&tool_id) {
+        return Err(crate::PyError::value_error(format!(
+            "invalid tool {tool_id} (must be between 0 and {})",
+            MONITORING_TOOL_COUNT - 1
+        )));
+    }
+    Ok(tool_id as usize)
+}
+
+fn monitoring_tool_name(tool_id: usize) -> PyObjectRef {
+    MONITORING_TOOL_NAMES[tool_id].load(std::sync::atomic::Ordering::Relaxed) as PyObjectRef
+}
+
+fn monitoring_set_tool_name(tool_id: usize, name: PyObjectRef) {
+    MONITORING_TOOL_NAMES[tool_id].store(name as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `monitoring_use_tool_id_impl` — claim `tool_id` for `w_name`, refusing an
+/// id someone else already holds.
+pub fn monitoring_use_tool_id(tool_id: usize, w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(crate::PyError::value_error("tool name must be a str"));
+    }
+    if !monitoring_tool_name(tool_id).is_null() {
+        return Err(crate::PyError::value_error(format!(
+            "tool {tool_id} is already in use"
+        )));
+    }
+    monitoring_set_tool_name(tool_id, w_name);
+    Ok(())
+}
+
+/// The id `_lsprof` claims, matching `sys.monitoring.PROFILER_ID`.
+pub const MONITORING_PROFILER_ID: usize = 2;
+
+/// Release `tool_id` unconditionally — `free_tool_id`'s interp-level spelling,
+/// for callers that claimed the id from native code.
+pub fn monitoring_free_tool_id(tool_id: usize) {
+    monitoring_set_tool_name(tool_id, pyre_object::PY_NULL);
+}
+
 /// CPython 3.14 `_PySys_GetSizeOf`: look up `__sizeof__` on the type,
 /// call the bound method, require a non-negative Py_ssize_t result, then add
 /// the pre-header used by a heap type.  Pyre has no physical CPython object
@@ -1983,10 +2056,65 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 make_builtin_function_with_arity(name, f, arity),
             );
         };
-        store_fn(mon, "use_tool_id", |_| Ok(w_none()), 2);
-        store_fn(mon, "free_tool_id", |_| Ok(w_none()), 1);
-        store_fn(mon, "clear_tool_id", |_| Ok(w_none()), 1);
-        store_fn(mon, "get_tool", |_| Ok(w_none()), 1);
+        store_fn(
+            mon,
+            "use_tool_id",
+            |args| {
+                if args.len() != 2 {
+                    return Err(crate::PyError::type_error(
+                        "use_tool_id() takes exactly two arguments",
+                    ));
+                }
+                monitoring_use_tool_id(monitoring_tool_id_w(args[0])?, args[1])?;
+                Ok(w_none())
+            },
+            2,
+        );
+        store_fn(
+            mon,
+            "free_tool_id",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(
+                        "free_tool_id() takes exactly one argument",
+                    ));
+                }
+                monitoring_set_tool_name(monitoring_tool_id_w(args[0])?, pyre_object::PY_NULL);
+                Ok(w_none())
+            },
+            1,
+        );
+        // `clear_tool_id` drops the tool's callbacks and events but keeps its
+        // claim on the id; with the event machinery inert there is nothing to
+        // clear, so only the id check is observable.
+        store_fn(
+            mon,
+            "clear_tool_id",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(
+                        "clear_tool_id() takes exactly one argument",
+                    ));
+                }
+                monitoring_tool_id_w(args[0])?;
+                Ok(w_none())
+            },
+            1,
+        );
+        store_fn(
+            mon,
+            "get_tool",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(
+                        "get_tool() takes exactly one argument",
+                    ));
+                }
+                let name = monitoring_tool_name(monitoring_tool_id_w(args[0])?);
+                Ok(if name.is_null() { w_none() } else { name })
+            },
+            1,
+        );
         store_fn(mon, "register_callback", |_| Ok(w_none()), 3);
         store_fn(mon, "set_events", |_| Ok(w_none()), 2);
         store_fn(mon, "get_events", |_| Ok(w_int_new(0)), 1);

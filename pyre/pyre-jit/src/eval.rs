@@ -773,6 +773,12 @@ unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
     };
 }
 
+unsafe fn lsprof_profiler_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -879,6 +885,14 @@ unsafe fn mmap_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::Gc
 /// mapdict prefix and therefore require the same custom trace as W_MMap.
 unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
+}
+
+/// `_lsprof.Profiler` owns the PyPy `ProfilerEntry` / `ProfilerContext`
+/// bookkeeping in Rust vectors, so its Python references are not visible as
+/// inline payload offsets.
+unsafe fn lsprof_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+    unsafe { pyre_interpreter::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
 }
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, cached unbound
@@ -3795,6 +3809,47 @@ fn build_gc() -> Box<MiniMarkGC> {
             descr.ptr_offsets,
         );
     }
+    // `interp_lsprof.py` keeps the profiler's entry trees on the W_Root owner,
+    // behind Rust vectors no inline offset can name, so it needs a marker; it is
+    // also `cProfile.Profile`'s base class, hence the mapdict prefix walk.  The
+    // two stats result objects hold their code and call-list references in
+    // inline fields and are not instantiable, so they register like any other
+    // rclass owner.
+    let profiler_descr = <pyre_interpreter::module::_lsprof::W_Profiler
+        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let profiler_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            profiler_descr.object_size,
+            object_tid,
+            lsprof_profiler_custom_trace,
+        )
+        .with_destructor_fn(lsprof_profiler_destructor),
+    );
+    profiler_descr.gc_type_id.set(profiler_tid);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        profiler_descr.pytype_ptr as usize,
+        profiler_tid,
+    );
+    pytype_to_tid.insert(profiler_descr.pytype_ptr as usize, profiler_tid);
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        profiler_descr.pytype_ptr as usize,
+        profiler_descr.ptr_offsets,
+    );
+
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_lsprof::W_StatsEntry
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_lsprof::W_StatsSubEntry
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+
     // `posix.DirEntry`: four inline GC edges (`w_name`/`w_path` and the cached
     // `w_stat`/`w_lstat`, the latter two NULL until first requested).  Appended
     // after the last unconditional vtable-bearing object (`W_GcStats`) so only

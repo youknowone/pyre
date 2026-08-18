@@ -44,6 +44,8 @@ pub mod _json;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
+pub mod _lsprof;
+#[allow(non_snake_case)]
 pub mod _lzma;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]

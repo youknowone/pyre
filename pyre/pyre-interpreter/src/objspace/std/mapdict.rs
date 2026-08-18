@@ -612,6 +612,17 @@ unsafe fn is_zlib_mapdict_layout(obj: PyObjectRef) -> bool {
     }
 }
 
+#[inline]
+unsafe fn is_lsprof_mapdict_layout(obj: PyObjectRef) -> bool {
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &*<crate::module::_lsprof::W_Profiler as PyreClassPyTypeOf>::PYTYPE,
+        )
+    }
+}
+
 /// Whether `obj`'s physical allocation carries the slots supplied by
 /// `MapdictStorageMixin` (`mapdict.py:748-761, 905-910`). Ordinary instances
 /// and `_random.Random` keep the historical prefix. The generated tuple/int/str
@@ -634,6 +645,7 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
         || unsafe { is_ssl_mapdict_layout(obj) }
         || unsafe { is_mmap_mapdict_layout(obj) }
         || unsafe { is_zlib_mapdict_layout(obj) }
+        || unsafe { is_lsprof_mapdict_layout(obj) }
     {
         return true;
     }
