@@ -674,6 +674,13 @@ pub struct CompiledWasmLoop {
     /// Direct-loop guard index to bridge table slot. A re-emission replays
     /// these slots into its fresh loop cell array.
     pub bridge_slots: RefCell<std::collections::HashMap<u32, u32>>,
+    /// The same, for a guard that lives inside a trace chained onto this loop,
+    /// keyed by `(owning trace_id, per-trace fail index)`. A standalone chained
+    /// bridge keeps its cells in its own module's array, which survives; a
+    /// region merged into this loop does not, because a re-emission reallocates
+    /// the loop array its guards are carved out of. Replayed once the rebuilt
+    /// `chained_trace_meta` names the new bases.
+    pub chained_bridge_slots: RefCell<std::collections::HashMap<(u64, u32), u32>>,
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
