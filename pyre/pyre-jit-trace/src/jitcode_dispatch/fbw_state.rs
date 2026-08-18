@@ -22,7 +22,10 @@ use super::*;
 /// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.
 /// Default 7: a deep value-returning chain (`b→c→…→h`) stays in compiled code
 /// and each extra inlined level removes a residual call — measured ~2.0–2.3×
-/// on the `depthN_inline_chain` fixtures with no regression elsewhere.
+/// on `bench/synth/inline_chain_depth_typeflip.py` with no regression
+/// elsewhere.  The number predates that file: it was taken on the separate
+/// per-depth fixtures later consolidated into it, so re-measure before
+/// leaning on it.
 ///
 /// A callee that raises inline below an intermediate frame is capped separately,
 /// to the top inline level by `callee_body_contains_raise`: its unwind needs the
