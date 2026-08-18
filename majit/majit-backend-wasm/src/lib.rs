@@ -266,11 +266,9 @@ fn reemit_enabled() -> bool {
     REEMIT_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Arm loop-closing bridge inlining. Inlining rebuilds the owning loop, so it
-/// also enables the replacement path.
+/// Arm loop-closing bridge inlining from the host before guest execution starts.
 pub fn inline_bridge_enable() {
     INLINE_BRIDGE_ENABLED.store(true, Ordering::Relaxed);
-    reemit_enable();
 }
 
 fn inline_bridge_enabled() -> bool {
@@ -3646,10 +3644,9 @@ impl majit_backend::Backend for WasmBackend {
             unsafe {
                 core::ptr::write(cell, bridge_slot);
             }
-            // Only retained module replacement needs to restore this cell
-            // after allocating a fresh dispatch array.  Without replacement,
-            // the live cell is already the sole dispatch state.
-            if is_direct && reemit_enabled() {
+            // Retained module replacement and loop-closing bridge inlining
+            // restore this cell after allocating a fresh dispatch array.
+            if is_direct && (reemit_enabled() || inline_bridge_enabled()) {
                 if let Some(source_loop) = original_token
                     .compiled
                     .get()
