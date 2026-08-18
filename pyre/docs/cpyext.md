@@ -99,9 +99,10 @@ single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
 the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
-`pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs` and
-`pyrex/tests/cpyext_warnings.rs` take their expectations from CPython 3.14.6
-running the same script against the same fixture.
+`pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs`,
+`pyrex/tests/cpyext_warnings.rs` and `pyrex/tests/cpyext_conversions.rs` take
+their expectations from CPython 3.14.6 running the same script against the
+same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -184,6 +185,27 @@ running the same script against the same fixture.
   NULL category is `RuntimeWarning`, and the category is never checked -- it is
   called with the message, so a class that is not a `Warning` is emitted under
   that class and one that is not callable refuses;
+- the conversions at the C boundary (`cpyext/unicodeobject.rs`,
+  `cpyext/osmodule.rs`): the named codecs `PyUnicode_Decode` /
+  `DecodeASCII` / `DecodeLatin1` / `DecodeUTF8` and `PyUnicode_AsEncodedString`
+  / `AsASCIIString` / `AsLatin1String` / `AsUTF8String`, each reached through
+  `bytes.decode` and `str.encode` so the error handler is the interpreter's
+  own; the `wchar_t` forms `PyUnicode_FromWideChar` / `AsWideChar` /
+  `AsWideCharString`, whose unit is one code point where a `wchar_t` is four
+  bytes and one UTF-16 unit where it is two; and the filesystem encoding
+  `PyUnicode_DecodeFSDefault` / `DecodeFSDefaultAndSize` / `EncodeFSDefault`
+  with the two `O&` converters `PyUnicode_FSConverter` / `FSDecoder` over
+  `PyOS_FSPath`. `PyUnicode_AsWideCharString` allocates through `PyMem_Malloc`,
+  which is the allocator its caller frees it with;
+- `PyIndex_Check`, and `Py_GetConstant` / `Py_GetConstantBorrowed` over one
+  immortal mirror per constant, since the borrowed spelling hands out a mirror
+  it took no reference to and two asks for the same identifier have to answer
+  the same pointer;
+- a parenthesised unit in the argument parser (`include/pyre3.14t/modsupport.h`)
+  and the compat-mode `PyArg_Parse` over it, where the argument is the value
+  itself rather than a tuple holding it and a format naming more than one unit
+  is a `SystemError`. `PyOS_snprintf` and `PyOS_vsnprintf` are beside
+  `PyErr_Format` in the headers, being variadic for the same reason;
 - the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
   `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
   `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
@@ -402,6 +424,10 @@ Known divergences, each documented at its definition:
   object it belongs to moves and the foreign memory does not;
 - a `memoryview` that is never released never ends its export, pyre having no
   reference counting to end it at the last drop;
+- the argument parser words a bad argument its own way: every message is
+  prefixed with the function name `_PyPyre_ArgError` was given, where CPython
+  numbers the argument instead and leaves the function out when the format
+  carries no `:name`;
 - `PyErr_WarnExplicitFormat` defaults a NULL category to `RuntimeWarning`,
   which the entry point it shares its core with already does. CPython's is the
   one spelling in the family that skips that default and hands the NULL
@@ -425,17 +451,23 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 749 public
    `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 412 are present, counting every form `Python.h` offers one
+   underscore -- 434 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like
    aliases on the other; on the same header the corrected count is 293, so
    this figure moved by 49. The 749/342 recorded after that was measured
    before the four slices below it, and the 747 after that was the same
-   census over the 3.14.6 headers -- 3.14.7 declares two more.) The figure counts only that population,
-   so the
-   private `_PyLong_*ByteArray` pair and the unchecked accessor macros the
-   extensions below need do not appear in it;
+   census over the 3.14.6 headers -- 3.14.7 declares two more.) The figure
+   counts only that population, so the private `_PyLong_*ByteArray` pair and
+   the unchecked accessor macros the extensions below need do not appear in
+   it. It also says nothing about the exported *data*, which is a separate
+   population and a separate gap: the `PyExc_*` class mirrors are complete,
+   but not one of the `PyAPI_DATA(PyTypeObject)` names is offered, so
+   `&PyList_Type` and its siblings do not link. Each would have to be a
+   statically allocated `PyTypeObject` the mirror synthesizer fills in place,
+   the way `_Py_NoneStruct` is for the singletons, since C takes its address
+   rather than reading a pointer;
 6. Windows API DLL/import-library packaging.
 
 A type built from a spec carries the module it was created from and the

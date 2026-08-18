@@ -510,14 +510,24 @@ pub unsafe extern "C" fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut CPyObject
     pyobject::make_ref(pyre_object::w_str_from_codepoint(ordinal as u32))
 }
 
-/// `PyUnicode_DecodeUTF8(string, length, errors)`.
+/// The handler a codec entry point was given, `strict` for a NULL one.
+fn error_handler(errors: *const c_char) -> String {
+    if errors.is_null() {
+        return "strict".to_owned();
+    }
+    unsafe { CStr::from_ptr(errors) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The body every `PyUnicode_Decode*` shares.
 ///
 /// The error handler is the interpreter's own, reached by decoding through
 /// `bytes.decode` rather than by naming the handlers this understands.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
+fn decode_through(
     string: *const c_char,
     length: isize,
+    encoding: &str,
     errors: *const c_char,
 ) -> *mut CPyObject {
     if string.is_null() || length < 0 {
@@ -525,22 +535,384 @@ pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
         return std::ptr::null_mut();
     }
     let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, length as usize) };
-    let handler = if errors.is_null() {
-        "strict".to_string()
-    } else {
-        unsafe { CStr::from_ptr(errors) }
-            .to_string_lossy()
-            .into_owned()
-    };
+    let handler = error_handler(errors);
     let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(bytes);
     super::object::result(call_method(
         w_bytes,
         "decode",
         &[
-            pyre_object::w_str_new("utf-8"),
+            pyre_object::w_str_new(encoding),
             pyre_object::w_str_new(&handler),
         ],
     ))
+}
+
+/// The body every `PyUnicode_As*String` shares: `str.encode`, refusing
+/// anything that is not a `str` the way `PyErr_BadArgument` does.
+fn encode_through(object: *mut CPyObject, encoding: &str, errors: *const c_char) -> *mut CPyObject {
+    let Some(value) = argument(object) else {
+        return std::ptr::null_mut();
+    };
+    if !unsafe { pyre_object::unicodeobject::is_str(value) } {
+        unsafe { super::pyerrors::PyErr_BadArgument() };
+        return std::ptr::null_mut();
+    }
+    let handler = error_handler(errors);
+    super::object::result(call_method(
+        value,
+        "encode",
+        &[
+            pyre_object::w_str_new(encoding),
+            pyre_object::w_str_new(&handler),
+        ],
+    ))
+}
+
+/// The encoding an entry point was given, `utf-8` for a NULL one.
+fn encoding_name(encoding: *const c_char) -> String {
+    if encoding.is_null() {
+        return "utf-8".to_owned();
+    }
+    unsafe { CStr::from_ptr(encoding) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF8(
+    string: *const c_char,
+    length: isize,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    decode_through(string, length, "utf-8", errors)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeASCII(
+    string: *const c_char,
+    length: isize,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    decode_through(string, length, "ascii", errors)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeLatin1(
+    string: *const c_char,
+    length: isize,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    decode_through(string, length, "latin-1", errors)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Decode(
+    string: *const c_char,
+    length: isize,
+    encoding: *const c_char,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    decode_through(string, length, &encoding_name(encoding), errors)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsUTF8String(object: *mut CPyObject) -> *mut CPyObject {
+    encode_through(object, "utf-8", std::ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsASCIIString(object: *mut CPyObject) -> *mut CPyObject {
+    encode_through(object, "ascii", std::ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsLatin1String(object: *mut CPyObject) -> *mut CPyObject {
+    encode_through(object, "latin-1", std::ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsEncodedString(
+    object: *mut CPyObject,
+    encoding: *const c_char,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    encode_through(object, &encoding_name(encoding), errors)
+}
+
+// ── the `wchar_t` forms ─────────────────────────────────────────────────
+
+/// `wchar_t`, whose width is the host's: four bytes holding one code point
+/// where the C library says so, two holding one UTF-16 unit on Windows.
+#[allow(non_camel_case_types)]
+#[cfg(windows)]
+pub type wchar_t = u16;
+
+#[allow(non_camel_case_types)]
+#[cfg(not(windows))]
+pub type wchar_t = i32;
+
+/// The string as the host's wide units.
+///
+/// The two arms are the two things a `wchar_t` holds. Where it is four bytes
+/// the interpreter's own code points go across one for one, an unpaired
+/// surrogate included; where it is two the string has to be spelled as UTF-16
+/// first, which is what makes the count differ from `len()` for anything
+/// outside the basic plane.
+fn wide_units(value: PyObjectRef) -> Vec<wchar_t> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(value) };
+    #[cfg(windows)]
+    {
+        wtf8.encode_wide().collect()
+    }
+    #[cfg(not(windows))]
+    {
+        wtf8.code_points()
+            .map(|cp| cp.to_u32() as wchar_t)
+            .collect()
+    }
+}
+
+/// [`wide_units`]' inverse.
+fn wide_text(units: &[wchar_t]) -> Option<rustpython_wtf8::Wtf8Buf> {
+    #[cfg(windows)]
+    {
+        Some(rustpython_wtf8::Wtf8Buf::from_wide(units))
+    }
+    #[cfg(not(windows))]
+    {
+        let mut text = rustpython_wtf8::Wtf8Buf::new();
+        for &unit in units {
+            text.push(CodePoint::from_u32(unit as u32)?);
+        }
+        Some(text)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FromWideChar(
+    wide: *const wchar_t,
+    size: isize,
+) -> *mut CPyObject {
+    if wide.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let size = match size < 0 {
+        true => {
+            let mut length = 0isize;
+            while unsafe { *wide.offset(length) } != 0 {
+                length += 1;
+            }
+            length
+        }
+        false => size,
+    };
+    let units = unsafe { std::slice::from_raw_parts(wide, size as usize) };
+    // A unit no code point answers to is a mistake the caller made; upstream
+    // reads it unchecked, which is a bad character rather than a report.
+    let Some(text) = wide_text(units) else {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "wide character not in range(0x110000)".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(pyre_object::w_str_from_wtf8_managed(text))
+}
+
+/// The count [`PyUnicode_AsWideChar`] and [`PyUnicode_AsWideCharString`] both
+/// answer with, or `None` with the failure already recorded.
+fn wide_argument(object: *mut CPyObject) -> Option<PyObjectRef> {
+    let value = argument(object)?;
+    if !unsafe { pyre_object::unicodeobject::is_str(value) } {
+        unsafe { super::pyerrors::PyErr_BadArgument() };
+        return None;
+    }
+    Some(value)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsWideChar(
+    object: *mut CPyObject,
+    wide: *mut wchar_t,
+    size: isize,
+) -> isize {
+    let Some(value) = wide_argument(object) else {
+        return -1;
+    };
+    let units = wide_units(value);
+    // With nowhere to write, the answer is what a buffer would have to hold,
+    // the trailing NUL included.
+    if wide.is_null() {
+        return units.len() as isize + 1;
+    }
+    // A buffer with room to spare takes the NUL as well, and answers the
+    // length without it; one without room is filled and answers what it took.
+    let (copied, answer) = match size > units.len() as isize {
+        true => (units.len() + 1, units.len() as isize),
+        false => (size.max(0) as usize, size),
+    };
+    for (index, &unit) in units.iter().chain(&[0]).take(copied).enumerate() {
+        unsafe { *wide.add(index) = unit };
+    }
+    answer
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_AsWideCharString(
+    object: *mut CPyObject,
+    size: *mut isize,
+) -> *mut wchar_t {
+    let Some(value) = wide_argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let units = wide_units(value);
+    // Freed by the caller with `PyMem_Free`, so it has to come from the
+    // allocator that answers to it.
+    let bytes = std::mem::size_of::<wchar_t>() * (units.len() + 1);
+    let block = unsafe { super::pymem::PyMem_Malloc(bytes) } as *mut wchar_t;
+    if block.is_null() {
+        unsafe { super::pyerrors::PyErr_NoMemory() };
+        return std::ptr::null_mut();
+    }
+    for (index, &unit) in units.iter().chain(&[0]).enumerate() {
+        unsafe { *block.add(index) = unit };
+    }
+    if !size.is_null() {
+        unsafe { *size = units.len() as isize };
+        return block;
+    }
+    // Without a length beside it the block is read to its first NUL, so one
+    // inside the string would hand out a shorter string than there is.
+    if units.contains(&0) {
+        unsafe { super::pymem::PyMem_Free(block as *mut c_void) };
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "embedded null character".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    block
+}
+
+// ── the filesystem encoding ─────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeFSDefault(string: *const c_char) -> *mut CPyObject {
+    if string.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { CStr::from_ptr(string) }.to_bytes();
+    pyobject::make_ref(crate::gateway::fsdecode_filename_bytes(bytes))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeFSDefaultAndSize(
+    string: *const c_char,
+    size: isize,
+) -> *mut CPyObject {
+    if string.is_null() || size < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, size as usize) };
+    pyobject::make_ref(crate::gateway::fsdecode_filename_bytes(bytes))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_EncodeFSDefault(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(value) = wide_argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let Some(bytes) = super::pyerrors::trap(crate::gateway::fsencode(value)) else {
+        return std::ptr::null_mut();
+    };
+    pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+}
+
+/// `Py_CLEANUP_SUPPORTED`, which both converters answer with so that a parse
+/// that goes on to fail can hand the reference back.
+const CLEANUP_SUPPORTED: c_int = 2;
+
+/// The release call both converters take: `arg` NULL means the parse is
+/// undoing what an earlier conversion wrote.
+fn release_converted(target: *mut c_void) -> c_int {
+    let slot = target as *mut *mut CPyObject;
+    let held = unsafe { *slot };
+    if !held.is_null() {
+        unsafe { pyobject::decref(held) };
+    }
+    unsafe { *slot = std::ptr::null_mut() };
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FSConverter(
+    argument: *mut CPyObject,
+    target: *mut c_void,
+) -> c_int {
+    if argument.is_null() {
+        return release_converted(target);
+    }
+    let Some(value) = super::object::argument(argument) else {
+        return 0;
+    };
+    let Some(path) = super::pyerrors::trap(crate::module::posix::interp_posix::fspath(value))
+    else {
+        return 0;
+    };
+    let bytes = if unsafe { pyre_object::bytesobject::is_bytes(path) } {
+        unsafe { pyre_object::bytesobject::w_bytes_data(path) }.to_vec()
+    } else {
+        match super::pyerrors::trap(crate::gateway::fsencode(path)) {
+            Some(bytes) => bytes,
+            None => return 0,
+        }
+    };
+    // A name the syscall would read to its first NUL is not the name that was
+    // passed, so it is refused rather than silently shortened.
+    if bytes.contains(&0) {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "embedded null byte".to_owned(),
+        ));
+        return 0;
+    }
+    let encoded = pyre_object::bytesobject::w_bytes_from_bytes(&bytes);
+    unsafe { *(target as *mut *mut CPyObject) = pyobject::make_ref(encoded) };
+    CLEANUP_SUPPORTED
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FSDecoder(
+    argument: *mut CPyObject,
+    target: *mut c_void,
+) -> c_int {
+    if argument.is_null() {
+        return release_converted(target);
+    }
+    let Some(value) = super::object::argument(argument) else {
+        return 0;
+    };
+    let Some(path) = super::pyerrors::trap(crate::module::posix::interp_posix::fspath(value))
+    else {
+        return 0;
+    };
+    let text = if unsafe { pyre_object::unicodeobject::is_str(path) } {
+        path
+    } else {
+        let bytes = unsafe { pyre_object::bytesobject::w_bytes_data(path) }.to_vec();
+        crate::gateway::fsdecode_filename_bytes(&bytes)
+    };
+    if unsafe { pyre_object::w_str_get_wtf8(text) }
+        .as_bytes()
+        .contains(&0)
+    {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "embedded null character".to_owned(),
+        ));
+        return 0;
+    }
+    unsafe { *(target as *mut *mut CPyObject) = pyobject::make_ref(text) };
+    CLEANUP_SUPPORTED
 }
 
 /// `unicodeobject.py:716 PyUnicode_FromObject` — an exact `str`, so a subclass

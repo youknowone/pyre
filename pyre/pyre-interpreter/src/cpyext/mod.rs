@@ -33,6 +33,7 @@ pub mod methodobject;
 pub mod modsupport;
 pub mod number;
 pub mod object;
+pub mod osmodule;
 pub mod pyerrors;
 pub mod pymem;
 pub mod pyobject;
@@ -737,6 +738,7 @@ pub fn ensure_linked() {
     pystate::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
+    osmodule::ensure_linked();
     warnings::ensure_linked();
     exception::ensure_linked();
     weakrefobject::ensure_linked();

@@ -956,6 +956,42 @@ fn create_environ() -> pyre_object::PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
+/// `posix_fspath` / `PyOS_FSPath` — `str` and `bytes` pass through unchanged
+/// (the protocol's identity case); any other object is resolved through
+/// `type(path).__fspath__(path)`.
+pub(crate) fn fspath(arg: pyre_object::PyObjectRef) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    // `str` and `bytes` only — a `bytearray` is a readable buffer and not a
+    // path, so it goes on to be rejected below.
+    unsafe {
+        if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes(arg) {
+            return Ok(arg);
+        }
+    }
+    // `path_type.__fspath__(path)` — the descriptor read off the type is
+    // unbound, so `path` is supplied as the sole argument.
+    let path_type = crate::typedef::r#type(arg);
+    if let Some(pt) = path_type
+        && let Some(fspath_fn) =
+            unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
+    {
+        let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
+        // The protocol is only satisfied by what a path can be, so an answer
+        // that is neither names the object that gave it and the type it gave.
+        if unsafe { pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result) } {
+            return Ok(result);
+        }
+        return Err(crate::PyError::type_error(format!(
+            "expected {}.__fspath__() to return str or bytes, not {}",
+            crate::gateway::short_type_name(arg),
+            crate::gateway::short_type_name(result)
+        )));
+    }
+    Err(crate::PyError::type_error(format!(
+        "expected str, bytes or os.PathLike object, not {}",
+        crate::gateway::short_type_name(arg)
+    )))
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "environ", create_environ());
     crate::module_ns_store(
@@ -3550,50 +3586,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }),
     );
-    // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.  str/bytes
-    // pass through unchanged (the protocol's identity case); any other
-    // object is resolved via `type(path).__fspath__(path)`.
+    // os.fspath() — posixmodule.c posix_fspath / PyOS_FSPath.
     crate::module_ns_store(
         ns,
         "fspath",
         crate::make_builtin_function_with_arity(
             "fspath",
-            |args| {
-                let arg = args.first().copied().unwrap_or(pyre_object::w_none());
-                // `str` and `bytes` only — a `bytearray` is a readable buffer
-                // and not a path, so it goes on to be rejected below.
-                unsafe {
-                    if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes(arg) {
-                        return Ok(arg);
-                    }
-                }
-                // `path_type.__fspath__(path)` — the descriptor read off the
-                // type is unbound, so `path` is supplied as the sole argument.
-                let path_type = crate::typedef::r#type(arg);
-                if let Some(pt) = path_type
-                    && let Some(fspath_fn) =
-                        unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
-                {
-                    let result = crate::call::call_function_impl_result(fspath_fn, &[arg])?;
-                    // The protocol is only satisfied by what a path can be,
-                    // so an answer that is neither names the object that
-                    // gave it and the type it gave.
-                    if unsafe {
-                        pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result)
-                    } {
-                        return Ok(result);
-                    }
-                    return Err(crate::PyError::type_error(format!(
-                        "expected {}.__fspath__() to return str or bytes, not {}",
-                        crate::gateway::short_type_name(arg),
-                        crate::gateway::short_type_name(result)
-                    )));
-                }
-                Err(crate::PyError::type_error(format!(
-                    "expected str, bytes or os.PathLike object, not {}",
-                    crate::gateway::short_type_name(arg)
-                )))
-            },
+            |args| fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
     );

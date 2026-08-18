@@ -1026,7 +1026,68 @@ pub unsafe extern "C" fn PyObject_Type(object: *mut CPyObject) -> *mut CPyObject
     pyobject::make_ref(class.as_ptr())
 }
 
+// ── the constants an extension asks for by identifier ───────────────────
+
+/// The object `Py_CONSTANT_<n>` names, `n` being an index this array covers.
+fn constant_object(identifier: usize) -> PyObjectRef {
+    match identifier {
+        0 => pyre_object::w_none(),
+        1 => pyre_object::boolobject::w_bool_from(false),
+        2 => pyre_object::boolobject::w_bool_from(true),
+        3 => pyre_object::w_ellipsis(),
+        4 => pyre_object::w_not_implemented(),
+        5 => pyre_object::w_int_new(0),
+        6 => pyre_object::w_int_new(1),
+        7 => pyre_object::w_str_new(""),
+        8 => pyre_object::bytesobject::w_bytes_from_bytes(b""),
+        9 => pyre_object::tupleobject::w_tuple_new(Vec::new()),
+        _ => unreachable!("the caller indexed CONSTANT_MIRRORS first"),
+    }
+}
+
+/// One mirror per constant, minted on first ask.
+///
+/// The mirror rather than the object: `Py_GetConstantBorrowed` hands it out
+/// without a reference, so it has to outlive every caller, and two asks for
+/// the same identifier have to answer the same pointer — which for `0` and
+/// `1` and the empty containers they would not, each `w_int_new` being its own
+/// object.
+static CONSTANT_MIRRORS: [std::sync::OnceLock<usize>; 10] =
+    [const { std::sync::OnceLock::new() }; 10];
+
+fn constant_mirror(identifier: std::ffi::c_uint) -> Option<*mut CPyObject> {
+    let index = identifier as usize;
+    let slot = CONSTANT_MIRRORS.get(index)?;
+    let held = *slot.get_or_init(|| {
+        let raw = pyobject::make_ref(constant_object(index));
+        unsafe { (*raw).ob_refcnt = pyobject::REFCNT_IMMORTAL };
+        raw as usize
+    });
+    Some(held as *mut CPyObject)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_GetConstant(identifier: std::ffi::c_uint) -> *mut CPyObject {
+    let Some(raw) = constant_mirror(identifier) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    unsafe { pyobject::incref(raw) };
+    raw
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_GetConstantBorrowed(identifier: std::ffi::c_uint) -> *mut CPyObject {
+    let Some(raw) = constant_mirror(identifier) else {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    };
+    raw
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(Py_GetConstant as *const ());
+    std::hint::black_box(Py_GetConstantBorrowed as *const ());
     std::hint::black_box(PyObject_GetAttrString as *const ());
     std::hint::black_box(PyObject_SetAttrString as *const ());
     std::hint::black_box(PyObject_HasAttrString as *const ());

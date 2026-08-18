@@ -472,6 +472,23 @@ pub unsafe extern "C" fn PyNumber_Check(object: *mut CPyObject) -> c_int {
     numeric as c_int
 }
 
+/// `nb_index` alone — whether [`PyNumber_Index`] would have a slot to call.
+///
+/// The lookup is on the type, so a class that defines `__index__` for its
+/// instances does not answer for itself.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyIndex_Check(object: *mut CPyObject) -> c_int {
+    let object = unsafe { super::pyobject::from_ref(object) };
+    if object.is_null() {
+        return 0;
+    }
+    let indexable = unsafe {
+        pyre_object::pyobject::is_int_or_long(object)
+            || crate::baseobjspace::lookup(object, "__index__").is_some()
+    };
+    indexable as c_int
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyNumber_Index(object: *mut CPyObject) -> *mut CPyObject {
     let Some(object) = argument(object) else {
@@ -564,6 +581,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyNumber_ToBase as *const ());
     std::hint::black_box(PyNumber_Check as *const ());
     std::hint::black_box(PyNumber_Index as *const ());
+    std::hint::black_box(PyIndex_Check as *const ());
     std::hint::black_box(PyNumber_Float as *const ());
     std::hint::black_box(PyNumber_AsSsize_t as *const ());
 }

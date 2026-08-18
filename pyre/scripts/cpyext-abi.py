@@ -34,7 +34,13 @@ RECORD = pathlib.Path(__file__).resolve().parent / "cpython-abi.txt"
 
 def strip_comments(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    return re.sub(r"//[^\n]*", " ", text)
+    text = re.sub(r"//[^\n]*", " ", text)
+    # A `printf`-checking attribute sits between the parameter list and the
+    # semicolon, so a declaration that carries one reads as a parameter list
+    # ending at the attribute's own closing paren.  It says nothing about the
+    # calling convention, so it goes before anything is matched.
+    return re.sub(r"Py_GCC_ATTRIBUTE\s*\(\((?:[^()]|\([^()]*\))*\)\)", " ", text,
+                  flags=re.S)
 
 
 def tidy(text):
@@ -119,7 +125,7 @@ SCALARS = {
     "i32": "int32_t", "u32": "uint32_t", "i64": "int64_t", "u64": "uint64_t",
     # Named aliases the Rust side spells the same way the header does, so the
     # comparison is against the reference name rather than its width.
-    "Py_UCS4": "Py_UCS4",
+    "Py_UCS4": "Py_UCS4", "wchar_t": "wchar_t",
 }
 
 STRUCTS = {

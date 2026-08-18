@@ -32,8 +32,8 @@ PyBytes_AsStringAndSize :: PyObject *, char **, Py_ssize_t * -> int
 PyBytes_Concat :: PyObject **, PyObject * -> void
 PyBytes_ConcatAndDel :: PyObject **, PyObject * -> void
 PyBytes_DecodeEscape :: const char *, Py_ssize_t, const char *, Py_ssize_t, const char * -> PyObject *
-PyBytes_FromFormat :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> PyObject *
-PyBytes_FromFormatV :: const char *, va_list) Py_GCC_ATTRIBUTE((format(printf, 1, 0)) -> PyObject *
+PyBytes_FromFormat :: const char *, ... -> PyObject *
+PyBytes_FromFormatV :: const char *, va_list -> PyObject *
 PyBytes_FromObject :: PyObject * -> PyObject *
 PyBytes_FromString :: const char * -> PyObject *
 PyBytes_FromStringAndSize :: const char *, Py_ssize_t -> PyObject *
@@ -552,11 +552,11 @@ PyOS_getsig :: int -> PyOS_sighandler_t
 PyOS_mystricmp :: const char *, const char * -> int
 PyOS_mystrnicmp :: const char *, const char *, Py_ssize_t -> int
 PyOS_setsig :: int, PyOS_sighandler_t -> PyOS_sighandler_t
-PyOS_snprintf :: char *, size_t, const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 3, 4)) -> int
+PyOS_snprintf :: char *, size_t, const char *, ... -> int
 PyOS_string_to_double :: const char *, char **, PyObject * -> double
 PyOS_strtol :: const char *, char **, int -> long
 PyOS_strtoul :: const char *, char **, int -> unsigned long
-PyOS_vsnprintf :: char *, size_t, const char *, va_list va) Py_GCC_ATTRIBUTE((format(printf, 3, 0)) -> int
+PyOS_vsnprintf :: char *, size_t, const char *, va_list -> int
 PyObject_ASCII :: PyObject * -> PyObject *
 PyObject_AsFileDescriptor :: PyObject * -> int
 PyObject_Bytes :: PyObject * -> PyObject *
@@ -726,8 +726,8 @@ PySys_ResetWarnOptions :: void -> void
 PySys_SetArgv :: int, wchar_t ** -> void
 PySys_SetArgvEx :: int, wchar_t **, int -> void
 PySys_SetObject :: const char *, PyObject * -> int
-PySys_WriteStderr :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> void
-PySys_WriteStdout :: const char *, ...) Py_GCC_ATTRIBUTE((format(printf, 1, 2)) -> void
+PySys_WriteStderr :: const char *, ... -> void
+PySys_WriteStdout :: const char *, ... -> void
 PyThreadState_Clear :: PyThreadState * -> void
 PyThreadState_Delete :: PyThreadState * -> void
 PyThreadState_DeleteCurrent :: void -> void
