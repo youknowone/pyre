@@ -848,6 +848,7 @@ fn func_effects_marks(effects: &crate::model::FuncEffects) -> Vec<String> {
     for (flag, name) in [
         (effects.cannot_collect, "cannot_collect"),
         (effects.random_effects_on_gcobjs, "random_effects_on_gcobjs"),
+        (effects.canmallocgc, "canmallocgc"),
         (effects.cannot_raise_assertion, "cannot_raise_assertion"),
         (effects.memerror_only_assertion, "memerror_only_assertion"),
         (effects.elidable, "elidable"),
@@ -5352,6 +5353,18 @@ impl CallControl {
         self.func_effects_mut(&path).random_effects_on_gcobjs = true;
     }
 
+    /// RPython: collectanalyze.py:31-33 —
+    /// `LL_OPERATIONS[op.opname].canmallocgc`. Mark a graph-less target as
+    /// the allocation operation it stands in for, which
+    /// `RandomEffectsAnalyzer.analyze_simple_operation` answers False
+    /// (effectinfo.py:417-418). Use this, not
+    /// [`Self::mark_external_gc_effects`], for a callee that merely
+    /// allocates: random effects additionally forbid an elidable caller
+    /// (rffi.py:160).
+    pub fn mark_canmallocgc(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).canmallocgc = true;
+    }
+
     /// RPython: collectanalyze.py:15 — `_gctransformer_hint_cannot_collect_`.
     /// Mark a target as known not to trigger GC collection.
     pub fn mark_cannot_collect(&mut self, path: CallPath) {
@@ -5961,10 +5974,18 @@ impl CallControl {
                 // collectanalyze.py:21-25: analyze_external_call —
                 // if funcobj.random_effects_on_gcobjs → True,
                 // else → bottom_result() (False).
+                //
+                // `canmallocgc` joins it because a callee in a crate that was
+                // never lowered is how this side spells an allocation
+                // operation, which `analyze_simple_operation` answers True
+                // (collectanalyze.py:31-33). Only this analyzer reads it:
+                // `analyze_random_effects` keeps returning False for it, as
+                // `RandomEffectsAnalyzer.analyze_simple_operation` does
+                // (effectinfo.py:417-418).
                 return self
                     .external_funcobjs
                     .get(path)
-                    .is_some_and(|f| f.random_effects_on_gcobjs);
+                    .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
             }
         };
         for block in &graph.blocks {
@@ -9474,10 +9495,10 @@ mod tests {
     /// The negative control is the point of the test as much as the positive
     /// ones: before the allocation arms existed, `analyze_can_collect` could
     /// only answer `true` through `close_stack` or `random_effects_on_gcobjs`,
-    /// and the latter is set by the `gc_effects` hint, which nothing in the
-    /// corpus carries. Every allocator therefore analysed as "cannot collect",
-    /// so an all-`false` verdict is exactly what the regression looks like and
-    /// a test that only checked the negative case would not have seen it.
+    /// and no path in the corpus carried either. Every allocator therefore
+    /// analysed as "cannot collect", so an all-`false` verdict is exactly what
+    /// the regression looks like and a test that only checked the negative case
+    /// would not have seen it.
     #[test]
     fn each_gc_allocation_op_collects_and_an_allocation_free_graph_does_not() {
         let alloc_kinds = [
@@ -9526,6 +9547,79 @@ mod tests {
         assert!(
             !cc.analyze_can_collect(&path, &mut seen),
             "a graph with no allocation and no call must analyse as not collecting"
+        );
+    }
+
+    /// `collectanalyze.py:27-33 analyze_simple_operation` answers True for an
+    /// allocation. Upstream sees one because it is an operation in a graph it
+    /// lowered; a callee in a crate `scripts/extract-llbc.py` does not lower
+    /// reaches `analyze_can_collect` with nothing to walk, so the declaration
+    /// registered by `mark_canmallocgc` is the only thing that can answer for
+    /// it.
+    ///
+    /// Three things are pinned here, and each one has been wrong in this file
+    /// before.
+    ///
+    /// **Resolution.** A 2-segment callsite misses `function_graphs`, misses
+    /// the free-fn leaf index (a crate that was never lowered registers no
+    /// graph to match), and only then falls through to the verbatim
+    /// `Some(path)` that makes the registered spelling reachable at all.
+    ///
+    /// **Attribution.** The negative control is the same graph with the
+    /// declaration withheld: the callee resolves identically and answers
+    /// `false`, so a `true` in the positive case is the mark's doing and not
+    /// some other arm's.
+    ///
+    /// **The axis.** `canmallocgc` must leave `analyze_random_effects` alone,
+    /// exactly as `RandomEffectsAnalyzer.analyze_simple_operation` returns
+    /// False for the same operation (`effectinfo.py:417-418`). Declaring these
+    /// allocators `random_effects_on_gcobjs` instead does answer can-collect,
+    /// and then `getcalldescr` rejects every elidable caller of a bigint
+    /// allocator — the pairing `rffi.py:160` asserts against.
+    #[test]
+    fn a_graphless_allocator_collects_without_claiming_random_effects() {
+        let callee =
+            CallPath::from_segments(["majit_gc", "alloc_fast_nursery_collecting_typed_rooted"]);
+        let caller = CallPath::from_segments(["alloc_rbigint_nursery_collecting_impl"]);
+
+        let build = |declare: bool| {
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("alloc_rbigint_nursery_collecting_impl");
+            let start = graph.startblock;
+            graph.blocks[start.0]
+                .operations
+                .push(direct_call_op(CallTarget::function_path([
+                    "majit_gc",
+                    "alloc_fast_nursery_collecting_typed_rooted",
+                ])));
+            graph.set_return(start, None);
+            cc.register_function_graph(caller.clone(), graph);
+            if declare {
+                cc.mark_canmallocgc(callee.clone());
+            }
+            cc
+        };
+
+        let cc = build(false);
+        let mut seen = HashSet::new();
+        assert!(
+            !cc.analyze_can_collect(&caller, &mut seen),
+            "an undeclared graph-less callee must answer `false` — otherwise \
+             the positive case below would not be attributable to the mark"
+        );
+
+        let cc = build(true);
+        let mut seen = HashSet::new();
+        assert!(
+            cc.analyze_can_collect(&caller, &mut seen),
+            "collectanalyze.py:27-33 — a caller of a graph-less callee declared \
+             `canmallocgc` collects"
+        );
+        let mut seen = HashSet::new();
+        assert!(
+            !cc.analyze_random_effects(&caller, &mut seen),
+            "effectinfo.py:417-418 — the same allocation answers \
+             `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
         );
     }
 

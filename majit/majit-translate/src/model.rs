@@ -5130,6 +5130,22 @@ pub struct FuncEffects {
     /// meaningful for an external (graph-less) funcobj; a graph-bearing
     /// function derives can-collect by walking the graph instead.
     pub random_effects_on_gcobjs: bool,
+    /// `LL_OPERATIONS[op.opname].canmallocgc` (collectanalyze.py:31-33) for a
+    /// callee that has no graph.
+    ///
+    /// Upstream reaches the collector through an *operation* — `malloc` /
+    /// `malloc_varsize` with `flavor='gc'`, or any LLOp declared
+    /// `canmallocgc=True` — and answers the two analyzers differently for it:
+    /// `CollectAnalyzer.analyze_simple_operation` returns True while
+    /// `RandomEffectsAnalyzer.analyze_simple_operation` returns False
+    /// (effectinfo.py:417-418). A crate that is not lowered to LLBC spells
+    /// that same operation as a call to a graph-less callee, so it needs the
+    /// same split: this flag answers can-collect only, leaving random-effects
+    /// alone. `random_effects_on_gcobjs` cannot stand in — it answers both,
+    /// and an elidable caller of a random-effects callee is a contradiction
+    /// upstream rejects outright (`assert not (elidable_function and
+    /// random_effects_on_gcobjs)`, rffi.py:160).
+    pub canmallocgc: bool,
     /// pyre `#[majit_macros::elidable_cannot_raise]` user assertion that
     /// the callee never raises (honoured by `getcalldescr`'s elidable
     /// branch before consulting `_canraise`).

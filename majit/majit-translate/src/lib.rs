@@ -2026,6 +2026,45 @@ fn analyze_pipeline_from_module_paths(
             "newlist_clear(count)".to_string(),
         );
     }
+
+    // `collectanalyze.py:27-33 analyze_simple_operation` answers True for the
+    // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,
+    // and any LLOp declared `canmallocgc=True`.  Upstream sees them because
+    // they are operations in a graph it lowered.  `majit_gc` is not among the
+    // crates `scripts/extract-llbc.py` lowers, so the same allocations arrive
+    // here as calls to a callee with no graph, and `analyze_can_collect`'s
+    // no-graph arm has nothing to read.  Nothing in a non-lowered crate's
+    // source can carry a declaration across, so it is written here — the same
+    // place upstream writes the one declaration it cannot derive either
+    // (`random_effects_on_gcobjs=True` at the `llexternal` callsite,
+    // `_rffi_stacklet.py:49-51`).
+    //
+    // `mark_canmallocgc`, not `mark_external_gc_effects`: random effects
+    // additionally answer `RandomEffectsAnalyzer` True, which upstream never
+    // does for an allocation (`effectinfo.py:417-418`) and which would make
+    // every elidable caller of a bigint allocator a contradiction
+    // (`assert not (elidable_function and random_effects_on_gcobjs)`,
+    // `rffi.py:160`).
+    //
+    // Every entry below reaches a collection on its slow path: the
+    // `*_collecting_*` allocators run a minor collection when the nursery
+    // cannot satisfy the request, and the `collect_*` entries are requested
+    // collections outright (`lloperation.py:480-481` marks both `gc__collect`
+    // and `gc__collect_step` `canmallocgc=True`).  Their non-collecting twins
+    // (`alloc_fast_nursery_typed`, `alloc_nursery_headerless_no_collect`, …)
+    // are deliberately absent: they spill to old-gen instead of collecting.
+    for gc_entry in [
+        "alloc_nursery_collecting_typed",
+        "alloc_nursery_collecting_typed_rooted",
+        "alloc_fast_nursery_collecting_typed_rooted",
+        "standalone_alloc_nursery_collecting_typed_rooted",
+        "standalone_alloc_fast_nursery_collecting_typed_rooted",
+        "collect_full",
+        "collect_step",
+        "collect_oldgen_nonmoving",
+    ] {
+        call_control.mark_canmallocgc(parse::CallPath::from_segments(["majit_gc", gc_entry]));
+    }
     let mut policy = policy::DefaultJitPolicy::new();
     call_control.find_all_graphs(&mut policy);
     prof.mark("  find_all_graphs");
