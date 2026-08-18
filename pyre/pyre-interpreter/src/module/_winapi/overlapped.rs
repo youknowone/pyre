@@ -131,14 +131,24 @@ fn w_overlapped(backend: Box<Mutex<NativeOverlapped>>) -> PyObjectRef {
 fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "GetOverlappedResult")?;
     let wait = crate::baseobjspace::is_true(arg(args, 1, "GetOverlappedResult")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let record = native(obj)?;
+    // A waiting call runs with the lock dropped.  It blocks until the
+    // operation ends, and `cancel` — the one call that can end it early —
+    // takes this same lock, so holding it here would put the wait beyond
+    // reach of the only thing that could wake it.  The record is owned by the
+    // object and never moves, so its address stays good while the guard is
+    // gone; the kernel is writing into it over the same period either way.
+    let (handle, overlapped) = {
+        let state = record.lock().unwrap();
+        (state.handle, std::ptr::addr_of!(state.overlapped))
+    };
     let mut transferred: u32 = 0;
     let completed = {
         let _blocked = crate::module::thread::before_external_block();
         unsafe {
             windows_sys::Win32::System::IO::GetOverlappedResult(
-                state.handle,
-                &state.overlapped,
+                handle,
+                overlapped,
                 &mut transferred,
                 i32::from(wait),
             )
@@ -149,6 +159,7 @@ fn overlapped_get_result(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         0
     };
+    let mut state = record.lock().unwrap();
     match error {
         0 | ERROR_MORE_DATA | ERROR_OPERATION_ABORTED => {
             state.completed = true;

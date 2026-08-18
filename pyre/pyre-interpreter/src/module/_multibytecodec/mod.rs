@@ -263,7 +263,14 @@ fn encode_impl(
     if unsafe { !pyre_object::is_str(w_input) } {
         return Err(crate::PyError::type_error("encoder argument must be str"));
     }
-    let input = unsafe { pyre_object::w_str_get_wtf8(w_input) };
+    // A registered error handler runs Python between iterations of the loop
+    // below, which still names this string in the error it reports and hands
+    // it to the handler again, so it is held on the shadow stack and reread
+    // from there rather than kept as a Rust local across the call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let input_slot = roots.base();
+    roots.pin_root(w_input);
+    let input = unsafe { pyre_object::w_str_get_wtf8(roots.get(input_slot)) };
     let (mut units, boundaries) = text_to_wchars(input);
     let codec = codec_ptr(name).ok_or_else(|| {
         crate::PyError::new(
@@ -322,7 +329,11 @@ fn encode_impl(
         let (replacement, resume_units): (Vec<u8>, usize) = match errors {
             "strict" => {
                 return Err(crate::typedef::unicode_encode_error(
-                    name, w_input, start, end, reason,
+                    name,
+                    roots.get(input_slot),
+                    start,
+                    end,
+                    reason,
                 ));
             }
             "ignore" => (Vec::new(), end_units),
@@ -332,7 +343,7 @@ fn encode_impl(
                     crate::type_methods::call_registered_encode_error_handler(
                         errors,
                         name,
-                        w_input,
+                        roots.get(input_slot),
                         boundaries.len() - 1,
                         start,
                         end,

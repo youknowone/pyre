@@ -27,7 +27,7 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, crate::PyError> {
     roots.pin_root(sound);
 
     let w_name = if unsafe { pyre_object::is_str(sound) } {
-        sound
+        roots.get(sound_slot)
     } else if unsafe { pyre_object::bytesobject::is_bytes(sound) } {
         return Err(crate::PyError::type_error(
             "'sound' must be str, os.PathLike, or None, not bytes",
@@ -120,7 +120,7 @@ crate::py_module! {
                 }
                 let data = crate::baseobjspace::simple_buffer_bytes(sound)?.ok_or_else(|| {
                     crate::PyError::type_error(format!(
-                        "expected str, bytes or os.PathLike object, not {}",
+                        "a bytes-like object is required, not '{}'",
                         crate::gateway::short_type_name(sound)
                     ))
                 })?;
@@ -131,7 +131,12 @@ crate::py_module! {
                 // sound.
                 let bytes = data.as_bytes().to_vec();
                 data.release();
-                let mut units = vec![0u16; bytes.len().div_ceil(2)];
+                // `PlaySoundW` reads a header at the pointer it is given, and
+                // an empty `Vec`'s pointer is the alignment sentinel rather
+                // than storage, so an empty buffer is backed by one zeroed
+                // unit: the header fails to parse and the call answers the
+                // failure an unplayable sound answers.
+                let mut units = vec![0u16; bytes.len().div_ceil(2).max(1)];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),

@@ -92,11 +92,16 @@ class MultibyteIncrementalDecoder:
             raise TypeError(
                 f"setstate() argument must be tuple, not {type(state).__name__}"
             )
+        # `PyArg_ParseTuple(state, "Sn;setstate(): illegal state argument")`
+        # names every shape failure with the one message its format string
+        # carries, the wrong number of elements included.
+        if (
+            len(state) != 2
+            or not isinstance(state[0], bytes)
+            or not isinstance(state[1], int)
+        ):
+            raise TypeError("setstate(): illegal state argument")
         buffer, flag = state
-        if not isinstance(buffer, bytes):
-            raise TypeError("setstate() argument 1 must be bytes")
-        if not isinstance(flag, int):
-            raise TypeError("setstate() argument 2 must be int")
         if len(buffer) > 8:
             raise UnicodeDecodeError(
                 self.codec.name, buffer, 0, len(buffer), "pending buffer too large"

@@ -587,14 +587,21 @@ crate::py_module! {
         "LOCALE_NAME_MAX_LENGTH" => 85,
     },
     inline_functions: {
-        fn NeedCurrentDirectoryForExePath(exe_name: &str) -> bool {
-            let exe_name_w: Vec<u16> =
-                exe_name.encode_utf16().chain(std::iter::once(0)).collect();
-            unsafe {
+        fn NeedCurrentDirectoryForExePath(
+            exe_name: &str,
+        ) -> Result<bool, crate::PyError> {
+            // The wide string ends at its first NUL, so a name carrying one
+            // would be answered for a shorter name than was passed.
+            let mut exe_name_w: Vec<u16> = exe_name.encode_utf16().collect();
+            if exe_name_w.contains(&0) {
+                return Err(crate::PyError::value_error("embedded null character"));
+            }
+            exe_name_w.push(0);
+            Ok(unsafe {
                 windows_sys::Win32::System::Environment::NeedCurrentDirectoryForExePathW(
                     exe_name_w.as_ptr(),
                 ) != 0
-            }
+            })
         }
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for

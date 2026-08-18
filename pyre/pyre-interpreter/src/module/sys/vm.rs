@@ -3221,28 +3221,38 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     fn pick_str(args: &[PyObjectRef]) -> Option<PyObjectRef> {
         args.iter().find(|&&a| !a.is_null() && unsafe { is_str(a) }).copied()
     }
-    // `allocate_stdio` builds these streams with `newline=None` where the host
-    // wants the translation, but `write` here is an instance builtin that
-    // encodes straight to the descriptor instead of going through
-    // `TextIOWrapper.write`, so it substitutes the line separator itself — on
-    // the text, before encoding, because at the byte level a utf-16 stdio
-    // encoding would be corrupted.  The count the caller gets back stays the
-    // length of what it passed in.
+    // `write` here is an instance builtin that encodes straight to the
+    // descriptor instead of going through `TextIOWrapper.write`, so it
+    // substitutes the line separator itself — on the text, before encoding,
+    // because at the byte level a utf-16 stdio encoding would be corrupted.
+    // The substitution is the one the stream is configured for and is read
+    // back from it, so a `reconfigure(newline=...)` reaches this path too.
+    // The count the caller gets back stays the length of what it passed in.
     fn encode_stdio_text(
         w_text: PyObjectRef,
+        stream_name: &str,
         encoding: &str,
         errors: &str,
     ) -> Result<Vec<u8>, crate::PyError> {
         let text = unsafe { pyre_object::w_str_get_wtf8(w_text) };
-        if !cfg!(windows) || !text.as_bytes().contains(&b'\n') {
+        // The mode is read off the live stream, so the cheap test comes first:
+        // text carrying no newline needs no mode and asks `sys` for nothing.
+        let newline = text
+            .as_bytes()
+            .contains(&b'\n')
+            .then(|| crate::stdio_newline(stream_name))
+            .flatten()
+            .filter(|nl| *nl != "\n");
+        let Some(newline) = newline else {
             return crate::type_methods::encode_object(w_text, encoding, errors);
-        }
+        };
         let mut out = rustpython_wtf8::Wtf8Buf::with_capacity(text.len() + 8);
         for point in text.code_points() {
             if point.to_u32() == u32::from(b'\n') {
-                out.push_char('\r');
+                out.push_str(newline);
+            } else {
+                out.push(point);
             }
-            out.push(point);
         }
         // `encode_object` runs a codec, so the substituted text is rooted
         // across it rather than left as a bare temporary.
@@ -3266,7 +3276,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         crate::make_builtin_function("write", |args| {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
-                let bytes = encode_stdio_text(s_obj, &encoding, "backslashreplace")?;
+                let bytes = encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace")?;
                 // An embedder with no fd 2 (wasm32) takes the bytes through
                 // its hook; otherwise fall through to the descriptor.
                 if !crate::stderr_hook_emit(&bytes) {
@@ -3295,7 +3305,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         crate::make_builtin_function("write", |args| {
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
-                let bytes = encode_stdio_text(s_obj, &encoding, &errors)?;
+                let bytes = encode_stdio_text(s_obj, "stdout", &encoding, &errors)?;
                 // Same seam `print` rides, so an embedder that captures stdout
                 // (wasm32, which has no fd 1) sees `sys.stdout.write` too and
                 // the two stay in order.

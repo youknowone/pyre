@@ -105,7 +105,7 @@ pub mod host_seam {
     /// only this one.
     #[majit_macros::dont_look_inside]
     pub fn emit_stdout(bytes: &[u8]) {
-        let bytes = crate::stdio_line_endings_bytes(bytes);
+        let bytes = crate::stdio_line_endings_bytes(bytes, "stdout");
         let bytes = bytes.as_ref();
         if super::print_hook_emit_bytes(bytes) {
             return;
@@ -130,7 +130,7 @@ pub mod host_seam {
     /// Emit bytes to the interpreter's stderr (fd 2).
     #[majit_macros::dont_look_inside]
     pub fn emit_stderr(bytes: &[u8]) {
-        let bytes = crate::stdio_line_endings_bytes(bytes);
+        let bytes = crate::stdio_line_endings_bytes(bytes, "stderr");
         let bytes = bytes.as_ref();
         if super::stderr_hook_emit(bytes) {
             return;
@@ -1260,25 +1260,25 @@ pub fn print_hook_emit(s: &str) -> bool {
     print_hook_emit_bytes(s.as_bytes())
 }
 
-/// The newline translation the standard streams are configured for.
+/// Apply the named standard stream's newline translation to text going to
+/// fd 1/2.
 ///
-/// `allocate_stdio` (`module/sys/vm.rs`) builds them with `newline=None` where
-/// the host wants it, and that is the mode `TextIOWrapper.write` rewrites
-/// `'\n'` in (`module/_io/textio.rs` `write_newline`).  Neither path that
-/// actually reaches fd 1/2 goes through it — `sys.stdout.write` is an instance
-/// builtin that encodes straight to the descriptor, and diagnostics
-/// (tracebacks, warnings, the displayhook) arrive at `host_seam::emit_stdout` /
-/// `emit_stderr` — so each applies the translation itself.  It cannot move
-/// down to the descriptor write: `sys.stdout.buffer.write` is binary and stays
+/// The substitution is what `TextIOWrapper.write` would make
+/// (`module/_io/textio.rs` `write_newline`), which neither path that actually
+/// reaches fd 1/2 goes through — `sys.stdout.write` is an instance builtin
+/// that encodes straight to the descriptor, and diagnostics (tracebacks,
+/// warnings, the displayhook) arrive at `host_seam::emit_stdout` /
+/// `emit_stderr` — so each applies it itself.  It cannot move down to the
+/// descriptor write: `sys.stdout.buffer.write` is binary and stays
 /// untranslated.
 ///
 /// A plain substitution, `'\r'` included: `TextIOWrapper` runs
 /// `text.replace('\n', writenl)`, so `'a\r\n'` really does come out `'a\r\r\n'`.
-pub fn stdio_line_endings(text: &str) -> std::borrow::Cow<'_, str> {
-    match stdio_line_endings_bytes(text.as_bytes()) {
+pub fn stdio_line_endings<'a>(text: &'a str, stream_name: &str) -> std::borrow::Cow<'a, str> {
+    match stdio_line_endings_bytes(text.as_bytes(), stream_name) {
         std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Borrowed(text),
-        // SAFETY: the substitution only inserts an ASCII '\r' ahead of an ASCII
-        // '\n', so well-formed utf-8 stays well-formed.
+        // SAFETY: the substitution replaces an ASCII '\n' with ASCII text, so
+        // well-formed utf-8 stays well-formed.
         std::borrow::Cow::Owned(bytes) => {
             std::borrow::Cow::Owned(unsafe { String::from_utf8_unchecked(bytes) })
         }
@@ -1290,18 +1290,45 @@ pub fn stdio_line_endings(text: &str) -> std::borrow::Cow<'_, str> {
 /// substitution is not safe for an arbitrary stdio encoding — utf-16 spells
 /// every ASCII character with a 0x00 beside it — which is why
 /// `sys.stdout.write` translates its text before encoding instead.
-pub fn stdio_line_endings_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    if !cfg!(windows) || !bytes.contains(&b'\n') {
+pub fn stdio_line_endings_bytes<'a>(
+    bytes: &'a [u8],
+    stream_name: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    // The mode is read off the live stream, so the cheap test comes first:
+    // output carrying no newline needs no mode and asks `sys` for nothing.
+    if !bytes.contains(&b'\n') {
         return std::borrow::Cow::Borrowed(bytes);
     }
+    let Some(newline) = stdio_newline(stream_name).filter(|nl| *nl != "\n") else {
+        return std::borrow::Cow::Borrowed(bytes);
+    };
     let mut out = Vec::with_capacity(bytes.len() + 8);
     for &byte in bytes {
         if byte == b'\n' {
-            out.push(b'\r');
+            out.extend_from_slice(newline.as_bytes());
+        } else {
+            out.push(byte);
         }
-        out.push(byte);
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// The substitution the named standard stream's own `write` would make.
+///
+/// Read from the live stream rather than from the platform, so that
+/// `sys.stdout.reconfigure(newline=...)` reaches the paths that do not go
+/// through `TextIOWrapper.write`.
+///
+/// These paths write to the descriptor whatever `sys` holds, so anything that
+/// states no mode of its own — the seam runs before `sys` exists and after it
+/// is torn down, and the name may have been rebound to something that is not a
+/// stream at all — leaves them on the mode `allocate_stdio` builds with.
+pub fn stdio_newline(stream_name: &str) -> Option<&'static str> {
+    let platform_default = if cfg!(windows) { Some("\r\n") } else { None };
+    let stated = crate::importing::get_sys_module("sys")
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, stream_name).ok())
+        .and_then(crate::module::_io::W_TextIOWrapper::stdio_write_newline);
+    stated.unwrap_or(platform_default)
 }
 
 /// Write a string through the print hook (if set) or stdout.
@@ -1309,7 +1336,7 @@ pub fn print_output(s: &str) {
     // `print()` writing to the unmodified `sys.stdout` short-circuits to here
     // instead of calling its `write`, so the standard stream's newline
     // translation has to be applied on this path too.
-    let s = stdio_line_endings(s);
+    let s = stdio_line_endings(s, "stdout");
     let s = s.as_ref();
     if print_hook_emit(s) {
         return;

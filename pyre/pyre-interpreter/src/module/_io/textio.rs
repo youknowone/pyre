@@ -947,6 +947,26 @@ impl W_TextIOWrapper {
         obj
     }
 
+    /// What [`Self::write_newline`] answers for `stream`, for the paths that
+    /// reach fd 1/2 without going through `write` and so have to apply the
+    /// substitution themselves.
+    ///
+    /// The outer `None` is "not a wrapper, so it states no mode" — a caller
+    /// writing to the descriptor regardless of what `sys.stderr` was replaced
+    /// with still has to pick one — and is distinct from the inner `None`,
+    /// which is a wrapper asking for no translation.
+    pub fn stdio_write_newline(stream: PyObjectRef) -> Option<Option<&'static str>> {
+        if stream.is_null()
+            || !std::ptr::eq(
+                unsafe { pyre_object::ll_type(stream) },
+                <Self as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+            )
+        {
+            return None;
+        }
+        Some(unsafe { &*(stream as *const Self) }.write_newline())
+    }
+
     /// Give a stream [`allocate_stdio`] built the encoder and decoder it had to
     /// go without.  Every read path needs the decoder: without it the stream
     /// reports itself unreadable however readable its buffer is, and only the
