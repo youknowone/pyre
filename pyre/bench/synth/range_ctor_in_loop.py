@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=190
+# pyre-check: max-pypy-ratio=96
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
 # escaping-object shapes.
@@ -9,11 +9,17 @@
 # pypy spends 0.10s, clearing the floor even on the platform with the
 # coarsest timer.
 #
-# The ceiling rose from 50 because that bound was fitted to the floored
-# denominator, not because anything got slower: the honest ratio here is
-# 83x as a median of interleaved pairwise runs. It is dominated by the four
-# deliberately residual shapes below rather than by the virtualized loops --
-# each iteration also raises and catches a ValueError.
+# `main` used to run interpreted end to end. The `try: range(0, 3, 0)` below
+# puts an out-of-line handler after the trailing comprehension, and the loop
+# region that gates the back edge grew across the gap between them and picked
+# up that comprehension's call-bearing `FOR_ITER` -- an opcode this loop never
+# reaches. With the region built from the exception table instead, the while
+# loop and the three `for` loops compile, and this gate's own metric falls
+# from 122x to 23.2x dynasm / 30.2x cranelift / 24.7x wasm. A separate
+# min-of-five interleaved harness reads the same move as 158x to 35.2x /
+# 38.3x, so the ceiling is set from the slower of the two readings: 2.5x of
+# 38.3x, the slack every bench here carries against a runner 2.5x slower than
+# an idle local box.
 N = 400000
 
 

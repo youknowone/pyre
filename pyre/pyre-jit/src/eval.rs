@@ -7402,38 +7402,89 @@ fn for_iter_bodies_all_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
     true
 }
 
-/// Return the end of the natural loop region whose header is `loop_header_pc`.
-/// Out-of-line exception handlers can rejoin the loop through a backward jump
-/// to the middle of the body, so grow the region until every such rejoining
-/// handler is included.
-fn loop_region_end(code: &pyre_interpreter::CodeObject, loop_header_pc: usize) -> Option<usize> {
+/// Return the pc ranges that make up the natural loop region whose header is
+/// `loop_header_pc`: the loop body, plus every out-of-line exception handler
+/// that rejoins the body through a backward jump. An empty result means
+/// `loop_header_pc` has no backedge and so names no region.
+///
+/// The region is a set of ranges rather than one span because a handler is laid
+/// out after the code that follows its `try`, not next to the body it protects.
+/// Whatever sits between the two — a later comprehension, a disjoint loop —
+/// belongs to neither and cannot run in this backedge's trace, so covering the
+/// gap would gate the backedge on `FOR_ITER`s it never reaches. The exception
+/// table names where the out-of-line code begins, which is what lets a
+/// rejoining jump widen the region back to its own handler instead of across
+/// the gap.
+fn loop_region_ranges(
+    code: &pyre_interpreter::CodeObject,
+    loop_header_pc: usize,
+) -> Vec<std::ops::RangeInclusive<usize>> {
     use pyre_interpreter::Instruction as I;
-    let mut region_end = None;
-    loop {
-        let previous_end = region_end;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            let extends_region = match (target, region_end) {
-                (Some(target), _) if target == loop_header_pc => true,
-                (Some(target), Some(end)) => pc > end && (loop_header_pc..=end).contains(&target),
-                _ => false,
-            };
-            if extends_region {
-                region_end = Some(region_end.map_or(pc, |end: usize| end.max(pc)));
+
+    let mut backward_jumps: Vec<(usize, usize)> = Vec::new();
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        let target = match instr {
+            I::JumpBackward { delta } => {
+                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
             }
+            I::JumpBackwardNoInterrupt { delta } => {
+                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            backward_jumps.push((pc, target));
         }
-        if region_end == previous_end {
-            return region_end;
+    }
+
+    let Some(body_end) = backward_jumps
+        .iter()
+        .filter(|(_, target)| *target == loop_header_pc)
+        .map(|(pc, _)| *pc)
+        .max()
+    else {
+        return Vec::new();
+    };
+
+    // The exception table is keyed by byte offset; pyre's `pc` is the
+    // instruction-unit index (two bytes per unit). Only the handlers laid out
+    // past the body can start an out-of-line block; one inside the body is
+    // already covered.
+    let mut handler_starts: Vec<usize> =
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+            .map(|entry| entry.target as usize / 2)
+            .filter(|start| *start > body_end)
+            .collect();
+    handler_starts.sort_unstable();
+
+    let mut ranges = vec![loop_header_pc..=body_end];
+    loop {
+        let rejoins: Vec<usize> = backward_jumps
+            .iter()
+            .filter(|(pc, target)| {
+                !ranges.iter().any(|range| range.contains(pc))
+                    && ranges.iter().any(|range| range.contains(target))
+            })
+            .map(|(pc, _)| *pc)
+            .collect();
+        if rejoins.is_empty() {
+            return ranges;
+        }
+        for pc in rejoins {
+            // Take the earliest handler that still starts at or before the
+            // jump: a handler runs on through the ones nested inside it, so
+            // the block this jump closes begins at the outermost of them.
+            // Without a handler to name a start the jump is not an out-of-line
+            // rejoin, and the span back to the body is kept whole rather than
+            // guessed at.
+            let start = handler_starts
+                .iter()
+                .copied()
+                .find(|start| *start <= pc)
+                .unwrap_or(body_end + 1);
+            ranges.push(start..=pc);
         }
     }
 }
@@ -7447,12 +7498,16 @@ fn loop_region_for_iter_bodies_all_jit_safe(
     loop_header_pc: usize,
 ) -> bool {
     use pyre_interpreter::Instruction as I;
-    let Some(region_end) = loop_region_end(code, loop_header_pc) else {
+    let ranges = loop_region_ranges(code, loop_header_pc);
+    if ranges.is_empty() {
         return true;
-    };
+    }
     let mut scan_state = pyre_interpreter::OpArgState::default();
-    for pc in loop_header_pc..=region_end {
-        let (instr, _) = scan_state.get(code.instructions[pc]);
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, _) = scan_state.get(unit);
+        if !ranges.iter().any(|range| range.contains(&pc)) {
+            continue;
+        }
         if matches!(instr, I::ForIter { .. }) && !for_iter_body_is_jit_safe_at(code, pc) {
             return false;
         }
@@ -7478,19 +7533,17 @@ fn loop_region_contains_escaping_range_append(
         AwaitAppendCall,
     }
 
-    let Some(region_end) = loop_region_end(code, loop_header_pc) else {
+    let ranges = loop_region_ranges(code, loop_header_pc);
+    if ranges.is_empty() {
         return false;
-    };
+    }
 
     let mut state = State::Searching;
     let mut decode = pyre_interpreter::OpArgState::default();
     for (pc, unit) in code.instructions.iter().copied().enumerate() {
         let (instr, op_arg) = decode.get(unit);
-        if pc < loop_header_pc {
+        if !ranges.iter().any(|range| range.contains(&pc)) {
             continue;
-        }
-        if pc > region_end {
-            break;
         }
         match instr {
             I::LoadAttr { namei }
@@ -9109,7 +9162,7 @@ fn maybe_compile_and_run(
     let region_safe = cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc);
     if !region_safe
         || (!cached_for_iter_bodies_all_jit_safe(code)
-            && !cached_loop_region_contains_escaping_range_append(code, loop_header_pc))
+            && !frame_has_traceable_escaping_range_loop(code))
     {
         return None;
     }
@@ -13710,8 +13763,8 @@ mod tests {
         }
 
         let direct_end = direct_end.expect("fixture must contain the outer backedge");
-        let region_end = loop_region_end(&code, outer_header).expect("loop must have a region");
-        assert!(region_end > direct_end);
+        let ranges = loop_region_ranges(&code, outer_header);
+        assert!(ranges.iter().any(|range| *range.start() > direct_end));
         assert!(!loop_region_for_iter_bodies_all_jit_safe(
             &code,
             outer_header
