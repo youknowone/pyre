@@ -2289,6 +2289,13 @@ fn traceback_walk_field(
     None
 }
 
+/// Runtime half of the optimized-frame `f_locals` getter.  The proxy owns the
+/// exact frame passed to it; reading or mutating the proxy later goes through
+/// that frame's existing synchronization path.
+extern "C" fn jit_inline_frame_locals_proxy_new(frame: i64) -> i64 {
+    pyre_interpreter::pyframe::frame_locals_proxy::new(frame as pyre_object::PyObjectRef) as i64
+}
+
 /// Prove the receiving code object still owns its host `CodeObject`, the
 /// `require_code` check every code-field getter runs before reading a slot.
 fn walker_guard_code_ptr_present<Sym: WalkSym>(
@@ -2563,6 +2570,52 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
+    // CPython 3.14 exposes an optimized frame's locals as a fresh
+    // `FrameLocalsProxy`.  Constructing that proxy does not read fast locals;
+    // its operations synchronize through the frame when they are actually
+    // used.  Keep the inline callee's own red frame as the proxy owner instead
+    // of residualizing the getter, whose explicit read barrier would force the
+    // outer standard virtualizable while this MIFrame is still active.
+    let inline_frame = current_inline_concrete_frame();
+    if name == "f_locals"
+        && inline_frame != 0
+        && concrete_obj as usize == inline_frame
+        && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
+        && unsafe {
+            (*(concrete_obj as *const pyre_interpreter::PyFrame))
+                .code()
+                .flags
+                .contains(pyre_interpreter::CodeFlags::OPTIMIZED)
+        }
+        && ctx
+            .callee_shadow
+            .as_ref()
+            .is_some_and(|shadow| shadow.concrete_frame == inline_frame && shadow.frame_box == obj)
+    {
+        let w_type =
+            pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
+        let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+        if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+            return Ok(None);
+        }
+        let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
+        walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let proxy = ctx.trace_ctx.call_ref_typed_with_effect(
+            jit_inline_frame_locals_proxy_new as *const (),
+            &[obj],
+            &[majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            proxy,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_proxy as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, proxy)?;
+        return Ok(Some(()));
+    }
     // `mapdict.py` resolution, returning the fold ingredients (the
     // read is left to the caller so it can be folded to a guarded inline read).
     if let Some((w_type, version_tag, map, storageindex)) = unsafe {
@@ -8321,22 +8374,13 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// land on the same frame.  Any other chain declines, and at runtime a
 /// `topframeref` that stops matching side-exits.
 ///
-/// Returns `None` (fall through to the generic residual, SAFE — exactly
-/// today's behaviour) for every other shape: a rebound `sys._getframe`, a
-/// bound receiver, a negative / non-int / inexact / non-constant depth, an
-/// inline sub-walk, a walk with no standard virtualizable, armed audit hooks,
-/// a `topframeref` / `gettopframe_nohidden()` mismatch with the portal frame,
-/// a hop whose forced `f_backref` is null, or a hop whose result is hidden.
+/// Returns `None` (fall through to the generic residual) for every other
+/// shape: a rebound `sys._getframe`, a bound receiver, a negative / non-int /
+/// inexact / non-constant depth, a walk with no frame identity, armed audit
+/// hooks, a top-level `topframeref` mismatch with the portal frame, a hop whose
+/// forced `f_backref` is null, or a hop whose result is hidden.
 /// Declines after emission rewind to the pre-specialization trace position and
 /// reset the heap cache before falling through.
-///
-/// ⛔ The TOP walk level is the only level this may take, at any depth. Inside
-/// an inline sub-walk depth 0 names the callee's virtual frame, whose
-/// `last_instr` is still the `-1` its constructor wrote and which nothing
-/// updates through the inlined body (`jitcode_dispatch/mod.rs` says so in the
-/// tree); depth > 0 would start the hop chain from that same frame.  The
-/// sub-walk gate is what makes "depth 0 == the portal" true rather than
-/// assumed.
 pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -8385,12 +8429,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     } else {
         (None, 0)
     };
-    // `virtualizable_boxes` describe the PORTAL frame only.  An inline sub-walk
-    // publishes a different concrete frame, so depth 0 there names the callee —
-    // the level this arm must not take.
-    if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
-        return Ok(None);
-    }
     // `vm.py:51 audit(space, "sys._getframe", [f])`.  With no hook installed
     // `audit` takes its `holder.hooks_w is None` early-out (`vm.py:481`) and the
     // event costs nothing; the emission below pins that read so a later
@@ -8402,29 +8440,62 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     if audit_holder.is_null() || pyre_interpreter::module::sys::vm::audit_hooks_armed() {
         return Ok(None);
     }
-    let (Some(vable_op), Some(vable_ptr)) = (
-        ctx.trace_ctx.standard_virtualizable_box(),
-        ctx.trace_ctx.standard_virtualizable_ptr(),
-    ) else {
+    // Every MIFrame owns one red frame. At the root that is the standard
+    // virtualizable; inside an inline sub-walk it is the callee frame seeded in
+    // `dispatch_inline_call_dr_kind` and carried by `CalleeLocalsShadow`.
+    // Starting the constant-depth walk from that per-level frame is the direct
+    // counterpart of `ec.gettopframe_nohidden()` returning the live MIFrame's
+    // virtual frame upstream.
+    let inline_ptr = current_inline_concrete_frame();
+    let inline_level = ctx.fbw_mode.inline_subwalk || inline_ptr != 0;
+    // A depth-zero lookup returns this MIFrame's own red frame directly.  A
+    // positive depth has to force each intervening virtual reference through
+    // `_do_jit_force_virtual`; until the inline walker carries that operation
+    // with the same per-level resume state, keep the established residual path
+    // instead of treating the concrete recording-time chain as its substitute.
+    if inline_level && depth_value != 0 {
         return Ok(None);
+    }
+    let (vable_op, vable_ptr) = if inline_level {
+        let Some(shadow) = ctx.callee_shadow.as_ref() else {
+            return Ok(None);
+        };
+        if inline_ptr == 0 || shadow.concrete_frame != inline_ptr || shadow.frame_box == OpRef::NONE
+        {
+            return Ok(None);
+        }
+        (shadow.frame_box, inline_ptr)
+    } else {
+        let (Some(op), Some(ptr)) = (
+            ctx.trace_ctx.standard_virtualizable_box(),
+            ctx.trace_ctx.standard_virtualizable_ptr(),
+        ) else {
+            return Ok(None);
+        };
+        (op, ptr)
     };
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
         return Ok(None);
     }
-    // The emitted guard compares the RAW `topframeref` against the portal, so
-    // require the record-time chain to make that comparison equivalent to
-    // `getframe`'s own resolution: the slot holds the frame pointer itself
-    // (an inlined callee's `JitVirtualRef` would decline here, and so would a
-    // deeper portal), and the hidden-frame walk lands on that same frame.
-    if unsafe { (*ec).topframeref } as usize != vable_ptr {
-        return Ok(None);
-    }
-    let frame = unsafe { (*ec).gettopframe_nohidden() };
-    if frame.is_null() || frame as usize != vable_ptr {
-        return Ok(None);
-    }
+    // At the portal, prove that the raw execution-context chain still names
+    // the standard frame and emit the equivalent runtime guard below. An
+    // inline level already has the stronger per-MIFrame identity witness:
+    // `frame_box` and `concrete_frame` were seeded together when that level was
+    // pushed, and the compiled trace carries the same box directly.
+    let frame = if inline_level {
+        inline_ptr as *mut pyre_interpreter::PyFrame
+    } else {
+        if unsafe { (*ec).topframeref } as usize != vable_ptr {
+            return Ok(None);
+        }
+        let frame = unsafe { (*ec).gettopframe_nohidden() };
+        if frame.is_null() || frame as usize != vable_ptr {
+            return Ok(None);
+        }
+        frame
+    };
 
     // --- emit the specialized IR (walker-native) ---
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -8462,34 +8533,34 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // `ec = space.getexecutioncontext()` — recovered off the portal frame, the
-    // same route `walker_ec_enter` takes (`inline_call.rs`), since the outer
-    // frame's `execution_context` is always the true one.
-    let ec_op = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[vable_op],
-        crate::descr::pyframe_execution_context_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(ec_op, majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)));
-    // `f = ec.gettopframe_nohidden()` followed by `pyjitpl.py:2166-2168`'s
-    // `ptr_eq(vref_box, standard_box)` + `implement_guard_value`: the identity
-    // this arm resolved at record time, re-checked every compiled iteration.
-    let topframeref_op = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec_op],
-        crate::descr::ec_topframeref_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        topframeref_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(vable_ptr)),
-    );
-    let is_standard = ctx
-        .trace_ctx
-        .record_op(OpCode::PtrEq, &[topframeref_op, vable_op]);
-    ctx.trace_ctx
-        .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_standard])?;
+    if !inline_level {
+        // `ec = space.getexecutioncontext()` — recovered off the portal frame,
+        // the same route `walker_ec_enter` takes (`inline_call.rs`).
+        let ec_op = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[vable_op],
+            crate::descr::pyframe_execution_context_descr(),
+        );
+        ctx.trace_ctx
+            .set_opref_concrete(ec_op, majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)));
+        // `f = ec.gettopframe_nohidden()` followed by
+        // `_do_jit_force_virtual`'s standard-box identity guard.
+        let topframeref_op = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[ec_op],
+            crate::descr::ec_topframeref_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            topframeref_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(vable_ptr)),
+        );
+        let is_standard = ctx
+            .trace_ctx
+            .record_op(OpCode::PtrEq, &[topframeref_op, vable_op]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_standard])?;
+    }
 
     let mut cur_op = vable_op;
     let mut cur_ptr = frame;
@@ -8580,6 +8651,16 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
 
         cur_op = next_op;
         cur_ptr = next_ptr;
+    }
+
+    // A depth-zero inline result exposes this callee frame. Publish its current
+    // coordinate and any locals that were still held in the strict-fold shadow
+    // before the frame becomes observable. This is the same per-frame state
+    // the ordinary residual force path flushes, without forcing the outer
+    // portal virtualizable or aborting its trace.
+    if inline_level && depth_value == 0 {
+        maybe_record_inline_callee_last_instr(ctx, op.pc);
+        disarm_folded_inline_callee_after_escape(ctx, op.pc)?;
     }
 
     // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields

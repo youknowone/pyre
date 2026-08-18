@@ -4148,7 +4148,7 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
 /// Kept as a thin pass-through so the dispatcher call sites stay
 /// readable; collapses to direct `walker_*` once the dispatchers
 /// inline.
-fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
+pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     jit_pc: usize,
 ) {

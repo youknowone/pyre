@@ -40,10 +40,6 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "static_ref_bindings.bin",
 ];
 
-/// Lowering switches read by `majit-translate` while this build script runs.
-/// They affect generated graphs, so Cargo and the content cache must both see
-/// their values; otherwise an A/B can silently restore the opposite setting.
-
 /// Outputs carrying this build-script process's own addresses, by
 /// construction. ASLR moves them on every process, so two processes always
 /// disagree and that disagreement is not a defect.
