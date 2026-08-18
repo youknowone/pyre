@@ -16102,7 +16102,15 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
 }
 
 fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
-    let node = tyref_node(ty, llbc)?;
+    // Peel the reference the way the atomic sibling does. A borrow of the
+    // wrapper has to answer with the same bank as the wrapper itself:
+    // `Rvalue::Ref` aliases the referent's Variable rather than introducing a
+    // new one, so a wrapper that types as its inner scalar by value and as a
+    // GC reference through a borrow puts one machine word in two register
+    // banks — the caller passes it in the int list while the callee's
+    // parameter is declared `r`. `strip_ty_wrappers` leaves `RawPtr` alone,
+    // so a raw pointer to the wrapper keeps pointer semantics.
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
     if !decl.is_repr_transparent() {
