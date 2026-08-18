@@ -7,11 +7,10 @@
 //! - `check_sys_modules()` — consult the module cache
 //! - `import_all_from()` — IMPORT_STAR handler
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    LazyLock, Mutex, OnceLock,
+    Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
 // `Path` is used only by the host_env source/package loaders; keep it gated
@@ -103,7 +102,7 @@ use host::os as host_os;
 // embedded stdlib bundle).  The import machinery never branches per host;
 // only the installed provider differs.
 #[cfg(feature = "host_env")]
-pub trait SourceProvider {
+pub trait SourceProvider: Send + Sync {
     /// True when `path` names a readable regular file.
     fn is_file(&self, path: &Path) -> bool;
     /// True when `path` names a directory.
@@ -114,33 +113,29 @@ pub trait SourceProvider {
 }
 
 #[cfg(feature = "host_env")]
-thread_local! {
-    static SOURCE_PROVIDER: RefCell<Option<std::rc::Rc<dyn SourceProvider>>> =
-        const { RefCell::new(None) };
-}
+static SOURCE_PROVIDER: LazyLock<Mutex<Option<Arc<dyn SourceProvider>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Install the byte source the import machinery reads through.  The wasm
 /// bootstrap installs a host-import-backed or in-memory-VFS provider before
 /// the first import; native/pyrex leaves it unset and the default kernel-FS
 /// provider answers every probe.
 #[cfg(feature = "host_env")]
-pub fn install_source_provider(provider: std::rc::Rc<dyn SourceProvider>) {
-    SOURCE_PROVIDER.with(|p| *p.borrow_mut() = Some(provider));
+pub fn install_source_provider(provider: Arc<dyn SourceProvider>) {
+    *SOURCE_PROVIDER.lock().unwrap() = Some(provider);
 }
 
 /// Run `f` against the installed provider, lazily defaulting to the platform's
-/// kernel-FS provider when none was installed.  The `Rc` is cloned out before
-/// `f` runs so the thread-local borrow is not held across the call (the import
-/// path is re-entrant).
+/// kernel-FS provider when none was installed. The `Arc` is cloned out before
+/// `f` runs so the process-global lock is not held across the re-entrant import
+/// path. PyPy owns this provider through its shared object space, not through
+/// an execution context or OS thread.
 #[cfg(feature = "host_env")]
 fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
-    let provider = SOURCE_PROVIDER.with(|p| {
-        let mut slot = p.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(default_source_provider());
-        }
-        slot.clone().unwrap()
-    });
+    let provider = {
+        let mut slot = SOURCE_PROVIDER.lock().unwrap();
+        slot.get_or_insert_with(default_source_provider).clone()
+    };
     f(&*provider)
 }
 
@@ -172,18 +167,18 @@ pub fn read_source_to_string(path: &Path) -> std::io::Result<String> {
     not(target_arch = "wasm32"),
     not(feature = "sandbox")
 ))]
-fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
-    std::rc::Rc::new(HostFsProvider)
+fn default_source_provider() -> Arc<dyn SourceProvider> {
+    Arc::new(HostFsProvider)
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
-    std::rc::Rc::new(SeamSourceProvider)
+fn default_source_provider() -> Arc<dyn SourceProvider> {
+    Arc::new(SeamSourceProvider)
 }
 
 #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
-fn default_source_provider() -> std::rc::Rc<dyn SourceProvider> {
-    std::rc::Rc::new(NullSourceProvider)
+fn default_source_provider() -> Arc<dyn SourceProvider> {
+    Arc::new(NullSourceProvider)
 }
 
 /// Kernel-filesystem provider — the default on native and the wasmtime
@@ -298,7 +293,7 @@ pub static VFS_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/stdlib_vf
 
 #[cfg(feature = "wasm_vfs")]
 enum VfsEntry {
-    File(std::rc::Rc<str>),
+    File(Arc<str>),
     Dir,
 }
 
@@ -348,7 +343,7 @@ impl VfsProvider {
                 map.entry(dir.to_path_buf()).or_insert(VfsEntry::Dir);
                 ancestor = dir.parent();
             }
-            map.insert(full, VfsEntry::File(std::rc::Rc::from(src.as_str())));
+            map.insert(full, VfsEntry::File(Arc::from(src.as_str())));
         }
         VfsProvider { map }
     }
@@ -380,7 +375,7 @@ impl SourceProvider for VfsProvider {
 pub fn mount_embedded_stdlib(mount: &Path) {
     let provider = VfsProvider::from_blob(VFS_BLOB, mount);
     add_sys_path(mount);
-    install_source_provider(std::rc::Rc::new(provider));
+    install_source_provider(Arc::new(provider));
 }
 
 // ── sys.modules cache ────────────────────────────────────────────────

@@ -3323,15 +3323,14 @@ pub fn funccall(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
 /// fast-path in `funccall_valuestack` can recognize this specific call and
 /// inline `exc_info_direct` without going through the regular dispatch.
 ///
-/// PyPy stores this on the space; pyre is single-space-per-thread, so a
-/// thread-local cell suffices. The paired `direct_fn` returns the same
-/// `(type, value, traceback)` tuple as the regular closure but skips the
-/// builtin-call setup.
+/// PyPy stores this on the shared object space. Pyre's process-global slots
+/// preserve the same identity across execution contexts and OS threads. The
+/// paired `direct_fn` returns the same `(type, value, traceback)` tuple as the
+/// regular closure but skips the builtin-call setup.
 type ExcInfoDirectFn = fn() -> PyObjectRef;
-thread_local! {
-    static SYS_EXC_INFO_CODE: std::cell::Cell<*const ()> = const { std::cell::Cell::new(std::ptr::null()) };
-    static SYS_EXC_INFO_DIRECT_FN: std::cell::Cell<Option<ExcInfoDirectFn>> = const { std::cell::Cell::new(None) };
-}
+static SYS_EXC_INFO_CODE: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static SYS_EXC_INFO_DIRECT_FN: std::sync::OnceLock<ExcInfoDirectFn> = std::sync::OnceLock::new();
 
 /// Register the BuiltinCode pointer + direct helper for `sys.exc_info`.
 ///
@@ -3340,18 +3339,21 @@ thread_local! {
 /// builtin function; `direct_fn` is the JIT-direct equivalent of the
 /// closure body. `funccall_valuestack` consults both to take the fast path.
 pub fn register_sys_exc_info_path(code: *const (), direct_fn: ExcInfoDirectFn) {
-    SYS_EXC_INFO_CODE.with(|cell| cell.set(code));
-    SYS_EXC_INFO_DIRECT_FN.with(|cell| cell.set(Some(direct_fn)));
+    SYS_EXC_INFO_CODE.store(code.cast_mut(), std::sync::atomic::Ordering::Release);
+    // Reinitializing the sys module may replace its BuiltinCode object, but
+    // every instance is backed by the same `exc_info_direct` symbol. Preserve
+    // the object-space-wide helper installed by the first initialization.
+    let _ = SYS_EXC_INFO_DIRECT_FN.set(direct_fn);
 }
 
 #[inline]
 fn sys_exc_info_code() -> *const () {
-    SYS_EXC_INFO_CODE.with(|cell| cell.get())
+    SYS_EXC_INFO_CODE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[inline]
 fn sys_exc_info_direct_fn() -> Option<ExcInfoDirectFn> {
-    SYS_EXC_INFO_DIRECT_FN.with(|cell| cell.get())
+    SYS_EXC_INFO_DIRECT_FN.get().copied()
 }
 
 /// function.py:139-203 `funccall_valuestack` — fast-path call dispatcher.
@@ -3388,7 +3390,7 @@ pub fn funccall_valuestack(
     // function.py:146-150 — JIT direct path for `sys.exc_info()` with no
     // arguments: skip the builtin call entirely and inline the tuple
     // construction. PyPy uses `space._code_of_sys_exc_info`; pyre uses the
-    // thread-local cache populated during sys module init.
+    // shared cache populated during sys module init.
     if nargs == 0
         && majit_metainterp::jit::we_are_jitted()
         && std::ptr::eq(code, sys_exc_info_code())

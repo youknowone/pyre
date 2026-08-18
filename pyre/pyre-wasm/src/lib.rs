@@ -307,7 +307,7 @@ mod host_fs_provider {
                 pyre_interpreter::importing::add_sys_path(Path::new(root));
             }
         }
-        pyre_interpreter::importing::install_source_provider(std::rc::Rc::new(HostFsProvider));
+        pyre_interpreter::importing::install_source_provider(std::sync::Arc::new(HostFsProvider));
     }
 }
 

@@ -4557,6 +4557,9 @@ fn walk_parked_exception_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// root at that thread's `unregister_mutator` while the holder stayed live.
 fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     walk_rbigint_parts_cache(visitor);
+    pyre_interpreter::module::_io::walk_autoflusher_roots(|slot| {
+        visit_pyobject_root(slot, visitor)
+    });
     sre_pattern_root_walker(visitor);
     w_globals_stamped_code_root_walker(visitor);
     mapdict_method_cache_root_walker(visitor);
@@ -4633,10 +4636,6 @@ fn register_thread_root_areas() {
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
-        );
-        register(
-            autoflusher_root_walker_area,
-            pyre_interpreter::module::_io::capture_autoflusher_root_area(),
         );
         register(
             jit_callee_frame_root_walker_area,
@@ -5451,17 +5450,6 @@ unsafe fn signal_handler_root_walker_area(
             data,
             |slot| visit_pyobject_root(slot, visitor),
         );
-    }
-}
-
-unsafe fn autoflusher_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    unsafe {
-        pyre_interpreter::module::_io::walk_autoflusher_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
     }
 }
 
@@ -9112,44 +9100,30 @@ fn maybe_compile_and_run(
     if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
-    // Pyre-local deviation: this short-circuit treats `DONT_TRACE_HERE` as a
-    // permanent never-trace blacklist and returns before the counter tick.
-    // Upstream `warmstate.py:485-495` uses the identically named flag to force
-    // a separate trace when no procedure token has been seen; the ported
-    // behavior exists in `warmstate.rs::should_start_dont_trace_here_trace`
-    // and `warmstate.rs::can_inline_callable`, but this eval-layer guard
-    // shadows it.
-    if driver
-        .meta_interp()
-        .warm_state_ref()
-        .is_dont_trace_here(green_key)
-    {
-        return None;
-    }
-    // warmstate.py:496-511: counter.tick → threshold reached → bound_reached
-    // TODO(parity): warmstate.py:473-496 funnels every back-edge through
-    // `maybe_compile_and_run`, which checks JC_TRACING, compiled-loop
-    // presence, DONT_TRACE_HERE, has_seen_a_procedure_token, and
-    // counter.tick in one linear sequence.  Pyre splits the checks
-    // across this function and `counter_tick_checked` (warmstate.rs:559).
-    // The flag-based DONT_TRACE_HERE path above duplicates part of the
-    // warmstate logic; verify that `counter_tick_checked` still covers
-    // the `has_seen_a_procedure_token` guard and the full `bound_reached`
-    // flow identically to warmstate.py:496-511.
-    if driver
+    // `WarmEnterState::maybe_compile` is the port of warmstate.py's complete
+    // JitCell decision: token lookup, DONT_TRACE_HERE retry, dead-token
+    // cleanup, and counter tick. Keeping that policy in one symbol prevents
+    // the eval entry point from assigning different semantics to its flags.
+    match driver
         .meta_interp_mut()
         .warm_state_mut()
-        .counter_tick_checked(green_key)
+        .maybe_compile(green_key)
     {
-        if driver
-            .meta_interp()
-            .is_tracing_key((frame.pycode as usize, loop_header_pc))
-        {
-            return None;
+        majit_metainterp::warmstate::HotResult::StartTracing => {
+            if driver
+                .meta_interp()
+                .is_tracing_key((frame.pycode as usize, loop_header_pc))
+            {
+                return None;
+            }
+            bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
-        return bound_reached(frame, green_key, loop_header_pc, driver, info, env);
+        majit_metainterp::warmstate::HotResult::RunCompiled => {
+            execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
+        }
+        majit_metainterp::warmstate::HotResult::NotHot
+        | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
     }
-    None
 }
 
 /// Panic-safe RAII pairing for `FailDescr::start_compiling` /

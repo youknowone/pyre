@@ -296,9 +296,10 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
 //
 // `rweaklist.py:52 store_handle` holds each stream through `weakref.ref`; the
 // `GcWeakrefBox` is pyre's rweakref, so the handle list is a `Vec` of boxes.
-// A box is collector-managed and this list is its only referent, so the slots
-// are walked as roots ([`walk_autoflusher_roots_area`]) — hence the list lives
-// with the boxing thread, and shutdown flushes that thread's streams.
+// A box is collector-managed and this list is its only referent, so
+// [`walk_autoflusher_roots`] walks the slots as roots. The table is shared
+// process state because `space.fromcache(AutoFlusher)` owns one instance for
+// the object space, independent of the thread that constructs a stream.
 
 /// `rweaklist.py:4 INITIAL_SIZE`.
 const AUTOFLUSHER_INITIAL_SIZE: usize = 4;
@@ -307,7 +308,7 @@ const AUTOFLUSHER_INITIAL_SIZE: usize = 4;
 struct AutoFlusher {
     /// `rweaklist.py:18 self.handles` — index → `GcWeakrefBox`. A null slot is
     /// the `dead_ref` placeholder RPython pre-fills the list with.
-    handles: Vec<PyObjectRef>,
+    handles: Vec<usize>,
     /// `rweaklist.py:19 self.free_list`.
     free_list: Vec<usize>,
 }
@@ -315,7 +316,7 @@ struct AutoFlusher {
 impl AutoFlusher {
     /// `rweaklist.py:17-20 initialize`.
     fn initialize(&mut self) {
-        self.handles = vec![std::ptr::null_mut(); AUTOFLUSHER_INITIAL_SIZE];
+        self.handles = vec![0; AUTOFLUSHER_INITIAL_SIZE];
         self.free_list = (0..AUTOFLUSHER_INITIAL_SIZE).collect();
     }
 
@@ -328,14 +329,16 @@ impl AutoFlusher {
             return index;
         }
         for (index, &handle) in self.handles.iter().enumerate() {
-            if unsafe { pyre_object::weakref::w_gc_weakref_box_deref(handle) }.is_null() {
+            if unsafe { pyre_object::weakref::w_gc_weakref_box_deref(handle as PyObjectRef) }
+                .is_null()
+            {
                 self.free_list.push(index);
             }
         }
         if self.free_list.len() * 3 < self.handles.len() * 2 {
             let length = self.handles.len();
             self.free_list.extend(length..length * 2);
-            self.handles.resize(length * 2, std::ptr::null_mut());
+            self.handles.resize(length * 2, 0);
         }
         self.free_list
             .pop()
@@ -343,15 +346,9 @@ impl AutoFlusher {
     }
 }
 
-thread_local! {
-    /// `interp_iobase.py:475-476 get_autoflusher` — `space.fromcache(AutoFlusher)`.
-    static AUTOFLUSHER: std::cell::RefCell<AutoFlusher> =
-        std::cell::RefCell::new(AutoFlusher::default());
-}
-
-pub fn capture_autoflusher_root_area() -> *const () {
-    AUTOFLUSHER.with(|flusher| flusher as *const _ as *const ())
-}
+/// `interp_iobase.py get_autoflusher` — `space.fromcache(AutoFlusher)`.
+static AUTOFLUSHER: std::sync::LazyLock<std::sync::Mutex<AutoFlusher>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(AutoFlusher::default()));
 
 /// Visit each stored `GcWeakrefBox` as a strong root.
 ///
@@ -364,21 +361,15 @@ pub fn capture_autoflusher_root_area() -> *const () {
 /// `invalidate_young_weakrefs` / `invalidate_old_weakrefs` when the stream
 /// itself dies, which is what turns the slot into `rweaklist.py`'s `dead_ref`.
 ///
-/// # Safety
-/// `data` must come from [`capture_autoflusher_root_area`], and the owning
-/// thread must be quiesced.
-pub unsafe fn walk_autoflusher_roots_area(
-    data: *const (),
-    mut visitor: impl FnMut(&mut PyObjectRef),
-) {
-    // Read through `as_ptr`: the walk runs at a safepoint the borrowing
-    // stream-construction path may already be inside.
-    let flusher = unsafe { &mut *(*(data as *const std::cell::RefCell<AutoFlusher>)).as_ptr() };
+pub fn walk_autoflusher_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
+    let mut flusher = AUTOFLUSHER.lock().unwrap();
     for slot in flusher.handles.iter_mut() {
-        if slot.is_null() {
+        if *slot == 0 {
             continue;
         }
-        visitor(slot);
+        let mut handle = *slot as PyObjectRef;
+        visitor(&mut handle);
+        *slot = handle as usize;
     }
 }
 
@@ -388,7 +379,7 @@ pub unsafe fn walk_autoflusher_roots_area(
 ///
 /// Returns `w_iobase`, which the rweakref allocation may have relocated.
 ///
-/// Reads and rewrites the runtime-mutable `AUTOFLUSHER` thread-local handle
+/// Reads and rewrites the runtime-mutable process-global `AUTOFLUSHER` handle
 /// table, not a build-time constant, so the JIT residualises the call instead
 /// of tracing into it (`@dont_look_inside`, the `importing::sys_modules_dict`
 /// shape).
@@ -397,20 +388,20 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     if w_iobase.is_null() {
         return w_iobase;
     }
-    let index = AUTOFLUSHER.with(|flusher| flusher.borrow_mut().reserve_next_handle_index());
+    let index = AUTOFLUSHER.lock().unwrap().reserve_next_handle_index();
     let _roots = pyre_object::gc_roots::push_roots();
     let target_root = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_iobase);
     // `rweaklist.py:51-52 store_handle` — reuse the slot's box when it already
     // holds one, so a long-lived process bounds the immortal boxes by its peak
     // number of open streams.
-    let handle = AUTOFLUSHER.with(|flusher| flusher.borrow().handles[index]);
+    let handle = AUTOFLUSHER.lock().unwrap().handles[index] as PyObjectRef;
     let stored = unsafe { pyre_object::weakref::w_gc_weakref_box_retarget(handle, w_iobase) };
     if !stored {
         let boxed = pyre_object::weakref::w_gc_weakref_box_new(
             pyre_object::gc_roots::shadow_stack_get(target_root),
         );
-        AUTOFLUSHER.with(|flusher| flusher.borrow_mut().handles[index] = boxed);
+        AUTOFLUSHER.lock().unwrap().handles[index] = boxed as usize;
     }
     pyre_object::gc_roots::shadow_stack_get(target_root)
 }
@@ -420,14 +411,14 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
 /// Ignore I/O errors."
 pub fn flush_all_streams() {
     loop {
-        let handles = AUTOFLUSHER.with(|flusher| {
-            let mut flusher = flusher.borrow_mut();
+        let handles = {
+            let mut flusher = AUTOFLUSHER.lock().unwrap();
             flusher.free_list.clear();
             // `self.initialize()` — reset the state here, so a stream created
             // while flushing is picked up by the next round instead of being
             // flushed twice.
             std::mem::take(&mut flusher.handles)
-        });
+        };
         // `initialize` has rebound the list the walker reads, so the detached
         // boxes have no root left — in RPython the local `handles` list is
         // itself traced.  A `flush` runs Python code, so a collection between
@@ -435,8 +426,11 @@ pub fn flush_all_streams() {
         // Pin them for the round and read each one back, the way
         // `autoflusher_add` reads its pinned stream back.  The `dead_ref`
         // placeholder slots carry nothing to keep alive.
-        let handles: Vec<PyObjectRef> =
-            handles.into_iter().filter(|slot| !slot.is_null()).collect();
+        let handles: Vec<PyObjectRef> = handles
+            .into_iter()
+            .filter(|slot| *slot != 0)
+            .map(|slot| slot as PyObjectRef)
+            .collect();
         let _handle_roots = pyre_object::gc_roots::push_roots();
         let handles_root = pyre_object::gc_roots::shadow_stack_len();
         for &handle in &handles {

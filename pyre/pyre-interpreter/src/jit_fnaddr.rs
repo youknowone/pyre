@@ -1114,7 +1114,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // thread-local `install_current_frame` moves, the two `display::repr_*`
     // twins the `REPR_ACTIVE` mid-repr set (the
     // `note_eval_activation_{enter,exit}` twin shape), and `autoflusher_add`
-    // the `AUTOFLUSHER` thread-local handle table.
+    // the process-global `AUTOFLUSHER` handle table owned by the object space.
     let unsupported_operation_type: fn() -> pyre_object::PyObjectRef =
         crate::module::_io::unsupported_operation_type;
     push_alias_pair(

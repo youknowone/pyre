@@ -3045,20 +3045,18 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
         let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
         let w_iter = if raw.is_null() {
-            // Exhausted enumerate (`:294-295` set `w_iter_or_list` to
-            // null); substitute an empty seq-iter so the reduce stays
-            // round-trippable.
-            pyre_object::w_seq_iter_new(w_list_new(vec![]), 0)
+            // `W_Enumerate.descr_next` clears the source after exhaustion.
+            // An empty list iterator preserves that exhausted state and the
+            // concrete iterator type exposed by CPython's reduce protocol.
+            pyre_object::w_list_iter_new(w_list_new(vec![]))
         } else if pyre_object::is_list(raw) {
-            // List fast path (`:289-294`): `w_iter_or_list` is the source
-            // list itself and `index` is the cursor into it.  Materialise
-            // a seq-iterator positioned at the cursor so the reconstructed
-            // enumerate resumes from the right element rather than the
-            // list head.
+            // The exact-list constructor fast path stores the source list and
+            // uses `index` as its cursor. Materialise the corresponding list
+            // iterator at that cursor so unpickling resumes at the same item.
             let len = pyre_object::w_list_len(raw);
-            let it = pyre_object::w_seq_iter_new(raw, len);
+            let it = pyre_object::w_list_iter_new(raw);
             let pos = i64_index.clamp(0, len as i64);
-            pyre_object::w_seq_iter_set_index(it, pos);
+            pyre_object::w_list_iter_set_index(it, pos);
             it
         } else {
             raw

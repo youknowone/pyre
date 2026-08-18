@@ -456,10 +456,9 @@ pub fn combine_starargs_wrapped(
 ///     ...merge into self.keyword_names_w / self.keywords_w...
 /// ```
 ///
-/// TODO: pyre's `view_as_kwargs` always returns
-/// `(None, [])` (kwargsdict variant unported), so the fast-path arm
-/// (lines 110-120) is unreachable until the dict-strategy port lands.
-/// The slow `keys()` iteration arm runs unconditionally for now.
+/// `baseobjspace::view_as_kwargs` supplies a direct names-and-values view for
+/// exact dicts whose keys are all strings. Other mappings use the `keys()` and
+/// item-lookup path below, preserving mapping overrides and their exceptions.
 pub fn combine_starstarargs_wrapped(
     keyword_names_out: &mut Vec<PyObjectRef>,
     keywords_out: &mut Vec<PyObjectRef>,

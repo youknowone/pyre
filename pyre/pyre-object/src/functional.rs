@@ -18,10 +18,9 @@ use pyre_macros::pyre_class;
 // ```
 //
 // `w_iter_or_list` is either the source iterator (general case) OR
-// the source list itself (start == 0 + exact-list source, line 268-269).
-// Pyre takes the simpler "always store the iterator" subset for now —
-// the list fast-path is a layered optimisation pyre does not need
-// today (covered by the `is_list` fast path at the call site).
+// the source list itself when the start is zero and the source is an exact
+// list. `w_enumerate_new` preserves that representation; reduce and iteration
+// code must therefore handle both the stored-list and stored-iterator forms.
 //
 // `index: i64` is the fast counter; once it overflows i64, `w_index`
 // carries the bigint value (PyPy line 297-303
