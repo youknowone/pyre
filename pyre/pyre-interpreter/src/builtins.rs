@@ -12657,6 +12657,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // bits the codegen honours, and the optimisation level.
     let opts = crate::compile::CompileOpts {
         optimize: optimize as u8,
+        debug_ranges: crate::importing::code_debug_ranges_flag(),
         allow_top_level_await: flags & PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
         dont_imply_dedent: flags & PYCF_DONT_IMPLY_DEDENT != 0,
         future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),

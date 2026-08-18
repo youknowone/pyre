@@ -59,6 +59,7 @@ pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileErr
 fn default_compile_opts() -> CompileOpts {
     CompileOpts {
         optimize: crate::importing::optimize_flag(),
+        debug_ranges: crate::importing::code_debug_ranges_flag(),
         ..Default::default()
     }
 }

@@ -3113,6 +3113,7 @@ static SYS_ORIG_ARGV: LazyLock<Mutex<Vec<std::ffi::OsString>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static SYS_STDIO_ENCODING: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
+static SYS_CODE_DEBUG_RANGES: AtomicBool = AtomicBool::new(true);
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -3144,6 +3145,7 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     #[cfg(windows)]
     crate::typedef::LEGACY_WINDOWS_FS_ENCODING
         .store(flags.legacy_windows_fs_encoding, Ordering::Relaxed);
+    SYS_CODE_DEBUG_RANGES.store(!flags.no_debug_ranges, Ordering::Relaxed);
     SYS_UTF8_MODE.store(flags.utf8_mode.unwrap_or(0), Ordering::Relaxed);
     SYS_SAFE_PATH.store(flags.safe_path, Ordering::Relaxed);
     SYS_OPTIMIZE.store(flags.optimize, Ordering::Relaxed);
@@ -3162,6 +3164,12 @@ pub fn xoptions() -> Vec<std::ffi::OsString> {
 
 pub fn bytes_warning_flag() -> i64 {
     SYS_BYTES_WARNING.load(Ordering::Relaxed)
+}
+
+/// CPython 3.14 `PyConfig.code_debug_ranges`, consumed by every compiler
+/// entry point so command-line, import and builtin `compile()` agree.
+pub fn code_debug_ranges_flag() -> bool {
+    SYS_CODE_DEBUG_RANGES.load(Ordering::Relaxed)
 }
 
 pub fn unbuffered_flag() -> bool {

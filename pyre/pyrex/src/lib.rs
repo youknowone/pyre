@@ -219,6 +219,7 @@ fn parse_args(
                 match option.to_str() {
                     Some("dev") => flags.dev_mode = true,
                     Some("warn_default_encoding") => flags.warn_default_encoding = true,
+                    Some("no_debug_ranges") => flags.no_debug_ranges = true,
                     Some("utf8") | Some("utf8=1") => flags.utf8_mode = Some(1),
                     Some("utf8=0") => flags.utf8_mode = Some(0),
                     Some(value) if value.starts_with("utf8=") => {

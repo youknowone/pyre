@@ -29,6 +29,9 @@ pub struct LaunchFlags {
     /// Read only on Windows, the only platform whose `PyPreConfig` carries it,
     /// and left false everywhere else.
     pub legacy_windows_fs_encoding: bool,
+    /// CPython 3.14 `code_debug_ranges == 0`, selected by either
+    /// `-X no_debug_ranges` or the PYTHONNODEBUGRANGES presence flag.
+    pub no_debug_ranges: bool,
     /// `None` until [`finalize`] resolves it; a command line that named
     /// `-X utf8` carries that value through instead.
     pub utf8_mode: Option<i64>,
@@ -90,6 +93,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONLEGACYWINDOWSFSENCODING",
     "PYTHONWARNINGS",
     "PYTHONIOENCODING",
+    "PYTHONNODEBUGRANGES",
     "LC_ALL",
     "LC_CTYPE",
     "LANG",
@@ -278,6 +282,8 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         flags.warn_default_encoding,
         "PYTHONWARNDEFAULTENCODING",
     );
+    flags.no_debug_ranges =
+        fold_presence_flag(&flags, flags.no_debug_ranges, "PYTHONNODEBUGRANGES");
     flags.stdio_encoding = if flags.ignore_environment {
         None
     } else {
