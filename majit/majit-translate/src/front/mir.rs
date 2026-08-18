@@ -7635,6 +7635,45 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `Wtf8Buf` / `String`::push_str(&mut buf, s) / push_wtf8(&mut
+                // buf, w) — and the argument-swapped `Wtf8Piece::push_onto(&s,
+                // &mut buf)` — an accumulator append.  A `Wtf8Buf` / `String`
+                // lifts to the single immutable `ValueType::Str`, so there is
+                // no builder to mutate in place; model the append functionally
+                // as `buf = ll_strconcat(buf, piece)` (the `add` BinOp the
+                // rtyper routes to `ll_strconcat`) and rebind the accumulator's
+                // MIR local so its later reads — and the loop-header phi that
+                // threads it across the back-edge — observe the concatenated
+                // string.  `str_builder_append_args` gives the accumulator and
+                // piece arg positions (push_str / push_wtf8: acc 0, piece 1;
+                // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
+                // arrives as a per-site ref-temp; `append_accumulator_of_arg_temp`
+                // traces it back to `buf` on demand from the MIR body, resolving
+                // to `buf` only when `buf` is a fresh `new` / `with_capacity`
+                // local whose every borrow feeds such an append, so a
+                // `&mut`-parameter accumulator (whose caller observes the
+                // real-buffer mutation) is excluded and keeps its residual
+                // rather than miscompiling.  The call returns `()`; its dead
+                // destination binds to a fresh Void var.
+                if args.len() == 2
+                    && let Some((acc_i, piece_i)) = str_builder_append_args(self.llbc, &reg)
+                    && let Some(buf_local) = arg_locals
+                        .get(acc_i)
+                        .copied()
+                        .flatten()
+                        .and_then(|rt| append_accumulator_of_arg_temp(self.body, self.llbc, rt))
+                {
+                    let concat = emit_str_add(&mut self.graph, bb_id, &args[acc_i], &args[piece_i]);
+                    self.local_var[buf_local] = Some(concat);
+                    self.local_var[dest_local] = Some(
+                        self.graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void),
+                    );
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `*const T::cast_mut()` / `*mut T::cast_const()` /
                 // `<ptr>::cast()` — address-preserving pointer
                 // reinterprets the JIT models as identity (the
@@ -14047,6 +14086,414 @@ fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashS
         .filter(|(_, c)| *c > 1)
         .map(|(i, _)| i)
         .collect()
+}
+
+/// The owning type of a functional-concat string builder: `Wtf8Buf` (the
+/// interpreter's repr accumulator) or std `String` (the byte / leaf / module
+/// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a
+/// `push_str` append models identically as `buf = ll_strconcat(buf, arg)`;
+/// `push_wtf8` is `Wtf8Buf`-only but the leaf gate never matches it on a
+/// `String`, so one owner set serves both.
+fn is_str_builder_owner(owner: Option<&str>) -> bool {
+    matches!(owner, Some("Wtf8Buf") | Some("String"))
+}
+
+/// The string-builder ctor leaf a MIR call resolves to, restricted to the
+/// fresh-buffer constructors this pass models (`new` / `with_capacity`) on a
+/// `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
+/// runs before the impl-owner resolution so the type lookup only fires for the
+/// candidate names.  Appends are recognised separately by
+/// [`str_builder_append_args`].
+fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let np = fd.item_meta.name_path();
+    let leaf = match np.rsplit("::").next()? {
+        "new" => "new",
+        "with_capacity" => "with_capacity",
+        "push_str" => "push_str",
+        "push_wtf8" => "push_wtf8",
+        _ => return None,
+    };
+    is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
+}
+
+/// If `reg` is a functional-concat string append, its `(accumulator, piece)`
+/// argument positions.  `push_str` / `push_wtf8` (on `Wtf8Buf` / `String`)
+/// take the accumulator as `&mut self` (arg 0) and the appended piece as
+/// arg 1.  `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps them: the
+/// piece is `self` (arg 0) and the accumulator is `out` (arg 1).  Every
+/// `Wtf8Piece` impl body is `out.push_str(self)` / `out.push_wtf8(self)`, so
+/// `out = out ++ self` models all of them; the accumulator gate
+/// ([`append_accumulator_of_arg_temp`]) still restricts the rewrite to a fresh
+/// owned local, so a `&mut`-parameter `out` keeps its residual.
+fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usize)> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let np = fd.item_meta.name_path();
+    match np.rsplit("::").next()? {
+        "push_str" | "push_wtf8" => {
+            is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some((0, 1))
+        }
+        // `Wtf8Piece::push_onto`: the `str` / `String` / `Wtf8` impls live
+        // under `pyre_interpreter::display`; the `Wtf8Buf` impl resolves to the
+        // `Wtf8Buf` owner.  Both append `self` (arg 0) onto the `&mut Wtf8Buf`
+        // accumulator (arg 1).
+        "push_onto" => (np.starts_with("pyre_interpreter::display")
+            || deref_impl_owner_leaf(llbc, fd).as_deref() == Some("Wtf8Buf"))
+        .then_some((1, 0)),
+        _ => None,
+    }
+}
+
+/// How an operand references accumulator local `c`: `Some(true)` = a bare
+/// `move c` (transfers the whole accumulated string, sound to pass on since
+/// the move leaves `c` dead), `Some(false)` = any other reference (`copy c`,
+/// or a `move`/`copy` of a projection of `c`) the functional-concat model
+/// cannot track, `None` = no reference to `c`.
+fn c_operand_kind(op: &Operand, c: usize) -> Option<bool> {
+    match op {
+        Operand::Move(p) => {
+            if matches!(p.kind, PlaceKind::Local(i) if i as usize == c) {
+                Some(true)
+            } else if place_references_local(p, c) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Operand::Copy(p) => place_references_local(p, c).then_some(false),
+        Operand::Const(_) => None,
+    }
+}
+
+/// Whether an operand reads local `l` (a `copy`/`move` whose place bottoms
+/// out at `l`).
+fn operand_reads_local(op: &Operand, l: usize) -> bool {
+    matches!(op, Operand::Copy(p) | Operand::Move(p) if place_references_local(p, l))
+}
+
+/// Whether a `&(mut) buf` ref-temp `rt` is used exactly once — as the
+/// accumulator argument of a recognised append (`push_str` / `push_wtf8`
+/// arg 0, or `Wtf8Piece::push_onto` arg 1) — and nowhere else, so rebinding
+/// `buf` to the concat captures the whole mutation.  A ref-temp that also
+/// escapes elsewhere would leave that other reader observing the pre-append
+/// buffer, so it declines.
+fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
+    let mut receiver = 0usize;
+    let mut other = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    // A write through a projection of `rt` (`*rt = v`) reads
+                    // `rt`; a bare `rt := ..` def does not.
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if operand_reads_local(&a.cond, rt) {
+                        other += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let acc_idx = match &call.func {
+                    CallFunc::Regular(reg) => {
+                        str_builder_append_args(llbc, reg).map(|(acc, _)| acc)
+                    }
+                    _ => None,
+                };
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                for (i, arg) in call.args.iter().enumerate() {
+                    if operand_reads_local(arg, rt) {
+                        if acc_idx == Some(i) {
+                            receiver += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(&discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if operand_reads_local(&assert.cond, rt) {
+                    other += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    receiver == 1 && other == 0
+}
+
+/// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
+/// `c`, return its append-receiver temps if every use of `c` is append-safe,
+/// else `None`.  Append-safe uses: the ctor def; a borrow `_r := &(mut) c`
+/// that reaches an append accumulator argument ([`append_receiver_of_borrow`],
+/// directly or through a single two-phase reborrow); or a bare `move c`
+/// (ownership transfer of the complete accumulated string).  Any other use — a
+/// `copy`, a projection read/write (`c.field` / `*c`), `&c.field`, `Len`/
+/// `Discriminant`, or `c` in an assert / switch — is an out-of-band access the
+/// functional model cannot track, so the whole local declines.  The returned
+/// temps are the call-argument locals the append arm resolves against
+/// ([`append_accumulator_of_arg_temp`]), which for a reborrowed `&mut` argument
+/// is the reborrow, not the direct borrow.
+fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Option<Vec<usize>> {
+    let mut ref_temps: Vec<usize> = Vec::new();
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    // A write into `c`'s storage through a projection
+                    // (`*c = ..` / `c.field = ..`) mutates the buffer
+                    // out-of-band.
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, c)
+                    {
+                        return None;
+                    }
+                    match &rvalue {
+                        Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } => {
+                            if matches!(rp.kind, PlaceKind::Local(i) if i as usize == c) {
+                                let PlaceKind::Local(r) = place.kind else {
+                                    return None; // borrow assigned into a projection
+                                };
+                                ref_temps.push(r as usize);
+                            } else if place_references_local(rp, c) {
+                                return None; // `&c.field` / `&*c` — escape
+                            }
+                        }
+                        Rvalue::Len(p) | Rvalue::Discriminant(p) => {
+                            if place_references_local(p, c) {
+                                return None;
+                            }
+                        }
+                        Rvalue::Use(op)
+                        | Rvalue::UnaryOp(_, op)
+                        | Rvalue::Cast(_, op, _)
+                        | Rvalue::Repeat(op, _, _)
+                        | Rvalue::ShallowInitBox(op, _) => {
+                            if c_operand_kind(op, c) == Some(false) {
+                                return None;
+                            }
+                        }
+                        Rvalue::BinaryOp(_, l, r) => {
+                            if c_operand_kind(l, c) == Some(false)
+                                || c_operand_kind(r, c) == Some(false)
+                            {
+                                return None;
+                            }
+                        }
+                        Rvalue::Aggregate(_, ops) => {
+                            if ops.iter().any(|op| c_operand_kind(op, c) == Some(false)) {
+                                return None;
+                            }
+                        }
+                        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {}
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if c_operand_kind(&a.cond, c).is_some() {
+                        return None;
+                    }
+                }
+                Ok(StmtKind::PlaceMention(_))
+                | Ok(StmtKind::StorageLive(_))
+                | Ok(StmtKind::StorageDead(_))
+                | Ok(StmtKind::Unknown) => {}
+                Err(_) => return None,
+            }
+        }
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && c_operand_kind(op, c).is_some()
+                {
+                    return None;
+                }
+                // `move c` into a call transfers the complete string (sound);
+                // a `copy` or projected reference declines.
+                if call
+                    .args
+                    .iter()
+                    .any(|a| c_operand_kind(a, c) == Some(false))
+                {
+                    return None;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if c_operand_kind(&discr, c).is_some() {
+                    return None;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if c_operand_kind(&assert.cond, c).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut receivers = Vec::with_capacity(ref_temps.len());
+    for &rt in &ref_temps {
+        receivers.push(append_receiver_of_borrow(body, llbc, rt)?);
+    }
+    Some(receivers)
+}
+
+/// Resolve a direct `&(mut) buf` borrow temp `rt` to the temp actually passed
+/// as the append's accumulator argument.  A method-autoref receiver
+/// (`buf.push_str(s)`) reaches the call unchanged, so `rt` is itself the sole
+/// append receiver.  An explicit `&mut buf` argument (`Wtf8Piece::push_onto(&s,
+/// &mut buf)`) is a two-phase reborrow — `rt := &Mut buf; recv := &TwoPhaseMut
+/// *rt` — so the call receives `recv` instead; accept it when `rt`'s only use
+/// is that single reborrow and `recv` is itself a sole append receiver.  The
+/// returned temp is the call's accumulator-argument local the append arm
+/// resolves against ([`append_accumulator_of_arg_temp`]).
+fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    if ref_temp_is_sole_append_receiver(body, llbc, rt) {
+        return Some(rt);
+    }
+    let mut recv: Option<usize> = None;
+    let mut other = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            match st.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } =
+                        &rvalue
+                        && place_is_immediate_deref_of(rp, rt)
+                    {
+                        let PlaceKind::Local(r) = place.kind else {
+                            return None; // reborrow assigned into a projection
+                        };
+                        if recv.replace(r as usize).is_some() {
+                            return None; // more than one reborrow of `rt`
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) => {
+                    if operand_reads_local(&a.cond, rt) {
+                        other += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `rt` is consumed by the reborrow statement; it must not reach any
+        // terminator (the append call receives `recv`, not `rt`).
+        match bb.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                if call.args.iter().any(|a| operand_reads_local(a, rt)) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(&discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                if operand_reads_local(&assert.cond, rt) {
+                    other += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let recv = recv?;
+    if other != 0 {
+        return None;
+    }
+    ref_temp_is_sole_append_receiver(body, llbc, recv).then_some(recv)
+}
+
+/// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
+/// exactly one def and that def is a `Wtf8Buf` / `String` `new` /
+/// `with_capacity` call.  A local with a second def, or one defined by a
+/// non-ctor rvalue, is not a fresh accumulator and keeps its residual.
+fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    let mut def_count = 0usize;
+    let mut ctor_def = false;
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                && matches!(place.kind, PlaceKind::Local(i) if i as usize == c)
+            {
+                def_count += 1;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term()
+            && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
+        {
+            def_count += 1;
+            ctor_def = matches!(
+                wtf8buf_method_leaf(llbc, &call),
+                Some("new") | Some("with_capacity")
+            );
+        }
+    }
+    def_count == 1 && ctor_def
+}
+
+/// Resolve the accumulator local a recognised append rebinds, given the MIR
+/// local `rt` passed as the append's accumulator argument (`push_str` /
+/// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
+/// borrows the accumulator directly (method autoref) or through a single
+/// two-phase reborrow; the owning `buf` is the fresh `new` / `with_capacity`
+/// local whose every borrow feeds such an append and whose append-receiver set
+/// ([`clean_accumulator_ref_temps`]) contains `rt`.  Resolved on demand from
+/// the MIR body, so the recognizer keeps no per-local side table; the append
+/// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
+fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    let n_locals = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    // Locals 0 (return) and 1..=arg_count (parameters) are never fresh owned
+    // accumulators — skipping them keeps a `&mut`-parameter receiver residual.
+    (arg_count + 1..n_locals).find(|&c| {
+        is_fresh_str_builder(body, llbc, c)
+            && clean_accumulator_ref_temps(body, llbc, c)
+                .is_some_and(|receivers| receivers.contains(&rt))
+    })
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace
