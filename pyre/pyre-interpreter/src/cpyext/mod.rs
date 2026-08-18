@@ -21,6 +21,7 @@ pub mod bytesobject;
 pub mod capsule;
 pub mod complexobject;
 pub mod dictobject;
+pub mod exception;
 pub mod floatobject;
 pub mod gc;
 pub mod import_;
@@ -735,6 +736,7 @@ pub fn ensure_linked() {
     pystate::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
+    exception::ensure_linked();
     weakrefobject::ensure_linked();
     gc::ensure_linked();
     pyerrors::ensure_linked();

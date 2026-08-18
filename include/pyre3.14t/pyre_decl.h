@@ -100,6 +100,19 @@ PyAPI_FUNC(Py_ssize_t) PyDict_Size(PyObject *);
 PyAPI_FUNC(int) PyDict_Update(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyDict_Values(PyObject *);
 
+/* cpyext/exception.rs */
+PyAPI_FUNC(int) PyExceptionClass_Check(PyObject *);
+PyAPI_FUNC(const char *) PyExceptionClass_Name(PyObject *);
+PyAPI_FUNC(int) PyExceptionInstance_Check(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetArgs(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetCause(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetContext(PyObject *);
+PyAPI_FUNC(PyObject *) PyException_GetTraceback(PyObject *);
+PyAPI_FUNC(void) PyException_SetArgs(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyException_SetCause(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyException_SetContext(PyObject *, PyObject *);
+PyAPI_FUNC(int) PyException_SetTraceback(PyObject *, PyObject *);
+
 /* cpyext/floatobject.rs */
 PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *);
 PyAPI_FUNC(int) PyFloat_Check(PyObject *);
@@ -320,13 +333,21 @@ PyAPI_FUNC(void) PyErr_BadInternalCall(void);
 PyAPI_FUNC(void) PyErr_Clear(void);
 PyAPI_FUNC(int) PyErr_ExceptionMatches(PyObject *);
 PyAPI_FUNC(void) PyErr_Fetch(PyObject **, PyObject **, PyObject **);
+PyAPI_FUNC(void) PyErr_GetExcInfo(PyObject **, PyObject **, PyObject **);
+PyAPI_FUNC(PyObject *) PyErr_GetHandledException(void);
+PyAPI_FUNC(PyObject *) PyErr_GetRaisedException(void);
 PyAPI_FUNC(int) PyErr_GivenExceptionMatches(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyErr_NoMemory(void);
 PyAPI_FUNC(void) PyErr_NormalizeException(PyObject **, PyObject **, PyObject **);
 PyAPI_FUNC(PyObject *) PyErr_Occurred(void);
 PyAPI_FUNC(void) PyErr_Restore(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetExcInfo(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetHandledException(PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetImportError(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyErr_SetImportErrorSubclass(PyObject *, PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetNone(PyObject *);
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
+PyAPI_FUNC(void) PyErr_SetRaisedException(PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
 
 /* cpyext/pymem.rs */

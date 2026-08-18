@@ -49,6 +49,12 @@ PyAPI_DATA(PyObject *) PyExc_UnicodeTranslateError;
 PyAPI_DATA(PyObject *) PyExc_ValueError;
 PyAPI_DATA(PyObject *) PyExc_ZeroDivisionError;
 
+/* An instance's class.  The two classification spellings beside it --
+   `PyExceptionClass_Check` and `PyExceptionInstance_Check` -- are entry points
+   rather than flag tests, since a pyre type mirror carries no `tp_flags` bit
+   for its base chain. */
+#define PyExceptionInstance_Class(x) ((PyObject *)Py_TYPE(x))
+
 #ifdef __cplusplus
 }
 #endif

@@ -201,16 +201,26 @@ fn normalized(w_type: PyObjectRef, w_value: PyObjectRef) -> Result<PyObjectRef, 
     Ok(instance)
 }
 
+/// `_PyErr_SetObject` — normalize the pair and make the instance the indicator.
+///
+/// The chaining is that function's too: an exception raised while another is
+/// being handled records the one being handled as its `__context__`, so the C
+/// caller's error does not hide it.
+fn set_normalized(class: PyObjectRef, value: PyObjectRef) {
+    let Some(instance) = trap(normalized(class, value)) else {
+        return;
+    };
+    crate::error::chain_context(instance, handled_exception());
+    set_pending_raw(pyobject::make_ref(instance));
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_SetObject(w_type: *mut CPyObject, value: *mut CPyObject) {
     super::object::realize_all([w_type, value]);
     let Some(class) = class_argument(w_type) else {
         return;
     };
-    let value = unsafe { pyobject::from_ref(value) };
-    if let Some(instance) = trap(normalized(class, value)) {
-        set_pending_raw(pyobject::make_ref(instance));
-    }
+    set_normalized(class, unsafe { pyobject::from_ref(value) });
 }
 
 #[unsafe(no_mangle)]
@@ -223,9 +233,7 @@ pub unsafe extern "C" fn PyErr_SetString(w_type: *mut CPyObject, message: *const
     } else {
         pyre_object::w_str_new(&unsafe { CStr::from_ptr(message) }.to_string_lossy())
     };
-    if let Some(instance) = trap(normalized(class, text)) {
-        set_pending_raw(pyobject::make_ref(instance));
-    }
+    set_normalized(class, text);
 }
 
 #[unsafe(no_mangle)]
@@ -233,9 +241,7 @@ pub unsafe extern "C" fn PyErr_SetNone(w_type: *mut CPyObject) {
     let Some(class) = class_argument(w_type) else {
         return;
     };
-    if let Some(instance) = trap(normalized(class, PY_NULL)) {
-        set_pending_raw(pyobject::make_ref(instance));
-    }
+    set_normalized(class, PY_NULL);
 }
 
 /// The exception class a `PyErr_Set*` argument names, or `None` after
@@ -325,9 +331,8 @@ pub unsafe extern "C" fn PyErr_GivenExceptionMatches(
 /// Hand the indicator out as the classic `(type, value, traceback)` triple.
 ///
 /// Each slot receives a new reference and the indicator is cleared, which is
-/// `PyErr_Fetch`'s contract.  The traceback slot is always NULL: pyre attaches
-/// the traceback while the error propagates, so a C caller that restores the
-/// triple unchanged loses nothing.
+/// `PyErr_Fetch`'s contract.  All three are derived from the one instance the
+/// indicator holds: the class it is of, itself, and its `__traceback__`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_Fetch(
     ptype: *mut *mut CPyObject,
@@ -335,14 +340,19 @@ pub unsafe extern "C" fn PyErr_Fetch(
     ptraceback: *mut *mut CPyObject,
 ) {
     let raw = pending_raw();
-    let (class, value) = if raw.is_null() {
-        (std::ptr::null_mut(), std::ptr::null_mut())
+    let (class, value, traceback) = if raw.is_null() {
+        (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
     } else {
         let class = unsafe { (*raw).ob_type as *mut CPyObject };
         unsafe { pyobject::incref(class) };
+        let traceback = unsafe { traceback_reference(pyobject::from_ref(raw)) };
         // The indicator's own reference is transferred to `pvalue`.
         PENDING.with(|slot| slot.set(std::ptr::null_mut()));
-        (class, raw)
+        (class, raw, traceback)
     };
     unsafe {
         if !ptype.is_null() {
@@ -356,32 +366,218 @@ pub unsafe extern "C" fn PyErr_Fetch(
             pyobject::decref(value);
         }
         if !ptraceback.is_null() {
-            *ptraceback = std::ptr::null_mut();
+            *ptraceback = traceback;
+        } else {
+            pyobject::decref(traceback);
         }
     }
 }
 
+/// An exception instance's `__traceback__` as a new reference, or NULL.
+fn traceback_reference(instance: PyObjectRef) -> *mut CPyObject {
+    if instance.is_null() || !unsafe { pyre_object::is_exception(instance) } {
+        return std::ptr::null_mut();
+    }
+    let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(instance) };
+    if stored.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::pytraceback::mark_traceback_escaped(stored) };
+    pyobject::make_ref(stored)
+}
+
+/// Detach the indicator and hand it to the caller, which is fetch-and-clear
+/// with no triple in the way.
+///
+/// The reference the indicator held becomes the caller's — nothing is increfed
+/// here — and NULL is the answer when nothing was pending, not an error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_GetRaisedException() -> *mut CPyObject {
+    let raw = pending_raw();
+    PENDING.with(|slot| slot.set(std::ptr::null_mut()));
+    raw
+}
+
+/// Make `exception` the indicator, stealing the reference and releasing
+/// whatever was pending.
+///
+/// A NULL argument is the clear spelling.  Upstream performs no check at all
+/// and a foreign object reaches the unwinder as a garbage read; pyre's
+/// indicator is a typed exception instance, so anything else is refused here
+/// with the `SystemError` `_PyErr_SetObject` uses for the same mistake.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_SetRaisedException(exception: *mut CPyObject) {
+    super::object::realize_all([exception]);
+    let instance = unsafe { pyobject::from_ref(exception) };
+    if exception.is_null() {
+        set_pending_raw(std::ptr::null_mut());
+        return;
+    }
+    if !unsafe { pyre_object::is_exception(instance) } {
+        unsafe { pyobject::decref(exception) };
+        set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "PyErr_SetRaisedException: exception {} is not a BaseException instance",
+                crate::type_methods::arg_type_name(instance)
+            ),
+        ));
+        return;
+    }
+    set_pending_raw(exception);
+}
+
+/// The exception currently being handled, as a new reference, or NULL.
+///
+/// `sys_exc_info` walks through the suspended generators' saved slots, so this
+/// answers the topmost handler's exception rather than only the current
+/// frame's, and it clears nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_GetHandledException() -> *mut CPyObject {
+    let handled = handled_exception();
+    match handled.is_null() {
+        true => std::ptr::null_mut(),
+        false => pyobject::make_ref(handled),
+    }
+}
+
+/// The handled exception, or a null pointer when nothing is being handled.
+///
+/// `None` never survives in the slot — the setters below store it as the empty
+/// slot — but a bare `raise` reaching an unset slot writes one, so it is mapped
+/// back here rather than handed out as an exception.
+fn handled_exception() -> PyObjectRef {
+    let handled = crate::eval::get_sys_exception();
+    match handled.is_null() || unsafe { !pyre_object::is_exception(handled) } {
+        true => PY_NULL,
+        false => handled,
+    }
+}
+
+/// Replace the handled exception, keeping the caller's reference.
+///
+/// This is the one setter in the family that borrows rather than steals, and
+/// `None` is stored as the empty slot.  It writes the current execution
+/// context's slot, which is not always the one [`PyErr_GetHandledException`]
+/// reads: inside a generator the read falls through to the caller's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_SetHandledException(exception: *mut CPyObject) {
+    super::object::realize_all([exception]);
+    let instance = unsafe { pyobject::from_ref(exception) };
+    if instance.is_null() || unsafe { pyre_object::is_none(instance) } {
+        crate::eval::set_current_exception(PY_NULL);
+        return;
+    }
+    if !unsafe { pyre_object::is_exception(instance) } {
+        set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "PyErr_SetHandledException: exception {} is not a BaseException instance",
+                crate::type_methods::arg_type_name(instance)
+            ),
+        ));
+        return;
+    }
+    crate::eval::set_current_exception(instance);
+}
+
+/// The handled exception as the classic triple, all three derived from it.
+///
+/// The empty state is the asymmetric one: the class and traceback slots
+/// receive `None` while the value slot receives NULL, which is what tells this
+/// apart from `sys.exc_info()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_GetExcInfo(
+    ptype: *mut *mut CPyObject,
+    pvalue: *mut *mut CPyObject,
+    ptraceback: *mut *mut CPyObject,
+) {
+    let handled = handled_exception();
+    // `Py_None` is immortal, so the two slots that can receive it need no
+    // reference of their own — which is why upstream hands it over bare.
+    let none = pyobject::borrow_mirror(pyre_object::w_none());
+    let (class, value, traceback) = if handled.is_null() {
+        (none, std::ptr::null_mut(), none)
+    } else {
+        let value = pyobject::make_ref(handled);
+        let class = unsafe { (*value).ob_type as *mut CPyObject };
+        unsafe { pyobject::incref(class) };
+        let traceback = traceback_reference(handled);
+        let traceback = match traceback.is_null() {
+            true => none,
+            false => traceback,
+        };
+        (class, value, traceback)
+    };
+    unsafe {
+        store_or_release(ptype, class);
+        store_or_release(pvalue, value);
+        store_or_release(ptraceback, traceback);
+    }
+}
+
+/// Hand `value` to `slot`, or release it when there is no slot to take it.
+unsafe fn store_or_release(slot: *mut *mut CPyObject, value: *mut CPyObject) {
+    match slot.is_null() {
+        true => unsafe { pyobject::decref(value) },
+        false => unsafe { *slot = value },
+    }
+}
+
+/// The three-argument spelling of [`PyErr_SetHandledException`], which is all
+/// it is: only the value is stored, and all three references are stolen.
+///
+/// Whatever is passed as the class or the traceback is unobservable — a later
+/// [`PyErr_GetExcInfo`] derives both from the value again — so the two are
+/// released and nothing else.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_SetExcInfo(
+    ptype: *mut CPyObject,
+    pvalue: *mut CPyObject,
+    ptraceback: *mut CPyObject,
+) {
+    unsafe {
+        PyErr_SetHandledException(pvalue);
+        pyobject::decref(pvalue);
+        pyobject::decref(ptype);
+        pyobject::decref(ptraceback);
+    }
+}
+
 /// The inverse of [`PyErr_Fetch`]; every argument's reference is stolen.
+///
+/// The traceback is written onto the instance rather than dropped, which is
+/// what makes the pair lossless: `Fetch` reads that same slot, so a caller
+/// that saves the triple and hands it straight back keeps the traceback the
+/// exception was carrying.  Nothing is chained here — the exception being
+/// restored is an older one rather than a new raise.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyErr_Restore(
     ptype: *mut CPyObject,
     pvalue: *mut CPyObject,
     ptraceback: *mut CPyObject,
 ) {
-    super::object::realize_all([ptype, pvalue]);
-    unsafe { pyobject::decref(ptraceback) };
+    super::object::realize_all([ptype, pvalue, ptraceback]);
+    let traceback = unsafe { pyobject::from_ref(ptraceback) };
     // `errors.c:62-67` — a NULL class clears the indicator whatever the value
     // is, so restoring what `PyErr_Fetch` handed back on a clear indicator
     // cannot leave an older exception standing.
     if ptype.is_null() {
-        unsafe { pyobject::decref(pvalue) };
+        unsafe {
+            pyobject::decref(pvalue);
+            pyobject::decref(ptraceback);
+        }
         set_pending_raw(std::ptr::null_mut());
         return;
     }
     let value = unsafe { pyobject::from_ref(pvalue) };
     if !value.is_null() && unsafe { pyre_object::is_exception(value) } {
+        restore_traceback(value, traceback);
         set_pending_raw(pvalue);
-        unsafe { pyobject::decref(ptype) };
+        unsafe {
+            pyobject::decref(ptype);
+            pyobject::decref(ptraceback);
+        }
         return;
     }
     // `errors.c:77-86` — anything else, a NULL value included, is built into an
@@ -392,12 +588,123 @@ pub unsafe extern "C" fn PyErr_Restore(
     if class.is_null() {
         set_pending_raw(std::ptr::null_mut());
     } else if let Some(instance) = trap(normalized(class, value)) {
+        restore_traceback(instance, traceback);
         set_pending_raw(pyobject::make_ref(instance));
     }
     unsafe {
         pyobject::decref(ptype);
         pyobject::decref(pvalue);
+        pyobject::decref(ptraceback);
     }
+}
+
+/// Write a restored traceback onto the instance that is about to be raised.
+///
+/// A NULL one leaves the slot alone, since `errors.c:87` only writes when the
+/// triple carried one; anything that is not a traceback is nothing to write.
+fn restore_traceback(instance: PyObjectRef, traceback: PyObjectRef) {
+    if traceback.is_null() || !unsafe { crate::pytraceback::is_pytraceback(traceback) } {
+        return;
+    }
+    unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(instance, traceback) };
+}
+
+/// Build an `ImportError` of `class` and make it the indicator.
+///
+/// The instance is built by calling the class as `class(message, name=...,
+/// path=..., name_from=...)`, so a subclass whose `__init__` does not take
+/// those three keywords refuses rather than silently losing them.  Every
+/// argument is borrowed, and the answer is always NULL — the return value is
+/// the convention `return PyErr_SetImportError(...)` relies on.
+fn set_import_error(
+    class: *mut CPyObject,
+    message: *mut CPyObject,
+    name: *mut CPyObject,
+    path: *mut CPyObject,
+) -> Option<()> {
+    super::object::realize_all([class, message, name, path]);
+    let class = super::object::argument(class)?;
+    let import_error = crate::builtins::lookup_exc_class("ImportError")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(class);
+    if !trap(crate::baseobjspace::issubclass(class, import_error))? {
+        set_pending_error(crate::PyError::type_error(
+            "expected a subclass of ImportError",
+        ));
+        return None;
+    }
+    if message.is_null() {
+        set_pending_error(crate::PyError::type_error("expected a message argument"));
+        return None;
+    }
+    let named: Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> = [("name", name), ("path", path)]
+        .into_iter()
+        .map(|(key, raw)| {
+            let value = unsafe { pyobject::from_ref(raw) };
+            let value = match value.is_null() {
+                true => pyre_object::w_none(),
+                false => value,
+            };
+            (rustpython_wtf8::Wtf8Buf::from_string(key.to_owned()), value)
+        })
+        .chain(std::iter::once((
+            rustpython_wtf8::Wtf8Buf::from_string("name_from".to_owned()),
+            pyre_object::w_none(),
+        )))
+        .collect();
+    let message = unsafe { pyobject::from_ref(message) };
+    let instance = trap(crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "cpyext keyword call has no current frame",
+            ));
+        }
+        crate::call::call_with_kwargs(
+            unsafe { &mut *frame },
+            pyre_object::gc_roots::shadow_stack_get(class_slot),
+            &[message],
+            &named,
+        )
+    }))?;
+    if !unsafe { pyre_object::is_exception(instance) } {
+        set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!(
+                "_PyErr_SetObject: exception {} is not a BaseException subclass",
+                crate::type_methods::arg_type_name(instance)
+            ),
+        ));
+        return None;
+    }
+    // `_PyErr_SetObject`'s implicit chaining: the exception being handled
+    // becomes the new one's context, so the ImportError does not hide it.
+    crate::error::chain_context(instance, handled_exception());
+    set_pending_raw(pyobject::make_ref(instance));
+    Some(())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_SetImportError(
+    message: *mut CPyObject,
+    name: *mut CPyObject,
+    path: *mut CPyObject,
+) -> *mut CPyObject {
+    let import_error = unsafe { PyExc_ImportError };
+    set_import_error(import_error, message, name, path);
+    std::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_SetImportErrorSubclass(
+    class: *mut CPyObject,
+    message: *mut CPyObject,
+    name: *mut CPyObject,
+    path: *mut CPyObject,
+) -> *mut CPyObject {
+    set_import_error(class, message, name, path);
+    std::ptr::null_mut()
 }
 
 /// `PyErr_NormalizeException` — replace the pair with the exception instance

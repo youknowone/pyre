@@ -98,9 +98,10 @@ The macOS/Linux slice is end-to-end: `pyrex/tests/cpyext_smoke.rs` imports a
 single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 `pyrex/tests/cpyext_types.rs` one defining types, all compiled from C against
 the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
-`pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs` and
-`pyrex/tests/cpyext_str.rs` take their expectations from CPython 3.14.6 running
-the same script against the same fixture.
+`pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
+`pyrex/tests/cpyext_str.rs` and `pyrex/tests/cpyext_exceptions.rs` take their
+expectations from CPython 3.14.6 running the same script against the same
+fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -130,7 +131,45 @@ the same script against the same fixture.
 - the C exception indicator (`cpyext/pyerrors.rs`): 37 `PyExc_*` class mirrors
   and `PyErr_SetString` / `SetObject` / `SetNone` / `Occurred` / `Clear` /
   `Fetch` / `Restore` / `ExceptionMatches` / `NoMemory` / `BadArgument` /
-  `BadInternalCall`, plus the `PyErr_Format` half the header cannot do;
+  `BadInternalCall`, plus the `PyErr_Format` half the header cannot do. The
+  indicator is one normalized instance, so `PyErr_GetRaisedException` is that
+  slot detached and `PyErr_SetRaisedException` is it replaced, both moving the
+  reference rather than counting a new one, and the `Fetch` triple's three
+  slots are all derived from it -- the class it is of, itself, and its
+  `__traceback__`. `Restore` writes the traceback back onto the instance, which
+  is what makes the pair lossless for a caller that saves the triple across
+  work of its own. The three `Set*` spellings chain: an exception raised while
+  another is being handled records the handled one as its `__context__`, as
+  `_PyErr_SetObject` does, so the C caller's error does not hide it; `Restore`
+  does not, the exception it is handed being an older one rather than a new
+  raise;
+- the *handled* exception beside it: `PyErr_GetHandledException` /
+  `SetHandledException` and the triple spelling `PyErr_GetExcInfo` /
+  `SetExcInfo`. The read walks the suspended generators' saved slots, so it
+  answers the topmost handler's exception, while the write reaches the current
+  execution context's own -- inside a generator those are different slots, as
+  they are upstream. Only the value is ever stored: a later `GetExcInfo`
+  derives the class and the traceback from it again, so whatever was passed as
+  either is released and nothing more. `SetHandledException` borrows where
+  every other setter in the family steals, and the empty state is the
+  asymmetric one -- the class and traceback slots receive `None` while the
+  value slot receives NULL, which is what tells it apart from `sys.exc_info()`;
+- `PyErr_SetImportError` and `PyErr_SetImportErrorSubclass`, which build the
+  instance by calling the class as `class(message, name=..., path=...,
+  name_from=...)`. A subclass whose `__init__` does not take those three
+  keywords therefore refuses, and one whose constructor raises leaves its own
+  exception standing instead. Both always answer NULL, which is the convention
+  `return PyErr_SetImportError(...)` relies on;
+- the exception instance's own slots (`cpyext/exception.rs`):
+  `PyException_GetTraceback` / `SetTraceback` / `GetCause` / `SetCause` /
+  `GetContext` / `SetContext` / `GetArgs` / `SetArgs`, and the classification
+  spellings `PyExceptionClass_Check` / `PyExceptionInstance_Check` /
+  `PyExceptionClass_Name`. `SetCause` and `SetContext` write the typed slot
+  directly rather than through `setattr`, because the attribute setters refuse
+  anything that is not `None` or a `BaseException` instance and these entry
+  points check nothing; `SetTraceback` does go through `setattr`, that slot
+  being type-checked in C too. `PyExceptionInstance_Class` stays the macro it
+  is upstream;
 - the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
   `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
   `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
@@ -305,6 +344,21 @@ Known divergences, each documented at its definition:
   one, because freeing a block clears that header;
 - `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
   leaving them NULL as CPython does;
+- `PyErr_SetRaisedException` and `PyErr_SetHandledException` refuse an object
+  that is not an exception instance, with the `SystemError` `_PyErr_SetObject`
+  uses for the same mistake. CPython checks neither, and a foreign object
+  reaching its unwinder is a garbage read at the exception layout's offsets --
+  measured as a spurious `SystemError` for an `int` and a segfault for a `str`
+  -- so there is no behaviour there to match;
+- `PyException_SetArgs` stores the items of its argument as `descr_setargs`
+  does, so a non-tuple sequence reads back as the tuple of its items where
+  CPython stores it verbatim: `args` is a typed slot here rather than a field
+  holding whatever was last written to it;
+- `PyErr_SetHandledException` takes no reference of its own, the handled slot
+  being a collector root rather than a counted reference. A caller that
+  releases the reference it handed over -- which the borrowing contract asks
+  for -- still finds the slot valid, but the refcount it can read has not
+  moved;
 - a type is built on a single base, so a `PyType_Spec` naming more than one is
   rejected rather than silently losing the rest, and `PyType_FromMetaclass`
   accepts only `type` for its metaclass: pyre builds a type through its own
@@ -349,15 +403,17 @@ Known divergences, each documented at its definition:
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 749 public
+   pyre does not take; and the remaining generated API. Of the 747 public
    `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 342 are present, counting every form `Python.h` offers one
+   underscore -- 407 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like
    aliases on the other; on the same header the corrected count is 293, so
-   this figure moved by 49.) The figure counts only that population, so the
+   this figure moved by 49. The 749/342 recorded after that was measured
+   before the four slices below it.) The figure counts only that population,
+   so the
    private `_PyLong_*ByteArray` pair and the unchecked accessor macros the
    extensions below need do not appear in it;
 6. Windows API DLL/import-library packaging.
@@ -420,6 +476,7 @@ package itself.
 - `pypy/module/cpyext/methodobject.py`: the `PyCFunction` carrier and its
   calling conventions.
 - `pypy/module/cpyext/pyerrors.py`: the `PyErr_*` entry points.
+- `pypy/module/cpyext/exception.py`: the `PyException_*` slot accessors.
 - `pypy/module/cpyext/typeobject.py`: `PyType_Ready`, slot inheritance and the
   descriptors built from `tp_methods` / `tp_members` / `tp_getset`.
 - `pypy/module/cpyext/slotdefs.py`: the wrappers that turn a C slot into an
