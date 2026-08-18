@@ -774,9 +774,11 @@ pub unsafe fn isinstance_dict_w(obj: PyObjectRef) -> bool {
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
 /// tuple — that one is followed by re-entering the loop.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:128): the `__bases__` walk is a loop, so
-/// `look_inside_graph` drops the graph from the candidate set and mints
-/// no jitcode for it; every call then stays an opaque residual.
+/// `@jit.unroll_safe` (abstractinst.py:128): the `__bases__` walk is a loop, and
+/// `look_inside_graph` (policy.py:61) rejects a loop-bearing graph. The hint
+/// clears `contains_loop` before that test, so the graph stays in the candidate
+/// set, mints a jitcode, and the walker unrolls the walk instead of leaving the
+/// call an opaque residual.
 #[majit_macros::unroll_safe]
 pub(crate) fn p_abstract_issubclass_w(
     w_derived: PyObjectRef,
@@ -843,9 +845,11 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:87): the tuple/union classinfo walk is a loop, so
-/// `look_inside_graph` drops the graph from the candidate set and mints
-/// no jitcode for it; every call then stays an opaque residual.
+/// `@jit.unroll_safe` (abstractinst.py:87): the tuple/union classinfo walk is a
+/// loop, and `look_inside_graph` (policy.py:61) rejects a loop-bearing graph.
+/// The hint clears `contains_loop` before that test, so the graph stays in the
+/// candidate set, mints a jitcode, and the walker unrolls the walk instead of
+/// leaving the call an opaque residual.
 #[majit_macros::unroll_safe]
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
@@ -909,11 +913,12 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // before the typedef row ever gets a chance to fire. Going
         // through `lookup_in_type` on `type(classinfo)` keeps the
         // proxy's typedef wrapper installed via `proxy_typedef_dict`
-        // visible. For real type objects pyre's `type` does not yet
-        // install an `__instancecheck__` slot, so this falls through
-        // to `p_recursive_isinstance_w` below — semantics-equivalent to
-        // PyPy's `type.__instancecheck__` slot calling back into
-        // `p_recursive_isinstance_type_w`.
+        // visible. For a real type object the metaclass is `type`, which
+        // carries an `__instancecheck__` slot, so an ordinary `isinstance(x,
+        // C)` takes the descriptor call here rather than the
+        // `p_recursive_isinstance_w` fall-through below; that slot is the one
+        // that calls back into `p_recursive_isinstance_type_w`, so the two
+        // paths agree.
         if let Some(cls_type) = crate::typedef::r#type(classinfo)
             && let Some(check) = lookup_in_type(cls_type.as_ptr(), "__instancecheck__")
         {
@@ -932,9 +937,11 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
 ///
-/// `@jit.unroll_safe` (abstractinst.py:164): the tuple/union classinfo walk is a loop, so
-/// `look_inside_graph` drops the graph from the candidate set and mints
-/// no jitcode for it; every call then stays an opaque residual.
+/// `@jit.unroll_safe` (abstractinst.py:164): the tuple/union classinfo walk is a
+/// loop, and `look_inside_graph` (policy.py:61) rejects a loop-bearing graph.
+/// The hint clears `contains_loop` before that test, so the graph stays in the
+/// candidate set, mints a jitcode, and the walker unrolls the walk instead of
+/// leaving the call an opaque residual.
 #[majit_macros::unroll_safe]
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
