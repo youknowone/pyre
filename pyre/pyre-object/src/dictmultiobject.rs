@@ -3117,6 +3117,28 @@ pub unsafe fn w_dict_setdefault_checked(
 
 /// `dictmultiobject.py:624-634 DictStrategy.pop` (base) +
 /// `:783-787 EmptyDictStrategy.pop` +
+/// Whether popping `key` moves the dictionary to the object strategy first —
+/// the third arm of `AbstractTypedStrategy.pop`
+/// (`dictmultiobject.py:1136-1138`), and the one that hashes the key.
+///
+/// # Safety
+/// `key` must be a valid PyObjectRef.
+unsafe fn pop_switches_to_object_strategy(
+    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
+    key: PyObjectRef,
+) -> bool {
+    if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
+        return !crate::is_bytes(key) && !_never_equal_to_string(key);
+    }
+    if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
+        return !crate::is_exact_type(key, &crate::STR_TYPE) && !_never_equal_to_string(key);
+    }
+    if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
+        return !crate::listobject::is_plain_int1(key) && !_never_equal_to_int(key);
+    }
+    false
+}
+
 /// `:1123-1138 AbstractTypedStrategy.pop` — strategy-dispatched pop.
 ///
 /// `EmptyDictStrategy.pop` does NOT hash the key
@@ -3141,7 +3163,23 @@ pub unsafe fn w_dict_pop_checked(
             None => Ok(None),
         }
     } else {
-        let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+        let mut strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+        // `AbstractTypedStrategy.pop` (`dictmultiobject.py:1132-1138`): a key
+        // of the wrong type that could still compare equal moves the
+        // dictionary to the object strategy and pops there, and that pop is
+        // what hashes the key.  The typed strategies reach the same place
+        // through their own `getitem`, which goes by way of the infallible
+        // lookup and so swallows the hash error a caller of this is asking
+        // for; making the move here keeps it.
+        let _roots = crate::gc_roots::push_roots();
+        let (mut obj, mut key) = (obj, key);
+        if pop_switches_to_object_strategy(strategy, key) {
+            let obj_slot = crate::gc_roots::pin_roots(&[obj, key]);
+            strategy.switch_to_object_strategy(obj);
+            obj = crate::gc_roots::shadow_stack_get(obj_slot);
+            key = crate::gc_roots::shadow_stack_get(obj_slot + 1);
+            strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+        }
         if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
             // `AbstractTypedStrategy.pop` (`dictmultiobject.py:1123`) performs
             // one r_dict lookup followed by removal.  Run that probe
