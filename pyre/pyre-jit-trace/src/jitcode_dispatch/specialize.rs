@@ -8322,12 +8322,16 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 ///
 /// `getframe` is `@jit.look_inside_iff(lambda space, depth:
 /// jit.isconstant(depth))` (`pypy/module/sys/vm.py:41`), so a constant depth is
-/// traced THROUGH: `ec.gettopframe_nohidden()` is a vref read that
-/// `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
-/// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`, the
-/// `depth == 0` test folds away, and `mark_as_escaped` is one `setfield_gc`.
-/// No call and no virtualizable force anywhere — pypy3 reports `forcings: 0`
-/// and `abort: vable escape: 0` on the fixtures where pyre loses the loop.
+/// traced THROUGH: at the portal, `ec.gettopframe_nohidden()` is a vref read
+/// that `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
+/// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`; in an
+/// inline MIFrame its live `JitVirtualRef` is known non-standard and follows
+/// the residual `jit_force_virtual` path, which `virtualize.py` removes after
+/// `vrefs_after_residual_call` publishes the forced pair.  The `depth == 0`
+/// test folds away, and `mark_as_escaped` is one `setfield_gc`.
+/// No call survives optimization and no virtualizable is forced — pypy3
+/// reports `forcings: 0` and `abort: vable escape: 0` on the fixtures where
+/// pyre loses the loop.
 ///
 /// Pyre residualizes the same walk as one opaque `bh_call_fn(_getframe,
 /// PY_NULL, depth)` `CallMayForce`, and [`pyre_interpreter::module::sys::vm::getframe`]'s

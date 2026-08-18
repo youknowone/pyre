@@ -4322,6 +4322,43 @@ pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         .heapcache_setfield_cached(callee_frame, last_instr_idx, last_instr);
 }
 
+pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
+        return;
+    };
+    let frame_reg = pjc.metadata.portal_frame_reg as usize;
+    let callee_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    // The walker is the recording-time interpreter.  Keep the concrete
+    // MIFrame in step with the emitted store just as
+    // `fbw_publish_exit_last_instr` does for the portal frame; otherwise a
+    // residual observer during this walk records the constructor's `-1`
+    // sentinel and bakes that answer into the compiled trace.  Inline frames
+    // are owned by this walk (and may already have escaped), so this is the
+    // authentic per-opcode PyFrame transition, not a speculative write to the
+    // portal frame that must be rolled back for replay.
+    if let Some(ConcreteValue::Ref(frame_ptr)) = ctx.concrete_registers_r.get(frame_reg).copied() {
+        if !frame_ptr.is_null() {
+            unsafe {
+                (*(frame_ptr as *mut pyre_interpreter::PyFrame)).last_instr = callee_py_pc as isize;
+            }
+        }
+    }
+}
+
+pub(super) fn record_and_publish_inline_callee_last_instr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    maybe_record_inline_callee_last_instr(ctx, jit_pc);
+    maybe_publish_inline_callee_last_instr_concrete(ctx, jit_pc);
+}
+
 pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
