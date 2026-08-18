@@ -1907,6 +1907,19 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
     )
 });
 
+/// The `[capacity][items…]` header shared by every list/tuple backing block.
+///
+/// The `0` type id is load-bearing, not a slot waiting to be filled:
+/// `items_block_capacity_descr()` is the capacity read for all three list
+/// strategies, and their blocks carry three different runtime tids
+/// (`GC_INT_ARRAY_GC_TYPE_ID`, `GC_FLOAT_ARRAY_GC_TYPE_ID`,
+/// `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three arms of
+/// `helpers::emit_promote_empty_list_inline`). One descr fronting three tids
+/// can name none of them, so `StructPtrInfo::make_guards` (`optimizeopt/info.rs`)
+/// declines the short-preamble entry rather than pin a layout that holds for
+/// one strategy and not the other two; `unroll_free_retry_rescued` counts the
+/// unrolled attempt that costs. Stamping any single tid here makes the guard
+/// false for the other two block kinds.
 static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,

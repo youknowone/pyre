@@ -4427,6 +4427,18 @@ fn vable_arraydescrof(
         base_size: crate::layout::target_word_size(),
         itemsize,
         len_offset: Some(0),
+        // No layout identity, and neither zero is a placeholder to fill in.
+        // `PyFrame.locals_cells_stack_w` is reached through two allocators —
+        // `alloc_frame_locals_array`'s GC arm stamps the object-array tid into
+        // the header, its `alloc_fixed_array_with_header` arm (taken for a
+        // frame the collector does not own, and as the GC arm's own
+        // out-of-memory fallback) leaves the prepended header zeroed — so one
+        // tid cannot describe every block a trace will meet. Stamping either
+        // slot would put a `GUARD_GC_TYPE` on the short-preamble entry that is
+        // false for the other arm's blocks. `ArrayPtrInfo::make_guards`
+        // (`optimizeopt/info.rs`) instead refuses to build the entry, which
+        // costs the one unrolled attempt `unroll_free_retry_rescued` counts and
+        // keeps the guard honest.
         type_id: 0,
         gc_type_id: 0,
         item_type,
