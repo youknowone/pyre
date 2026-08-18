@@ -1396,6 +1396,7 @@ pub unsafe fn fset_func_qualname(
             ));
         }
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WQualname);
         (*(obj as *mut Function)).w_qualname = value;
         Ok(())
     }
@@ -1500,6 +1501,7 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
         let w_qualname = pyre_object::w_str_new(function_get_name(obj));
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WQualname);
         (*(obj as *mut Function)).w_qualname = w_qualname;
         w_qualname
     }
@@ -1518,6 +1520,7 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WQualname);
         (*(obj as *mut Function)).w_qualname = value;
     }
 }
@@ -1608,6 +1611,7 @@ pub unsafe fn function_get_closure(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::Closure);
         (*(obj as *mut Function)).closure = closure;
     }
 }
@@ -1629,6 +1633,7 @@ pub unsafe fn function_get_defaults(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::DefsW);
         (*(obj as *mut Function)).defs_w = defaults;
     }
 }
@@ -1650,6 +1655,7 @@ pub unsafe fn function_get_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WKwDefs);
         (*(obj as *mut Function)).w_kw_defs = kwdefaults;
     }
 }
@@ -2224,6 +2230,7 @@ pub unsafe fn function_get_func_code(obj: PyObjectRef) -> *const () {
 pub unsafe fn function_set_func_code(obj: PyObjectRef, code: *const ()) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::Code);
         (*(obj as *mut Function)).code = code;
     }
 }
@@ -2284,6 +2291,7 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         } else {
             pyre_object::lltype::malloc_raw(raw_name) as *const String
         };
+        function_notify_quasi_immut(obj, QuasiImmutSlot::Name);
         (*(obj as *mut Function)).name = raw_name;
     }
 }
@@ -2332,6 +2340,7 @@ pub unsafe fn fget_func_objclass(obj: PyObjectRef) -> Result<PyObjectRef, crate:
 pub unsafe fn function_set_objclass(obj: PyObjectRef, w_type: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WObjclass);
         (*(obj as *mut Function)).w_objclass = w_type;
     }
 }
@@ -2380,6 +2389,7 @@ pub unsafe fn fget_func_text_signature(obj: PyObjectRef) -> Result<PyObjectRef, 
 pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
+        function_notify_quasi_immut(obj, QuasiImmutSlot::WTextSignature);
         (*(obj as *mut Function)).w_text_signature = value;
     }
 }
