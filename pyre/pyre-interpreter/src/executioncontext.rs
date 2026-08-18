@@ -2648,6 +2648,13 @@ impl UserDelAction {
         if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()
             || pyre_object::generator::AsyncGenAThrow::from_obj(current()).is_some()
         {
+            // executioncontext.py:651-661 — a finalizer that would call a
+            // user-defined app-level function defers under `gc.disable()`.
+            // This one emits a RuntimeWarning, so it reaches the overridable
+            // `warnings` machinery, exactly like the generator branch below.
+            if self.gc_disabled(current()) {
+                return;
+            }
             crate::baseobjspace::async_gen_awaitable_finalize(current());
             return;
         }

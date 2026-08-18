@@ -216,7 +216,13 @@ pub fn decode_instruction_for_dispatch(
             decode_instruction_at(code, opcode_pc).ok_or(crate::pycode::BytecodeCorruption)?;
         instruction = decoded.0;
         op_arg = decoded.1;
-        if !matches!(instruction, Instruction::ExtendedArg) && u8::from(instruction) < 44 {
+        // `Reserved` is excluded for the same reason the forward decoder
+        // excludes it: an unknown opcode byte is preserved here so dispatch
+        // reaches it and reports `SystemError: unknown opcode N`.
+        if !matches!(instruction, Instruction::ExtendedArg)
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
             return Err(crate::pycode::BytecodeCorruption);
         }
     }
