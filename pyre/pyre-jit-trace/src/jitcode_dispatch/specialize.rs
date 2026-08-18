@@ -11707,6 +11707,15 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Resolve the EC while declining is still free, for the `__context__` tail
+    // below.  `walker_ensure_execution_context` returns `None` on a null
+    // snapshot sym or a frameless walk, and its recovery records a
+    // `GETFIELD_GC_R` that must not land after a guard referencing it
+    // (`try_walker_trace_raise_bare_class` resolves it at the same boundary).
+    let Some(ec) = walker_ensure_execution_context(ctx) else {
+        return Ok(None);
+    };
+
     // --- commit: pin the receiver, run the authentic raise, emit inline ---
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
@@ -11817,6 +11826,35 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         .class_now_known(new_op, exc_type_ptr as usize as i64);
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
+
+    // `__context__` chaining on the still-virtual exception, the tail
+    // `try_walker_trace_raise_bare_class` carries: `active = GETFIELD_GC_R(ec,
+    // sys_exc_value)` then `SETFIELD_GC(exc, active, w_context)`.  Without it
+    // the catch-side `record_inline_exception_context` compensation finds the
+    // context unchained and passes this exception to the resolver call, which
+    // forces the very allocation this fold exists to keep virtual.
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
+    fbw_context_chained_insert(new_op);
+    // Apply the same context write to the concrete exception, which the
+    // registration above stops the compensation from performing, so Python
+    // code reached later in this authoritative walk observes the
+    // `__context__` the recorded SETFIELD performs on compiled iterations.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+
     // Inline-built marker: the downstream raise routing records the frame
     // node via the virtual `record_fresh_application_traceback` instead of
     // the forcing runtime hook (mirrors `try_walker_trace_raise_bare_class`).
