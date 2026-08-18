@@ -285,6 +285,128 @@ const fn immortal_type() -> CPyTypeObject {
 /// never entered in the census.
 pub static mut CPY_MODULE_DEF_TYPE: CPyTypeObject = immortal_type();
 
+// ── the static type mirrors ─────────────────────────────────────────────
+
+/// The `PyTypeObject` statics an extension names by address.
+///
+/// `api.py:746-790 build_exported_objects` registers the same family: C spells
+/// `&PyList_Type`, so each one has to be storage whose address is fixed at link
+/// time and whose body the runtime fills in place, which is what a
+/// [`PyAPI_DATA`] object is and what a mirror allocated on demand can never be.
+/// A name whose type this build does not have stays unbound -- its `tp_name` is
+/// then NULL, which is the state `PyType_Ready` would have left it in.
+macro_rules! type_mirrors {
+    ($($symbol:ident => $resolve:expr,)*) => {
+        $(
+            /// The mirror of the like-named builtin type.
+            #[unsafe(no_mangle)]
+            pub static mut $symbol: CPyTypeObject = immortal_type();
+        )*
+
+        /// Bind every static type mirror to the interpreter type it stands for.
+        ///
+        /// Called before the first `PyInit_*`, so a type reached through
+        /// `make_ref` finds the static already entered and hands out its
+        /// address rather than synthesizing a second block for the same type.
+        pub fn init_type_mirrors() {
+            let bound: &[(*mut CPyTypeObject, PyObjectRef)] = &[
+                $( (&raw mut $symbol, $resolve), )*
+            ];
+            for &(mirror, w_type) in bound {
+                let header = unsafe { &raw mut (*mirror).ob_base.ob_base };
+                if w_type.is_null() || unsafe { !(*header).ob_pyre_link.is_null() } {
+                    continue;
+                }
+                pyobject::attach_foreign(w_type, header);
+                describe_interpreter_type(mirror, w_type);
+            }
+            // Deferred until every link above is in the table: a metatype is
+            // itself one of these statics, and resolving it earlier would
+            // synthesize a block for a type that is about to be bound here.
+            for &(mirror, _) in bound {
+                let header = unsafe { &raw mut (*mirror).ob_base.ob_base };
+                let w_type = unsafe { (*header).ob_pyre_link };
+                if w_type.is_null() || unsafe { !(*header).ob_type.is_null() } {
+                    continue;
+                }
+                let of_type = pyobject::type_mirror(w_type);
+                unsafe { pyobject::set_ob_type(header, of_type) };
+            }
+        }
+
+        fn ensure_type_mirrors_linked() {
+            $( std::hint::black_box(&raw const $symbol); )*
+        }
+    };
+}
+
+type_mirrors! {
+    // The object model.
+    PyType_Type => crate::typedef::w_type(),
+    PyBaseObject_Type => crate::typedef::w_object(),
+    PySuper_Type => builtin_type(&pyre_object::descriptor::SUPER_TYPE),
+    // The built-in data types.
+    PyBool_Type => builtin_type(&pyre_object::pyobject::BOOL_TYPE),
+    PyByteArray_Type => builtin_type(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+    PyBytes_Type => builtin_type(&pyre_object::bytesobject::BYTES_TYPE),
+    PyComplex_Type => builtin_type(&pyre_object::pyobject::COMPLEX_TYPE),
+    PyDict_Type => builtin_type(&pyre_object::pyobject::DICT_TYPE),
+    PyEllipsis_Type => builtin_type(&pyre_object::pyobject::ELLIPSIS_TYPE),
+    PyFloat_Type => builtin_type(&pyre_object::pyobject::FLOAT_TYPE),
+    PyFrozenSet_Type => builtin_type(&pyre_object::setobject::FROZENSET_TYPE),
+    PyList_Type => builtin_type(&pyre_object::pyobject::LIST_TYPE),
+    PyLong_Type => builtin_type(&pyre_object::pyobject::INT_TYPE),
+    PyMemoryView_Type => builtin_type(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+    PyModule_Type => builtin_type(&pyre_object::pyobject::MODULE_TYPE),
+    PySet_Type => builtin_type(&pyre_object::setobject::SET_TYPE),
+    PySlice_Type => builtin_type(&pyre_object::sliceobject::SLICE_TYPE),
+    PyTuple_Type => builtin_type(&pyre_object::pyobject::TUPLE_TYPE),
+    PyUnicode_Type => builtin_type(&pyre_object::pyobject::STR_TYPE),
+    Py_GenericAliasType => builtin_type(&pyre_object::_pypy_generic_alias::GENERIC_ALIAS_TYPE),
+    // The dict views.
+    PyDictProxy_Type => builtin_type(&pyre_object::pyobject::MAPPING_PROXY_TYPE),
+    PyDictItems_Type => builtin_type(&pyre_object::dictmultiobject::DICT_ITEMS_TYPE),
+    PyDictKeys_Type => builtin_type(&pyre_object::dictmultiobject::DICT_KEYS_TYPE),
+    PyDictValues_Type => builtin_type(&pyre_object::dictmultiobject::DICT_VALUES_TYPE),
+    // Functions, methods and descriptors.  `PyCFunction_Type` is absent: a
+    // method an extension defines carries `methodobject`'s own
+    // `builtin_function_or_method`, not the interpreter's, so one symbol
+    // cannot name the type of both it and `len`.
+    PyClassMethodDescr_Type => builtin_type(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
+    PyClassMethod_Type => builtin_type(&pyre_object::function::CLASSMETHOD_TYPE),
+    PyFunction_Type => builtin_type(&crate::function::FUNCTION_TYPE),
+    PyGetSetDescr_Type => builtin_type(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE),
+    PyMemberDescr_Type => builtin_type(&pyre_object::typedef::MEMBER_TYPE),
+    PyMethodDescr_Type => builtin_type(&crate::function::METHOD_DESCRIPTOR_TYPE),
+    PyMethod_Type => builtin_type(&pyre_object::function::METHOD_TYPE),
+    PyProperty_Type => builtin_type(&pyre_object::descriptor::PROPERTY_TYPE),
+    PyStaticMethod_Type => builtin_type(&pyre_object::function::STATICMETHOD_TYPE),
+    PyWrapperDescr_Type => builtin_type(&crate::function::SLOT_WRAPPER_TYPE),
+    // The built-ins that are types.
+    PyEnum_Type => builtin_type(&pyre_object::functional::ENUMERATE_TYPE),
+    PyFilter_Type => builtin_type(&pyre_object::functional::FILTER_TYPE),
+    PyMap_Type => builtin_type(&pyre_object::functional::MAP_TYPE),
+    PyRange_Type => builtin_type(&pyre_object::functional::RANGE_TYPE),
+    PyReversed_Type => builtin_type(&pyre_object::functional::REVERSED_TYPE),
+    PyZip_Type => builtin_type(&pyre_object::functional::ZIP_TYPE),
+    // Frames, code and the objects a call leaves behind.
+    PyAsyncGen_Type => builtin_type(&pyre_object::generator::ASYNC_GENERATOR_TYPE),
+    PyCell_Type => builtin_type(&pyre_object::nestedscope::CELL_TYPE),
+    PyCode_Type => builtin_type(&crate::pycode::CODE_TYPE),
+    PyCoro_Type => builtin_type(&pyre_object::generator::COROUTINE_TYPE),
+    PyFrame_Type => builtin_type(&crate::pyframe::FRAME_TYPE),
+    PyGen_Type => builtin_type(&pyre_object::generator::GENERATOR_TYPE),
+    PyTraceBack_Type => builtin_type(&crate::pytraceback::PYTRACEBACK_TYPE),
+    _PyAsyncGenASend_Type => builtin_type(&pyre_object::generator::ASYNC_GEN_ASEND_TYPE),
+    _PyWeakref_RefType => builtin_type(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE),
+}
+
+/// The interpreter type object a layout static describes, or null when this
+/// build has not built it yet.
+fn builtin_type(layout: &'static pyre_object::pyobject::PyType) -> PyObjectRef {
+    crate::typedef::gettypeobject(layout)
+}
+
 /// The name a synthesized mirror hands out as `tp_name`.
 ///
 /// `tp_name` is a `const char *` an extension may keep for as long as it holds
@@ -3554,6 +3676,7 @@ fn new_exception(
 
 pub(super) fn ensure_linked() {
     std::hint::black_box(&raw const CPY_MODULE_DEF_TYPE);
+    ensure_type_mirrors_linked();
     std::hint::black_box(PyObject_Free as *const ());
     std::hint::black_box(PyObject_Del as *const ());
     std::hint::black_box(PyType_Ready as *const ());

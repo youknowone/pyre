@@ -23,6 +23,7 @@ struct _object {
 #define PyObject_HEAD_INIT(type) { 0, 0, type },
 #define Py_REFCNT(ob) (((PyObject *)(ob))->ob_refcnt)
 #define Py_TYPE(ob) (((PyObject *)(ob))->ob_type)
+#define Py_IS_TYPE(ob, type) (Py_TYPE(ob) == (type))
 
 /* The reference-counting macros are in `refcount.h`, which `Python.h` includes
    after the declarations they expand to. */
@@ -303,6 +304,66 @@ struct PyType_Spec {
 
 #define PyObject_TypeCheck(ob, type) \
     (Py_TYPE(ob) == (type) || PyType_IsSubtype(Py_TYPE(ob), (type)))
+
+/* The built-in types, as storage rather than as a pointer: C names them by
+   address (`&PyList_Type`, `tp_base = &PyDict_Type`, `PyObject_TypeCheck(x,
+   &PyType_Type)`), so each is a block the runtime binds to its interpreter
+   type before the first `PyInit_*` runs.  A name this build has no type for
+   keeps a NULL `tp_name`. */
+PyAPI_DATA(PyTypeObject) PyType_Type;
+PyAPI_DATA(PyTypeObject) PyBaseObject_Type;
+PyAPI_DATA(PyTypeObject) PySuper_Type;
+/* The data types. */
+PyAPI_DATA(PyTypeObject) PyBool_Type;
+PyAPI_DATA(PyTypeObject) PyByteArray_Type;
+PyAPI_DATA(PyTypeObject) PyBytes_Type;
+PyAPI_DATA(PyTypeObject) PyComplex_Type;
+PyAPI_DATA(PyTypeObject) PyDict_Type;
+PyAPI_DATA(PyTypeObject) PyEllipsis_Type;
+PyAPI_DATA(PyTypeObject) PyFloat_Type;
+PyAPI_DATA(PyTypeObject) PyFrozenSet_Type;
+PyAPI_DATA(PyTypeObject) PyList_Type;
+PyAPI_DATA(PyTypeObject) PyLong_Type;
+PyAPI_DATA(PyTypeObject) PyMemoryView_Type;
+PyAPI_DATA(PyTypeObject) PyModule_Type;
+PyAPI_DATA(PyTypeObject) PySet_Type;
+PyAPI_DATA(PyTypeObject) PySlice_Type;
+PyAPI_DATA(PyTypeObject) PyTuple_Type;
+PyAPI_DATA(PyTypeObject) PyUnicode_Type;
+PyAPI_DATA(PyTypeObject) Py_GenericAliasType;
+/* The dict views. */
+PyAPI_DATA(PyTypeObject) PyDictProxy_Type;
+PyAPI_DATA(PyTypeObject) PyDictItems_Type;
+PyAPI_DATA(PyTypeObject) PyDictKeys_Type;
+PyAPI_DATA(PyTypeObject) PyDictValues_Type;
+/* Functions, methods and descriptors. */
+PyAPI_DATA(PyTypeObject) PyClassMethodDescr_Type;
+PyAPI_DATA(PyTypeObject) PyClassMethod_Type;
+PyAPI_DATA(PyTypeObject) PyFunction_Type;
+PyAPI_DATA(PyTypeObject) PyGetSetDescr_Type;
+PyAPI_DATA(PyTypeObject) PyMemberDescr_Type;
+PyAPI_DATA(PyTypeObject) PyMethodDescr_Type;
+PyAPI_DATA(PyTypeObject) PyMethod_Type;
+PyAPI_DATA(PyTypeObject) PyProperty_Type;
+PyAPI_DATA(PyTypeObject) PyStaticMethod_Type;
+PyAPI_DATA(PyTypeObject) PyWrapperDescr_Type;
+/* The built-ins that are types. */
+PyAPI_DATA(PyTypeObject) PyEnum_Type;
+PyAPI_DATA(PyTypeObject) PyFilter_Type;
+PyAPI_DATA(PyTypeObject) PyMap_Type;
+PyAPI_DATA(PyTypeObject) PyRange_Type;
+PyAPI_DATA(PyTypeObject) PyReversed_Type;
+PyAPI_DATA(PyTypeObject) PyZip_Type;
+/* Frames, code and what a call leaves behind. */
+PyAPI_DATA(PyTypeObject) PyAsyncGen_Type;
+PyAPI_DATA(PyTypeObject) PyCell_Type;
+PyAPI_DATA(PyTypeObject) PyCode_Type;
+PyAPI_DATA(PyTypeObject) PyCoro_Type;
+PyAPI_DATA(PyTypeObject) PyFrame_Type;
+PyAPI_DATA(PyTypeObject) PyGen_Type;
+PyAPI_DATA(PyTypeObject) PyTraceBack_Type;
+PyAPI_DATA(PyTypeObject) _PyAsyncGenASend_Type;
+PyAPI_DATA(PyTypeObject) _PyWeakref_RefType;
 /* Objects. */
 
 /* The `object.__getattribute__` / `__setattr__` / `__dict__` terminals, which

@@ -235,13 +235,16 @@ static inline int _PyPyre_ArgConvert(PyObject *arg, const char **format,
     case 'O': {
         if (**format == '!') {
             (*format)++;
-            PyObject *expected = (PyObject *)va_arg(*va, PyTypeObject *);
-            int matched = PyObject_IsInstance(arg, expected);
-            if (matched < 0) {
-                return 0;
-            }
-            if (!matched) {
-                _PyPyre_ArgError(fname, "argument has the wrong type");
+            PyTypeObject *expected = va_arg(*va, PyTypeObject *);
+            /* The layout, not `isinstance`: the caller goes on to read the
+               object through the fields that type declares, so an object
+               whose `__class__` merely answers with it must be refused. */
+            if (!PyType_IsSubtype(Py_TYPE(arg), expected)) {
+                char buffer[128];
+                snprintf(buffer, sizeof(buffer), "argument must be %.50s, not %.50s",
+                         expected->tp_name,
+                         arg == Py_None ? "None" : Py_TYPE(arg)->tp_name);
+                _PyPyre_ArgError(fname, buffer);
                 return 0;
             }
             *va_arg(*va, PyObject **) = arg;

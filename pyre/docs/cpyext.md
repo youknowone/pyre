@@ -67,6 +67,21 @@ header. Both reach the extension as a call it compiles against, so both are
 checked; a header inline is the one an export cannot catch, because it is
 written by hand rather than generated.
 
+`check` also covers the exported **data** -- the `PyAPI_DATA` objects -- which
+no part of the generated half can see: nothing about one is a `PyAPI_FUNC`, and
+its Rust side is a `static` rather than a function. Each declared name is
+checked three ways: that a `cpyext` static actually defines it, that the two
+agree on its type, and that the type is the one CPython gives it. The first is
+the one that matters, because a declaration with nothing behind it fails at
+`dlopen` time in a loaded extension rather than at build time here. A static a
+table-driven macro declares is read out of the macro's own body and its
+invocation, the same way `pyrex/build.rs` reads them to export them.
+
+`_Py_TrueStruct` and `_Py_FalseStruct` are the recorded exceptions: CPython
+declares each as the `PyLongObject` its value is, and a mirror is a `PyObject`
+whatever it stands for. `Py_True` casts the address on both sides, so nothing
+an extension writes can see the difference.
+
 It compares ABI slots rather than spellings, resolving CPython's typedefs, so
 `Py_hash_t` and `Py_ssize_t` agree and `long` and `Py_ssize_t` do not. The
 recorded declarations live in `scripts/cpython-abi.txt` because CI has no
@@ -121,6 +136,17 @@ same fixture.
   whether a block holds a reference to its own type (`pyobject.py:91-93`,
   `object.py:72-73`) and whose storage the mirror is
   (`typeobject.py:716-722`);
+- the 49 builtin `PyTypeObject` statics an extension names by address
+  (`cpyext/typeobject.rs`): `PyList_Type`, `PyDict_Type`, `PyType_Type` and
+  their siblings, the same family `api.py:746-790 build_exported_objects`
+  registers. Each is storage whose address is fixed at link time and whose
+  body the runtime fills in place, because C spells `&PyList_Type` -- a mirror
+  allocated on demand can never be that. They are bound before the singletons:
+  binding a singleton resolves its own `ob_type`, and a type reached before
+  its static is entered would get a synthesized block instead, which is then
+  the block `Py_TYPE(Py_True)` answers with forever. The address being the one
+  the runtime hands out is what makes `Py_IS_TYPE(x, &PyList_Type)`,
+  `PyObject_TypeCheck`, the `O!` argument format and `Py_tp_base` work;
 - the two forms a mirror is handed out in before its interpreter object exists
   (`cpyext/unicodeobject.rs`, `cpyext/bytesobject.rs`): `PyUnicode_New(size,
   maxchar)` and `PyBytes_FromStringAndSize(NULL, size)` return an unlinked
@@ -205,7 +231,11 @@ same fixture.
   and the compat-mode `PyArg_Parse` over it, where the argument is the value
   itself rather than a tuple holding it and a format naming more than one unit
   is a `SystemError`. `PyOS_snprintf` and `PyOS_vsnprintf` are beside
-  `PyErr_Format` in the headers, being variadic for the same reason;
+  `PyErr_Format` in the headers, being variadic for the same reason. The `O!`
+  unit tests the layout -- `PyType_IsSubtype(Py_TYPE(arg), type)`, the way
+  `convertsimple` does -- rather than asking `isinstance`, since the caller
+  goes on to read the object through the fields that type declares and an
+  object whose `__class__` merely answers with it has none of them;
 - the `PyCFunction` carrier (`cpyext/methodobject.rs`) and the call bridge for
   `METH_NOARGS`, `METH_O`, `METH_VARARGS`, `METH_VARARGS | METH_KEYWORDS`,
   `METH_FASTCALL` and `METH_FASTCALL | METH_KEYWORDS`;
@@ -448,27 +478,30 @@ Known divergences, each documented at its definition:
    `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
    `tp_call`, which such a type is required to have
    (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 749 public
-   `PyAPI_FUNC` entry points CPython 3.14 declares in its top-level
+   pyre does not take; and the remaining generated API. Of the 746 public
+   `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
    underscore -- 434 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like
-   aliases on the other; on the same header the corrected count is 293, so
-   this figure moved by 49. The 749/342 recorded after that was measured
-   before the four slices below it, and the 747 after that was the same
-   census over the 3.14.6 headers -- 3.14.7 declares two more.) The figure
+   aliases on the other. The 749/434 recorded after that was read with a
+   census script of its own; the population is now read with
+   `cpyext-abi.py`'s own declaration reader, the same one the gate uses,
+   which finds three fewer declarations in the same headers.) The figure
    counts only that population, so the private `_PyLong_*ByteArray` pair and
    the unchecked accessor macros the extensions below need do not appear in
-   it. It also says nothing about the exported *data*, which is a separate
-   population and a separate gap: the `PyExc_*` class mirrors are complete,
-   but not one of the `PyAPI_DATA(PyTypeObject)` names is offered, so
-   `&PyList_Type` and its siblings do not link. Each would have to be a
-   statically allocated `PyTypeObject` the mirror synthesizer fills in place,
-   the way `_Py_NoneStruct` is for the singletons, since C takes its address
-   rather than reading a pointer;
+   it. The exported *data* is a separate population, counted and checked
+   separately (see below): 121 of the objects the header declares are
+   measured against CPython's own declaration for them;
 6. Windows API DLL/import-library packaging.
+
+`PyCFunction_Type` is the one `PyAPI_DATA(PyTypeObject)` name deliberately
+absent. A method an extension defines carries `cpyext/methodobject.rs`'s own
+`builtin_function_or_method`, which is a different type object from the one
+`len` carries, so a single symbol cannot name the type of both. Binding it
+either way would make `Py_IS_TYPE(op, &PyCFunction_Type)` answer wrongly for
+half the objects it is asked about.
 
 A type built from a spec carries the module it was created from and the
 `Py_tp_token` it declared, both in a side table keyed by the type's own

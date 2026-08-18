@@ -1,6 +1,6 @@
 # The declarations pyre's extension ABI is measured against.
 # Written by scripts/cpyext-abi.py snapshot; do not edit by hand.
-# source: CPython 3.14.7 Include/*.h and Include/cpython/*.h
+# source: CPython 3.14 Include/*.h and Include/cpython/*.h
 
 # [declarations]
 PyAIter_Check :: PyObject * -> int
@@ -1209,6 +1209,195 @@ pthread_mutex_trylock :: pthread_mutex_t * -> int
 pthread_mutex_unlock :: pthread_mutex_t * -> int
 pthread_self :: void -> pthread_t
 pthread_setspecific :: pthread_key_t, const void * -> int
+
+# [data]
+PY_TIMEOUT_MAX :: const long long
+PyAsyncGen_Type :: PyTypeObject
+PyBaseObject_Type :: PyTypeObject
+PyBool_Type :: PyTypeObject
+PyByteArrayIter_Type :: PyTypeObject
+PyByteArray_Type :: PyTypeObject
+PyBytesIter_Type :: PyTypeObject
+PyBytes_Type :: PyTypeObject
+PyCFunction_Type :: PyTypeObject
+PyCMethod_Type :: PyTypeObject
+PyCallIter_Type :: PyTypeObject
+PyCapsule_Type :: PyTypeObject
+PyCell_Type :: PyTypeObject
+PyClassMethodDescr_Type :: PyTypeObject
+PyClassMethod_Type :: PyTypeObject
+PyCode_Type :: PyTypeObject
+PyComplex_Type :: PyTypeObject
+PyContextToken_Type :: PyTypeObject
+PyContextVar_Type :: PyTypeObject
+PyContext_Type :: PyTypeObject
+PyCoro_Type :: PyTypeObject
+PyDictItems_Type :: PyTypeObject
+PyDictIterItem_Type :: PyTypeObject
+PyDictIterKey_Type :: PyTypeObject
+PyDictIterValue_Type :: PyTypeObject
+PyDictKeys_Type :: PyTypeObject
+PyDictProxy_Type :: PyTypeObject
+PyDictRevIterItem_Type :: PyTypeObject
+PyDictRevIterKey_Type :: PyTypeObject
+PyDictRevIterValue_Type :: PyTypeObject
+PyDictValues_Type :: PyTypeObject
+PyDict_Type :: PyTypeObject
+PyEllipsis_Type :: PyTypeObject
+PyEnum_Type :: PyTypeObject
+PyExc_ArithmeticError :: PyObject *
+PyExc_AssertionError :: PyObject *
+PyExc_AttributeError :: PyObject *
+PyExc_BaseException :: PyObject *
+PyExc_BaseExceptionGroup :: PyObject *
+PyExc_BlockingIOError :: PyObject *
+PyExc_BrokenPipeError :: PyObject *
+PyExc_BufferError :: PyObject *
+PyExc_BytesWarning :: PyObject *
+PyExc_ChildProcessError :: PyObject *
+PyExc_ConnectionAbortedError :: PyObject *
+PyExc_ConnectionError :: PyObject *
+PyExc_ConnectionRefusedError :: PyObject *
+PyExc_ConnectionResetError :: PyObject *
+PyExc_DeprecationWarning :: PyObject *
+PyExc_EOFError :: PyObject *
+PyExc_EncodingWarning :: PyObject *
+PyExc_EnvironmentError :: PyObject *
+PyExc_Exception :: PyObject *
+PyExc_FileExistsError :: PyObject *
+PyExc_FileNotFoundError :: PyObject *
+PyExc_FloatingPointError :: PyObject *
+PyExc_FutureWarning :: PyObject *
+PyExc_GeneratorExit :: PyObject *
+PyExc_IOError :: PyObject *
+PyExc_ImportError :: PyObject *
+PyExc_ImportWarning :: PyObject *
+PyExc_IndentationError :: PyObject *
+PyExc_IndexError :: PyObject *
+PyExc_InterruptedError :: PyObject *
+PyExc_IsADirectoryError :: PyObject *
+PyExc_KeyError :: PyObject *
+PyExc_KeyboardInterrupt :: PyObject *
+PyExc_LookupError :: PyObject *
+PyExc_MemoryError :: PyObject *
+PyExc_ModuleNotFoundError :: PyObject *
+PyExc_NameError :: PyObject *
+PyExc_NotADirectoryError :: PyObject *
+PyExc_NotImplementedError :: PyObject *
+PyExc_OSError :: PyObject *
+PyExc_OverflowError :: PyObject *
+PyExc_PendingDeprecationWarning :: PyObject *
+PyExc_PermissionError :: PyObject *
+PyExc_ProcessLookupError :: PyObject *
+PyExc_PythonFinalizationError :: PyObject *
+PyExc_RecursionError :: PyObject *
+PyExc_ReferenceError :: PyObject *
+PyExc_ResourceWarning :: PyObject *
+PyExc_RuntimeError :: PyObject *
+PyExc_RuntimeWarning :: PyObject *
+PyExc_StopAsyncIteration :: PyObject *
+PyExc_StopIteration :: PyObject *
+PyExc_SyntaxError :: PyObject *
+PyExc_SyntaxWarning :: PyObject *
+PyExc_SystemError :: PyObject *
+PyExc_SystemExit :: PyObject *
+PyExc_TabError :: PyObject *
+PyExc_TimeoutError :: PyObject *
+PyExc_TypeError :: PyObject *
+PyExc_UnboundLocalError :: PyObject *
+PyExc_UnicodeDecodeError :: PyObject *
+PyExc_UnicodeEncodeError :: PyObject *
+PyExc_UnicodeError :: PyObject *
+PyExc_UnicodeTranslateError :: PyObject *
+PyExc_UnicodeWarning :: PyObject *
+PyExc_UserWarning :: PyObject *
+PyExc_ValueError :: PyObject *
+PyExc_Warning :: PyObject *
+PyExc_WindowsError :: PyObject *
+PyExc_ZeroDivisionError :: PyObject *
+PyFilter_Type :: PyTypeObject
+PyFloat_Type :: PyTypeObject
+PyFrameLocalsProxy_Type :: PyTypeObject
+PyFrame_Type :: PyTypeObject
+PyFrozenSet_Type :: PyTypeObject
+PyFunction_Type :: PyTypeObject
+PyGen_Type :: PyTypeObject
+PyGetSetDescr_Type :: PyTypeObject
+PyImport_FrozenModules :: const struct _frozen *
+PyImport_Inittab :: struct _inittab *
+PyInstanceMethod_Type :: PyTypeObject
+PyListIter_Type :: PyTypeObject
+PyListRevIter_Type :: PyTypeObject
+PyList_Type :: PyTypeObject
+PyLongRangeIter_Type :: PyTypeObject
+PyLong_Type :: PyTypeObject
+PyMap_Type :: PyTypeObject
+PyMemberDescr_Type :: PyTypeObject
+PyMemoryView_Type :: PyTypeObject
+PyMethodDescr_Type :: PyTypeObject
+PyMethod_Type :: PyTypeObject
+PyModuleDef_Type :: PyTypeObject
+PyModule_Type :: PyTypeObject
+PyODictItems_Type :: PyTypeObject
+PyODictIter_Type :: PyTypeObject
+PyODictKeys_Type :: PyTypeObject
+PyODictValues_Type :: PyTypeObject
+PyODict_Type :: PyTypeObject
+PyPickleBuffer_Type :: PyTypeObject
+PyProperty_Type :: PyTypeObject
+PyRangeIter_Type :: PyTypeObject
+PyRange_Type :: PyTypeObject
+PyReversed_Type :: PyTypeObject
+PySeqIter_Type :: PyTypeObject
+PySetIter_Type :: PyTypeObject
+PySet_Type :: PyTypeObject
+PySlice_Type :: PyTypeObject
+PyStaticMethod_Type :: PyTypeObject
+PyStdPrinter_Type :: PyTypeObject
+PyStructSequence_UnnamedField :: const char *const
+PySuper_Type :: PyTypeObject
+PyTraceBack_Type :: PyTypeObject
+PyTupleIter_Type :: PyTypeObject
+PyTuple_Type :: PyTypeObject
+PyType_Type :: PyTypeObject
+PyUnicodeIter_Type :: PyTypeObject
+PyUnicode_Type :: PyTypeObject
+PyWrapperDescr_Type :: PyTypeObject
+PyZip_Type :: PyTypeObject
+Py_BytesWarningFlag :: int
+Py_DebugFlag :: int
+Py_DontWriteBytecodeFlag :: int
+Py_FileSystemDefaultEncodeErrors :: const char *
+Py_FileSystemDefaultEncoding :: const char *
+Py_FrozenFlag :: int
+Py_GenericAliasType :: PyTypeObject
+Py_HasFileSystemDefaultEncoding :: int
+Py_HashRandomizationFlag :: int
+Py_IgnoreEnvironmentFlag :: int
+Py_InspectFlag :: int
+Py_InteractiveFlag :: int
+Py_IsolatedFlag :: int
+Py_LegacyWindowsFSEncodingFlag :: int
+Py_LegacyWindowsStdioFlag :: int
+Py_NoSiteFlag :: int
+Py_NoUserSiteDirectory :: int
+Py_OptimizeFlag :: int
+Py_QuietFlag :: int
+Py_UTF8Mode :: int
+Py_UnbufferedStdioFlag :: int
+Py_VerboseFlag :: int
+Py_Version :: const unsigned long
+Py_hexdigits :: const char *
+_PyAsyncGenASend_Type :: PyTypeObject
+_PyWeakref_CallableProxyType :: PyTypeObject
+_PyWeakref_ProxyType :: PyTypeObject
+_PyWeakref_RefType :: PyTypeObject
+_Py_EllipsisObject :: PyObject
+_Py_FalseStruct :: PyLongObject
+_Py_NoneStruct :: PyObject
+_Py_NotImplementedStruct :: PyObject
+_Py_TrueStruct :: PyLongObject
+_Py_stats :: PyStats *
 
 # [typedefs]
 DictKeysKind :: int

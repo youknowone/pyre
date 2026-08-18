@@ -716,11 +716,15 @@ pub fn exec_dynamic(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
 ///
 /// Upstream splits this over `State.build_api` and the `@bootstrap_function`
 /// hooks each module registers; pyre has one call because the mirrors it
-/// prepares are the singletons and the exception types.
+/// prepares are the singletons, the builtin types and the exception types.
 fn initialize() {
     // First: every mirror below creates a P-link, and a link needs the
     // collector's rawrefcount state to exist.
     pyobject::init_rawrefcount();
+    // Before the singletons: binding one resolves its `ob_type`, and a type
+    // reached before its static is entered gets a synthesized block instead,
+    // which is then the block `Py_TYPE(Py_True)` answers with forever.
+    typeobject::init_type_mirrors();
     pyobject::init_singletons();
     pyerrors::init_exception_mirrors();
 }
