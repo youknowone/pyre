@@ -6024,11 +6024,24 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // produces a `SimpleFieldDescr` whose `index()` matches the
             // upstream value rather than a `u32::MAX` sentinel.
             let field = majit_translate::jitcode::BhFieldSpec {
-                // `unwrap_or(0)` and not the `u32::MAX` "no index" sentinel
-                // used elsewhere in this file: `0` is the value this field has
-                // carried on this path all along, and swapping in the sentinel
-                // would change a descr's identity, not just measure it.
-                index: index_in_parent.unwrap_or(0) as u32,
+                // `index()` is the key the `HeapCache` files a field read
+                // under, so it has to separate every field one object can be
+                // read through.  A numbered field answers with its position;
+                // an unnumbered one used to answer `0`, which is a position
+                // too — the one held by the first own field of whatever struct
+                // is read off that same object.  `PyObject.ob_type` carries no
+                // number (the positional census skips the header words), so it
+                // filed its read under slot 0 and `W_StringIO.buffer` — offset
+                // 16, position 0 — hit that entry and was handed the type
+                // pointer, whose `+24` word then reached `arraylen_gc` as an
+                // array.  Number the unnumbered ones off the payload instead,
+                // the scheme the runtime-minted field descrs already use: its
+                // `FIELD_DESCR_TAG` is disjoint from the positional numbers,
+                // and two fields of one object cannot share an offset.
+                index: match index_in_parent {
+                    Some(index) => *index as u32,
+                    None => stable_field_index(*offset, *field_size, *field_type, *is_field_signed),
+                },
                 field_key,
                 name: full_name,
                 offset: *offset,
