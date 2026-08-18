@@ -3149,12 +3149,13 @@ fn try_adopt_multi_frame_blackhole(
     // recursion that bottoms out inside the drive sees the budget it would
     // have seen interpreted -- otherwise `sys.setrecursionlimit`'s cutoff
     // moves by the chain's depth on exactly the round an abort is adopted.
-    // The root is already accounted, so its own call spends nothing; its
-    // guard is the one the loop never pops, and it falls with this vector
-    // after the drive.
+    // The root is already accounted and never reaches the leave callback, so
+    // omit it: the vector then contains exactly one guard for every callback
+    // pop, in outer-to-inner order.
     let level_recursion = std::cell::RefCell::new(
         per_frame
             .iter()
+            .skip(1)
             .map(|&(frame_ptr, _)| {
                 pyre_interpreter::call::enter_recursive_frame(
                     frame_ptr as *const pyre_interpreter::PyFrame,
