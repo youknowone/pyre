@@ -66,6 +66,62 @@ def method_callee():
     assert total == expected, 'baked a stale method __code__: %r != %r' % (total, expected)
 
 
+def getter_small(self):
+    return 1
+
+
+def getter_big(self):
+    return 500
+
+
+class WithProperty:
+    x = property(getter_small)
+
+
+def property_accessor_callee():
+    # The property fold resolves the accessor to a trace constant, so it lands
+    # on the same arm the module-level callee does.
+    obj = WithProperty()
+    total = 0
+    i = 0
+    while i < N:
+        total += obj.x
+        if i == SWITCH:
+            getter_small.__code__ = getter_big.__code__
+        i += 1
+    expected = (SWITCH + 1) + (N - SWITCH - 1) * 500
+    assert total == expected, 'baked a stale accessor __code__: %r != %r' % (total, expected)
+
+
+def hook_small(self, name):
+    return 1
+
+
+def hook_big(self, name):
+    return 500
+
+
+class WithHook:
+    pass
+
+
+WithHook.__getattr__ = hook_small
+
+
+def getattr_hook_callee():
+    # The `__getattr__` fold resolves its callee the same way.
+    obj = WithHook()
+    total = 0
+    i = 0
+    while i < N:
+        total += obj.absent
+        if i == SWITCH:
+            hook_small.__code__ = hook_big.__code__
+        i += 1
+    expected = (SWITCH + 1) + (N - SWITCH - 1) * 500
+    assert total == expected, 'baked a stale hook __code__: %r != %r' % (total, expected)
+
+
 def fresh_callee_still_inlines():
     # A `MAKE_FUNCTION` in the loop body allocates a fresh callee every
     # iteration, so the lever keeps re-proving `code` off the live function
@@ -82,5 +138,7 @@ def fresh_callee_still_inlines():
 
 module_level_callee()
 method_callee()
+property_accessor_callee()
+getattr_hook_callee()
 fresh_callee_still_inlines()
 print("OK")
