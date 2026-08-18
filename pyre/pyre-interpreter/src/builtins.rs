@@ -13881,6 +13881,12 @@ fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
     raw - ((raw == -1) as i64)
 }
 
+/// The `bytes` hash over a caller's buffer, which is what `Py_HashBuffer`
+/// answers with.
+pub(crate) fn hash_buffer(bytes: &[u8]) -> i64 {
+    _hash_bytes(bytes)
+}
+
 #[inline]
 fn _hash_bytes(bytes: &[u8]) -> i64 {
     _hash_bytes_with_key(bytes, hash_secret())

@@ -24,6 +24,7 @@ pub mod dictobject;
 pub mod exception;
 pub mod floatobject;
 pub mod gc;
+pub mod genericaliasobject;
 pub mod import_;
 pub mod iterator;
 pub mod listobject;
@@ -748,6 +749,7 @@ pub fn ensure_linked() {
     exception::ensure_linked();
     weakrefobject::ensure_linked();
     gc::ensure_linked();
+    genericaliasobject::ensure_linked();
     pyerrors::ensure_linked();
     pymem::ensure_linked();
     setobject::ensure_linked();

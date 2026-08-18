@@ -116,9 +116,10 @@ single-phase extension, `pyrex/tests/cpyext_methods.rs` a multi-phase one and
 the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_pystate.rs`, `pyrex/tests/cpyext_object_families.rs`,
 `pyrex/tests/cpyext_str.rs`, `pyrex/tests/cpyext_exceptions.rs`,
-`pyrex/tests/cpyext_warnings.rs` and `pyrex/tests/cpyext_conversions.rs` take
-their expectations from CPython 3.14.6 running the same script against the
-same fixture.
+`pyrex/tests/cpyext_warnings.rs`, `pyrex/tests/cpyext_conversions.rs`,
+`pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs` and
+`pyrex/tests/cpyext_small.rs` take their expectations from CPython 3.14.6
+running the same script against the same fixture.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
@@ -189,6 +190,24 @@ same fixture.
 - `PyImport_ImportModuleAttr` / `PyImport_ImportModuleAttrString`
   (`cpyext/import_.rs`), the import-then-`getattr` pair a C caller reaching
   into Python uses;
+- the small entry points beside them (`cpyext/unicodeobject.rs`,
+  `cpyext/dictobject.rs`, `cpyext/object.rs`, `cpyext/typeobject.rs`,
+  `cpyext/genericaliasobject.rs`): the locale codec `PyUnicode_DecodeLocale` /
+  `DecodeLocaleAndSize` / `EncodeLocale`, which takes only the `strict` and
+  `surrogateescape` handlers and refuses the rest before it runs rather than
+  reaching the codec registry, reporting what it cannot convert as the
+  `locale` codec's own `decoding error` / `encoding error`;
+  `PyUnicode_FromKindAndData`, whose units are code points of one of three
+  widths, so a 2-byte unit in the surrogate range is one character rather than
+  half an encoding; `Py_HashBuffer`, the hash `bytes` of the same content has;
+  `PyDict_SetDefaultRef`, whose reference is a new one either way -- which is
+  what separates it from the borrowing `PyDict_SetDefault` beside it -- and
+  which leaves NULL there whenever the call fails; `Py_ReprEnter` /
+  `Py_ReprLeave` over the interpreter's own mid-repr set, so a container
+  reached from a C `tp_repr` and one reached from Python see the same
+  recursion; `Py_GenericAlias`, what `origin[args]` builds; and
+  `_PyType_Name`, the tail of `tp_name` after the last dot, which points into
+  `tp_name` itself and so is freed by nobody;
 - the *handled* exception beside it: `PyErr_GetHandledException` /
   `SetHandledException` and the triple spelling `PyErr_GetExcInfo` /
   `SetExcInfo`. The read walks the suspended generators' saved slots, so it
@@ -427,6 +446,10 @@ Known divergences, each documented at its definition:
   one, because freeing a block clears that header;
 - `PyList_New(n)` fills the slots with `None` rather than NULL, `PyTuple_New(n)`
   leaving them NULL as CPython does;
+- the locale codec converts as UTF-8 rather than as whatever `LC_CTYPE`
+  names: pyre reads no locale, and the filesystem encoding it does have is
+  UTF-8 on the platforms this builds for. A process started under a non-UTF-8
+  locale therefore converts as UTF-8 where CPython would follow the locale;
 - `PyErr_SetRaisedException` and `PyErr_SetHandledException` refuse an object
   that is not an exception instance, with the `SystemError` `_PyErr_SetObject`
   uses for the same mistake. CPython checks neither, and a foreign object
@@ -498,7 +521,7 @@ Known divergences, each documented at its definition:
    pyre does not take; and the remaining generated API. Of the 746 public
    `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 442 are present, counting every form `Python.h` offers one
+   underscore -- 448 are present, counting every form `Python.h` offers one
    in: an export, a `static inline`, or a macro of either kind. (The
    previously recorded 763/292 came from a pattern that missed the
    declarations annotated `_Py_NO_RETURN` on one side and the object-like

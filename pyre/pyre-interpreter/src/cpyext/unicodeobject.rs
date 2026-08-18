@@ -829,6 +829,190 @@ pub unsafe extern "C" fn PyUnicode_EncodeFSDefault(object: *mut CPyObject) -> *m
     pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }
 
+/// The name every failure the locale codec reports is spelled with.
+const LOCALE_CODEC: &str = "locale";
+
+/// The locale codec's two handlers, `true` for surrogateescape.
+///
+/// The conversion refuses anything else before it runs rather than reaching
+/// the codec registry, so the check is here rather than in a codec lookup.
+fn locale_handler(errors: *const c_char) -> Option<bool> {
+    match error_handler(errors).as_str() {
+        "strict" => Some(false),
+        "surrogateescape" => Some(true),
+        _ => {
+            super::pyerrors::set_pending_error(crate::PyError::value_error(
+                "unsupported error handler".to_owned(),
+            ));
+            None
+        }
+    }
+}
+
+/// `PyUnicode_DecodeLocaleAndSize` — the bytes as the current locale spells
+/// them, which is UTF-8 on the platforms this builds for.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeLocaleAndSize(
+    string: *const c_char,
+    length: isize,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    if string.is_null() || length < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let count = length as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, count) };
+    // The block is read as a NUL-terminated string, so the terminator has to
+    // sit exactly where the length says and nowhere before it.
+    if unsafe { *string.add(count) } != 0 || bytes.contains(&0) {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "embedded null byte".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    let Some(escaping) = locale_handler(errors) else {
+        return std::ptr::null_mut();
+    };
+    let error = match std::str::from_utf8(bytes) {
+        Ok(text) => return pyobject::make_ref(pyre_object::w_str_new(text)),
+        Err(error) => error,
+    };
+    if escaping {
+        return pyobject::make_ref(crate::gateway::fsdecode_filename_bytes(bytes));
+    }
+    // The position is counted in the units the conversion answers with, which
+    // are code points rather than bytes.
+    let position = unsafe { std::str::from_utf8_unchecked(&bytes[..error.valid_up_to()]) }
+        .chars()
+        .count();
+    super::pyerrors::set_pending_error(crate::typedef::unicode_decode_error(
+        LOCALE_CODEC,
+        bytes,
+        position,
+        position + 1,
+        "decoding error",
+    ));
+    std::ptr::null_mut()
+}
+
+/// The NUL-terminated spelling of the same decode.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_DecodeLocale(
+    string: *const c_char,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    if string.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let length = unsafe { CStr::from_ptr(string) }.to_bytes().len() as isize;
+    unsafe { PyUnicode_DecodeLocaleAndSize(string, length, errors) }
+}
+
+/// `PyUnicode_EncodeLocale` — the string as the current locale spells it.
+///
+/// A surrogate in the escape range is the byte it stands for, and every other
+/// one has no spelling at all, escaping or not.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_EncodeLocale(
+    object: *mut CPyObject,
+    errors: *const c_char,
+) -> *mut CPyObject {
+    let Some(value) = wide_argument(object) else {
+        return std::ptr::null_mut();
+    };
+    let points: Vec<u32> = unsafe { pyre_object::w_str_get_wtf8(value) }
+        .code_points()
+        .map(|point| point.to_u32())
+        .collect();
+    // The block the conversion hands back is read to its first NUL, so a
+    // string holding one has nowhere to be put.
+    if points.contains(&0) {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "embedded null character".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    let Some(escaping) = locale_handler(errors) else {
+        return std::ptr::null_mut();
+    };
+    let mut bytes: Vec<u8> = Vec::with_capacity(points.len());
+    for (position, point) in points.into_iter().enumerate() {
+        if let Some(character) = char::from_u32(point) {
+            let mut buffer = [0u8; 4];
+            bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+        if escaping && (0xdc80..=0xdcff).contains(&point) {
+            bytes.push((point - 0xdc00) as u8);
+            continue;
+        }
+        super::pyerrors::set_pending_error(crate::typedef::unicode_encode_error(
+            LOCALE_CODEC,
+            value,
+            position,
+            position + 1,
+            "encoding error",
+        ));
+        return std::ptr::null_mut();
+    }
+    pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+}
+
+/// `PyUnicode_FromKindAndData(kind, buffer, size)` — a string from an array of
+/// code points of one of the three widths.
+///
+/// The units are code points rather than an encoding, so a 2-byte unit in the
+/// surrogate range is one, which is what makes the result a lone surrogate
+/// rather than a decode error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_FromKindAndData(
+    kind: c_int,
+    buffer: *const std::ffi::c_void,
+    size: isize,
+) -> *mut CPyObject {
+    if size < 0 {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::ValueError,
+            "size must be positive".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    let count = size as usize;
+    let points: Vec<u32> = match kind {
+        1 => unsafe { std::slice::from_raw_parts(buffer as *const u8, count) }
+            .iter()
+            .map(|&unit| unit as u32)
+            .collect(),
+        2 => unsafe { std::slice::from_raw_parts(buffer as *const u16, count) }
+            .iter()
+            .map(|&unit| unit as u32)
+            .collect(),
+        4 => unsafe { std::slice::from_raw_parts(buffer as *const u32, count) }.to_vec(),
+        _ => {
+            super::pyerrors::set_pending_error(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "invalid kind".to_owned(),
+            ));
+            return std::ptr::null_mut();
+        }
+    };
+    let mut text = Wtf8Buf::with_capacity(count);
+    for point in points {
+        // A surrogate is a code point a `str` holds, so the unit is read as
+        // one rather than as half of an encoding.
+        let Some(point) = CodePoint::from_u32(point) else {
+            super::pyerrors::set_pending_error(crate::PyError::value_error(format!(
+                "character U+{point:x} is not in range [U+0000; U+10ffff]"
+            )));
+            return std::ptr::null_mut();
+        };
+        text.push(point);
+    }
+    pyobject::make_ref(pyre_object::w_str_from_wtf8_managed(text))
+}
+
 /// `Py_CLEANUP_SUPPORTED`, which both converters answer with so that a parse
 /// that goes on to fail can hand the reference back.
 const CLEANUP_SUPPORTED: c_int = 2;

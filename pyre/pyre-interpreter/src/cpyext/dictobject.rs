@@ -333,6 +333,67 @@ pub unsafe extern "C" fn PyDict_GetItemRef(
     unsafe { get_item_ref(found, result) }
 }
 
+/// `PyDict_SetDefaultRef(dict, key, default, &result)` — 1 when the key was
+/// already there, 0 when the default was inserted, -1 on failure.
+///
+/// The reference handed back is a new one either way, which is what separates
+/// it from the borrowing `PyDict_SetDefault` beside it.  A NULL
+/// `result` is the caller saying it wants the insertion and not the value.
+///
+/// # Safety
+/// `result` must be null or a writable `PyObject *`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDict_SetDefaultRef(
+    object: *mut CPyObject,
+    key: *mut CPyObject,
+    default_value: *mut CPyObject,
+    result: *mut *mut CPyObject,
+) -> c_int {
+    super::object::realize_all([object, key, default_value]);
+    // Nothing is handed back unless the whole call works, so the failure
+    // arms below can just leave this as it is.
+    if !result.is_null() {
+        unsafe { *result = std::ptr::null_mut() };
+    }
+    let (Some(dict), Some(key), Some(default_value)) = (
+        dict_argument(object, "PyDict_SetDefaultRef"),
+        argument(key),
+        argument(default_value),
+    ) else {
+        return -1;
+    };
+    let present = match crate::baseobjspace::contains(dict, key) {
+        Ok(present) => present,
+        Err(error) => {
+            super::pyerrors::set_pending_error(error);
+            return -1;
+        }
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(dict);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(key);
+    let default_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(default_value);
+    let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+    let found = unsafe {
+        pyre_object::dictmultiobject::w_dict_setdefault_checked(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(default_slot),
+        )
+    }
+    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key));
+    let Some(found) = trap(found) else {
+        return -1;
+    };
+    if !result.is_null() {
+        unsafe { *result = pyobject::make_ref(found) };
+    }
+    present as c_int
+}
+
 /// `PyDict_GetItemStringRef(dict, key, &result)`.
 ///
 /// # Safety

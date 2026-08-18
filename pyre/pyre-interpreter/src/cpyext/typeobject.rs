@@ -3129,6 +3129,27 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
     value as *mut c_void
 }
 
+/// `_PyType_Name(type)` — the tail of `tp_name` after the last dot, which is
+/// the name without the module qualifying it.
+///
+/// The answer points into `tp_name` itself, so it lives exactly as long as the
+/// type object does and the caller frees nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyType_Name(tp: *mut CPyTypeObject) -> *const c_char {
+    if tp.is_null() {
+        return std::ptr::null();
+    }
+    let name = unsafe { (*tp).tp_name };
+    if name.is_null() {
+        return name;
+    }
+    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match bytes.iter().rposition(|&byte| byte == b'.') {
+        Some(dot) => unsafe { name.add(dot + 1) },
+        None => name,
+    }
+}
+
 /// `PyType_GetName` and `PyType_GetQualName` — `__name__`, which is the part
 /// of `tp_name` after the last dot for a type whose name arrived qualified.
 #[unsafe(no_mangle)]
@@ -3683,6 +3704,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyType_Check as *const ());
     std::hint::black_box(PyType_IsSubtype as *const ());
     std::hint::black_box(PyType_GetFlags as *const ());
+    std::hint::black_box(_PyType_Name as *const ());
     std::hint::black_box(PyType_FromSpec as *const ());
     std::hint::black_box(PyType_FromSpecWithBases as *const ());
     std::hint::black_box(PyType_FromModuleAndSpec as *const ());

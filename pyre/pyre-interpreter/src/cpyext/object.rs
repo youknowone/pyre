@@ -1085,7 +1085,49 @@ pub unsafe extern "C" fn Py_GetConstantBorrowed(identifier: std::ffi::c_uint) ->
     raw
 }
 
+/// `Py_ReprEnter(obj)` — 0 when the caller may go on to render `obj`, 1 when
+/// it is already being rendered on this thread and the caller should emit its
+/// own elision instead.
+///
+/// The set is the interpreter's own, so a container reached from a C `tp_repr`
+/// and one reached from Python see the same recursion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_ReprEnter(object: *mut CPyObject) -> c_int {
+    let Some(object) = argument(object) else {
+        // Nothing to record the entry against, which is answered the way a
+        // missing thread state is: the caller may go ahead.
+        return 0;
+    };
+    (!crate::display::repr_enter(object)) as c_int
+}
+
+/// `Py_ReprLeave(obj)` — undo the entry [`Py_ReprEnter`] recorded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_ReprLeave(object: *mut CPyObject) {
+    let object = unsafe { super::pyobject::from_ref(object) };
+    if !object.is_null() {
+        crate::display::repr_leave(object);
+    }
+}
+
+/// `Py_HashBuffer(ptr, len)` — the hash `bytes` of the same content has.
+///
+/// # Safety
+/// `pointer` must address `length` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Py_HashBuffer(pointer: *const std::ffi::c_void, length: isize) -> isize {
+    if pointer.is_null() || length < 0 {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pointer as *const u8, length as usize) };
+    crate::builtins::hash_buffer(bytes) as isize
+}
+
 pub(super) fn ensure_linked() {
+    std::hint::black_box(Py_ReprEnter as *const ());
+    std::hint::black_box(Py_ReprLeave as *const ());
+    std::hint::black_box(Py_HashBuffer as *const ());
     std::hint::black_box(Py_GetConstant as *const ());
     std::hint::black_box(Py_GetConstantBorrowed as *const ());
     std::hint::black_box(PyObject_GetAttrString as *const ());
