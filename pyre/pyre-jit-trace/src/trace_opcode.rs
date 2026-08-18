@@ -3469,33 +3469,6 @@ impl MIFrame {
 /// between the int and float fast paths in the retired compare helper,
 /// but reads the ConcreteValue variant directly so the check does not
 /// have to allocate an intermediate w_int/w_float box.
-/// Trace-side mirror of `pyre_interpreter::eval::check_exc_match_against`
-/// (`pyre/pyre-interpreter/src/eval.rs:81-130`).  Kept structurally
-/// identical so the recorded boolean matches the interpreter's
-/// concrete computation — including tuple-of-types, builtin-function
-/// alias, str-named exception kinds, and `is_type` + MRO fallback.
-///
-/// SAFETY: `exc_value` and `exc_type` must be non-null PyObjectRefs
-/// owned by the running interpreter for the duration of this call.
-unsafe fn trace_check_exc_match_against(
-    exc_value: pyre_object::PyObjectRef,
-    exc_type: pyre_object::PyObjectRef,
-) -> bool {
-    // pyopcode.py:1040 — bool-returning mirror of
-    // `pyre_interpreter::eval::check_exc_match_against`. The validity
-    // gate at pyopcode.py:1034-1039 lives in
-    // `pyre_interpreter::eval::validate_check_exc_match_class` and runs
-    // BEFORE this helper in the BC handler, matching the interpreter's
-    // split. PyPy's `@jit.unroll_safe cmp_exc_match` inlines both into
-    // the trace and emits a guard for the `raise oefmt(...)` arm;
-    // pyre's residual-call ABI keeps `bool` so the raise/guard split
-    // lives on the caller side.
-    let Some(w_exc_class) = pyre_interpreter::typedef::r#type(exc_value) else {
-        return false;
-    };
-    pyre_interpreter::baseobjspace::exception_match(w_exc_class.as_ptr(), exc_type)
-}
-
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {
         ConcreteValue::Int(_) => (true, false),
