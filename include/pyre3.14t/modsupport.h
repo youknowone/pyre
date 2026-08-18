@@ -722,11 +722,21 @@ static inline PyObject *Py_BuildValue(const char *format, ...)
 }
 
 /* The same build over a list the caller already opened, which is how a
-   variadic entry point of its own passes its arguments on. */
+   variadic entry point of its own passes its arguments on.
+
+   The walk goes over a `va_copy`, not over `&va`: an argument of type
+   `va_list` is an array on some ABIs, where it decays to a pointer and `&va`
+   names the parameter slot rather than the list.  Copying gives an object of
+   the type the walker takes the address of, on every ABI, and leaves the
+   caller's own list where it was. */
 static inline PyObject *Py_VaBuildValue(const char *format, va_list va)
 {
+    va_list copy;
+    va_copy(copy, va);
     const char *cursor = format;
-    return _PyPyre_BuildValue(&cursor, &va);
+    PyObject *value = _PyPyre_BuildValue(&cursor, &copy);
+    va_end(copy);
+    return value;
 }
 
 #ifdef __cplusplus
