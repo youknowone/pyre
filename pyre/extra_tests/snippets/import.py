@@ -76,3 +76,29 @@ from testutils import assert_raises
 
 with assert_raises(SyntaxError):
     exec("import")
+
+
+# interp_import.py:85-90 hands a cached package's fromlist to importlib's
+# `_handle_fromlist` rather than re-entering `__import__`.  Pyre's slow path is
+# the Python importlib bootstrap, so replacing that entry point makes an
+# accidental fall through observable without depending on timing.
+import importlib
+import importlib._bootstrap as bootstrap
+
+bootstrap_import = bootstrap.__import__
+bootstrap_calls = []
+
+
+def counting_bootstrap_import(*args, **kwargs):
+    bootstrap_calls.append(args[0])
+    return bootstrap_import(*args, **kwargs)
+
+
+bootstrap.__import__ = counting_bootstrap_import
+try:
+    from importlib import import_module as cached_import_module
+
+    assert cached_import_module is importlib.import_module
+    assert bootstrap_calls == []
+finally:
+    bootstrap.__import__ = bootstrap_import
