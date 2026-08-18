@@ -1817,6 +1817,21 @@ pub unsafe fn getattr_hook_fast_path(
     if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }.is_some() {
         return None;
     }
+    // A devolved instance keeps its attributes in a real dictionary, and
+    // mapdict.py:1534-1536 states that `find_map_attr` "will always return
+    // None if attrkind==DICT" for such a map.  The hit path reads that call
+    // for a Some, so a None costs it only the fold; this path reads it for its
+    // ABSENCE and would take an always-None answer as proof the name is not on
+    // the instance.  `LOAD_METHOD_mapdict_fill_cache_method` — upstream's own
+    // case of pinning a map to cache a negative instance lookup — refuses the
+    // shape outright (mapdict.py:1569 `if map is None or
+    // isinstance(map.terminator, DevolvedDictTerminator): return`), and the
+    // map pin cannot stand in: the devolved terminator is a per-class
+    // singleton, so the guarded map word is the same for every devolved
+    // instance and unchanged by a later `obj.<name> = ...`.
+    if unsafe { map_is_devolved(map) } {
+        return None;
+    }
     // `classify_attr(w_type, None, false)` answers `(DICT, false)` — the
     // no-descriptor arm (mapdict.py:1509-1510) — so this is the same
     // `find_map_attr` call the hit path makes, read for its absence.
