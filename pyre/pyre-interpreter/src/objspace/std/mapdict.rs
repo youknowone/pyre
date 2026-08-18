@@ -3550,10 +3550,12 @@ unsafe fn maybe_migrate_to_boxed<O: MapdictObject>(
 /// # Safety
 /// `attr_node` must point to a live `PlainAttribute`; `obj` to a live carrier.
 unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut Object) {
-    // The carrier's storage is a plain `Vec` no collector updates, and the read
-    // below boxes an unboxed attribute. Publish the values already copied,
-    // copy them back once the read is done, and only then hand `add_attr` a
-    // storage it is free to re-lay-out.
+    // The carrier's storage is a plain `Vec` no collector updates, and a value
+    // the read had to box is named by nothing else until `add_attr` stores it
+    // — old-gen birth buys it immobility rather than survival, so the
+    // re-lay-out below can sweep it. Publish both, copy the storage run back
+    // once the read is done, and only then hand `add_attr` a storage it is
+    // free to re-lay-out.
     let _roots = pyre_object::gc_roots::push_roots();
     let storage_slot = pyre_object::gc_roots::pin_roots(&new_obj.storage);
     let value_slot =
@@ -4736,8 +4738,10 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
-    // The read boxes an unboxed slot, so each allocation stales the values
-    // already collected; pin them as they are read and copy the run back.
+    // A value the read had to box is named by nothing the collector walks
+    // until this `Vec` is handed on, and old-gen birth buys immobility rather
+    // than survival, so the walk's own allocations can sweep one collected
+    // earlier; pin them as they are read and copy the run back.
     let roots = pyre_object::gc_roots::push_roots();
     let values_base = roots.base();
     let mut vals: Vec<PyObjectRef> = Vec::new();
@@ -4769,10 +4773,11 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     ensure_mapdict_initialized(obj);
     let inst = mapdict_carrier(obj);
     let nodes = dict_nodes_in_order(&inst);
-    // Every iteration allocates — `box_str_constant` on an intern miss, the
-    // read on an unboxed slot — so a value collected earlier goes stale while
-    // the walk is still running. Pin each value at its read and copy the run
-    // back once the walk is over; the names are immortal interned constants.
+    // A value the read had to box is named by nothing the collector walks
+    // until this `Vec` is handed on, and old-gen birth buys immobility rather
+    // than survival, so the walk's own allocations can sweep one collected
+    // earlier. Pin each value at its read and copy the run back once the walk
+    // is over; the names are immortal interned constants.
     let roots = pyre_object::gc_roots::push_roots();
     let values_base = roots.base();
     let mut out: Vec<(PyObjectRef, PyObjectRef)> = Vec::new();

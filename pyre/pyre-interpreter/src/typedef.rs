@@ -3112,9 +3112,10 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         return Ok(annotate);
     }
     let none = pyre_object::w_none();
-    // Allocate the key first: call arguments evaluate left to right, so
-    // reading the dict slot ahead of `w_str_new` would hand the store a
-    // pre-move word.
+    // The lookup above is a full `finditem_str`, so a `__getitem__` on a dict
+    // subclass runs Python between the pin and this store and the module dict
+    // moves under it; the store therefore reads the slot rather than the word
+    // pinned earlier.  The key is an immortal non-GC string and needs no slot.
     let annotate_key = pyre_object::w_str_new("__annotate__");
     crate::baseobjspace::setitem(roots.get(dict_slot), annotate_key, none)?;
     Ok(none)
@@ -16405,9 +16406,10 @@ fn staticmethod_annotate_get(args: &[PyObjectRef]) -> crate::PyResult {
 
 fn staticmethod_wrapped_attr_set(args: &[PyObjectRef], name: &str) -> crate::PyResult {
     let sm = staticmethod_require(args.get(1).copied().unwrap_or(PY_NULL), name)?;
-    // Allocating the key after both words are pinned is what keeps the store
-    // from receiving pre-move addresses: call arguments evaluate left to
-    // right, so an inline `w_str_new` would run after the dict was read.
+    // `w_staticmethod_getdict` mints the dict on the first access and the value
+    // arrives as a by-value argument, neither of them a word the collector
+    // rewrites, so both take a slot and the store reads them back.  The key is
+    // an immortal non-GC string and needs none.
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
