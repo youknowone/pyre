@@ -1698,7 +1698,7 @@ impl GcCache {
                 let Some(listed) = sd
                     .all_fielddescrs()
                     .iter()
-                    .find(|f| f.field_key() == fd.field_key)
+                    .find(|f| f.field_key() == fd.field_key())
                 else {
                     continue;
                 };
@@ -1763,10 +1763,10 @@ impl GcCache {
                 continue;
             }
             for fd in cached.values() {
-                if !listed.iter().any(|f| f.field_key() == fd.field_key) {
+                if !listed.iter().any(|f| f.field_key() == fd.field_key()) {
                     orphans.insert(format!(
                         "{}@{}~[{}]",
-                        fd.field_key,
+                        fd.field_key(),
                         fd.offset,
                         listed
                             .iter()
@@ -5131,6 +5131,21 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 
 // ── Concrete descriptor implementations (descr.py) ──
 
+/// `descr.py:227 name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
+/// external `_cache_field[STRUCT][fieldname]` key inside the display name so
+/// every descriptor does not need a second owned string. Both the struct name
+/// and pyre's synthetic nested-field spelling may contain dots, so deriving the
+/// split from the finished display name would be ambiguous; retain the exact
+/// byte offset supplied while the two inputs are still separate.
+fn field_key_start(name: &str, field_key: &str) -> u32 {
+    let start = name
+        .len()
+        .checked_sub(field_key.len())
+        .filter(|&start| name.get(start..) == Some(field_key))
+        .expect("FieldDescr display name must end with its cache field key");
+    u32::try_from(start).expect("FieldDescr display-name prefix must fit in u32")
+}
+
 /// Simple concrete FieldDescr for use by pyre-jit and tests.
 /// RPython: `FieldDescr(name, offset, size, flag, index_in_parent, is_pure)`.
 #[derive(Debug)]
@@ -5153,10 +5168,12 @@ pub struct SimpleFieldDescr {
     /// `compute_bitstrings` (`effectinfo.py:524-526`).
     ei_index: AtomicU32,
     /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
-    name: String,
-    /// descr.py:220-233 cache key (`fieldname`), distinct from display
-    /// `name` built at descr.py:227.
-    field_key: String,
+    name: Box<str>,
+    /// Byte offset of `descr.py:220-233`'s external cache key (`fieldname`)
+    /// inside `name`. RPython keeps the key only in `_cache_field`; pyre needs
+    /// to expose it for its descriptor-identity census, so retain a compact
+    /// slice position instead of duplicating the owned string.
+    field_key_start: u32,
     offset: usize,
     field_size: usize,
     field_type: Type,
@@ -5198,7 +5215,7 @@ impl Clone for SimpleFieldDescr {
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
             name: self.name.clone(),
-            field_key: self.field_key.clone(),
+            field_key_start: self.field_key_start,
             offset: self.offset,
             field_size: self.field_size,
             field_type: self.field_type,
@@ -5268,8 +5285,8 @@ impl SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
-            name: String::new(),
-            field_key: String::new(),
+            name: Box::default(),
+            field_key_start: 0,
             offset,
             field_size,
             field_type,
@@ -5300,12 +5317,13 @@ impl SimpleFieldDescr {
         name: String,
         field_key: String,
     ) -> Self {
+        let field_key_start = field_key_start(&name, &field_key);
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
-            name,
-            field_key,
+            name: name.into_boxed_str(),
+            field_key_start,
             offset,
             field_size,
             field_type,
@@ -5456,7 +5474,7 @@ impl FieldDescr for SimpleFieldDescr {
         &self.name
     }
     fn field_key(&self) -> &str {
-        &self.field_key
+        &self.name[self.field_key_start as usize..]
     }
     fn index_in_parent(&self) -> usize {
         self.index_in_parent
@@ -5886,12 +5904,13 @@ fn make_simple_descr_group_inner(
         let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
             .iter()
             .map(|spec| {
+                let field_key_start = field_key_start(&spec.name, &spec.field_key);
                 Arc::new(SimpleFieldDescr {
                     index: AtomicU32::new(spec.index),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
-                    name: spec.name.clone(),
-                    field_key: spec.field_key.clone(),
+                    name: spec.name.clone().into_boxed_str(),
+                    field_key_start,
                     offset: spec.offset,
                     field_size: spec.field_size,
                     field_type: spec.field_type,
@@ -6644,8 +6663,8 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     index: AtomicU32::new(0x6000_0000),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
-                    name: "object.typeptr".to_string(),
-                    field_key: "typeptr".to_string(),
+                    name: Box::from("object.typeptr"),
+                    field_key_start: field_key_start("object.typeptr", "typeptr"),
                     offset: 0,
                     field_size: std::mem::size_of::<usize>(),
                     field_type: crate::Type::Int,
