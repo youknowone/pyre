@@ -6514,18 +6514,17 @@ pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::D
     use majit_ir::effectinfo::{DescrMintSpec, DescrSetMember};
 
     for entry in entries {
-        match (&entry.member, &entry.spec) {
+        let descr = match (&entry.member, &entry.spec) {
             (
                 DescrSetMember::Field {
                     struct_id,
                     field_name,
                 },
                 spec,
-            ) => {
-                mint_field(LLType::Struct(*struct_id), field_name, spec);
-            }
+            ) => mint_field(LLType::Struct(*struct_id), field_name, spec)
+                .map(|descr| descr as majit_ir::DescrRef),
             (DescrSetMember::Array { array_id }, spec) => {
-                mint_array(LLType::Array(*array_id), spec);
+                mint_array(LLType::Array(*array_id), spec)
             }
             (
                 DescrSetMember::InteriorField { array_id, name },
@@ -6550,21 +6549,28 @@ pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::D
                 else {
                     continue;
                 };
-                let _ = majit_ir::descr::gc_cache()
-                    .lock()
-                    .unwrap()
-                    .get_interiorfield_descr(
-                        array_key,
-                        name.clone(),
-                        String::new(),
-                        array_descr,
-                        field_descr,
-                    );
+                Some(
+                    majit_ir::descr::gc_cache()
+                        .lock()
+                        .unwrap()
+                        .get_interiorfield_descr(
+                            array_key,
+                            name.clone(),
+                            String::new(),
+                            array_descr,
+                            field_descr,
+                        ),
+                )
             }
             // A member paired with a spec of another shape cannot describe its
             // own slot; leaving it unpublished keeps it counted as absent
             // rather than filling the slot with the wrong layout.
-            _ => {}
+            _ => None,
+        };
+        if let Some(descr) = descr
+            && entry.ei_index != u32::MAX
+        {
+            descr.set_ei_index(entry.ei_index);
         }
     }
 }
@@ -6933,6 +6939,77 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
     ei._write_descrs_interiorfields = Some(write_interiorfields);
 }
 
+/// Validate a translated EffectInfo's structural raw-set image without
+/// retaining the rehydrated `Vec<DescrRef>` graph.
+///
+/// RPython discards the six raw frozensets after translation has run
+/// `compute_bitstrings`; the translated object retains the compact bitstrings,
+/// and each descriptor retains `ei_index`. Pyre's earlier runtime rehydration
+/// rebuilt those translation-only frozensets solely because partitioning had
+/// been delayed across the process boundary. Once the build artifact carries
+/// both outputs, resolving every member here is an invariant check, not
+/// runtime state construction. `single_write_descr_array` is the one raw
+/// descriptor reference EffectInfo deliberately keeps after compaction
+/// (`effectinfo.py:201-206`), so that singleton alone remains live.
+pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
+    fn degrade(ei: &mut majit_ir::EffectInfo) {
+        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
+        ei.can_collect = true;
+        ei.can_invalidate = true;
+        ei.readonly_descrs_fields = None;
+        ei.write_descrs_fields = None;
+        ei.readonly_descrs_arrays = None;
+        ei.write_descrs_arrays = None;
+        ei.readonly_descrs_interiorfields = None;
+        ei.write_descrs_interiorfields = None;
+        ei.single_write_descr_array = None;
+    }
+
+    let Some(keys) = ei.descr_set_keys.take() else {
+        if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
+            degrade(ei);
+        }
+        return;
+    };
+    let resolve = |members: &[majit_ir::effectinfo::DescrSetMember]| {
+        let mut out = Vec::with_capacity(members.len());
+        let mut complete = true;
+        for member in members {
+            let looked_up = descr_from_set_member(member);
+            record_set_member_lookup(member, &looked_up);
+            match looked_up {
+                SetMemberLookup::Resolved(descr) => out.push(descr),
+                SetMemberLookup::AbsentContainer | SetMemberLookup::Ambiguous => complete = false,
+            }
+        }
+        complete.then_some(out)
+    };
+    let resolved = (
+        resolve(&keys.readonly_fields),
+        resolve(&keys.write_fields),
+        resolve(&keys.readonly_arrays),
+        resolve(&keys.write_arrays),
+        resolve(&keys.readonly_interiorfields),
+        resolve(&keys.write_interiorfields),
+    );
+    let (
+        Some(_readonly_fields),
+        Some(_write_fields),
+        Some(_readonly_arrays),
+        Some(write_arrays),
+        Some(_readonly_interiorfields),
+        Some(_write_interiorfields),
+    ) = resolved
+    else {
+        degrade(ei);
+        return;
+    };
+    ei.single_write_descr_array = match write_arrays.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+}
+
 /// `BhCallDescr` -> `CallDescr` adapter. RPython parity: codewriter
 /// `Assembler.descrs` carries the same `CallDescr` instance the
 /// metainterp pulls during op recording. pyre keeps the codewriter-side
@@ -6967,24 +7044,25 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
         );
     }
     let result_size = if bh.void_word_abi { 8 } else { bh.result_size };
-    // call.py:320 effectinfo_from_writeanalyze parity: the descr consumed
-    // by pyjitpl/residual-call recording must expose the same EffectInfo
-    // that the codewriter classified for this call site.
-    //
-    // descr.py:524-526 `get_result_type()` parity — preserve the raw
-    // `bh.result_type` char ('i'/'r'/'f'/'v'/'S'/'L') so downstream
-    // consumers (`bhimpl_call_*` dispatch, `is_result_signed`) can
-    // recover the original singlefloat/longlong classification that the
-    // normalized `Type` collapses.
-    majit_ir::descr::make_call_descr_full_with_result_class(
-        u32::MAX,
-        arg_types,
-        result_type,
-        bh.result_type,
-        bh.result_signed,
-        result_size,
-        bh.extra_info.clone(),
-    )
+    if let Some(translated_id) = bh.translated_effect_info_id {
+        majit_metainterp::make_call_descr_sized_with_translated_effect(
+            &arg_types,
+            result_type,
+            bh.result_signed,
+            result_size,
+            translated_id,
+        )
+    } else {
+        majit_ir::descr::make_call_descr_full_with_result_class(
+            u32::MAX,
+            arg_types,
+            result_type,
+            bh.result_type,
+            bh.result_signed,
+            result_size,
+            bh.extra_info.clone(),
+        )
+    }
 }
 
 /// descr.py:384 InteriorFieldDescr for SETINTERIORFIELD_GC.
@@ -7134,6 +7212,7 @@ mod set_member_lookup_tests {
                 is_quasi_immutable: false,
                 index_in_parent: 1,
             },
+            ei_index: u32::MAX,
         }]);
 
         let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {

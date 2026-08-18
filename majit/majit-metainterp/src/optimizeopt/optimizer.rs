@@ -15,6 +15,7 @@ use crate::optimizeopt::{
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type};
+use std::sync::Arc;
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::IntBound;
@@ -316,7 +317,7 @@ pub(crate) struct PendingBridgeRd {
     pub liveboxes: Vec<OpRef>,
     pub livebox_types: Vec<Type>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
-    pub all_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub all_descrs: Arc<Vec<majit_ir::descr::DescrRef>>,
     /// `optimizer.cpu` (model.py:39 AbstractCPU) — carried through the
     /// bridge into the retrace `Optimizer.cpu` slot. RPython never sees a
     /// `None` here: `optimizer.cpu` is set at `Optimizer.__init__` time.
@@ -448,7 +449,7 @@ pub struct Optimizer {
     /// Taken from MIStaticData at optimizer construction, returned after.
     /// descr.py:25-47: descriptors get descr_index assigned inline during
     /// collect_optimizer_knowledge_for_resume().
-    pub all_descrs: Vec<DescrRef>,
+    pub all_descrs: Arc<Vec<DescrRef>>,
     /// optimizer.py:787: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
     /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook —
@@ -1503,7 +1504,7 @@ impl Optimizer {
             final_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
-            all_descrs: Vec::new(),
+            all_descrs: Arc::new(Vec::new()),
             constant_fold_alloc: None,
             string_length_resolver: None,
             string_content_resolver: None,
@@ -5400,7 +5401,7 @@ impl Optimizer {
         }
         let new_idx = self.all_descrs.len() as i32;
         descr.set_descr_index(new_idx);
-        self.all_descrs.push(descr.clone());
+        Arc::make_mut(&mut self.all_descrs).push(descr.clone());
         // descr.py:47: assert len(all_descrs) < 2**15
         assert!(
             self.all_descrs.len() < (1 << 15),

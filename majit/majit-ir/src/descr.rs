@@ -2912,6 +2912,7 @@ pub fn ei_descr_mints_snapshot() -> Vec<DescrMintEntry> {
         .map(|(member, spec)| DescrMintEntry {
             member: member.clone(),
             spec: spec.clone(),
+            ei_index: u32::MAX,
         })
         .collect()
 }

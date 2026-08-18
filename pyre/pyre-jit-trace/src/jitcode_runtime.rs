@@ -685,6 +685,48 @@ pub fn all_descrs() -> &'static [BhDescr] {
     })
 }
 
+/// Canonical translated EffectInfo objects. RPython embeds each object once
+/// and lets CallDescrs retain references to it; the indexed wire table carries
+/// that identity across pyre's build-script/runtime process boundary.
+fn effect_info_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/effect_infos_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/effect_infos.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize effect_infos_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn effect_info_count() -> usize {
+    effect_info_offsets().len() - 1
+}
+
+fn load_effect_info(index: usize) -> (u32, majit_ir::EffectInfo) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/effect_infos.bin"));
+    let offsets = effect_info_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize effect_infos.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
 /// Indexed `pipeline.ei_descr_mints` — gccache slots named only by an
 /// EffectInfo raw set, paired with the arguments their mint took.
 ///
@@ -798,14 +840,13 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
     // This BhCallDescr was decoded solely for setup.  Move its EffectInfo
     // into the canonical runtime CallDescr instead of cloning the complete
     // six-set serialization payload and then dropping the source copy.
-    let mut effect_info = bh.extra_info;
-    crate::descr::rehydrate_effect_info(&mut effect_info);
-    majit_metainterp::make_call_descr_sized_with_effect(
+    majit_metainterp::make_call_descr_sized_with_translated_effect(
         &arg_types,
         result_type,
         bh.result_signed,
         bh.result_size,
-        effect_info,
+        bh.translated_effect_info_id
+            .expect("translated BhCallDescr is missing its EffectInfo identity"),
     )
 }
 
@@ -858,6 +899,15 @@ pub fn rehydrate_build_descr_raw_sets() {
         for i in 0..ei_descr_mint_count() {
             let entry = load_ei_descr_mint(i);
             crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
+        }
+        // `effectinfo.compute_bitstrings` has already run in the translator.
+        // Resolve the structural spellings once per canonical EffectInfo,
+        // retain only its compact bitstrings/single-write descriptor, and
+        // publish the object table before any CallDescr asks for an id.
+        for i in 0..effect_info_count() {
+            let (translated_id, mut effect_info) = load_effect_info(i);
+            crate::descr::prepare_frozen_effect_info(&mut effect_info);
+            majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
         }
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind != 1 {

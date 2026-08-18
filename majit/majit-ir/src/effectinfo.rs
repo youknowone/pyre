@@ -131,13 +131,16 @@ pub enum DescrMintSpec {
 pub struct DescrMintEntry {
     pub member: DescrSetMember,
     pub spec: DescrMintSpec,
+    /// `effectinfo.py:526 descr.ei_index = mapping.setdefault(...)`, frozen
+    /// by source translation. `u32::MAX` until the build-time partition runs.
+    pub ei_index: u32,
 }
 
 /// `effectinfo.py:128-145 frozenset_or_none`: serializable projection of
 /// the six raw EffectInfo descr sets. The vectors are kept in the same
 /// canonical order as the raw `DescrRef` sets so deserialization can rebuild
 /// the exact object graph before `compute_bitstrings`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DescrSetKeys {
     pub readonly_fields: Vec<DescrSetMember>,
     pub write_fields: Vec<DescrSetMember>,
@@ -171,6 +174,19 @@ impl DescrSetKeys {
             readonly_interiorfields: Vec::new(),
             write_interiorfields: Vec::new(),
         }
+    }
+
+    fn canonicalize(&mut self) {
+        fn sort_dedup(members: &mut Vec<DescrSetMember>) {
+            members.sort();
+            members.dedup();
+        }
+        sort_dedup(&mut self.readonly_fields);
+        sort_dedup(&mut self.write_fields);
+        sort_dedup(&mut self.readonly_arrays);
+        sort_dedup(&mut self.write_arrays);
+        sort_dedup(&mut self.readonly_interiorfields);
+        sort_dedup(&mut self.write_interiorfields);
     }
 }
 
@@ -299,6 +315,49 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
     let canonical = Arc::new(EffectInfoCell::new(effect_info));
     cache.push(canonical.clone());
     canonical
+}
+
+/// Recover the EffectInfo object identity assigned by source translation.
+///
+/// RPython's translated image carries the canonical EffectInfo object itself.
+/// Pyre serializes the image through a build-script process, so references to
+/// that object cross the boundary as a dense id and are rejoined here. The
+/// vector is the direct translated-object table; it is not keyed by descriptor
+/// content and does not duplicate any raw descriptor set.
+fn translated_effect_infos() -> &'static Mutex<Vec<Option<Arc<EffectInfoCell>>>> {
+    static TRANSLATED: LazyLock<Mutex<Vec<Option<Arc<EffectInfoCell>>>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+    &TRANSLATED
+}
+
+pub fn intern_translated_effect_info(
+    translated_id: u32,
+    effect_info: EffectInfo,
+) -> Arc<EffectInfoCell> {
+    let mut translated = translated_effect_infos()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let slot = translated_id as usize;
+    if translated.len() <= slot {
+        translated.resize_with(slot + 1, || None);
+    }
+    if let Some(existing) = &translated[slot] {
+        return existing.clone();
+    }
+    let canonical = Arc::new(EffectInfoCell::new(effect_info));
+    translated[slot] = Some(canonical.clone());
+    canonical
+}
+
+/// Look up an EffectInfo already published from the translated object table.
+/// Call descriptors carry only this dense identity at runtime; the canonical
+/// object itself is loaded once from the frozen EffectInfo artifact.
+pub fn translated_effect_info(translated_id: u32) -> Option<Arc<EffectInfoCell>> {
+    translated_effect_infos()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(translated_id as usize)
+        .and_then(Clone::clone)
 }
 
 /// effectinfo.py:266-269: frozenset_or_none(x)
@@ -1481,6 +1540,49 @@ struct EiCanonKey {
     call_release_gil: ReleaseGilCacheKey,
 }
 
+/// Address-independent image of [`EiCanonKey`] for source translation.
+///
+/// RPython runs `compute_bitstrings` while translating, so descriptor and
+/// EffectInfo object identity are stable inside the translated image. Pyre's
+/// analyzer and runtime are separate processes; the serializable
+/// [`DescrSetKeys`] are the translated-image names of those same descriptor
+/// objects. This key therefore replaces each raw `DescrRef` frozenset with its
+/// structural member set. It is build-time-only data, not a runtime side table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FrozenEiCanonKey {
+    extraeffect: ExtraEffect,
+    oopspecindex: u16,
+    pyre_helper: u8,
+    descr_set_keys: Option<DescrSetKeys>,
+    can_invalidate: bool,
+    can_collect: bool,
+    call_release_gil_site: Option<usize>,
+}
+
+impl FrozenEiCanonKey {
+    fn from_effect_info(ei: &EffectInfo, position: usize) -> Self {
+        Self {
+            extraeffect: ei.extraeffect,
+            oopspecindex: ei.oopspecindex as u16,
+            pyre_helper: ei.pyre_helper as u8,
+            descr_set_keys: ei.descr_set_keys.clone(),
+            can_invalidate: ei.can_invalidate,
+            can_collect: ei.can_collect,
+            // effectinfo.py:144-146 inserts a fresh object into every
+            // release-gil cache key. The stable build-time analogue is the
+            // EI's position in the deterministic descriptor/JitCode walk.
+            call_release_gil_site: (ei.call_release_gil_target.0 != 0).then_some(position),
+        }
+    }
+}
+
+pub struct FrozenBitstringLayout {
+    pub descr_indices: [std::collections::BTreeMap<DescrSetMember, u32>; 3],
+    /// Canonical translated-object identity parallel to the `all_eis` input.
+    /// Ordinary structurally-identical EIs share an id; release-gil EIs do not.
+    pub effect_info_ids: Vec<u32>,
+}
+
 /// Project an Arc-identity raw set to a thin-pointer ptr-id Vec.
 /// Caller's `Vec<DescrRef>` is assumed already canonicalised
 /// (sorted by `Arc::as_ptr`, dedup'd) — the resulting `Vec<usize>`
@@ -1522,6 +1624,164 @@ impl EiCanonKey {
             call_release_gil,
         }
     }
+}
+
+/// Translation-time form of [`compute_bitstrings`] using stable descriptor
+/// keys instead of live `Arc` addresses.
+///
+/// This is the same `effectinfo.py:465-547` partition: for each of fields,
+/// arrays and interior fields, descriptors with identical `(readers, writers)`
+/// membership share one compact `ei_index`, and the most popular classes are
+/// assigned first. The returned maps are the translated-image equivalent of
+/// `descr.ei_index`; a serializer can put each value onto the corresponding
+/// descriptor construction record rather than retaining a runtime side table.
+///
+/// Numeric indices need not match [`compute_bitstrings`]' pointer-address
+/// tie-break. Membership and bit checks do match, while the structural
+/// [`DescrSetMember`] tie-break makes the result reproducible across analyzer
+/// processes.
+pub fn compute_frozen_bitstrings(all_eis: &mut [&mut EffectInfo]) -> FrozenBitstringLayout {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // `frozenset_or_none`: canonical member order is part of neither
+    // semantics nor identity, so normalize it before forming cache keys.
+    for ei in all_eis.iter_mut() {
+        match ei.descr_set_keys.as_mut() {
+            Some(keys) => keys.canonicalize(),
+            None => {
+                ei.readonly_descrs_fields = None;
+                ei.write_descrs_fields = None;
+                ei.readonly_descrs_arrays = None;
+                ei.write_descrs_arrays = None;
+                ei.readonly_descrs_interiorfields = None;
+                ei.write_descrs_interiorfields = None;
+            }
+        }
+    }
+
+    // `EffectInfo._cache`: structurally identical ordinary EIs denote one
+    // object. Release-gil EIs retain one identity per deterministic mint site.
+    let mut canonical_id_for_position = Vec::with_capacity(all_eis.len());
+    let mut first_position_for_shape: BTreeMap<FrozenEiCanonKey, usize> = BTreeMap::new();
+    for (position, ei) in all_eis.iter().enumerate() {
+        let key = FrozenEiCanonKey::from_effect_info(ei, position);
+        let next = first_position_for_shape.len();
+        let canonical_id = *first_position_for_shape.entry(key).or_insert(next);
+        canonical_id_for_position.push(canonical_id);
+    }
+
+    let mut result: [BTreeMap<DescrSetMember, u32>; 3] = std::array::from_fn(|_| BTreeMap::new());
+    for category in 0..3 {
+        let mut category_members = BTreeSet::new();
+        for ei in all_eis.iter() {
+            let Some(keys) = ei.descr_set_keys.as_ref() else {
+                continue;
+            };
+            let (read, write) = pick_key_category(keys, category);
+            category_members.extend(read.iter().cloned());
+            category_members.extend(write.iter().cloned());
+        }
+
+        let mut memberships = Vec::with_capacity(category_members.len());
+        for member in category_members {
+            assert_member_category(&member, category);
+            let mut readers = Vec::new();
+            let mut writers = Vec::new();
+            for (position, ei) in all_eis.iter().enumerate() {
+                let Some(keys) = ei.descr_set_keys.as_ref() else {
+                    continue;
+                };
+                let canonical_id = canonical_id_for_position[position];
+                let (read, write) = pick_key_category(keys, category);
+                if read.binary_search(&member).is_ok() {
+                    readers.push(canonical_id);
+                }
+                if write.binary_search(&member).is_ok() {
+                    writers.push(canonical_id);
+                }
+            }
+            readers.sort_unstable();
+            readers.dedup();
+            writers.sort_unstable();
+            writers.dedup();
+            memberships.push((member, readers, writers));
+        }
+
+        // effectinfo.py:519-526 popularity ordering + mapping.setdefault.
+        memberships.sort_by(|a, b| {
+            (b.1.len() + b.2.len())
+                .cmp(&(a.1.len() + a.2.len()))
+                .then(a.0.cmp(&b.0))
+        });
+        let mut class_indices: BTreeMap<(Vec<usize>, Vec<usize>), u32> = BTreeMap::new();
+        for (member, readers, writers) in memberships {
+            let next = class_indices.len() as u32;
+            let ei_index = *class_indices.entry((readers, writers)).or_insert(next);
+            result[category].insert(member, ei_index);
+        }
+
+        // effectinfo.py:528-538: bitstrings are encoded from the descriptor's
+        // compact class index, exactly as the live-object path does.
+        for ei in all_eis.iter_mut() {
+            let Some(keys) = ei.descr_set_keys.as_ref() else {
+                continue;
+            };
+            let (read, write) = pick_key_category(keys, category);
+            let read_indices: Vec<u32> = read
+                .iter()
+                .map(|member| {
+                    *result[category]
+                        .get(member)
+                        .expect("frozen bitstrings: read member missing from partition")
+                })
+                .collect();
+            let write_indices: Vec<u32> = write
+                .iter()
+                .map(|member| {
+                    *result[category]
+                        .get(member)
+                        .expect("frozen bitstrings: write member missing from partition")
+                })
+                .collect();
+            store_category_bitstrings(
+                ei,
+                category,
+                Some(crate::bitstring::make_bitstring(&read_indices)),
+                Some(crate::bitstring::make_bitstring(&write_indices)),
+            );
+        }
+    }
+    FrozenBitstringLayout {
+        descr_indices: result,
+        effect_info_ids: canonical_id_for_position
+            .into_iter()
+            .map(|id| u32::try_from(id).expect("too many translated EffectInfo identities"))
+            .collect(),
+    }
+}
+
+fn pick_key_category(
+    keys: &DescrSetKeys,
+    category: usize,
+) -> (&Vec<DescrSetMember>, &Vec<DescrSetMember>) {
+    match category {
+        0 => (&keys.readonly_fields, &keys.write_fields),
+        1 => (&keys.readonly_arrays, &keys.write_arrays),
+        2 => (&keys.readonly_interiorfields, &keys.write_interiorfields),
+        _ => unreachable!("frozen bitstrings: invalid category"),
+    }
+}
+
+fn assert_member_category(member: &DescrSetMember, category: usize) {
+    assert!(
+        matches!(
+            (category, member),
+            (0, DescrSetMember::Field { .. })
+                | (1, DescrSetMember::Array { .. })
+                | (2, DescrSetMember::InteriorField { .. })
+        ),
+        "frozen bitstrings: descriptor member is in the wrong category: {member:?}"
+    );
 }
 
 /// `effectinfo.py:465-547` `compute_bitstrings`.
@@ -2076,5 +2336,144 @@ mod compute_bitstrings_tests {
         // f_a appears only in eisetr, f_b only in eisetw → distinct
         // (eisetr, eisetw) class → distinct ei_index.
         assert_ne!(f_a.get_ei_index(), f_b.get_ei_index());
+    }
+
+    fn field_member(struct_id: u64, field_name: &str) -> DescrSetMember {
+        DescrSetMember::Field {
+            struct_id,
+            field_name: field_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn frozen_partition_matches_live_membership_semantics() {
+        let f0 = mk_field(0);
+        let f1 = mk_field(1);
+        let f2 = mk_field(2);
+        let k0 = field_member(10, "a");
+        let k1 = field_member(10, "b");
+        let k2 = field_member(20, "c");
+
+        let make_eis = || {
+            vec![
+                EffectInfo {
+                    _readonly_descrs_fields: Some(vec![f0.clone(), f1.clone()]),
+                    _write_descrs_fields: Some(vec![f2.clone()]),
+                    descr_set_keys: Some(DescrSetKeys {
+                        readonly_fields: vec![k0.clone(), k1.clone()],
+                        write_fields: vec![k2.clone()],
+                        ..DescrSetKeys::default()
+                    }),
+                    ..EffectInfo::default()
+                },
+                EffectInfo {
+                    _readonly_descrs_fields: Some(vec![f0.clone()]),
+                    _write_descrs_fields: Some(vec![f1.clone(), f2.clone()]),
+                    descr_set_keys: Some(DescrSetKeys {
+                        readonly_fields: vec![k0.clone()],
+                        write_fields: vec![k1.clone(), k2.clone()],
+                        ..DescrSetKeys::default()
+                    }),
+                    ..EffectInfo::default()
+                },
+            ]
+        };
+
+        let mut live_eis = make_eis();
+        let mut live_refs: Vec<&mut EffectInfo> = live_eis.iter_mut().collect();
+        compute_bitstrings(&[f0.clone(), f1.clone(), f2.clone()], &mut live_refs);
+
+        let mut frozen_eis = make_eis();
+        let mut frozen_refs: Vec<&mut EffectInfo> = frozen_eis.iter_mut().collect();
+        let frozen_indices = compute_frozen_bitstrings(&mut frozen_refs);
+
+        for (live, frozen) in live_eis.iter().zip(&frozen_eis) {
+            for (descr, member) in [(&f0, &k0), (&f1, &k1), (&f2, &k2)] {
+                let live_index = descr.get_ei_index();
+                let frozen_index = frozen_indices.descr_indices[0][member];
+                assert_eq!(
+                    crate::bitstring::bitcheck(
+                        live.readonly_descrs_fields.as_ref().unwrap(),
+                        live_index,
+                    ),
+                    crate::bitstring::bitcheck(
+                        frozen.readonly_descrs_fields.as_ref().unwrap(),
+                        frozen_index,
+                    )
+                );
+                assert_eq!(
+                    crate::bitstring::bitcheck(
+                        live.write_descrs_fields.as_ref().unwrap(),
+                        live_index,
+                    ),
+                    crate::bitstring::bitcheck(
+                        frozen.write_descrs_fields.as_ref().unwrap(),
+                        frozen_index,
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_partition_is_independent_of_member_input_order() {
+        let ka = field_member(1, "a");
+        let kb = field_member(1, "b");
+        let mut ordered = EffectInfo {
+            descr_set_keys: Some(DescrSetKeys {
+                readonly_fields: vec![ka.clone(), kb.clone()],
+                write_fields: vec![kb.clone()],
+                ..DescrSetKeys::default()
+            }),
+            ..EffectInfo::default()
+        };
+        let mut shuffled = EffectInfo {
+            descr_set_keys: Some(DescrSetKeys {
+                readonly_fields: vec![kb.clone(), ka.clone(), kb.clone()],
+                write_fields: vec![kb],
+                ..DescrSetKeys::default()
+            }),
+            ..EffectInfo::default()
+        };
+
+        let ordered_indices = compute_frozen_bitstrings(&mut [&mut ordered]);
+        let shuffled_indices = compute_frozen_bitstrings(&mut [&mut shuffled]);
+        assert_eq!(
+            ordered_indices.descr_indices,
+            shuffled_indices.descr_indices
+        );
+        assert_eq!(
+            ordered.readonly_descrs_fields,
+            shuffled.readonly_descrs_fields
+        );
+        assert_eq!(ordered.write_descrs_fields, shuffled.write_descrs_fields);
+    }
+
+    #[test]
+    fn frozen_partition_keeps_random_effects_wildcard() {
+        let mut random = EffectInfo {
+            extraeffect: ExtraEffect::RandomEffects,
+            descr_set_keys: None,
+            readonly_descrs_fields: Some(vec![0xff]),
+            write_descrs_fields: Some(vec![0xff]),
+            readonly_descrs_arrays: Some(vec![0xff]),
+            write_descrs_arrays: Some(vec![0xff]),
+            readonly_descrs_interiorfields: Some(vec![0xff]),
+            write_descrs_interiorfields: Some(vec![0xff]),
+            ..EffectInfo::default()
+        };
+        let indices = compute_frozen_bitstrings(&mut [&mut random]);
+        assert!(
+            indices
+                .descr_indices
+                .iter()
+                .all(|category| category.is_empty())
+        );
+        assert!(random.readonly_descrs_fields.is_none());
+        assert!(random.write_descrs_fields.is_none());
+        assert!(random.readonly_descrs_arrays.is_none());
+        assert!(random.write_descrs_arrays.is_none());
+        assert!(random.readonly_descrs_interiorfields.is_none());
+        assert!(random.write_descrs_interiorfields.is_none());
     }
 }

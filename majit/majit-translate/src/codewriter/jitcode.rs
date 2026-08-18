@@ -932,6 +932,11 @@ pub struct BhCallDescr {
     /// RPython `CallDescr.extrainfo` (`descr.py:453`,
     /// `effectinfo.py:13-263`).
     pub extra_info: majit_ir::descr::EffectInfo,
+    /// Object identity assigned by translation after all EffectInfos are
+    /// known. RPython preserves this directly in the translated image; pyre
+    /// carries the dense id across its analyzer/runtime process boundary.
+    #[serde(default)]
+    pub translated_effect_info_id: Option<u32>,
 }
 
 /// Widest `arg_classes` the blackhole's residual-call dispatch table can build
@@ -1006,6 +1011,7 @@ impl BhCallDescr {
             },
             void_word_abi: result_class == 'v' && result_size == 8,
             extra_info: cd.get_extra_info().clone(),
+            translated_effect_info_id: None,
         }
     }
 
@@ -1024,6 +1030,7 @@ impl BhCallDescr {
             result_erased,
             void_word_abi: false,
             extra_info,
+            translated_effect_info_id: None,
         }
     }
 
@@ -1051,6 +1058,7 @@ impl BhCallDescr {
             ),
             void_word_abi: false,
             extra_info,
+            translated_effect_info_id: None,
         }
     }
 

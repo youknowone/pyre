@@ -325,7 +325,7 @@ pub struct UnrollOptimizer {
     pub snapshot_frame_pcs: SnapshotFramePcs,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
-    pub all_descrs: Vec<majit_ir::descr::DescrRef>,
+    pub all_descrs: std::sync::Arc<Vec<majit_ir::descr::DescrRef>>,
     /// compile.py:204-207 / heap.py:807-808 quasi-immutable deps collected
     /// by the phase optimizers for post-compile watcher registration.
     pub quasi_immutable_deps: Vec<(u64, u32)>,
@@ -499,7 +499,7 @@ impl UnrollOptimizer {
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
             snapshot_frame_pcs: Vec::new(),
-            all_descrs: Vec::new(),
+            all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
             phase1_emit_ops: Vec::new(),

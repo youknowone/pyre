@@ -3633,7 +3633,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the outer `UnrollOptimizer` holding an empty vector, which
     /// `compile_loop` then publishes.  Ignore those instead of invalidating
     /// every `descr_index` already serialized into a compiled bridge.
-    pub(crate) fn take_back_all_descrs(&mut self, all_descrs: Vec<DescrRef>) {
+    pub(crate) fn take_back_all_descrs(&mut self, all_descrs: std::sync::Arc<Vec<DescrRef>>) {
         let mut slot = self.staticdata.all_descrs().lock().unwrap();
         if all_descrs.len() >= slot.len() {
             *slot = all_descrs;
@@ -18245,7 +18245,7 @@ impl MetaInterpStaticData {
     /// backing store is `descr_registry::all_descrs()` because `descr_index`
     /// is stamped off the process-wide `GcCache` — see that static's docs for
     /// why the list cannot be per-instance.
-    pub fn all_descrs(&self) -> &'static std::sync::Mutex<Vec<DescrRef>> {
+    pub fn all_descrs(&self) -> &'static std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>> {
         majit_ir::descr_registry::all_descrs()
     }
 
@@ -18631,6 +18631,19 @@ impl MetaInterpStaticData {
     /// same bitstrings (compute_bitstrings's class assignment is
     /// deterministic for a given EI population).
     pub fn finish_setup_descrs(&self) {
+        self.finish_setup_descrs_impl(false);
+    }
+
+    /// Translated-image variant: descriptor `ei_index` values and EffectInfo
+    /// bitstrings were already produced by source translation, as they are in
+    /// RPython's generated binary. Only publish `all_descrs` and its dense
+    /// `descr_index` stamps; rebuilding translation-only raw frozensets here
+    /// would retain a second object graph with no upstream runtime analogue.
+    pub fn finish_setup_descrs_frozen(&self) {
+        self.finish_setup_descrs_impl(true);
+    }
+
+    fn finish_setup_descrs_impl(&self, frozen_bitstrings: bool) {
         // `warmspot.py:289` runs `finish_setup` once, in one process,
         // before any tracing, so its writes onto the shared descrs have a
         // single writer by construction.  Pyre keeps `MetaInterpStaticData`
@@ -18650,7 +18663,7 @@ impl MetaInterpStaticData {
         // the next sequential `descr_index`.  Pyre's descriptor mint
         // sites publish into the same `GcCache` owner, including
         // metainterp call descrs via `GcCache._cache_call`.
-        let all_descrs = majit_ir::descr_registry::snapshot_all();
+        let all_descrs = std::sync::Arc::new(majit_ir::descr_registry::snapshot_all());
 
         // `descr.py:25-47 setup_descrs` assigns sequential `descr_index`
         // to every cached descr in fixed group order (size, field, array,
@@ -18670,6 +18683,11 @@ impl MetaInterpStaticData {
         // Publish onto staticdata.all_descrs so opencoder / bridgeopt /
         // optimizer reads pick up the same length.
         *self.all_descrs().lock().unwrap() = all_descrs.clone();
+
+        if frozen_bitstrings {
+            majit_ir::effectinfo::mark_compute_bitstrings_ran();
+            return;
+        }
 
         // pyjitpl.py:2290 `effectinfo.compute_bitstrings(self.all_descrs)`.
         // Two-pass mutation: clone each distinct call descr EI for the
@@ -22627,7 +22645,7 @@ mod tests {
             frontend_boxes: vec![11, 22],
             liveboxes: vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
             livebox_types: vec![Type::Int, Type::Ref],
-            all_descrs: vec![],
+            all_descrs: std::sync::Arc::new(vec![]),
             cpu: crate::cpu::default_cpu(),
         };
 

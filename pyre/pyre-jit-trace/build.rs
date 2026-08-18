@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v9";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v11";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -29,6 +29,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "descrs_index.bin",
+    "effect_infos.bin",
+    "effect_infos_index.bin",
     "ei_descr_mints.bin",
     "ei_descr_mints_index.bin",
     "field_mint_census.bin",
@@ -69,7 +71,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 ///
 /// What decides the cross-process verdict after these exclusions:
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
-/// `descrs_index.bin`, `ei_descr_mints.bin`, `ei_descr_mints_index.bin`,
+/// `descrs_index.bin`, `effect_infos_index.bin`, `ei_descr_mints.bin`,
+/// `ei_descr_mints_index.bin`,
 /// `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
@@ -88,6 +91,7 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jitcodes.bin",
     "indirectcalltargets.bin",
     "descrs.bin",
+    "effect_infos.bin",
     "fnaddr_bindings.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
@@ -258,6 +262,12 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
         bincode::serialize(&(vec![0_u32], Vec::<u8>::new())).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(format!("{out_dir}/effect_infos.bin"), b"").unwrap();
+    std::fs::write(
+        format!("{out_dir}/effect_infos_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), b"").unwrap();
@@ -980,8 +990,129 @@ fn real_main() {
 
         std::fs::write(format!("{out_dir}/jit_trace_gen.rs"), &code).unwrap();
 
+        // RPython runs effectinfo.compute_bitstrings during translation and
+        // puts both outputs directly into the translated image: compact
+        // bitstrings on each EffectInfo and `ei_index` on each descriptor.
+        // Pyre's analyzer is a build-script process, so freeze that same
+        // object graph into the serialized image before crossing the process
+        // boundary. Keep the live pipeline untouched: trace-code generation
+        // above consumes its Arc identities, while these clones are solely the
+        // translated constants written below.
+        let mut frozen_descrs = pipeline.descrs.clone();
+        let mut frozen_jitcodes: Vec<std::sync::Arc<majit_translate::jitcode::JitCode>> = pipeline
+            .jitcodes
+            .iter()
+            .map(|jitcode| std::sync::Arc::new((**jitcode).clone()))
+            .collect();
+        let mut frozen_mints = pipeline.ei_descr_mints.clone();
+        let mut call_descrs: Vec<&mut majit_translate::jitcode::BhCallDescr> = Vec::new();
+        for descr in &mut frozen_descrs {
+            match descr {
+                majit_translate::jitcode::BhDescr::Call { calldescr }
+                | majit_translate::jitcode::BhDescr::JitCode { calldescr, .. } => {
+                    call_descrs.push(calldescr)
+                }
+                _ => {}
+            }
+        }
+        for jitcode in &mut frozen_jitcodes {
+            call_descrs.push(
+                &mut std::sync::Arc::get_mut(jitcode)
+                    .expect("fresh frozen JitCode clone is unexpectedly shared")
+                    .body_mut()
+                    .calldescr,
+            );
+        }
+        // `effectinfo.compute_bitstrings(self.cpu.setup_descrs())` sees every
+        // CallDescr in GcCache, not only the subset an opcode or JitCode body
+        // happens to serialize. Include that full call group so descriptors
+        // minted by a non-opcode call still receive their upstream partition.
+        // The serialized BhCallDescr copies below are appended only so their
+        // translated object ids and bitstrings are written in place; ordinary
+        // duplicates collapse through EffectInfo._cache identity.
+        let mut cached_effect_infos: Vec<majit_ir::EffectInfo> = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            .snapshot_calls()
+            .into_iter()
+            .filter_map(|descr| {
+                descr.as_call_descr().map(|call| {
+                    let mut effect_info = call.get_extra_info().clone();
+                    // The frozen partition reads `descr_set_keys` plus scalar
+                    // EI metadata. Drop its live-object frozenset projection
+                    // immediately instead of retaining a second cumulative
+                    // Arc graph until codegen ends. Serialized BhCallDescrs
+                    // below keep their own complete values.
+                    effect_info._readonly_descrs_fields = None;
+                    effect_info._write_descrs_fields = None;
+                    effect_info._readonly_descrs_arrays = None;
+                    effect_info._write_descrs_arrays = None;
+                    effect_info._readonly_descrs_interiorfields = None;
+                    effect_info._write_descrs_interiorfields = None;
+                    effect_info.single_write_descr_array = None;
+                    effect_info.extradescrs = None;
+                    effect_info
+                })
+            })
+            .collect();
+        let cached_effect_info_count = cached_effect_infos.len();
+        let frozen_layout = {
+            let mut effect_infos: Vec<&mut majit_ir::EffectInfo> =
+                cached_effect_infos.iter_mut().collect();
+            effect_infos.extend(
+                call_descrs
+                    .iter_mut()
+                    .map(|calldescr| &mut calldescr.extra_info),
+            );
+            majit_ir::effectinfo::compute_frozen_bitstrings(&mut effect_infos)
+        };
+        let serialized_effect_info_ids: Vec<u32> = frozen_layout
+            .effect_info_ids
+            .iter()
+            .copied()
+            .skip(cached_effect_info_count)
+            .collect();
+        assert_eq!(call_descrs.len(), serialized_effect_info_ids.len());
+        let mut frozen_effect_infos = std::collections::BTreeMap::new();
+        for (calldescr, effect_info_id) in call_descrs
+            .into_iter()
+            .zip(serialized_effect_info_ids.into_iter())
+        {
+            calldescr.translated_effect_info_id = Some(effect_info_id);
+            frozen_effect_infos
+                .entry(effect_info_id)
+                .or_insert_with(|| calldescr.extra_info.clone());
+            // The translated image stores one EffectInfo object and lets every
+            // CallDescr point at it. Keep BhCallDescr's host-side field for
+            // codewriter use, but serialize only this inert placeholder once
+            // the dense identity above has been assigned.
+            calldescr.extra_info = majit_ir::EffectInfo::MOST_GENERAL.clone();
+        }
+        for entry in &mut frozen_mints {
+            let category = match &entry.member {
+                majit_ir::effectinfo::DescrSetMember::Field { .. } => 0,
+                majit_ir::effectinfo::DescrSetMember::Array { .. } => 1,
+                majit_ir::effectinfo::DescrSetMember::InteriorField { .. } => 2,
+            };
+            // A descriptor can be minted while write-analysis is still
+            // assembling a concrete EI and then survive in GcCache after a
+            // later unrepresentable member degrades that EI to
+            // EF_RANDOM_EFFECTS. `setup_descrs()` still enumerates it, while
+            // effectinfo.py:496 leaves its `ei_index = sys.maxint` because no
+            // final raw frozenset names it. Preserve that sentinel instead of
+            // pretending the mint log is exactly the final raw-set union.
+            entry.ei_index = frozen_layout.descr_indices[category]
+                .get(&entry.member)
+                .copied()
+                .unwrap_or(u32::MAX);
+        }
+
         // JSON metadata for debugging
-        let json = serde_json::to_string_pretty(&pipeline).unwrap();
+        let mut frozen_pipeline = pipeline.clone();
+        frozen_pipeline.descrs = frozen_descrs.clone();
+        frozen_pipeline.jitcodes = frozen_jitcodes.clone();
+        frozen_pipeline.ei_descr_mints = frozen_mints.clone();
+        let json = serde_json::to_string_pretty(&frozen_pipeline).unwrap();
         std::fs::write(format!("{out_dir}/jit_metadata.json"), &json).unwrap();
 
         // Persist `pipeline.jitcodes` (RPython `all_jitcodes` from
@@ -991,10 +1122,10 @@ fn real_main() {
         // RPython `warmspot.py:281-282` `self.metainterp_sd.jitcodes =
         // codewriter.make_jitcodes()`.
         let mut jitcodes_bin = Vec::new();
-        let mut jitcode_names = Vec::with_capacity(pipeline.jitcodes.len());
-        let mut jitcode_offsets = Vec::with_capacity(pipeline.jitcodes.len() + 1);
+        let mut jitcode_names = Vec::with_capacity(frozen_jitcodes.len());
+        let mut jitcode_offsets = Vec::with_capacity(frozen_jitcodes.len() + 1);
         jitcode_offsets.push(0_u32);
-        for jitcode in &pipeline.jitcodes {
+        for jitcode in &frozen_jitcodes {
             jitcode_names.push(jitcode.name.clone());
             jitcodes_bin.extend(bincode::serialize(jitcode).unwrap());
             jitcode_offsets.push(
@@ -1068,10 +1199,10 @@ fn real_main() {
         // table shape upstream gets from translation-time constants without
         // reconstituting every descriptor in this process.
         let mut descrs_bin = Vec::new();
-        let mut descr_offsets = Vec::with_capacity(pipeline.descrs.len() + 1);
-        let mut descr_kinds = Vec::with_capacity(pipeline.descrs.len());
+        let mut descr_offsets = Vec::with_capacity(frozen_descrs.len() + 1);
+        let mut descr_kinds = Vec::with_capacity(frozen_descrs.len());
         descr_offsets.push(0_u32);
-        for descr in &pipeline.descrs {
+        for descr in &frozen_descrs {
             // `GcCache.setup_descrs` publishes structural descriptors before
             // call descriptors.  Persist that two-pass classification beside
             // the dense offsets so runtime can preserve the ordering without
@@ -1089,14 +1220,37 @@ fn real_main() {
                     .expect("serialized descrs.bin exceeds the u32 offset range"),
             );
         }
-        assert_eq!(descr_offsets.len(), pipeline.descrs.len() + 1);
-        assert_eq!(descr_kinds.len(), pipeline.descrs.len());
+        assert_eq!(descr_offsets.len(), frozen_descrs.len() + 1);
+        assert_eq!(descr_kinds.len(), frozen_descrs.len());
         assert_eq!(descr_offsets.first().copied(), Some(0));
         assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
         assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
         let descrs_index_bin = bincode::serialize(&(descr_offsets, descr_kinds)).unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
+
+        // RPython's translated constants preserve EffectInfo object identity:
+        // thousands of CallDescrs point at a small canonical object table.
+        // Keep the same ownership instead of repeating each EffectInfo inside
+        // every BhCallDescr wire record. Entries stay independently decodable
+        // so runtime setup drops their structural key strings immediately.
+        let mut effect_infos_bin = Vec::new();
+        let mut effect_info_offsets = Vec::with_capacity(frozen_effect_infos.len() + 1);
+        effect_info_offsets.push(0_u32);
+        for (translated_id, effect_info) in &frozen_effect_infos {
+            effect_infos_bin.extend(bincode::serialize(&(*translated_id, effect_info)).unwrap());
+            effect_info_offsets.push(
+                u32::try_from(effect_infos_bin.len())
+                    .expect("serialized effect_infos.bin exceeds the u32 offset range"),
+            );
+        }
+        let effect_infos_index_bin = bincode::serialize(&effect_info_offsets).unwrap();
+        std::fs::write(format!("{out_dir}/effect_infos.bin"), &effect_infos_bin).unwrap();
+        std::fs::write(
+            format!("{out_dir}/effect_infos_index.bin"),
+            &effect_infos_index_bin,
+        )
+        .unwrap();
 
         // `MAJIT_MINT_INDEX_CENSUS=1`: how many `fielddescrof` mints resolved a
         // slot for `index_in_parent`, and how many carried out the `0` they were
@@ -1131,9 +1285,9 @@ fn real_main() {
         // spec at a time instead of retaining all member/spec strings at the
         // peak of first-JIT setup.
         let mut ei_descr_mints_bin = Vec::new();
-        let mut ei_descr_mint_offsets = Vec::with_capacity(pipeline.ei_descr_mints.len() + 1);
+        let mut ei_descr_mint_offsets = Vec::with_capacity(frozen_mints.len() + 1);
         ei_descr_mint_offsets.push(0_u32);
-        for entry in &pipeline.ei_descr_mints {
+        for entry in &frozen_mints {
             ei_descr_mints_bin.extend(bincode::serialize(entry).unwrap());
             ei_descr_mint_offsets.push(
                 u32::try_from(ei_descr_mints_bin.len())

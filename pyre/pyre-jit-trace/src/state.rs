@@ -276,7 +276,7 @@ impl MetaInterpStaticData {
         // (`MetaInterpStaticData::all_descrs`), or `bridgeopt.py:155
         // metainterp_sd.all_descrs[descr_index]` indexes an empty list.
         if !was_done {
-            self.canonical.finish_setup_descrs();
+            self.canonical.finish_setup_descrs_frozen();
         }
     }
 

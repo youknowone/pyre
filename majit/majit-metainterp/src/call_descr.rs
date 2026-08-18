@@ -689,6 +689,31 @@ pub fn make_call_descr_sized_with_effect(
     )
 }
 
+/// Deserialized translated-image variant. `translated_effect_info_id` is the
+/// identity of RPython's canonical EffectInfo object, carried explicitly
+/// because pyre's build script and runtime do not share object addresses.
+pub fn make_call_descr_sized_with_translated_effect(
+    arg_types: &[Type],
+    result_type: Type,
+    result_signed: bool,
+    result_size: usize,
+    translated_effect_info_id: u32,
+) -> DescrRef {
+    let effect_info = majit_ir::effectinfo::translated_effect_info(translated_effect_info_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "translated EffectInfo {translated_effect_info_id} was not published before its CallDescr"
+            )
+        });
+    make_call_descr_sized_with_cell(
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+        effect_info,
+    )
+}
+
 fn make_call_descr_sized(
     arg_types: &[Type],
     result_type: Type,
@@ -724,6 +749,22 @@ fn make_call_descr_sized(
     // targets bypass the interner with a fresh cell, matching the `object()`
     // cache breaker at effectinfo.py:144-146.
     let effect_info = majit_ir::effectinfo::intern_effect_info(effect_info);
+    make_call_descr_sized_with_cell(
+        arg_types,
+        result_type,
+        result_signed,
+        result_size,
+        effect_info,
+    )
+}
+
+fn make_call_descr_sized_with_cell(
+    arg_types: &[Type],
+    result_type: Type,
+    result_signed: bool,
+    result_size: usize,
+    effect_info: Arc<majit_ir::effectinfo::EffectInfoCell>,
+) -> DescrRef {
     let key = majit_ir::descr::LLType::func_key(
         arg_types,
         result_type,

@@ -5980,6 +5980,7 @@ mod tests {
             result_erased: crate::jitcode::CallResultErasedKey::Unsigned,
             void_word_abi: false,
             extra_info: effect.clone(),
+            translated_effect_info_id: None,
         };
         let raw_address = crate::jitcode::BhCallDescr {
             arg_classes: "i".to_string(),
@@ -5989,6 +5990,7 @@ mod tests {
             result_erased: crate::jitcode::CallResultErasedKey::Address,
             void_word_abi: false,
             extra_info: effect,
+            translated_effect_info_id: None,
         };
 
         assert_eq!(single_float.result_type, 'S');

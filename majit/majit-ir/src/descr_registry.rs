@@ -166,10 +166,11 @@ pub fn snapshot_all() -> Vec<DescrRef> {
 ///
 /// `MetaInterpStaticData::all_descrs()` is the accessor; nothing else should
 /// reach in here directly.
-static ALL_DESCRS: std::sync::Mutex<Vec<DescrRef>> = std::sync::Mutex::new(Vec::new());
+static ALL_DESCRS: std::sync::LazyLock<std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::sync::Arc::new(Vec::new())));
 
 /// Handle to the process-wide `all_descrs` list documented on [`ALL_DESCRS`].
-pub fn all_descrs() -> &'static std::sync::Mutex<Vec<DescrRef>> {
+pub fn all_descrs() -> &'static std::sync::Mutex<std::sync::Arc<Vec<DescrRef>>> {
     &ALL_DESCRS
 }
 
