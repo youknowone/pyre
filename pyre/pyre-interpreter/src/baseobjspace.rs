@@ -12843,9 +12843,18 @@ pub fn call_args_and_c_profile_args(
             // stash already holds the original OperationError; if
             // c_exception_trace raises, overwrite the stash so the
             // tracer error is what propagates.
-            if let Err(trace_err) = unsafe {
+            // The bare `raise` re-raises the error the call left pending, so it
+            // has to outlive the hook — and the hook runs Python, whose every
+            // call resets the one-cell stash.  Park it where the collector
+            // still walks it for the duration.
+            let parked = crate::call::park_call_error();
+            let traced = unsafe {
                 (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
-            } {
+            };
+            if parked {
+                crate::call::unpark_call_error();
+            }
+            if let Err(trace_err) = traced {
                 crate::call::set_call_error(trace_err);
             }
         }
