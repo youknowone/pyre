@@ -895,8 +895,23 @@ struct LabelResumeData {
     ref_slots: usize,
 }
 
+/// Where one inlined bridge region starts in a merged analysis stream, and
+/// which value ids carry that region's own live-ins.
+struct InlinedRegionSpan {
+    ops_start: usize,
+    inputarg_ids: Vec<u32>,
+}
+
 impl LabelResumeData {
     fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        Self::collect_with_regions(inputargs, ops, &[])
+    }
+
+    fn collect_with_regions(
+        inputargs: &[InputArg],
+        ops: &[Op],
+        regions: &[InlinedRegionSpan],
+    ) -> Self {
         let (_, num_vars) = collect_guards_and_vars(inputargs, ops);
         let ref_values = RefValues::collect(inputargs, ops);
         let normal_value_slots = normal_frame_value_slots(inputargs, ops);
@@ -961,6 +976,24 @@ impl LabelResumeData {
                     && let Some(v) = available.get_mut(r.raw() as usize)
                 {
                     *v = true;
+                }
+            }
+            // An appended region's live-ins reach it only through the
+            // guard-fail branch that is the region's sole predecessor, and that
+            // branch assigns them. Nothing the entry dispatch can land on
+            // reaches a region's first read without passing it, so those ids
+            // are dead until written here. Treating them as live would reserve
+            // one frozen-frame slot per region live-in at every resumable
+            // label, and the resume loader would reload a value the guard
+            // overwrites before anything reads it.
+            for region in regions {
+                if region.ops_start <= label_pos {
+                    continue;
+                }
+                for &id in &region.inputarg_ids {
+                    if let Some(v) = available.get_mut(id as usize) {
+                        *v = true;
+                    }
                 }
             }
 
@@ -2289,12 +2322,20 @@ pub fn build_wasm_module(
     let mut merged_inputargs = Vec::new();
     let mut merged_ops = Vec::new();
     let mut gc_table_bases = HashMap::new();
+    let mut region_spans: Vec<InlinedRegionSpan> = Vec::new();
     let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
     } else {
         merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
         merged_ops.extend(ops.iter().cloned());
         for bridge in inlined_bridges {
+            // Taken before this region's ops are appended, so it names the
+            // first op of the region. `fresh_value_copy` keeps `index`, so the
+            // ids recorded here are the ids the merged stream reads.
+            region_spans.push(InlinedRegionSpan {
+                ops_start: merged_ops.len(),
+                inputarg_ids: bridge.inputargs.iter().map(|ia| ia.index).collect(),
+            });
             merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
             for op in &bridge.ops {
                 if op.opcode == OpCode::LoadFromGcTable {
@@ -2383,7 +2424,8 @@ pub fn build_wasm_module(
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let label_resume = LabelResumeData::collect(&analysis_inputargs, &analysis_ops);
+    let label_resume =
+        LabelResumeData::collect_with_regions(&analysis_inputargs, &analysis_ops, &region_spans);
     let max_value_slots =
         normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
@@ -3039,8 +3081,13 @@ fn build_function(
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
     // because store-on-def writes them only later.
+    // The loop below fills `entry_inputargs`, not every arg of the merged
+    // stream: an appended region's live-ins are stored by the guard-fail branch
+    // that reaches the region, which is nowhere near this entry. Marking those
+    // homes filled here would skip their clear and leave the collector reading
+    // an uninitialised slot.
     let mut input_filled_home = vec![false; ref_homes.len()];
-    for ia in inputargs {
+    for ia in entry_inputargs {
         if let Some(h) = ref_homes.home_id(ia.index) {
             input_filled_home[h as usize] = true;
         }
