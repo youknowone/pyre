@@ -773,6 +773,11 @@ pub unsafe fn isinstance_dict_w(obj: PyObjectRef) -> bool {
 /// `w_derived.__bases__` looking for an identity match with `w_cls`.
 /// Recursion is bounded by avoiding the last entry of each `__bases__`
 /// tuple — that one is followed by re-entering the loop.
+///
+/// `@jit.unroll_safe` (abstractinst.py:128): the `__bases__` walk is a loop, so
+/// `look_inside_graph` drops the graph from the candidate set and mints
+/// no jitcode for it; every call then stays an opaque residual.
+#[majit_macros::unroll_safe]
 pub(crate) fn p_abstract_issubclass_w(
     w_derived: PyObjectRef,
     w_cls: PyObjectRef,
@@ -837,6 +842,11 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
 /// Handles tuple/union recursion, the `__instancecheck__` override
 /// looked up via `space.lookup(w_klass_or_tuple, "__instancecheck__")`,
 /// then the abstract `__class__`/`__bases__` walk.
+///
+/// `@jit.unroll_safe` (abstractinst.py:87): the tuple/union classinfo walk is a loop, so
+/// `look_inside_graph` drops the graph from the candidate set and mints
+/// no jitcode for it; every call then stays an opaque residual.
+#[majit_macros::unroll_safe]
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
     // Python frame push, so guard the C stack here or a deep classinfo
@@ -921,6 +931,11 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// `abstract_issubclass_w(space, w_derived, w_klass_or_tuple, allow_override=True)`.
 /// Tuple/union recursion, `__subclasscheck__` override looked up on
 /// `type(classinfo)`, then the abstract `__bases__` walk.
+///
+/// `@jit.unroll_safe` (abstractinst.py:164): the tuple/union classinfo walk is a loop, so
+/// `look_inside_graph` drops the graph from the candidate set and mints
+/// no jitcode for it; every call then stays an opaque residual.
+#[majit_macros::unroll_safe]
 pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
     // Python frame push, so guard the C stack here or a deep classinfo
