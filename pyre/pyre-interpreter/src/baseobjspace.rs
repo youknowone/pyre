@@ -18982,11 +18982,25 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         return;
     }
 
-    let qualname = unsafe { w_generator_get_qualname(async_gen) };
+    // `py_repr_wtf8` and `warn_category_w` both run Python and are therefore
+    // collection points.  `async_gen` and its qualname are plain Rust locals,
+    // which no root walker scans, so pin them on the shadow stack and read
+    // them back at every use past this point.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let async_gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(async_gen);
+
+    let qualname = unsafe {
+        w_generator_get_qualname(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
+    };
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(qualname);
     let method_repr = unsafe { crate::display::py_repr_wtf8(w_str_new(method)) }
         .unwrap_or_else(|_| Wtf8Buf::from_string(format!("'{method}'")));
-    let qualname_repr = unsafe { crate::display::py_repr_wtf8(qualname) }
-        .unwrap_or_else(|_| Wtf8Buf::from_string("'<unknown>'".to_owned()));
+    let qualname_repr = unsafe {
+        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(qualname_slot))
+    }
+    .unwrap_or_else(|_| Wtf8Buf::from_string("'<unknown>'".to_owned()));
     let message = crate::display::wtf8_format!(
         "coroutine method ",
         method_repr,
@@ -18996,13 +19010,19 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
     );
     let w_message = w_str_from_wtf8(message);
     if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
-        let repr = unsafe { crate::display::py_repr_wtf8(async_gen) }
-            .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
+        let repr = unsafe {
+            crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
+        }
+        .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
         let where_desc = crate::display::wtf8_format!(
             "Exception ignored while finalizing async generator ",
             repr
         );
-        err.write_unraisable(w_none(), &where_desc, async_gen);
+        err.write_unraisable(
+            w_none(),
+            &where_desc,
+            pyre_object::gc_roots::shadow_stack_get(async_gen_slot),
+        );
     }
 }
 
@@ -19839,7 +19859,13 @@ mod tests {
         assert!(result.is_null());
         let error = crate::call::take_call_error().expect("non-iterable *args error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
-        assert!(error.message_text().contains("argument after *"));
+        // Not the bare `argument after *`, which is a prefix of the `**`
+        // message and would pass on either error.
+        assert!(
+            error
+                .message_text()
+                .contains("argument after * must be an iterable")
+        );
 
         crate::call::clear_call_error();
         let result = call(dict_type, w_tuple_new(Vec::new()), Some(w_none()));

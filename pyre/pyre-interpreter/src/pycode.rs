@@ -1310,10 +1310,16 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         // CPython 3.14 `code_getlnotab`: issue the warning before decoding or
         // allocating the bytes result, and propagate warnings-as-errors.
         unsafe { require_code(obj, name)? };
+        // Warning dispatch can run arbitrary Python, so it is a collection
+        // point.  `obj` arrives as a plain Rust local, which no root walker
+        // scans: pin it on the shadow stack and read it back afterwards, then
+        // reacquire the immutable CodeObject view rather than retaining a Rust
+        // borrow across the re-entrant boundary.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(obj);
         crate::warn::warn_deprecation("co_lnotab is deprecated, use co_lines instead.")?;
-        // Warning dispatch can run arbitrary Python.  Reacquire the immutable
-        // CodeObject view after that call rather than retaining a Rust borrow
-        // across the re-entrant boundary.
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let code = unsafe { require_code(obj, name)? };
         return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
             &legacy_lnotab(code, unsafe {

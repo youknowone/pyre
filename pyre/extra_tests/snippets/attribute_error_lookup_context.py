@@ -16,6 +16,8 @@ try:
 except AttributeError as exc:
     assert exc.name is name
     assert exc.obj is empty
+else:
+    raise AssertionError("getattr on a raising __getattr__ must fail")
 
 
 class ExplicitNone:
@@ -28,6 +30,8 @@ try:
 except AttributeError as exc:
     assert exc.name is None
     assert exc.obj is None
+else:
+    raise AssertionError("an explicit AttributeError must propagate")
 
 
 class InnerLookup:
@@ -40,3 +44,5 @@ try:
 except AttributeError as exc:
     assert exc.name == "appnd"
     assert exc.obj is list
+else:
+    raise AssertionError("the inner lookup must fail and win the context")
