@@ -6104,9 +6104,12 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => getattr_str(obj, s),
-        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        getattr_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
+    } else {
+        unsafe { getattr_surrogate(obj, w_name, name) }
     }
 }
 
@@ -6121,9 +6124,15 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => getattr_str_impl(obj, s, true, true),
-        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        getattr_str_impl(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            true,
+            true,
+        )
+    } else {
+        unsafe { getattr_surrogate(obj, w_name, name) }
     }
 }
 
@@ -6136,9 +6145,14 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => setattr_str(obj, s, value),
-        Err(_) => unsafe { setattr_surrogate(obj, w_name, name, value) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        setattr_str(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            value,
+        )
+    } else {
+        unsafe { setattr_surrogate(obj, w_name, name, value) }
     }
 }
 
@@ -6151,9 +6165,12 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => delattr_str(obj, s),
-        Err(_) => unsafe { delattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        delattr_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
+    } else {
+        unsafe { delattr_surrogate(obj, w_name, name) }
     }
 }
 

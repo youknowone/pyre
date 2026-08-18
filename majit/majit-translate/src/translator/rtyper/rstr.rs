@@ -58,10 +58,10 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
     build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
-    build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
-    build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
-    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph, const_str_cache_llstr,
-    null_str_ptr,
+    build_ll_stringslice_helper_graph, build_ll_stritem_checked_helper_graph,
+    build_ll_stritem_helper_graph, build_ll_stritem_nonneg_checked_helper_graph,
+    build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
+    build_ll_unichr2str_helper_graph, const_str_cache_llstr, null_str_ptr,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
@@ -265,6 +265,11 @@ impl Repr for StringRepr {
     /// constant `'None'`.
     fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_str(self, hop, "ll_str", STRPTR.clone())
+    }
+
+    /// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`).
+    fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_getslice(self, hop, "ll_stringslice", STRPTR.clone())
     }
 
     /// RPython `AbstractStringRepr.rtype_method_*` dispatch table
@@ -558,6 +563,12 @@ impl Repr for UnicodeRepr {
     /// the unicode-specialised helper graph.
     fn rtype_int(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_int(self, hop, "ll_unicode_int", UNICODEPTR.clone())
+    }
+
+    /// Inherited `AbstractStringRepr.rtype_getslice`, specialized to
+    /// `Ptr(UNICODE)` and the unicode helper family.
+    fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_getslice(self, hop, "ll_unicode_slice", UNICODEPTR.clone())
     }
 
     /// RPython `AbstractUnicodeRepr.rtype_method_*` dispatch table
@@ -2806,6 +2817,40 @@ fn rtype_abstract_string_method_findlike_char(
     hop.gendirectcall(&helper, vec![v_str, v_ch, v_start, v_end])
 }
 
+/// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`).
+fn rtype_abstract_string_getslice(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_prefix: &str,
+    ptr_lltype: LowLevelType,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::SliceKind;
+
+    let v_str = hop.inputarg(ConvertedTo::Repr(self_repr), 0)?;
+    let (kind, mut bounds) = hop.decompose_slice_args()?;
+    let suffix = match kind {
+        SliceKind::MinusOne => "minusone",
+        SliceKind::StartOnly => "startonly",
+        SliceKind::StartStop => "startstop",
+    };
+    let helper_name = format!("{helper_prefix}_{suffix}");
+    let mut arg_types = vec![ptr_lltype.clone()];
+    arg_types.extend((0..bounds.len()).map(|_| LowLevelType::Signed));
+    let name_for_builder = helper_name.clone();
+    let ptr_for_builder = ptr_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name,
+        arg_types,
+        ptr_lltype,
+        move |rtyper, _args, _result| {
+            build_ll_stringslice_helper_graph(rtyper, &name_for_builder, ptr_for_builder, kind)
+        },
+    )?;
+    let mut args = vec![v_str];
+    args.append(&mut bounds);
+    hop.gendirectcall(&helper, args)
+}
+
 // ____________________________________________________________
 // Shared single-cast hash helper synthesizer — used by both CharRepr
 // and UniCharRepr since their helper graphs are structurally identical
@@ -3383,6 +3428,115 @@ fn build_ll_charlike_hash_helper_graph(
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
+
+    /// `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`) selects the
+    /// start/stop helper and preserves string representation on the result.
+    #[test]
+    fn string_repr_rtype_getslice_emits_stringslice_helpers() {
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_str: Arc<dyn Repr> = string_repr();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let string = Variable::new();
+        string.set_concretetype(Some(STRPTR.clone()));
+        let start = Variable::new();
+        start.set_concretetype(Some(LowLevelType::Signed));
+        let stop = Variable::new();
+        stop.set_concretetype(Some(LowLevelType::Signed));
+        let result = Variable::new();
+        let args = vec![
+            Hlvalue::Variable(string),
+            Hlvalue::Variable(start),
+            Hlvalue::Variable(stop),
+        ];
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new("getslice", args.clone(), Hlvalue::Variable(result)),
+            Vec::new(),
+            llops,
+        );
+        hop.args_v.borrow_mut().extend(args);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_str.clone()), Some(r_int.clone()), Some(r_int)]);
+        *hop.r_result.borrow_mut() = Some(r_str);
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("string getslice must rtype")
+            .expect("string getslice returns a variable");
+        assert_eq!(
+            hop.llops
+                .borrow()
+                .ops
+                .iter()
+                .filter(|op| op.opname == "direct_call")
+                .count(),
+            1
+        );
+        let names = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .map(|graph| graph.borrow().name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "ll_stringslice_startstop"));
+        assert!(names.iter().any(|name| name == "_ll_stringslice"));
+
+        let wrapper = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|graph| graph.borrow().name == "ll_stringslice_startstop")
+            .cloned()
+            .expect("startstop wrapper graph");
+        let wrapper = wrapper.borrow();
+        assert!(matches!(
+            wrapper.startblock.borrow().exitswitch,
+            Some(Hlvalue::Constant(ref c))
+                if c.value == ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID)
+        ));
+        let branch_ops = wrapper
+            .startblock
+            .borrow()
+            .exits
+            .iter()
+            .map(|link| {
+                link.borrow()
+                    .target
+                    .as_ref()
+                    .expect("branch target")
+                    .borrow()
+                    .operations
+                    .first()
+                    .expect("branch comparison")
+                    .opname
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(branch_ops.contains(&"int_gt".to_string()));
+        assert!(branch_ops.contains(&"int_ge".to_string()));
+    }
 
     #[test]
     fn str_decode_utf8_decodes_valid_utf8_and_rejects_invalid_bytes() {

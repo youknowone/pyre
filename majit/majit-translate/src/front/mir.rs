@@ -1427,6 +1427,9 @@ fn derive_program_metadata(
                 // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 let is_rbigint = name == "rbigint::RBigInt" || name.ends_with("::rbigint::RBigInt");
+                let is_tuple_object = leaf == "W_TupleObject"
+                    && (name == "tupleobject::W_TupleObject"
+                        || name.ends_with("::tupleobject::W_TupleObject"));
                 let rows: Vec<(String, String)> = fields
                     .iter()
                     .enumerate()
@@ -1443,6 +1446,16 @@ fn derive_program_metadata(
                         // field offset/size to the backend.
                         let field_ty = if is_rbigint && fname == "_digits" {
                             "[i64]".to_string()
+                        } else if is_tuple_object && fname == "wrappeditems" {
+                            // tupleobject.py:376-390: wrappeditems is the
+                            // immutable `list` / translated
+                            // `GcArray(OBJECTPTR)`. Rust's `*mut ItemsBlock`
+                            // is only its physical storage spelling; exposing
+                            // that wrapper makes getitem dispatch on a
+                            // classdef-less instance. Preserve the upstream
+                            // field shape while Charon's ExactLayout continues
+                            // to provide the real pointer-sized offset.
+                            "[*mut PyObject]".to_string()
                         } else {
                             tyref_to_ast_string(&f.ty, llbc)
                         };
@@ -2148,6 +2161,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
@@ -2161,6 +2175,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_range_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_range_sites(
+                &mut lo.graph,
+                &lo.slice_index_range_sites,
+            );
+        }
         if !lo.slice_index_rangeto_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangeto_sites(
                 &mut lo.graph,
@@ -2953,6 +2973,10 @@ struct Lowering<'a> {
     /// recognizer. The end's unsigned coloring is captured from MIR here,
     /// before the operand can become a block inputarg.
     slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
+    /// Full `Range { start, end }` aggregates retained for the orthodox
+    /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
+    /// `range_iter` candidate; both passes are consumer-gated.
+    slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -3186,6 +3210,7 @@ impl<'a> Lowering<'a> {
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
+            slice_index_range_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -4924,6 +4949,13 @@ impl<'a> Lowering<'a> {
                             start: arg_vars[0].clone(),
                             end: arg_vars[1].clone(),
                         });
+                    self.slice_index_range_sites.push(
+                        crate::front::slice_index::SliceIndexRangeSite {
+                            range_result: res.clone(),
+                            start: arg_vars[0].clone(),
+                            end: arg_vars[1].clone(),
+                        },
+                    );
                 }
                 if owner_path.as_slice() == ["core", "ops", "range"]
                     && ctor_name == "RangeTo"
@@ -7235,6 +7267,9 @@ impl<'a> Lowering<'a> {
                     && (self.is_workspace_index_call(&reg)
                         || (self.is_vec_index_call(&reg)
                             && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
+                        || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                            && (!self.is_slice_scalar_index_mut_call(&reg)
                                 || add_dest_used_only_as_single_deref(self.body, dest_local))))
                 {
                     let res = self
@@ -7920,9 +7955,35 @@ impl<'a> Lowering<'a> {
                 // allocation, not an alias of the source.)
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
+                } else if args.len() == 2
+                    && crate::front::str_find::is_rpython_str_slice_prefix(&segments)
+                {
+                    // PyPy's `name[:dotindex]` reaches ordinary
+                    // `rtype_getslice`.  Rust's core string index body is
+                    // opaque to Charon, so route the exact interpreter
+                    // compatibility helper through the existing marker that
+                    // becomes `getslice(s, 0, stop)` after annotation.
+                    (vec!["__getslice_rangeto".to_string()], None)
                 } else {
                     (segments, method_hint)
                 };
+                // PyPy's `__import__` fast path uses the signed
+                // `str.find` operation directly.  Replace the
+                // interpreter's native compatibility helper with that same
+                // existing RPython method lowering.
+                if crate::front::str_find::is_rpython_str_find_char(&segments) {
+                    let index = crate::front::str_find::emit_rpython_str_find_char(
+                        &mut self.graph,
+                        bb_id,
+                        &args,
+                    )
+                    .map_err(LowerError::Unsupported)?;
+                    self.local_var[dest_local] = Some(index);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `vec![e0, …, eN]` lowers to
                 // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
                 // `box_assume_init` primitive is unregistered, so the legacy
@@ -9797,6 +9858,35 @@ impl<'a> Lowering<'a> {
     /// same gate is shared with the deferred-write liveness pre-pass.
     fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
         is_vec_index_regular(reg, self.llbc)
+    }
+
+    /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
+    /// indexing.  RPython represents the same operation directly as
+    /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
+    /// not survive as a residual call.  Range implementations share the same
+    /// name, so accept only the literal `usize` second argument; RangeFrom /
+    /// RangeTo continue through `front::slice_index`'s bounded getslice
+    /// rewrites.
+    fn is_slice_scalar_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
+            )
+        });
+        is_index && index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) == Some("Usize")
+    }
+
+    fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::index::<Impl>::index_mut")
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
@@ -12693,7 +12783,8 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)`
+    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)` or
+    /// `<usize as From<bool>>::from(flag)`
     /// (`core::convert::num::<Impl>::from`, Opaque in the LLBC) to an
     /// identity bind on the destination local.  `From` is implemented in
     /// core only for value-preserving conversions, and a
@@ -12740,13 +12831,17 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        // Only smaller-than-word unsigned sources widen as a
-        // value-preserving identity in the word carrier (the same gate
-        // `try_lower_usize_try_from` uses).
-        if !matches!(
+        // Smaller-than-word unsigned sources widen as a value-preserving
+        // identity in the word carrier (the same gate
+        // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
+        // sibling: converting it to Unsigned emits `cast_bool_to_uint`
+        // through the ordinary `r_uint` builtin (`rbool.py:63-74`).
+        let src_is_bool = tyref_to_value_type(src, self.llbc) == ValueType::Bool;
+        let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
-        ) {
+        );
+        if !src_is_small_uint && !src_is_bool {
             return Ok(false);
         }
         // Destination must be a word-sized integer carrier.  A signed
@@ -12768,7 +12863,25 @@ impl<'a> Lowering<'a> {
         }
         let arg = arg.clone();
         let bb_id = self.block_id[mir_bb];
-        if dest_signed_word {
+        if src_is_bool && dest_unsigned_word {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Unsigned,
+                },
+            });
+            self.local_var[dest_local] = Some(res);
+        } else if dest_signed_word {
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -25208,13 +25321,13 @@ mod tests {
         );
     }
 
-    /// The real site is in bounds: its `args: &[PyObjectRef]` is shared and
-    /// therefore cannot change length between the two `ArrayLen` reads. The
-    /// frontend has no shared-reference/immutability notion with which to
-    /// prove that fact, however, so the sound static-length fold declines.
+    /// PyPy carries `call_function` arguments as one dynamic RPython list.
+    /// The Rust interpreter must not reintroduce a fixed-array RangeTo index
+    /// shortcut into this core dispatcher: core's array index body is opaque
+    /// to Charon and blocks the dispatcher from two-phase translation.
     #[test]
     #[ignore]
-    fn call_function_impl_result_declines_residual_array_index() {
+    fn call_function_impl_result_has_no_residual_array_index() {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -25242,13 +25355,111 @@ mod tests {
         };
         assert_eq!(
             calls_path(&["core", "array", "<Impl>", "index"]),
-            1,
-            "unproved RangeTo array index remains residual"
+            0,
+            "PyPy-shaped dynamic arguments must not leave a fixed-array index"
         );
         assert_eq!(
             calls_path(&["__getslice_rangeto"]),
             0,
             "no RangeTo getslice call is planted without an immutability proof"
+        );
+    }
+
+    /// PyPy's `_match_keywords` indexes its small signature and argument
+    /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
+    /// lower to the same ArrayRead shape instead of remaining an opaque core
+    /// call that prevents the whole builtin-call chain from being annotated.
+    #[test]
+    #[ignore]
+    fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
+            .expect("lower bind_kwargs_to_signature");
+
+        let residual_scalar_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "core".to_string(),
+                        "slice".to_string(),
+                        "index".to_string(),
+                        "<Impl>".to_string(),
+                        "index".to_string(),
+                    ]
+                )
+            })
+            .collect();
+        assert_eq!(
+            residual_scalar_indexes.len(),
+            0,
+            "scalar SliceIndex<usize> calls must become getitem operations"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| { matches!(op.kind, OpKind::ArrayRead { .. }) }),
+            "keyword matching should contain the lowered signature getitems"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__getslice_range".to_string()]
+                )
+            }),
+            "the proven *args tail Range should use the annotated getslice marker"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "core".to_string(),
+                        "convert".to_string(),
+                        "num".to_string(),
+                        "<Impl>".to_string(),
+                        "from".to_string(),
+                    ]
+                )
+            }),
+            "bool-to-usize offset conversion must not remain an opaque core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "rpython".to_string(),
+                        "rlib".to_string(),
+                        "rarithmetic".to_string(),
+                        "r_uint".to_string(),
+                    ]
+                )
+            }),
+            "From<bool> for usize should use RPython's cast_bool_to_uint path"
         );
     }
 }

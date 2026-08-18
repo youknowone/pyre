@@ -89,6 +89,7 @@ pub(crate) mod saturating_sub;
 pub mod semantic;
 pub(crate) mod slice_first;
 pub(crate) mod slice_index;
+pub(crate) mod str_find;
 pub mod typestr;
 
 pub use semantic::{AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry};

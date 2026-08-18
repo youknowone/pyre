@@ -103,6 +103,39 @@ pub(crate) struct SliceIndexRangeToSite {
     pub end: Variable,
 }
 
+/// A recognized `Range { start, end }` aggregate feeding a residual scalar
+/// slice-index call.  This is RPython's ordinary `getslice(start, stop)`
+/// shape; bounds are retained separately so the transparent Rust range shell
+/// can be removed after the consumer proof succeeds.
+#[derive(Clone)]
+pub(crate) struct SliceIndexRangeSite {
+    pub range_result: Variable,
+    pub start: Variable,
+    pub end: Variable,
+}
+
+pub(crate) fn rewire_slice_index_range_sites(
+    graph: &mut FunctionGraph,
+    sites: &[SliceIndexRangeSite],
+) -> usize {
+    let mut rewritten = 0;
+    for site in sites {
+        let outcome = rewire_one_slice_index_site(
+            graph,
+            &site.range_result,
+            SliceIndexBounds::Range {
+                start: &site.start,
+                end: &site.end,
+            },
+        );
+        match outcome {
+            Ok(()) => rewritten += 1,
+            Err(_decline) => {}
+        }
+    }
+    rewritten
+}
+
 /// Rewrite every captured `RangeFrom` aggregate that feeds exactly one
 /// residual `slice::index` call into an orthodox `getslice(slice, start,
 /// None)` op. Fail-safe: a site that does not match the expected single-
@@ -152,9 +185,19 @@ pub(crate) fn rewire_slice_index_rangeto_sites(
 
 #[derive(Clone, Copy)]
 enum SliceIndexBounds<'a> {
-    RangeFrom { start: &'a Variable },
-    MinusOne { end: &'a Variable },
-    StaticLength { end: &'a Variable },
+    RangeFrom {
+        start: &'a Variable,
+    },
+    Range {
+        start: &'a Variable,
+        end: &'a Variable,
+    },
+    MinusOne {
+        end: &'a Variable,
+    },
+    StaticLength {
+        end: &'a Variable,
+    },
 }
 
 fn rewire_one_slice_index_rangeto_site(
@@ -232,7 +275,9 @@ fn rewire_one_slice_index_site(
         &index_result,
         matches!(
             bounds,
-            SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::StaticLength { .. }
+            SliceIndexBounds::Range { .. }
+                | SliceIndexBounds::MinusOne { .. }
+                | SliceIndexBounds::StaticLength { .. }
         ),
     ) {
         return Err(format!(
@@ -273,6 +318,21 @@ fn rewire_one_slice_index_site(
                 ));
             }
         }
+        SliceIndexBounds::Range { start, end } => {
+            if !graph_defines(graph, start) || !graph_defines(graph, end) {
+                return Err(format!("{name}: Range bounds are not defined in the graph"));
+            }
+            if !range_end_matches_slice_len(graph, end, &slice) {
+                return Err(format!(
+                    "{name}: Range end is not the indexed slice length — declining"
+                ));
+            }
+            if !range_start_is_bounded_by_end(graph, start, end, &range) {
+                return Err(format!(
+                    "{name}: Range start <= end is not proven at the index — declining"
+                ));
+            }
+        }
         SliceIndexBounds::MinusOne { end } => {
             if !graph_defines(graph, end) {
                 return Err(format!("{name}: MinusOne end is not defined in the graph"));
@@ -299,7 +359,10 @@ fn rewire_one_slice_index_site(
     //    place: the range can be carried by a block link without being read
     //    by an operation, and sweeping its sole defining ctor would orphan
     //    that link-carried value.
-    if matches!(bounds, SliceIndexBounds::RangeFrom { .. }) {
+    if matches!(
+        bounds,
+        SliceIndexBounds::RangeFrom { .. } | SliceIndexBounds::Range { .. }
+    ) {
         for b in &mut graph.blocks {
             b.operations.retain(|op| {
                 let is_field_write =
@@ -333,6 +396,18 @@ fn rewire_one_slice_index_site(
         })
         .ok_or_else(|| format!("{name}: slice::index op vanished before rewrite"))?;
     match bounds {
+        SliceIndexBounds::Range { start, end } => {
+            graph.blocks[rb].operations[ri] = SpaceOperation {
+                result: Some(index_result),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_range".to_string()],
+                    },
+                    args: vec![slice, start.clone(), end.clone()],
+                    result_ty: index_result_ty,
+                },
+            };
+        }
         SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::StaticLength { .. } => {
             let (segments, args) = match bounds {
                 SliceIndexBounds::MinusOne { .. } => {
@@ -343,6 +418,7 @@ fn rewire_one_slice_index_site(
                     vec![slice, end.clone()],
                 ),
                 SliceIndexBounds::RangeFrom { .. } => unreachable!(),
+                SliceIndexBounds::Range { .. } => unreachable!(),
             };
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
@@ -397,9 +473,11 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         var: &Variable,
         seen: &mut std::collections::HashSet<Variable>,
         reachable: &std::collections::HashSet<crate::model::BlockId>,
-    ) -> Option<Variable> {
+    ) -> Result<Option<Variable>, ()> {
         if !seen.insert(var.clone()) {
-            return None;
+            // A loop-carried pass-through contributes no new definition.  A
+            // non-cyclic incoming edge must still establish the unique root.
+            return Ok(None);
         }
         // MIR is not strict SSA: an operation result can also be threaded
         // through a later block as an inputarg under the same Variable name.
@@ -411,7 +489,7 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
             .flat_map(|b| &b.operations)
             .any(|op| op.result.as_ref() == Some(var))
         {
-            return Some(var.clone());
+            return Ok(Some(var.clone()));
         }
         let Some((block_id, arg_index)) = graph.blocks.iter().find_map(|b| {
             b.inputargs
@@ -419,7 +497,7 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
                 .position(|arg| arg == var)
                 .map(|i| (b.id, i))
         }) else {
-            return Some(var.clone());
+            return Ok(Some(var.clone()));
         };
         let incoming: Option<Vec<Variable>> = graph
             .blocks
@@ -434,15 +512,34 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
                     .cloned()
             })
             .collect();
-        let incoming: Vec<Variable> = incoming?
+        let incoming: Vec<Variable> = incoming
+            .ok_or(())?
             .into_iter()
             .filter(|candidate| candidate != var)
             .collect();
-        let first = incoming.first()?.clone();
-        if incoming.iter().any(|candidate| candidate != &first) {
-            return None;
+        if incoming.is_empty() {
+            // Function entry arguments are authoritative external roots.
+            return (block_id == graph.startblock)
+                .then(|| var.clone())
+                .map(Some)
+                .ok_or(());
         }
-        visit(graph, &first, seen, reachable)
+        let mut root: Option<Variable> = None;
+        for candidate in incoming {
+            let mut branch_seen = seen.clone();
+            let Some(candidate_root) = visit(graph, &candidate, &mut branch_seen, reachable)?
+            else {
+                continue;
+            };
+            if root
+                .as_ref()
+                .is_some_and(|established| established != &candidate_root)
+            {
+                return Err(());
+            }
+            root = Some(candidate_root);
+        }
+        Ok(root)
     }
     visit(
         graph,
@@ -450,6 +547,8 @@ fn resolve_block_alias(graph: &FunctionGraph, var: &Variable) -> Option<Variable
         &mut std::collections::HashSet::new(),
         &reachable_from_start(graph),
     )
+    .ok()
+    .flatten()
 }
 
 fn const_int_value(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -910,6 +1009,163 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
         .flat_map(|b| &b.operations)
         .any(|op| op.result.as_ref() == Some(&rhs) && matches!(&op.kind, OpKind::ConstInt(1)));
     has_len && has_one
+}
+
+/// Prove that the Range stop is exactly `len(slice)`.  Rust's slice index
+/// would reject an oversized stop while RPython's list-slice helper clamps,
+/// so the rewrite is admitted only when both expressions denote the same
+/// length read (following block aliases).
+fn range_end_matches_slice_len(graph: &FunctionGraph, end: &Variable, slice: &Variable) -> bool {
+    let Some(end) = resolve_block_alias(graph, end) else {
+        return false;
+    };
+    let Some(slice) = resolve_block_alias(graph, slice) else {
+        return false;
+    };
+    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        op.result.as_ref() == Some(&end)
+            && matches!(
+                &op.kind,
+                OpKind::ArrayLen { base, .. }
+                    if resolve_block_alias(graph, base).as_ref() == Some(&slice)
+            )
+    })
+}
+
+/// Prove `start <= end` on the control-flow edge reaching this Range index.
+/// A zero start is immediate because the Range element type is `usize`;
+/// otherwise require a dominating comparison edge.  This preserves Rust's
+/// bounds semantics while lowering the already-proven slice to RPython's
+/// `getslice` operation.
+fn range_start_is_bounded_by_end(
+    graph: &FunctionGraph,
+    start: &Variable,
+    end: &Variable,
+    range: &Variable,
+) -> bool {
+    if const_int_value(graph, start) == Some(0) {
+        return true;
+    }
+    let Some(start_root) = resolve_block_alias(graph, start) else {
+        return false;
+    };
+    let Some(end_root) = resolve_block_alias(graph, end) else {
+        return false;
+    };
+    let Some(index_block) = graph.blocks.iter().find_map(|b| {
+        b.operations.iter().find_map(|op| {
+            (is_slice_range_index_call(&op.kind)
+                && matches!(&op.kind, OpKind::Call { args, .. } if args.get(1) == Some(range)))
+            .then_some(b.id)
+        })
+    }) else {
+        return false;
+    };
+
+    let mut dominators: std::collections::HashMap<
+        crate::model::BlockId,
+        std::collections::HashSet<crate::model::BlockId>,
+    > = graph
+        .blocks
+        .iter()
+        .map(|b| (b.id, graph.blocks.iter().map(|x| x.id).collect()))
+        .collect();
+    dominators.insert(graph.startblock, [graph.startblock].into_iter().collect());
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &graph.blocks {
+            if block.id == graph.startblock {
+                continue;
+            }
+            let preds = graph.predecessors(block.id);
+            if preds.is_empty() {
+                continue;
+            }
+            let mut next: std::collections::HashSet<_> = dominators[&preds[0]].clone();
+            for pred in &preds[1..] {
+                next.retain(|id| dominators[pred].contains(id));
+            }
+            next.insert(block.id);
+            if next != dominators[&block.id] {
+                dominators.insert(block.id, next);
+                changed = true;
+            }
+        }
+    }
+
+    for candidate in &graph.blocks {
+        if candidate.id == index_block || !dominators[&index_block].contains(&candidate.id) {
+            continue;
+        }
+        let Some(crate::model::ExitSwitch::Value(switch)) = &candidate.exitswitch else {
+            continue;
+        };
+        let Some((op, lhs, rhs)) = comparison_variables_for_switch(graph, switch) else {
+            continue;
+        };
+        let Some(lhs) = resolve_block_alias(graph, &lhs) else {
+            continue;
+        };
+        let Some(rhs) = resolve_block_alias(graph, &rhs) else {
+            continue;
+        };
+        let success = match (lhs == start_root, rhs == end_root, op.as_str()) {
+            (true, true, "le" | "lt") => Some(true),
+            (true, true, "gt" | "ge") => Some(false),
+            _ if lhs == end_root && rhs == start_root => match op.as_str() {
+                "ge" | "gt" => Some(true),
+                "lt" | "le" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(success) = success else { continue };
+        let mut true_target = None;
+        let mut false_target = None;
+        for link in &candidate.exits {
+            match link.exitcase {
+                Some(crate::model::ExitCase::Bool(true)) => true_target = Some(link.target),
+                Some(crate::model::ExitCase::Bool(false)) => false_target = Some(link.target),
+                _ => {}
+            }
+        }
+        let (Some(true_target), Some(false_target)) = (true_target, false_target) else {
+            continue;
+        };
+        let proving = if success { true_target } else { false_target };
+        let rejecting = if success { false_target } else { true_target };
+        if reaches_without_retesting(graph, proving, index_block, candidate.id)
+            && !reaches_without_retesting(graph, rejecting, index_block, candidate.id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn comparison_variables_for_switch(
+    graph: &FunctionGraph,
+    switch: &Variable,
+) -> Option<(String, Variable, Variable)> {
+    let switch = resolve_block_alias(graph, switch)?;
+    let (op, lhs, rhs) = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .find_map(|candidate| {
+            if candidate.result.as_ref() != Some(&switch) {
+                return None;
+            }
+            match &candidate.kind {
+                OpKind::BinOp { op, lhs, rhs, .. } => Some((op.clone(), lhs.clone(), rhs.clone())),
+                OpKind::UnaryOp { op, operand, .. } if op == "bool" => {
+                    comparison_variables_for_switch(graph, operand)
+                }
+                _ => None,
+            }
+        })?;
+    Some((op, lhs, rhs))
 }
 
 /// `true` when `kind` is a residual `core::slice::index::<Impl>::index` call —

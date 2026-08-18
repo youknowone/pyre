@@ -765,6 +765,7 @@ fn format_unknown_kwds_err(fname: &Wtf8, unmatched: &[Wtf8Buf]) -> Wtf8Buf {
 }
 
 #[cold]
+#[majit_macros::dont_look_inside]
 fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &Wtf8) -> Result<(), PyError> {
     if posonly_kwds.is_empty() {
         return Ok(());
@@ -776,6 +777,31 @@ fn raise_if_posonly_kwds(posonly_kwds: &[String], fname: &Wtf8) -> Result<(), Py
         posonly_kwds.join(", ")
     ));
     Err(crate::PyError::type_error(msg))
+}
+
+/// Cold `Arguments.parse_obj` keyword-error formatter.
+///
+/// PyPy keeps `oefmt` lazy: the accepted-call trace retains the keyword
+/// matching guards but does not trace construction of an error string.  Keep
+/// pyre's eager `PyError` representation behind the same residual boundary,
+/// as the generated gateway arity helpers above do.  The helper returns the
+/// caller's exact result carrier so the rejected branch can tail-return it.
+#[cold]
+#[majit_macros::dont_look_inside]
+fn builtin_keyword_failure(
+    fname: &str,
+    unmatched: &[Wtf8Buf],
+    takes_no_keywords: bool,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    let msg = if takes_no_keywords {
+        let mut msg = Wtf8Buf::new();
+        msg.push_str(fname);
+        msg.push_str("() takes no keyword arguments");
+        msg
+    } else {
+        format_unknown_kwds_err(Wtf8::new(fname), unmatched)
+    };
+    Err(PyError::type_error(msg))
 }
 
 /// Materialize a Python call frame without retaining the by-value `PyFrame`
@@ -2340,9 +2366,7 @@ pub(crate) fn bind_kwargs_to_signature(
     // rejected with the "takes no keyword arguments" form (e.g. `len`, `abs`).
     if !kwargs.is_empty() && !has_varkw && sig.num_kwonlyargnames() == 0 && posonly == n_pos_params
     {
-        return Err(crate::PyError::type_error(format!(
-            "{fname}() takes no keyword arguments"
-        )));
+        return builtin_keyword_failure(fname, &[], true);
     }
 
     // argument.py:235-236 — flag too many positionals with no `*args` to
@@ -2366,7 +2390,11 @@ pub(crate) fn bind_kwargs_to_signature(
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or
         // the unexpected-keyword error below.
-        let key_str = key.as_str().ok();
+        let key_str = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(key) } {
+            Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(key) })
+        } else {
+            None
+        };
         let mut matched = false;
         for pi in 0..nparams {
             if key_str == Some(sig.argnames[pi]) {
@@ -2417,15 +2445,11 @@ pub(crate) fn bind_kwargs_to_signature(
         // at all (no **kwargs and no keyword-only params). Every BuiltinCode
         // call routes through parse_obj (gateway.py funcrun / funcrun_obj), so
         // the rewrite applies at any arity, not just the single-argument form.
-        let msg = if !has_varkw && sig.num_kwonlyargnames() == 0 {
-            let mut msg = Wtf8Buf::new();
-            msg.push_wtf8(Wtf8::new(fname));
-            msg.push_str("() takes no keyword arguments");
-            msg
-        } else {
-            format_unknown_kwds_err(Wtf8::new(fname), &unmatched_kw_names)
-        };
-        return Err(crate::PyError::type_error(msg));
+        return builtin_keyword_failure(
+            fname,
+            &unmatched_kw_names,
+            !has_varkw && sig.num_kwonlyargnames() == 0,
+        );
     }
 
     // argument.py:289 — too-many-positionals is raised last, after the
@@ -2863,7 +2887,11 @@ fn call_with_kwargs_in_ctx_impl(
                 let value = current_kwarg(kw_index);
                 // A lone-surrogate keyword name never equals a source-level
                 // parameter name; it falls to **kwargs or the error below.
-                let key_str = key.as_str().ok();
+                let key_str = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(key) } {
+                    Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(key) })
+                } else {
+                    None
+                };
                 let mut matched = false;
                 for pi in 0..total_params {
                     if key_str == Some(code.varnames[pi].as_str()) {
@@ -3378,27 +3406,17 @@ pub fn call_function_impl_result(
     crate::stack_check::drain_jit_pending_exception()?;
 
     let callable = _roots.get(root_base);
-    // RPython's GC transform reloads `Arguments.arguments_w` livevars in
-    // place; it does not allocate another list at every ObjSpace call.  Keep
-    // the common small call shape allocation-free and retain a Vec only for
-    // genuinely wide calls.
-    const INLINE_ARGS: usize = 8;
-    let mut inline_args = [PY_NULL; INLINE_ARGS];
-    let mut wide_args = Vec::new();
-    let args = if args.len() <= INLINE_ARGS {
-        // The index loop lowers to `setarrayitem`; iterator adapters are residual calls.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..args.len() {
-            inline_args[i] = _roots.get(root_base + 1 + i);
-        }
-        &inline_args[..args.len()]
-    } else {
-        wide_args = Vec::with_capacity(args.len());
-        for i in 0..args.len() {
-            wide_args.push(_roots.get(root_base + 1 + i));
-        }
-        wide_args.as_slice()
-    };
+    // `baseobjspace.py:1193-1213 call_function` carries `args_w` as one
+    // RPython list.  Rebuild that same dynamic list from the updated root
+    // slots.  A former fixed `[PY_NULL; 8]` shortcut ended in Rust's opaque
+    // `<[T; N]>::index(&array, ..len)` and prevented the whole call dispatcher
+    // from entering two-phase translation; the meta-tracer can virtualize
+    // this orthodox list on the common fixed-arity paths.
+    let mut rooted_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        rooted_args.push(_roots.get(root_base + 1 + i));
+    }
+    let args = rooted_args.as_slice();
 
     // Binding an override descriptor below runs `baseobjspace::get`, whose
     // property and general `__get__` arms execute Python.  That updates the
