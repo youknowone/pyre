@@ -10053,36 +10053,33 @@ impl CraneliftBackend {
         // The jitframe pointer register (EBP, the pinned register) is reserved
         // and never shares a slot with a value.
         //
-        // The inputarg→ref-root sync must NOT run in this pre-dispatch entry
-        // block when the trace has LABELs: the per-LABEL loaders (the
-        // dispatch_key re-entry path) read each LABEL's carried values from
-        // the dense jitframe slots `JF_FRAME_ITEM0_OFS + i*8`, and when
-        // `max_output_slots < arity` those slots overlap the ref-root region
-        // (`ref_root_base_ofs + slot*8`). Syncing an inputarg to its root slot
-        // here would clobber a carried value before the loader reads it. Defer
-        // the sync to the preamble (key-0 host-entry) path, which is the only
-        // path that needs roots established before the preamble's own ops; the
-        // loader paths reach a LABEL block that re-syncs its carried roots with
-        // no GC in between.
+        // A LABEL trace defers root seeding to the host-entry preamble: the
+        // per-LABEL loaders read their carried values from the dense slots
+        // `JF_FRAME_ITEM0_OFS + i*8`, which overlap the ref-root region when
+        // `max_output_slots < arity`, so seeding here would clobber a carried
+        // value before its loader reads it. A linear entry needs no eager
+        // root-home write at all. A guard's
+        // `allocate_gcmap(&failarg_ref_slots)` contains only dense indices,
+        // while `ref_root_base_ofs` starts at `max_output_slots`, which is at
+        // least `inputargs.len()`, so no guard gcmap can name the ref-root word
+        // such a store would write. Every `emit_push_gcmap` is preceded by
+        // `spill_ref_roots` over the same slot list, and `get_gcmap` uses the
+        // same ref-root predicate as that spill. Its two mark-without-spill
+        // escapes are inert here: demotion requires a LABEL, and
+        // `stale_ref_vars` has no insertion anywhere. The home's first write
+        // is therefore the first spill. Any future path that marks a ref-root
+        // word without a preceding spill is a live GC bug.
         let mut deferred_entry_root_syncs: Vec<(u32, CValue)> = Vec::new();
-        let mut entry_sync_jf_ptr = None;
         let has_labels = !label_indices.is_empty();
+        debug_assert!(
+            demoted_failarg_slots.is_empty(),
+            "entry loop runs before any LABEL seeds a demoted home"
+        );
         for (i, val) in entry_input_vals.iter().copied().enumerate() {
             let slot = inputargs[i].index;
             builder.def_var(var(slot), val);
             if has_labels {
                 deferred_entry_root_syncs.push((slot, val));
-            } else {
-                sync_ref_root_var(
-                    &mut builder,
-                    ptr_type,
-                    &mut entry_sync_jf_ptr,
-                    &ref_root_slots,
-                    slot,
-                    val,
-                    ref_root_base_ofs,
-                    &mut synced_ref_vars,
-                );
             }
         }
 
