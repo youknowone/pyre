@@ -19,6 +19,13 @@ by_keyword = _multiprocessing.SemLock(
 assert by_keyword.kind == RECURSIVE_MUTEX
 assert by_keyword.maxvalue == 1
 
+# Only `subtype` is positional-only, so the first three bind by name as well.
+by_all_keywords = _multiprocessing.SemLock(
+    kind=RECURSIVE_MUTEX, value=1, maxvalue=1, name=f'{base}-all-kw', unlink=True
+)
+assert by_all_keywords.kind == RECURSIVE_MUTEX
+assert by_all_keywords.maxvalue == 1
+
 by_position = _multiprocessing.SemLock(
     RECURSIVE_MUTEX, 1, 1, f'{base}-pos', True
 )

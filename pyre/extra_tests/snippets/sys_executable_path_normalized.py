@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 # `initpath.py:find_executable` applies `abspath`, whose second half is
 # `normpath` -- joining the cwd alone would carry the caller's spelling of
@@ -35,3 +36,44 @@ for spelling, cwd in spellings:
     assert os.curdir not in parts, (spelling, reported)
     assert os.pardir not in parts, (spelling, reported)
     assert os.path.samefile(reported, sys.executable), (spelling, reported)
+
+# `resolvedirof` is what follows links; the invoked spelling is not, so a
+# symlinked executable answers with the link.  `samefile` cannot see the
+# difference -- it resolves both sides -- so this compares the strings.
+with tempfile.TemporaryDirectory() as tmp:
+    # The container is resolved up front so that the only unresolved link left
+    # in the comparison is the one under test -- on darwin the temporary
+    # directory itself sits under a symlinked `/var`, which the child's own cwd
+    # reports resolved.
+    tmp = os.path.realpath(tmp)
+    link = os.path.join(tmp, 'pyre-link')
+    os.symlink(sys.executable, link)
+
+    for spelling, cwd in ((link, None), (os.path.join(os.curdir, 'pyre-link'), tmp)):
+        result = subprocess.run(
+            [spelling, '-c', SHOW],
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (spelling, result.stderr)
+        assert result.stdout.decode().strip() == link, (spelling, result.stdout)
+
+if os.name == 'posix':
+    # `..` directly under the root names nothing, so it is dropped rather than
+    # carried.  A path opening with exactly two slashes is the host's to
+    # interpret and keeps both; three or more collapse to one.
+    stripped = sys.executable.lstrip(os.sep)
+    rooted = [
+        (os.sep + os.pardir + sys.executable, sys.executable),
+        (os.sep * 2 + stripped, os.sep * 2 + stripped),
+        (os.sep * 3 + stripped, sys.executable),
+    ]
+    for spelling, expected in rooted:
+        result = subprocess.run(
+            [spelling, '-c', SHOW],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, (spelling, result.stderr)
+        assert result.stdout.decode().strip() == expected, (spelling, result.stdout)

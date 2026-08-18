@@ -2064,23 +2064,62 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                // Only a normal segment can be cancelled: popping a root or a
-                // prefix would rewrite which volume the path names, and `..`
-                // above the root has nothing to remove.
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+            Component::ParentDir => match out.components().next_back() {
+                // Only a normal segment can be cancelled.
+                Some(Component::Normal(_)) => {
                     out.pop();
-                } else {
-                    out.push(component);
                 }
-            }
+                // `/..` is `/`: nothing sits above a root, so the component
+                // names nothing and is dropped rather than kept
+                // (`rpath.py:53-57`, and `:142` for the drive-rooted spelling).
+                Some(Component::RootDir) => {}
+                // A relative path may open with `..`, `../..` keeps both, and
+                // a drive-relative `C:..` keeps its own: popping a prefix
+                // would rewrite which volume the path names.
+                _ => out.push(component),
+            },
             other => out.push(other),
         }
     }
     if out.as_os_str().is_empty() {
         out.push(Component::CurDir);
     }
-    out
+    restore_double_root(path, out)
+}
+
+/// A path opening with exactly two slashes is reserved for the host to
+/// interpret, so `//host/bin` keeps both while `///x` collapses to one
+/// (`rpath.py:43-47`).  `Path::components` yields a single `RootDir` either
+/// way, so the distinction has to be read off the original spelling and put
+/// back afterwards.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32"),
+    unix
+))]
+fn restore_double_root(original: &Path, normalized: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = original.as_os_str().as_bytes();
+    if !bytes.starts_with(b"//") || bytes.starts_with(b"///") {
+        return normalized;
+    }
+    let mut doubled = std::ffi::OsString::from("/");
+    doubled.push(normalized.as_os_str());
+    PathBuf::from(doubled)
+}
+
+/// Windows carries its own leading separators in `Component::Prefix`, which
+/// `Path::push` spells back out, so nothing is left to restore.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32"),
+    not(unix)
+))]
+fn restore_double_root(_original: &Path, normalized: PathBuf) -> PathBuf {
+    normalized
 }
 
 /// Return the executable spelling used to invoke pyre, made absolute without
