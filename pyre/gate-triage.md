@@ -864,12 +864,13 @@ Kept as-is; listed for completeness.
   multi-frame switch, with both readers and OFF paths deleted after
   `walker_ec_enter` / `walker_ec_leave` closed the escaping-`sys._getframe`
   identity answer.
-- **Config / value / master switches (~17)** — tuning, paths, modes; keep:
-  `PYRE_WALKER_STORE_SUBSCR_FNADDR`,
+- **Config / value / master switches (~16)** — tuning, paths, modes; keep:
   `PYRE_MIR_FRONTEND_LLBC`, `PYRE_WASM_ENGINE`, `_FUEL`, `_MODULE`, `_NO_CACHE`,
   `PYRE_GC_INTERP`, `PYRE_JIT`, `PYRE_NO_JIT`, `PYRE_STDLIB`,
   `PYRE_CHECK_PYPY3`, `PYRE_CHECK_PYTHON3`, `PYRE_SANDBOX_NO_SECCOMP`,
   `PYRE_SHARED_BUILD`, `PYRE_SYNTH_PYPY`, `PYRE_SYNTH_PYRE`, `PYRE_SYNTH_PYTHON`.
+  (`PYRE_WALKER_STORE_SUBSCR_FNADDR` retired 2026-08-18 with its sole reader,
+  the STORE_SUBSCR walker specialization gate, deleted.)
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
@@ -978,7 +979,7 @@ one-binary comparison, not as latent defaults.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 56 hand-written trace-time specialization rows, and an
+off that many of the 55 hand-written trace-time specialization rows, and an
 unset variable suppresses none. It is a measurement instrument — suppressing a
 fold is how the descent wall behind it is made to print — so it retires with
 the folds it selects, not before them.

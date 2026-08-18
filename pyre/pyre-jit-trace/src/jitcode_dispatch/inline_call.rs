@@ -4674,7 +4674,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             descr_refs: &callee_descr_refs,
             raw_descrs: RawDescrPool::PerFn(callee_perfn_descrs),
             is_authoritative_executor: ctx.is_authoritative_executor,
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,
@@ -6196,8 +6195,8 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
 ) -> Option<IndexInlineCandidate> {
     // Every other lever that inlines app-level Python out of a specializer
     // declines once it is itself inside a callee sub-walk — `try_walker_inline_
-    // type_call`, `..._property_get`, `..._property_set`, `..._subscr_getitem`
-    // and `try_walker_specialize_seqiter_getitem_next` all lead with this.
+    // type_call`, `..._property_get`, `..._property_set` and
+    // `..._subscr_getitem` all lead with this.
     if !ctx.is_authoritative_executor || ctx.fbw_mode.inline_subwalk {
         return None;
     }
@@ -6443,238 +6442,6 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         false,
         None,
     )
-}
-
-/// Inline the generic sequence cursor's `__getitem__(seq, index)` step.
-///
-/// The cursor update is deliberately emitted and applied only after the
-/// callee returns an item.  A guard in the callee therefore resumes at this
-/// FOR_ITER with the same index, while a recording-time exhaustion raise can
-/// discard the inline and let the existing residual produce the NULL result.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_seqiter_getitem_next<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    code: &[u8],
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor {
-        return Ok(None);
-    }
-    if dst_bank != 'r' {
-        return Ok(None);
-    }
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
-    }
-    if r_args.len() != 1 {
-        return Ok(None);
-    }
-
-    let iter_op = r_args[0];
-    let Some(iter_obj) = walker_concrete_ref_object(ctx, iter_op) else {
-        return Ok(None);
-    };
-    let (seq, index) = unsafe {
-        if (*iter_obj).ob_type != &pyre_object::iterobject::SEQ_ITER_TYPE {
-            return Ok(None);
-        }
-        let iter = iter_obj as *mut pyre_object::iterobject::W_SeqIterObject;
-        ((*iter).seq, (*iter).index)
-    };
-    if seq.is_null() {
-        return Ok(None);
-    }
-    if unsafe {
-        pyre_object::is_list(seq)
-            || pyre_object::is_tuple(seq)
-            || pyre_object::is_str(seq)
-            || pyre_object::bytesobject::is_bytes_like(seq)
-            || pyre_object::interp_array::is_array(seq)
-            || pyre_object::is_generic_alias(seq)
-    } {
-        return Ok(None);
-    }
-
-    let Some((w_type, version_tag, w_getitem)) =
-        (unsafe { pyre_interpreter::baseobjspace::getitem_fast_path(seq) })
-    else {
-        return Ok(None);
-    };
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_getitem) })
-    else {
-        return Ok(None);
-    };
-    if nparams != 2 {
-        return Ok(None);
-    }
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
-    };
-    if body_facts.owns_loop_header {
-        return Ok(None);
-    }
-    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return Ok(None);
-    };
-    let Some((callee_descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code)
-    else {
-        return Ok(None);
-    };
-    let exact_numeric_args = [
-        ExactNumericArg::default(),
-        ExactNumericArg {
-            numeric: true,
-            plain_int: true,
-        },
-    ];
-    let replay_safety = fbw_callee_body_replay_safety(
-        body.code,
-        &exact_numeric_args,
-        body.num_regs_i,
-        body.constants_i,
-        body.num_regs_r,
-        body.constants_r,
-        callee_descr_refs,
-        false,
-    );
-    // `DeferredCall` is admitted alongside `Clean`, and the terminating `raise`
-    // is what makes that necessary: `RaiseVarargs` classifies as a deferred
-    // residual, so a cursor body that ends on one would otherwise never be
-    // served — which is why this route passes `entry_is_call_boundary: true`
-    // below.  The deferred promise holds here: a residual the lever cannot
-    // inline aborts before executing and denies the callee.
-    //
-    // What the shared FOR_ITER gate withholds admission from is an entry
-    // reached from an operator opcode, because those opcodes POP their
-    // operands: a rewind that re-executes `BINARY_OP` or `COMPARE_OP` needs
-    // operands the flush cannot re-materialize and resumes one short.
-    // `FOR_ITER` only PEEKS, and its single operand is the iterator the walk
-    // already holds, so re-executing it needs nothing the stack lost.  The
-    // cursor bump below runs only after the callee returns, so the re-executed
-    // step reads the same index.
-    if !matches!(
-        replay_safety,
-        CalleeReplaySafety::Clean | CalleeReplaySafety::DeferredCall
-    ) {
-        return Ok(None);
-    }
-    if fbw_foriter_deferred_call_denied(w_code as usize) {
-        return Ok(None);
-    }
-
-    let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
-        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body_coord);
-    let pre_emit_pos = ctx.trace_ctx.get_trace_position();
-
-    let seq_iter_type_addr = &pyre_object::iterobject::SEQ_ITER_TYPE as *const _ as i64;
-    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
-        let type_const = ctx.trace_ctx.const_int(seq_iter_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(iter_op, seq_iter_type_addr);
-
-    let seq_descr = crate::descr::seq_iter_seq_descr();
-    let seq_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, iter_op, seq_descr);
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[seq_op])?;
-    ctx.trace_ctx
-        .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq as usize)));
-
-    let index_descr = crate::descr::seq_iter_index_descr();
-    let index_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, index_descr.clone());
-    ctx.trace_ctx
-        .set_opref_concrete(index_op, Value::Int(index));
-    let boxed_index = crate::state::wrapint(ctx.trace_ctx, index_op);
-    let concrete_boxed_index = pyre_object::w_int_new(index);
-    ctx.trace_ctx.set_opref_concrete(
-        boxed_index,
-        Value::Ref(majit_ir::GcRef(concrete_boxed_index as usize)),
-    );
-
-    let _roots = pyre_object::gc_roots::push_roots();
-    let iter_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(iter_obj);
-    let boxed_index_root = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(concrete_boxed_index);
-    let concrete_boxed_index = pyre_object::gc_roots::shadow_stack_get(boxed_index_root);
-    let getitem_const = ctx.trace_ctx.const_ref(w_getitem as i64);
-
-    let inline = try_walker_inline_resolved_user_call(
-        ctx,
-        op,
-        code,
-        funcptr,
-        r_args,
-        call_descr,
-        dst_bank,
-        dst,
-        w_getitem,
-        getitem_const,
-        w_getitem,
-        vec![
-            ConcreteValue::Ref(w_getitem),
-            ConcreteValue::Null,
-            ConcreteValue::Ref(seq),
-            ConcreteValue::Ref(concrete_boxed_index),
-        ],
-        vec![seq_op, boxed_index],
-        vec![
-            ConcreteValue::Ref(seq),
-            ConcreteValue::Ref(concrete_boxed_index),
-        ],
-        true,
-        None,
-        w_code,
-        nparams,
-        has_closure,
-        Some((seq_op, seq, w_type, version_tag)),
-        None,
-        // FOR_ITER, not a CALL, but a peeking entry the rewind can re-execute —
-        // the replay-safety note above states why that is what the gate asks.
-        true,
-        false,
-        None,
-    );
-    if !matches!(inline, Ok(Some((DispatchOutcome::Continue, _)))) {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    }
-
-    let one = ctx.trace_ctx.const_int(1);
-    let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[index_op, one]);
-    ctx.trace_ctx
-        .set_opref_concrete(next_index, Value::Int(index.wrapping_add(1)));
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[iter_op, next_index],
-        index_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(iter_op, index_descr.index(), next_index);
-    let iter_ptr = pyre_object::gc_roots::shadow_stack_get(iter_root)
-        as *mut pyre_object::iterobject::W_SeqIterObject;
-    unsafe {
-        (*iter_ptr).index += 1;
-    }
-
-    let item_op = ctx.registers_r[dst];
-    let Some(concrete_item) = walker_concrete_ref_object(ctx, item_op) else {
-        return Err(DispatchError::callee_inline_unsupported(op.pc));
-    };
-    fbw_foriter_inflight_capture(concrete_item, body_coord);
-    ctx.vstack_last_ref = item_op;
-
-    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
@@ -7239,7 +7006,6 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
             outer_active_boxes: ctx.outer_active_boxes.clone(),
-            store_subscr_fn_addr: ctx.store_subscr_fn_addr,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,

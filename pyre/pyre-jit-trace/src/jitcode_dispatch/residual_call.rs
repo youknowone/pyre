@@ -2872,9 +2872,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // could commit an irreversible heap mutation the journals do not cover,
     // while an in-flight FOR_ITER item is already captured (a consume ran
     // earlier this iteration).  The journaled list ops (setitem / append) run
-    // OUTSIDE this executor (`try_walker_store_subscr_specialization` /
-    // `try_walker_orthodox_list_append`) and roll back on abort, so they are
-    // not body-effect candidates here.
+    // OUTSIDE this executor (`try_walker_orthodox_list_append`) and roll back
+    // on abort, so they are not body-effect candidates here.
     //
     // The OLD allow-list (`StoreSubscr` / `CallFn` / `SetCurrentException`
     // only) MISSED the many statement-level mutators that reach this executor
@@ -4910,6 +4909,128 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     Some(())
 }
 
+/// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
+/// R-list args, and `descr`, runs `_build_allboxes` to produce the
+/// callee's ABI-ordered arglist, classifies the call by `EffectInfo`
+/// via [`select_residual_call_opcode`], records the matching
+/// kind-coded `CallMayForce*` / `CallLoopinvariant*` / `CallPure*` /
+/// `Call*` op, emits `GUARD_NOT_FORCED` on the forces branch, emits
+/// `GUARD_NO_EXCEPTION` if the classification says `can_raise`, and
+/// writes the recorded result OpRef into the dst register chosen by
+/// `dst_bank`.
+///
+/// RPython parity: `pyjitpl.py _opimpl_residual_call1` →
+/// `do_residual_or_indirect_call` → `do_residual_call`
+/// (pyjitpl.py). `pyjitpl.py opimpl_residual_call_r_i =
+/// _opimpl_residual_call1` and `:1347 opimpl_residual_call_r_r =
+/// _opimpl_residual_call1` confirm both kind variants share the
+/// `_call1` body. The `_X` suffix is the *call's return kind* — mapping
+/// comes from `do_residual_call`'s `descr.get_normalized_result_type()`
+/// dispatch (pyjitpl.py) and `select_residual_call_opcode`'s
+/// kind-keyed opcode tables.
+///
+/// `dst_bank` selects where the call's result lands:
+/// * `'r'`: caller's `registers_r[dst]` — Ref-typed `Call*` family
+///   (`_r_r/iRd>r`, `pyjitpl.py opimpl_residual_call_r_r`).
+/// * `'i'`: caller's `registers_i[dst]` — Int-typed `Call*` family
+///   (`_r_i/iRd>i`, `pyjitpl.py opimpl_residual_call_r_i`).
+/// * `'v'`: void return — operand layout drops the trailing `>X` byte and
+///   the writeback no-ops (`_r_v/iRd`, `pyjitpl.py
+///   opimpl_residual_call_r_v`, `blackhole.py bhimpl_residual_call_r_v`).
+/// (`'f'` is intentionally absent: RPython does not exec-generate
+/// `opimpl_residual_call_r_f`. The only float-result residual_call
+/// shape is `_irf_f/iIRFd>f`, dispatched by
+/// [`dispatch_residual_call_iIRFd_kind`].)
+///
+/// TODO: walker selects the IR opcode by EffectInfo
+/// branch (`CallMayForce*` for forces, `CallLoopinvariant*` for
+/// loop-invariant, `CallPure*` for elidable, otherwise `Call*`) via
+/// [`select_residual_call_opcode`]. Two sub-cases route through
+/// dedicated helpers before the selector:
+///   - **release-gil** ([`direct_call_release_gil`], `pyjitpl.py-
+///     3681`) — early-return when `ei.is_call_release_gil()`,
+///     reshapes the arglist to `[savebox, funcbox] + argboxes[1:]`
+///     and records `CALL_RELEASE_GIL_*` instead of `CALL_MAY_FORCE_*`.
+///   - **loop-invariant heapcache** ([`loopinvariant_lookup`] /
+///     [`loopinvariant_now_known`], `pyjitpl.py`) —
+///     short-circuits the record on a heapcache hit and populates
+///     the cache after a fresh record.
+///
+/// Emits `GUARD_NOT_FORCED` on the forces path plus
+/// `GUARD_NO_EXCEPTION` whenever `check_can_raise(False)` is true,
+/// matching `pyjitpl.py`. After every recorded call op,
+/// invalidates the heapcache via
+/// `heap_cache.invalidate_caches_varargs(call_opcode, ei, allboxes)`
+/// matching `pyjitpl.py _record_helper_varargs` parity (forces
+/// branch's `pyjitpl.py` redundantly invalidates with
+/// `CALL_MAY_FORCE_*`, equivalent because `select_residual_call_opcode`
+/// returns `CallMayForce*` for the forces classification).  Release-gil
+/// helper invalidates with `CALL_MAY_FORCE_*` matching
+/// `pyjitpl.py`'s `opnum1`. The pre-call vable IR bookkeeping
+/// (`pyjitpl.py vable_and_vrefs_before_residual_call`, IR-only
+/// portion: FORCE_TOKEN + SETFIELD_GC) is wired via
+/// [`maybe_walker_vable_and_vrefs_before_residual_call`].  The
+/// after-call helpers (`pyjitpl.py
+/// vrefs_after_residual_call` / `vable_after_residual_call`) and the
+/// runtime heap mutations on `tracing_before_residual_call` run in the
+/// residual-call execution path — see
+/// [`walker_vable_and_vrefs_before_residual_call`] for the IR-vs-heap
+/// split rationale.  The `OS_NOT_IN_TRACE` check fires up front via
+/// [`do_not_in_trace_call_result`] — fail-loud guard against future
+/// silent TODOs once the `majit-translate` analyzer trio
+/// populates `oopspecindex`.
+///
+/// Still missing relative to upstream `do_residual_call`, all blocked
+/// on infrastructure absent from pyre-jit-trace today:
+///   - `OS_JIT_FORCE_VIRTUAL` PTR_EQ + GUARD_VALUE prelude
+///     (`pyjitpl.py _do_jit_force_virtual`) —
+///     walker is fail-loud here via [`do_jit_force_virtual_guard`]
+///     (called from each `dispatch_residual_call_*` arm); a producer
+///     that emits an `OopSpecIndex::JitForceVirtual` calldescr surfaces
+///     `DispatchError::JitForceVirtualRequiresConcreteResolver` instead
+///     of silently recording `CALL_MAY_FORCE_*` (this was the prior
+///     behaviour and is documented as STRICTER-THAN-PYPY in
+///     [`do_jit_force_virtual_guard`]'s docstring). Optimizer pass
+///     `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`)
+///     already handles the constant-token / non-null-forced short-circuit
+///     post-trace. Adding the PTR_EQ + GUARD_VALUE prelude (the only
+///     way to retire the fail-loud guard) is not yet implemented and
+///     would land with the walker; metainterp has a tests-only
+///     orthodox port at
+///     `majit-metainterp/src/pyjitpl.rs _do_jit_force_virtual`
+///     that the converged walker would route through. Production reach
+///     today is zero — `jtransform.rs jit.force_virtual` is the only
+///     producer and pyre's interpreter does not emit it.
+///   - `vrefs_after_residual_call` is ported on `TraceCtx` but the walker
+///     never calls it; no `jit.virtual_ref` producers exist today, so the
+///     upstream loops are empty either way. Vable forces are detected by the
+///     residual-call execution path's heap-token bracket.
+///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
+///     tracer also returns `None` from this helper unless a
+///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
+///     (`majit-metainterp/src/pyjitpl.rs` defers to
+///     direct_call_release_gil/may_force, which is the same fall-through
+///     the walker already takes).
+///   - `direct_assembler_call` (`pyjitpl.py`) + KEEPALIVE
+///     (`pyjitpl.py`) — only fire when `assembler_call=True`
+///     in `do_residual_call`. Walker's residual_call dispatchers are
+///     never called with `assembler_call=True`; the parallel
+///     `inline_call_*/dR>X` family routes through
+///     [`dispatch_inline_call_dr_kind`] instead. Adding the path would
+///     require the codewriter to emit a new `assembler_call` shape, not
+///     a walker-side change.
+///   - Per-PC liveness narrowing for the snapshot that
+///     `walker_capture_snapshot_for_last_guard` attaches
+///     (`pyjitpl.py _get_list_of_active_boxes`). Walker's
+///     helper today snapshots every non-`OpRef::NONE` register across
+///     all three banks; RPython narrows the box list via
+///     `jitcode.get_live_vars_info(pc, op_live)` so dead registers are
+///     pruned before the snapshot.  The walker has no `op_live` byte
+///     reader plumbed through `SubJitCodeBody` yet — follow-up
+///     once the codewriter exposes the per-PC liveness table on the
+///     callee body slice.  Over-capture is correctness-preserving:
+///     `store_final_boxes_in_guard` filters dead boxes from the
+///     snapshot via the optimizer's liveness pass.
 pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -5128,32 +5249,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         );
     }
 
-    // STORE_SUBSCR strategy-aware specialization.  Fires when funcptr
-    // matches the registered `store_subscr_fn` address, r_args carries the
-    // 3-arg `[obj_reg, key_reg, value_reg]` shape codewriter emits
-    // (`codewriter.rs build_store_subscr_fn_residual_call_r_v_insn`),
-    // dst_bank is `'v'` (STORE_SUBSCR returns void), and all 3 concrete
-    // shadow slots are populated.  On success, records the specialized
-    // IR shape (guard_class + guard_strategy + setarrayitem-family) via
-    // the trait-equivalent `generated_store_subscr_value` helper (now
-    // generic over `WalkerFrameOps`, with `WalkContext` impl).
-    //
-    // Production dispatch supplies the expected address via
-    // `WalkContext.store_subscr_fn_addr`; tests and diagnostics may use
-    // `PYRE_WALKER_STORE_SUBSCR_FNADDR=<hex>`.  Without either address,
-    // the gate decays to no-op and dispatcher falls through to the generic
-    // residual-call path.
-    let specialization =
-        try_walker_store_subscr_specialization(ctx, code, op, funcptr, &r_args, dst_bank);
     // Drain the snapshot-capture failure the `WalkerFrameOps`
     // `generate_guard` impl latched (its `()` trait signature has no error
     // channel): a guard recorded without a resume snapshot must abort the
-    // walk, whether the specialization completed or declined mid-way.
+    // walk.
     if let Some(e) = ctx.pending_guard_snapshot_error.take() {
         return Err(e);
-    }
-    if let Some(outcome) = specialization {
-        return Ok((outcome, op.next_pc));
     }
 
     // StoreName/StoreGlobal IntMutableCell in-place store fold: module-scope

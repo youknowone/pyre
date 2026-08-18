@@ -396,7 +396,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // `walker_capture_snapshot_for_last_guard` would attach
             // resume data pointing at the wrong frame, so keep
             // STORE_SUBSCR specialization off on this entry.
-            store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,
@@ -1315,7 +1314,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // never run pre-deopt (the deopt cut the trace there), so this is its
             // first and only concrete execution.
             is_authoritative_executor: true,
-            store_subscr_fn_addr: None,
             pending_guard_snapshot_error: None,
             vstack_boxes: Vec::new(),
             vstack_depth: 0,

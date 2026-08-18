@@ -1696,30 +1696,12 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// nesting depth is shallow (2–3 levels), so the per-sub-walk
     /// clone cost is negligible.
     pub outer_active_boxes: Vec<OpRef>,
-    /// Runtime address of `bh_store_subscr_fn` (pyre-jit's
-    /// `cpu.store_subscr_fn` binding) used by
-    /// `try_walker_store_subscr_specialization` to recognise the
-    /// 3-arg `residual_call_r_v(store_subscr_fn, obj, key, value)`
-    /// emitted by `codewriter.rs
-    /// build_store_subscr_fn_residual_call_r_v_insn`.
-    ///
-    /// Every root entry currently passes `None` (the retired
-    /// per-opcode arm entry was the caller that plumbed the address
-    /// through pyre-jit's `cpu.store_subscr_fn`).  Sub-walks inherit
-    /// the parent's value.  `None` disables the field-based
-    /// specialization gate.
-    ///
-    /// `PYRE_WALKER_STORE_SUBSCR_FNADDR` is read as the fallback when this
-    /// field is `None`, keeping test fixtures and runtime overrides from
-    /// needing a full production `MIFrame` entry.
-    pub store_subscr_fn_addr: Option<usize>,
     /// Snapshot-capture failure latched by the `WalkerFrameOps`
     /// `generate_guard` impl, whose `()` trait signature (shared with
-    /// `MIFrame`) has no error channel.  The STORE_SUBSCR
-    /// specialization drives the `majit-translate` codegen helpers over
-    /// this context; its dispatcher call site drains the latch and
-    /// surfaces the `DispatchError` so a guard recorded without a resume
-    /// snapshot aborts the walk instead of compiling.
+    /// `MIFrame`) has no error channel.  The residual-call dispatcher
+    /// drains the latch and surfaces the `DispatchError` so a guard
+    /// recorded without a resume snapshot aborts the walk instead of
+    /// compiling.
     pub pending_guard_snapshot_error: Option<DispatchError>,
     /// PyPy-faithful kept-operand-stack snapshot: the walk-level
     /// symbolic operand stack, indexed by ABSOLUTE operand-stack depth
@@ -7399,39 +7381,6 @@ fn direct_call_release_gil<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
     }
     Ok(None)
-}
-
-/// Parse `"0x<hex>"` or `"<decimal>"` into a `usize` address for
-/// env-var-driven function-pointer gates.
-fn parse_hex_or_decimal_usize(s: &str) -> Option<usize> {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        usize::from_str_radix(rest, 16).ok()
-    } else {
-        s.parse::<usize>().ok()
-    }
-}
-
-/// Runtime resolution of the `bh_store_subscr_fn` address via
-/// `pyre_interpreter::jit_trace_fnaddrs()` linear scan (cached in a
-/// `OnceLock`).  Returns
-/// `None` if the symbol is unregistered (which would indicate a
-/// jit_fnaddr.rs regression — the path is registered at
-/// `pyre-interpreter/src/jit_fnaddr.rs`).
-///
-/// Cached on first call.  Linear scan is acceptable because the table
-/// has ~150 entries and the cache miss happens once per process.
-pub(crate) fn bh_store_subscr_fn_addr_cached() -> Option<usize> {
-    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        const PATH: &str = "pyre_interpreter::opcode_ops::bh_store_subscr_fn";
-        for (name, addr) in pyre_interpreter::jit_trace_fnaddrs() {
-            if name == PATH {
-                return Some(addr as usize);
-            }
-        }
-        None
-    })
 }
 
 /// Resolve a concrete callable pointer to `(w_code, arg_count, has_closure)`,

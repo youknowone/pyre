@@ -578,10 +578,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs:151`)
     // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`.
-    // Registered here so `pyre-jit-trace`'s walker specialization gate
-    // (`try_walker_store_subscr_specialization`) can recover the
-    // runtime address via `jit_trace_fnaddrs()` lookup without a
-    // cross-crate `pyre-jit-trace → pyre-jit` dependency edge.
+    // Registered here so a consumer can recover the runtime address via
+    // `jit_trace_fnaddrs()` lookup without a cross-crate dependency edge.
     push_alias_pair(
         &mut entries,
         "pyre_interpreter::opcode_ops::bh_store_subscr_fn",
