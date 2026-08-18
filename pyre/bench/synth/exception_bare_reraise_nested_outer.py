@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=12
+# pyre-check: skip-cpython
+# cpython 2.30s vs pyre 0.42s (5.5x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Bare `raise` inside a nested handler whose re-raise must reach the OUTER
 # handler, exercised under a bridge resume that lands inside the inner handler.
 #

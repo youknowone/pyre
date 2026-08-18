@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=28
+# pyre-check: skip-cpython
+# cpython 2.16s vs pyre 0.50s (4.3x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Regression guard for P2 root result seeding when the residual-call result is
 # stored into a root local slot.  The late type flip forces a guard failure in
 # the inlined callee chain; the root stores the returned value in `x` before

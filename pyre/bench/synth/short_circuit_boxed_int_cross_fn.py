@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=16
+# pyre-check: skip-cpython
+# cpython 2.26s vs pyre 0.43s (5.3x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Cross-function kept-stack short-circuit where a small-int function is traced
 # BEFORE a structurally-identical heap-int (>= 256) function.
 #

@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=12
+# pyre-check: skip-cpython
+# cpython 1.62s vs pyre 0.21s (7.7x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # A boxed-int conditional-expression keeps a heap int (>= 256) live on the
 # operand stack across a `goto_if_not` branch guard INSIDE an exception
 # handler body.  The kept-stack guard's not-taken arm resumes at a PC the

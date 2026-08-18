@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=11
+# pyre-check: skip-cpython
+# cpython 3.46s vs pyre 0.29s (11.9x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # A hot `math.sqrt(x)` loop.  The walker specializes the call
 # (`try_walker_specialize_math_sqrt`) to a domain-guarded pure
 # `CALL_F(sqrt_nonneg_jit)` (ll_math.rs `ll_math_sqrt` -> `sqrt_nonneg`,

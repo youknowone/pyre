@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=9.5
+# pyre-check: skip-cpython
+# cpython 2.68s vs pyre 0.24s (11.2x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
 N = 35553509

@@ -3679,8 +3679,18 @@ def main():
         # 0.13s on the linux and macos runners and 0.39s on the windows one, so
         # pyre reads faster than pypy there. This is the bench that sets the
         # floor divisor's lower bound among the non-synthetic ones.
-        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       1,       5,       1,       5)
-        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       0.5,     5,       1,       5,    wasm_float_tol=True)
+        #
+        # Neither carries a cpython gate, and an absent gate is what stops
+        # cpython being spawned for the row at all. On the ubuntu runner
+        # cpython takes 11.38s against the slowest backend's 0.45s here and
+        # 4.42s against 0.85s on nbody, so the gates they used to carry (1x,
+        # and 0.5x/1x) sat 25x and 3x inside their margin while the 5x pypy
+        # gate beside them reads 1.6x-2.6x: pypy trips on the smaller
+        # regression of the two in both rows. Those two spawns were three
+        # quarters of every cpython second this file spends outside the
+        # synthetic suite.
+        chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    5,       None,    5)
+        chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
