@@ -1826,6 +1826,10 @@ fn path_or_fd_w(
             )?
             .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            // A `None` left on the type switches the protocol off the way
+            // `__hash__ = None` does, so the object is turned away as not
+            // path-like and named by its own type.  `_unwrap_path` instead
+            // calls what it found, which reports `NoneType` as not callable.
             if pyre_object::is_none(fspath_fn) {
                 return Err(reject(obj));
             }

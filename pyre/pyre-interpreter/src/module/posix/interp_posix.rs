@@ -1095,6 +1095,10 @@ pub(crate) fn fspath(
         }
         .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
         let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
+        // A `None` left on the type switches the protocol off the way
+        // `__hash__ = None` does, so the object is turned away as not
+        // path-like and named by its own type.  `_fspath` instead calls what
+        // it found, which reports `NoneType` as not callable.
         if unsafe { pyre_object::is_none(fspath_fn) } {
             return Err(crate::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",
