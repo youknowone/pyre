@@ -3631,6 +3631,19 @@ impl MiniMarkGC {
             }
             if shadow_was_visited {
                 unsafe { (*(shadow_hdr as *mut GcHeader)).set_flag(flags::VISITED) };
+                // The copy above replaced every field of an object the marker
+                // has already accounted for as black, and the incoming values
+                // are this cycle's first sight of them: the shadow was reserved
+                // black before anything was copied into it (`allocate_shadow`),
+                // so nothing has ever traced these slots.  A black object is
+                // never pushed again by `grey_child`, so without this its
+                // children stay white and the sweep frees them while the object
+                // still points at them.  Re-greying a modified black object is
+                // what `_add_to_more_objects_to_trace` (incminimark.py:2357-2360)
+                // does for every other mid-cycle mutation.
+                if self.gc_state == GcState::Marking {
+                    self.incr_state.more_gray_stack.push(shadow_obj);
+                }
             }
             shadow_hdr
         } else {
