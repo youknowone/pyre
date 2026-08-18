@@ -227,6 +227,39 @@ pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
     alloc_rbigint_nursery_collecting_impl(value, true)
 }
 
+/// Let the collector reclaim the conversion's temporaries before the nursery
+/// is exhausted.
+///
+/// `rbigint.py:3113-3118`'s loop reaches `x.divmod(...)` on every iteration,
+/// and upstream that is an ordinary malloc: when the nursery cannot satisfy it
+/// the GC collects, so the quotients and remainders of earlier iterations —
+/// dead the moment the next one starts — never leave the nursery. pyre's digit
+/// allocator cannot collect (its callers hold several unboxed `RBigInt`
+/// handles at once), so it spills to old-gen instead. A long conversion fills
+/// the nursery once and then promotes every later block, and the next
+/// allocation *after* the conversion pays for all of them in one collection.
+///
+/// Minting one payload through the collecting allocator restores the upstream
+/// shape at the one point in that loop where the frame's only live edge is
+/// already rooted. The bump fails exactly when the nursery is exhausted, which
+/// is exactly when spilling would otherwise begin; the collection that follows
+/// hands the loop a fresh nursery, so at most one iteration's blocks can be
+/// promoted instead of the whole conversion's.
+///
+/// The minted handle is immediately dead. That is the point: it is a request
+/// for the collection, not a value.
+///
+/// # Safety
+///
+/// The caller must keep every `RBigInt` it holds live across this call rooted
+/// — `x` in the two `_format_recursive_*` graphs is held in an
+/// [`RBigIntGcRoot`] for exactly this reason — and must not read an `&RBigInt`
+/// derived before the call afterwards.
+#[inline]
+pub unsafe fn format_recursion_safepoint(rooted: &RBigInt) {
+    let _ = alloc_rbigint_clone_nursery_collecting(rooted.clone());
+}
+
 /// Allocate the fresh translated GC handle required by `RBigInt::clone`.
 ///
 /// RPython's `rbigint.neg`/`abs` shallow-copy the immutable digit list and

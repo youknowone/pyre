@@ -1175,6 +1175,14 @@ impl RBigInt {
         _AsDouble(self)
     }
 
+    /// Render this value in `digits`' base, between `prefix` and `suffix`.
+    ///
+    /// A conversion long enough to exhaust the nursery collects part-way
+    /// through, so a caller must not read an `&RBigInt` — this receiver
+    /// included — that it obtained before the call. `self` is consumed into a
+    /// by-value handle before the first collection point and is never read
+    /// again here, so a caller that needs the receiver afterwards must
+    /// re-derive it from whatever roots it.
     #[majit_macros::jit_elidable]
     pub fn format(
         &self,
@@ -4521,7 +4529,7 @@ fn _format_int10_18digits(mut val: i64, builder: &mut String) {
     reason = "The signature is the direct specialized _format_recursive graph from rbigint.py; callable identity and argument order are part of RPython specialization parity"
 )]
 fn _format_recursive_decimal(
-    mut x: RBigInt,
+    x: RBigInt,
     mut i: i64,
     output: &mut String,
     pcb: &PartsCacheBase,
@@ -4530,9 +4538,18 @@ fn _format_recursive_decimal(
     size_prefix: i64,
     max_str_digits: i64,
 ) -> Result<(), RBigIntError> {
+    // `x` stays live across `divmod` and across the recursive call, both of
+    // which can now collect.  RPython's stack map roots it there; a Rust local
+    // has no stack map, so it is rooted explicitly for the whole body.  `top`
+    // is moved into the callee, which roots it the same way, and `pts`/`pcb`
+    // are forwarded by `walk_rbigint_cache_digit_slots`.
+    let mut x = crate::rbigint::gc::RBigIntGcRoot::new(x);
     while i > 0 {
+        // Safety: this frame's only live `RBigInt` is `x`, held in the root
+        // guard above, and nothing reads an `&RBigInt` taken before this point.
+        unsafe { crate::rbigint::gc::format_recursion_safepoint(&x) };
         let (top, low) = x.divmod(&pts[i as usize])?;
-        x = low;
+        *x = low;
         if top.tobool() || output.len() as i64 != size_prefix {
             _format_recursive_decimal(
                 top,
@@ -4601,7 +4618,7 @@ fn _format_recursive_decimal(
     reason = "The signature is the direct specialized _format_recursive graph from rbigint.py; grouping state would obscure recursive-call and specialization parity"
 )]
 fn _format_recursive_general(
-    mut x: RBigInt,
+    x: RBigInt,
     mut i: i64,
     output: &mut String,
     pcb: &PartsCacheBase,
@@ -4610,9 +4627,18 @@ fn _format_recursive_general(
     size_prefix: i64,
     max_str_digits: i64,
 ) -> Result<(), RBigIntError> {
+    // `x` stays live across `divmod` and across the recursive call, both of
+    // which can now collect.  RPython's stack map roots it there; a Rust local
+    // has no stack map, so it is rooted explicitly for the whole body.  `top`
+    // is moved into the callee, which roots it the same way, and `pts`/`pcb`
+    // are forwarded by `walk_rbigint_cache_digit_slots`.
+    let mut x = crate::rbigint::gc::RBigIntGcRoot::new(x);
     while i > 0 {
+        // Safety: this frame's only live `RBigInt` is `x`, held in the root
+        // guard above, and nothing reads an `&RBigInt` taken before this point.
+        unsafe { crate::rbigint::gc::format_recursion_safepoint(&x) };
         let (top, low) = x.divmod(&pts[i as usize])?;
-        x = low;
+        *x = low;
         if top.tobool() || output.len() as i64 != size_prefix {
             _format_recursive_general(
                 top,
