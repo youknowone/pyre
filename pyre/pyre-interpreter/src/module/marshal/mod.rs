@@ -240,7 +240,7 @@ unsafe fn write_code(
     out.write_u32(code.max_stackdepth);
     out.write_u32(code.flags.bits());
 
-    write_bytes(out, &code.instructions.original_bytes())?;
+    write_bytes(out, &unsafe { crate::pycode::code_bytes(code_root.get()) })?;
 
     out.write_u8(b'(');
     write_len(out, code.constants.len())?;

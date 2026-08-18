@@ -338,6 +338,17 @@ pub struct PyCode {
     /// for the bootstrap family; without both it holds a pre-move address after
     /// the first collection that moves the string.
     pub filename_bytes: *mut Vec<u8>,
+    /// PyPy `pycode.py:132 self.co_code = co_code`: byte-exact public
+    /// bytecode supplied to `CodeType` / `code.replace` when it contains an
+    /// opcode that RustPython's enum cannot represent (or its explicit
+    /// `Reserved` hole).  Ordinary compiler-produced code leaves this null
+    /// and derives `co_code` from `CodeUnits`.
+    ///
+    /// The execution stream uses `Instruction::Reserved` as a placeholder,
+    /// but getters, equality, hashing and marshal must retain the actual byte.
+    /// Keeping the owner-local field mirrors PyPy's `PyCode.co_code`; an
+    /// address-keyed side table would lose both lifetime and structural parity.
+    pub co_code_bytes: *mut Vec<u8>,
     /// Whether a nested compiler constant selected by
     /// `importing.py update_code_filenames`' `oldname` guard inherits
     /// `filename_bytes` if a fallback slot ever has to be rebuilt. False for
@@ -868,6 +879,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         code_ptr,
         co_firstlineno_raw,
         filename_bytes: std::ptr::null_mut(),
+        co_code_bytes: std::ptr::null_mut(),
         filename_inherits_to_nested: false,
         w_globals: pyre_object::PY_NULL,
         w_weakreflifeline: pyre_object::PY_NULL,
@@ -1050,6 +1062,38 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     } else if !slot.is_null() {
         unsafe { drop(Box::from_raw(*slot)) };
         *slot = std::ptr::null_mut();
+    }
+}
+
+/// Replace the byte-exact `PyCode.co_code` fallback owned by `obj`.
+///
+/// A null slot means every opcode is representable by compiler-core and its
+/// canonical `original_bytes()` is authoritative.
+unsafe fn set_co_code_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+    let slot = unsafe { &mut (*(obj as *mut PyCode)).co_code_bytes };
+    if let Some(bytes) = bytes {
+        if slot.is_null() {
+            *slot = Box::into_raw(Box::new(bytes));
+        } else {
+            unsafe { **slot = bytes };
+        }
+    } else if !slot.is_null() {
+        unsafe { drop(Box::from_raw(*slot)) };
+        *slot = std::ptr::null_mut();
+    }
+}
+
+/// Return the public, byte-exact `co_code` spelling for a live `PyCode`.
+///
+/// # Safety
+/// `w_code` must point to a live [`PyCode`].
+pub(crate) unsafe fn code_bytes(w_code: PyObjectRef) -> Vec<u8> {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if pycode.co_code_bytes.is_null() {
+        let code = unsafe { &*(pycode.code_ptr as *const crate::CodeObject) };
+        code.instructions.original_bytes()
+    } else {
+        unsafe { (&*pycode.co_code_bytes).clone() }
     }
 }
 
@@ -1286,7 +1330,7 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_stacksize" => w_int_new(code.max_stackdepth as i64),
         "co_flags" => w_int_new(code.flags.bits() as i64),
         "co_code" | "_co_code_adaptive" => {
-            pyre_object::bytesobject::w_bytes_from_bytes(&code.instructions.original_bytes())
+            pyre_object::bytesobject::w_bytes_from_bytes(&unsafe { code_bytes(obj) })
         }
         "co_consts" => constants_tuple(obj, code),
         "co_names" => names_tuple(&code.names),
@@ -1338,7 +1382,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     let stacksize = stacksize_value as u32;
     let flags_bits = flags_value as u32;
-    let instructions = unsafe { read_code_units(args[7])? };
+    let (instructions, co_code_bytes) = unsafe { read_code_units(args[7])? };
     let constants = unsafe { read_code_consts(args[8])? };
     let names = unsafe { read_code_names(args[9], "names")? };
     let varnames = unsafe { read_code_names(args[10], "varnames")? };
@@ -1418,6 +1462,7 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
     unsafe { set_filename_bytes(result, filename_bytes) };
+    unsafe { set_co_code_bytes(result, co_code_bytes) };
     unsafe { w_code_fill_consts_from_tuple(result, args[8]) };
     Ok(result)
 }
@@ -1501,6 +1546,9 @@ pub unsafe fn code_eq(
     {
         return Ok(w_bool_from(false));
     }
+    if unsafe { code_bytes(this) } != unsafe { code_bytes(other) } {
+        return Ok(w_bool_from(false));
+    }
     Ok(w_bool_from(code_data_equal(a, b)))
 }
 
@@ -1548,7 +1596,7 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     }
     add_obj(
         &mut result,
-        pyre_object::bytesobject::w_bytes_from_bytes(&code.instructions.original_bytes()),
+        pyre_object::bytesobject::w_bytes_from_bytes(&unsafe { code_bytes(obj) }),
     )?;
     add_obj(
         &mut result,
@@ -1883,6 +1931,14 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     };
     let mut filename_inherits_to_nested =
         unsafe { (*(w_self as *const PyCode)).filename_inherits_to_nested };
+    let mut co_code_bytes = unsafe {
+        let ptr = (*(w_self as *const PyCode)).co_code_bytes;
+        if ptr.is_null() {
+            None
+        } else {
+            Some((&*ptr).clone())
+        }
+    };
     let get = |name: &str| crate::builtins::kwarg_get(kwargs, name);
     let rebuild_localspluskinds = get("co_varnames").is_some()
         || get("co_cellvars").is_some()
@@ -1961,7 +2017,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         filename_inherits_to_nested = false;
     }
     if let Some(v) = get("co_code") {
-        code.instructions = unsafe { read_code_units(v)? };
+        (code.instructions, co_code_bytes) = unsafe { read_code_units(v)? };
     }
 
     if requested_nlocals.is_some_and(|n| n as usize != code.varnames.len()) {
@@ -2009,6 +2065,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 
     let result = box_code_object_with_firstlineno(code, firstlineno_raw);
     unsafe { set_filename_bytes(result, filename_bytes) };
+    unsafe { set_co_code_bytes(result, co_code_bytes) };
     unsafe {
         (*(result as *mut PyCode)).filename_inherits_to_nested = filename_inherits_to_nested;
     }
@@ -2123,7 +2180,9 @@ unsafe fn read_code_bytes(v: PyObjectRef, field: &str) -> Result<Box<[u8]>, crat
 
 /// `co_code` bytes → the decoded `CodeUnits` instruction stream.  The byte
 /// form is the `original_bytes` layout: one `(opcode, arg)` pair per unit.
-unsafe fn read_code_units(v: PyObjectRef) -> Result<crate::bytecode::CodeUnits, crate::PyError> {
+unsafe fn read_code_units(
+    v: PyObjectRef,
+) -> Result<(crate::bytecode::CodeUnits, Option<Vec<u8>>), crate::PyError> {
     if !unsafe { pyre_object::bytesobject::is_bytes_like(v) } {
         return Err(crate::PyError::type_error("co_code must be a bytes object"));
     }
@@ -2134,16 +2193,29 @@ unsafe fn read_code_units(v: PyObjectRef) -> Result<crate::bytecode::CodeUnits, 
         ));
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
+    let mut preserve_raw = false;
     for pair in bytes.chunks_exact(2) {
-        let op = crate::bytecode::Instruction::try_from(pair[0]).map_err(|_| {
-            crate::PyError::value_error(format!("co_code contains unknown opcode {}", pair[0]))
-        })?;
-        units.push(crate::bytecode::CodeUnit::new(
-            op,
-            crate::bytecode::OpArgByte::from(pair[1]),
-        ));
+        let (op, arg) = match crate::bytecode::Instruction::try_from(pair[0]) {
+            Ok(crate::bytecode::Instruction::Reserved) | Err(_) => {
+                preserve_raw = true;
+                // `CodeUnit` cannot carry an arbitrary opcode byte.  Keep the
+                // exact public stream in `PyCode.co_code_bytes`, and carry the
+                // invalid opcode in the Reserved placeholder's otherwise
+                // meaningless arg so shared interpreter/JIT dispatch can
+                // report CPython's `unknown opcode N` at execution time.
+                (
+                    crate::bytecode::Instruction::Reserved,
+                    crate::bytecode::OpArgByte::from(pair[0]),
+                )
+            }
+            Ok(op) => (op, crate::bytecode::OpArgByte::from(pair[1])),
+        };
+        units.push(crate::bytecode::CodeUnit::new(op, arg));
     }
-    Ok(crate::bytecode::CodeUnits::from(units))
+    Ok((
+        crate::bytecode::CodeUnits::from(units),
+        preserve_raw.then(|| bytes.to_vec()),
+    ))
 }
 
 /// A `tuple` `co_consts` field → the compiler `Constants` backing table.
@@ -2835,6 +2907,14 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     if !code.co_names_w.is_null() {
         drop(unsafe { Box::from_raw(code.co_names_w) });
         code.co_names_w = std::ptr::null_mut();
+    }
+    if !code.filename_bytes.is_null() {
+        drop(unsafe { Box::from_raw(code.filename_bytes) });
+        code.filename_bytes = std::ptr::null_mut();
+    }
+    if !code.co_code_bytes.is_null() {
+        drop(unsafe { Box::from_raw(code.co_code_bytes) });
+        code.co_code_bytes = std::ptr::null_mut();
     }
 }
 

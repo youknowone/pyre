@@ -277,7 +277,10 @@ pub fn decode_instruction_forward(
             opcode_pc += 1;
             continue;
         }
-        if opcode_pc != start && u8::from(instruction) < 44 {
+        if opcode_pc != start
+            && u8::from(instruction) < 44
+            && !matches!(instruction, Instruction::Reserved)
+        {
             return Err(crate::pycode::BytecodeCorruption);
         }
         return Ok((opcode_pc, instruction, op_arg));
@@ -3511,6 +3514,14 @@ where
         + ArithmeticOpcodeHandler,
 {
     match instruction {
+        // CPython 3.14 accepts unknown bytes in `CodeType` / `code.replace`
+        // and reports them only when dispatch reaches the instruction.  The
+        // constructor stores the raw opcode byte in this placeholder's low
+        // arg byte because compiler-core's enum cannot represent it.
+        Instruction::Reserved => Err(PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("unknown opcode {}", u32::from(op_arg) & 0xff),
+        )),
         Instruction::ExtendedArg
         | Instruction::Resume { .. }
         | Instruction::Nop
