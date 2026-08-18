@@ -53,9 +53,16 @@ for spelling, cwd in spellings:
     assert os.pardir not in parts, (spelling, reported)
     assert os.path.samefile(reported, sys.executable), (spelling, reported)
 
-if os.name == 'posix':
-    # `resolvedirof` is what follows links; the invoked spelling is not, so a
-    # symlinked executable answers with the link.  `samefile` cannot see the
+# The checks below compare the reported spelling character for character, and
+# that is a contract of this implementation rather than a portable one: the
+# reference interpreter's own `sys.executable` does not run through
+# `posixpath.normpath` -- it answers a relative `../bin/python` unnormalized --
+# and a darwin framework build answers with the image path the loader resolved,
+# so neither the spelling nor its normalization survives there.  What is
+# asserted is `initpath.py`'s division: `abspath` normalizes lexically and
+# `resolvedirof` is the only half that follows a link.
+if sys.implementation.name == 'pyre' and os.name == 'posix':
+    # A symlinked executable answers with the link.  `samefile` cannot see the
     # difference -- it resolves both sides -- so this compares the strings.
     # Windows is left out because creating a symlink there needs a privilege
     # an ordinary account does not hold.
