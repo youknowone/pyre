@@ -13404,11 +13404,12 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // `space.id` (baseobjspace.py): a plain `int` yields its
     // value-derived `immutable_unique_id`; every other object falls back
-    // to `compute_unique_id` — its address.
+    // to `compute_unique_id`, which incminimark implements through
+    // `id_or_identityhash` (incminimark.py) so nursery moves preserve it.
     let obj = args[0];
     Ok(match crate::function::immutable_unique_id(obj) {
         Some(w_id) => w_id,
-        None => w_int_new(obj as usize as i64),
+        None => w_int_new(pyre_object::gc_hook::gc_identity_hash(obj as usize) as i64),
     })
 }
 

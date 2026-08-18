@@ -685,17 +685,47 @@ pub fn all_descrs() -> &'static [BhDescr] {
     })
 }
 
-/// Deserialized `pipeline.ei_descr_mints` — the gccache slots that only an
-/// `EffectInfo` raw set names, paired with the arguments their mint took.
+/// Indexed `pipeline.ei_descr_mints` — gccache slots named only by an
+/// EffectInfo raw set, paired with the arguments their mint took.
 ///
 /// See `descr::publish_effect_info_descr_mints` for why the opcode table alone
-/// leaves these slots empty on this side of the build/runtime split.
-fn load_ei_descr_mints() -> Vec<majit_ir::effectinfo::DescrMintEntry> {
+/// leaves these slots empty on this side of the build/runtime split.  Entries
+/// are decoded independently so setup never retains all 2,000+ string-heavy
+/// mint specs at once.
+fn ei_descr_mint_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize ei_descr_mints_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn ei_descr_mint_count() -> usize {
+    ei_descr_mint_offsets().len() - 1
+}
+
+fn load_ei_descr_mint(index: usize) -> majit_ir::effectinfo::DescrMintEntry {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_mints.bin"));
-    bincode::deserialize(BYTES).unwrap_or_else(|e| {
+    let offsets = ei_descr_mint_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
         panic!(
-            "pyre-jit-trace: failed to deserialize ei_descr_mints.bin \
-             ({} bytes): {e}",
+            "pyre-jit-trace: failed to deserialize ei_descr_mints.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
             BYTES.len(),
         )
     })
@@ -825,9 +855,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // Upstream's descriptors remain in GcCache; the temporary arguments
         // passed to get_*_descr do not.  Drop the decoded strings/specs as
         // soon as their canonical runtime descriptors have been published.
-        {
-            let ei_descr_mints = load_ei_descr_mints();
-            crate::descr::publish_effect_info_descr_mints(&ei_descr_mints);
+        for i in 0..ei_descr_mint_count() {
+            let entry = load_ei_descr_mint(i);
+            crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
         }
         for (i, kind) in index.kinds.iter().copied().enumerate() {
             if kind != 1 {
@@ -2018,6 +2048,16 @@ mod tests {
     }
 
     #[test]
+    fn effect_info_mint_index_bounds_each_serialized_entry() {
+        let offsets = ei_descr_mint_offsets();
+        assert_eq!(offsets.len(), ei_descr_mint_count() + 1);
+        for i in 0..ei_descr_mint_count() {
+            let _entry = load_ei_descr_mint(i);
+            assert!(offsets[i] < offsets[i + 1], "mint entry {i} is empty");
+        }
+    }
+
+    #[test]
     fn rehydrate_effect_info_consumes_serialized_set_keys() {
         let mut effect_info = majit_ir::EffectInfo::default();
         assert!(effect_info.descr_set_keys.is_some());
@@ -2103,7 +2143,7 @@ mod tests {
         let base = rss_kb();
         let n_descrs = descr_count();
         let after_descrs = rss_kb();
-        let n_mints = load_ei_descr_mints().len();
+        let n_mints = ei_descr_mint_count();
         let after_mints = rss_kb();
         rehydrate_build_descr_raw_sets();
         let after_rehydrate = rss_kb();
@@ -2117,7 +2157,7 @@ mod tests {
             after_descrs - base
         );
         eprintln!(
-            "[rss-decomp] deserialize_ei_mints n={n_mints} delta={} KB",
+            "[rss-decomp] ei_mint_index        n={n_mints} delta={} KB",
             after_mints - after_descrs
         );
         eprintln!(

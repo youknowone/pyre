@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v8";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v9";
 /// Retained cache entries. Each is ~6 MB, and a handful covers the
 /// configurations one checkout switches between (native/wasm × release/dev).
 const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
@@ -30,6 +30,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "descrs.bin",
     "descrs_index.bin",
     "ei_descr_mints.bin",
+    "ei_descr_mints_index.bin",
     "field_mint_census.bin",
     "liveness.bin",
     "fnaddr_bindings.bin",
@@ -68,7 +69,8 @@ const CODEGEN_OUTPUTS: &[&str] = &[
 ///
 /// What decides the cross-process verdict after these exclusions:
 /// `jit_trace_gen.rs`, `jitcodes_index.bin`, `jit_drivers.bin`, `insns.bin`,
-/// `descrs_index.bin`, `ei_descr_mints.bin`, `liveness.bin`.
+/// `descrs_index.bin`, `ei_descr_mints.bin`, `ei_descr_mints_index.bin`,
+/// `liveness.bin`.
 /// `jitcodes_index.bin` is the load-bearing one — it holds each jitcode's name
 /// and its byte boundaries in `jitcodes.bin`, and an address is a fixed-width
 /// `i64` there, so a change in jitcode population, order or body length still
@@ -258,9 +260,10 @@ fn emit_llbc_extraction_placeholders() {
         bincode::serialize(&(vec![0_u32], Vec::<u8>::new())).unwrap(),
     )
     .unwrap();
+    std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), b"").unwrap();
     std::fs::write(
-        format!("{out_dir}/ei_descr_mints.bin"),
-        bincode::serialize(&Vec::<majit_ir::effectinfo::DescrMintEntry>::new()).unwrap(),
+        format!("{out_dir}/ei_descr_mints_index.bin"),
+        bincode::serialize(&vec![0_u32]).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -1123,8 +1126,27 @@ fn real_main() {
         // raw-set members no opcode names would have no slot on the far side;
         // persist their mint arguments and let the runtime cache take the same
         // `descr.py:224-238` miss branch this one did.
-        let ei_descr_mints_bin = bincode::serialize(&pipeline.ei_descr_mints).unwrap();
+        // Mint specs are one-shot setup inputs.  Keep the same indexed-entry
+        // shape as `descrs.bin` so the runtime can deserialize and publish one
+        // spec at a time instead of retaining all member/spec strings at the
+        // peak of first-JIT setup.
+        let mut ei_descr_mints_bin = Vec::new();
+        let mut ei_descr_mint_offsets = Vec::with_capacity(pipeline.ei_descr_mints.len() + 1);
+        ei_descr_mint_offsets.push(0_u32);
+        for entry in &pipeline.ei_descr_mints {
+            ei_descr_mints_bin.extend(bincode::serialize(entry).unwrap());
+            ei_descr_mint_offsets.push(
+                u32::try_from(ei_descr_mints_bin.len())
+                    .expect("serialized ei_descr_mints.bin exceeds the u32 offset range"),
+            );
+        }
+        let ei_descr_mints_index_bin = bincode::serialize(&ei_descr_mint_offsets).unwrap();
         std::fs::write(format!("{out_dir}/ei_descr_mints.bin"), &ei_descr_mints_bin).unwrap();
+        std::fs::write(
+            format!("{out_dir}/ei_descr_mints_index.bin"),
+            &ei_descr_mints_index_bin,
+        )
+        .unwrap();
 
         // Analyzer-side descriptor producers run in this build-script process,
         // while the runtime formats the field-position report. Persist the
