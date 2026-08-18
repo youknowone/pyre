@@ -1588,17 +1588,29 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// single-frame snapshot (`entry_py_pc` / `outer_active_boxes`), which is
 /// sound for side-effect-free leaves (re-execute the whole call on deopt).
 ///
-/// That layout is a property of the CALL-family helpers alone, so the residual
-/// this reads from has to be one of them.  Every other entry the inline lever
-/// serves passes its own receiver-plus-metadata list, not an operand-stack
-/// image: `load_attr_fn(obj, code, name_idx)` is `r_args = [obj, code]` and
-/// `store_attr_fn` is `[obj, value, code]`, whose `code` operand is a code
-/// object the Python stack never held.  Publishing it as a stack slot resumes
-/// the interpreter with the code object where the receiver belongs — the
-/// `__getattr__`/`property` folds returned `AttributeError: 'code' object has
-/// no attribute <name>` for an attribute their own hook answers.  Decline for
-/// those instead; their operand image comes from the per-slot resume sources
+/// That layout is a property of a subset of the CALL-family helpers, so the
+/// residual this reads from has to be one of them.  Every other entry the
+/// inline lever serves passes its own receiver-plus-metadata list, not an
+/// operand-stack image: `load_attr_fn(obj, code, name_idx)` is
+/// `r_args = [obj, code]` and `store_attr_fn` is `[obj, value, code]`, whose
+/// `code` operand is a code object the Python stack never held.  Publishing it
+/// as a stack slot resumes the interpreter with the code object where the
+/// receiver belongs — the `__getattr__`/`property` folds returned
+/// `AttributeError: 'code' object has no attribute <name>` for an attribute
+/// their own hook answers.  Decline for those instead; their operand image
+/// comes from the per-slot resume sources
 /// ([`reconstructed_call_stack_from_resume_sources`]).
+///
+/// `call_kw` is excluded for the same reason one step subtler: its list is a
+/// PERMUTATION of the stack rather than a different set of values.  The wire
+/// order is `(callable, null_or_self, kwnames, arg0..arg{n-1})`
+/// (`majit-ir effectinfo.rs` `PyreHelperKind::CallKw`), while `CALL_KW` pops
+/// `kwnames` FIRST (`eval.rs call_kw`), so the stack image is
+/// `[callable, null_or_self, arg0..arg{n-1}, kwnames]`.  A real `CALL_KW`
+/// always carries a non-empty kwnames tuple, so `n >= 1` on every reachable
+/// path and the two orders never coincide.  The flush's only structural check
+/// is a depth compare, which a permutation of the right length passes, and the
+/// re-executed `CALL_KW` would then pop `arg{n-1}` as its keyword-name tuple.
 pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -1607,9 +1619,7 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
 ) -> Option<Vec<pyre_object::PyObjectRef>> {
     if !matches!(
         call_descr.get_extra_info().pyre_helper,
-        majit_ir::PyreHelperKind::CallFn
-            | majit_ir::PyreHelperKind::CallKw
-            | majit_ir::PyreHelperKind::CallFunctionEx
+        majit_ir::PyreHelperKind::CallFn | majit_ir::PyreHelperKind::CallFunctionEx
     ) {
         return None;
     }
@@ -1650,8 +1660,8 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
     // Only `null_or_self@1` may be null, and the layout above names it by
     // index, so it is checked by position rather than by admitting a null
     // anywhere.  Everything else here is a Python value the rewound `CALL`
-    // pops — an argument, or `kwnames` in the `call_kw` layout — and a null in
-    // one of those slots is an UNRESOLVED register, not a value: the concrete
+    // pops, and a null in one of those slots is an UNRESOLVED register, not a
+    // value: the concrete
     // Ref bank holds `Ref(null)` for a box the walk never materialized, which
     // is why `concrete_ref_for_color` tests for it and why the prefix loop
     // above declines on it.  Publishing one lets the resumed interpreter pop a
