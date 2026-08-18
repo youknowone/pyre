@@ -1403,37 +1403,55 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
 
 /// Resolve a recorded box to the concrete ref it stands for.
 ///
-/// A NULL `Ref` is an UNRESOLVED box, not a slot whose value is null: a box
-/// carries a concrete only once the walk materialized one, and an operand the
-/// walk still holds symbolically — a deferred `LOAD_ATTR name + NULL|self`
-/// pair is the shape that reaches here — reads back `Ref(0)`.  Answer
-/// unresolved, as [`concrete_ref_for_color`] and the virtualizable-shadow
-/// fallback in [`collect_call_stack_overrides`] already do, so the slot stays
-/// ABSENT and the outer-call flush declines to the legacy replay.  Publishing
-/// it instead writes a null into a live operand-stack slot, and the
-/// interpreter resumed there dispatches through it: `out.append(f(i))` in an
-/// `except` handler faulted in `classify_callable` on the method-load slot
-/// this used to hand back as a resolved value.  The one operand whose correct
-/// value IS null — a `CALL`'s own `null_or_self` — is named and supplied
-/// separately by that function.
+/// `GcRef::NO_CONCRETE` is the sentinel for "no runtime value is known for
+/// this box" (`value.rs:51-59`), and `heapcache_ops` stamps it on a box whose
+/// load could not be replayed, so it never answers a slot.  A stamped NULL is
+/// judged by what carries it:
+///
+/// * An input argument is bound from the real frame when the loop is entered
+///   and rebound from the fail args at every guard failure, so a NULL stamped
+///   on one is the operand's value, the same way RPython's
+///   `MIFrame.registers_r` entry for a loop input box holds it.
+///   `LOAD_FAST_AND_CLEAR` saves an unbound local as exactly that null and
+///   leaves it on the operand stack below an inlined comprehension for the
+///   whole loop, so answering unresolved left every paused-caller image built
+///   over that stack one slot short and `capture_root_parent_resume_stack`
+///   declined it.
+/// * Any other box may read back `Ref(0)` while the walk still holds the
+///   operand symbolically — a deferred `LOAD_ATTR name + NULL|self` pair is
+///   the shape that reaches here.  Answer unresolved, as
+///   [`concrete_ref_for_color`] and the virtualizable-shadow fallback in
+///   [`collect_call_stack_overrides`] already do, so the slot stays ABSENT and
+///   the outer-call flush declines to the legacy replay.  Publishing it
+///   instead writes a null into a live operand-stack slot, and the interpreter
+///   resumed there dispatches through it: `out.append(f(i))` in an `except`
+///   handler faulted in `classify_callable` on the method-load slot this used
+///   to hand back as a resolved value.
+///
+/// The one operand whose correct value IS null whatever carries it — a
+/// `CALL`'s own `null_or_self` — is named and supplied separately by
+/// [`collect_call_stack_overrides`].
 pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
     // RPython history.py:361 defines CONST_NULL as a real
     // `ConstPtr(lltype.nullptr(llmemory.GCREF.TO))`.  Preserve that typed
-    // constant before consulting the runtime-concrete table.  A symbolic Ref
-    // operation whose concrete lookup happens to return Ref(NULL) is still an
-    // unresolved box and must remain absent, but an inline ConstPtr(NULL) is
-    // positive proof that this operand-stack slot contains Python's call
-    // sentinel.  LOAD_SPECIAL records exactly that constant for its
-    // `self_or_null` half, including the `__exit__` pair retained below a
+    // constant before consulting the runtime-concrete table: an inline
+    // ConstPtr(NULL) is positive proof that this operand-stack slot contains
+    // Python's call sentinel.  LOAD_SPECIAL records exactly that constant for
+    // its `self_or_null` half, including the `__exit__` pair retained below a
     // nested CALL inside a `with` body.
     if let OpRef::ConstPtr(value) = opref {
         return Some(value.as_usize() as pyre_object::PyObjectRef);
     }
+    let null_is_a_value = matches!(opref, OpRef::InputArgRef(_));
     match ctx.trace_ctx.concrete_of_opref(opref) {
-        Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
+        Some(Value::Ref(r))
+            if r != majit_ir::GcRef::NO_CONCRETE && (null_is_a_value || !r.is_null()) =>
+        {
+            Some(r.as_usize() as pyre_object::PyObjectRef)
+        }
         _ => None,
     }
 }
