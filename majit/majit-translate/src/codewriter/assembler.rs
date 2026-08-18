@@ -4055,9 +4055,31 @@ fn fielddescrof(
         // flattened inline aggregate shares an address with its first leaf
         // (`heaptracker.py:68-69`).  So resolve only when exactly one field sits
         // there, and otherwise leave the caller's number rather than name a
-        // sibling.  The `found_parent_field` arm is untouched for the converse
-        // reason: it picked its spec BY NAME, which is the better key.
-        if !found_parent_field
+        // sibling.
+        //
+        // The name arm runs first and covers `found_parent_field` too.  That
+        // arm carries a number STORED on the spec it matched, and the list that
+        // number counts is not always the list `parent` holds: `bh_field_lookup`
+        // probes the owner spelling the field descriptor arrived with, while
+        // `parent` is built for the canonical one, and the two flatten
+        // differently whenever only one of them reaches the field registry a
+        // by-value member's leaves are enumerated through.  Measured on this
+        // tree, 23 field descrs claimed a slot the list attached to them gives
+        // to a sibling; `builtins::WritableBuffer.owner_slot` (an `Int`) claimed
+        // slot 2, which its own parent gives to `address` (a `Ref`).  A
+        // consumer that resolves a field through `all_fielddescrs[index]` — the
+        // optimizer's `init_fields` slot space — then reads one bank's value
+        // out of the other's slot.  `descr.py:228` has no such split because
+        // one walker answers both questions upstream; taking the position from
+        // the attached list restores that.
+        if let Some(parent_spec) = parent.as_ref()
+            && let Some(pos) = parent_spec
+                .all_fielddescrs
+                .iter()
+                .position(|spec| spec.field_key() == field_key)
+        {
+            index_in_parent = Some(pos);
+        } else if !found_parent_field
             && let Some(parent_spec) = parent.as_ref()
             && let Some(pos) = unique_slot_at_offset(&parent_spec.all_fielddescrs, offset)
         {
