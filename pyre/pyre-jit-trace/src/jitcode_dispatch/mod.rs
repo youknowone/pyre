@@ -1180,6 +1180,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     kind: pyre_object::interp_exceptions::ExcKind,
     site: &TracebackNodeSite,
     w_next: OpRef,
+    opcode_position: usize,
 ) {
     let traceback = ctx.trace_ctx.record_op_with_descr(
         OpCode::NewWithVtable,
@@ -1211,22 +1212,30 @@ fn emit_traceback_node<Sym: WalkSym>(
 
     // `f_lineno` resolves through `offset2lineno(pycode, last_instr)` on every
     // read, so the frame itself has to carry the coordinate — the node's own
-    // `tb_lasti` answers a different question and is frozen. The interpreter
-    // gets this for free from `pyopcode.py`'s per-opcode `last_instr` store;
-    // compiled code does not run it, and `fbw_publish_exit_last_instr` only
-    // reaches the virtualizable, so an inlined callee frame would keep the `-1`
-    // initialization sentinel and report its `def` line. A frame that goes on
-    // running has this overwritten by its own later publish, exactly as the
-    // per-opcode store would.
+    // `tb_lasti` answers a different question and is frozen.  Preserve the
+    // exact operation PyPy traces from `pyopcode.py`'s per-opcode
+    // `self.last_instr = ...`: `pyjitpl.py:1188-1199
+    // _opimpl_setfield_vable` updates the shadow for the standard frame and
+    // falls through to SETFIELD_GC only for a nonstandard/inlined frame.  A raw
+    // SETFIELD_GC here wrote the root frame on every caught-exception bridge,
+    // even though `last_instr` is declared virtualizable by
+    // `interp_jit.py:25-30`.
     let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
-    let last_instr_descr = crate::descr::pyframe_next_instr_descr();
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[site.frame, last_instr_value],
-        last_instr_descr.clone(),
+    let vinfo = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .expect("traceback frame last_instr requires PyFrame virtualizable info");
+    let last_instr_index = vinfo
+        .static_field_index_by_name("last_instr")
+        .expect("PyFrame virtualizable must contain last_instr");
+    let last_instr_descr = vinfo.static_field_descr(last_instr_index);
+    ctx.trace_ctx.vable_setfield(
+        opcode_position,
+        site.frame,
+        last_instr_descr,
+        last_instr_value,
+        Some(Value::Int(i64::from(site.last_instruction))),
     );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(site.frame, last_instr_descr.index(), last_instr_value);
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     ctx.trace_ctx.record_op_with_descr(
@@ -1309,7 +1318,7 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
     // the heapcache answers with the node being built and `w_next` self-links.
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
     let w_next = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, exc, traceback_descr);
-    emit_traceback_node(ctx, exc, kind, &site, w_next);
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position);
     true
 }
 
@@ -1345,7 +1354,7 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
-    emit_traceback_node(ctx, exc, kind, &site, w_next);
+    emit_traceback_node(ctx, exc, kind, &site, w_next, opcode_position);
     true
 }
 
