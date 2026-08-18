@@ -584,7 +584,25 @@ crate::py_module! {
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
                     "__new__",
-                    crate::make_builtin_function("__new__", semlock_descr_new),
+                    // interp_semaphore.py:572-573 declares the parameters
+                    // through `@unwrap_spec(kind=int, value=int, maxvalue=int,
+                    // name='text', unlink=int)`, so `interp2app` binds them by
+                    // name as well as by position.  Registering the same names
+                    // here routes a keyword call through the gateway binder,
+                    // which hands the body the slots in positional order.
+                    // `subtype` stays positional-only: it is the class the
+                    // descriptor was reached through, not a parameter.
+                    crate::make_builtin_function_with_signature(
+                        "__new__",
+                        semlock_descr_new,
+                        crate::gateway::Signature::new(
+                            vec!["subtype", "kind", "value", "maxvalue", "name", "unlink"],
+                            None,
+                            None,
+                            0,
+                            1,
+                        ),
+                    ),
                 );
                 // interp_semaphore.py:606 `as_classmethod=True` — `_rebuild`
                 // allocates on the class it is called through.
