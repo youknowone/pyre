@@ -304,12 +304,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     // at https://profiler.firefox.com/. Samples land on epoch checkpoints
     // (function entries / loop back-edges), so call-dense small functions are
     // over-represented and bulk ops (memory.fill) are attributed to the next
-    // checkpoint. Epoch interruption changes main-module codegen, so pair with
-    // PYRE_WASM_NO_CACHE=1 to avoid clobbering the shared .cwasm cache.
+    // checkpoint. Epoch interruption changes main-module codegen, so this mode
+    // caches its module under its own `.cwasm` (see `cache_variant`).
     let guest_profile_out = std::env::var("PYRE_WASM_GUEST_PROFILE").ok();
     if guest_profile_out.is_some() {
         config.epoch_interruption(true);
     }
+    let cache_variant = cache_variant(meter_fuel, guest_profile_out.is_some());
     // Diagnostic: PYRE_WASM_STARTUP_TRACE=1 prints a fixed-startup breakdown
     // (module load/deserialize, main-module instantiate, guest bootstrap+run)
     // so the warmup tax can be attributed to host module-load vs guest
@@ -328,7 +329,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     let engine = Engine::new(&config)?;
     startup_lap("engine_new");
 
-    let module = load_main_module(&engine, module_path)?;
+    let module = load_main_module(&engine, module_path, cache_variant)?;
     startup_lap("load_module");
 
     let mut store = Store::new(&engine, Host::default());
@@ -1290,13 +1291,16 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
 /// hash. A rebuilt module or a pre-placed `.cwasm` therefore recompiles instead
 /// of running a stale or untrusted artifact. Set `PYRE_WASM_NO_CACHE` to bypass
 /// the cache entirely.
-fn load_main_module(engine: &Engine, module_path: &Path) -> Result<Module> {
+///
+/// `variant` separates the artifacts of engine configurations that emit
+/// different code for the same module; see [`cache_variant`].
+fn load_main_module(engine: &Engine, module_path: &Path, variant: &str) -> Result<Module> {
     let cache_disabled = std::env::var_os("PYRE_WASM_NO_CACHE").is_some();
     let wasm_bytes = std::fs::read(module_path)
         .with_context(|| format!("read wasm module {}", module_path.display()))?;
     let hash = wasm_content_hash(&wasm_bytes);
-    let cache_path = cache_path_for(module_path);
-    let key_path = cache_key_path_for(module_path);
+    let cache_path = cache_path_for(module_path, variant);
+    let key_path = cache_key_path_for(module_path, variant);
 
     if !cache_disabled && cache_key_matches(&key_path, &hash) {
         // SAFETY: the artifact was produced by this runner's own engine via
@@ -1313,28 +1317,61 @@ fn load_main_module(engine: &Engine, module_path: &Path) -> Result<Module> {
     let module = Module::new(engine, &wasm_bytes[..])
         .with_context(|| format!("load wasm module {}", module_path.display()))?;
     if !cache_disabled && let Ok(bytes) = module.serialize() {
-        // Best-effort: a failed cache write only forgoes the speedup. Write
-        // the artifact before the key so an interrupted write never leaves a
-        // key pointing at a half-written `.cwasm`.
-        if std::fs::write(&cache_path, bytes).is_ok() {
-            let _ = std::fs::write(&key_path, &hash);
+        // Best-effort: a failed cache write only forgoes the speedup. Publish
+        // the artifact through a per-process temporary and rename it into
+        // place, then write the key: a rename swaps the directory entry, so a
+        // concurrent run either deserializes the previous artifact whole or
+        // this one whole. Writing the file in place instead would truncate it
+        // under whoever has it mapped, and the key would name a `.cwasm` that
+        // is only half there.
+        let staged = staged_cache_path_for(&cache_path);
+        if std::fs::write(&staged, bytes).is_ok() {
+            if std::fs::rename(&staged, &cache_path).is_ok() {
+                let _ = std::fs::write(&key_path, &hash);
+            } else {
+                let _ = std::fs::remove_file(&staged);
+            }
         }
     }
     Ok(module)
 }
 
-/// `<module>.cwasm` next to the module (full name kept, so
+/// The suffix separating the compiled artifacts of engine configurations that
+/// emit different code for the same module. Both knobs below instrument every
+/// guest instruction, so their modules are neither interchangeable with the
+/// plain one nor with each other; sharing one cache path makes each switch
+/// between modes reject the stored artifact, recompile the whole module and
+/// rewrite the file the other mode just wrote.
+fn cache_variant(meter_fuel: bool, epoch_interruption: bool) -> &'static str {
+    match (meter_fuel, epoch_interruption) {
+        (false, false) => "",
+        (true, false) => ".fuel",
+        (false, true) => ".epoch",
+        (true, true) => ".fuel.epoch",
+    }
+}
+
+/// `<module><variant>.cwasm` next to the module (full name kept, so
 /// `pyre_wasm.wasm-host.wasm` → `pyre_wasm.wasm-host.wasm.cwasm`).
-fn cache_path_for(module_path: &Path) -> PathBuf {
+fn cache_path_for(module_path: &Path, variant: &str) -> PathBuf {
     let mut s = module_path.as_os_str().to_owned();
+    s.push(variant);
     s.push(".cwasm");
     PathBuf::from(s)
 }
 
 /// Sidecar recording the SHA-256 of the `.wasm` its `.cwasm` was compiled from.
-fn cache_key_path_for(module_path: &Path) -> PathBuf {
-    let mut s = module_path.as_os_str().to_owned();
-    s.push(".cwasm.sha256");
+fn cache_key_path_for(module_path: &Path, variant: &str) -> PathBuf {
+    let mut s = cache_path_for(module_path, variant).into_os_string();
+    s.push(".sha256");
+    PathBuf::from(s)
+}
+
+/// Where a `.cwasm` is written before being renamed over the real one. The pid
+/// keeps two runs publishing the same variant from staging onto each other.
+fn staged_cache_path_for(cache_path: &Path) -> PathBuf {
+    let mut s = cache_path.as_os_str().to_owned();
+    s.push(format!(".{}.tmp", std::process::id()));
     PathBuf::from(s)
 }
 

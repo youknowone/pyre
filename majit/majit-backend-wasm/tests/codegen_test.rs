@@ -46,9 +46,34 @@ fn run_runtime_program(
     for &(key, value) in envs {
         command.env(key, value);
     }
-    command
+    let output = command
         .output()
-        .unwrap_or_else(|err| panic!("failed to run {}: {err}", binary.display()))
+        .unwrap_or_else(|err| panic!("failed to run {}: {err}", binary.display()));
+    // A child killed by a signal leaves every assertion below nothing to show:
+    // both runtimes report their own failures before exiting — the wasm runner
+    // keeps the run result precisely so a guest trap still prints its JIT
+    // stats — so a failed status next to an empty stderr means the process
+    // never reached any of that. Name the signal and the run that took it
+    // here, once, instead of letting each call site blame output the child
+    // never had the chance to write.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = output.status.signal() {
+            let env = envs
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            panic!(
+                "{} died on signal {signal} running {}\nenv: {env}\nstderr:\n{}",
+                binary.display(),
+                script.display(),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+    output
 }
 
 fn stat_value(stderr: &str, name: &str) -> u64 {

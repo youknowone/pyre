@@ -2366,8 +2366,8 @@ class Check:
         # Snapshot the wasm-host build to a stable path so a later `web` build of
         # the same crate cannot overwrite the module the runner loads. Copy when
         # the bytes actually changed: rewriting an identical file would bump its
-        # mtime and needlessly invalidate the runner's `<module>.cwasm` compiled
-        # cache (which is keyed by mtime), forcing a ~5s recompile on every run.
+        # mtime, and the runner's `<module>.cwasm` compiled cache is keyed by
+        # the module's content hash, so an identical rewrite buys nothing.
         src_bytes = Path(WASM_BUILD_OUTPUT).read_bytes()
         dst = Path(WASM_MODULE_PATH)
         if not dst.exists() or dst.read_bytes() != src_bytes:
@@ -2385,6 +2385,11 @@ class Check:
         invalidates the cache. Warming it in the build phase moves that fixed
         cost out of every measured benchmark (including the first), so the
         reported times reflect Python execution, not module compilation.
+
+        Fuel metering emits a different module, cached separately as
+        `<module>.fuel.cwasm`, so warm that one too: the wasm runtime codegen
+        regression tests all run under PYRE_WASM_JIT_STATS, and they start six
+        runners at once — without this every one of them recompiles.
         """
         runner = default_binary("wasm")
         if not Path(runner).exists():
@@ -2393,14 +2398,15 @@ class Check:
         env["PYRE_WASM_MODULE"] = str(Path(WASM_MODULE_PATH).resolve())
         env["PYRE_WASM_ENGINE"] = "wasmtime"
         print("Warming wasmtime module cache (.cwasm)...")
-        try:
-            subprocess.run(
-                [runner, "--engine", "wasmtime", os.devnull],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=env, timeout=120,
-            )
-        except (OSError, subprocess.SubprocessError):
-            pass  # best-effort; a cold first bench just pays the compile once
+        for extra in ({}, {"PYRE_WASM_JIT_STATS": "1"}):
+            try:
+                subprocess.run(
+                    [runner, "--engine", "wasmtime", os.devnull],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env={**env, **extra}, timeout=120,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass  # best-effort; a cold first bench just pays the compile once
 
     def _print_cargo_diagnostics(self, cargo_path):
         """Dump the toolchain state when cargo refuses to run.
