@@ -1688,8 +1688,9 @@ impl<'a> AssemblerARM64<'a> {
         self._assemble(true)?;
         self.check_unrelocated_jump_target()?;
 
-        // regalloc sets fail_arg_locs in append_guard_token_with_faillocs.
-        // No allocate_unmapped_fail_arg_slots needed.
+        // regalloc sets fail_arg_locs in append_guard_token_with_faillocs,
+        // which stamps `rd_locs` from them right there
+        // (`llsupport/assembler.py:279`), so no post-regalloc fixup pass runs.
 
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
