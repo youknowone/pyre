@@ -1304,12 +1304,13 @@ pub struct JitCellToken {
     /// (`LoopTargetDescr` Arc; `TargetToken IS-A AbstractDescr` in
     /// PyPy, so a `DescrRef` is the matching identity).  Each
     /// successful loop / retrace populates this through
-    /// `record_target_token`.  Its one reader is
-    /// [`Self::first_target_token`], the descr a bridge closes onto:
-    /// neither `has_compiled_loop` (token presence) nor pyre's
-    /// `has_compiled_targets` (the `compiled_loops` side table) reads
-    /// this list, so it is not pyre's `has_compiled_targets` signal
-    /// despite mirroring what upstream's reads.  The metainterp-side
+    /// `record_target_token`.  Its one reader with a caller is
+    /// [`Self::first_target_token`], the descr a bridge closes onto;
+    /// [`Self::has_target_tokens`] reads it too but is called from
+    /// nowhere.  Neither `has_compiled_loop` (token presence) nor
+    /// pyre's `has_compiled_targets` (the `compiled_loops` side table)
+    /// reads this list, so it is not pyre's `has_compiled_targets`
+    /// signal despite mirroring what upstream's reads.  The metainterp-side
     /// `TargetToken` value (with `virtual_state` / `short_preamble`)
     /// stays on the `CompiledEntry::front_target_tokens` list per
     /// the F.6 retirement plan — the per-target descr identity is the
