@@ -2396,6 +2396,8 @@ impl<'a> RegAlloc<'a> {
     pub fn walk_operations(&mut self) -> Vec<RegAllocOp> {
         let operations: &'a [Op] = self.operations;
         let inputargs: &'a [InputArg] = self.inputargs;
+        // Take the lowering plan so dispatch can borrow each LirOp without cloning it.
+        let j2_ops = std::mem::take(&mut self.j2_ops);
         let mut output = Vec::with_capacity(operations.len());
 
         for (i, op) in operations.iter().enumerate() {
@@ -2431,9 +2433,9 @@ impl<'a> RegAlloc<'a> {
             // The dynasm backend now enters through the j2-style lowered
             // operation. The legacy opcode dispatch below is only a guard
             // rail if `_prepare` did not produce a matching plan entry.
-            if let Some(j2_op) = self.j2_ops.get(i).cloned() {
-                self._dispatch_j2(&j2_op, op, i, &mut output);
-                self._free_j2_op_vars(&j2_op, op);
+            if let Some(j2_op) = j2_ops.get(i) {
+                self._dispatch_j2(j2_op, op, i, &mut output);
+                self._free_j2_op_vars(j2_op, op);
             } else {
                 self._dispatch_legacy(op, i, &mut output);
                 self._free_op_vars(op);
@@ -2476,32 +2478,27 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
+    /// Free a lowered operation's uses, fail args, and result in order.
     fn _free_j2_op_vars(&mut self, j2_op: &LirOp, raw_op: &Op) {
-        let mut uses = Vec::new();
-        let mut fail_uses = Vec::new();
-        let mut def = None;
-        let mut def_tp = raw_op.opcode.result_type();
-
-        match j2_op {
+        let (def, def_tp) = match j2_op {
             LirOp::Label { args } | LirOp::Jump { args } | LirOp::Finish { args } => {
-                uses.extend(args.iter().copied());
+                self._possibly_free_j2_vars(args.iter().copied());
+                (None, raw_op.opcode.result_type())
             }
             LirOp::IntBin { dst, lhs, rhs, .. } | LirOp::IntCmp { dst, lhs, rhs, .. } => {
-                uses.push(*lhs);
-                uses.push(*rhs);
-                def = Some(*dst);
-                def_tp = Type::Int;
+                self._possibly_free_j2_vars([*lhs, *rhs].into_iter());
+                (Some(*dst), Type::Int)
             }
             LirOp::IntUnary { dst, arg, .. } => {
-                uses.push(*arg);
-                def = Some(*dst);
-                def_tp = Type::Int;
+                self._possibly_free_j2_vars(std::iter::once(*arg));
+                (Some(*dst), Type::Int)
             }
             LirOp::Guard {
                 args, fail_args, ..
             } => {
-                uses.extend(args.iter().copied());
-                fail_uses.extend(fail_args.iter().copied());
+                self._possibly_free_j2_vars(args.iter().copied());
+                self._possibly_free_j2_vars(fail_args.iter().copied());
+                (None, raw_op.opcode.result_type())
             }
             LirOp::Load {
                 dst,
@@ -2512,12 +2509,14 @@ impl<'a> RegAlloc<'a> {
                 size,
                 ..
             } => {
-                uses.push(*base);
-                uses.extend(offset.iter().copied());
-                uses.extend(index.iter().copied());
-                uses.extend(scale.iter().copied());
-                uses.extend(size.iter().copied());
-                def = Some(*dst);
+                self._possibly_free_j2_vars(
+                    std::iter::once(*base)
+                        .chain(offset.iter().copied())
+                        .chain(index.iter().copied())
+                        .chain(scale.iter().copied())
+                        .chain(size.iter().copied()),
+                );
+                (Some(*dst), raw_op.opcode.result_type())
             }
             LirOp::Store {
                 base,
@@ -2528,16 +2527,19 @@ impl<'a> RegAlloc<'a> {
                 size,
                 ..
             } => {
-                uses.push(*base);
-                uses.extend(offset.iter().copied());
-                uses.extend(index.iter().copied());
-                uses.extend(scale.iter().copied());
-                uses.push(*value);
-                uses.extend(size.iter().copied());
+                self._possibly_free_j2_vars(
+                    std::iter::once(*base)
+                        .chain(offset.iter().copied())
+                        .chain(index.iter().copied())
+                        .chain(scale.iter().copied())
+                        .chain(std::iter::once(*value))
+                        .chain(size.iter().copied()),
+                );
+                (None, raw_op.opcode.result_type())
             }
             LirOp::Call { dst, args, .. } => {
-                uses.extend(args.iter().copied());
-                def = *dst;
+                self._possibly_free_j2_vars(args.iter().copied());
+                (*dst, raw_op.opcode.result_type())
             }
             LirOp::Opcode {
                 dst,
@@ -2545,24 +2547,27 @@ impl<'a> RegAlloc<'a> {
                 fail_args,
                 ..
             } => {
-                uses.extend(args.iter().copied());
-                fail_uses.extend(fail_args.iter().copied());
-                def = *dst;
+                self._possibly_free_j2_vars(args.iter().copied());
+                self._possibly_free_j2_vars(fail_args.iter().copied());
+                (*dst, raw_op.opcode.result_type())
             }
-        }
-
-        for arg in uses.into_iter().chain(fail_uses) {
-            if !arg.is_constant() && !arg.is_none() {
-                let tp = self.tp(arg);
-                self.possibly_free_var(arg, tp);
-            }
-        }
+        };
         if let Some(dst) = def
             && !dst.is_none()
             && !dst.is_constant()
             && def_tp != Type::Void
         {
             self.possibly_free_var(dst, def_tp);
+        }
+    }
+
+    /// Free lowered operands in order without materializing a temporary use list.
+    fn _possibly_free_j2_vars(&mut self, uses: impl Iterator<Item = OpRef>) {
+        for arg in uses {
+            if !arg.is_constant() && !arg.is_none() {
+                let tp = self.tp(arg);
+                self.possibly_free_var(arg, tp);
+            }
         }
     }
 
