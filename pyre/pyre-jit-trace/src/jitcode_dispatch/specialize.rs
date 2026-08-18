@@ -11838,7 +11838,8 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
 
 /// B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
-/// `sys_exc_value` slot (`ec_sys_exc_value_descr`).
+/// `sys_exc_value` slot (`ec_sys_exc_value_descr`), and consume pyre's
+/// propagation-root clear without recording a runtime call.
 /// Recognised by the codewriter-stamped `pyre_helper` tag, NOT a funcptr
 /// address (the residual calls the cross-crate `cpu.{get,set}_current_
 /// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
@@ -11852,6 +11853,17 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
 ///     dst_bank `'v'`): the PUSH_EXC_INFO store and the POP_EXCEPT restore.
 ///     Emit `SETFIELD_GC(ec, exc, sys_exc_value)` and apply the concrete
 ///     write the authoritative walk's residual executor would have done.
+///   * `ClearInFlightException` — `set_in_flight_exception(PY_NULL)`
+///     (`[]→void`, dst_bank `'v'`): apply the clear to the authoritative
+///     recording walk, but emit no IR.  PyPy keeps the propagating exception
+///     in the local `OperationError` and PUSH_EXC_INFO transfers it directly
+///     to `ExecutionContext.sys_exc_operror` (`pyopcode.py:123-185, 836-863`),
+///     so there is no equivalent residual clear in its compiled trace.  Pyre's
+///     extra TLS carrier only exposes the Rust `PyError`'s GC children while
+///     the interpreter unwinds.  The walk's inline traceback construction
+///     never publishes that carrier at compiled runtime; leaving its clear as
+///     a CallN would therefore execute an unmatched TLS write on every caught
+///     exception.
 ///
 /// A balanced save (`GETFIELD`) + store + restore (`SETFIELD`) on the same
 /// descr-identity field with no intervening read is dead-store-eliminated,
@@ -11867,6 +11879,19 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     dst_bank: char,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if pyre_helper == majit_ir::PyreHelperKind::ClearInFlightException {
+        // The authoritative walk executed record_application_traceback and
+        // published its concrete exception in the interpreter-only carrier.
+        // Complete that concrete ownership transfer now.  Compiled traceback
+        // recording is emitted as GC IR and never publishes the carrier, so
+        // there is deliberately no corresponding runtime operation to record.
+        if !r_args.is_empty() || dst_bank != 'v' {
+            return Ok(None);
+        }
+        pyre_interpreter::eval::set_in_flight_exception(pyre_object::PY_NULL);
+        return Ok(Some(()));
+    }
+
     if pyre_helper == majit_ir::PyreHelperKind::GetCurrentException {
         // PUSH_EXC_INFO `prev = ec.sys_exc_value` — `[]→Ref`.
         if !r_args.is_empty() || dst_bank != 'r' {

@@ -5925,7 +5925,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
-    // `sys_exc_value` slot. Recognised by the
+    // `sys_exc_value` slot, and consume the interpreter-only propagation-root
+    // clear without recording a runtime CallN. Recognised by the
     // codewriter-stamped `pyre_helper` tag (not a funcptr address — the
     // residual calls the cross-crate `cpu.{get,set}_current_exception_fn`
     // wrappers).  A balanced PUSH save + POP restore on the same descr-
@@ -5938,6 +5939,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.pyre_helper,
             majit_ir::PyreHelperKind::GetCurrentException
                 | majit_ir::PyreHelperKind::SetCurrentException
+                | majit_ir::PyreHelperKind::ClearInFlightException
         )
         && try_walker_lower_exc_info_residual(
             ctx,

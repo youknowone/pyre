@@ -10247,10 +10247,12 @@ impl CodeWriter {
                             );
                             // `eval.rs::push_exc_info` clears the propagation
                             // carrier immediately after publishing `exc` as
-                            // current.  Preserve that ownership transfer in
-                            // both tracing and compiled execution; otherwise
-                            // the carrier keeps the handled exception and its
-                            // traceback/frame alive indefinitely.
+                            // current.  Keep the operation explicit for the
+                            // interpreter/blackhole path.  The authoritative
+                            // full-body walker applies the concrete clear but
+                            // emits no runtime CallN: its compiled traceback
+                            // IR never publishes this interpreter-only carrier
+                            // (PyPy's local OperationError needs no such call).
                             let _ = residual_call!(
                                 clear_in_flight_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,

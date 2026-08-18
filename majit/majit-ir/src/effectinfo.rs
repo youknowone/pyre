@@ -1057,9 +1057,11 @@ pub enum PyreHelperKind {
     MakeFunction,
     /// `bh_clear_in_flight_exception()` — the `[] -> void` residual emitted by
     /// PUSH_EXC_INFO to complete the caught-exception ownership transfer.  The
-    /// full-body walker recognises this tag to keep the executed-effect
-    /// odometer off it: the written slot is a GC-liveness root with no value
-    /// reader, so a non-committing walk has nothing to undo.
+    /// full-body walker applies the concrete clear during its authoritative
+    /// walk and emits no runtime IR: compiled traceback construction never
+    /// publishes this interpreter-only GC-liveness carrier.  Generic fallback
+    /// also keeps the executed-effect odometer off it because the slot has no
+    /// value reader and a non-committing walk has nothing to undo.
     ClearInFlightException,
 }
 
