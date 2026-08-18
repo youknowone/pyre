@@ -202,6 +202,17 @@ tempfile = "3"
 walkdir = "2"
 insta = "1"
 
+# xz-core 0.1.0-rc.0 files its `lzma12_optmap` static initializer in the MSVC
+# `.CRT$XIB` group.  `_initterm_e` walks that table as `int (__cdecl *)(void)`
+# and `__scrt_common_main_seh` returns 255 when an entry reports non-zero, but
+# the initializer's Rust signature returns `()`, so nothing defines the value
+# that is read.  Every pyre invocation on windows-latest exited 255 with empty
+# stdout and stderr.  The fork moves the table to `.CRT$XCU`, which `_initterm`
+# walks as `_PVFV` and whose result is discarded; the change is
+# simnalamburt/xz-rs#20 and this pin drops when it is released.
+[patch.crates-io]
+xz-core = { git = "https://github.com/youknowone/xz-rs-simnalamburt", rev = "9c5cc27154e90b48348f713e28ab02bb2c5b52b4" }
+
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;
 # codegen-units=1 additionally lets LLVM optimize the interpreter's large
