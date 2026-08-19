@@ -3485,9 +3485,13 @@ impl OpcodeStepExecutor for PyFrame {
                 "WITH_EXCEPT_START requires five stack values",
             ));
         }
-        let val = locals_w!(self)[depth - 1];
-        let exit_self = locals_w!(self)[depth - 4];
-        let exit_func = locals_w!(self)[depth - 5];
+        // Indices first: a subscript evaluates its receiver before its index
+        // expression, so arithmetic inside the brackets puts the subtraction's
+        // overflow check between the `locals_cells_stack_w` read and its use.
+        let (i_val, i_self, i_func) = (depth - 1, depth - 4, depth - 5);
+        let val = locals_w!(self)[i_val];
+        let exit_self = locals_w!(self)[i_self];
+        let exit_func = locals_w!(self)[i_func];
         let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
