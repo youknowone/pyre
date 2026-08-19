@@ -2994,12 +2994,7 @@ unsafe fn mapdict_carrier(obj: PyObjectRef) -> MapdictCarrier {
 }
 
 impl MapdictCarrier {
-    unsafe fn slots(
-        &self,
-    ) -> (
-        *mut usize,
-        *mut *mut pyre_object::object_array::ItemsBlock,
-    ) {
+    unsafe fn slots(&self) -> (*mut usize, *mut *mut pyre_object::object_array::ItemsBlock) {
         let obj = self.obj;
         if unsafe { pyre_object::is_int(obj) } {
             let user = obj as *mut pyre_object::intobject::W_IntObjectUser;

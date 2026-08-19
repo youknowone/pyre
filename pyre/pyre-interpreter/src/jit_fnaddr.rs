@@ -3555,10 +3555,35 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_list_write_barrier, is_pyframe_operand_stack_accessor, jit_static_pytype_addrs,
-        jit_trace_fnaddrs,
+        is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_trace_fnaddrs,
     };
     use std::collections::HashMap;
+
+    /// The exemption is keyed on the registered path, so a rename or a typo in
+    /// one of the three patterns silently drops a helper out of the set and the
+    /// walk that met only it stops taking the no-replay roads. Pin each
+    /// pattern, and pin a sibling in the same module that must NOT be exempt:
+    /// `pyre_stack_too_big_slowpath` shares `::stack_check::` with the one
+    /// match, so a pattern loosened to the module would take it too.
+    #[test]
+    fn is_rerunnable_bookkeeping_residual_matches_the_registered_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for path in [
+            "pyre_interpreter::stack_check::stack_check",
+            "pyre_object::pyobject::ensure_object_subclass_ranges_initialized",
+            "pyre_object::ensure_object_subclass_ranges_initialized",
+        ] {
+            assert!(
+                is_rerunnable_bookkeeping_residual(bindings[path] as usize),
+                "{path} is registered but not exempt"
+            );
+        }
+        assert!(!is_rerunnable_bookkeeping_residual(
+            bindings["pyre_interpreter::stack_check::pyre_stack_too_big_slowpath"] as usize
+        ));
+        assert!(!is_rerunnable_bookkeeping_residual(0));
+    }
 
     #[test]
     fn jit_trace_fnaddrs_contains_root_and_module_aliases() {
