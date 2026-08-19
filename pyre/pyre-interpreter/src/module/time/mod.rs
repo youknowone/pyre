@@ -114,6 +114,20 @@ crate::py_module! {
                 crate::make_builtin_function_with_arity("tzset", t::tzset, 0),
             );
         }
+        // Windows reads the same four attributes off the host zone record.
+        // `tzset` stays absent: it is the POSIX call that rereads `$TZ`, and
+        // the MSVC runtime's `_tzset` is not exposed under that name either.
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        {
+            t::init_timezone(ns);
+            // `GetThreadTimes` is unconditional on Windows, so `thread_time`
+            // is published there for the same reason the Unix arm publishes
+            // it wherever `CLOCK_THREAD_CPUTIME_ID` exists.
+            crate::module_ns_store(ns, "thread_time",
+                crate::make_builtin_function_with_arity("thread_time", t::thread_time, 0));
+            crate::module_ns_store(ns, "thread_time_ns",
+                crate::make_builtin_function_with_arity("thread_time_ns", t::thread_time_ns, 0));
+        }
         // localtime/mktime/ctime/strftime consult $TZ + /etc/localtime (and
         // the LC_TIME locale DB), reading host state outside the controller;
         // gmtime (UTC) and asctime (fixed C format) stay pure.

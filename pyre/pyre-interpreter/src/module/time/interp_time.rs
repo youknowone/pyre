@@ -17,12 +17,11 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Number of fields in `time.struct_time` as seen by C extensions.
-/// `interp_time.py:290` uses 9, raised to 11 when `struct tm` carries
-/// `tm_zone`/`tm_gmtoff` — true on every Unix target pyre builds for.
-#[cfg(unix)]
+/// `interp_time.py:290` uses 9 plus `tm_zone`/`tm_gmtoff`.  The Unix
+/// `struct tm` carries that pair; the MSVC one does not, and `localtime`
+/// derives it from the host zone rather than dropping the fields, so the
+/// count is the same everywhere.
 pub const STRUCT_TM_ITEMS: i64 = 11;
-#[cfg(not(unix))]
-pub const STRUCT_TM_ITEMS: i64 = 9;
 
 /// Process-start `Instant` used as the monotonic-clock origin whenever
 /// `clock_gettime(CLOCK_MONOTONIC)` is unavailable.  Keeping a single
@@ -287,6 +286,20 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
     let name_str = name.as_str().unwrap_or_default();
+    // Each name reports the call the corresponding function is actually made
+    // of, so the Windows table is its own — none of the five is a
+    // `clock_gettime` there.  `time` is `SystemTime::now`, `monotonic` and
+    // `perf_counter` are `Instant`, and the two CPU clocks are the
+    // `Get*Times` pair `process_time_nanos` / `thread_time_nanos` read.
+    #[cfg(windows)]
+    let (implementation, monotonic, adjustable) = match name_str {
+        "time" => ("GetSystemTimePreciseAsFileTime()", false, true),
+        "monotonic" | "perf_counter" => ("QueryPerformanceCounter()", true, false),
+        "process_time" => ("GetProcessTimes()", true, false),
+        "thread_time" => ("GetThreadTimes()", true, false),
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    #[cfg(not(windows))]
     let (implementation, monotonic, adjustable) = match name_str {
         "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
         "monotonic" | "perf_counter" => {
@@ -401,9 +414,27 @@ fn get_clock_info_resolution(name: &str) -> f64 {
         .unwrap_or(1.0e-9)
 }
 
+/// Windows has no `clock_getres`; each clock's resolution is a property of
+/// the call behind it.  `QueryPerformanceFrequency` answers for the two
+/// `Instant` clocks, and the other three are counted in the 100ns unit both
+/// `FILETIME` and `Get*Times` use.
+#[cfg(all(windows, feature = "host_env"))]
+fn get_clock_info_resolution(name: &str) -> f64 {
+    const FILETIME_TICK_SECONDS: f64 = 1.0e-7;
+    match name {
+        "monotonic" | "perf_counter" => host_time::query_performance_frequency()
+            .filter(|&frequency| frequency > 0)
+            .map_or(FILETIME_TICK_SECONDS, |frequency| 1.0 / frequency as f64),
+        _ => FILETIME_TICK_SECONDS,
+    }
+}
+
 /// Without a host `clock_getres` (non-Unix, no `host_env`, or redox), report the
 /// nanosecond representation resolution every pyre clock carries internally.
-#[cfg(not(all(unix, feature = "host_env", not(target_os = "redox"))))]
+#[cfg(not(any(
+    all(unix, feature = "host_env", not(target_os = "redox")),
+    all(windows, feature = "host_env")
+)))]
 fn get_clock_info_resolution(_name: &str) -> f64 {
     1.0e-9
 }
@@ -440,11 +471,50 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
     }
 }
 
-#[cfg(not(all(unix, feature = "host_env")))]
+/// `GetProcessTimes`' kernel + user total, the pair `_PyTime_GetProcessTime`
+/// reads on this platform.  The monotonic fallback below would count a sleep,
+/// which is the one thing process time must not do.
+#[cfg(all(windows, feature = "host_env"))]
+fn process_time_nanos() -> Result<i128, crate::PyError> {
+    host_time::get_process_time_100ns()
+        .map(|hundred_ns| i128::from(hundred_ns) * 100)
+        .ok_or_else(|| {
+            crate::PyError::runtime_error(
+                "the processor time used is not available or its value cannot be represented",
+            )
+        })
+}
+
+#[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
 fn process_time_nanos() -> Result<i128, crate::PyError> {
     // No host clock available; fall back to the monotonic baseline so
     // the value is still non-decreasing.
     Ok(monotonic_baseline().elapsed().as_nanos() as i128)
+}
+
+/// `GetThreadTimes`' kernel + user total for the calling thread — the
+/// `_PyTime_GetThreadTime` counterpart of the `CLOCK_THREAD_CPUTIME_ID` read
+/// below.  As there, an unreadable clock raises rather than reporting a
+/// process-wide figure in its place.
+#[cfg(all(windows, feature = "host_env"))]
+fn thread_time_nanos() -> Result<i128, crate::PyError> {
+    host_time::get_thread_time_100ns()
+        .map(|hundred_ns| i128::from(hundred_ns) * 100)
+        .ok_or_else(|| crate::PyError::os_error("the thread time used is not available"))
+}
+
+/// time.thread_time() → float
+#[cfg(all(windows, feature = "host_env"))]
+pub fn thread_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(floatobject::w_float_new(thread_time_nanos()? as f64 * 1e-9))
+}
+
+/// time.thread_time_ns() → int
+#[cfg(all(windows, feature = "host_env"))]
+pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _ = args;
+    Ok(w_int_new(thread_time_nanos()? as i64))
 }
 
 /// time.process_time() → float
@@ -920,6 +990,81 @@ pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 // ── Windows helpers ─────────────────────────────────────────────────
 
+/// Days from 1970-01-01 to a proleptic-Gregorian date, for a `timegm` the
+/// MSVC runtime does not offer under a portable name.  Civil-from-days in
+/// reverse, with March as the first month so a leap day lands last.
+#[cfg(windows)]
+fn windows_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_of_year = (month + 9) % 12;
+    let day_of_year = (153 * month_of_year + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
+}
+
+/// `time_localtime`'s `#else` arm, which supplies the two fields the MSVC
+/// `struct tm` lacks: the zone name for this timestamp, and the offset as
+/// `timegm(local) - when`.
+///
+/// The name comes from the host zone rather than `strftime("%Z")` — the two
+/// agree, and reading it directly keeps the string out of the runtime's
+/// locale encoding, which cannot spell a zone named outside its code page.
+#[cfg(windows)]
+fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
+    let info = host_time::get_tz_info();
+    tm.tm_zone = if tm.tm_isdst > 0 {
+        info.daylight_name
+    } else {
+        info.standard_name
+    };
+    let days = windows_days_from_civil(
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+    );
+    let as_utc = days * 86400
+        + i64::from(tm.tm_hour) * 3600
+        + i64::from(tm.tm_min) * 60
+        + i64::from(tm.tm_sec);
+    tm.tm_gmtoff = as_utc - when as i64;
+}
+
+/// `_init_timezone`'s Windows arm.  The runtime derives `_timezone` /
+/// `_daylight` / `_tzname` from the same zone record `GetTimeZoneInformation`
+/// reports, and reading the record is what keeps the two names as text rather
+/// than bytes in whichever code page the runtime is set to.
+///
+/// `Bias` is minutes to add to local time to reach UTC, which is the sign
+/// `time.timezone` already uses.  `altzone` is `timezone - 3600` — the value
+/// the module publishes on this platform, not a second reading of the record.
+/// `daylight` says the zone observes DST at all, which is what the runtime
+/// reports and what a January/July pair shows.
+#[cfg(windows)]
+pub(crate) fn init_timezone(ns: PyObjectRef) {
+    const YEAR: i64 = (365 * 24 + 6) * 3600;
+    let info = host_time::get_tz_info();
+    let timezone = i64::from(info.bias + info.standard_bias) * 60;
+    let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
+    let observes_dst = [start, start + YEAR / 2]
+        .iter()
+        .filter_map(|&when| _c_localtime(when).ok())
+        .any(|tm| tm.tm_isdst > 0);
+
+    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
+    crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
+    crate::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
+    crate::module_ns_store(
+        ns,
+        "tzname",
+        w_tuple_new(vec![
+            w_str_new(&info.standard_name),
+            w_str_new(&info.daylight_name),
+        ]),
+    );
+}
+
 #[cfg(windows)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -970,8 +1115,8 @@ fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
 
 /// `app_time.py:5-23 class struct_time(metaclass=structseqtype)` —
 /// process-wide cached subclass-of-tuple type.  The 9-field positional
-/// core; on Unix (`HAS_TM_ZONE`) `tm_zone` / `tm_gmtoff` are named-only
-/// extras so `n_fields == _STRUCT_TM_ITEMS == 11`.
+/// core, with `tm_zone` / `tm_gmtoff` as named-only extras so
+/// `n_fields == _STRUCT_TM_ITEMS == 11`.
 static STRUCT_TIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub(crate) fn struct_time_type() -> PyObjectRef {
@@ -980,18 +1125,11 @@ pub(crate) fn struct_time_type() -> PyObjectRef {
         "tm_isdst",
     ];
     *STRUCT_TIME_TYPE.get_or_init(|| {
-        #[cfg(unix)]
-        {
-            crate::_structseq::make_struct_seq_with_extra(
-                "time.struct_time",
-                SEQ,
-                &["tm_zone", "tm_gmtoff"],
-            ) as usize
-        }
-        #[cfg(not(unix))]
-        {
-            crate::_structseq::make_struct_seq("time.struct_time", SEQ) as usize
-        }
+        crate::_structseq::make_struct_seq_with_extra(
+            "time.struct_time",
+            SEQ,
+            &["tm_zone", "tm_gmtoff"],
+        ) as usize
     }) as PyObjectRef
 }
 
@@ -1008,19 +1146,11 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
         w_int_new((tm.tm_yday + 1) as i64),
         w_int_new(tm.tm_isdst as i64),
     ];
-    // `_tm_to_tuple` — on Unix the zone fields are exposed as extras.
-    #[cfg(unix)]
-    {
-        let extras = vec![
-            ("tm_zone", pyre_object::w_str_new(&tm.tm_zone)),
-            ("tm_gmtoff", w_int_new(tm.tm_gmtoff)),
-        ];
-        crate::_structseq::new_instance_with_extra(struct_time_type(), seq, extras)
-    }
-    #[cfg(not(unix))]
-    {
-        crate::_structseq::new_instance(struct_time_type(), seq)
-    }
+    let extras = vec![
+        ("tm_zone", pyre_object::w_str_new(&tm.tm_zone)),
+        ("tm_gmtoff", w_int_new(tm.tm_gmtoff)),
+    ];
+    crate::_structseq::new_instance_with_extra(struct_time_type(), seq, extras)
 }
 
 /// `interp_time.py:738-758 _get_inttime` — extract integral epoch seconds
@@ -1152,14 +1282,25 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
 /// time.localtime([seconds]) — interp_time.localtime
 pub fn localtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args)?;
-    let tm = _c_localtime(seconds)?;
+    #[cfg_attr(not(windows), expect(unused_mut))]
+    let mut tm = _c_localtime(seconds)?;
+    #[cfg(windows)]
+    windows_fill_local_zone(&mut tm, seconds);
     Ok(_tm_to_tuple(&tm))
 }
 
 /// time.gmtime([seconds]) — interp_time.gmtime
 pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args)?;
-    let tm = _c_gmtime(seconds)?;
+    #[cfg_attr(not(windows), expect(unused_mut))]
+    let mut tm = _c_gmtime(seconds)?;
+    // The Unix `struct tm` names UTC itself; the MSVC one has no zone fields
+    // at all, so the pair `gmtime` always answers is set here.
+    #[cfg(windows)]
+    {
+        tm.tm_zone = "UTC".to_string();
+        tm.tm_gmtoff = 0;
+    }
     Ok(_tm_to_tuple(&tm))
 }
 
@@ -1394,21 +1535,30 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
         Ok(result)
     }
+    // The wide runtime call, which is what `format_time` resolves to here.
+    // The narrow one goes through the active code page, so it can neither be
+    // handed a format outside that page — an astral character comes back as
+    // nothing — nor return a `%Z` zone name that the page cannot spell.
+    // UTF-16 is what pyre's own strings already are: `encode_wide` carries a
+    // lone surrogate as itself, and `from_wide` carries it back.
     #[cfg(windows)]
     {
         unsafe extern "C" {
-            fn strftime(
-                buf: *mut libc::c_char,
+            fn wcsftime(
+                buf: *mut u16,
                 maxsize: usize,
-                format: *const libc::c_char,
+                format: *const u16,
                 timeptr: *const MsvcTm,
             ) -> usize;
         }
-        let c_fmt = std::ffi::CString::new(fmt_wtf8.as_bytes())
-            .map_err(|_| crate::PyError::value_error("embedded null in format string"))?;
         let msvc_tm = c_tm_to_msvc_tm(&tm);
-        let mut buf = vec![0u8; 256];
-        unsafe {
+        let render_segment = |segment: &[u16]| -> Result<Vec<u16>, crate::PyError> {
+            if segment.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut c_fmt = segment.to_vec();
+            c_fmt.push(0);
+            let mut buf = vec![0u16; 256];
             loop {
                 // A directive the runtime does not accept reaches its invalid
                 // parameter handler, which ends the process unless it is
@@ -1416,35 +1566,58 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // instead.  The cell has to start clear for that read to
                 // describe this call rather than an earlier one.
                 crate::builtins::clear_crt_errno();
-                let n = crate::builtins::crt_call!(strftime(
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    buf.len(),
-                    c_fmt.as_ptr(),
-                    &msvc_tm,
-                ));
+                let n = unsafe {
+                    crate::builtins::crt_call!(wcsftime(
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        c_fmt.as_ptr(),
+                        &msvc_tm,
+                    ))
+                };
                 // A rejected directive is neither a buffer too small for the
                 // result nor the empty-result case below.
                 if n == 0 && crate::builtins::crt_errno() == libc::EINVAL {
                     return Err(crate::PyError::value_error("Invalid format string"));
                 }
                 if n != 0 {
-                    // The same recovery as the unix arm above: unrecognised
-                    // directive bytes are echoed verbatim, so a format that is
-                    // a lone surrogate's WTF-8 encoding comes back unchanged,
-                    // and genuinely undecodable locale output takes
-                    // surrogateescape rather than raising.
-                    let rendered = buf[..n].to_vec();
-                    return Ok(match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-                        Ok(wtf8) => w_str_from_wtf8_managed(wtf8),
-                        Err(bytes) => crate::typedef::charp2uni(&bytes),
-                    });
+                    return Ok(buf[..n].to_vec());
                 }
-                if buf.len() > 16384 {
-                    return Ok(w_str_new(""));
+                // A buffer 256 times the format length is not failing for lack
+                // of room: the format simply yields an empty result, e.g. `%Z`
+                // when the timezone is unknown.
+                if buf.len() >= 256 * format_len.max(1) {
+                    return Ok(Vec::new());
                 }
                 buf.resize(buf.len() * 2, 0);
             }
+        };
+
+        // gh-124531 and gh-78662: an embedded NUL is literal data rather than
+        // the end of the format, and so is every character outside ASCII.  The
+        // runtime can carry neither — its format argument ends at the first
+        // NUL, and letting a non-ASCII character make the round trip would fuse
+        // an adjacent surrogate pair back into the one character it spells.  So
+        // the runtime renders the ASCII runs and the rest is copied verbatim,
+        // which also makes `%` immediately before such a character the
+        // incomplete directive it is.
+        let mut result = rustpython_wtf8::Wtf8Buf::new();
+        let mut segment: Vec<u16> = Vec::new();
+        // The trailing `None` renders the last run without repeating the call.
+        for code_point in fmt_wtf8.code_points().map(Some).chain([None]) {
+            let unit = code_point.map_or(0, rustpython_wtf8::CodePoint::to_u32);
+            if (1..=0x7f).contains(&unit) {
+                segment.push(unit as u16);
+                continue;
+            }
+            result.push_wtf8(&rustpython_wtf8::Wtf8Buf::from_wide(&render_segment(
+                &segment,
+            )?));
+            segment.clear();
+            if let Some(literal) = code_point {
+                result.push(literal);
+            }
         }
+        Ok(w_str_from_wtf8_managed(result))
     }
 }
 

@@ -9,6 +9,57 @@ use crate::host_seam::sys as libc;
 
 /// Raise `_locale.Error` with the supplied message.  Mirrors
 /// `interp_locale.py:15-20 make_error`.
+/// The NUL-terminated buffer a collation call is made with: wide where the
+/// collation is wide, bytes elsewhere.
+///
+/// `PyUnicode_AsWideCharString` raises on an embedded NUL before either
+/// platform's collation sees the argument, so the rejection belongs to the
+/// argument rather than to whichever collation the build ends up calling.
+#[cfg(windows)]
+type CollationArg = Vec<u16>;
+#[cfg(not(windows))]
+type CollationArg = std::ffi::CString;
+
+fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::PyError> {
+    let text = crate::baseobjspace::str_utf8_w(obj)?.to_string();
+    #[cfg(windows)]
+    {
+        if text.contains('\0') {
+            return Err(crate::PyError::value_error("embedded null character"));
+        }
+        Ok(text.encode_utf16().chain([0]).collect())
+    }
+    #[cfg(not(windows))]
+    {
+        std::ffi::CString::new(text.into_bytes())
+            .map_err(|_| crate::PyError::value_error("embedded null character"))
+    }
+}
+
+/// The wide collation the runtime offers.  The narrow pair runs its arguments
+/// through the active code page first, so a character the page cannot spell
+/// collates as whatever replaced it, which puts an accented letter after `b`
+/// instead of before it.
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+unsafe extern "C" {
+    fn wcscoll(s1: *const u16, s2: *const u16) -> i32;
+    fn wcsxfrm(dst: *mut u16, src: *const u16, count: usize) -> usize;
+}
+
+/// Whether the runtime's locale parser would overrun its fixed code page
+/// buffer on this name.  That buffer holds 16 wide characters including the
+/// terminator; a longer encoding is a debug assertion rather than a rejection,
+/// so a composite `LC_ALL` name reaches `setlocale`, comes back reporting
+/// success, and leaves the offending category at "C".  Answer it here instead.
+#[cfg(all(windows, feature = "host_env"))]
+fn windows_encoding_too_long(locale: &str) -> bool {
+    locale.split(';').any(|part| {
+        let name = part.rsplit_once('=').map_or(part, |(_, name)| name);
+        name.split_once('.')
+            .is_some_and(|(_, encoding)| encoding.len() >= 16)
+    })
+}
+
 fn locale_error(message: &str) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("_locale.Error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
@@ -320,6 +371,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if !(libc::LC_ALL..=libc::LC_TIME).contains(&cat) {
                     return Err(locale_error("invalid locale category"));
                 }
+                #[cfg(windows)]
+                if locale_str.as_deref().is_some_and(windows_encoding_too_long) {
+                    return Err(locale_error("unsupported locale setting"));
+                }
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())
@@ -404,41 +459,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "strcoll",
             |args| {
-                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                if args.len() < 2
+                    || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
                 {
-                    if args.len() < 2
-                        || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
-                    {
-                        return Err(crate::PyError::type_error(
-                            "strcoll: arguments must be strings",
-                        ));
-                    }
-                    let s1 = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
-                    let s2 = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
-                    let c1 = std::ffi::CString::new(s1.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                    let c2 = std::ffi::CString::new(s2.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                    Ok(pyre_object::w_int_new(
-                        rustpython_host_env::locale::strcoll(&c1, &c2) as i64,
-                    ))
+                    return Err(crate::PyError::type_error(
+                        "strcoll: arguments must be strings",
+                    ));
                 }
-                #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+                let c1 = collation_arg(args[0])?;
+                let c2 = collation_arg(args[1])?;
+                #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
                 {
-                    if args.len() < 2
-                        || !unsafe { pyre_object::is_str(args[0]) && pyre_object::is_str(args[1]) }
-                    {
-                        return Err(crate::PyError::type_error(
-                            "strcoll: arguments must be strings",
-                        ));
-                    }
+                    #[cfg(windows)]
+                    let ord = unsafe { wcscoll(c1.as_ptr(), c2.as_ptr()) } as i64;
+                    #[cfg(not(windows))]
+                    let ord = rustpython_host_env::locale::strcoll(&c1, &c2) as i64;
+                    Ok(pyre_object::w_int_new(ord))
+                }
+                #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
+                {
                     // No libc collation available (or sandbox build) — fall back
-                    // to lexical bytewise comparison.  Pure computation, no I/O;
-                    // under sandbox this keeps the fixed "C" collation and never
-                    // calls host libc collation, which would leak host LC_COLLATE.
-                    let s1 = crate::baseobjspace::str_utf8_w(args[0])?.to_string();
-                    let s2 = crate::baseobjspace::str_utf8_w(args[1])?.to_string();
-                    let ord = match s1.as_str().cmp(s2.as_str()) {
+                    // to lexical comparison.  Pure computation, no I/O; under
+                    // sandbox this keeps the fixed "C" collation and never calls
+                    // host libc collation, which would leak host LC_COLLATE.
+                    let ord = match c1.cmp(&c2) {
                         std::cmp::Ordering::Less => -1,
                         std::cmp::Ordering::Equal => 0,
                         std::cmp::Ordering::Greater => 1,
@@ -461,23 +505,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "strxfrm() argument must be str",
                     ));
                 }
+                let c = collation_arg(s)?;
+                #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+                {
+                    // The transform is usually no longer than its argument, so
+                    // start there; a return of `count` or more is the length the
+                    // transform needs, with the buffer left indeterminate.
+                    let mut buf = vec![0u16; c.len()];
+                    let out = loop {
+                        let n = unsafe { wcsxfrm(buf.as_mut_ptr(), c.as_ptr(), buf.len()) };
+                        if n < buf.len() {
+                            buf.truncate(n);
+                            break buf;
+                        }
+                        buf = vec![0u16; n + 1];
+                    };
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        rustpython_wtf8::Wtf8Buf::from_wide(&out),
+                    ))
+                }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let sv = crate::baseobjspace::str_utf8_w(s)?.to_string();
-                    let c = std::ffi::CString::new(sv.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                    let out = rustpython_host_env::locale::strxfrm(&c, sv.len() + 1);
+                    let out = rustpython_host_env::locale::strxfrm(&c, c.as_bytes().len() + 1);
                     // `interp_locale.py:139` returns `space.newtext(val)` —
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply
                     // surrogateescape.
                     Ok(pyre_object::w_str_new(&String::from_utf8_lossy(&out)))
                 }
-                #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+                #[cfg(not(all(any(unix, windows), feature = "host_env", not(feature = "sandbox"))))]
                 {
                     // No libc collation available (or sandbox build) — the
                     // transform is identity, keeping the fixed "C" locale and
                     // never reaching host libc strxfrm.
+                    let _ = c;
                     Ok(s)
                 }
             },
