@@ -318,6 +318,16 @@ pub fn new_simple_namespace_instance() -> crate::PyResult {
 /// `MapDictStrategy.switch_to_text_strategy` devolution path here: the
 /// dictionary remains the instance's one authoritative `__dict__`, while its
 /// storage becomes private and ordered like CPython's `ns_dict`.
+///
+/// The devolution is load-bearing, and an ordinary attribute-assigning class
+/// does not show why — its instances keep insertion order across the same
+/// delete. The case that needs it is the keyword constructor:
+///
+/// ```text
+/// del SimpleNamespace(x=1, y=2, z=3).y      # reaches a shortened map
+/// list(SimpleNamespace(x=1, y=2, z=3).__dict__)
+/// # ['z', 'x', 'y'] on the map strategy, ['x', 'y', 'z'] devolved
+/// ```
 fn simple_namespace_new(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&subtype) = args.first() else {
         return Err(crate::PyError::type_error(
