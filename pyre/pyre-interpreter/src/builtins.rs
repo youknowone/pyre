@@ -4850,6 +4850,12 @@ pub(crate) fn resolve_pos_or_kw(
 /// is reported against `maxpos`.  The order matters: `list.sort` declares no
 /// positional slot and two keyword-only ones, so one stray positional is a
 /// positional error while three arguments are a total-count error.
+///
+/// The total-count message says "at most" whatever `minargs` is
+/// (`memoryview(b"", 1)` — one required slot — reports "takes at most 1
+/// argument (2 given)"); only the positional message names an exact count,
+/// and only when every positional slot is required (`itertools.batched([], 1,
+/// 2)` reports "takes exactly 2 positional arguments (3 given)").
 pub(crate) fn clinic_arity(
     fn_name: &str,
     npos: usize,
@@ -4861,14 +4867,9 @@ pub(crate) fn clinic_arity(
     let maxargs = maxpos + kwonly;
     if npos + nkw > maxargs {
         return Err(crate::PyError::type_error(format!(
-            "{fn_name}() takes {} {maxargs} {}argument{} ({} given)",
-            if minargs < maxargs {
-                "at most"
-            } else {
-                "exactly"
-            },
+            "{fn_name}() takes at most {maxargs} {}argument{} ({} given)",
             // bpo-31229: a call that passed only keywords names them, so
-            // "takes exactly 1 argument (2 given)" cannot read as a claim
+            // "takes at most 1 argument (2 given)" cannot read as a claim
             // about positional arguments that were never supplied.
             if npos == 0 { "keyword " } else { "" },
             if maxargs == 1 { "" } else { "s" },
