@@ -3241,6 +3241,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let positional_defaults = if missing.is_empty() {
         None
     } else {
+        // The defaults are read live off `callable_guard_op` below, while the
+        // tuple they are checked against comes from `callable`.  Those are the
+        // same object for an ordinary call, but not for a specializer that
+        // resolves an app-level method behind a builtin: `str(e)` reaching an
+        // exception subclass's `__str__` passes the CALL's own operand — the
+        // `str` builtin — as the guard operand while `callable` is the resolved
+        // `Function`.  Reading `Function.defs_w` off that operand loads
+        // whatever sits at the same offset in another type, so decline the
+        // inline rather than emit the load.  Measured on a `__str__(self,
+        // value=7)` of an `Exception` subclass: 122 bridges and 24480 guard
+        // failures over 50000 iterations, against 0 and 1 for the same loop
+        // with no defaulted parameter.
+        if callable_guard_value != callable {
+            return Ok(None);
+        }
         let Some(defaults) =
             (unsafe { positional_defaults_for_inline(callable, &missing, nparams) })
         else {
@@ -4146,11 +4161,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // field in `quasi_immutable_deps`, so a later `f.__defaults__ = ...`
         // retires this loop instead of leaving the guard below to fail forever.
         //
-        // Gated on the same flag as the field guards above, and for a stronger
-        // reason: installing dereferences `callable_guard_op` as a `Function` to
-        // reach its `mutate_defs_w` slot.  The specializer-owned callers arrive
-        // here with the CALL's own operand — a `PyCFunction` — so an ungated
-        // install would write through a type-confused pointer.
+        // Gated on the same flag as the field guards above.  Reaching a
+        // `Some(defaults)` already proved the guard operand is `callable`
+        // itself, so what the flag still adds here is the trace-constant
+        // exclusion: the install dereferences `callable_guard_op` to reach the
+        // `mutate_defs_w` slot, and a baked `ConstPtr` is the pointer the note
+        // above says must not be loaded through.
         if guards_the_callee_function {
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
