@@ -36,22 +36,6 @@ fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
     crate::call::call_function_impl_result(simple_weak_set_type(), &[])
 }
 
-/// Whether `cls` can be weak-referenced at all, which is what decides whether
-/// a `SimpleWeakSet` can hold it.
-///
-/// `app_abc.py:39-40 add` has no such test — upstream reaches it only with a
-/// real class, because `_abc_register` rejects everything else. Pyre admits a
-/// callable non-type there (see `register`), so the test lives on this side of
-/// the boundary rather than in the app-level source, which stays verbatim.
-/// `__contains__` needs none: `app_abc.py:33-38` already reads a referent-less
-/// item as absent.
-fn can_weakref(cls: PyObjectRef) -> bool {
-    use crate::module::_weakref::interp__weakref as wr;
-    let roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = roots.publish(&[cls]);
-    wr::getlifeline(roots.get(cls_slot)).is_ok()
-}
-
 /// `app_abc.py:33-38 SimpleWeakSet.__contains__` through the membership
 /// protocol, which is where the weakref probe and the `TypeError` fallback
 /// live.
@@ -82,15 +66,14 @@ fn weak_cache_contains(
 /// behind for every class the check ever saw.
 ///
 /// Silently declines a class with no collection, for the same reason
-/// [`weak_cache_contains`] reads one as a miss, and one that cannot be
-/// weak-referenced, for the reason [`can_weakref`] records.
+/// [`weak_cache_contains`] reads one as a miss.  Every item reaching here is a
+/// class — `register` and `subclass_of` each reject a non-type argument — and a
+/// class is weak-referenceable, so `add` needs no test of its own, which is
+/// also why `app_abc.py add` has none.
 fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let item_slot = roots.publish(&[item]);
-    if !can_weakref(roots.get(item_slot)) {
-        return Ok(());
-    }
     let cache = cache_attr(roots.get(cls_slot), name)?;
     if cache.is_null() {
         return Ok(());
@@ -133,17 +116,35 @@ fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-/// The registry generation `cls`'s negative cache was recorded against.  A
-/// class with no version attribute, or one holding something other than an
-/// `int`, reports generation 0, which is below every counter value a
-/// registration produces — so its negative cache is discarded rather than
-/// trusted.
-fn negative_cache_version(cls: PyObjectRef) -> Result<u64, crate::PyError> {
-    let version = cache_attr(cls, "_abc_negative_cache_version")?;
-    if version.is_null() || !unsafe { is_int(version) } {
-        return Ok(0);
+/// Compare `cls._abc_negative_cache_version` against the invalidation counter
+/// the way `_abc_subclasscheck` (`<`) and `_abc_instancecheck` (`==`) do.
+///
+/// The stored value is passed to the comparison as it stands rather than
+/// normalised to an integer first: a rebound non-int raises from the compare,
+/// and a value with its own `__lt__` / `__eq__` stays observable.
+fn negative_cache_version_compare(
+    cls: PyObjectRef,
+    op: crate::objspace::descroperation::CompareOp,
+) -> Result<bool, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.publish(&[cls]);
+    let version = cache_attr(roots.get(cls_slot), "_abc_negative_cache_version")?;
+    if version.is_null() {
+        // A class that never ran `_abc_init` records no generation.  Upstream
+        // raises `AttributeError` reading it; the collections are tolerated the
+        // same way here, and the answer that goes with an absent one is "older
+        // than any counter" — rebuild on `<`, refuse to trust on `==`.
+        return Ok(matches!(op, crate::objspace::descroperation::CompareOp::Lt));
     }
-    Ok(unsafe { w_int_get_value(version) }.max(0) as u64)
+    let version_slot = roots.publish(&[version]);
+    let counter_slot = roots.publish(&[w_int_new(
+        INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64
+    )]);
+    crate::baseobjspace::is_true(crate::objspace::descroperation::compare(
+        roots.get(version_slot),
+        roots.get(counter_slot),
+        op,
+    )?)
 }
 
 /// `app_abc.py _abc_init` — install the three collections and the
@@ -217,29 +218,24 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let cls = args[0];
     let subclass = args[1];
-    // `subclass` must be a class (`PyType_Check`).  Pyre's stdlib stubs
-    // register callable non-type shells to ABCs — `_contextvars.Context` is a
-    // builtin function here, yet `contextvars` runs `Mapping.register(Context)`
-    // at import.  `__subclasscheck__` already tolerates such members by
-    // skipping non-type registry entries (see `subclass_of`), so the
-    // `PyObject_IsSubclass` guards below (which reject non-type args) only run
-    // for real types; a callable stub falls straight through to the append,
-    // and only a genuine non-class value (`register(42)`) is rejected.
-    if unsafe { is_type(subclass) } {
-        // Already a subclass (`PyObject_IsSubclass(subclass, cls) > 0`) —
-        // nothing to register.  This also dedups: a previously registered
-        // `subclass` resolves through `__subclasscheck__`'s registry walk.
-        if crate::baseobjspace::issubclass(subclass, cls)? {
-            return Ok(subclass);
-        }
-        // Registering `subclass` would also make `cls` its subclass.
-        if crate::baseobjspace::issubclass(cls, subclass)? {
-            return Err(crate::PyError::runtime_error(
-                "Refusing to create an inheritance cycle",
-            ));
-        }
-    } else if !crate::baseobjspace::callable_w(subclass) {
+    // `_abc_register`: `if not isinstance(subclass, type): raise TypeError(
+    // "Can only register classes")`.  Everything downstream reads a registry
+    // entry as a class, so the rejection is what makes that sound.
+    if !unsafe { is_type(subclass) } {
         return Err(crate::PyError::type_error("Can only register classes"));
+    }
+    // Already a subclass (`issubclass(subclass, cls)`) — nothing to register.
+    // This also dedups: a previously registered `subclass` resolves through
+    // `__subclasscheck__`'s registry walk.
+    if crate::baseobjspace::issubclass(subclass, cls)? {
+        return Ok(subclass);
+    }
+    // Registering `subclass` would also make `cls` its subclass.  Tested after
+    // the arm above, so `X.register(X)` stays a no-op rather than a cycle.
+    if crate::baseobjspace::issubclass(cls, subclass)? {
+        return Err(crate::PyError::runtime_error(
+            "Refusing to create an inheritance cycle",
+        ));
     }
     // `app_abc.py:99 cls._abc_registry.add(subclass)`.  An ABC that never ran
     // `_abc_init` has no collection to add to; it gets one here rather than
@@ -260,9 +256,12 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `Mapping` / `Sequence` is what makes `case {...}` / `case [...]` accept
     // a class that inherits from neither, so the marker has to travel with
     // the registration, not only with `__abc_tpflags__` at class creation.
-    let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
-    if flag != b'?' && unsafe { is_type(subclass) } {
-        set_collection_flag_recursive(subclass, flag);
+    // `_abc_register` reads the flags under `if isinstance(cls, type):`.
+    if unsafe { is_type(cls) } {
+        let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
+        if flag != b'?' {
+            set_collection_flag_recursive(subclass, flag);
+        }
     }
     Ok(subclass)
 }
@@ -333,7 +332,10 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // recorded against, so a bumped counter discards the whole cache rather
     // than trusting any entry in it.
     let counter = INVALIDATION_COUNTER.load(Ordering::Relaxed);
-    if negative_cache_version(roots.get(cls_slot))? < counter {
+    if negative_cache_version_compare(
+        roots.get(cls_slot),
+        crate::objspace::descroperation::CompareOp::Lt,
+    )? {
         let fresh = new_simple_weak_set()?;
         crate::baseobjspace::setattr_str(roots.get(cls_slot), "_abc_negative_cache", fresh)?;
         let version = w_int_new(counter as i64);
@@ -398,15 +400,6 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                     Err(err) if err.matches_stop_iteration() => break,
                     Err(err) => return Err(err),
                 };
-                // A registered entry that is not a class cannot be a base
-                // class, so it can never make `subclass` a subclass — skip
-                // it rather than letting `issubclass` raise.  `range` is
-                // registered to `Sequence` but is a builtin function in
-                // pyre, so without this guard a single bad entry aborts the
-                // whole recursive check.
-                if !unsafe { is_type(rcls) } {
-                    continue;
-                }
                 let item_roots = pyre_object::gc_roots::push_roots();
                 let rcls_slot = item_roots.base();
                 item_roots.pin_root(rcls);
@@ -503,14 +496,14 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // The version test is `==`, not `<`: a cache recorded against a
         // *later* counter than the one read here cannot describe this
         // registry either.
-        if negative_cache_version(roots.get(cls_slot))?
-            == INVALIDATION_COUNTER.load(Ordering::Relaxed)
-            && weak_cache_contains(
-                roots.get(cls_slot),
-                "_abc_negative_cache",
-                roots.get(subclass_slot),
-            )?
-        {
+        if negative_cache_version_compare(
+            roots.get(cls_slot),
+            crate::objspace::descroperation::CompareOp::Eq,
+        )? && weak_cache_contains(
+            roots.get(cls_slot),
+            "_abc_negative_cache",
+            roots.get(subclass_slot),
+        )? {
             return Ok(w_bool_from(false));
         }
         return Ok(w_bool_from(subclasscheck_of(
@@ -606,9 +599,17 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
         data_slots.push(roots.publish(&[data]));
     }
-    // The last read that can run Python; take it before the reloads below so
-    // they answer with final addresses.
-    let version = w_int_new(negative_cache_version(roots.get(cls_slot))? as i64);
+    // `_get_dump` reports the generation attribute itself, not a number derived
+    // from it.  The last read that can run Python; take it before the reloads
+    // below so they answer with final addresses.
+    let version = cache_attr(roots.get(cls_slot), "_abc_negative_cache_version")?;
+    // Same tolerance as the collections above: a class that never ran
+    // `_abc_init` reports generation 0 rather than raising at a debug helper.
+    let version = if version.is_null() {
+        w_int_new(0)
+    } else {
+        version
+    };
     let mut items: Vec<PyObjectRef> = data_slots.iter().map(|&slot| roots.get(slot)).collect();
     items.push(version);
     Ok(w_tuple_new(items))
