@@ -74,13 +74,10 @@ static APPLEVEL_FORK_CALLBACKS: LazyLock<Mutex<ApplevelForkCallbacks>> =
 static FORK_SERIALIZER: Mutex<()> = Mutex::new(());
 
 // `_in_next`'s test-and-set is indivisible under PyPy's GIL. Pyre is
-// free-threaded, so the scandir iterator's flag transitions take the same
-// narrow serializer the process operation above does: `_in_next` and the open
-// flag are both read and written under it, so a `close()` on one thread lands
-// either wholly before another thread's step decision or wholly after it. Only
-// those transitions are held, never the enumeration step, so a second thread
-// arriving mid-enumeration still finds `_in_next` set and is refused rather
-// than blocked — which is what interp_scandir.py:133-135 does.
+// free-threaded, so every borrow of the native scandir iterator takes this
+// narrow serializer. Claiming, taking, and releasing are separate serialized
+// accesses, so a second thread arriving during a claimed step observes
+// `_in_next` and is refused as interp_scandir.py:133-135 requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
 fn require_env_mapping(
@@ -4942,15 +4939,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn scandir_iter_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Ok(args[0])
     }
-    fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
-        // `W_ScandirIterator._close` clears the state inspected by
-        // `_finalize_`, whether closure is explicit or due to exhaustion.
+
+    /// Every mutable borrow of the native iterator is derived, used and dropped
+    /// inside the serializer, so no two callers ever hold overlapping
+    /// references to the same `W_ScandirIterator`.
+    fn with_scandir_iter<R>(
+        self_obj: PyObjectRef,
+        body: impl FnOnce(&mut W_ScandirIterator) -> R,
+    ) -> Option<R> {
         let _serialized = SCANDIR_IN_NEXT_SERIALIZER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(iterator) = W_ScandirIterator::from_obj(self_obj) {
+        W_ScandirIterator::from_obj(self_obj).map(body)
+    }
+
+    fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
+        // `W_ScandirIterator._close` clears the state inspected by
+        // `_finalize_`, whether closure is explicit or due to exhaustion.
+        let _ = with_scandir_iter(self_obj, |iterator| {
             iterator.open = false;
-        }
+        });
     }
     fn scandir_iter_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         scandir_iter_mark_closed(args[0]);
@@ -4971,54 +4979,57 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// every way out (interp_scandir.py:136,158).  The open flag is read in the
     /// same serialized region, so the answer names a state no concurrent
     /// `close()` can be halfway through.
-    fn scandir_iter_claim_next(iterator: &mut W_ScandirIterator) -> ScandirStep {
-        let _serialized = SCANDIR_IN_NEXT_SERIALIZER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // `W_ScandirIterator.next_w` ends enumeration after `close()`, without
-        // yielding entries already buffered in the native owner.
-        if !iterator.open {
-            return ScandirStep::Ended;
-        }
-        if iterator.in_next {
-            return ScandirStep::InProgress;
-        }
-        iterator.in_next = true;
-        ScandirStep::Claimed
+    fn scandir_iter_claim_next(self_obj: PyObjectRef) -> Option<ScandirStep> {
+        with_scandir_iter(self_obj, |iterator| {
+            // `W_ScandirIterator.next_w` ends enumeration after `close()`, without
+            // yielding entries already buffered in the native owner.
+            if !iterator.open {
+                return ScandirStep::Ended;
+            }
+            if iterator.in_next {
+                return ScandirStep::InProgress;
+            }
+            iterator.in_next = true;
+            ScandirStep::Claimed
+        })
     }
 
-    fn scandir_iter_release_next(iterator: &mut W_ScandirIterator) {
-        let _serialized = SCANDIR_IN_NEXT_SERIALIZER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        iterator.in_next = false;
+    fn scandir_iter_release_next(self_obj: PyObjectRef) {
+        let _ = with_scandir_iter(self_obj, |iterator| {
+            iterator.in_next = false;
+        });
     }
 
     /// One enumeration step, with the step already claimed.
-    fn scandir_iter_next_entry(
-        iterator: &mut W_ScandirIterator,
-        self_obj: PyObjectRef,
-    ) -> Result<PyObjectRef, crate::PyError> {
-        let idx = iterator.index;
-        let entries = iterator.entries;
-        let len = unsafe { pyre_object::w_list_len(entries) } as i64;
-        if idx >= len {
-            scandir_iter_mark_closed(self_obj);
-            return Err(crate::PyError::stop_iteration());
-        }
-        let Some(item) = (unsafe { pyre_object::w_list_getitem(entries, idx) }) else {
-            scandir_iter_mark_closed(self_obj);
-            return Err(crate::PyError::stop_iteration());
-        };
-        iterator.index = idx + 1;
-        Ok(item)
+    fn scandir_iter_next_entry(self_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        with_scandir_iter(self_obj, |iterator| {
+            let idx = iterator.index;
+            let entries = iterator.entries;
+            let len = unsafe { pyre_object::w_list_len(entries) } as i64;
+            if idx >= len {
+                iterator.open = false;
+                return Err(crate::PyError::stop_iteration());
+            }
+            let Some(item) = (unsafe { pyre_object::w_list_getitem(entries, idx) }) else {
+                iterator.open = false;
+                return Err(crate::PyError::stop_iteration());
+            };
+            iterator.index = idx + 1;
+            Ok(item)
+        })
+        .unwrap_or_else(|| {
+            Err(crate::PyError::type_error(
+                "expected a 'posix.ScandirIterator' object",
+            ))
+        })
     }
 
     fn scandir_iter_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = args[0];
-        let iterator = W_ScandirIterator::from_obj(self_obj)
-            .ok_or_else(|| crate::PyError::type_error("expected a 'posix.ScandirIterator' object"))?;
-        match scandir_iter_claim_next(iterator) {
+        let step = scandir_iter_claim_next(self_obj).ok_or_else(|| {
+            crate::PyError::type_error("expected a 'posix.ScandirIterator' object")
+        })?;
+        match step {
             ScandirStep::Ended => return Err(crate::PyError::stop_iteration()),
             // interp_scandir.py:133-135 refuses a step taken while another is
             // in progress, and refuses it through `fail`, which closes the
@@ -5032,15 +5043,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             ScandirStep::Claimed => {}
         }
-        let result = scandir_iter_next_entry(iterator, self_obj);
-        scandir_iter_release_next(iterator);
+        let result = scandir_iter_next_entry(self_obj);
+        scandir_iter_release_next(self_obj);
         result
     }
     fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {
-        let _serialized = SCANDIR_IN_NEXT_SERIALIZER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        W_ScandirIterator::from_obj(self_obj).is_some_and(|iterator| iterator.open)
+        with_scandir_iter(self_obj, |iterator| iterator.open).unwrap_or(false)
     }
     fn scandir_iter_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = args[0];
