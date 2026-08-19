@@ -1262,6 +1262,11 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
     if tc == "X" {
         return bstr_to_pyobject(bytes);
     }
+    // `P_get` reads a null pointer as `None`, the way `z_get` and `Z_get` read
+    // a null string as one; the host's table answers the address either way.
+    if tc == "P" && host_ctypes::read_pointer_from_buffer(bytes) == 0 {
+        return pyre_object::w_none();
+    }
     decoded_to_pyobject(host_ctypes::decode_type_code(tc, bytes))
 }
 

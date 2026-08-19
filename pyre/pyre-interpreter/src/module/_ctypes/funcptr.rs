@@ -619,9 +619,7 @@ pub(super) fn callback_result(
         Ret::Void => Ok(pyre_object::w_none()),
         Ret::Code(code) => {
             let bytes = cdata::encode_value_into(&code, result, obj, "result")?;
-            Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
-                &code, &bytes,
-            )))
+            Ok(cdata::decode_slot(&code, &bytes))
         }
         Ret::Pointer(_) | Ret::Aggregate(_) => Ok(result),
     }
@@ -776,18 +774,17 @@ fn build_return_value(
         }
         Ret::Void => Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None)),
         Ret::Code(c) => {
-            // Reconstruct the raw result bytes and decode exactly as before:
-            // a scalar carries its register image, a pointer-code result its
-            // address bytes.
-            let decoded = match result {
-                host_ctypes::CallValue::Scalar(b) => host_ctypes::decode_type_code(&c, &b),
-                host_ctypes::CallValue::Pointer(p) => {
-                    host_ctypes::decode_type_code(&c, &p.to_ne_bytes())
+            // Reconstruct the raw result bytes and read them as a slot of that
+            // type: a scalar carries its register image, a pointer-code result
+            // its address bytes.
+            let bytes = match result {
+                host_ctypes::CallValue::Void => {
+                    return Ok(cdata::decoded_to_pyobject(host_ctypes::DecodedValue::None));
                 }
-                host_ctypes::CallValue::Void => host_ctypes::DecodedValue::None,
-                host_ctypes::CallValue::Aggregate(b) => host_ctypes::decode_type_code(&c, &b),
+                host_ctypes::CallValue::Scalar(b) | host_ctypes::CallValue::Aggregate(b) => b,
+                host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
             };
-            Ok(cdata::decoded_to_pyobject(decoded))
+            Ok(cdata::decode_slot(&c, &bytes))
         }
     }
 }
