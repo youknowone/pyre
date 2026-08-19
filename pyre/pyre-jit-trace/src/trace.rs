@@ -4126,27 +4126,65 @@ fn run_perfn_walk<Sym: WalkSym>(
         // inside the discarded callee attempt.  Only the first of those two is
         // named below: `AbortPermanentMarkerReached` never reaches this leg
         // because it is absent from `leaves_complete_image`'s allow-list, which
-        // gates the `matches!` entirely.  The nested-residual variant
-        // marked `blackhole_required: true` owns a complete per-frame image
-        // and so passes `leaves_complete_image`, but the image it hands the
-        // blackhole is not a valid forward resume for every shape that reaches
-        // it.  Two `bench/synth` fixtures are the standing witnesses, both
-        // wrong-code rather than a decline: `inline_subwalk_user_iterator`
-        // (the inlined callee's return value comes back as an untyped ref, so
-        // the caller's `acc += v` raises `TypeError: ... 'int' and 'object'`)
-        // and `list_append_write_barrier_gc` (`stack underflow during
-        // interpreter peek` — the resumed frame's operand stack is short).
-        // `PYRE_WALKABORT_OFF=1` is the control: both pass with the leg
-        // disabled.  The `frame_finished_execution` store the handoff used to
-        // skip is NO LONGER one of the reasons — the drive now performs it at
-        // every level it leaves (`state::finish_blackhole_level_frame`, wired
-        // as `on_leave_level`), which is what
-        // `parity_tests/jit_inline_traceback_frame_clear.py` needs on
-        // `sys._getframe().clear()`.  Restore the carrier for this variant
-        // until the two image defects above are closed;
-        // `ForceQuasiImmutable` resumes AT the forcing opcode via
-        // `flush_qmut_abort_state` (arm below), which re-runs the write the
-        // walk stopped in front of instead of finishing the frame past it.
+        // gates the `matches!` entirely.  `ForceQuasiImmutable` resumes AT the
+        // forcing opcode via `flush_qmut_abort_state` (arm below), which re-runs
+        // the write the walk stopped in front of instead of finishing the frame
+        // past it.
+        //
+        // The `LoopBearingCalleeInlineUnsupported` arm only ever excludes the
+        // nested-residual variant marked `blackhole_required: true`: the plain
+        // decline is already outside `leaves_complete_image`'s allow-list and
+        // keeps the carrier either way.  That variant DOES own a complete
+        // per-frame image, and it had two separate blockers.  The first is
+        // closed: the blackhole did not publish `PyFrame.finish_value`'s
+        // `frame_finished_execution` store, which this codewriter lowers into
+        // the `*_return` operation instead of emitting — the walker re-emits it
+        // (`finish_current_frame_execution`) and the interpreter performs it on
+        // RETURN_VALUE, and the drive now performs it at every level it leaves
+        // (`state::finish_blackhole_level_frame`, wired as `on_leave_level`),
+        // so a frame it finished no longer reads back as executing.  That is
+        // what `parity_tests/jit_inline_traceback_frame_clear.py` needs on
+        // `sys._getframe().clear()`.
+        //
+        // The second blocker is PERMANENT, and it is why this arm stays.  A
+        // multi-frame image stacks the CALLEE above its CALLER, so every frame
+        // but the bottom one has a `nextblackholeinterp`.  `bhimpl_jit_merge_point`
+        // (`blackhole.py:1066-1093`) reads exactly that as the RECURSIVE PORTAL
+        // level: with a next interpreter present it takes
+        // `bhimpl_recursive_call_{i,r,f,v}`, parks the portal's result in
+        // `tmpreg_*`, sets `return_type`, and raises `LeaveFrame`.  That is
+        // correct upstream, where a portal jitdriver's merge point occurs only in
+        // the portal frame — but this decline is
+        // `LoopBearingCalleeInlineUnsupported`, which reports that the callee
+        // bears a loop, and a loop-bearing callee carries its own
+        // merge point at that loop's header.  The callee therefore hits its merge
+        // point BEFORE it ever reaches a `*_return`, and the caller below it
+        // receives that `tmpreg_*` as the callee's return value.
+        //
+        // Measured on `inline_subwalk_user_iterator`, whose `step` bears the
+        // `for x in it` loop: the image is `[run@1054, step@260]`, `step` runs a
+        // straight line from its resume to the `jit_merge_point` at its loop
+        // header and leaves there with `ret_type=Ref`, and `run` resumes holding
+        // the iterator — the ref live in the merge point's red list — where its
+        // call result belongs, ending in `unsupported operand type(s) for +:
+        // 'int' and 'object'`.  `list_append_write_barrier_gc` reproduces it
+        // independently on `[big_live_len_regrow@1191, churn@162]`, where `churn`
+        // leaves at the merge point of its own `for i in range(k)` loop — the very
+        // frame the failing traceback ends on — surfacing instead as `stack
+        // underflow during interpreter peek` off a traceback whose frames are
+        // interleaved, `str(i)` appearing to call `churn`.  Ten further
+        // fixtures answer `fbw_blackhole_adopted_multi_frame 0 -> 1`, so the
+        // handoff is reached broadly; the two failures are the shapes whose
+        // callee reaches its own merge point first, not a corner.
+        // `PYRE_WALKABORT_OFF=1` is the control: both fixtures pass with the
+        // leg disabled.
+        //
+        // So the handoff cannot represent "callee paused inside its own loop with
+        // its caller below it" at all, and the gh#467 CALL-forward carrier — which
+        // rewinds the OUTER frame to its CALL and re-runs the callee whole — is
+        // the only correct route for this decline.  Narrowing the arm to "refuse
+        // when a non-bottom frame can reach a merge point before returning" would
+        // exclude the same set, since bearing a loop is what this decline reports.
         //
         // And only for an abort whose image is COMPLETE
         // (`DispatchError::leaves_complete_image`).  Pyre's walker has a whole
