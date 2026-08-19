@@ -80,12 +80,18 @@ before any test, a denied resource, or a suite whose every case was skipped).
 - `.github/workflows/pyre-cpython-nightly.yml` — non-gating nightly `--full`
   across three lanes (dynasm JIT-on, dynasm JIT-off, cranelift) with reports
   uploaded as artifacts. A module that passes JIT-off but not JIT-on is a JIT
-  correctness divergence.
+  correctness divergence. It runs on the gate's own host and repeats the gate's
+  `--jobs` and `--timeout`, so a lane's verdict for a module means the same
+  thing the baseline means by it; a report measured under a tighter per-module
+  budget calls a module TIMEOUT for reasons that have nothing to do with the
+  module. Because the non-`PASS` modules are only ever run here, this is also
+  where a recorded verdict that has since gone stale becomes visible.
 
 ## Current state and backlog (Phase 0)
 
-The baseline currently records **206 `PASS`**, 161 `IMPORTERROR`, 26 `FAIL`,
-22 `SKIP`, 13 `CRASH`, and 6 `TIMEOUT` (434 modules, stdlib 3.14.6). The
+The baseline records **210 `PASS`**, 148 `IMPORTERROR`, 34 `SKIP`, 27 `FAIL`,
+8 `CRASH`, and 7 `TIMEOUT` (434 modules, stdlib 3.14.6). These are a snapshot
+counted from `baseline.json`, which is the authority when they disagree. The
 `PASS` set grows as the gaps below are closed; non-passing modules include both
 import/stdlib gaps and tests that reach semantic failures, crashes, or timeouts.
 (It was 0 `PASS` / 414 `IMPORTERROR` before the

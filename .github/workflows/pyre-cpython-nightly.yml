@@ -7,7 +7,11 @@ name: pyre CPython suite (nightly)
 #     not under JIT is a JIT correctness divergence
 #   * cranelift, JIT on
 # Reports are uploaded as artifacts so coverage growth and JIT divergence can
-# be tracked over time. This never gates a PR (`--full` always exits 0).
+# be tracked over time. This never gates a PR: `--full` reports a regression
+# against the baseline instead of failing on it. It is not the same as always
+# exiting 0 -- a run whose buckets do not account for every module it selected
+# still fails, and withholds its report, because that summary is short of a
+# result rather than carrying a bad one.
 
 on:
   schedule:
@@ -23,12 +27,21 @@ permissions:
 
 jobs:
   full-suite:
-    name: full CPython suite (macos)
-    # aarch64: the gate's baseline is darwin-aarch64 and the JIT codegen is
-    # arch-specific, so the exploratory reports (incl. the JIT-divergence
-    # signal) are produced on the same arch as the gate.
-    runs-on: macos-latest
-    timeout-minutes: 120
+    name: full CPython suite (linux)
+    # The gate runs on ubuntu-24.04 and the baseline records its verdicts, so
+    # the exploratory lanes run there too: a report from another host measures
+    # host divergence on top of the coverage it is meant to show, and the JIT
+    # codegen is arch-specific besides. Each lane is spelled with the gate's
+    # own `--jobs` and `--timeout` for the same reason -- a module the report
+    # calls TIMEOUT under a tighter budget than the baseline was recorded with
+    # is not a finding about the module.
+    runs-on: ubuntu-24.04
+    # Three full 434-module lanes, plus the LLBC extract and both backend
+    # builds ahead of them, do not fit the 120 this job carried before: over
+    # the eight nights preceding this change not one run finished all three
+    # lanes -- three were cut off inside the cranelift lane, three inside the
+    # lane before it, and two never got past the first.
+    timeout-minutes: 330
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
@@ -71,6 +84,15 @@ jobs:
       with:
         path: build/llbc
         key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+        # The exact key misses whenever any of the four crates moved, which is
+        # most nights, and without a prefix to fall back on a miss restores
+        # nothing at all -- so the whole extract ran from scratch every time,
+        # ~23 minutes of a budget that had none to give. The key only chooses
+        # what gets offered: `extract-llbc.py` re-adjudicates each crate
+        # against the current tree and re-extracts the ones that moved, so a
+        # loose restore cannot hand the build a stale artefact.
+        restore-keys: |
+          llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Extract LLBC
       if: steps.llbc-cache.outputs.cache-hit != 'true'
       shell: bash
@@ -80,11 +102,17 @@ jobs:
         cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
         cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
     - name: dynasm (JIT on)
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 4 --timeout 120 --report reports/dynasm-jit.json
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
+    # A lane exits nonzero on more than a regression -- `--full` gates none of
+    # those, but a summary short of the modules it selected still returns 1 --
+    # and without this the JIT-divergence comparison these three lanes exist to
+    # produce is lost to whichever lane happened to run first.
     - name: dynasm (JIT off)
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 4 --timeout 120 --report reports/dynasm-nojit.json
+      if: ${{ !cancelled() }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 3 --timeout 300 --report reports/dynasm-nojit.json
     - name: cranelift (JIT on)
-      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 4 --timeout 120 --report reports/cranelift-jit.json
+      if: ${{ !cancelled() }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 3 --timeout 300 --report reports/cranelift-jit.json
     - name: Upload reports
       if: ${{ always() }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

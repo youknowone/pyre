@@ -126,8 +126,9 @@ KNOWN_SKIPS = {
 # Whole modules that CPython skips at import on some platforms. Off-platform
 # modules are neither run nor written to the baseline, avoiding false
 # `PASS -> SKIP` regressions. Keep each predicate aligned with CPython's guard;
-# modules that only skip individual cases do not belong here. Baseline host
-# enforcement remains `check.py`'s job (`CPYTHON_SUITE_BASELINE_HOST`).
+# modules that only skip individual cases do not belong here. A host that
+# disagrees about a module for any other reason records it in its own
+# `host_baseline_path` overlay instead.
 PLATFORM_GATED = {
     # `if not is_apple: raise unittest.SkipTest("Apple-specific")`, where
     # `test.support.is_apple` is darwin plus the mobile Apple platforms.
