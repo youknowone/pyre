@@ -1233,7 +1233,7 @@ pub(super) fn invalid_type_code_error() -> crate::PyError {
 /// `Py_TYPE(value)->tp_name` — the class an instance reports itself as, which
 /// for an instance-layout object is its `w_class` rather than the layout type
 /// its `ob_type` names.
-fn value_type_name(obj: PyObjectRef) -> String {
+pub(super) fn value_type_name(obj: PyObjectRef) -> String {
     match crate::typedef::r#type(obj) {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
         None => unsafe { pyre_object::type_name_of(obj) }.to_string(),

@@ -414,6 +414,18 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "resize",
         crate::make_builtin_function("resize", ctypes_resize),
     );
+    // `call_function` / `call_cdeclfunction` are the module's own
+    // "so that we can call CFunction instances" pair, described as debugging
+    // only and private; the readline extension `_ctypes` names in that comment
+    // is why they are still here.  The two differ by the calling convention
+    // they pass, which x86-64 has one of.
+    for name in ["call_function", "call_cdeclfunction"] {
+        crate::module_ns_store(
+            ns,
+            name,
+            crate::make_builtin_function_with_arity(name, super::funcptr::call_function, 2),
+        );
+    }
 }
 
 /// Resolve `symbol` in the library a `_handle` names, for `CFuncPtr((name,
@@ -1036,4 +1048,6 @@ fn register_stub_ctypes(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "addressof", crate::typedef::w_object());
     crate::module_ns_store(ns, "byref", crate::typedef::w_object());
     crate::module_ns_store(ns, "resize", crate::typedef::w_object());
+    crate::module_ns_store(ns, "call_function", crate::typedef::w_object());
+    crate::module_ns_store(ns, "call_cdeclfunction", crate::typedef::w_object());
 }

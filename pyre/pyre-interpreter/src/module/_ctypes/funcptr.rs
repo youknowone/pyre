@@ -40,6 +40,8 @@ const INTERNAL_WSTRING_AT_ADDR: usize = 3;
 const INTERNAL_MEMORYVIEW_AT_ADDR: usize = 4;
 const INTERNAL_PYBYTES_FROMSTRINGANDSIZE: usize = 5;
 const INTERNAL_PYOS_SNPRINTF: usize = 6;
+#[cfg(windows)]
+const INTERNAL_PYERR_SETFROMWINDOWSERR: usize = 7;
 
 static CFUNCPTR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
@@ -162,6 +164,38 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
+/// The borrow a marshalled argument is handed to the call as; the borrow ends
+/// with the call, and `owned` outlives it.
+fn owned_arg_as_call_arg(arg: &OwnedArg) -> host_ctypes::CallArg<'_> {
+    match arg {
+        OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
+            code: code.as_str(),
+            buffer: buf.as_slice(),
+        },
+        OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
+        OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
+        OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
+        OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
+            layout,
+            buffer: buf.as_slice(),
+        },
+    }
+}
+
+fn call_error(e: host_ctypes::CallError) -> crate::PyError {
+    match e {
+        host_ctypes::CallError::NullFunctionPointer => {
+            crate::PyError::value_error("NULL function pointer")
+        }
+        host_ctypes::CallError::UnknownTypeCode(c) => {
+            crate::PyError::type_error(format!("unsupported type code {c:?}"))
+        }
+        host_ctypes::CallError::BufferTooSmall { expected, got } => crate::PyError::value_error(
+            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
+        ),
+    }
+}
+
 /// `(name, dll)` → resolved symbol address.  `dll._handle` is the integer
 /// library handle; `name` is the symbol string/bytes.
 fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
@@ -188,6 +222,8 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
     match name_bytes.as_slice() {
         b"PyBytes_FromStringAndSize" => return Ok(INTERNAL_PYBYTES_FROMSTRINGANDSIZE),
         b"PyOS_snprintf" => return Ok(INTERNAL_PYOS_SNPRINTF),
+        #[cfg(windows)]
+        b"PyErr_SetFromWindowsErr" => return Ok(INTERNAL_PYERR_SETFROMWINDOWSERR),
         _ => {}
     }
     super::interp_ctypes::lookup_symbol(handle, &name_bytes).map_err(|e| {
@@ -542,6 +578,10 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         INTERNAL_MEMORYVIEW_AT_ADDR => return internal_memoryview_at(call_args),
         INTERNAL_PYBYTES_FROMSTRINGANDSIZE => return internal_pybytes_fromstringandsize(call_args),
         INTERNAL_PYOS_SNPRINTF => return internal_pyos_snprintf(call_args),
+        #[cfg(windows)]
+        INTERNAL_PYERR_SETFROMWINDOWSERR => {
+            return internal_pyerr_setfromwindowserr(call_args);
+        }
         _ => {}
     }
 
@@ -592,22 +632,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     // Borrow the owned data as `CallArg`s; these borrows end with the call.
-    let host_args: Vec<host_ctypes::CallArg> = owned
-        .iter()
-        .map(|o| match o {
-            OwnedArg::Typed(code, buf) => host_ctypes::CallArg::Typed {
-                code: code.as_str(),
-                buffer: buf.as_slice(),
-            },
-            OwnedArg::Int(v) => host_ctypes::CallArg::Int(*v),
-            OwnedArg::Double(v) => host_ctypes::CallArg::Double(*v),
-            OwnedArg::Pointer(v) => host_ctypes::CallArg::Pointer(*v),
-            OwnedArg::Aggregate(layout, buf) => host_ctypes::CallArg::Aggregate {
-                layout,
-                buffer: buf.as_slice(),
-            },
-        })
-        .collect();
+    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
 
     let addr = funcptr_addr(self_obj);
     let flags = funcptr_flags(self_obj);
@@ -627,18 +652,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
-    let result = result?.map_err(|e| match e {
-        host_ctypes::CallError::NullFunctionPointer => {
-            crate::PyError::value_error("NULL function pointer")
-        }
-        host_ctypes::CallError::UnknownTypeCode(c) => {
-            crate::PyError::type_error(format!("unsupported type code {c:?}"))
-        }
-        host_ctypes::CallError::BufferTooSmall { expected, got } => crate::PyError::value_error(
-            format!("aggregate argument buffer too small: expected {expected}, got {got}"),
-        ),
-    });
-    let result = result?;
+    let result = result?.map_err(call_error)?;
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
@@ -834,6 +848,71 @@ fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRe
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(
         &bytes[..size.min(bytes.len())],
     ))
+}
+
+/// `PyErr_SetFromWindowsErr(ierr)` — raise the OSError a Win32 error code
+/// names, or the one `GetLastError()` names when the code is 0.  The parameter
+/// is a C `int`, so a code with the top bit set arrives as the negative number
+/// `.winerror` reports; a code the system has no message for is spelled
+/// `Windows Error 0x<code>`, which is what `test_windows_message` reads.
+#[cfg(windows)]
+fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let code = match args.first() {
+        Some(&arg) => crate::baseobjspace::int_w(arg)? as i32,
+        None => std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    };
+    Err(crate::PyError::os_error_win32_syscall2(
+        code,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// `_ctypes.call_function(address, args)` — call an address that carries no
+/// argtypes, no restype and no flags, so every argument converts by the
+/// default rules and the result is read as a C `int`.  `call_cdeclfunction` is
+/// the same call under `FUNCFLAG_CDECL`, which on this architecture is the
+/// only calling convention there is.
+pub(super) fn call_function(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (Some(&addr), Some(&arguments)) = (args.first(), args.get(1)) else {
+        return Err(crate::PyError::type_error(
+            "call_function() takes exactly 2 arguments",
+        ));
+    };
+    if !unsafe { pyre_object::is_tuple(arguments) } {
+        return Err(crate::PyError::type_error(format!(
+            "argument 2 must be tuple, not {}",
+            cdata::value_type_name(arguments)
+        )));
+    }
+    let addr = cdata::pointer_word(addr)?;
+    let mut keepalive: Vec<Vec<u8>> = Vec::new();
+    let owned = seq_to_vec(arguments)
+        .expect("a tuple")
+        .into_iter()
+        .map(|arg| marshal_default_arg(arg, &mut keepalive))
+        .collect::<Result<Vec<_>, _>>()?;
+    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
+    let result = {
+        let _blocked = crate::module::thread::before_external_block();
+        super::seh::guard(|| {
+            host_ctypes::call(
+                addr,
+                &host_args,
+                host_ctypes::CallRet::Code("i"),
+                host_ctypes::CallOptions::default(),
+            )
+        })
+    };
+    drop(keepalive);
+    let bytes = match result?.map_err(call_error)? {
+        host_ctypes::CallValue::Scalar(b) => b,
+        host_ctypes::CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
+        _ => Vec::new(),
+    };
+    Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
+        "i", &bytes,
+    )))
 }
 
 fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
