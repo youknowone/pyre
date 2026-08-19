@@ -237,3 +237,56 @@ fn address_of_the_vable_array_slot_is_marked_not_a_read() {
          anything"
     );
 }
+
+/// Every `locals_w!` read in `fast2locals` is consumed by an array operation
+/// in the block that reads it.
+///
+/// This is the other half of what the virtualizable protocol needs, and it
+/// is checked separately because the two fail independently: an unmarked
+/// read that escapes its block trips `_check_no_vable_array`, and a read
+/// consumed in place but marked `taken_by_address` silently lowers to
+/// `getarrayitem_gc`.  `fast2locals` is the graph a policy that admitted
+/// loops would open first (`pyframe.py:539` decorates it `@jit.unroll_safe`),
+/// so it is where both have to hold.
+#[test]
+fn every_vable_array_read_in_fast2locals_is_consumed_in_its_block() {
+    let Some(graph) = lower_pyframe_method("fast2locals") else {
+        return;
+    };
+
+    let mut checked = 0;
+    for (index, block) in graph.blocks.iter().enumerate() {
+        let reads: Vec<Variable> = block
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "locals_cells_stack_w" => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        for array_var in reads {
+            checked += 1;
+            let consumed = block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::ArrayRead { base, .. }
+                        | OpKind::ArrayWrite { base, .. }
+                        | OpKind::ArrayLen { base, .. }
+                        if *base == array_var
+                )
+            });
+            assert!(
+                consumed,
+                "the virtualizable array read in block {index} of {:?} has no array \
+                 operation consuming it there",
+                graph.name,
+            );
+        }
+    }
+    assert!(
+        checked > 0,
+        "no read of the virtualizable array in `fast2locals`"
+    );
+}

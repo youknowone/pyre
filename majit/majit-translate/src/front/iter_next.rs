@@ -117,6 +117,14 @@ fn is_iter_op_segments(segments: &[String]) -> bool {
 /// foreign iterator constructor) is not followed, so the walk returns
 /// `true` only on a positively-confirmed `iter` source.
 fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
+    iter_op_container(graph, var).is_some()
+}
+
+/// The container an `iter` op constructed `var` over, when the backward walk
+/// confirms one.  `originates_from_iter_op` is this with the container
+/// discarded; [`iter_next_item_type`] needs it, because the container is the
+/// only thing that separates the two iterator reprs.
+fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
     let mut visited: Vec<Variable> = Vec::new();
     let mut stack: Vec<Variable> = vec![var.clone()];
     while let Some(v) = stack.pop() {
@@ -130,11 +138,12 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
                 if op.result.as_ref() == Some(&v)
                     && let OpKind::Call {
                         target: CallTarget::FunctionPath { segments },
+                        args,
                         ..
                     } = &op.kind
                     && is_iter_op_segments(segments)
                 {
-                    return true;
+                    return args.first().cloned();
                 }
             }
         }
@@ -155,7 +164,55 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
             }
         }
     }
-    false
+    None
+}
+
+/// The element type the native `next` op yields for the iterator `var`.
+///
+/// `ListIteratorRepr::rtype_next` (`rlist.py ll_listnext`) hands back the
+/// list's item repr — a GC reference for every list this fold admits —
+/// while `RangeIteratorRepr::rtype_next` (`rrange.py ll_rangenext_*`) hands
+/// back a `Signed`.  `front::range_iter` reroutes an exclusive int `Range`
+/// for-loop onto the `range()` builtin plus the same `iter` bridge, so both
+/// reprs arrive here behind one `iter` op and only the container that op was
+/// given tells them apart.
+///
+/// Answering `Ref` for a range is not inert.  The legacy type walker reads
+/// `result_ty` straight off the op (`legacy_annotator`'s `Call` arm returns
+/// it whenever it is not `Unknown`), so the loop's induction variable lands
+/// in the ref register bank, and every `array[i]` in the loop body then
+/// assembles as a `getarrayitem_gc` whose index is ref-kind — which
+/// `assembler.rs` rejects outright.  Graphs containing a loop are normally
+/// residualized rather than looked inside, so this surfaces only on a graph
+/// carrying `@jit.unroll_safe`.
+fn iter_next_item_type(graph: &FunctionGraph, iterator: &Variable) -> ValueType {
+    let over_a_range = iter_op_container(graph, iterator)
+        .is_some_and(|container| produced_by_range_builtin(graph, &container));
+    if over_a_range {
+        ValueType::Int
+    } else {
+        ValueType::Ref(None)
+    }
+}
+
+/// Whether `var` is the result of `front::range_iter`'s reserved
+/// `["__pyre_range"]` call — the `range(a, b)` builtin standing in for an
+/// exclusive int `Range`.
+fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.len() == 1 && segments[0] == "__pyre_range"
+                )
+        })
 }
 
 /// Transitive closure of dead forwarded inputarg slots starting from
@@ -590,6 +647,7 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     // call (peeled above) are dropped so the native `next` op — which
     // produces the scrutinised `opt` directly — is A's last op and thus the
     // block's `raising_op` under the `LastException` exitswitch below.
+    let item_ty = iter_next_item_type(graph, &iter_arg);
     graph.blocks[a].operations.truncate(next_idx + 1);
     graph.blocks[a].operations[next_idx] = SpaceOperation {
         result: Some(opt.clone()),
@@ -598,7 +656,7 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
                 segments: next_op_segments(),
             },
             args: vec![iter_arg],
-            result_ty: ValueType::Ref(None),
+            result_ty: item_ty,
         },
     };
 
