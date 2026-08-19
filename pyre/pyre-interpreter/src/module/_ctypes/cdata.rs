@@ -81,6 +81,12 @@ fn init_cdata_type(ns: PyObjectRef) {
             ),
         );
     }
+    // What an `out` parameter hands back once the callee has written it.
+    type_ns_store(
+        ns,
+        "__ctypes_from_outparam__",
+        crate::make_builtin_function("__ctypes_from_outparam__", |args| Ok(args[0])),
+    );
 }
 
 pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -257,6 +263,21 @@ fn init_simplecdata_type(ns: PyObjectRef) {
         ns,
         "__new__",
         crate::typedef::make_new_descr(simplecdata_new),
+    );
+    // A scalar `out` parameter hands back the value rather than the box; one
+    // whose type is a user subclass hands back the instance, because the
+    // subclass is the thing the caller asked for.
+    type_ns_store(
+        ns,
+        "__ctypes_from_outparam__",
+        crate::make_builtin_function("__ctypes_from_outparam__", |args| {
+            let obj = args[0];
+            if super::funcptr::is_simple_subclass(unsafe { pyre_object::w_instance_get_type(obj) })
+            {
+                return Ok(obj);
+            }
+            value_getter(&[pyre_object::PY_NULL, obj])
+        }),
     );
     type_ns_store(
         ns,

@@ -753,17 +753,26 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // ── COMError — `args` is the (text, details) tail, not the whole tuple ──
     let w_exception = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    crate::module_ns_store(
-        ns,
+    let comerror = crate::builtins::make_exc_type_with_init(
         "COMError",
-        crate::builtins::make_exc_type_with_init(
-            "COMError",
-            Some("Raised when a COM method call failed."),
-            crate::builtins::exc_exception_new,
-            Some(comerror_init),
-            w_exception,
-        ),
+        Some("Raised when a COM method call failed."),
+        crate::builtins::exc_exception_new,
+        Some(comerror_init),
+        w_exception,
     );
+    let _ = COMERROR_TYPE_OBJ.set(comerror as usize);
+    crate::module_ns_store(ns, "COMError", comerror);
+}
+
+#[cfg(all(windows, feature = "host_env"))]
+static COMERROR_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// The `COMError` class, once `_ctypes` has been set up.
+#[cfg(all(windows, feature = "host_env"))]
+pub(super) fn comerror_type() -> Option<pyre_object::PyObjectRef> {
+    COMERROR_TYPE_OBJ
+        .get()
+        .map(|&tp| tp as pyre_object::PyObjectRef)
 }
 
 /// `comerror_init` — stamps the three slots and re-points `args` at the tail.
@@ -804,8 +813,10 @@ fn comerror_init(
     crate::baseobjspace::setattr_str(w_self, "hresult", roots.get(args_slot))?;
     crate::baseobjspace::setattr_str(w_self, "text", roots.get(args_slot + 1))?;
     crate::baseobjspace::setattr_str(w_self, "details", roots.get(args_slot + 2))?;
-    // `args = args[1:]`, so the hresult is reachable only through its attribute.
+    // `args` carries all three, hresult included, and `str()`/`repr()` show
+    // all three with it.
     let w_args = pyre_object::tupleobject::w_tuple_new(vec![
+        roots.get(args_slot),
         roots.get(args_slot + 1),
         roots.get(args_slot + 2),
     ]);
