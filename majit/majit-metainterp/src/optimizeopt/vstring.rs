@@ -874,7 +874,8 @@ impl OptString {
         // optimizer.py:99-113 getintbound resolves `op = get_box_replacement(op)`
         // before reading the bound. Route through `resolve_box_box` (not the raw
         // box-native walk) so a non-canonical InputArg operand reaches its
-        // canonical slot (mod.rs:4337) instead of missing the recorded bound.
+        // canonical slot (`mod.rs`'s `resolve_operand_operand`) instead of
+        // missing the recorded bound.
         let op = ctx.resolve_operand_operand(op);
         ctx.peek_intbound_box(&op)
             .filter(|bound| bound.is_constant())

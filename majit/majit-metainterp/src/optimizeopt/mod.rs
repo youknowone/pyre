@@ -471,7 +471,7 @@ impl ImportedShortPureOp {
         // for invented (the alt identifier) or self.res for non-invented.
         // pyre's `source` IS the alt identifier for invented (the synthetic
         // alias allocated by the compound-dedup pass at
-        // shortpreamble.rs:478-491) and IS self.res for non-invented.
+        // `ShortBoxes` in `shortpreamble.rs`) and IS self.res for non-invented.
         let pop_op = ctx.materialize_operand_at(source);
         ImportedShortPureOp {
             opcode,
@@ -721,7 +721,7 @@ pub struct OptContext {
     /// `Rc`s sharing one position across the peel boundary. An operand
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
-    /// that defers `resolve_box_box`'s InputArg arm (#9/S9).
+    /// that defers `resolve_box_box`'s InputArg arm (#9).
     pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
@@ -959,7 +959,7 @@ pub struct OptContext {
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
     ///
     /// Production runs through `Optimizer::emit_operation`, which owns the
-    /// guard chain via its own `last_guard_op_idx` (optimizer.rs:3584).
+    /// guard chain via its own `last_guard_op_idx` (`optimizer.rs`).
     /// This field tracks the chain for the standalone OptContext entry
     /// (unit tests that drive `OptContext::emit` without an `Optimizer`);
     /// `OptContext::emit` gates its guard handling on `!in_final_emission`
@@ -1054,12 +1054,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     fn get_box_replacement_operand(&self, opref: OpRef) -> Operand {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
-        // return the same producer Rc (ptr_eq) — the #160/S11 livebox dedup key.
+        // return the same producer Rc (ptr_eq) — the #160 livebox dedup key.
         // `get_box_replacement_operand_opt` carries the debug-build tripwire that
         // the native Operand walk agrees with the legacy forwarding form on presence and
         // identity, so the resume-numbering path validates the forwarding→Operand
         // equivalence across the corpus. The fallback PANICS on a producerless
-        // position (E3 dropped the position-only Operand variant), the armed
+        // position (the position-only Operand variant was dropped), the armed
         // hazard-5 tripwire: a non-Const numbering key with no findable producer
         // would otherwise mint a fresh, non-ptr_eq box and corrupt the livebox
         // dedup. #157 drained these fires to zero across the corpus.
@@ -1830,7 +1830,7 @@ impl OptContext {
     /// Construct an `OptContext` and seed `inputarg_refs` with one canonical
     /// `InputArg::from_type(tp, i)` per entry of `inputarg_types`.
     ///
-    /// Mirrors `TraceIterator::new` (`opencoder.rs:373-426`, parity with
+    /// Mirrors `TraceIterator::new` (`opencoder.rs`, parity with
     /// `opencoder.py:259-262` `inputarg_from_tp(arg.type)`). Test fixtures
     /// that construct via this helper exercise the optimizer's operand-direct
     /// routing — the production path.
@@ -2951,7 +2951,7 @@ impl OptContext {
         //
         // RPython has exactly one emit path (`Optimizer._emit_operation`,
         // optimizer.py:614).  Pyre's `Optimizer::emit_operation`
-        // (optimizer.rs:3259) handles guard dispatch (force_box on args,
+        // (`optimizer.rs`) handles guard dispatch (force_box on args,
         // emit_guard_operation, force_box on fail_args, _maybe_replace_guard_value)
         // and then calls `ctx.emit(op.clone())` for the
         // `_newoperations.append(op)` step (optimizer.py:646).  The
@@ -3197,7 +3197,7 @@ impl OptContext {
                 // `materialize_operand_at`, not `from_bound_op`: a
                 // const-folded entry carries an inline-Const pos,
                 // which resolves to its Const operand. The map keys by this
-                // res operand (unsupported-green-type/S8); the single-op re-export lookup
+                // res operand; the single-op re-export lookup
                 // (pure.rs) reproduces it via `materialize_operand_at(source)`.
                 // The operand's identity is the canonical `_forwarded` host
                 // Rc (a synthetic producer registered on first
@@ -3329,7 +3329,7 @@ impl OptContext {
         // `produced` (OpRef dual-key: source + result_opref) is internal
         // scaffolding for `dep_or_materialize` below, which resolves a
         // dependency arg by its replay position. `builder_entries` is the
-        // unsupported-green-type/S8 builder map: ONE entry per short box keyed by the Phase-1
+        // builder map: ONE entry per short box keyed by the Phase-1
         // carried res box (`produced_op.res`, the same Rc the produce loop
         // reads as `self.res`). The carried box is invariant to the
         // invented-name replay-position aliasing the dual key compensates for,
@@ -3472,8 +3472,10 @@ impl OptContext {
                     // The receiver must still be bindable in this namespace —
                     // a miss means the replay cannot be reconstructed and the
                     // whole short preamble is declined. The emitted op keeps
-                    // `preamble_op`'s own receiver rather than this resolution;
-                    // see the comment on `obj_b` below.
+                    // `preamble_op`'s own receiver rather than this resolution,
+                    // because resolving it through `short_args` would collapse
+                    // the renamed short-inputarg and `source_op` identities
+                    // (see `obj_b` below).
                     if resolve_arg(
                         object_arg.to_opref(),
                         self,
@@ -3676,7 +3678,7 @@ impl OptContext {
             // (`preamble_op`), NOT from `preamble_op.op` (= self.res or
             // the alt for invented). pyre's flat-OpRef equivalent is
             // `pop.preamble_op.pos` — the OpRef the replay Op was
-            // constructed at by `ImportedShortPureOp::new` (mod.rs:144).
+            // constructed at by `ImportedShortPureOp::new`.
             // For invented Pure that OpRef differs from `pop.op` (the
             // alt) so the alt's `make_equal_to(...)` chain at
             // `forwarded[pop.op]` does not collide with the replay's
@@ -3757,7 +3759,7 @@ impl OptContext {
         //     clear (info lives across iterations on input args).
         //   * non-input non-Const with forwarded info → also append the
         //     arg op to `self.short` (handled by the builder's `use_box`
-        //     dependency walk at shortpreamble.rs:1660-1688), emit
+        //     dependency walk in `shortpreamble.rs`), emit
         //     guards, AND clear the replay op's marker to prevent double-emission.
         //
         // RPython's non-input `arg` is the replay ResOperation object, while
@@ -3765,7 +3767,8 @@ impl OptContext {
         // model the IntBound/PtrInfo lives in the canonical operand forwarding
         // slot, so clearing that slot here would drop live body facts before
         // loop-close virtualstate.py:491-492 can see them. The builder consumes
-        // the replay op's own marker (`Op.forwarded`) at shortpreamble.rs:2116
+        // the replay op's own marker (`Op.forwarded`) in `shortpreamble.rs`'s
+        // `use_box`
         // to mirror `arg.set_forwarded(None)` without clearing optimizer info.
         enum ForwardedInfo {
             // shortpreamble.py:376-379 EmptyInfo / empty_info sentinel.
@@ -4302,8 +4305,8 @@ impl OptContext {
             }
             // unroll.py:53-98 has no dispatch arm for "no info" — the
             // caller never stores an `Unknown` entry in `exported_infos`
-            // (see `collect_exported_info`'s `None` return at
-            // unroll.rs:2889 mirroring unroll.py:440 `if info:`).
+            // (see `collect_exported_info`'s `None` return
+            // in `unroll.rs`, mirroring unroll.py:440 `if info:`).
             OpInfo::Unknown | OpInfo::EmptyInfo(_) => unreachable!(
                 "exported_infos must never contain OpInfo::Unknown/EmptyInfo; \
                  the absent-entry branch (clear_forwarded) handles that case"
@@ -5056,11 +5059,11 @@ impl OptContext {
         }
     }
 
-    /// Box-canonicalization heal (#189 keystone, phase 1). When a position's
+    /// Box-canonicalization heal (#189). When a position's
     /// canonical producer (the `find_producer_op` / OpRef-store resolution)
     /// has received a forwarding — const-fold (`make_constant_box` /
     /// `seed_constant`) or CSE (`make_equal_to`) — that did NOT route through
-    /// `emit`'s `live_synthetics` catch-up (mod.rs:2673), the recorder input
+    /// `emit`'s `live_synthetics` catch-up, the recorder input
     /// op the operands carry at that position stays a DISTINCT, still-
     /// unforwarded `Op`. A box-native walk from such an operand then freezes
     /// on the unforwarded input op while the OpRef path resolves the canonical
@@ -5396,7 +5399,8 @@ impl OptContext {
             );
         } else {
             // optimizer.py:432 `box.set_forwarded(constbox)`, gated on
-            // `Forwarded::None` per the no-clobber rule documented above.
+            // `Forwarded::None` so an earlier pass's PtrInfo / IntBound /
+            // Box(Const) forwarding is never clobbered.
             if matches!(box_.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
                 box_.set_forwarded_const(majit_ir::Const::from_value(value));
             }
@@ -6135,7 +6139,7 @@ impl OptContext {
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
             // shared guard's rd_numb encodes the donor's livebox type
             // layout, so the sharer must inherit fail_arg_types too —
-            // otherwise `deserialize_optimizer_knowledge` (bridgeopt.rs:911)
+            // otherwise `deserialize_optimizer_knowledge` (`bridgeopt.rs`)
             // reconstructs a different Ref-set and reads past the buffer.
             match self.new_operations[idx].get_fail_arg_types() {
                 Some(types) => op.set_fail_arg_types(types.to_vec()),
@@ -6709,7 +6713,7 @@ impl OptContext {
         // load-bearing contract that subtype markers
         // (`is_resume_at_position()`, `loop_version()`) survive
         // `store_final_boxes_in_guard` (compile.py:1035-1043, mirrored
-        // at pyjitpl.rs:6799 `is_resume_at_position()`).
+        // in `pyjitpl.rs`'s `compile_bridge` `is_resume_at_position()`).
         match op.getdescr() {
             Some(existing) => {
                 if let Some(fd) = existing.as_fail_descr() {
@@ -6785,7 +6789,7 @@ impl OptContext {
     /// tag.
     ///
     /// RPython equivalent: `ConstInt(value)` — constants in RPython are
-    /// first-class Const objects, not boxes. Post-S0 inline-Const the value
+    /// first-class Const objects, not boxes. With inline Consts the value
     /// is carried on the `OpRef::const_*` variant itself: no pool
     /// reservation and no `seed_constant` step (its const arm is a
     /// tautological no-op, asserting only that the variant tag the caller
@@ -6952,7 +6956,7 @@ impl OptContext {
     ///    `protect_speculative_operation` (which matches upstream as a
     ///    plain `()` function).
     ///  - Helper-internal `Ok(None)` for OVF/shift/divide-by-zero/
-    ///    non-finite cast (see `pure.rs:993`).
+    ///    non-finite cast (see `pure.rs`'s `propagate_forward`).
     ///    Every other path panics (caller-invariant, NotImplemented).
     pub fn constant_fold(&self, op: &Op) -> Option<Value> {
         // optimizer.py:822-825: "if cpu.supports_guard_gc_type is
@@ -7183,9 +7187,12 @@ impl OptContext {
     /// itself (every Box is a Python object, so identity lookup is the
     /// `is` operator — O(1)). pyre's flat `OpRef(u32)` cannot mirror
     /// that in O(1) without an auxiliary index; mutation patterns on
-    /// `new_operations` (in-place replace at `optimizer.rs:3391`,
-    /// `rewrite.rs:1579/1674`, plus `remove(jump_idx)` at
-    /// `optimizer.rs:2605`) make a maintained `pos_to_index` brittle.
+    /// `new_operations` (in-place `replace_new_operation` from
+    /// `optimizer.rs`'s `emit_operation` and `rewrite.rs`'s
+    /// `optimize_guard_class` / `optimize_guard_value`, plus
+    /// `remove(jump_idx)` in `optimizer.rs`'s
+    /// `optimize_with_constants_and_inputs_at`) make a maintained
+    /// `pos_to_index` brittle.
     /// unifies on this single API. A maintained index would need to be kept
     /// in sync with every in-place replacement and removal site.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
@@ -7602,7 +7609,8 @@ impl OptContext {
     /// the typed value at `gcref.raw() + descr.offset()` using
     /// `FieldDescr.field_size()` / `is_field_signed()` (the same
     /// (offset, size, sign) triple `Cpu::bh_getfield_gc_i` consumes on
-    /// the backend — compiler.rs:14570). Wraps the read in a freshly
+    /// the backend — `majit-backend-cranelift/src/compiler.rs`). Wraps
+    /// the read in a freshly
     /// allocated const OpRef matching `InputArg*` parity.
     ///
     /// Concrete-Ref extractor is `runtime_value_of` (mod.rs) which
@@ -7683,7 +7691,7 @@ impl OptContext {
     /// tracked field box (the recorded `setfield_gc` source). This mirrors what
     /// `bh_getfield_gc_*` would observe on the eager object: look up the field
     /// slot via `info.getfield(index_in_parent)` (the same parent-local slot
-    /// `enum_forced_boxes_for_entry` reads, virtualstate.rs:854-865), resolve
+    /// `enum_forced_boxes_for_entry` reads, in `virtualstate.rs`), resolve
     /// its own runtime value (`runtime_value_of`, the InputArg*.value analog),
     /// and wrap it in a fresh const OpRef matching the concrete-read return
     /// shape. Returns `None` when the runtime box is not a virtual, the slot is
@@ -7784,7 +7792,8 @@ impl OptContext {
     ///
     /// Reads `array_ptr + base_size + i * itemsize` per
     /// `ArrayDescr.base_size()` / `ArrayDescr.itemsize()` matching the
-    /// backend `Cpu::bh_getarrayitem_gc_*` (compiler.rs:14611). Wraps
+    /// backend `Cpu::bh_getarrayitem_gc_*`
+    /// (`majit-backend-cranelift/src/compiler.rs`). Wraps
     /// the read in a freshly allocated const OpRef.
     ///
     /// Concrete-Ref extractor routes through `runtime_value_of`; see
@@ -8958,7 +8967,7 @@ mod boxref_forwarding_tests {
         ));
     }
 
-    /// Forward-reference dup-materialization regression (keystone S2): a
+    /// Forward-reference dup-materialization regression: a
     /// consumer that binds its operand to a position's stand-in BEFORE the
     /// producer at that position is emitted must, after the producer emits,
     /// resolve through to the emitted producer — not freeze on the orphaned
@@ -9236,7 +9245,7 @@ mod boxref_forwarding_tests {
     /// `[0..phase2_inputarg_base)` carries placeholder resop hosts (preamble
     /// emit ops do NOT appear in the body trace iteration, so the body iter
     /// has no `cls()` allocation for them). Replicates the import_state
-    /// pattern at unroll.rs:3105:
+    /// pattern in `unroll.rs`'s `import_state`:
     ///
     ///   1. `make_equal_to(source_p2, target_p1)` writes
     ///      `source._forwarded = Box(placeholder_at_target_p1.raw)`.
@@ -9278,7 +9287,7 @@ mod boxref_forwarding_tests {
 
         // Step 2: setinfo_from_preamble's terminal write.
         // `setinfo_from_preamble(source, info)` first walks the chain via
-        // `get_box_replacement` (mod.rs:2538) which returns `target_p1`,
+        // `get_box_replacement` which returns `target_p1`,
         // then calls `set_ptr_info(target_p1, info)`. Replicate the
         // post-walk write directly.
         let info = PtrInfo::NonNull { last_guard_pos: -1 };

@@ -174,7 +174,8 @@ impl OptIntBounds {
     /// which mints the wrong Box family when the original Box at slot
     /// `idx` was an `InputArgInt(idx)` constant-folded via
     /// `optimizer.py:410`. Under variant-aware OpRef Eq
-    /// (resoperation.rs:290) `IntOp(idx) == InputArgInt(idx)` is false,
+    /// (`impl PartialEq for OpRef` in `majit-ir/src/resoperation.rs`)
+    /// `IntOp(idx) == InputArgInt(idx)` is false,
     /// so cache keys silently key-mismatch.
     ///
     /// Mint via `make_constant_int` (constant namespace, inline-Const

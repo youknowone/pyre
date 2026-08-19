@@ -628,9 +628,11 @@ pub(crate) fn merge_backend_constants_from_ctx(
         };
         // A ref constant is never resolved from this backend pool: a referenced
         // (live) ref operand is an inline ConstPtr that `remove_constptr`
-        // (rewrite.rs:613) rewrites to `LoadFromGcTable`, loading from the
+        // (`majit-gc/src/rewrite.rs`) rewrites to `LoadFromGcTable`, loading
+        // from the
         // GC-traced gc_table. Only dead (non-result) const-folded positions
-        // reach here, and the recorder invariant (recorder.rs:209) forbids a
+        // reach here, and the recorder invariant (`recorder.rs`'s
+        // `box_for_operand`) forbids a
         // `RefOp(pos)` operand from referencing a dead position, so a ref entry
         // is vestigial. Dropping it keeps the pool — and the `CompiledTrace`
         // constants cloned from it — free of raw `GcRef`, which has no GC root
@@ -804,7 +806,8 @@ impl Optimizer {
                 for (field_idx, field_info) in fields {
                     let field_ref = Self::import_virtual_state_value(field_info, ctx);
                     // ob_type (offset 0) class pointers — the exporter at
-                    // virtualstate.rs:1989 already encodes these as
+                    // `virtualstate.rs`'s `export_single_value` already
+                    // encodes these as
                     // `Value::Ref(GcRef)`, so `field_ref` is already a
                     // typed `RefOp` variant carrying a `Value::Ref(class_gcref)`
                     // const forwarding step on its `_forwarded` slot
@@ -1322,8 +1325,9 @@ impl Optimizer {
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 // unroll.py:454 Box carries its type. VArray heads are
-                // Ref-typed. Bound at allocation — see the
-                // Virtual arm above.
+                // Ref-typed. Bound at allocation via `reserve_virtual_box`
+                // so the `set_ptr_info` write below cannot land on a bare
+                // position and silently drop the imported virtual-ness.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
@@ -1363,8 +1367,9 @@ impl Optimizer {
                 field_descrs,
             } => {
                 // unroll.py:454 Box carries its type. VStruct heads are
-                // Ref-typed. Bound at allocation — see the
-                // Virtual arm above.
+                // Ref-typed. Bound at allocation via `reserve_virtual_box`
+                // so the `set_ptr_info` write below cannot land on a bare
+                // position and silently drop the imported virtual-ness.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
@@ -1399,8 +1404,10 @@ impl Optimizer {
                 element_fields,
             } => {
                 // unroll.py:454 Box carries its type. VArrayStruct heads
-                // are Ref-typed. Bound at allocation — see the
-                // Virtual arm above.
+                // are Ref-typed. Bound at allocation via
+                // `reserve_virtual_box` so the `set_ptr_info` write below
+                // cannot land on a bare position and silently drop the
+                // imported virtual-ness.
                 let (opref, head_box) = ctx.reserve_virtual_box(majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
@@ -2536,7 +2543,7 @@ impl Optimizer {
         // terminals are guaranteed bound before any `&self` reader
         // (e.g. `OptIntBounds::getintbound_box`) reaches a
         // `set_forwarded_*` write. `TraceIterator::next()`
-        // (opencoder.rs:500) plants unbound resop slots; without this
+        // (`opencoder.rs`) plants unbound resop slots; without this
         // pre-pass, `get_box_replacement_box(&self)` could return an
         // unbound terminal that fails `write_forwarded`'s bound-
         // precondition assert.
@@ -3040,7 +3047,7 @@ impl Optimizer {
         // `optimize_peeled_loop` (compile.py:291) chain walk reaches it
         // via `partial_trace.operations`.
         //
-        // pyre's per-iter `TraceIterator::next()` (opencoder.rs:500)
+        // pyre's per-iter `TraceIterator::next()` (`opencoder.rs`)
         // pushes a fresh resop operand slot for every visited op
         // BEFORE the optimizer pipeline decides whether to emit. Two
         // categories of slot escape the `new_operations` carry above
@@ -3311,7 +3318,9 @@ impl Optimizer {
                 // `compile_loop_body` catches it as an `InvalidLoop` to skip
                 // jump-to-existing and either retrace or fall back to the
                 // interpretive path. Propagate via the `InvalidLoop` panic
-                // payload so the existing wrapper at unroll.rs:1146 catches
+                // payload so the existing wrapper
+                // (`unroll.rs`'s
+                // `optimize_trace_with_constants_and_inputs_vable_out`) catches
                 // and reroutes instead of crashing the worker thread.
                 let (preview_label_args, preview_virtuals, preview_label_source_positions) =
                     match preview_virtual_state.make_inputargs_and_virtuals_with_source_positions(
@@ -3681,15 +3690,15 @@ impl Optimizer {
             }
         }
 
-        // Path A — finalize cascade removed. PyPy walks args ONCE at op-emit
+        // Finalize cascade removed. PyPy walks args ONCE at op-emit
         // time via `_emit_operation:614-625 force_box`; never re-walks. The
         // cited `compile.py:emit_op:403-423` is a virtualizable-only patcher
         // (5 callers all inside `patch_new_loop_to_load_virtualizable_fields`),
         // not a general finalize pass. Pyre's emit-time arg walking happens
         // in two PyPy-parity locations:
-        //   1. `propagate_from_pass_range:3336-3339` — incoming op args
+        //   1. `propagate_from_pass_range` — incoming op args
         //      resolved via `ctx.get_box_replacement` BEFORE pass dispatch.
-        //   2. `Optimizer::emit_operation:3524-3528` — `force_box` on every
+        //   2. `Optimizer::emit_operation` — `force_box` on every
         //      arg unconditionally (PyPy `optimizer.py:623-625` parity).
         // After emit, args are frozen on the op. Postprocess setting
         // `box._forwarded = Const` (e.g., `make_constant` from
@@ -3722,8 +3731,8 @@ impl Optimizer {
         // Drain remaining extra ops. send_extra_operation may raise
         // InvalidLoop; propagate it.
         self.drain_extra_operations_from(0, &mut ctx)?;
-        // Path A — second finalize cascade also removed. Same rationale as
-        // above: each emit_extra-queued op runs through `propagate_from_pass_range`
+        // Second finalize cascade also removed, on the same rationale:
+        // each emit_extra-queued op runs through `propagate_from_pass_range`
         // which resolves its incoming args at input time via
         // `ctx.get_box_replacement`, and through `Optimizer::emit_operation`
         // which `force_box`es every arg. No retroactive walking of pre-existing
@@ -3886,7 +3895,9 @@ impl Optimizer {
                             continue;
                         }
                         let arg_opref = arg.to_opref();
-                        // Unreachable, same evidence as the args loop above.
+                        // Unreachable on the same evidence: a non-const
+                        // failarg is always producer-bound (PYRE_REMAP_PROBE
+                        // 2026-06-11: 0 fires).
                         if !arg_opref.is_constant() && remap.contains_key(&arg_opref.raw()) {
                             unreachable!(
                                 "position-only failarg hit const-compact remap: {arg_opref:?}"
@@ -3989,7 +4000,8 @@ impl Optimizer {
                             let mut arg_opref = arg.to_opref();
                             let pre = arg_opref;
                             remap_opref(&mut arg_opref);
-                            // Never remapped (same evidence) — frozen position
+                            // Never remapped (PYRE_REMAP_PROBE 2026-06-11:
+                            // 0 fires) — frozen position
                             // stays valid, no rewrite; a hard guard replaces the
                             // position-only re-mint (#9).
                             assert!(
@@ -4032,9 +4044,10 @@ impl Optimizer {
         // `ops` vector that already carries the terminal JUMP. Matching the
         // RPython ordering means splicing the alias `extra_same_as` ops
         // just ahead of that terminator so they execute at end of preamble
-        // and never appear past the Jump. With the dedup loop now
-        // accumulating into `loop_info.extra_same_as` (see the closure
-        // above), no `ctx.emit`-after-terminator cleanup is needed.
+        // and never appear past the Jump. With the export dedup (the
+        // `'export:` block's Case A / Case B arms) accumulating into
+        // `loop_info.extra_same_as` instead of `ctx.new_operations`, no
+        // `ctx.emit`-after-terminator cleanup is needed.
         if !loop_info.extra_same_as.is_empty() || !loop_info.extra_before_label.is_empty() {
             let term_idx = ops
                 .iter()
@@ -4050,7 +4063,7 @@ impl Optimizer {
             }
         }
         // resume.py:411-417 parity: store_final_boxes_in_guard
-        // (mod.rs:2261) already replaces TAGCONST/TAGVIRTUAL fail_args
+        // (`optimizeopt/mod.rs`) already replaces TAGCONST/TAGVIRTUAL fail_args
         // entries with OpRef::NONE via the snapshot-driven numbering pass
         // (`liveboxes = [None] * n; liveboxes[i] = box for TAGBOX`).
         // No additional const filtering is needed here.
@@ -4166,7 +4179,8 @@ impl Optimizer {
         // from one of the bridge's own body guards (synthesized below). A
         // bridge that closes into an existing loop with no body guard
         // (interpreter-entry / straight-line prologue) would retarget with
-        // `patchguardop` left None and hit the `unroll.rs:3346` invariant the
+        // `patchguardop` left None and hit the unroll.py:333 invariant in
+        // `unroll.rs`'s `jump_to_existing_trace_impl` the
         // moment virtual-state matching emits an extra guard. Keep those on
         // the jump_to_preamble path. The predicate matches the synthesis
         // filter below, so retarget runs only when patchguardop is gettable.
@@ -4636,7 +4650,7 @@ impl Optimizer {
         // (optimizer.py:614-625) walks args via force_box at the entry to
         // emission; pyre's pre-pass walk via `ctx.get_box_replacement` is
         // the structural analog (force_box is invoked separately at
-        // `Optimizer::emit_operation:3527` for the post-pass refresh).
+        // `Optimizer::emit_operation` for the post-pass refresh).
         // fail_args are NOT walked here — PyPy snapshots them once at
         // `store_final_boxes_in_guard` time via the numbering layer (which
         // encodes Const entries as TAGCONST in rd_numb, leaving fail_args
@@ -4914,7 +4928,8 @@ impl Optimizer {
 
         // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
         // Pyre defers the fold into JitStatsCounters via update_counters
-        // (see field doc for the rationale).
+        // because `Optimizer` holds no `metainterp_sd.profiler` reference
+        // (see the `opt_ops_emitted` field doc).
         self.opt_ops_emitted = self.opt_ops_emitted.saturating_add(1);
         if op.opcode.is_guard() {
             // optimizer.py:629: profiler.count(Counters.OPT_GUARDS).
@@ -5161,8 +5176,8 @@ impl Optimizer {
         // compile.py:925-926 invent_fail_descr_for_op: GUARD_NOT_FORCED /
         // GUARD_NOT_FORCED_2 must always mint a fresh ResumeGuardForcedDescr
         // (`assert copied_from_descr is None`).  They are never on the
-        // sharing chain.  Mirrors the OptContext path at
-        // optimizeopt/mod.rs:3061-3066.
+        // sharing chain.  Mirrors the OptContext path in
+        // `optimizeopt/mod.rs`'s `emit_guard_operation`.
         let shared = !op.has_descr()
             && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
@@ -5210,7 +5225,8 @@ impl Optimizer {
                             // because the heap pass only stages
                             // setarrayitem ops with a constant
                             // index. Fall back to InvalidLoop
-                            // (caught at pyjitpl.rs:3454) on
+                            // (caught in `pyjitpl.rs`'s
+                            // `compile_loop_body`) on
                             // either invariant violation rather
                             // than silently coercing to 0.
                             let boxindex = ctx.resolve_operand_operand(&pf_op.arg(1));
@@ -6277,7 +6293,7 @@ mod tests {
         // args reference (a fail arg pointing at a *folded* getfield would make
         // the position-only synthetic resolve to itself while the OpRef store
         // forwards to the survivor — the resolve_box_box divergence tripwire,
-        // mod.rs:4750; binding to the real folded producer needs the oprc
+        // `materialize_operand_at`; binding to the real folded producer needs the oprc
         // driver, blocked here by CallMayForceR's void result position).
         let field_descr_b = field_group.field_descrs[1].clone() as DescrRef;
         let call_descr_a = call_may_force_descr(83, majit_ir::Type::Ref);
@@ -6310,7 +6326,8 @@ mod tests {
         // so its result refs are `Type::Ref` at the call position; the resume-only
         // free fail-vars (2000..3003) and the dangling positions stay `Type::Int`
         // exactly as the fixture wired them. Detached fail-arg synthetics resolve
-        // to themselves (the `same_box` arm, mod.rs:4637), deferring to the OpRef
+        // to themselves (the `same_box` arm of `resolve_operand_operand`),
+        // deferring to the OpRef
         // store — no `Operand::Box`.
         let mut call_a = Op::with_descr(
             OpCode::CallMayForceR,
@@ -6941,8 +6958,9 @@ mod tests {
     #[ignore = "test fixture uses FieldDescr without parent SizeDescr, so ensure_ptr_info_arg0 panics before rd_numb encoding is exercised"]
     // Pre-existing test-setup bug (independent of rd_virtuals shape).
     // The fix needs three coupled changes that exceed an in-session port:
-    //   (1) a parent-aware FieldDescr (TestDescr at line 4106 fits) returning
-    //       a parent_descr so virtualize.rs:585-590 doesn't panic;
+    //   (1) a parent-aware FieldDescr (this file's `TestDescr` fits) returning
+    //       a parent_descr so virtualize.rs's `optimize_setfield_gc` doesn't
+    //       panic;
     //   (2) a SizeDescr that exposes an `all_field_descrs` array containing
     //       that field, so virtualize.rs:`init_fields` can index into the
     //       VirtualInfo (mirrors virtualize.rs:`TestParentSizeDescr`); and
@@ -7056,7 +7074,7 @@ mod tests {
 
     #[test]
     fn test_inputarg_type_resolves_phase1_slots_from_phase2_context() {
-        // 6 step 1: from a Phase-2-like context (`inputarg_base > 0`)
+        // From a Phase-2-like context (`inputarg_base > 0`)
         // `OptContext::inputarg_type` must resolve low OpRefs in
         // `[0, num_inputs)` as Phase 1 inputarg slot lookups against the
         // shared `inputarg_types` Vec (history.py:220 parity for
@@ -7403,7 +7421,7 @@ mod tests {
     fn test_resumedata_memo_encodes_rd_numb_on_guard() {
         use crate::history::test_support::TraceBuilder;
         let mut opt = Optimizer::default_pipeline();
-        // OptIntBound (mod.rs:2624 getintbound) requires IntAdd's args to be
+        // OptIntBound (`mod.rs`'s `getintbound_handle`) requires IntAdd's args to be
         // Type::Int — the two header inputs are Int.
         let mut b = TraceBuilder::new();
         let x = b.input(Type::Int, 0);

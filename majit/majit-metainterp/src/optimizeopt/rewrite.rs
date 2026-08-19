@@ -83,7 +83,7 @@ pub struct OptRewrite {
     /// it up via get_pure_result against the shared _pure_operations table.
     /// Convergence: retire this cache and route the bool lookups through the pure
     /// optimizer's get_pure_result / pure_from_args2 (both already present at
-    /// pure.rs:498/492) keyed off the pure-op table — coupled to the pure-optimizer
+    /// `pure.rs`) keyed off the pure-op table — coupled to the pure-optimizer
     /// subsystem. NOT a box-identity rekey target: rekeying the OpRef pair to operand
     /// would entrench a structure upstream does not have.
     bool_result_cache: indexmap::IndexMap<(OpCode, OpRef, OpRef), OpRef>,
@@ -2090,7 +2090,8 @@ impl Optimization for OptRewrite {
             // INT_SIGNEXT belongs on `OptIntBounds`, not `OptRewrite`.
             // rewrite.py has no `optimize_INT_SIGNEXT`; the handler lives
             // at intbounds.py:450-466 (optimize + postprocess). pyre's
-            // intbounds.rs:1760 already implements the full upstream
+            // intbounds.rs's `optimize_int_signext` /
+            // `postprocess_int_signext` already implement the full upstream
             // logic (is_within_range check), so this `OptRewrite` arm
             // is redundant — its weaker `nbytes == 8` shortcut admits a
             // strict subset of intbounds's removals. Removed for
@@ -2149,7 +2150,7 @@ impl Optimization for OptRewrite {
                             .iter()
                             .any(|(k, _)| *k == func_val)
                     {
-                        // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
+                        // RPython shortpreamble.py:158-159. Dual-slot case:
                         // `produce_loop_invariant` installs
                         // `make_equal_to(source, result_opref)`, so the source
                         // box's `_forwarded` slot now holds
@@ -2158,7 +2159,7 @@ impl Optimization for OptRewrite {
                         // `result_opref` (= get_box_replacement(source))
                         // so `take_preamble_forwarded_opinfo` reads the
                         // info seeded at result_opref's slot per the
-                        // dual-slot rule (mod.rs:1817 replay_pos).
+                        // dual-slot rule (`mod.rs`'s `replay_pos` closure).
                         let replay_pos = ctx.get_replacement_opref(source);
                         let source_op = ctx.materialize_operand_at(source);
                         let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));

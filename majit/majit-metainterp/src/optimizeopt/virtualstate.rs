@@ -642,8 +642,8 @@ impl VirtualState {
         // visit returns 0 without re-counting. Pyre's parallel:
         //
         // - If the entry is already present (real OpRef from
-        //   `import_virtual_state_from_label_args_recurse` at
-        //   optimizer.rs:795, or `NONE` from a prior counting visit),
+        //   `import_virtual_state_from_label_args_recurse`
+        //   in `optimizer.rs`, or `NONE` from a prior counting visit),
         //   return 0. unroll.py:53 `setinfo_from_preamble` parity:
         //   preserve the existing real OpRef rather than overwriting.
         // - Otherwise insert `NONE` to mark this node visited, then
@@ -1535,7 +1535,8 @@ impl VirtualState {
             // runtime test instead would emit a GUARD_VALUE against a target
             // constant the incoming state already contradicts.
             // `Value`'s PartialEq is the `same_constant` port
-            // (majit-ir/src/value.rs:84-95 — bitwise for floats,
+            // (`impl PartialEq for Value` in `majit-ir/src/value.rs` —
+            // bitwise for floats,
             // history.py:292).
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
             // virtualstate.py:399 `raise VirtualStatesCantMatch("different constants")`.
@@ -1908,12 +1909,13 @@ impl VirtualState {
                     // `fieldbox_runtime` are both `None` when the parent's
                     // `_items[i]` slot is unset. pyre's VirtualArrayInfo
                     // initialises items as `vec![OpRef::NONE; length]`
-                    // (info.rs:755), so a NONE slot is the parity-equivalent
+                    // (`ptr_info.rs`'s `PtrInfo::virtual_array`), so a NONE
+                    // slot is the parity-equivalent
                     // of RPython's `_items[i] is None` and must propagate
                     // as `runtime_box=None`. Threading `Some(OpRef::NONE)`
                     // instead would let downstream NonNull / IntBounded
                     // arms emit a guard whose `box_opref` falls back to
-                    // `args[arg_index]` (to_ops :2160), promoting "no
+                    // `args[arg_index]` (in `to_ops`), promoting "no
                     // guard for this item" into "guard on the parent".
                     let inner = parent_items
                         .as_ref()
@@ -1970,9 +1972,11 @@ impl VirtualState {
                     // `if descr is not other.fielddescrs[j]: raise
                     // VirtualStatesCantMatch`. Object identity, not
                     // numeric index. pyre's Arc::as_ptr-keyed
-                    // `descr_identity` (descr.rs:1053) is the parity port —
+                    // `descr_identity` (`majit-ir/src/descr.rs`) is the
+                    // parity port —
                     // DescrRef::index() is `u32::MAX` for cache-route
-                    // minted field descrs (descr.rs:506), so an index
+                    // minted field descrs (the `Descr::index` default in
+                    // `majit-ir/src/descr.rs`), so an index
                     // compare would collapse distinct descrs.
                     if descr_identity(a) != descr_identity(b) {
                         return Err(VirtualStatesCantMatch::default());
@@ -2030,7 +2034,8 @@ impl VirtualState {
                         // index `i` is the outer loop variable. pyre's
                         // `expected_field_descrs[j]` is an InteriorFieldDescr
                         // built from `ArrayDescr.get_all_interiorfielddescrs()`
-                        // (virtualize.rs:462-466), so the recurse helper
+                        // (`virtualize.rs`'s `optimize_new_array`), so the
+                        // recurse helper
                         // routes through `ctx.get_runtime_interiorfield`.
                         Some(elem_idx),
                         state,
@@ -2068,7 +2073,7 @@ impl VirtualState {
     /// Pyre stores `field_descrs` (parent-local order, line-by-line
     /// `get_all_fielddescrs()`) and a parallel `fields` Vec keyed by
     /// `field_slot_index` (FieldDescr.index_in_parent when a parent
-    /// SizeDescr is bound, else Descr.index — heap.rs:843). Iterate
+    /// SizeDescr is bound, else Descr.index — `heap.rs`). Iterate
     /// `field_descrs` positionally, match by RPython `is`-identity
     /// (Arc::as_ptr via `descr_identity`), then resolve each
     /// (fielddescr, fieldstate) pair via the parent-local slot index.
@@ -2102,9 +2107,11 @@ impl VirtualState {
         for i in 0..expected_field_descrs.len() {
             // virtualstate.py:159: `other.fielddescrs[i] is not self.fielddescrs[i]`.
             // RPython uses Python object identity — pyre's port is
-            // `descr_identity` (descr.rs:1053 Arc::as_ptr). DescrRef::index()
+            // `descr_identity` (`majit-ir/src/descr.rs`, Arc::as_ptr).
+            // DescrRef::index()
             // is the dense u32 GC tid; for cache-route minted field
-            // descrs that value is `u32::MAX` (descr.rs:506), so an
+            // descrs that value is `u32::MAX` (the `Descr::index`
+            // default), so an
             // index-based check would collapse distinct descrs together
             // and admit cross-struct false matches.
             if descr_identity(&expected_field_descrs[i])
@@ -2116,7 +2123,7 @@ impl VirtualState {
             // `get_index()` is the parent-local field slot index, not
             // the global Descr.index(); pyre's `info.fields` and
             // `element_fields[i]` are populated via `field_slot_index`
-            // (heap.rs:843) / `descr_index` (virtualize.rs:1986), both
+            // (`heap.rs`) / `descr_index` (`virtualize.rs`), both
             // of which read `FieldDescr.index_in_parent()` when a
             // parent SizeDescr is bound (matching descr.py:228). Fall
             // back to `Descr::index()` for descrs without a parent, the
@@ -2148,9 +2155,10 @@ impl VirtualState {
             // `opinfo._fields[descr.get_index()]` is `None`, RPython
             // passes `fieldbox=None, fieldbox_runtime=None` and any
             // downstream guard becomes a no-op. pyre's NONE-placeholder
-            // slot (`info.rs:755`) carries the same "unset" meaning and
+            // slot (`ptr_info.rs`'s `PtrInfo::virtual_array`) carries the
+            // same "unset" meaning and
             // must be filtered out before being passed as a runtime
-            // sentinel — otherwise to_ops's fallback (:2160) would
+            // sentinel — otherwise `to_ops`'s `args[arg_index]` fallback would
             // promote a missing-field guard onto the top-level arg.
             let inner_box_opref = parent_field_oprefs
                 .and_then(|f| f.iter().find(|(idx, _)| *idx == descr_idx))
@@ -2442,7 +2450,8 @@ impl GuardRequirement {
     ///
     /// Most variants emit a single guard; `GuardBounds` expands to the
     /// int_ge/int_le/int_and pairs of `IntBound::make_guards`
-    /// (intutils.py:1264-1289). The caller (unroll.rs:2856) iterates the
+    /// (intutils.py:1264-1289). The caller (`unroll.rs`'s
+    /// `jump_to_existing_trace_impl`) iterates the
     /// returned `Vec` and applies `rd_resume_position` /
     /// `ResumeAtPositionDescr` only to entries that pass `is_guard()` —
     /// matching unroll.py:335 `if isinstance(guard, GuardResOp)`. The
@@ -2570,7 +2579,8 @@ impl GuardRequirement {
                 bounds.make_guards(arg, &mut emitted, ctx);
                 // Tag GUARD_TRUE / GUARD_VALUE with empty fail_args; the
                 // non-guard INT_GE / INT_LE / INT_AND producers keep the
-                // default. The caller (unroll.rs:2856) gates the
+                // default. The caller (`unroll.rs`'s
+                // `jump_to_existing_trace_impl`) gates the
                 // rd_resume_position / descr stamp on `is_guard()` per
                 // unroll.py:335 `isinstance(guard, GuardResOp)`.
                 for op in &mut emitted {
@@ -2629,7 +2639,7 @@ pub(crate) struct ExportCache {
     //
     // bind-at-alloc invariant: every position reaching export resolves to a
     // bound box (debug-asserted in `export_single_value`). Production forced
-    // end-args and `ProducedShortOp.res` (shortpreamble.rs:436
+    // end-args and `ProducedShortOp.res` (`PreambleOp::add_op_to_short`
     // `materialize_operand_at`) are bound at creation; an unbound position would
     // mint a fresh operand from the opref per visit and split the cache, so the
     // assert traps that as a bind-at-alloc gap rather than silently
@@ -2723,7 +2733,9 @@ fn export_single_value(
     // benchmarks in pyre/check.py (int_loop, float_loop, fib_loop,
     // fib_recursive, nested_loop, nbody, fannkuch, raise_catch_loop,
     // spectral_norm, inline_helper). The cyclic-virtual-graph regression
-    // (RPython parity gap documented above) is therefore latent — no
+    // (pyre returns a fresh `Unknown` leaf for a back-edge instead of
+    // closing the cycle on one node, per `export_single_value`'s doc) is
+    // therefore latent — no
     // benchmark constructs the necessary self-referential structures.
     if cache.in_progress.contains(&box_) {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
@@ -3311,7 +3323,8 @@ mod tests {
         // virtualstate.py:392-394 (Int/Float leaves) / :525-529 (Ptr leaf): a
         // virtual incoming can never satisfy a NotVirtual expected. In pyre the
         // rejection is performed by the `info_type_matches` gate
-        // (virtualstate.rs:1470-1476) before the Constant match arm is reached;
+        // (in `generate_guards_for_entry_recursive`) before the Constant
+        // match arm is reached;
         // this test pins that gate so the arm stays unreachable for virtuals.
         let mut ctx = OptContext::new(128);
         let descr = test_descr(1);

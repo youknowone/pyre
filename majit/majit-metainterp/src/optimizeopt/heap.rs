@@ -2088,8 +2088,11 @@ impl OptHeap {
             .collect();
         for (descr_idx, descr, effect_idx) in array_descrs {
             let read = ei.check_readonly_descr_array(effect_idx);
-            // heap.py:556 — no sentinel special case, for the reason given
-            // in the field loop above.
+            // heap.py:556 — no sentinel special case: a descr whose
+            // `ei_index` is still the sentinel bitchecks false upstream too,
+            // and a call with no computed write set is `EF_RANDOM_EFFECTS`
+            // and never reaches here (spelled out in the `cached_fields`
+            // loop above).
             //
             // Raw-set fallback, the array twin of the field loop's: on the
             // macro / `JitDriver` path `compute_bitstrings` never runs, so
@@ -2336,7 +2339,8 @@ impl OptHeap {
         {
             match entry {
                 crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                    // heap.py:185-186 force-then-setfield (see above).
+                    // heap.py:185-186: force the preamble op, then write the
+                    // forced value back into the struct info.
                     let cached = ctx.force_op_from_preamble_op(&pop);
                     ctx.structinfo_setfield(op, field_idx, cached);
                     let obj_box = ctx.get_box_replacement_operand(obj);
@@ -2554,7 +2558,7 @@ impl OptHeap {
     /// - cai.invalidate() also invalidates parent.clear_varindex via
     ///   submap.invalidate_index (heap.py:266 parent.clear_varindex()
     ///   inside ArrayCachedItem.invalidate; pyre lifts this to the
-    ///   caller-side per the `cai.invalidate` doc at heap.rs:516).
+    ///   caller-side per the `ArrayCachedItem::invalidate` doc).
     /// - `_get_rhs_from_set_op` uses op.arg(2) at the put_back step.
     fn force_lazy_set_array(
         &mut self,
@@ -2894,7 +2898,8 @@ impl OptHeap {
                         .and_then(|info| info.take_preamble_item(const_index as usize))
                 });
             if let Some(pop) = pop {
-                // heap.py:243-249 force-then-setitem (see above).
+                // heap.py:243-249: force the preamble op, then write the
+                // forced value back into the array info.
                 let cached = ctx.force_op_from_preamble_op(&pop);
                 let array_box = ctx.get_box_replacement_operand(array);
                 self.arrayitem_cache(&descr, const_index)
@@ -2912,7 +2917,8 @@ impl OptHeap {
             {
                 match entry {
                     crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                        // heap.py:243-249 force-then-setitem (see above).
+                        // heap.py:243-249: force the preamble op, then write
+                        // the forced value back into the array info.
                         let cached = ctx.force_op_from_preamble_op(&pop);
                         let array_box = ctx.get_box_replacement_operand(array);
                         self.arrayitem_cache(&descr, const_index)
@@ -3171,7 +3177,8 @@ impl OptHeap {
             }
 
             // ── Raw array item reads/writes ──
-            // Same rationale as raw fields above: keep exact ordering and
+            // Same rationale as the `GetfieldRaw*` / `SetfieldRaw` arms:
+            // keep exact ordering and
             // dynamic indices visible until we have RPython-style virtualizable
             // handling for these buffers.
             OpCode::GetarrayitemRawI | OpCode::GetarrayitemRawR | OpCode::GetarrayitemRawF => {
@@ -3990,7 +3997,9 @@ mod tests {
     /// Single shared parent SizeDescr for all test FieldDescrs. The exact
     /// instance doesn't matter — `ensure_ptr_info_arg0` only reads
     /// `is_object()`. We use a Struct (is_object=false) so the field branch
-    /// constructs `PtrInfo::Struct` (the matchless case at heap.rs:1313).
+    /// constructs `PtrInfo::Struct` (the matchless case in
+    /// `put_field_back_to_info`, which writes through `structinfo_setfield`
+    /// without matching on the variant).
     fn test_parent_descr() -> DescrRef {
         Arc::new(TestSizeDescr {
             index: 0xFFFF_0000,
@@ -4379,8 +4388,9 @@ mod tests {
     /// `extraeffect=EF_RANDOM_EFFECTS`, all six raw sets `None`, all six
     /// bitstrings `None`, `can_invalidate=True`. Production sites and
     /// tests use this whenever no analyzer info is available — invalidation
-    /// flows through `dispatch_emit:2631/2766 call_has_random_effects ==
-    /// true → clean_caches`, mirroring `heap.py:551`'s top-level
+    /// flows through `emit_residual_call` / `handle_side_effects`'s
+    /// `call_has_random_effects == true → clean_caches` branch, mirroring
+    /// `heap.py:551`'s top-level
     /// random-effects branch. The previous saturated-bitstring fallback
     /// (`CanRaise + raw=Some(empty) + bitstring=Some(0xff;8)`) was a
     /// pyre-only shape PyPy never produces — `effectinfo_from_writeanalyze`

@@ -981,7 +981,8 @@ pub fn optimize_vector(
 /// greater than any prefix position, because the loop body is the tail of
 /// `optimized_ops`. Retained scalar body ops keep their original positions,
 /// which are likewise above the prefix. The gso index constants are inline
-/// `OpRef::const_int` (guard.rs:614) carrying their value on the OpRef, so
+/// `OpRef::const_int` (minted in `guard.rs`'s `eliminate_guards`) carrying
+/// their value on the OpRef, so
 /// nothing needs registering in the constant pool.
 pub(crate) fn apply_loop_vectorization(
     optimized_ops: Vec<Op>,
@@ -2122,7 +2123,7 @@ impl VectorizingOptimizer {
         // jump's token — for a loop these are the same token, so the jump
         // correctly targets prefix_label. TODO: thread a JitCellToken when the
         // compile path is un-gated so finaloplist mints fresh prefix-label
-        // tokens (vector.rs:156-185).
+        // tokens (`VectorLoop::finaloplist`).
         // vector.py:172 `finally: loop.teardown_vectorization()`. The earlier
         // `return None` exits drop `sched_state` instead, discarding the same
         // pos-keyed forwarded store.

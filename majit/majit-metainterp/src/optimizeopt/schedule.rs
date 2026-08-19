@@ -82,7 +82,7 @@ pub struct AccumPack {
 /// seed is always the loop-carried label arg fed through `accumulate_prepare`
 /// (schedule.py:666-669) — a `FlowValue::Variable` register, never a `Const` —
 /// so identity-by-position and identity-by-box coincide (the Const ptr-
-/// instability that forces #115/S7 to keep const-namespace tables OpRef-keyed
+/// instability that forces #115 to keep const-namespace tables OpRef-keyed
 /// never applies here). The consumer rebinds the producer at emit time
 /// (vector.rs `pre_emit_guard_accum`). Box-shaping `seed` is a cosmetic
 /// #169/#175 follow-up, not a correctness fix.
@@ -618,7 +618,7 @@ impl VecScheduleState {
     /// schedule.py:762-779: VecScheduleState.post_schedule.
     ///
     /// RPython reads `self.graph.loop`; majit's VecScheduleState holds no
-    /// graph/loop (see struct above), so the loop is a parameter. `seen` is
+    /// graph/loop field, so the loop is a parameter. `seen` is
     /// threaded in because majit's `ensure_args_unpacked` takes it as an
     /// explicit param (vector.rs); RPython keeps the equivalent state on self.
     pub fn post_schedule(

@@ -117,7 +117,9 @@ impl IntBoundMakeGuards for IntBound {
             let arg_box = ctx.materialize_operand_at(box_ref);
             let arg_bound = ctx.materialize_operand_at(bound);
             let mut op = Op::new(OpCode::IntLe, &[arg_box.clone(), arg_bound.clone()]);
-            // intutils.py:1281 INT_LE producer identity — see comment above.
+            // intutils.py:1281 INT_LE producer identity: a fresh Int OpRef in
+            // `op.pos` so the GuardTrue below captures the producer's result
+            // rather than `Op::new`'s `OpRef::NONE`.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);
@@ -129,7 +131,9 @@ impl IntBoundMakeGuards for IntBound {
             let arg_box = ctx.materialize_operand_at(box_ref);
             let arg_mask = ctx.materialize_operand_at(mask);
             let mut op = Op::new(OpCode::IntAnd, &[arg_box.clone(), arg_mask.clone()]);
-            // intutils.py:1286 INT_AND producer identity — see comment above.
+            // intutils.py:1286 INT_AND producer identity: a fresh Int OpRef in
+            // `op.pos` so the GuardValue below captures the producer's result
+            // rather than `Op::new`'s `OpRef::NONE`.
             op.pos.set(ctx.alloc_op_position_typed(Type::Int));
             let op_pos = op.pos.get();
             guards.push(op);

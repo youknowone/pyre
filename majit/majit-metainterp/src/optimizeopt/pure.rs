@@ -2667,7 +2667,7 @@ mod tests {
             Some(1),
         );
         // Production threads the builder's replay Rc into the pop
-        // (produce_pure); mirror it so use_box sees one object. unsupported-green-type/S8: the
+        // (produce_pure); mirror it so use_box sees one object. The
         // builder keys by the entry res box (`materialize_operand_at(pos)`); the
         // memoized box for the same position hits.
         let src1 = ctx.materialize_operand_at(OpRef::int_op(1));

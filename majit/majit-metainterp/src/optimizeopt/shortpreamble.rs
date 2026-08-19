@@ -572,7 +572,8 @@ impl PotentialShortOp {
                         // must be cleared to stay consistent with the updated `res`
                         // (upstream keys slot identity off `short_op.res`, which the
                         // line above just rebound). Otherwise the import slot-lookup
-                        // (unroll.rs:4171) would map this invented alias onto the
+                        // (in `unroll.rs`'s `inline_short_preamble`) would map
+                        // this invented alias onto the
                         // loop-carried `short_args[slot]` instead of minting a fresh
                         // result, collapsing the extra `same_as` identity.
                         alt.label_arg_idx = None;
@@ -858,8 +859,10 @@ impl ShortBoxes {
         }
         if self.potential_op_oprefs.contains(&opref) {
             // shortpreamble.py:291-294 `r = self.add_op_to_short(...);
-            // return r.preamble_op`. ShortInputArg: renamed short_inputargs
-            // box, see the produced arm above.
+            // return r.preamble_op`. ShortInputArg returns the RENAMED
+            // short_inputargs box for the slot (shortpreamble.py:257
+            // `ShortInputArg(box, renamed)`), same as the
+            // `produced_short_boxes` hit.
             let produced = self.materialize_one(ctx, opref)?;
             if produced.kind == PreambleOpKind::InputArg {
                 return Some(self.renamed_short_inputarg(produced.label_arg_idx));
@@ -1361,10 +1364,10 @@ pub struct ProducedShortOp {
     pub label_arg_idx: Option<usize>,
 }
 
-/// Phase B B.1: helper used by `ProducedShortOp::produce_op` to seed a
+/// Helper used by `ProducedShortOp::produce_op` to seed a
 /// fresh constant-pool slot in the importing trace for a Const arg seen
 /// in the imported short op. Mirrors the inline `imported_const_opref`
-/// closure inside the legacy `import_short_preamble_ops` (unroll.rs:3510).
+/// closure inside the legacy `import_short_preamble_ops` (`unroll.rs`).
 fn imported_const_opref(
     imported_constants: &mut indexmap::IndexMap<OpRef, OpRef>,
     source: OpRef,
@@ -1448,10 +1451,10 @@ impl ProducedShortOp {
     /// result OpRef in `produced_results` keyed by `self.preamble_op.pos`
     /// so successor entries can reference it.
     ///
-    /// Phase B B.1 (parallel implementation, dead code): the legacy
-    /// enum-dispatch path in `import_short_preamble_ops` (unroll.rs:3504-3925)
-    /// remains the active caller. B.2 wires this method as the sole produce-op
-    /// driver. B.3+ retire the legacy enum.
+    /// Parallel implementation, currently dead code: the legacy
+    /// enum-dispatch path in `import_short_preamble_ops` (`unroll.rs`)
+    /// remains the active caller. Wiring this method as the sole produce-op
+    /// driver, then retiring the legacy enum, is the planned follow-up.
     ///
     /// Returns `None` when:
     /// - args cannot be fully classified, mirroring legacy
@@ -1567,7 +1570,7 @@ impl ProducedShortOp {
         //
         // pyre's flat-OpRef analog allocates the wrapper at `source` (the
         // synthetic alias from the compound-dedup pass at
-        // shortpreamble.rs:478-491) and the alt body slot at `result_opref`
+        // this file's `ShortBoxes`) and the alt body slot at `result_opref`
         // (= `result_map[source]`, the body-visible OpRef this alt's
         // imported Pure / SAME_AS will live at). Forward `source ->
         // result_opref` so body refs after `force_op_from_preamble`
@@ -2044,7 +2047,7 @@ struct AbstractShortPreambleBuilderState {
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
     known_constants: IndexSet<OpRef>,
-    /// B.6.4 canonical dedup for `record_imported_preamble_use`.
+    /// Canonical dedup for `record_imported_preamble_use`.
     /// `produced_short_boxes` is a dual-key map (source key + result_opref
     /// key both pointing at the same `ProducedShortOp`), so the source vs.
     /// body-visible distinction is not enough — RPython's Box identity
@@ -2283,7 +2286,7 @@ pub struct ShortPreambleBuilder {
     state: AbstractShortPreambleBuilderState,
     /// shortpreamble.py:250 `self.produced_short_boxes = {}` — keyed by the
     /// short-box res Box identity (`shortop.res`), looked up by box everywhere
-    /// (produce_arg/use_box/add_op_to_short). #146/S8 re-keyed this from the
+    /// (produce_arg/use_box/add_op_to_short). #146 re-keyed this from the
     /// flat-OpRef position (which needed a dual source/result_opref key for
     /// invented names) to the single carried res box: `self.res` at the
     /// cross-peel produce loop, `materialize_operand_at(pos)` at the single-op
@@ -2318,7 +2321,8 @@ impl ShortPreambleBuilder {
             );
             // Const res boxes are ptr-unstable (minted fresh per resolution),
             // so they can never be a stable box-identity key; export already
-            // filters const short boxes (optimizer.rs:2942) so this is inert
+            // filters const short boxes (`optimizer.rs`'s
+            // `optimize_with_constants_and_inputs_at`) so this is inert
             // for the live path, and the single-op re-export passes the
             // memoized `materialize_operand_at(pos)` box.
             if k.to_opref().is_constant() {
@@ -2424,7 +2428,7 @@ impl ShortPreambleBuilder {
     /// `produce_heap_array_item` re-export (pure.rs/shortpreamble.rs, via
     /// `OptContext.imported_short_preamble_builder`).
     ///
-    /// #146/S8: keyed by the short-box res Box identity (`shortop.res`), the
+    /// #146: keyed by the short-box res Box identity (`shortop.res`), the
     /// carried box the produce loop holds as `self.res`. This replaced the
     /// flat-OpRef position key, whose dual source/result_opref entries
     /// compensated for invented-name replay-position aliasing; the carried box
@@ -2449,7 +2453,7 @@ impl ShortPreambleBuilder {
     ///   self.used_boxes.append(op)
     ///   self.short_preamble_jump.append(preamble_op.preamble_op)
     ///
-    /// This is that unconditional pattern (#149/S8f collapse): the prior
+    /// This is that unconditional pattern (#149 collapse): the prior
     /// produced_short_boxes map lookup is gone. `field_entry::PreambleOp` now
     /// carries the ORIGINAL box an invented-name CompoundOp alternate aliases
     /// (threaded from `ProducedShortOp.same_as_source` at the produce_* export
@@ -2466,12 +2470,12 @@ impl ShortPreambleBuilder {
         // pop reproduces the builder map entry's record — `op` resolves to the
         // same `resolved_op`, and `invented_name` / `same_as_source` are
         // threaded through `field_entry::PreambleOp` — so the
-        // produced_short_boxes lookup is no longer consulted here (#149/S8f).
+        // produced_short_boxes lookup is no longer consulted here (#149).
         let replay_op = &preamble_op.preamble_op;
         // shortpreamble.py:435 `op = preamble_op.op.get_box_replacement()`:
         // for non-invented entries the resolved operand IS the preamble-defined
         // res, so the `used_boxes` label slot always has a producer at
-        // label fall-through. pyre's Cat-2.2 heap import resolves through
+        // label fall-through. pyre's heap import resolves through
         // `make_equal_to(source, result)` to a fresh body-visible OpRef with
         // NO preamble producer — the flat-OpRef analogue of an invented
         // name. Emit the same defining alias the invented arm uses
@@ -2567,7 +2571,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// constructor clone read it), but EVERY key-lookup of it
     /// (insert_dep_recursive / use_box_recursive / use_box /
     /// add_preamble_op_from_pop / add_preamble_op / produced_short_op) is dead
-    /// over the full bench corpus — measured. A #146/S8 operand re-key here is
+    /// over the full bench corpus — measured. A #146 operand re-key here is
     /// therefore unverifiable (the gate cannot exercise the silent-miss
     /// surface), like the deferred vectorizer maps.
     produced_short_boxes: IndexMap<OpRef, ProducedShortOp>,
@@ -2591,7 +2595,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// jump-arg Box objects themselves), so the remap `setarg` writes
     /// produce live-tracking bound operands instead of frozen positions.
     phase1_to_inputarg: indexmap::IndexMap<OpRef, majit_ir::operand::Operand>,
-    /// B.6.4 canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
+    /// Canonical dedup keyed by `produced.preamble_op.pos`. Mirrors
     /// `AbstractShortPreambleBuilderState.recorded_canonical_results` —
     /// `produced_short_boxes` carries dual entries (source-key plus
     /// result_opref-key) for the same RPython Box, so per-key dedup
@@ -2660,7 +2664,7 @@ impl ExtendedShortPreambleBuilder {
     pub fn new(target_token: majit_ir::DescrRef, sb: &ShortPreambleBuilder) -> Self {
         ExtendedShortPreambleBuilder {
             // The live builder now keys `produced_short_boxes` by the short-box
-            // res Box (#146/S8); this builder keys by `preamble_op.pos` (the
+            // res Box (#146); this builder keys by `preamble_op.pos` (the
             // assert in `ensure_dep_from_produced`), so re-key on copy.
             produced_short_boxes: {
                 let mut m = indexmap::IndexMap::new();
@@ -2891,7 +2895,8 @@ impl ExtendedShortPreambleBuilder {
                 // Unmapped Phase 1 jump arg (no rename): keep the STATIC short
                 // preamble position in `short_jump_args`. That position is
                 // exactly the replay key that `inline_short_preamble` registers
-                // in `mapping` (`mapping[sp_op.pos] = new_ref`, unroll.rs:3963)
+                // in `mapping` (`mapping[sp_op.pos] = new_ref`, in
+                // `unroll.rs`'s `inline_short_preamble`)
                 // or a seeded short-inputarg — mirroring RPython where
                 // `short_jump_args = short[-1].getarglist()` references the same
                 // Box identities as the short-op results (unroll.py:374).
@@ -3071,7 +3076,7 @@ impl ExtendedShortPreambleBuilder {
                 return;
             }
             let op = resolved_key;
-            // shortpreamble.py:436-437 plus the Cat-2.2 fresh-slot case: a
+            // shortpreamble.py:436-437 plus the fresh-slot case: a
             // non-invented pop whose resolved slot differs from the carried
             // preamble box has no preamble producer for the label slot (see
             // ShortPreambleBuilder::add_preamble_op_from_pop); emit the same
@@ -3494,17 +3499,17 @@ pub(crate) fn produced_short_boxes_from_exported_boxes(
 /// `unroll.py:497-504` build path: drive `ShortPreambleBuilder` from
 /// pre-derived `produced_short_boxes` (RPython `ExportedState.short_boxes`).
 ///
-/// Phase B B1 first slice: separated from
+/// Separated from
 /// `build_short_preamble_from_exported_boxes` so callers that already
 /// hold the `Vec<(OpRef, ProducedShortOp)>` (e.g. `ExportedState.produced_short_boxes`
-/// at `unroll.rs:2349`) can invoke the builder directly without
+/// in `unroll.rs`) can invoke the builder directly without
 /// re-running the rename + filter pass.
 pub(crate) fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
 ) -> ShortPreamble {
-    // #146/S8: the builder map keys by the entry res Box (`p.res`, the carried
+    // #146: the builder map keys by the entry res Box (`p.res`, the carried
     // Phase-1 short-box result). The input slice is keyed by `preamble_op.pos`;
     // re-key to res for the builder map and the use_box driving loop (const res
     // is ptr-unstable and never a key — export filters it).
@@ -3908,7 +3913,7 @@ mod tests {
 
     #[test]
     fn test_rpython_short_preamble_builder_add_op_to_short_recurses_dependencies() {
-        // #146/S8: the builder map keys by the short-box res Box identity, and a
+        // #146: the builder map keys by the short-box res Box identity, and a
         // dependency is found when an op's arg Box Rc::ptr_eq's the dep's res
         // (RPython box-identity `if arg in produced_short_boxes`). Express the
         // B-depends-on-A edge by binding B's IntMul arg(0) to A's producer op
@@ -4430,7 +4435,7 @@ mod tests {
         let produced = sb.produced_ops(&mut __ctx);
         let short_inputargs = sb.create_short_inputargs(&[OpRef::int_op(30), OpRef::int_op(31)]);
         let label_arg_oprefs: Vec<OpRef> = short_inputargs.clone();
-        // #146/S8: the builder map keys by the entry res Box; re-key the
+        // #146: the builder map keys by the entry res Box; re-key the
         // produced_ops list (keyed by `preamble_op.pos`) to res for new() and
         // look up by the res box of the int_op(10) entry.
         let entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> = produced
@@ -4495,7 +4500,7 @@ mod tests {
             .map(|(result, pop)| (*result, pop.res.clone()))
             .unwrap();
 
-        // #146/S8: re-key the produced_ops list to res for new() + look up the
+        // #146: re-key the produced_ops list to res for new() + look up the
         // invented-name alias entry by its res box.
         let entries: Vec<(majit_ir::operand::Operand, ProducedShortOp)> = produced
             .iter()

@@ -580,7 +580,8 @@ impl PtrInfoExt for PtrInfo {
                 // to True because its PyObject layout has static
                 // singletons (INSTANCE_TYPE, INT_TYPE, …) with no GC
                 // header, and the False-branch GUARD_IS_OBJECT reads
-                // `obj - GcHeader::SIZE` (codegen.rs:797-802) which
+                // `obj - GcHeader::SIZE` (the `GuardIsObject` arm of
+                // `majit-backend-wasm/src/codegen.rs`) which
                 // SIGBUSes on those statics. The False branch is still
                 // emitted line-by-line so a backend that flips
                 // `remove_gctypeptr=false` (e.g. a future heap-only
@@ -611,11 +612,13 @@ impl PtrInfoExt for PtrInfo {
                     // producer of an `InstancePtrInfo` descr proves the
                     // downcast: `ensure_ptr_info_arg0` unwraps the identical
                     // `parent_descr` with `.expect` before it builds the info
-                    // (mod.rs:8362-8366), and `deserialize_optheap` asserts
-                    // the same shape on the same value (heap.rs:3691-3696).
+                    // (`optimizeopt/mod.rs`), and `deserialize_optheap` asserts
+                    // the same shape on the same value (`heap.rs`'s
+                    // `import_cached_fields`).
                     // A fabricated `0` would reach the backend as classptr 0
                     // and panic in the subclass-range lookup
-                    // (aarch64/assembler.rs:3785-3792), naming the wrong layer.
+                    // (`aarch64/assembler.rs`'s `emit_guard_subclass`),
+                    // naming the wrong layer.
                     // A real `SizeDescr` whose `vtable()` is 0 is left alone:
                     // that is the headerless state, not a manufactured one.
                     let vtable = descr
@@ -647,19 +650,21 @@ impl PtrInfoExt for PtrInfo {
                 //       short.extend([GUARD_NONNULL[op],
                 //                     GUARD_GC_TYPE[op, c_typeid]])
                 // `StructPtrInfo.descr` is a plain `DescrRef`
-                // (ptr_info.rs:232-239), so info.py:361 `if self.descr is not
+                // (`ptr_info.rs`), so info.py:361 `if self.descr is not
                 // None` is unconditionally true here and the `SizeDescr`
                 // downcast cannot legitimately fail: `ensure_ptr_info_arg0`
                 // proves it on the same `parent_descr` one line before it
-                // builds the info (mod.rs:8362-8366), and the VirtualStruct
+                // builds the info (`optimizeopt/mod.rs`), and the VirtualStruct
                 // force path hands its descr to `handle_new`, which unwraps a
-                // `SizeDescr` (majit-gc/src/rewrite.rs:1109-1112).  A tid may
+                // `SizeDescr` (`majit-gc/src/rewrite.rs`).  A tid may
                 // not be invented for a descr that cannot name one: the
-                // allocator never mints 0 (majit-ir/src/descr.rs:766-769,
-                // `next_type_id = 1`, `gctypelayout.py:328-331`) while the
+                // allocator never mints 0 (`majit-ir/src/descr.rs`'s
+                // `GcCache::next_type_id` starts at 1,
+                // `gctypelayout.py:328-331`) while the
                 // runtime header tid 0 is the live `rclass.OBJECT` root
-                // (pyre-jit-trace/src/descr.rs:475), so a fabricated 0 would
-                // pass on any plain `object` instance and certify a layout the
+                // (`pyre-jit-trace/src/descr.rs`'s `OBJECT_GC_TYPE_ID`), so a
+                // fabricated 0 would pass on any plain `object` instance and
+                // certify a layout the
                 // optimizer never named.
                 let sd = info.descr.as_size_descr().expect(
                     "StructPtrInfo.descr must be a SizeDescr \
@@ -705,12 +710,14 @@ impl PtrInfoExt for PtrInfo {
                 //       short.append(lenop)
                 //       self.lenbound.make_guards(lenop, short, optimizer)
                 // `ArrayPtrInfo.descr` is a plain `DescrRef`
-                // (ptr_info.rs:245-255) and info.py:634 reads
+                // (`ptr_info.rs`) and info.py:634 reads
                 // `self.descr.get_type_id()` unconditionally.  Every producer
                 // feeds an array-op descr (optimizer.py:485-487
-                // `info.ArrayPtrInfo(op.getdescr())`, mod.rs:8383-8388) — the
-                // same Arc the mandatory GC rewrite unwraps as an `ArrayDescr`
-                // (majit-gc/src/rewrite.rs:2038-2040, :2186-2189, :2469-2472),
+                // `info.ArrayPtrInfo(op.getdescr())`, `ensure_ptr_info_arg0`) —
+                // the same Arc the mandatory GC rewrite unwraps as an
+                // `ArrayDescr`
+                // (`majit-gc/src/rewrite.rs`'s `handle_setarrayitem` /
+                // `handle_getarrayitem` / `transform_to_gc_load`),
                 // including for the ARRAYLEN_GC this arm itself emits below.
                 let ad = info.descr.as_array_descr().expect(
                     "ArrayPtrInfo.descr must be an ArrayDescr \
@@ -751,12 +758,14 @@ impl PtrInfoExt for PtrInfo {
                 // A length-less array descr (`len_offset = None`, the shape a
                 // header-less buffer takes) has no length word to read, and
                 // the mandatory GC rewrite unwraps the lendescr unconditionally
-                // (`majit-gc/src/rewrite.rs:2477`) — emitting the op there
-                // panics.  The bound itself is reachable on such an array: a
+                // (`majit-gc/src/rewrite.rs`'s `transform_to_gc_load`) — emitting
+                // the op there panics.  The bound itself is reachable on such an
+                // array: a
                 // constant-index element read narrows it through
                 // `getlenbound().make_gt_const(index)` (`heap.py:676-681`,
-                // ported at `optimizeopt/heap.rs:2873`) without ever consulting
-                // the descr.  Upstream cannot reach this because a raw array
+                // ported in `optimizeopt/heap.rs`'s `optimize_getarrayitem`)
+                // without ever consulting the descr.  Upstream cannot reach this
+                // because a raw array
                 // gets `getarrayitem_raw_*` and an `AbstractRawPtrInfo`, never
                 // `ArrayPtrInfo`; pyre routes both families through one info
                 // type, so the gate belongs here, alongside the `is_gc_managed`
@@ -1465,11 +1474,15 @@ fn force_box_impl(
             // `self.size = -1` (is_virtual = `size != -1`), so a later
             // `getrawptrinfo` still recovers the raw-buffer identity. pyre
             // installs `nonnull()` instead — a PRE-EXISTING-ADAPTATION: the
-            // RawSlice force keeps identity via a `parent = none` sentinel
-            // (see below), but a non-virtual RawBuffer would need a size=-1
-            // sentinel on `RawBufferPtrInfo` AND an `is_virtual()` gate at
+            // RawSlice force keeps identity by reinstalling
+            // `RawSlicePtrInfo` with `parent` set to the none sentinel (the
+            // `VirtualRawSlice` arm of `force_box_impl`), but a non-virtual
+            // RawBuffer would need a size=-1 sentinel on `RawBufferPtrInfo` AND
+            // an `is_virtual()` gate at
             // every `matches!(PtrInfo::VirtualRawBuffer(_))` site in
-            // virtualize.rs (1232/1261/1269/…), which currently assume virtual
+            // virtualize.rs (`optimize_raw_load` / `optimize_raw_store` /
+            // `optimize_getarrayitem_raw` / `optimize_setarrayitem_raw`),
+            // which currently assume virtual
             // and would re-virtualize a forced buffer. Raw buffers are absent
             // from the check.py corpus, so that cascade is ungateable here.
             // nonnull() preserves nonnull-ness; a later RAW_LOAD/RAW_STORE just
@@ -1948,8 +1961,9 @@ mod tests {
 
     /// A length-less array descr has no length word to read, and the mandatory
     /// GC rewrite unwraps the lendescr unconditionally
-    /// (`majit-gc/src/rewrite.rs:2477`), so emitting `ARRAYLEN_GC` for one
-    /// panics the compile. The bound that triggers the emission is reachable —
+    /// (`majit-gc/src/rewrite.rs`'s `transform_to_gc_load`), so emitting
+    /// `ARRAYLEN_GC` for one panics the compile. The bound that triggers the
+    /// emission is reachable —
     /// a constant-index element read narrows it without ever consulting the
     /// descr — which is why the gate has to be here rather than at the
     /// narrowing site.

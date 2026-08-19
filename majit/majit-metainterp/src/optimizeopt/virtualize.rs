@@ -771,7 +771,7 @@ impl OptVirtualize {
     /// virtualize.py:223-224 optimize_NEW_ARRAY_CLEAR.
     /// RPython forwards to `optimize_NEW_ARRAY(op, clear=True)`; the
     /// OpCode discriminator in majit already encodes `clear` semantics
-    /// (optimize_new_array consults `OpCode::NewArrayClear` at line 424),
+    /// (optimize_new_array consults `OpCode::NewArrayClear`),
     /// so this wrapper has no behavioral effect. Kept as a structural
     /// mirror of the upstream dispatch table.
     #[allow(dead_code)]
@@ -951,8 +951,8 @@ impl OptVirtualize {
         // Only for a virtual: `virtualize.py:185-186` reaches `opinfo.getfield`
         // under `opinfo.is_virtual()`, and a non-virtual info's descr is
         // `OptHeap`'s to move (`optimizer.py:484`). The header reads are
-        // excluded for the reason the arms below give -- they do not resolve
-        // through the field list at all.
+        // excluded by the `is_typeptr` / `is_w_class` guards below -- they do
+        // not resolve through the field list at all.
         if !is_raw_op
             && !field_descr.is_header_field()
             && let (Some(b), Some(parent_descr)) =
@@ -1032,7 +1032,7 @@ impl OptVirtualize {
             //
             // Answering from the layout's canonical class here is unsound:
             // `force_box` empties the forced instance's field list
-            // (info.rs:1113-1118, so heap's `do_setfield` cannot
+            // (`info.rs`'s `force_box_impl`, so heap's `do_setfield` cannot
             // MUST_ALIAS-elide the materializing SETFIELD_GC) and routes
             // the header write into `OptHeap`, where it sits in
             // `CachedField::lazy_set`. A retag to a user subclass would be
@@ -1160,8 +1160,8 @@ impl OptVirtualize {
             // Without the fold the load survives to the arg-forcing pass,
             // which materializes the very virtual it reads: an exception
             // whose traceback slot is read before it is written
-            // (`pytraceback.rs:462`) escapes with its args list and the
-            // traceback node behind it.
+            // (`pytraceback.rs`'s `record_application_traceback`) escapes with
+            // its args list and the traceback node behind it.
             //
             // Reaching here means `field_val` was `None` and neither header
             // arm answered.  `virtualstate.py:171-174` tolerates a `None`
@@ -1660,7 +1660,8 @@ impl OptVirtualize {
             && let Some(descr) = op.getdescr()
             && let Some(ad) = descr.as_array_descr()
         {
-            // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+            // resume.py:1544 / `materialize_virtual_from_rd` in
+            // pyre/pyre-jit/src/eval.rs
             // `assert not descr.is_array_of_pointers()` at
             // setrawbuffer_item. Upstream's `_I/_F`-only
             // surface guarantees this; pyre carries the
@@ -1787,7 +1788,8 @@ impl OptVirtualize {
             && let Some(descr) = op.getdescr()
             && let Some(ad) = descr.as_array_descr()
         {
-            // resume.py:1544 / pyre/pyre-jit/src/eval.rs:5625
+            // resume.py:1544 / `materialize_virtual_from_rd` in
+            // pyre/pyre-jit/src/eval.rs
             // `assert not descr.is_array_of_pointers()`. A
             // pointer descr stored into the virtual rawbuffer's
             // `descrs[]` would panic at resume materialisation,
@@ -1989,7 +1991,8 @@ impl OptVirtualize {
         let obj_is_null = ctx.is_const_null(&obj_box);
 
         // If vref is still virtual, update the virtual struct fields directly
-        // (majit in-place absorption, see doc comment above).
+        // (majit in-place absorption: `emit_extra` skips the current pass, so
+        // there is no `send_extra_operation` re-entry to absorb the writes).
         // virtualize.py:150-153: set 'forced' to point to the real object
         // (skipped when objbox is CONST_NULL).
         let vref_box = ctx.get_box_replacement_operand_opt(vref_ref);
@@ -2222,8 +2225,9 @@ impl Optimization for OptVirtualize {
             // arrays of GC refs). It is NOT routed through this
             // optimisation: a folded read against `VirtualRawBuffer`
             // would let a pointer descr enter the buffer's
-            // `descrs[]`, which `setrawbuffer_item` (pyre/pyre-jit/
-            // src/eval.rs:5625) explicitly rejects with
+            // `descrs[]`, which `setrawbuffer_item`
+            // (`materialize_virtual_from_rd` in
+            // pyre/pyre-jit/src/eval.rs) explicitly rejects with
             // `assert !is_array_of_pointers()` at resume
             // materialisation. `_R` therefore falls through the
             // catchall arm to plain emit, mirroring upstream's
@@ -2834,7 +2838,7 @@ struct VRefSizeDescr;
 /// `virtual_token` (slot 0) and `forced` (slot 1). Mirror that here so
 /// `SizeDescr::all_fielddescrs()` returns the descriptor-order pair —
 /// `info::all_fielddescrs_from_descr` consumes this view at force-box
-/// and visitor-dispatch sites (info.rs:1340).
+/// and visitor-dispatch sites (`info.rs`).
 static VREF_ALL_FIELDDESCRS: std::sync::LazyLock<Vec<Arc<dyn majit_ir::FieldDescr>>> =
     std::sync::LazyLock::new(|| {
         vec![
@@ -3179,12 +3183,12 @@ mod tests {
     ///
     /// - `init_fields` opens with
     ///   `let Some(size_descr) = descr.as_size_descr() else { return; }`
-    ///   (`ptr_info.rs:1051`), so the setfield's own `init_fields` leaves the
+    ///   (`ptr_info.rs`), so the setfield's own `init_fields` leaves the
     ///   virtual's descr exactly as the allocation set it. Any
     ///   size-descr-parented field descr would instead take the `cur_len == 0`
     ///   arm right there and close the window before the read is reached.
     /// - `field_slot_disagreement` opens with `descr.as_size_descr()?`
-    ///   (`:2508`), so the write is not refused and no panic fires.
+    ///   (this file), so the write is not refused and no panic fires.
     #[derive(Debug)]
     struct NarrowParentFieldDescr {
         idx: u32,
@@ -3265,7 +3269,7 @@ mod tests {
 
     /// An allocation descr that is NOT a `SizeDescr` — `as_size_descr()`
     /// answers `None`, so a virtual allocated with it starts at `cur_len == 0`
-    /// via `init_fields`' `.map(..).unwrap_or(0)` (`ptr_info.rs:1080-1084`).
+    /// via `init_fields`' `.map(..).unwrap_or(0)` (`ptr_info.rs`).
     fn non_size_descr(idx: u32) -> DescrRef {
         Arc::new(TestArrayDescr { idx })
     }
@@ -3275,7 +3279,7 @@ mod tests {
     }
 
     fn ref_field_descr(idx: u32) -> DescrRef {
-        // ensure_ptr_info_arg0 (mod.rs:3082) requires field descrs flowing
+        // ensure_ptr_info_arg0 (`optimizeopt/mod.rs`) requires field descrs flowing
         // into GETFIELD/SETFIELD to carry a parent_descr backreference per
         // optimizer.py:478. TestRefFieldDescr mirrors TestFieldDescr but
         // for Ref-typed slots, returning a fresh parent SizeDescr on each
@@ -3346,7 +3350,8 @@ mod tests {
     /// canonicalize explicitly before invoking the handler.
     fn resolve_op_args(op: &mut Op, ctx: &mut OptContext) {
         for i in 0..op.num_args() {
-            // Mirror the production driver's `None` arm (optimizer.rs:3687):
+            // Mirror the production driver's `None` arm
+            // (`optimizer.rs`'s `propagate_from_pass_range`):
             // an unbound operand whose root is not a sentinel is minted and
             // registered via `materialize_operand_at`, then walked to its
             // terminal — cloning the orig arg would skip canonicalization.
@@ -4434,11 +4439,12 @@ mod tests {
     }
 
     /// THE THIRD LEG — the one that makes the read path's `init_fields`
-    /// (`:867-877`) actually replace the descr, which neither leg above does.
+    /// (in `optimize_getfield_gc`) actually replace the descr, which neither
+    /// leg above does.
     ///
     /// Both legs above allocate with `size_descr(1)` and then `setfield` a
     /// `field_descr(10)` whose parent IS a `SizeDescr`, so the SETFIELD's own
-    /// `init_fields` takes the `cur_len == 0` arm at `:749` and leaves
+    /// `init_fields` takes the `cur_len == 0` arm (`ptr_info.rs`) and leaves
     /// `cur_len == 11`. Every slot they read is below that, so the read-side
     /// call is a no-op on both — ablating it (`if false &&`) left both green.
     ///
@@ -4465,8 +4471,9 @@ mod tests {
     /// returns `true` for a descr with no field list at all. `get_field` then
     /// finds slot 3 populated and forwards it, so `folded_read_answer` reads
     /// `None` (a non-constant operand) instead of `Some(Int(0))`. That is the
-    /// two-sided ablation: delete the block at `:867-877` and this assertion
-    /// must go RED, where the two legs above stay green.
+    /// two-sided ablation: delete the read-side `init_fields` block in
+    /// `optimize_getfield_gc` and this assertion must go RED, where the two
+    /// legs above stay green.
     #[test]
     fn test_read_path_init_fields_upgrades_a_zero_length_descr_before_the_slot_check() {
         let mut ops = vec![
@@ -5268,8 +5275,9 @@ mod tests {
         // any lazy_set on the cached fields it could touch. PyPy
         // `effectinfo.py:285 effectinfo_from_writeanalyze` force-promotes
         // analyzer-absent EIs to `EF_RANDOM_EFFECTS` (`MOST_GENERAL`,
-        // `effectinfo.py:271-273`). `dispatch_emit:2631/2766
-        // call_has_random_effects` then routes through `clean_caches`,
+        // `effectinfo.py:271-273`). `emit_residual_call` /
+        // `handle_side_effects` then see `call_has_random_effects` and
+        // route through `clean_caches`,
         // so the per-cached-field flush runs and `setfield_gc` survives
         // in front of the call. The test threads `MOST_GENERAL` directly
         // rather than through `default_effect_info()`, which returns the
