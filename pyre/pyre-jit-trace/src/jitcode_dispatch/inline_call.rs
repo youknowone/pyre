@@ -5647,9 +5647,33 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     }
     // What follows is `type.__call__`.  A metaclass that overrides `__call__`
     // runs instead of it and may return anything at all, so it stays residual.
-    if !std::ptr::eq(unsafe { (*w_type).w_class }, w_metatype) {
-        return type_call_decline("metaclass overrides __call__");
-    }
+    //
+    // The question is which `__call__` the metatype resolves to, not whether it
+    // is `type` itself: `ABCMeta` supplies `__instancecheck__`,
+    // `__subclasscheck__` and `register` and leaves `__call__` alone, so every
+    // class that registers with a `numbers` / `collections.abc` ABC — which is
+    // every `Fraction`, `Decimal` and `deque` construction — resolves to the
+    // same `type.__call__` a plain class does.  Comparing the metatype's
+    // identity refused all of them.
+    let w_metaclass = unsafe { (*w_type).w_class };
+    let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
+        None
+    } else {
+        let meta_call =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metaclass, "__call__") };
+        let type_call =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_metatype, "__call__") };
+        if meta_call != type_call {
+            return type_call_decline("metaclass overrides __call__");
+        }
+        // The answer above is a dict lookup, so it needs the same pin the
+        // `__new__` / `__init__` answers get.  A metaclass whose dict changes
+        // are untracked cannot supply one.
+        if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_metaclass) } == 0 {
+            return type_call_decline("metaclass has no version tag");
+        }
+        Some(w_metaclass)
+    };
     // A version tag of 0 is a type whose dict changes are not tracked, so the
     // `__new__` / `__init__` / `__del__` lookups below cannot be pinned.
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
@@ -5727,6 +5751,12 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(r_args[0], type_const);
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    // A metaclass that does not override `__call__` today can be given one, and
+    // that changes its own version tag rather than the class's.
+    if let Some(w_metaclass) = metaclass_to_pin {
+        let metaclass_const = ctx.trace_ctx.const_ref(w_metaclass as i64);
+        walker_pin_type_version_tag(ctx, op.pc, metaclass_const)?;
+    }
 
     // The walker is the executor here, so the instance the rest of this walk
     // reads has to be a real one — the same split `trace_box_int` makes between
