@@ -3707,7 +3707,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // 15.3 once admitted, and `self.i >= self.n` 1207 -> 15.9.  Swapping that
     // `raise` for a `return` already measured 17.7, which is what named the
     // token rather than the branch or the attribute compare.
-    if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+    if fbw_inline_diag_enabled() {
         let mut pc = 0usize;
         let mut shown = 0;
         while pc < body.code.len() && shown < 8 {
@@ -5321,7 +5321,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let (outcome, _end_pc) = match callee_outcome {
         Ok(v) => v,
         Err(e) => {
-            if std::env::var("PYRE_FBW_INLINE_DIAG").is_ok() {
+            if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
             }
             // gh#467: a supported abort fired inside this top-level inline
@@ -5579,14 +5579,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     }
 }
 
-/// Whether the instantiation emit's decline reasons are being collected.
-fn type_call_diag_enabled() -> bool {
-    std::env::var("PYRE_FBW_INLINE_DIAG").is_ok()
-}
-
 /// Report why the instantiation emit declined, under `PYRE_FBW_INLINE_DIAG`.
 fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if type_call_diag_enabled() {
+    if fbw_inline_diag_enabled() {
         eprintln!("[type-call-decline] {reason}");
     }
     Ok(None)
@@ -5624,7 +5619,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         // about, so name the reason only for a call that does resolve to a
         // class, and only while the reasons are being collected — the extra
         // resolution below is diagnostic cost, not tracing cost.
-        if type_call_diag_enabled()
+        if fbw_inline_diag_enabled()
             && r_args.len() >= 2
             && walker_concrete_ref_object(ctx, r_args[1]).is_none()
             && walker_concrete_ref_object(ctx, r_args[0])
@@ -5802,7 +5797,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         instance,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
     );
-    if type_call_diag_enabled() {
+    if fbw_inline_diag_enabled() {
         eprintln!(
             "[type-call-inline] pc={} class={} init={}",
             op.pc,
@@ -5861,7 +5856,7 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
         // stood.  Say so when it does not: without this line the diagnostic
         // reads as a successful fold on a trace that ends up carrying the whole
         // instantiation as a residual.
-        if type_call_diag_enabled() {
+        if fbw_inline_diag_enabled() {
             eprintln!(
                 "[type-call-rewind] pc={} class={} why=__init__ sub-walk declined",
                 op.pc,

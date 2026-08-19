@@ -1014,7 +1014,7 @@ the folds it selects, not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
 consulted/fired tallies.
 
-### §6c — Default-OFF diagnostics, censuses and probes (67): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (68): keep, cost nothing
 
 Each is inert unless set, so none is a removal target by this file's
 already-ON criterion. They are listed so they cannot be missed again.
@@ -1053,6 +1053,12 @@ example; it is unset by default. Its `AFTER`, `BUDGET`, `EVERY`, and `ROWS`
 value knobs bound the capture window, sampling rate, and report size. This is a
 diagnostic tool rather than a temporary runtime experiment, so it retires only
 if the example itself is removed.
+
+`PYRE_FBW_REPLAY_DIRTY_BODY` is a sub-knob of `PYRE_FBW_INLINE_DIAG` rather
+than a gate of its own: `replay_safety_dump_body` returns unless both are set,
+so setting it alone prints nothing. It lists each callee body as it is scanned,
+which is what lets the `pc` on a following `[replay-dirty]` line be matched to
+an op. It goes with the inline diagnostic it extends.
 
 `PYRE_VSTACK_NO_EXACT` and `PYRE_VSTACK_KEEP_REORDER` are A/B switches over the
 walk-level operand-stack mirror, each restoring the behaviour its default
